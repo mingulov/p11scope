@@ -1814,10 +1814,13 @@ impl AttestedSemanticLane {
     /// closes retired graph files (256 per call) and reports true
     /// only once the chain drains. An Unproved detach or an
     /// exit-retained lane refuses; the first error stays owned.
+    /// Pending polls print the stop estimate and progress through
+    /// `out`, same text as the blocking drive.
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn poll_wound_down(
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        out: &mut dyn std::io::Write,
     ) -> Result<bool, SemanticRefusal> {
         self.wound_down_error = None;
         if self.exit_retained {
@@ -1832,7 +1835,7 @@ impl AttestedSemanticLane {
         }
         #[cfg(test)]
         if let Some(io) = self.test_io.as_mut() {
-            let progress = match io.poll_terminal_detach(&mut std::io::sink()) {
+            let progress = match io.poll_terminal_detach(out) {
                 Ok(progress) => progress,
                 Err(error) => {
                     self.wound_down_error = Some(format!("{error:#}"));
@@ -1859,10 +1862,7 @@ impl AttestedSemanticLane {
             }
             return Ok(drained);
         };
-        match live
-            .session
-            .poll_owned_producer_detach(&mut std::io::sink())
-        {
+        match live.session.poll_owned_producer_detach(out) {
             Ok(ProducerDetachProgress::Pending) => Ok(false),
             Ok(ProducerDetachProgress::Complete) => {
                 let drained = coordinator.close_retired_graph_files(256);
@@ -4389,14 +4389,14 @@ mod joint_terminal_tests {
         let mut coordinator = coordinator_for_test();
         let mut lane = shell_lane_for_test();
         assert_eq!(
-            lane.poll_wound_down(&mut coordinator),
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
             Err(SemanticRefusal::Unavailable)
         );
         // Substituted I/O does not waive the gate, and the detach is
         // never polled before Finish.
         let (mut lane, shared, _) = io_lane_for_test(DetachScript::Complete);
         assert_eq!(
-            lane.poll_wound_down(&mut coordinator),
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
             Err(SemanticRefusal::Unavailable)
         );
         assert_eq!(shared.borrow().detach_polls, 0);
@@ -4404,7 +4404,7 @@ mod joint_terminal_tests {
         // without touching the detach — even unfinished.
         lane.exit_retained = true;
         assert_eq!(
-            lane.poll_wound_down(&mut coordinator),
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
             Err(SemanticRefusal::Unavailable)
         );
         assert_eq!(shared.borrow().detach_polls, 0);
@@ -4415,9 +4415,15 @@ mod joint_terminal_tests {
         let mut coordinator = coordinator_for_test();
         let (mut lane, shared, _) = io_lane_for_test(DetachScript::Pending);
         lane.test_finished = true;
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(false));
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(false)
+        );
         assert_eq!(shared.borrow().detach_polls, 1);
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(false));
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(false)
+        );
         assert_eq!(shared.borrow().detach_polls, 2);
     }
 
@@ -4426,14 +4432,23 @@ mod joint_terminal_tests {
         let mut coordinator = coordinator_for_test();
         let (mut lane, shared, _) = io_lane_for_test(DetachScript::Complete);
         lane.test_finished = true;
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(true)
+        );
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(true)
+        );
         assert_eq!(shared.borrow().detach_polls, 2);
         // A finished shell lane has nothing to detach; the shared
         // retired-file chain is already empty.
         let mut lane = shell_lane_for_test();
         lane.test_finished = true;
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -4446,7 +4461,7 @@ mod joint_terminal_tests {
             "a later poll failure".into(),
         ];
         assert_eq!(
-            lane.poll_wound_down(&mut coordinator),
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
             Err(SemanticRefusal::Unavailable)
         );
         assert_eq!(
@@ -4458,7 +4473,7 @@ mod joint_terminal_tests {
             "the first error is kept, nothing consumed or overwritten"
         );
         assert_eq!(
-            lane.poll_wound_down(&mut coordinator),
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
             Err(SemanticRefusal::Unavailable)
         );
         assert_eq!(shared.borrow().detach_polls, 2);
@@ -4500,7 +4515,10 @@ mod joint_terminal_tests {
         lane.test_finished = true;
         lane.set_test_joint_frame(true);
         lane.set_test_joint_machine(true);
-        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+            Ok(true)
+        );
         lane.set_test_joint_frame(false);
         assert!(lane.take_joined_session().unwrap().is_none());
         assert!(
@@ -4607,7 +4625,7 @@ mod joint_terminal_tests {
             .expect("disposition-required admits abandon");
         for _ in 0..2 {
             assert_eq!(
-                lane.poll_wound_down(&mut coordinator),
+                lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
                 Err(SemanticRefusal::Unavailable)
             );
             assert!(matches!(

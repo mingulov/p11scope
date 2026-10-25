@@ -3812,7 +3812,7 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
     loop {
         let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
         let lane = semantic.as_mut().expect("lane");
-        match lane.poll_wound_down(coordinator) {
+        match lane.poll_wound_down(coordinator, &mut std::io::sink()) {
             Ok(true) => break,
             Ok(false) => {}
             Err(refusal) => anyhow::bail!("the live wound-down never refuses: {refusal}"),
@@ -4472,7 +4472,7 @@ fn finish_stop_take_mint(
     loop {
         let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
         let lane = semantic.as_mut().expect("lane");
-        match lane.poll_wound_down(coordinator) {
+        match lane.poll_wound_down(coordinator, &mut std::io::sink()) {
             Ok(true) => break,
             Ok(false) => {}
             Err(refusal) => anyhow::bail!("{tag}: the live wound-down never refuses: {refusal}"),

@@ -1067,7 +1067,7 @@ impl CleanupWorker {
     /// One-shot terminal stop estimate over the submitted singles:
     /// the single count with its ceiling in seconds, or `None` while the
     /// estimate stays below the print floor.
-    fn stop_estimate(&self) -> Option<(usize, u64)> {
+    pub(crate) fn stop_estimate(&self) -> Option<(usize, u64)> {
         let singles = self.state.lock().unwrap().single_links;
         let ms = (singles as u64).saturating_mul(SINGLE_LINK_CLOSE_MS);
         if ms < STOP_ESTIMATE_FLOOR_MS {
@@ -1430,6 +1430,61 @@ fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
     );
 }
 
+/// The one-shot stop estimate line, shared by the blocking drive and
+/// the poll path so the text cannot drift.
+fn write_stop_estimate_line(out: &mut dyn Write, singles: usize, estimate_secs: u64) {
+    let _ = writeln!(
+        out,
+        "p11scope: closing {singles} probe links one at a time (no batched uprobe detach on this kernel); about {estimate_secs} s, progress follows",
+    );
+}
+
+/// Poll-path detach progress printer: the one-shot estimate latch and
+/// the last printed progress mark, keyed off the worker's own clock
+/// so scripted clocks drive it in tests. Same text and cadence as
+/// `drive_cleanup`; quiet without work.
+#[derive(Default)]
+pub(crate) struct DetachPollPrinter {
+    estimate_printed: bool,
+    last_progress_elapsed: Option<Duration>,
+}
+
+impl DetachPollPrinter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Print the one-shot estimate (first pending poll, when above
+    /// the floor) and the ~1/s progress line for a still-pending
+    /// detach.
+    pub(crate) fn poll_pending(
+        &mut self,
+        worker: &CleanupWorker,
+        had_work: bool,
+        out: &mut dyn Write,
+    ) {
+        if !had_work {
+            return;
+        }
+        if !self.estimate_printed {
+            self.estimate_printed = true;
+            if let Some((singles, estimate_secs)) = worker.stop_estimate() {
+                write_stop_estimate_line(out, singles, estimate_secs);
+            }
+        }
+        let progress = worker.progress();
+        let elapsed = progress.elapsed;
+        if elapsed >= Duration::from_secs(1)
+            && self
+                .last_progress_elapsed
+                .is_none_or(|last| elapsed >= last + Duration::from_secs(1))
+        {
+            self.last_progress_elapsed = Some(elapsed);
+            write_progress_line(out, &progress);
+        }
+    }
+}
+
 /// First-pass poll: a fast session settles here instead of sleeping
 /// the full printed cadence (10-50 ms keeps every capture's exit fast
 /// without a busy spin).
@@ -1477,10 +1532,7 @@ pub(crate) fn drive_cleanup(
 ) -> CleanupExit {
     worker.begin_terminal();
     if let Some((singles, estimate_secs)) = worker.stop_estimate() {
-        let _ = writeln!(
-            out,
-            "p11scope: closing {singles} probe links one at a time (no batched uprobe detach on this kernel); about {estimate_secs} s, progress follows",
-        );
+        write_stop_estimate_line(out, singles, estimate_secs);
     }
     let mut first_poll = true;
     loop {

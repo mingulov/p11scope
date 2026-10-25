@@ -1389,6 +1389,7 @@ enum OwnedProducerDetach {
         worker: CleanupWorker,
         started: std::time::Instant,
         had_work: bool,
+        progress: cleanup_worker::DetachPollPrinter,
     },
     Unproved,
     Complete,
@@ -1440,6 +1441,7 @@ impl OwnedProducerDetach {
             worker,
             started,
             had_work,
+            ..
         } = prior
         else {
             if matches!(prior, Self::Complete) {
@@ -1484,19 +1486,20 @@ impl OwnedProducerDetach {
     /// `try_join` reports pending and the SAME worker stays in place
     /// with every original lease. Only a joined receipt settles, through
     /// the same `settle_cleanup_exit` + `finish_producer_detach` path as
-    /// `drive`. Nothing is printed: progress lines belong to the
-    /// blocking `drive`.
+    /// `drive`. Pending polls print the one-shot estimate and the ~1/s
+    /// progress line through `out`, same text as the blocking `drive`.
     fn poll(
         &mut self,
         failures: &mut Vec<String>,
         detached: &mut bool,
         wall_ms: &mut u64,
-        _out: &mut dyn std::io::Write,
+        out: &mut dyn std::io::Write,
     ) -> Result<ProducerDetachProgress> {
         let Self::Pending {
             worker,
             started,
             had_work,
+            progress,
         } = self
         else {
             if matches!(self, Self::Complete) {
@@ -1512,6 +1515,7 @@ impl OwnedProducerDetach {
         let started = *started;
         let had_work = *had_work;
         let Some(receipt) = worker.try_join() else {
+            progress.poll_pending(worker, had_work, out);
             return Ok(ProducerDetachProgress::Pending);
         };
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
@@ -1552,6 +1556,7 @@ pub(crate) fn drive_owned_producer_detach_for_test(
         worker,
         started: std::time::Instant::now(),
         had_work,
+        progress: cleanup_worker::DetachPollPrinter::new(),
     };
     job.drive(&mut Vec::new(), &mut false, &mut 0, second_signal, out)
 }
@@ -7472,6 +7477,7 @@ impl Session {
             worker,
             started,
             had_work,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         Ok(())
     }
@@ -9098,6 +9104,7 @@ mod tests {
                 ),
                 started: std::time::Instant::now(),
                 had_work: false,
+                progress: cleanup_worker::DetachPollPrinter::new(),
             },
         ] {
             fixture.detach = detach;
@@ -10283,6 +10290,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let mut detached = false;
         let mut out = Vec::new();
@@ -10368,6 +10376,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let mut detached = false;
         let mut out = Vec::new();
@@ -10429,6 +10438,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let mut detached = false;
         let mut out = Vec::new();
@@ -10476,6 +10486,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let mut detached = false;
         let mut failures = Vec::new();
@@ -10534,6 +10545,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         for _ in 0..4 {
             assert!(
@@ -10622,6 +10634,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let original = match &job {
             OwnedProducerDetach::Pending { worker, .. } => worker.original_thread_id(),
@@ -10742,6 +10755,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         (job, now, release)
     }
@@ -10949,6 +10963,7 @@ mod tests {
             worker,
             started: std::time::Instant::now(),
             had_work: true,
+            progress: cleanup_worker::DetachPollPrinter::new(),
         };
         let mut detached = false;
         let mut failures = Vec::new();
@@ -11015,6 +11030,7 @@ mod tests {
                 worker,
                 started: std::time::Instant::now(),
                 had_work: true,
+                progress: cleanup_worker::DetachPollPrinter::new(),
             };
             let mut detached = false;
             let mut wall = 0;

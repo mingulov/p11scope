@@ -218,6 +218,7 @@ fn scene_pending_blocked() -> NativeScene {
         worker,
         started: Instant::now(),
         had_work: true,
+        progress: super::cleanup_worker::DetachPollPrinter::new(),
     };
     let spy = Arc::new(AtomicBool::new(false));
     NativeScene {
@@ -269,6 +270,7 @@ fn scene_unproved_failed() -> NativeScene {
                 worker,
                 started: Instant::now(),
                 had_work: true,
+                progress: super::cleanup_worker::DetachPollPrinter::new(),
             },
             failures: Vec::new(),
             detached: false,
@@ -356,6 +358,7 @@ fn scene_complete_minted() -> NativeScene {
                 worker,
                 started: Instant::now(),
                 had_work: true,
+                progress: super::cleanup_worker::DetachPollPrinter::new(),
             },
             failures: Vec::new(),
             detached: false,

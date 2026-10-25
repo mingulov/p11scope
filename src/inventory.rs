@@ -3037,7 +3037,7 @@ impl ClassicDriver<'_> {
             }
             JointFinishDriver::Published => {
                 let wound = match lane.as_mut() {
-                    Some(lane) => lane.poll_wound_down(coordinator),
+                    Some(lane) => lane.poll_wound_down(coordinator, &mut std::io::stderr()),
                     None => return JointStepOutcome::Stayed,
                 };
                 match wound {
@@ -3168,7 +3168,7 @@ impl ClassicDriver<'_> {
             let Some(lane) = winding.lane.as_mut() else {
                 return false;
             };
-            match lane.poll_wound_down(&mut *self.coordinator) {
+            match lane.poll_wound_down(&mut *self.coordinator, &mut std::io::stderr()) {
                 Ok(false) => Outcome::Pending,
                 Ok(true) => Outcome::Joined,
                 Err(error) => {
@@ -11664,7 +11664,10 @@ mod tests {
         let mut lane = joint_lane(WindDownIo::completing(), true);
         lane.set_test_joint_frame(false);
         assert!(
-            matches!(lane.poll_wound_down(&mut coord), Ok(true)),
+            matches!(
+                lane.poll_wound_down(&mut coord, &mut std::io::sink()),
+                Ok(true)
+            ),
             "the completing detach joins"
         );
         assert!(
@@ -11725,7 +11728,7 @@ mod tests {
         assert!(batch.is_empty(), "an empty finish abandons empty");
         assert!(
             matches!(
-                lane.poll_wound_down(&mut coord),
+                lane.poll_wound_down(&mut coord, &mut std::io::sink()),
                 Err(SemanticRefusal::Unavailable)
             ),
             "the retained lane refuses the wound-down"

@@ -764,6 +764,18 @@ class CompareTwins(unittest.TestCase):
         with self.assertRaisesRegex(oracle.LedgerError, "claim a positive"):
             compare_pair(oracle, ledger_rows(), snapshot)
 
+    def test_mutation_merge_claims_failures_rejected(self):
+        oracle = require_oracle(self)
+        for failed, unknown in ((5, 5), (5, 0), (0, 5)):
+            with self.subTest(failed=failed, unknown=unknown):
+                snapshot = merge_snapshot()
+                snapshot["key_rows"] = [key_row("i0", "A", 0, 0,
+                                                failed=failed,
+                                                unknown=unknown)]
+                with self.assertRaisesRegex(oracle.LedgerError,
+                                            "claim failures or unknowns"):
+                    compare_pair(oracle, ledger_rows(), snapshot)
+
     def test_mutation_merge_without_gap_rejected(self):
         oracle = require_oracle(self)
         snapshot = merge_snapshot()
@@ -1246,6 +1258,22 @@ class EmissionTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("P11SCOPE-A", completed.stdout)
             self.assertIn("P11SCOPE-B", completed.stdout)
+
+    def test_mk_providers_uses_fixture_pin_env(self):
+        require_oracle(self)
+        text = MK_PROVIDERS.read_text(encoding="utf-8")
+        self.assertIn("P11SCOPE_KEY_FIXTURE_PIN", text)
+        if not softhsm_available():
+            self.skipTest("requires softhsm2-util and libsofthsm2.so")
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "prov-pin"
+            env = dict(os.environ, P11SCOPE_KEY_FIXTURE_PIN="4321")
+            completed = subprocess.run(
+                ["sh", str(MK_PROVIDERS), str(dest)],
+                capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("PROVIDER_A", completed.stdout)
+            self.assertIn("PROVIDER_B", completed.stdout)
 
     def test_late_b_emits_cut_ledger(self):
         oracle = require_oracle(self)

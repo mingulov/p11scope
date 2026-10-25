@@ -730,8 +730,9 @@ fn stop_disp_body(scene: Scene, event: JointEvent) {
 }
 
 /// J9/J11 × deadline (U E): the expired deadline is really
-/// applied — the loop samples it as the retention cause through
-/// the real helper — then the suspended tick abandons the
+/// applied — the Driver records it as the retention cause through
+/// the real loop helper (F1: cause ownership is driver-side,
+/// never machine-owned) — then the suspended tick abandons the
 /// dispositioned finish with the first error kept.
 fn deadline_disp_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
@@ -747,7 +748,7 @@ fn deadline_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(
         run.stop_cause,
         Some(ZeroPassCause::Deadline),
-        "the run records the deadline cause"
+        "the Driver records the deadline cause (F1)"
     );
     driver.on_tick();
     assert_eq!(

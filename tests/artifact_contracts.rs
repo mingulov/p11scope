@@ -748,18 +748,15 @@ fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
     // The shipped configurations compile on push, not only on a manual
     // dispatch: the static musl observer plus the P0 feature set on both
     // libcs. A musl-only break (a libc wrapper with no musl binding) once
-    // landed and was found only by a manual build. The musl gates stay on
-    // default targets (lib and bins) until the product source fixes its
-    // three pre-existing musl-only breaks (two test-only check errors and
-    // one manifest clippy error); then they widen back to --all-targets
-    // and clippy.
+    // landed and was found only by a manual build.
     for gate in [
         "fmt --all -- --check",
         "check --locked --offline --workspace --all-targets",
         "clippy --locked --offline --workspace --all-targets -- -D warnings",
-        "check --locked --offline --workspace --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl",
+        "clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings",
         "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
-        "check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
     ] {
         if !step_calls(lint)
             .any(|call| call == format!("cargo +\"$(cat .release-rust-version)\" {gate}"))
@@ -807,7 +804,8 @@ fn assert_release_preview_builds_full_and_p0(ci: &str) -> Result<(), String> {
         (
             format!(
                 "{cargo} build --locked --offline --release --no-default-features \
-                 --features stub-object-attributes --target x86_64-unknown-linux-musl"
+                 --features stub-object-attributes --target x86_64-unknown-linux-musl \
+                 --target-dir target/p0-preview"
             ),
             "P0 static pre-build",
         ),
@@ -845,6 +843,50 @@ fn assert_release_preview_builds_full_and_p0(ci: &str) -> Result<(), String> {
     ] {
         require_contract_marker(preview, &marker, contract)?;
     }
+    Ok(())
+}
+
+/// The preview container image holds the FULL static binary, not the P0
+/// one: the FULL pre-build writes the default musl target dir that the
+/// observer Dockerfile copies, the P0 pre-build writes its own target dir
+/// so it cannot overwrite those bytes, and the docker build runs after
+/// the FULL pre-build.
+fn assert_release_preview_image_consumes_full_prebuild(
+    ci: &str,
+    dockerfile: &str,
+) -> Result<(), String> {
+    let preview = job_block(ci, "release-preview");
+    let full = "cargo +\"$(cat .release-rust-version)\" build --locked --offline --release --target x86_64-unknown-linux-musl";
+    let full_line = preview
+        .lines()
+        .find(|line| line.contains(full))
+        .ok_or_else(|| "the preview has no FULL static pre-build".to_string())?;
+    if full_line.contains("--target-dir") || full_line.contains("CARGO_TARGET_DIR") {
+        return Err(
+            "the FULL pre-build must write the default target dir the image copies".to_string(),
+        );
+    }
+    let p0 = preview
+        .lines()
+        .find(|line| line.contains("stub-object-attributes --target x86_64-unknown-linux-musl"))
+        .ok_or_else(|| "the preview has no P0 static pre-build".to_string())?;
+    if !p0.contains("--target-dir ") && !p0.contains("--target-dir=") {
+        return Err(
+            "the P0 pre-build must use its own target dir so the FULL binary survives for the image"
+                .to_string(),
+        );
+    }
+    let docker = preview
+        .find("docker build -f deploy/Dockerfile.observer")
+        .ok_or_else(|| "the preview has no observer docker build".to_string())?;
+    if docker < preview.find(full).unwrap_or(usize::MAX) {
+        return Err("the observer docker build must run after the FULL pre-build".to_string());
+    }
+    require_contract_marker(
+        dockerfile,
+        "COPY target/x86_64-unknown-linux-musl/release/p11scope",
+        "observer image",
+    )?;
     Ok(())
 }
 
@@ -10332,12 +10374,15 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // step, so deleting the workspace test gate left this claim standing.
     assert_hosted_offline_gates(&ci).unwrap();
     assert_release_preview_builds_full_and_p0(&ci).unwrap();
+    let dockerfile = read("deploy/Dockerfile.observer");
+    assert_release_preview_image_consumes_full_prebuild(&ci, &dockerfile).unwrap();
     // A removed shipped-configuration step must fail, not silently narrow the
     // push gate back to gnu FULL: drop each new lint gate line in turn.
     for gate in [
-        "check --locked --offline --workspace --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl",
+        "clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings",
         "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
-        "check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
     ] {
         let step = format!("- run: cargo +\"$(cat .release-rust-version)\" {gate}\n");
         let dropped = ci.replacen(&step, "", 1);
@@ -10364,6 +10409,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             "removing the preview {marker:?} step must fail"
         );
     }
+    // The P0 pre-build must keep its own target dir: without it the P0
+    // bytes overwrite the FULL binary the image copies.
+    let default_dir = ci.replacen(" --target-dir target/p0-preview", "", 1);
+    assert!(
+        assert_release_preview_image_consumes_full_prebuild(&default_dir, &dockerfile).is_err(),
+        "a P0 pre-build writing the default target dir must fail"
+    );
     let bpf_driver = read("scripts/check-bpf-noninterference.py");
     assert_hosted_dependency_preparation(&ci, &bpf_driver).unwrap();
     for marker in [

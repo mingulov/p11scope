@@ -86,6 +86,7 @@ class PackageReleaseTests(unittest.TestCase):
             f"head\t{self.head}\ntree\t{self.tree}\n"
             f"release_artifacts_sha256\t{digest(self.ledger.read_bytes())}\n"
             "checker_status\t0\nterminal_status\t0\n"
+            "capture_mode\tfull\n"
             "cwd\t/private/host/path\nsecret\tPRIVATE-CAPTURE-CANARY\n"
         )
         (self.receipt / "facts.log").write_text(self.facts)
@@ -225,6 +226,8 @@ class PackageReleaseTests(unittest.TestCase):
             self.assertIn("FULL", embedded["scope"])
 
     def test_p0_option_reproduces_p0_provenance(self):
+        (self.receipt / "facts.log").write_text(
+            self.facts.replace("capture_mode\tfull", "capture_mode\tp0"))
         result = PACKAGE.package(self.root, self.receipt, self.notices, self.source,
                                  self.output, capture_mode="p0")
         self.assertEqual(result["p11scope_features"], ["stub-object-attributes"])
@@ -232,6 +235,33 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(release["p11scope_features"], ["stub-object-attributes"])
         self.assertIn("P0", release["scope"])
         self.assertIn("object-attribute capture disabled", release["scope"])
+
+    def test_receipt_capture_mode_must_match_the_flag(self):
+        cases = (
+            ("full", "full", False),
+            ("p0", "p0", False),
+            ("full", "p0", True),
+            ("p0", "full", True),
+            (None, "full", True),
+            (None, "p0", True),
+        )
+        for fact, flag, refuses in cases:
+            with self.subTest(fact=fact, flag=flag):
+                lines = [line for line in self.facts.splitlines()
+                         if not line.startswith("capture_mode\t")]
+                if fact is not None:
+                    lines.append(f"capture_mode\t{fact}")
+                (self.receipt / "facts.log").write_text("\n".join(lines) + "\n")
+                output = self.base / f"release-{fact or 'missing'}-{flag}"
+                if refuses:
+                    with self.assertRaisesRegex(
+                            ValueError, "receipt capture mode does not match --capture-mode"):
+                        PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                        output, capture_mode=flag)
+                    self.assertFalse(output.exists())
+                else:
+                    PACKAGE.package(self.root, self.receipt, self.notices, self.source,
+                                    output, capture_mode=flag)
 
     def test_unknown_capture_mode_refuses_without_output(self):
         with self.assertRaisesRegex(ValueError, "capture"):

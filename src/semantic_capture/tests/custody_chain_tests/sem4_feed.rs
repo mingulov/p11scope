@@ -55,9 +55,9 @@ fn stage_physical_use(scene: &mut RealScene, caller: CallerId, first_ns: u64, la
 
 /// (api_returns, historical_only_returns, lossy, [(mechanism, calls)],
 /// completed) of the first instance semantic row, if any.
-fn semantic_row_summary(
-    scene: &RealScene,
-) -> Option<(Option<u64>, u64, bool, Vec<(u64, u64)>, u64)> {
+type SemanticRowSummary = (Option<u64>, u64, bool, Vec<(u64, u64)>, u64);
+
+fn semantic_row_summary(scene: &RealScene) -> Option<SemanticRowSummary> {
     let row = scene
         .scene
         .coordinator

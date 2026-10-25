@@ -47204,6 +47204,43 @@ fn collected_graph_revalidate_mismatch_retains_native_debt() {
 }
 
 #[test]
+fn collected_graph_install_refuses_a_stale_epoch() {
+    // Install's own revalidation (epoch plus Freeze scalars): a mutation
+    // after NativePoll must refuse retained without installing, leaving
+    // the pins revision and the plan untouched.
+    let mut case = graph_case_with_exit(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut reached = false;
+    while std::time::Instant::now() < deadline {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Install && graph.install_step == 0)
+        {
+            reached = true;
+            break;
+        }
+        case.service(1);
+        std::thread::yield_now();
+    }
+    assert!(reached, "Install before its first credit");
+    let revision = case.engine.pinned.revision();
+    let slots = case.engine.plan.slots.clone();
+    case.engine.note_graph_inputs_mutated();
+    assert!(case.service(1).pending);
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(
+        graph.verdict,
+        Some(Verdict::RefusedRetained),
+        "a stale epoch must not install"
+    );
+    assert!(!graph.installed);
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.plan.slots, slots);
+}
+
+#[test]
 fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
     // Before the take: a live preflight exists, then prepare fails.
     let mut case = graph_case_with_exit(true);

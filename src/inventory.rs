@@ -2214,6 +2214,27 @@ fn take_classic_commit_fault_for_test() -> Option<String> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Every line passed to `ClassicDriver::warn`, in order. Tests
+    /// drain it through `take_warned_for_test` (thread-local, like
+    /// the commit fault above: no driver field, so no literal churn).
+    static WARNED_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the warned-lines record (tests).
+#[cfg(test)]
+fn take_warned_for_test() -> Vec<String> {
+    WARNED_FOR_TEST.with(|warned| warned.take())
+}
+
+/// Record one warned line (tests).
+#[cfg(test)]
+fn record_warned_for_test(line: &str) {
+    WARNED_FOR_TEST.with(|warned| warned.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
 pub(crate) fn classic_semantic_stop_refusing_publication_for_test(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: crate::inventory_semantics::AttestedSemanticLane,
@@ -2462,6 +2483,8 @@ impl ClassicDriver<'_> {
     /// (which must never scribble beside its screen) the log tail, kept
     /// for stderr past the screen.
     fn warn(&mut self, warning: &str) {
+        #[cfg(test)]
+        record_warned_for_test(warning);
         match self.display.as_mut() {
             Some(display) => display.warn(warning),
             None => inventory_diagnostic(warning),
@@ -15065,6 +15088,569 @@ mod promotion_driver_tests {
                 .finish_poll_calls_for_test(),
             1,
             "the poll ran once through the lane"
+        );
+    }
+
+    /// Nonzero live-derived stop counts for the disclosure twins: the
+    /// live-run shape (a burst collected, refresh scans refused),
+    /// scripted because substituted lanes carry no live Session.
+    /// Shed stays real and is noted per test.
+    fn scripted_nonzero_stop_counts() -> crate::inventory_semantics::ScriptedStopCounts {
+        use crate::attach::image_query::ImageQueryRefusal;
+        let mut refusal_counts = [0u64; 12];
+        for _ in 0..10 {
+            crate::inventory_semantics::count_scan_refusals(
+                &mut refusal_counts,
+                &[ImageQueryRefusal::Unknown],
+            );
+        }
+        for _ in 0..2 {
+            crate::inventory_semantics::count_scan_refusals(
+                &mut refusal_counts,
+                &[ImageQueryRefusal::Custody],
+            );
+        }
+        crate::inventory_semantics::ScriptedStopCounts {
+            refusal_counts,
+            collected_calls: 68,
+            joined_calls: 5,
+            scan_refusals: 12,
+        }
+    }
+
+    /// The stop line the disclosure twins expect: scripted
+    /// collected/joined/refused, real shed, no bound callers in the
+    /// scene.
+    fn expected_stop_line() -> String {
+        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 12)
+    }
+
+    /// Committed gaps for one subject, read without publishing:
+    /// proves what a commit already published (order against it).
+    fn committed_gaps_by_subject(
+        driver: &mut ClassicDriver<'_>,
+        subject: &str,
+    ) -> Vec<(String, String)> {
+        driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .filter(|(candidate, _)| candidate == subject)
+            .collect()
+    }
+
+    #[test]
+    fn joint_stop_publish_discloses_before_final_commit() {
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A Joint stop that publishes ends with the same honest stop
+        // disclosure as the legacy path: exactly one scan-refusal gap
+        // plus exactly one call-count line with the lane's lifetime
+        // counts, both before the final commit.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Published(
+            BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            },
+        ))));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "begin Ok reaches Polling"
+        );
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure before the finish publishes"
+        );
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "the poll publishes"
+        );
+        // Production marks the lane finished at publication; the
+        // scripted poll only answers progress, so the scaffolding H0
+        // stop runs here (its batch drops unstaged, as in joint_lane).
+        let _ = driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .finish_semantic_stop();
+        // The seal drains before the completion, as in production: a
+        // framed take stays not-ready and the lane never completes.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_lane_stopped();
+        assert!(driver.semantic.is_none(), "the wound-down lane completes");
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "exactly one stop line, before the final commit"
+        );
+        // The final commit publishes the staged scan-refusal gap.
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+    }
+
+    #[test]
+    fn legacy_stop_disclosure_is_unchanged() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // Healthy twin: the legacy stop keeps its one gap plus one
+        // line with the lane's lifetime counts. Passes before and
+        // after the shared-helper refactor.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = wind_down_lane(WindDownIo::completing());
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.terminal_seq_calls, 1,
+            "the terminal sequence runs once; the safety-net hook discloses nothing further"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "exactly one legacy stop line"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one legacy scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+    }
+
+    #[test]
+    fn joint_stop_disposition_abandon_discloses_once() {
+        use crate::inventory_semantics::SemanticRefusal;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A disposition-required hold discloses exactly once, before
+        // the abandon commit: both gaps are already committed when
+        // the hold returns, with no further publish.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "begin Ok reaches Polling"
+        );
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "disposition holds through the finite stop"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(
+            committed_gaps_by_subject(&mut driver, "joint finish abandoned for exit").len(),
+            1,
+            "the abandon recorded once"
+        );
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(
+            scans.len(),
+            1,
+            "the disclosure ran before the abandon commit published it"
+        );
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "exactly one stop line"
+        );
+        // A further hook reaps nothing further.
+        driver.on_lane_stopped();
+        assert_eq!(take_warned_for_test().len(), 1, "the line prints once");
+        assert_eq!(
+            committed_gaps_by_subject(&mut driver, "semantic scan refused").len(),
+            1,
+            "the gap records once"
+        );
+    }
+
+    #[test]
+    fn joint_stop_wound_down_failure_discloses_once() {
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A Published finish whose detach fails holds with the same
+        // one disclosure. The lane is finished, so no abandon batch
+        // is admitted — but the counts are still disclosed.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        io.fail_poll = true;
+        let mut lane = joint_lane(io, false);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Published(
+            BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            },
+        ))));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "begin Ok reaches Polling"
+        );
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "the poll publishes"
+        );
+        let _ = driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .finish_semantic_stop();
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the failed detach abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        // No abandon commit runs here (a finished lane admits no
+        // abandon batch), so both gaps stage until the final publish
+        // — while the line already printed, before that commit.
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "exactly one stop line, before the final commit"
+        );
+        let published = gaps(&mut driver);
+        assert_eq!(
+            published
+                .iter()
+                .filter(|(subject, _)| subject == "joint wound-down failed")
+                .count(),
+            1,
+            "the wound-down failure records once"
+        );
+        assert!(
+            published
+                .iter()
+                .all(|(subject, _)| subject != "joint finish abandoned for exit"),
+            "a finished lane admits no abandon batch"
+        );
+        let scans: Vec<(String, String)> = published
+            .into_iter()
+            .filter(|(subject, _)| subject == "semantic scan refused")
+            .collect();
+        assert_eq!(scans.len(), 1, "the counts are still disclosed once");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the publish warns nothing further"
+        );
+    }
+
+    #[test]
+    fn joint_second_stop_while_polling_abandons_once_and_discloses() {
+        use crate::inventory_semantics::SemanticRefusal;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // Exit while a finish is Polling: the second stop escalates
+        // to the typed exit — the abandon runs once and the stop
+        // disclosure still prints. A repeat escalation is a no-op
+        // (the lane is held; a second abandon would refuse per the
+        // abandon contract).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "begin Ok reaches Polling"
+        );
+        // The disposition admits the abandon at the hold.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure before the exit"
+        );
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second stop escalates"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the first error is kept"
+        );
+        let abandons = committed_gaps_by_subject(&mut driver, "joint finish abandoned for exit");
+        assert_eq!(abandons.len(), 1, "the abandon ran once");
+        assert_eq!(
+            abandons[0].1, "joint finish disposition required",
+            "the abandon records its reason"
+        );
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(
+            scans.len(),
+            1,
+            "the disclosure ran before the abandon commit published it"
+        );
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the stop disclosure still prints"
+        );
+        driver.on_stop_requested();
+        assert_eq!(
+            take_warned_for_test().len(),
+            1,
+            "a repeat escalation warns nothing more"
+        );
+        assert_eq!(
+            committed_gaps_by_subject(&mut driver, "semantic scan refused").len(),
+            1,
+            "a repeat escalation records nothing more"
+        );
+    }
+
+    #[test]
+    fn joint_stop_without_refusals_prints_line_without_gap() {
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // Zero refusals on the Joint path: no gap, the line still
+        // prints (match legacy).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Published(
+            BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            },
+        ))));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        driver.on_lane_stopped();
+        let _ = driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .finish_semantic_stop();
+        // The seal drains before the completion, as in production: a
+        // framed take stays not-ready and the lane never completes.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_lane_stopped();
+        assert!(driver.semantic.is_none(), "the wound-down lane completes");
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                0, 0, 0, 0, 0
+            )],
+            "the line still prints with zero counts"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        assert!(
+            committed_gaps_by_subject(&mut driver, "semantic scan refused").is_empty(),
+            "zero refusals record no gap"
+        );
+    }
+
+    #[test]
+    fn legacy_stop_without_refusals_prints_line_without_gap() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // Zero refusals on the legacy path: no gap, the line still
+        // prints. Passes before and after the refactor.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
+        driver.on_stop_requested();
+        driver.on_lane_stopped();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                0, 0, 0, 0, 0
+            )],
+            "the line still prints with zero counts"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        assert!(
+            committed_gaps_by_subject(&mut driver, "semantic scan refused").is_empty(),
+            "zero refusals record no gap"
+        );
+    }
+
+    #[test]
+    fn joint_winding_complete_discloses_once() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A Joint promotion wind-down that completes discloses the
+        // lane once, like its hold twin: the finished lane's counts
+        // are read before the take hands the session away.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure at wind-down start"
+        );
+        // The seal drains before the completion, as in production.
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the completed winding discloses once"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("a commit publishes the staged gap");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the lane's per-reason counts"
+        );
+        driver.on_tick();
+        assert_eq!(
+            take_warned_for_test().len(),
+            1,
+            "a further tick discloses nothing more"
         );
     }
 

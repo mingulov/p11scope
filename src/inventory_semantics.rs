@@ -829,6 +829,12 @@ pub(crate) struct AttestedSemanticLane {
     /// pins zero polls past Published.
     #[cfg(test)]
     finish_poll_calls: usize,
+    /// Tests-only live-derived lifetime counts for the honest stop
+    /// disclosure: substituted lanes carry no live Session, so the
+    /// stop readers below would report zeros without this. Shed
+    /// stays lane-level and real (`note_shed_calls`).
+    #[cfg(test)]
+    scripted_stop_counts: Option<ScriptedStopCounts>,
     /// The last wound-down poll's detach error text, if it failed:
     /// the legacy cleanup gap carries it instead of the mapped
     /// refusal code. Fresh each poll.
@@ -1196,6 +1202,18 @@ impl std::fmt::Debug for AttestedSemanticLane {
     }
 }
 
+/// Tests-only live-derived lifetime counts for the honest stop
+/// disclosure: substituted lanes carry no live Session to read.
+/// Shed is not scripted: it stays lane-level and real.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptedStopCounts {
+    pub(crate) refusal_counts: [u64; 12],
+    pub(crate) collected_calls: u64,
+    pub(crate) joined_calls: u64,
+    pub(crate) scan_refusals: u64,
+}
+
 impl AttestedSemanticLane {
     pub(crate) fn with_pending_h3_continuation<R>(
         &self,
@@ -1277,6 +1295,8 @@ impl AttestedSemanticLane {
             scripted_finish_poll: None,
             #[cfg(test)]
             finish_poll_calls: 0,
+            #[cfg(test)]
+            scripted_stop_counts: None,
             wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
@@ -1417,6 +1437,8 @@ impl AttestedSemanticLane {
             scripted_finish_poll: None,
             #[cfg(test)]
             finish_poll_calls: 0,
+            #[cfg(test)]
+            scripted_stop_counts: None,
             wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
@@ -1524,6 +1546,15 @@ impl AttestedSemanticLane {
     /// the honest stop line. Joined is H0's cumulative router count;
     /// without a live lane only finalized sheds are known.
     pub(crate) fn semantic_stop_call_counts(&self) -> (u64, u64, u64, u64) {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted_stop_counts {
+            return (
+                scripted.collected_calls,
+                scripted.joined_calls,
+                self.disclosed_calls_shed,
+                scripted.scan_refusals,
+            );
+        }
         let (collected, joined, refused) = self.live.as_ref().map_or((0, 0, 0), |live| {
             (
                 live.collected_calls,
@@ -1537,6 +1568,10 @@ impl AttestedSemanticLane {
     /// Lifetime per-reason scan-refusal counts (zeros without a live
     /// lane), index-aligned with [`SCAN_REFUSAL_LABELS`].
     pub(crate) fn scan_refusal_counts(&self) -> [u64; 12] {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted_stop_counts {
+            return scripted.refusal_counts;
+        }
         self.live
             .as_ref()
             .map_or([0; 12], |live| live.refusal_counts)
@@ -1799,6 +1834,15 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn finish_poll_calls_for_test(&self) -> usize {
         self.finish_poll_calls
+    }
+
+    /// Script the live-derived stop counts (or clear them with
+    /// `None`): the stop readers answer them without a live
+    /// Session, so the driver's stop disclosure runs unprivileged
+    /// with nonzero counts. Shed stays real (`note_shed_calls`).
+    #[cfg(test)]
+    pub(crate) fn set_scripted_stop_counts_for_test(&mut self, counts: Option<ScriptedStopCounts>) {
+        self.scripted_stop_counts = counts;
     }
 
     /// Take the last wound-down poll's detach error text, if it
@@ -4637,6 +4681,67 @@ mod joint_terminal_tests {
             shared.borrow().detach_polls,
             0,
             "refused polls never touch the detach"
+        );
+    }
+
+    #[test]
+    fn abandon_on_joint_shell_lane_runs_once_and_records() {
+        // The Joint path's abandon without substituted I/O (the live
+        // `None` arm): a Joint-marked shell lane with a latched
+        // disposition abandons once — terminal batch, finished,
+        // exit-retained, one gap — and the second call refuses per
+        // the contract ("A second call refuses: the first abandon
+        // already exit-retained the lane.").
+        let mut coordinator = coordinator_for_test();
+        let mut lane = shell_lane_for_test();
+        lane.set_test_joint_frame(true);
+        lane.set_test_joint_machine(true);
+        assert!(lane.has_joint_frame(), "the seam marks a Joint lane");
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        let domain = lane.domain();
+        let batch = lane
+            .abandon_finish_for_exit(&mut coordinator, "native ownership uncertain")
+            .expect("disposition-required admits abandon on the Joint path");
+        assert!(lane.is_finished(), "the abandon finishes the lane");
+        assert!(lane.exit_retained, "the lane stays exit-retained");
+        assert_eq!(batch.domain(), domain, "the batch names the lane");
+        assert!(batch.is_empty(), "an empty finish abandons empty");
+        // Scope gaps stage until publication; commit, then read back.
+        coordinator
+            .commit_batch(false)
+            .expect("a fresh coordinator commits");
+        let gaps = coordinator.registry().gaps();
+        assert_eq!(gaps.len(), 1, "one abandon, one gap");
+        assert_eq!(gaps[0].subject, "joint finish abandoned for exit");
+        assert_eq!(gaps[0].reason, "native ownership uncertain");
+        assert!(
+            matches!(
+                lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain"),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "a second abandon refuses: the first already exit-retained the lane"
+        );
+        coordinator
+            .commit_batch(false)
+            .expect("a fresh coordinator commits");
+        assert_eq!(
+            coordinator.registry().gaps().len(),
+            1,
+            "the refused abandon records nothing more"
+        );
+        assert!(
+            matches!(
+                lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "the retained lane refuses the wound-down"
+        );
+        assert!(
+            matches!(
+                lane.take_joined_session(),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "the retained lane refuses the take"
         );
     }
 }

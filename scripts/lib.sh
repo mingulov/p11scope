@@ -483,7 +483,9 @@ launch_user_recorded_process_group() {
 }
 
 # Emit a closed, sorted JSON projection of one current user-owned process
-# session. A process that races or cannot be identified invalidates the snapshot.
+# session. A member proven dead mid-snapshot (zombie, dead, or reaped with
+# no PID reuse) is omitted; any other race or unidentifiable member
+# invalidates the snapshot.
 snapshot_user_process_session() {
     sups_sid=$1
     case $sups_sid in ''|*[!0-9]*) return 1 ;; esac

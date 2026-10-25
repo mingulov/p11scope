@@ -2519,7 +2519,7 @@ mod tests {
             file_descriptors: cpus.checked_mul(4).unwrap() + 512,
         };
         let stage = BankReservation {
-            retained_bytes: stage_retained_for_banks(mode, cpus, 1, 1024 * 1024),
+            retained_bytes: stage_retained_for_banks(mode, cpus, 1),
             transient_bytes: 1024 * 1024,
             metadata_bytes: 256 * 1024,
             file_descriptors: cpus.checked_mul(8).unwrap() + 16,
@@ -3151,14 +3151,14 @@ mod tests {
     const STAGE_HEADROOM: usize = 32 * 1024 * 1024;
 
     /// The retained allowance for staging `banks` fresh counter banks of
-    /// `mode` on `cpus` possible CPUs.
-    fn stage_retained_for_banks(
-        _mode: CounterMode,
-        _cpus: usize,
-        _banks: usize,
-        legacy_fixed: usize,
-    ) -> usize {
-        legacy_fixed
+    /// `mode` on `cpus` possible CPUs: the full bank payload plus headroom.
+    fn stage_retained_for_banks(mode: CounterMode, cpus: usize, banks: usize) -> usize {
+        banks
+            .checked_mul(512)
+            .and_then(|cells| cells.checked_mul(mode.stats_bytes() as usize))
+            .and_then(|payload| payload.checked_mul(cpus))
+            .and_then(|payload| payload.checked_add(STAGE_HEADROOM))
+            .expect("stage envelope fits usize")
     }
 
     #[test]
@@ -3166,19 +3166,19 @@ mod tests {
         // Per-mode cell widths from the bank geometry contract: counts 24,
         // timestamps 40, latency 296. The final 8192-endpoint grow stages 14
         // fresh banks in one call; the held-return flow stages one.
-        for (banks, funded, legacy_fixed) in
-            [(14usize, 16, 256 * 1024 * 1024), (1, 1, 1024 * 1024)]
-        {
-            let retained =
-                stage_retained_for_banks(CounterMode::Latency, 256, funded, legacy_fixed);
+        for (banks, funded) in [(14usize, 16), (1, 1)] {
+            let retained = stage_retained_for_banks(CounterMode::Latency, 256, funded);
             let need = banks * 512 * 296 * 256 + STAGE_HEADROOM;
             assert!(
                 retained >= need,
                 "{banks} latency banks at P=256: envelope {retained} < need {need}"
             );
         }
-        for (mode, value) in [(CounterMode::Counts, 24usize), (CounterMode::Timestamps, 40)] {
-            let retained = stage_retained_for_banks(mode, 256, 16, 256 * 1024 * 1024);
+        for (mode, value) in [
+            (CounterMode::Counts, 24usize),
+            (CounterMode::Timestamps, 40),
+        ] {
+            let retained = stage_retained_for_banks(mode, 256, 16);
             let need = 14 * 512 * value * 256 + STAGE_HEADROOM;
             assert!(
                 retained >= need,
@@ -3310,7 +3310,7 @@ mod tests {
             // Caller envelopes only: no OS limit is changed. Resource admission
             // is a separate controller gate before this ignored cell can run.
             let stage = BankReservation {
-                retained_bytes: stage_retained_for_banks(mode, cpus, 16, 256 * 1024 * 1024),
+                retained_bytes: stage_retained_for_banks(mode, cpus, 16),
                 transient_bytes: 256 * 1024 * 1024,
                 metadata_bytes: 16 * 1024 * 1024,
                 file_descriptors: cpus

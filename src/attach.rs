@@ -6489,6 +6489,9 @@ impl Session {
                 "static attachment refused while old global native ownership is pending or uncertain"
             );
         }
+        if !targets.is_empty() && !self.deferred_group_slots.is_empty() {
+            bail!("static attachment refused while a collected group deferral owns removals");
+        }
         self.pid_pairs.retarget_gap(targets, objects);
         self.global_retirements.select(targets, objects);
         attachment_admission(&self.detach_failures, !targets.is_empty())?;
@@ -7155,6 +7158,36 @@ impl Session {
             .cancel_collected_with(input, ticket, worker, work)
     }
 
+    /// Partition one collected removal into whole groups (which proceed
+    /// natively) and partial shared-Multi members, recorded in
+    /// `deferred_group_slots` for the terminal detach. Only a requested
+    /// stop with proven quiescence may park removals this way.
+    pub(crate) fn defer_collected_partial_groups(
+        &mut self,
+        q: &CollectedFinishQ,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        if work == 0 {
+            return Ok(DeferralProgress::Yielded);
+        }
+        anyhow::ensure!(
+            self.stop_gate.stop_requested() && self.stop_gate.quiescent(),
+            native_retirement::DEFER_ENTRY_REFUSAL
+        );
+        self.native_retirement.defer_collected_with(
+            q as *const CollectedFinishQ as usize,
+            input,
+            &self.links,
+            &self.retained_static,
+            &self.pid_pairs,
+            &mut self.deferred_group_slots,
+            reserve,
+            work,
+        )
+    }
+
     /// Whether this Session retires collected removals physically at Q.
     /// Multi lanes close links natively; Singles lanes retire logically
     /// only and the terminal detach closes everything.
@@ -7191,6 +7224,10 @@ impl Session {
         anyhow::ensure!(
             !self.native_retirement.collected_blocking(),
             "selective detach refused while original native retirement owns the registry"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "selective detach refused while a collected group deferral owns removals"
         );
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
         if let Some(banks) = &self.counter_banks {
@@ -7452,13 +7489,22 @@ impl Session {
                 let mut outcomes = Vec::new();
                 for link in std::mem::take(&mut self.links) {
                     let producer = link.producer();
+                    let slots: Vec<u32> = link.slots().to_vec();
                     match take_owned_links(&mut self.ebpf, link) {
-                        Ok(links) => outcomes.extend(links.into_iter().map(|link| {
-                            Ok((
-                                counter_banks::retain_link(link, keepalive.as_ref()),
-                                producer,
-                            ))
-                        })),
+                        Ok(links) => {
+                            // Only a take that yields owned handles submits
+                            // the link: failed or empty takes prove nothing
+                            // for the deferred mint gate.
+                            if !links.is_empty() {
+                                self.submitted_terminal_slots.extend(slots);
+                            }
+                            outcomes.extend(links.into_iter().map(|link| {
+                                Ok((
+                                    counter_banks::retain_link(link, keepalive.as_ref()),
+                                    producer,
+                                ))
+                            }))
+                        }
                         Err(error) => outcomes.push(Err(error)),
                     }
                 }
@@ -7526,8 +7572,9 @@ impl Session {
     /// sequence. Gates, in order: no prior destructive mint failure (a
     /// poisoned Session refuses before its poll, consuming nothing
     /// further), the producer detach worker joined (Complete, never an
-    /// observed empty link set) and the stop gate still proves Q — both
-    /// enforced fail-fast before the terminal poll, so a refused mint
+    /// observed empty link set), the stop gate still proves Q, and every
+    /// deferred group slot proven terminally submitted — all enforced
+    /// fail-fast before the terminal poll, so a refused mint
     /// consumes nothing — then the selected gate (when present) reads
     /// back TERMINAL, one explicitly bounded terminal EVENTS poll runs,
     /// its known drain failures (backlog past the bound, reserved-but-
@@ -7547,6 +7594,11 @@ impl Session {
         // the split the refusal ate. (The selected gate below already
         // refuses fail-fast the same way.)
         SessionNativeCompletion::join_gates(detach_complete, quiescent)?;
+        if !deferred_slots_proven(&self.deferred_group_slots, &self.submitted_terminal_slots) {
+            bail!(
+                "native completion unproved: deferred group slots were not all terminally submitted"
+            );
+        }
         let selected_terminal = match &self.native_selection {
             Some(selected) => {
                 selected.require_terminal()?;
@@ -7636,6 +7688,10 @@ impl Session {
         anyhow::ensure!(
             !self.native_retirement.collected_blocking(),
             "native registry mutation refused during original retirement preparation"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "native registry mutation refused while a collected group deferral owns removals"
         );
         // Resolve singles' fallible program lookup before extracting any
         // ownership. A refused lookup keeps all native handles untouched and
@@ -8011,6 +8067,10 @@ impl Session {
             !self.native_retirement.collected_blocking(),
             "quiescence cannot invalidate an active collected retirement registry"
         );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "quiescence cannot invalidate while a collected group deferral owns removals"
+        );
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         if service_events.is_some() {
             self.ensure_events_consumer()?;
@@ -8079,6 +8139,10 @@ impl Session {
         anyhow::ensure!(
             !self.native_retirement.collected_blocking(),
             "legacy discovery drain cannot invalidate an active collected retirement registry"
+        );
+        anyhow::ensure!(
+            self.deferred_group_slots.is_empty(),
+            "legacy discovery drain cannot invalidate while a collected group deferral owns removals"
         );
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         self.ensure_discovery_consumer()?;

@@ -321,6 +321,10 @@ impl RetainedRetirementInput {
     pub(crate) fn into_removed(self) -> (Vec<Slot>, ResourceLease) {
         (self.removed, self.storage)
     }
+
+    pub(crate) fn removed_is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
 }
 
 impl RetainedRetirementInputRefusal {

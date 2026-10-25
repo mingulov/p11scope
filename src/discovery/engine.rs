@@ -5,9 +5,10 @@
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
     BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementState,
-    CollectedRetirementTicket, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
-    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, RetainedInputMeasure,
-    RetainedRetirementInput, RetirementPoll, RetirementProgress, RetirementTicket, Scope, Session,
+    CollectedRetirementTicket, CounterSnapshot, DeferralProgress, DetachOutcome,
+    DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome,
+    RetainedInputMeasure, RetainedRetirementInput, RetirementPoll, RetirementProgress,
+    RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -2757,6 +2758,15 @@ pub(crate) trait EngineSession {
     ) -> Result<RetirementProgress> {
         bail!("this native leaf has no collected carrier")
     }
+    fn defer_collected_partial_groups(
+        &mut self,
+        _q: Option<&CollectedFinishQ>,
+        _input: &mut Option<RetainedRetirementInput>,
+        _reserve: &SemanticResourceReserver,
+        _work: usize,
+    ) -> Result<DeferralProgress> {
+        bail!("this native leaf has no collected carrier")
+    }
     // T3's carrier predicate; consumed by T4b (G24).
     #[allow(dead_code)]
     fn collected_retirement_is_physical(&self) -> bool {
@@ -2989,6 +2999,17 @@ impl EngineSession for Session {
         work: usize,
     ) -> Result<RetirementProgress> {
         Session::cancel_collected_static_retirement(self, input, ticket, work)
+    }
+
+    fn defer_collected_partial_groups(
+        &mut self,
+        q: Option<&CollectedFinishQ>,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        let q = require_original_q(q)?;
+        Session::defer_collected_partial_groups(self, q, input, reserve, work)
     }
 
     fn collected_retirement_is_physical(&self) -> bool {
@@ -4110,6 +4131,8 @@ struct CollectedGraph {
     ticket: Option<CollectedRetirementTicket>,
     mutated: bool,
     native_cancel_owed: bool,
+    deferral_done: bool,
+    partial_deferred: bool,
     installed: bool,
     install_step: u8,
     install_index: usize,
@@ -4168,6 +4191,8 @@ impl CollectedGraph {
             ticket: None,
             mutated: false,
             native_cancel_owed: false,
+            deferral_done: false,
+            partial_deferred: false,
             installed: false,
             install_step: 0,
             install_index: 0,
@@ -24525,7 +24550,9 @@ impl Engine {
     /// a ticket stores it; `Prepared` advances to NativeBegin. Before the
     /// take, an `Err` cancels once and refuses untouched; after the take,
     /// the ticket cancel runs one credit at a time until it returns the
-    /// input (untouched) or retains it.
+    /// input (untouched) or retains it. The deferral scan runs first: a
+    /// `Split` carries the whole input onward (an empty whole closes
+    /// without a native call) and `NoPartial` passes through.
     fn step_graph_native_prepare(
         &mut self,
         session: &mut dyn EngineSession,
@@ -24533,6 +24560,53 @@ impl Engine {
         reserve: &SemanticResourceReserver,
         graph: &mut CollectedGraph,
     ) -> GraphService {
+        if !graph.deferral_done {
+            if graph.removed.is_some() {
+                match session.defer_collected_partial_groups(q, &mut graph.removed, reserve, 1) {
+                    Ok(DeferralProgress::Yielded) => return Self::graph_idle(false),
+                    Ok(DeferralProgress::Scanning) => return Self::graph_idle(true),
+                    Ok(DeferralProgress::NoPartial(input)) => {
+                        graph.removed = Some(input);
+                        graph.deferral_done = true;
+                        return Self::graph_idle(true);
+                    }
+                    Ok(DeferralProgress::Split { whole, .. }) => {
+                        graph.partial_deferred = true;
+                        graph.deferral_done = true;
+                        if whole.removed_is_empty() {
+                            drop(whole);
+                            graph.removed = None;
+                            graph.verdict = Some(Verdict::Closed);
+                            graph.phase = GraphPhase::Install;
+                            return Self::graph_idle(true);
+                        }
+                        graph.removed = Some(whole);
+                        return Self::graph_idle(true);
+                    }
+                    Err(error) => {
+                        // Before the take: cancel once (result ignored),
+                        // refuse untouched, disclose once.
+                        if graph.removed.is_some() {
+                            let _ = session.cancel_collected_static_retirement(
+                                graph.removed.as_ref(),
+                                None,
+                                1,
+                            );
+                            self.refuse_graph_native_untouched(graph);
+                        } else if graph.ticket.is_some() {
+                            // After the take: the ticket cancel starts next
+                            // credit (one native call per credit).
+                            graph.native_cancel_owed = true;
+                        } else {
+                            // Defensive: taken but unticketed cannot cancel.
+                            self.refuse_graph_native_retained(graph, error.to_string());
+                        }
+                        return Self::graph_idle(true);
+                    }
+                }
+            }
+            graph.deferral_done = true;
+        }
         // Owed cancel after a post-take prepare error: one cancel credit
         // at a time until the release answers.
         if graph.native_cancel_owed {
@@ -24732,6 +24806,12 @@ impl Engine {
             graph.install_invalidated = !graph.facts.invalidated_modules.is_empty()
                 || !graph.facts.invalidated_fallbacks.is_empty();
             graph.installed = true;
+            if graph.partial_deferred {
+                self.mark_partial(
+                    "global native retirement",
+                    "physical close deferred to Session cleanup",
+                );
+            }
             graph.install_step = 1;
             graph.install_index = 0;
             return Self::graph_idle(true);
@@ -27271,6 +27351,20 @@ pub(crate) mod session_fixture {
                 bail!("scripted leaf has no collected carrier");
             };
             fixture.borrow_mut().collected_cancel(input, ticket, work)
+        }
+
+        fn defer_collected_partial_groups(
+            &mut self,
+            q: Option<&CollectedFinishQ>,
+            input: &mut Option<RetainedRetirementInput>,
+            reserve: &SemanticResourceReserver,
+            work: usize,
+        ) -> Result<DeferralProgress> {
+            anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            let Some(fixture) = self.global_retirement.as_ref() else {
+                bail!("scripted leaf has no collected carrier");
+            };
+            fixture.borrow_mut().collected_defer(input, reserve, work)
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {

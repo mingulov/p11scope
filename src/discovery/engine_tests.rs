@@ -47977,13 +47977,81 @@ fn insert_sizing_selection_rows(engine: &mut Engine, views: u32) {
 
 #[test]
 fn collected_finish_partial_multi_keeps_surviving_sibling() {
-    // Two native groups: {0, 1} retires whole, {2, 3} retires only 2.
-    // Sibling 3 stays active and attached; 2 retires logically while its
-    // physical close waits for the Session's terminal detach.
-    let (_guards, mut engine) = engine_with_accepted_providers(4);
+    // Two native groups: one retires whole, the other retires only its
+    // first member. The surviving sibling stays active and attached; the
+    // deferred member retires logically while its physical close waits
+    // for the Session's terminal detach. Synthetic four-view population
+    // in the sizing shape (one table per view): identical provider
+    // binaries would dedup to a single plan slot.
+    const VIEWS: u32 = 4;
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        record_scan_ownership(
+            &mut pins,
+            ProcessViewId(index as u32),
+            *key,
+            &shared_path_text,
+        );
+    }
+    overlay_reback(
+        &mut pins,
+        &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
+    );
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut module = overlay_module(*key);
+            module.view = ProcessViewId(index as u32);
+            module.path.clone_from(&shared_path_text);
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every row must reconcile");
+    assert_eq!(reconciled.len(), VIEWS as usize);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(8192)).unwrap(),
+        ),
+    );
+    assert_eq!(engine.plan.slots.len(), VIEWS as usize);
+    engine.bind_plan_module_ids_for_test();
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
     let mut session = ScriptedSession::default();
     let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
-    assert_eq!(engine.plan.slots.len(), 4);
     let view_of: Vec<ProcessViewId> = engine
         .plan
         .slots
@@ -47998,24 +48066,35 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        4,
+        VIEWS as usize,
         "each slot belongs to its own view: {view_of:?}"
     );
+    let retired: Vec<u32> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| view_of[slot.index as usize].0 < VIEWS - 1)
+        .map(|slot| slot.index)
+        .collect();
+    let survivor = engine
+        .plan
+        .slots
+        .iter()
+        .find(|slot| view_of[slot.index as usize].0 == VIEWS - 1)
+        .map(|slot| slot.index)
+        .unwrap();
+    assert_eq!(retired.len(), 3);
+    let whole = [retired[0], retired[1]];
+    let partial = [retired[2], survivor];
     session
         .global_retirement
         .as_ref()
         .unwrap()
         .borrow_mut()
-        .combine_slot_groups(&[&[0, 1], &[2, 3]]);
-    for view in &view_of[..3] {
-        assert!(
-            engine
-                .retirement_intents
-                .insert(*view, RetirementCause::ExpectedRemoval)
-                .is_none()
-        );
-        assert!(engine.ready_expected_removals.insert(*view));
-    }
+        .combine_slot_groups(&[&whole, &partial]);
+    engine
+        .pending_retirements
+        .extend((0..VIEWS - 1).map(ProcessViewId));
     let mut outcome = engine
         .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
         .unwrap();
@@ -48032,21 +48111,21 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
     assert_eq!(leaf.begins, 1, "begins counts whole groups only");
     assert_eq!(
         leaf.deferred_slots(),
-        &std::collections::BTreeSet::from([2]),
+        &std::collections::BTreeSet::from([retired[2]]),
         "the partial member is deferred"
     );
-    assert!(engine.plan.is_active(3), "the sibling stays active");
-    assert!(leaf.has_slot_link(3), "the sibling stays attached");
+    assert!(engine.plan.is_active(survivor), "the sibling stays active");
+    assert!(leaf.has_slot_link(survivor), "the sibling stays attached");
     assert!(
-        !engine.plan.is_active(2),
+        !engine.plan.is_active(retired[2]),
         "the deferred member retires logically"
     );
     assert!(
-        leaf.has_slot_link(2),
+        leaf.has_slot_link(retired[2]),
         "the deferred member stays attached for terminal close"
     );
-    assert!(!engine.plan.is_active(0) && !engine.plan.is_active(1));
-    assert!(!leaf.has_slot_link(0) && !leaf.has_slot_link(1));
+    assert!(!engine.plan.is_active(whole[0]) && !engine.plan.is_active(whole[1]));
+    assert!(!leaf.has_slot_link(whole[0]) && !leaf.has_slot_link(whole[1]));
     assert_eq!(
         engine
             .counters

@@ -521,6 +521,13 @@ self_test() {
     server_block | python3 -c 'import sys; compile(sys.stdin.read(), "server.py", "exec")' \
         || { echo "embedded server does not compile" >&2; exit 1; }
     entry_block | sh -n || { echo "embedded entry does not parse" >&2; exit 1; }
+    # Each embedded script's first line (right after its heredoc RUN line)
+    # is its shebang: the kernel execs the entry directly (ENTRYPOINT), so a
+    # marker comment above the shebang is an exec format error in the pod.
+    [ "$(sed -n "/<<'SHEOF'\$/{n;p;q}" "$KNATIVE_DOCKERFILE")" = '#!/bin/sh' ] \
+        || { echo "embedded entry does not start with its shebang" >&2; exit 1; }
+    [ "$(sed -n "/<<'PYEOF'\$/{n;p;q}" "$KNATIVE_DOCKERFILE")" = '#!/usr/bin/env python3' ] \
+        || { echo "embedded server does not start with its shebang" >&2; exit 1; }
     # The KService shape: kind.local tag placeholder, scale-to-zero, one request.
     [ "$(grep -c 'image: kind.local/p11scope-knative-holder:KNATIVE_HOLDER_TAG' "$KNATIVE_KSVC")" -eq 1 ] \
         || { echo "ksvc lost its tag placeholder" >&2; exit 1; }

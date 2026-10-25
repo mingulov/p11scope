@@ -129,6 +129,9 @@ mod instance_tests;
 #[cfg(test)]
 mod continuation_guard_tests;
 #[cfg(test)]
+#[path = "attach/joint_cells_native_tests.rs"]
+mod joint_cells;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod native_completion_tests;

@@ -24,12 +24,24 @@ CMDLINE_BYTES = b"fixture\0"
 class ScriptedProc:
     """Serve a scripted open() sequence, then plausible live content."""
 
-    def __init__(self, script):
+    def __init__(self, script, task_script=None):
         self.script = list(script)
+        self.task_script = list(task_script) if task_script is not None else []
         self.calls = []
 
     def opened(self, path, mode):
         self.calls.append(path)
+        if "/task/" in path:
+            if self.task_script:
+                payload = self.task_script.pop(0)
+                if isinstance(payload, Exception):
+                    raise payload
+                return io.BytesIO(payload)
+            try:
+                tid = int(path[: -len("/stat")].rsplit("/", 1)[1])
+            except (IndexError, ValueError):
+                tid = 41
+            return io.BytesIO(stat_bytes(tid, state="Z"))
         if self.script:
             payload = self.script.pop(0)
             if isinstance(payload, Exception):
@@ -52,12 +64,26 @@ class DyingMemberSnapshotTests(unittest.TestCase):
         ).read_text()
         cls.source = compile(source, "scripts/lane-lib-oracle-5:oracle", "exec")
 
-    def run_oracle(self, pids, script):
-        proc = ScriptedProc(script)
+    def run_oracle(self, pids, script, tasks=None, task_script=None):
+        proc = ScriptedProc(script, task_script)
         output = io.StringIO()
+        task_map = tasks if tasks is not None else {pid: [pid] for pid in pids}
+
+        def fake_glob(pattern):
+            if pattern == "/proc/[0-9]*":
+                return [f"/proc/{pid}" for pid in pids]
+            if "/task/" in pattern:
+                try:
+                    pid = int(pattern.split("/")[2])
+                except (IndexError, ValueError):
+                    return []
+                tids = task_map.get(pid, [pid])
+                return [f"/proc/{pid}/task/{tid}/stat" for tid in tids]
+            return []
+
         with (
             patch("sys.argv", ["snapshot", "41"]),
-            patch("glob.glob", return_value=[f"/proc/{pid}" for pid in pids]),
+            patch("glob.glob", side_effect=fake_glob),
             patch("builtins.open", side_effect=proc.opened),
             contextlib.redirect_stdout(output),
         ):
@@ -170,6 +196,45 @@ class DyingMemberSnapshotTests(unittest.TestCase):
                 LIVE_STAT,
                 FileNotFoundError(2, "No such file or directory"),
                 stat_bytes(41, starttime=200),
+            ],
+        )
+        self.assertEqual(status, "failed")
+        self.assertIn("cannot close process-group member 41", message)
+
+    def test_tgid_zombie_with_live_thread_still_fails(self):
+        status, message = self.run_oracle(
+            [41],
+            [
+                ZOMBIE_STAT,
+                FileNotFoundError(2, "No such file or directory"),
+                ZOMBIE_STAT,
+            ],
+            tasks={41: [41, 82]},
+            task_script=[stat_bytes(41, state="Z"), stat_bytes(82, state="S")],
+        )
+        self.assertEqual(status, "failed")
+        self.assertIn("cannot close process-group member 41", message)
+
+    def test_task_scan_error_still_fails(self):
+        status, message = self.run_oracle(
+            [41],
+            [
+                ZOMBIE_STAT,
+                FileNotFoundError(2, "No such file or directory"),
+                ZOMBIE_STAT,
+            ],
+            task_script=[OSError(5, "Input/output error")],
+        )
+        self.assertEqual(status, "failed")
+        self.assertIn("cannot close process-group member 41", message)
+
+    def test_probe_rejects_reuse_by_zombie(self):
+        status, message = self.run_oracle(
+            [41],
+            [
+                LIVE_STAT,
+                FileNotFoundError(2, "No such file or directory"),
+                stat_bytes(41, state="Z", starttime=200),
             ],
         )
         self.assertEqual(status, "failed")

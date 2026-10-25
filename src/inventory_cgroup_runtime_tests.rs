@@ -49,6 +49,7 @@ impl<'a> ObservedDriver<'a> {
                 semantic: None,
                 semantic_staged: false,
                 seated_summary: None,
+                second_signal: None,
                 lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
                 completion_source: None,
                 pending_install: None,

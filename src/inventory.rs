@@ -1346,6 +1346,7 @@ fn run_with_terminal_budget(
         semantic,
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -1922,6 +1923,11 @@ struct ClassicDriver<'a> {
     /// begun-but-unfinished Joint finish to the typed exit instead of
     /// re-running the stop path.
     stop_requested: bool,
+    /// The second operator signal probe: when it fires at the lane
+    /// stop, a begun-but-unfinished Joint finish escalates to the
+    /// typed exit instead of stepping on. `None` without a signal
+    /// source.
+    second_signal: Option<&'a dyn Fn() -> bool>,
     /// The first Joint finish error, kept for the retained
     /// consumer's exit (§6.4): the abandon reason, the wound-down
     /// refusal, or the escalation note. Never overwritten by later
@@ -1996,6 +2002,7 @@ pub(crate) fn classic_semantic_tick_for_test(
         semantic: Some(lane),
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2055,6 +2062,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         semantic: Some(lane),
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2152,6 +2160,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         semantic: Some(lane),
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2244,6 +2253,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         semantic: None,
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: Some(Box::new(crate::attach::NativeCompletionMinter::new())),
         pending_install: None,
@@ -5399,6 +5409,7 @@ fn run_dashboard(
         semantic,
         semantic_staged: false,
         seated_summary: None,
+        second_signal: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -9777,6 +9788,7 @@ mod tests {
                 semantic: Some(scene.lane),
                 semantic_staged: false,
                 seated_summary: None,
+                second_signal: None,
                 lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
                 completion_source: None,
                 pending_install: None,
@@ -9887,6 +9899,7 @@ mod tests {
                 semantic: Some(scene.lane),
                 semantic_staged: true,
                 seated_summary: None,
+                second_signal: None,
                 lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
                 completion_source: None,
                 pending_install: None,
@@ -11433,6 +11446,7 @@ mod promotion_driver_tests {
             semantic: None,
             semantic_staged: false,
             seated_summary: None,
+            second_signal: None,
             lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
             completion_source: None,
             pending_install: None,
@@ -14351,6 +14365,67 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn second_signal_at_lane_stop_escalates_the_begun_finish() {
+        // The second operator signal reaches the driver at the lane
+        // stop: a begun-but-unfinished Joint finish escalates to the
+        // typed exit instead of stepping on.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.second_signal = Some(&|| true);
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second signal escalates the begun finish"
+        );
+        assert!(driver.semantic.is_none(), "the escalation holds its lane");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("second stop during joint finish"),
+            "the escalation keeps its cause"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "joint finish held for exit")
+                .count(),
+            1,
+            "the escalation discloses its hold: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn lane_stop_without_second_signal_steps_the_begun_finish() {
+        // Control: without a second signal the lane stop steps the
+        // begun finish normally instead of escalating.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.second_signal = Some(&|| false);
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "no signal means no escalation"
+        );
+        assert!(driver.semantic.is_some(), "the polling lane is kept");
+        assert!(
+            driver.joint_first_error.is_none(),
+            "no error without escalation"
+        );
+    }
+
+    #[test]
     fn stop_drains_service_without_installing() {
         use crate::attach::selected_detailed::SelectedPreparationFailure;
         let mut coordinator = coordinator();
@@ -14402,6 +14477,7 @@ mod promotion_driver_tests {
             semantic: None,
             semantic_staged: false,
             seated_summary: None,
+            second_signal: None,
             lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
             completion_source: None,
             pending_install: None,

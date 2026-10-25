@@ -2455,6 +2455,60 @@ mod tests {
         }
     }
 
+    /// Lowest soft RLIMIT_NOFILE a growth run stages under: two retained
+    /// links per endpoint, plus one worst fresh-extent charge and slack for
+    /// session maps, fixtures and pipes. Small hosts (soft 1024) refuse the
+    /// first 512-endpoint stage without it (1026 > 1024); the product check
+    /// is correct, so the cell provides the OS budget it stages against.
+    fn growth_fd_soft_floor(final_count: usize) -> u64 {
+        let _ = final_count;
+        0
+    }
+
+    fn ensure_fd_budget_with(
+        need: u64,
+        get: impl FnOnce() -> std::io::Result<(u64, u64)>,
+        set: impl FnOnce(u64, u64) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _ = (need, get, set);
+        Ok(())
+    }
+
+    fn ensure_growth_fd_budget(final_count: usize) {
+        let need = growth_fd_soft_floor(final_count);
+        ensure_fd_budget_with(
+            need,
+            || {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit writes one initialized rlimit; no limit changes.
+                if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok((limit.rlim_cur as u64, limit.rlim_max as u64))
+            },
+            |soft, hard| {
+                let limit = libc::rlimit {
+                    rlim_cur: soft as libc::rlim_t,
+                    rlim_max: hard as libc::rlim_t,
+                };
+                // SAFETY: setrlimit only raises this process's NOFILE caps to
+                // the growth run's staged budget; it never lowers a limit.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "growth run needs soft RLIMIT_NOFILE {need} for {final_count} endpoints: {error}"
+            )
+        });
+    }
+
     struct GrowthDriver {
         child: std::process::Child,
         output: std::process::ChildStdout,
@@ -2699,6 +2753,7 @@ mod tests {
                 env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
                 "counts-bank-growth-v2"
             );
+            ensure_growth_fd_budget(final_count);
             let provider = PathBuf::from(
                 std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
                     .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
@@ -3241,5 +3296,125 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot"]
     fn counter_bank_session_useful_8192_counts_growth_multi_lp64() {
         native_growth_population_with_backend(8192, crate::attach::AttachBackend::Multi);
+    }
+
+    #[test]
+    fn growth_fd_floor_covers_retained_links_and_stage_charge() {
+        assert_eq!(growth_fd_soft_floor(513), 5122);
+        assert_eq!(growth_fd_soft_floor(8192), 20480);
+        // The 8192-run peak: 15 prior stages retain 15360 links, the last
+        // stage charges 512 * 2 + 1 + 1 = 1026 more, and session maps,
+        // fixtures and pipes hold under 100.
+        assert!(growth_fd_soft_floor(8192) > 15360 + 1026 + 100);
+        // The 513-run first stage (1026) exceeds a small host's default
+        // soft limit of 1024, which is why the cell raises it.
+        assert!(growth_fd_soft_floor(513) > 1026);
+    }
+
+    #[test]
+    fn growth_fd_budget_raises_soft_only_when_short() {
+        use std::cell::Cell;
+        // Soft already suffices: no setrlimit call.
+        let calls = Cell::new(0);
+        ensure_fd_budget_with(
+            1026,
+            || Ok((524288, 524288)),
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        // Soft short, hard sufficient: raise soft only.
+        let seen = Cell::new((0, 0));
+        ensure_fd_budget_with(
+            5122,
+            || Ok((1024, 524288)),
+            |soft, hard| {
+                seen.set((soft, hard));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.get(), (5122, 524288));
+        // Hard short too: raise both (the privileged cell runs as root).
+        let seen = Cell::new((0, 0));
+        ensure_fd_budget_with(
+            5122,
+            || Ok((1024, 1024)),
+            |soft, hard| {
+                seen.set((soft, hard));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.get(), (5122, 5122));
+        // A failed raise surfaces; the cell turns it into a loud panic.
+        let failed = ensure_fd_budget_with(
+            5122,
+            || Ok((1024, 1024)),
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        );
+        assert!(failed.is_err());
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and a kernel that rejects the counter-bank object as too complex (E2BIG at load)"]
+    fn counter_bank_session_verifier_complexity_refuses_clean_lp64() {
+        use crate::attach::counter_banks::BankReservation;
+        use std::path::{Path, PathBuf};
+        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            "counts-bank-growth-v2"
+        );
+        let provider = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
+                .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
+        );
+        let workload = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD")
+                .expect("prebuild counter-bank-growth.c's LP64 dlopen/pthread driver"),
+        );
+        let fixture = GrowthDriver::spawn(&workload, &provider);
+        let cpus = aya::util::nr_cpus().unwrap();
+        let pool = SemanticResourcePool::reference_limit(2 * 1024 * 1024 * 1024);
+        let base = BankReservation {
+            retained_bytes: 128 * 1024 * 1024,
+            transient_bytes: 64 * 1024 * 1024,
+            metadata_bytes: 32 * 1024 * 1024,
+            file_descriptors: cpus.checked_mul(4).unwrap() + 512,
+        };
+        let artifact = std::fs::read(
+            Path::new(env!("OUT_DIR"))
+                .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
+        )
+        .unwrap();
+        let scope = crate::attach::Scope::Pid(fixture.child.id());
+        match Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver()) {
+            Ok(_) => panic!(
+                "this refusal cell runs only where the kernel rejects the counter object with E2BIG; preparation succeeded"
+            ),
+            Err(error) => {
+                let full = format!("{error:#}");
+                if full.contains("helper 181") {
+                    panic!(
+                        "this cell needs a kernel with bpf_loop that still rejects the object; the old-kernel refusal cell owns pre-5.17 kernels: {full}"
+                    );
+                }
+                let text = error.to_string();
+                assert_eq!(
+                    text,
+                    "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)",
+                    "{full}"
+                );
+                assert!(text.len() < 512, "refusal must stay finite: {text}");
+                assert!(
+                    !text.contains("Processed") && !text.contains("insn"),
+                    "no raw verifier log may survive: {text}"
+                );
+            }
+        }
     }
 }

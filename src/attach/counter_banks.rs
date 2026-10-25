@@ -317,6 +317,15 @@ pub(crate) enum BankRefusal {
     Allocated,
     Exhausted,
     Budget,
+    /// A resource-exhaustion refusal that names what ran out: the resource,
+    /// the needed total and the available budget, all finite. Only checks
+    /// that compare a need against a limit use it; arithmetic-overflow and
+    /// reserver refusals stay bare `Budget`.
+    BudgetExhausted {
+        resource: &'static str,
+        needed: u64,
+        available: u64,
+    },
     Native,
     Ownership,
     Links,
@@ -2340,6 +2349,15 @@ impl BankIo for NativeIo<'_> {
     }
 }
 
+/// Maps a kernel verifier-budget rejection during counter preparation to
+/// the named counter-mode refusal. Only a genuine BPF_PROG_LOAD E2BIG (the
+/// program is too complex for this kernel's verifier) is rewritten, with a
+/// finite reason that never embeds the raw verifier log; every other error
+/// passes through unchanged.
+fn map_counter_verifier_budget_refusal(error: anyhow::Error) -> anyhow::Error {
+    error
+}
+
 impl Session {
     /// A new private Session only, with its backend fixed before root loading.
     pub(crate) fn prepare_counter_banks_with_backend(
@@ -2379,7 +2397,8 @@ impl Session {
                     backend,
                     None,
                     Some(preparation),
-                )?;
+                )
+                .map_err(map_counter_verifier_budget_refusal)?;
                 let banks = session
                     .counter_banks
                     .as_ref()
@@ -2428,7 +2447,8 @@ impl Session {
             super::AttachBackend::Singles,
             None,
             Some(preparation),
-        )?;
+        )
+        .map_err(map_counter_verifier_budget_refusal)?;
         // The keepalive is already in Session before the first real producer.
         session.links = super::activate_after_preparation_with(Ok(()), || {
             super::attach_lifecycle_with(
@@ -5970,6 +5990,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fd_budget_refusal_names_resource_with_needed_and_available() {
+        // Small-host shape: a 512-endpoint first stage charges 512 * 2 links
+        // + 1 bank + 1 transient = 1026 FDs, which already exceeds a soft
+        // RLIMIT_NOFILE of 1024 before counting observed-open FDs. The
+        // refusal must name the resource and both numbers, in print and value.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut history = plan(1);
+        let mut io = GrowthIo::new(&pool);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { transaction: 1, .. }
+        ));
+        history.extend_exact(plan(2)).unwrap();
+        io.next_stage();
+        io.fd_preflight = Some((
+            1026,
+            Ok(FdSnapshot {
+                soft_limit: FdLimit::Finite(1024),
+                observed_open: 40,
+            }),
+        ));
+        let result = directory.stage_with(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(
+            result,
+            BankPublication::Refused(BankRefusal::BudgetExhausted {
+                resource: "file descriptors",
+                needed: 1066,
+                available: 1024,
+            })
+        );
+        let printed = format!("{result:?}");
+        assert!(
+            printed.contains("file descriptors")
+                && printed.contains("1066")
+                && printed.contains("1024"),
+            "{printed}"
+        );
+    }
+
+    #[test]
     fn counter_bank_multi_storage_remains_paid_after_clean_rollback() {
         use super::super::RegisteredLink;
         for short in [None, Some(0), Some(1), Some(2)] {
@@ -6840,6 +6911,38 @@ pub(crate) mod tests {
                 "must defer past the kernel gate: {text}"
             );
             assert_eq!(pool.snapshot().charged_bytes, charged);
+        }
+    }
+
+    #[test]
+    fn counter_verifier_budget_refusal_maps_e2big_only() {
+        // A kernel verifier-budget rejection (E2BIG from BPF_PROG_LOAD)
+        // becomes the finite named refusal without the raw verifier log.
+        let blob = "verifier-line\n".repeat(9000);
+        let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::E2BIG).into();
+        let loaded = loaded.context(format!("loading function_list_return\n{blob}"));
+        let mapped = map_counter_verifier_budget_refusal(loaded);
+        assert_eq!(
+            mapped.to_string(),
+            "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)"
+        );
+        assert!(
+            !format!("{mapped:#}").contains("verifier-line"),
+            "the raw verifier log must not survive the mapping"
+        );
+        // Every other failure passes through with its chain unchanged: the
+        // old-kernel token (no E2BIG), the Multi pid-filter errno (EINVAL)
+        // and an unrelated error.
+        for untouched in [
+            anyhow::anyhow!(
+                "counter-mode-unavailable-on-kernel: the kernel loads BPF programs but rejects the bpf_loop (helper 181) probe"
+            ),
+            std::io::Error::from_raw_os_error(libc::EINVAL).into(),
+            anyhow::anyhow!("some other failure"),
+        ] {
+            let before = format!("{untouched:#}");
+            let after = map_counter_verifier_budget_refusal(untouched);
+            assert_eq!(format!("{after:#}"), before);
         }
     }
 

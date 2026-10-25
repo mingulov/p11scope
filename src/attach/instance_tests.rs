@@ -2231,25 +2231,68 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     } = spawn_cmd_target()?;
     let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
     let mut harness = Harness::start(&plan, target.pid(), &pins)?;
-    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
-        target.command(b'c')?;
-        single_join(&pump_until(harness, target, 1)?)
+    let call = |harness: &mut Harness, target: &mut Target, which: &str| -> Result<InstanceId> {
+        target
+            .command(b'c')
+            .with_context(|| format!("punch-hole call {which}: fixture did not answer"))?;
+        let routed = pump_until(&mut *harness, target, 1)?;
+        single_join(&routed).with_context(|| {
+            let counters = harness.session.instance_maps().counters();
+            format!(
+                "punch-hole call {which} did not join \
+                 (routed={routed:?} counters={counters:?} scans={:?})",
+                harness.scan
+            )
+        })
     };
-    let a = call(&mut harness, &mut target)?;
-    let before = harness.session.instance_maps().counters()?.local_bumps;
+    let epochs_of = |harness: &Harness, target: &Target| -> Result<(u64, u64, u64, u64, u64)> {
+        let reading = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        Ok((
+            reading.local,
+            reading.global,
+            reading.fault,
+            reading.sticky,
+            reading.record_flags,
+        ))
+    };
+    let a = call(&mut harness, &mut target, "a (before the hole)")?;
+    let before = harness.session.instance_maps().counters()?;
+    let epochs_before = epochs_of(&harness, &target)?;
     let holed = target.command(b'h')?;
     ensure!(holed == "PHOLE", "{holed}");
-    let hole_bumps = harness.session.instance_maps().counters()?.local_bumps - before;
+    let after_hole = harness.session.instance_maps().counters()?;
+    let epochs_after = epochs_of(&harness, &target)?;
+    let hole_bumps = after_hole.local_bumps - before.local_bumps;
+    eprintln!(
+        "T3A_PHOLE_DIAG counters_before={before:?} counters_after={after_hole:?} \
+         target_local={}->{} target_global={}->{} fault={}->{} sticky={}->{} flags={}->{} \
+         scans={:?}",
+        epochs_before.0,
+        epochs_after.0,
+        epochs_before.1,
+        epochs_after.1,
+        epochs_before.2,
+        epochs_after.2,
+        epochs_before.3,
+        epochs_after.3,
+        epochs_before.4,
+        epochs_after.4,
+        harness.scan
+    );
     ensure!(
         hole_bumps >= 1,
         "punch-hole did not reach uprobe_munmap (hook gap?)"
     );
-    let b = call(&mut harness, &mut target)?;
+    let b = call(&mut harness, &mut target, "b (after the hole)")?;
     ensure!(b != a, "punch-hole kept the instance");
     let counters = harness.session.instance_maps().counters()?;
     eprintln!(
-        "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} scans={:?}",
-        harness.scan
+        "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} \
+         target_local={}->{} target_global={}->{} scans={:?}",
+        epochs_before.0, epochs_after.0, epochs_before.1, epochs_after.1, harness.scan
     );
     ensure!(harness.false_joins().is_empty());
     ensure!(counters.faults == 0 && harness.misses == 0);

@@ -184,6 +184,8 @@ self_test() {
         || { echo "oracle call lost --b-pre-round2-pid" >&2; exit 1; }
     grep -q 'release_gate "\$PID_B3" "\$B3_GAT[E]"' "$0" \
         || { echo "round-2 twin gate is not released from the host" >&2; exit 1; }
+    grep -q 'round2-passes-at-ma[p]=' "$0" \
+        || { echo "the copy-up no longer waits for the spans to scan the round-2 twin" >&2; exit 1; }
     d1_help_self_test
     d1_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -1052,6 +1054,15 @@ maps_provider "$PID_B3" || fail_cell "round-2 twin does not map the provider"
 STAT_B3=$(prov_stat "$PID_B3") || fail_cell "cannot stat the round-2 twin's provider"
 [ "$STAT_B3" = "$STAT_B_PRE" ] || fail_cell "round-2 twin does not map the lower copy (stat $STAT_B3, want $STAT_B_PRE)"
 fact "pid-b3=$PID_B3 stat-b3=$STAT_B3"
+# The spanning captures must see the twin on the lower copy before the
+# copy-up; a twin first scanned after it never had the old module (dev run 5).
+R2M_K0=$(pass_count span-kernel)
+R2M_U0=$(pass_count span-userspace)
+fact "round2-passes-at-map=$R2M_K0,$R2M_U0"
+wait_passes span-kernel "$PID_SPAN_K" "$((R2M_K0 + 2))" \
+    || fail_cell "spanning kernel capture ran fewer than two passes after the round-2 twin mapped"
+wait_passes span-userspace "$PID_SPAN_U" "$((R2M_U0 + 2))" \
+    || fail_cell "spanning userspace capture ran fewer than two passes after the round-2 twin mapped"
 
 say "=== same-bytes copy-up in B only (OQ5) ==="
 STAT_B_COPY_PRE=$(prov_stat "$PID_B_PRE") || fail_cell "cannot re-stat B provider"

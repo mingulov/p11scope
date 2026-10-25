@@ -324,6 +324,21 @@ LEDGER one" PRIVATE=0 PATH="$stub:$PATH" wait_docker_log_count c '^LEDGER ' 2 1 
         echo "v1 cgroup accepted" >&2
         exit 1
     fi
+    # Overlay upper directory: the root mount's upperdir only.
+    printf '%s\n' \
+        '612 540 0:140 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/s/2/fs:/s/1/fs,upperdir=/s/9/fs,workdir=/s/9/work' \
+        '613 612 0:141 / /proc rw - proc proc rw' > "$stub/mi-overlay"
+    got=$(D1_MOUNTINFO_FILE=$stub/mi-overlay upper_of_pid 1234) \
+        || { echo "overlay upperdir refused" >&2; exit 1; }
+    [ "$got" = "/s/9/fs" ] || { echo "upperdir resolved to $got" >&2; exit 1; }
+    printf '%s\n' '45 1 0:35 /@ / rw,noatime shared:1 - btrfs /dev/sda3 rw,upperdir=/x' > "$stub/mi-btrfs"
+    printf '%s\n' '612 540 0:140 / / rw - overlay overlay ro,lowerdir=/s/2/fs:/s/1/fs' > "$stub/mi-ro"
+    for mi in mi-btrfs mi-ro; do
+        if D1_MOUNTINFO_FILE=$stub/$mi upper_of_pid 1234 >/dev/null 2>&1; then
+            echo "upperdir accepted from $mi" >&2
+            exit 1
+        fi
+    done
     rm -rf "$stub"
     trap - EXIT
 }
@@ -523,6 +538,41 @@ container_pid() {
 
 prov_stat() {
     sudo -n stat -c '%d:%i %s' "/proc/$1/root$PROVIDER_PATH"
+}
+
+# Overlay upper directory of a container's root mount. The overlay view keeps
+# the origin inode number across copy-up when all layers share one
+# filesystem, so copy-up is proven in the upper layer itself.
+# D1_MOUNTINFO_FILE is a self-test hook.
+upper_of_pid() {
+    if [ -n "${D1_MOUNTINFO_FILE-}" ]; then
+        info=$(cat "$D1_MOUNTINFO_FILE") || return 1
+    else
+        info=$(sudo -n cat "/proc/$1/mountinfo") || return 1
+    fi
+    up=$(printf '%s\n' "$info" | awk '
+        $5 == "/" {
+            for (i = 7; i <= NF && $i != "-"; i++) ;
+            if ($(i + 1) != "overlay") { exit }
+            n = split($(i + 3), opt, ",")
+            for (j = 1; j <= n; j++) {
+                if (opt[j] ~ /^upperdir=\//) { print substr(opt[j], 10); exit }
+            }
+        }')
+    [ -n "$up" ] || { echo "no overlay upperdir on the root mount of pid $1" >&2; return 1; }
+    printf '%s\n' "$up"
+}
+
+upper_has() {
+    sudo -n test -e "$1$PROVIDER_PATH"
+}
+
+upper_stat() {
+    sudo -n stat -c '%d:%i %s' "$1$PROVIDER_PATH"
+}
+
+upper_sha() {
+    sudo -n sha256sum "$1$PROVIDER_PATH" | awk '{print $1}'
 }
 
 prov_sha() {
@@ -809,6 +859,12 @@ SHA_B_PRE=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider"
 fact "stat-a-pre=$STAT_A_PRE sha-a-pre=$SHA_A_PRE"
 fact "stat-b-pre=$STAT_B_PRE sha-b-pre=$SHA_B_PRE"
 [ "$SHA_A_PRE" = "$SHA_B_PRE" ] || fail_cell "A and B provider bytes differ pre-copy-up"
+UPPER_A=$(upper_of_pid "$PID_A") || fail_cell "no overlay upper layer for $D1_A"
+UPPER_B=$(upper_of_pid "$PID_B_PRE") || fail_cell "no overlay upper layer for $D1_B"
+fact "upper-a=$UPPER_A upper-b=$UPPER_B"
+[ "$UPPER_A" != "$UPPER_B" ] || fail_cell "A and B share one upper layer"
+if upper_has "$UPPER_A"; then fail_cell "A provider is already in its upper layer"; fi
+if upper_has "$UPPER_B"; then fail_cell "B provider is already in its upper layer"; fi
 
 say "=== pre-copy-up captures ==="
 run_inventory kernel "$WORK/d1-pre-kernel.json" || fail_cell "pre kernel inventory failed"
@@ -842,7 +898,12 @@ STAT_B_POST=$(prov_stat "$PID_B_PRE") || fail_cell "cannot stat B provider after
 SHA_B_POST=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider after copy-up"
 STAT_A_CHECK=$(prov_stat "$PID_A") || fail_cell "cannot re-stat A provider"
 fact "stat-b-copy-pre=$STAT_B_COPY_PRE stat-b-post=$STAT_B_POST sha-b-post=$SHA_B_POST stat-a-check=$STAT_A_CHECK"
-[ "$STAT_B_COPY_PRE" != "$STAT_B_POST" ] || fail_cell "copy-up changed no inode (stat $STAT_B_POST)"
+upper_has "$UPPER_B" || fail_cell "copy-up left no provider in B's upper layer"
+if upper_has "$UPPER_A"; then fail_cell "A provider was copied up during B copy-up"; fi
+UPPER_STAT_B=$(upper_stat "$UPPER_B") || fail_cell "cannot stat B upper provider"
+UPPER_SHA_B=$(upper_sha "$UPPER_B") || fail_cell "cannot hash B upper provider"
+fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
+[ "$UPPER_SHA_B" = "$SHA_B_PRE" ] || fail_cell "B upper provider bytes differ (not same-bytes)"
 [ "$SHA_B_POST" = "$SHA_B_PRE" ] || fail_cell "copy-up changed bytes (not same-bytes)"
 [ "$STAT_A_CHECK" = "$STAT_A_PRE" ] || fail_cell "A provider moved during B copy-up"
 
@@ -859,8 +920,11 @@ PID_B_POST=$(container_pid "$D1_B") || fail_cell "no pid for restarted $D1_B"
 CG_B_POST=$(cg_of_pid "$PID_B_POST") || fail_cell "no cgroup for restarted $D1_B"
 STAT_B_RESTART=$(prov_stat "$PID_B_POST") || fail_cell "cannot stat restarted B provider"
 SHA_B_RESTART=$(prov_sha "$PID_B_POST") || fail_cell "cannot hash restarted B provider"
-fact "pid-b-post=$PID_B_POST cgroup-b-post=$CG_B_POST stat-b-restart=$STAT_B_RESTART sha-b-restart=$SHA_B_RESTART"
-[ "$STAT_B_RESTART" = "$STAT_B_POST" ] || fail_cell "restarted B maps $STAT_B_RESTART, want upper $STAT_B_POST"
+UPPER_B_RESTART=$(upper_of_pid "$PID_B_POST") || fail_cell "no overlay upper layer for restarted $D1_B"
+UPPER_STAT_B_RESTART=$(upper_stat "$UPPER_B_RESTART") || fail_cell "cannot stat restarted B upper provider"
+fact "pid-b-post=$PID_B_POST cgroup-b-post=$CG_B_POST stat-b-restart=$STAT_B_RESTART sha-b-restart=$SHA_B_RESTART upper-b-restart=$UPPER_B_RESTART upper-stat-b-restart=$UPPER_STAT_B_RESTART"
+[ "$UPPER_B_RESTART" = "$UPPER_B" ] || fail_cell "restarted B has upper layer $UPPER_B_RESTART, want $UPPER_B"
+[ "$UPPER_STAT_B_RESTART" = "$UPPER_STAT_B" ] || fail_cell "restarted B upper provider is $UPPER_STAT_B_RESTART, want $UPPER_STAT_B"
 [ "$SHA_B_RESTART" = "$SHA_B_PRE" ] || fail_cell "restarted B bytes differ"
 
 say "=== post-copy-up captures ==="

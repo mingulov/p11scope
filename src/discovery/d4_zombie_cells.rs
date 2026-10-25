@@ -1,23 +1,25 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! D4 zombie cells: leader-zombie groups with one live survivor. Ordinary
+//! D4 zombie cells: leader-zombie groups with live survivors. Ordinary
 //! twins pin the sweep-seam classification (a group without a live member
 //! stays exited; a live survivor prepares through retained-member custody
-//! without disturbing the shared census); the ignored twin asserts
-//! backend parity for collision/data-only zombie mappings on Btrfs.
+//! without disturbing the shared census; two survivors mint no member);
+//! the ignored twin asserts backend parity for collision/data-only zombie
+//! mappings on Btrfs.
 
 use super::*;
 use std::time::{Duration, Instant};
 
 /// A thread group whose leader is an unreaped zombie with one live
-/// survivor. Built with raw syscalls only (fork-safe): the forked child
-/// raw-clones a survivor thread into its group on the COW-inherited
-/// stack, then the child's main exits its own thread via raw `exit(2)`.
-/// Killed and reaped on drop. The survivor shares the child's frozen
-/// post-fork mappings, so its maps stay byte-stable for like-for-like
-/// reads.
+/// survivor (`spawn`) or two (`spawn_two`). Built with raw syscalls
+/// only (fork-safe): the forked child raw-clones each survivor thread
+/// into its group on a COW-inherited stack, then the child's main
+/// exits its own thread via raw `exit(2)`. Killed and reaped on drop.
+/// The survivors share the child's frozen post-fork mappings, so their
+/// maps stay byte-stable for like-for-like reads.
 struct ZombieLeaderGroup {
     tgid: u32,
     survivor: u32,
+    second: Option<u32>,
 }
 
 /// The raw-clone survivor: reports its TID over the pipe (whose write end
@@ -52,17 +54,43 @@ extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
 
 impl ZombieLeaderGroup {
     fn spawn() -> Self {
-        let mut stack = Box::new([0u8; 65536]);
-        // The heap top is 16-aligned (aligned base, multiple-of-16 size).
-        let stack_top = stack.as_mut_ptr_range().end as *mut std::ffi::c_void;
-        let (mut pipes, mut tid_bytes) = ([0; 2], [0u8; 4]);
+        let (tgid, survivors) = Self::spawn_inner(1);
+        Self {
+            tgid,
+            survivor: survivors[0],
+            second: None,
+        }
+    }
+
+    /// A zombie leader with two live survivors: the ambiguous side of
+    /// the exactly-one rule, which mints no member.
+    fn spawn_two() -> Self {
+        let (tgid, survivors) = Self::spawn_inner(2);
+        Self {
+            tgid,
+            survivor: survivors[0],
+            second: Some(survivors[1]),
+        }
+    }
+
+    /// Fork a child that raw-clones `count` (1 or 2) survivors, then
+    /// exits its main thread; collect each survivor's reported TID.
+    fn spawn_inner(count: usize) -> (u32, Vec<u32>) {
+        assert!(count == 1 || count == 2, "one or two survivors");
+        let mut stacks = [Box::new([0u8; 65536]), Box::new([0u8; 65536])];
+        // Each heap top is 16-aligned (aligned base, multiple-of-16 size).
+        let tops = [
+            stacks[0].as_mut_ptr_range().end as *mut std::ffi::c_void,
+            stacks[1].as_mut_ptr_range().end as *mut std::ffi::c_void,
+        ];
+        let (mut pipes, mut tid_bytes) = ([0; 2], [0u8; 8]);
         // SAFETY: two valid two-element arrays for pipe2.
         assert_eq!(
             unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
         // SAFETY: the child only makes raw syscalls (close, clone, exit) on
-        // the COW-inherited stack and pipe; no allocator, no pthread, no locks.
+        // the COW-inherited stacks and pipe; no allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -74,16 +102,18 @@ impl ZombieLeaderGroup {
                     | libc::CLONE_SIGHAND
                     | libc::CLONE_THREAD
                     | libc::CLONE_SYSVSEM;
-                let cloned = libc::clone(
-                    clone_survivor_main,
-                    stack_top,
-                    FLAGS,
-                    pipes[1] as isize as *mut std::ffi::c_void,
-                );
-                if cloned < 0 {
-                    libc::_exit(1);
+                for index in 0..count {
+                    let cloned = libc::clone(
+                        clone_survivor_main,
+                        tops[index],
+                        FLAGS,
+                        pipes[1] as isize as *mut std::ffi::c_void,
+                    );
+                    if cloned < 0 {
+                        libc::_exit(1);
+                    }
                 }
-                // The main thread exits alone; the survivor keeps the group.
+                // The main thread exits alone; the survivors keep the group.
                 libc::syscall(libc::SYS_exit, 0);
                 libc::_exit(0);
             }
@@ -93,14 +123,17 @@ impl ZombieLeaderGroup {
         unsafe {
             libc::close(pipes[1]);
         }
+        // Each survivor writes its 4-byte TID in one small pipe write,
+        // so the bytes split into intact TIDs in either order.
+        let want = 4 * count;
         let mut done = 0;
-        while done < tid_bytes.len() {
+        while done < want {
             // SAFETY: reading into a valid stack buffer.
             let got = unsafe {
                 libc::read(
                     pipes[0],
                     tid_bytes.as_mut_ptr().add(done).cast(),
-                    tid_bytes.len() - done,
+                    want - done,
                 )
             };
             assert!(got > 0, "clone survivor never reported its tid");
@@ -110,10 +143,17 @@ impl ZombieLeaderGroup {
         unsafe {
             libc::close(pipes[0]);
         }
-        Self {
-            tgid: pid as u32,
-            survivor: u32::from_ne_bytes(tid_bytes),
-        }
+        let survivors = (0..count)
+            .map(|index| {
+                u32::from_ne_bytes([
+                    tid_bytes[4 * index],
+                    tid_bytes[4 * index + 1],
+                    tid_bytes[4 * index + 2],
+                    tid_bytes[4 * index + 3],
+                ])
+            })
+            .collect();
+        (pid as u32, survivors)
     }
 
     /// Live task IDs of the group, sorted.
@@ -177,6 +217,35 @@ fn assert_lone_survivor(group: &ZombieLeaderGroup) {
     for task in &tasks {
         assert!(
             *task == group.survivor || *task == group.tgid,
+            "unexpected task {task} in {tasks:?}"
+        );
+    }
+}
+
+/// The group holds exactly two live survivors: both are listed and
+/// every other task entry (if any) is the zombie leader itself, whose
+/// listing is kernel-dependent.
+fn assert_two_survivors(group: &ZombieLeaderGroup) {
+    let second = group.second.expect("a two-survivor group");
+    assert_ne!(group.survivor, group.tgid, "first survivor is a nonleader");
+    assert_ne!(second, group.tgid, "second survivor is a nonleader");
+    assert_ne!(
+        group.survivor, second,
+        "the two survivors are distinct tasks"
+    );
+    let tasks = group.tasks();
+    assert!(
+        tasks.contains(&group.survivor),
+        "first survivor {} listed in {tasks:?}",
+        group.survivor
+    );
+    assert!(
+        tasks.contains(&second),
+        "second survivor {second} listed in {tasks:?}"
+    );
+    for task in &tasks {
+        assert!(
+            *task == group.survivor || *task == second || *task == group.tgid,
             "unexpected task {task} in {tasks:?}"
         );
     }
@@ -265,6 +334,20 @@ fn zombie_group_with_live_survivor_prepares_through_member() {
         member.read_exe_identity().expect("member exe reads"),
         crate::discovery::caller_registry::read_exe_identity(std::process::id())
             .expect("self exe reads")
+    );
+}
+
+#[test]
+fn zombie_group_with_two_live_survivors_stays_exited_at_sweep_seam() {
+    let group = ZombieLeaderGroup::spawn_two();
+    wait_leader_zombie(group.tgid);
+    assert_two_survivors(&group);
+    let mut io = OsConfirmIo::default();
+    let mut budget = CaptureWorkBudget::default();
+    let out = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None);
+    assert!(
+        matches!(out, Err(Confirmation::Exited)),
+        "a zombie group with two live survivors mints no member and stays exited at the seam"
     );
 }
 

@@ -4763,3 +4763,56 @@ fn failed_config_write_invalidates_binding() {
         "the failed write named its target"
     );
 }
+
+#[test]
+fn fd_headroom_member_refusal_resets_target_before_ordinary_run() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, false],
+        outcomes: vec![
+            MemberOutcome::Failure(RunFailure::FdHeadroom),
+            MemberOutcome::Slot,
+        ],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 2);
+    // The refused member run falls back without attempting; the
+    // ordinary run still proves by kernel.
+    assert_userspace_mapped(&out.confirmations[0]);
+    assert_kernel_slot(&out.confirmations[1], Slot(0));
+    assert_eq!(out.attempts, 1, "the refusal is not an attempt");
+    assert!(out.failed_target.is_none(), "no demotion");
+    assert_eq!(out.tids.len(), 2);
+    let (tgid, tid) = out.tids[0].expect("the member run selected by TID");
+    assert!(out.tids[1].is_none(), "the ordinary run selects by scope");
+    // The member write named its target, so the reset below pins a
+    // real installed target rather than a vacuous zero.
+    assert!(
+        out.config_writes.len() >= 2,
+        "install plus the member target write"
+    );
+    assert_eq!(
+        (
+            out.config_writes[1].target_tgid,
+            out.config_writes[1].target_tid
+        ),
+        (tgid, tid),
+        "the member write named its target"
+    );
+    // The refusal reset the target before the ordinary run: the
+    // trailing write zeroes it, so the ordinary run executes under
+    // no member target. Ordinaries add no config write, so the reset
+    // precedes the ordinary run.
+    let last = out.config_writes.last().expect("the install wrote");
+    assert_eq!(
+        (last.target_tgid, last.target_tid),
+        (0, 0),
+        "the trailing config write zeroes the member target"
+    );
+    assert_eq!(
+        out.config_writes.len(),
+        3,
+        "install, member target, then the refusal reset"
+    );
+}

@@ -568,10 +568,11 @@ fn shape(
     Ok(())
 }
 
-/// Selects the stats template for the typed stats view from the read mode
-/// and the aggregate template shape.
-fn stats_view_shape(mode: CounterMode, _stats_shape: CounterMode) -> CounterMode {
-    mode
+/// Selects the stats template for the typed stats view. Bank objects carry
+/// the legacy 24-byte aggregate in every mode; only the bank cells vary with
+/// the read mode, so the view follows the aggregate template, never the mode.
+fn stats_view_shape(_mode: CounterMode, stats_shape: CounterMode) -> CounterMode {
+    stats_shape
 }
 
 impl<'a> NativeSource<'a> {

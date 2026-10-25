@@ -1560,6 +1560,54 @@ fn synthetic_none() -> SweepAttribution {
     SweepAttribution::default()
 }
 
+/// The E3 prototype: the strongest copy-up guard expressible from
+/// already-crossed fields — exact identity, the current join rule.
+fn prototype_copy_up_guard(expected: FileIdentity, mapped: FileIdentity) -> bool {
+    expected == mapped
+}
+
+/// E3 prototype verdict against the Task-5 vectors: the proof boundary
+/// carries (dev, ino) per side; the pin's (size, ctime) never crosses
+/// into FileIdentity or RangeProof; nothing else is captured. The
+/// pre-copy-up lower vector (must allow) and the post-copy-up upper
+/// vector (must refuse) render identically through the real accessors,
+/// so refusing breaks the lower edge and allowing keeps the re-edge:
+/// no pure guard separates them. Any staleness check needs new fields
+/// on the proof boundary plus a ConfirmIo change — outside E3's land
+/// criteria. RED remains, disclosure final.
+#[test]
+fn overlay_copy_up_prototype_guard_cannot_separate() {
+    let vector = |line: &str| OverlayTruth {
+        maps_line: line.into(),
+        map_files_dev: 42,
+        map_files_ino: 7,
+        statfs_magic: p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC,
+        held_fstat: (42, 7),
+        xino_effective: true,
+        xino_auto: "N".into(),
+        map_files_backing: false,
+        xino_off_copy_up_stable: None,
+    };
+    // Pre-copy-up lower (must allow) and post-copy-up upper (must
+    // refuse): the stable overlay inode renders identically on both.
+    let lower = vector("7f2b4c000000-7f2b4c001000 r-xp 00000000 00:2a 7 /merged/lib.so");
+    let upper = vector("7f2b4c000000-7f2b4c001000 r-xp 00000000 00:2a 7 /merged/lib.so");
+    let lower_inputs = (lower.maps_key(), lower.map_files_identity());
+    let upper_inputs = (upper.maps_key(), upper.map_files_identity());
+    assert_eq!(
+        lower_inputs, upper_inputs,
+        "stability: the guard sees identical inputs"
+    );
+    assert!(
+        prototype_copy_up_guard(lower.map_files_identity(), lower.map_files_identity()),
+        "the lower edge must stay allowed"
+    );
+    assert!(
+        prototype_copy_up_guard(upper.map_files_identity(), upper.map_files_identity()),
+        "and so the re-edge stays allowed too: separation impossible"
+    );
+}
+
 fn synthetic_quad_evidence() -> KernelLegEvidence {
     KernelLegEvidence {
         fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
@@ -1608,6 +1656,76 @@ fn privileged_d4_overlay_xino_backend_parity() {
             .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
     }
     eprintln!("D4_OVERLAY lane={lane:?} modes=on,off,same-fs verdict=table");
+}
+
+/// Task 6 copy-up reproducer (lanes B only): the upper mapper after
+/// copy-up must NOT re-edge to the stale lower anchor on the userspace
+/// leg. RED while D-C7-3 stands (the stable overlay inode joins them);
+/// the lower control proves the test sees real edges. Lane A fails
+/// outright (keys differ there, so absence would pass vacuously).
+#[test]
+#[ignore = "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only)"]
+fn overlay_copy_up_userspace_edge_absent() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    if lane != OverlayLane::B {
+        panic!(
+            "OVERLAY-COPY-UP lane: lanes B only (lane-A keys differ, absence would pass vacuously)"
+        );
+    }
+    let work = tempfile::tempdir().unwrap();
+    let fixture = OverlayFixture::mount(work.path(), XinoMode::On).expect("overlay mount");
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xF6u8; 8192]).unwrap();
+    let xino = fixture.xino_verdict("lib.so").expect("xino on effective");
+    let merged = fixture.merged_path("lib.so");
+    // Lower control first: pre-copy-up, the userspace leg edges.
+    let control = SwapChild::spawn(&merged);
+    let c_snap = control.maps();
+    let c_range = (control.address, control.address + 4096);
+    let c_line = find_line(&c_snap, c_range, *b"r-xp").expect("control line");
+    let key = ObjectKey::of(&c_line);
+    let (pins, object) = overlay_pin(&merged, key).expect("pin");
+    let index = overlay_index(key, object, &pins);
+    let userspace = d4_overlay_attribute_pid(control.pid as u32, c_snap, &index);
+    let members: Vec<u32> = userspace.members.iter().map(|member| member.pid).collect();
+    assert_eq!(
+        members,
+        [control.pid as u32],
+        "lower control edges: {userspace:?}"
+    );
+    // Copy up, then map the upper file through the same merged path.
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )
+    .expect("copy-up");
+    let upper = SwapChild::spawn(&merged);
+    let u_snap = upper.maps();
+    let u_range = (upper.address, upper.address + 4096);
+    let u_line = find_line(&u_snap, u_range, *b"r-xp").expect("upper line");
+    // Same key (stable overlay inode): the join under test.
+    assert_eq!(ObjectKey::of(&u_line), key, "post-copy-up key stability");
+    let held = std::fs::File::open(&merged).unwrap();
+    let truth = record_truth(
+        upper.pid as u32,
+        u_range,
+        &held,
+        &fixture.upper_path("lib.so"),
+        xino,
+        None,
+    )
+    .expect("truth");
+    eprintln!(
+        "D4_OVERLAY_COPY_UP lane={lane:?} target-{}",
+        truth_verdict(&truth)
+    );
+    let userspace = d4_overlay_attribute_pid(upper.pid as u32, u_snap, &index);
+    let members: Vec<u32> = userspace.members.iter().map(|member| member.pid).collect();
+    assert!(
+        members.is_empty(),
+        "D-C7-3 stands: upper mapper re-edged to the stale anchor: {userspace:?}"
+    );
 }
 
 /// One ignored run's shared kernel session, generation counter, lane

@@ -822,15 +822,33 @@ pod_ledger_is() {
 # numbering and the runc exec artifacts (src/render.rs observation causes).
 # Either accepted shape passes -- discovered-live with a named pre-attach
 # gap, or absent-with-disclosure -- and every silent shape fails, including
-# an exact count across the attach-time scan limit.
+# an exact count across the attach-time scan limit. The disclosure
+# vocabulary is frozen: an unknown cause fails loudly, never passes as
+# disclosure.
 scan_limit_check() {
     python3 -I - "$1" <<'PY'
 import json, sys
+# Frozen scan-disclosure vocabulary (OQ4 pattern): discovery/slots are the
+# built binary's absent-leg output (K1 negative.json: an idle cgroup with
+# no provider); unprotected_live_windows is the expected live-leg cause
+# (src/render.rs gap_classes, observed-profile-v3.md), PENDING the first
+# live K2 run. Anything else -- loss, failure, future or misspelled cause
+# -- fails loudly for triage from facts.log.
+ALLOWED_SCAN_DISCLOSURE = {
+    "discovery": "K1 negative.json observation causes (built binary)",
+    "slots": "K1 negative.json observation causes (built binary)",
+    "unprotected_live_windows": "src/render.rs gap_classes; PENDING live K2",
+}
+BENIGN_SCAN_CAUSES = {"pid_namespace", "proc_namespace_mismatch", "pid_descendant_gaps"}
 document = json.load(open(sys.argv[1], encoding="utf-8"))
 causes = set(document["evidence"]["gap_classes"]["observation"]["causes"])
 if "pid_namespace" not in causes:
     raise SystemExit("nested capture without its pid_namespace cause")
-disclosure = causes - {"pid_namespace", "proc_namespace_mismatch", "pid_descendant_gaps"}
+unknown = causes - BENIGN_SCAN_CAUSES - set(ALLOWED_SCAN_DISCLOSURE)
+if unknown:
+    raise SystemExit(f"unknown scan cause: {sorted(unknown)} "
+                     f"(frozen disclosure: {sorted(ALLOWED_SCAN_DISCLOSURE)})")
+disclosure = causes - BENIGN_SCAN_CAUSES
 counted = sum(row["calls"] for row in document["functions"] if row["calls"])
 modules = document["capture"]["modules"]
 if not disclosure:

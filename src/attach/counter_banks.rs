@@ -242,6 +242,134 @@ impl BankGeometry {
     }
 }
 
+/// Per-capture kernel map memory cap, default 256 MiB. It covers the fixed
+/// precharge (RV keys, START, STATS) plus every bank. This is kernel map
+/// bytes, not RSS. No CLI override in v0.5.0.
+pub(crate) const COUNTER_MAP_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Fixed kernel map bytes: RV_COUNTS plus START plus STATS, with P possible
+/// CPUs. RV is a preallocated PERCPU_HASH charged like `configured_payload`
+/// for type 5 (key plus aligned value times P, times entries); START is a
+/// plain HASH like type 1; STATS is a PERCPU_ARRAY like type 6. The aggregate
+/// template stays 24 bytes in every mode; only bank cells vary. Growth
+/// constants dominate legacy (RV 4096), which never occurs in production.
+pub(crate) fn counter_fixed_map_bytes(cpus: usize) -> Result<usize, BankRefusal> {
+    if cpus == 0 {
+        return Err(BankRefusal::Topology);
+    }
+    let rv = 16usize
+        .checked_add(8usize.checked_mul(cpus).ok_or(BankRefusal::Budget)?)
+        .and_then(|per| per.checked_mul(65536))
+        .ok_or(BankRefusal::Budget)?;
+    let start = 304usize.checked_mul(16384).ok_or(BankRefusal::Budget)?;
+    let stats = 4usize
+        .checked_add(24usize.checked_mul(cpus).ok_or(BankRefusal::Budget)?)
+        .and_then(|per| per.checked_mul(512))
+        .ok_or(BankRefusal::Budget)?;
+    rv.checked_add(start)
+        .and_then(|total| total.checked_add(stats))
+        .ok_or(BankRefusal::Budget)
+}
+
+/// Per-bank kernel map bytes for a counter mode: 512 cells times the
+/// mode value size times P possible CPUs. This reuses the same
+/// `bank_payload_bytes` the staging charge uses, never a second formula.
+pub(crate) fn counter_bank_map_bytes(
+    mode: CounterMode,
+    cpus: usize,
+) -> Result<usize, BankRefusal> {
+    BankGeometry::checked(mode, 16, 512)?.bank_payload_bytes(cpus)
+}
+
+/// Affordable bank count under the memory cap, capped at the 16-bank
+/// geometry. Zero means the fixed precharge alone exceeds the cap.
+pub(crate) fn counter_affordable_banks(
+    mode: CounterMode,
+    cpus: usize,
+) -> Result<usize, BankRefusal> {
+    let fixed = counter_fixed_map_bytes(cpus)?;
+    let per_bank = counter_bank_map_bytes(mode, cpus)?;
+    if fixed > COUNTER_MAP_MEMORY_LIMIT {
+        return Ok(0);
+    }
+    if per_bank == 0 {
+        return Err(BankRefusal::Budget);
+    }
+    Ok(((COUNTER_MAP_MEMORY_LIMIT - fixed) / per_bank).min(GROWTH_BANKS))
+}
+
+/// Affordable endpoint ceiling under the memory cap: banks times 512.
+pub(crate) fn counter_affordable_endpoints(
+    mode: CounterMode,
+    cpus: usize,
+) -> Result<usize, BankRefusal> {
+    Ok(counter_affordable_banks(mode, cpus)?.checked_mul(512).ok_or(BankRefusal::Budget)?)
+}
+
+/// Growth-gate check for a total bank count: fixed plus banks times
+/// per-bank must fit the cap, else an atomic `BudgetExhausted` refusal
+/// naming the `counter-memory-limit` token with needed and available bytes.
+pub(crate) fn check_counter_map_memory(
+    mode: CounterMode,
+    cpus: usize,
+    total_banks: usize,
+) -> Result<(), BankRefusal> {
+    check_counter_map_memory_for_geometry(
+        BankGeometry::checked(mode, 16, 512)?,
+        cpus,
+        total_banks,
+    )
+}
+
+fn check_counter_map_memory_for_geometry(
+    geometry: BankGeometry,
+    cpus: usize,
+    total_banks: usize,
+) -> Result<(), BankRefusal> {
+    geometry.validate()?;
+    if total_banks > GROWTH_BANKS {
+        return Err(BankRefusal::Shape(BankShapeCause::GeometryDims));
+    }
+    let fixed = counter_fixed_map_bytes(cpus)?;
+    let per_bank = geometry.bank_payload_bytes(cpus)?;
+    let banks_bytes = total_banks
+        .checked_mul(per_bank)
+        .ok_or(BankRefusal::Budget)?;
+    let needed = fixed.checked_add(banks_bytes).ok_or(BankRefusal::Budget)?;
+    if needed > COUNTER_MAP_MEMORY_LIMIT {
+        return Err(BankRefusal::BudgetExhausted {
+            resource: "counter-memory-limit",
+            needed: u64::try_from(needed).map_err(|_| BankRefusal::Budget)?,
+            available: u64::try_from(COUNTER_MAP_MEMORY_LIMIT)
+                .map_err(|_| BankRefusal::Budget)?,
+        });
+    }
+    Ok(())
+}
+
+/// Preflight for a requested endpoint count: refuses with the
+/// `counter-memory-limit` token naming the mode, P, fixed bytes, per-bank
+/// bytes and the affordable endpoint ceiling.
+pub(crate) fn check_counter_endpoints_fit(
+    mode: CounterMode,
+    cpus: usize,
+    endpoints: usize,
+) -> Result<(), String> {
+    let fixed = counter_fixed_map_bytes(cpus)
+        .map_err(|reason| format!("counter-memory-limit: cannot size fixed maps: {reason:?}"))?;
+    let per_bank = counter_bank_map_bytes(mode, cpus)
+        .map_err(|reason| format!("counter-memory-limit: cannot size banks: {reason:?}"))?;
+    let ceiling = counter_affordable_endpoints(mode, cpus)
+        .map_err(|reason| format!("counter-memory-limit: cannot size ceiling: {reason:?}"))?;
+    if endpoints > ceiling {
+        return Err(format!(
+            "counter-memory-limit: mode {} P {cpus} fixed {fixed} bytes per-bank {per_bank} bytes affordable ceiling {ceiling} endpoints (requested {endpoints})",
+            mode.name()
+        ));
+    }
+    Ok(())
+}
+
 /// One private per-mode bank artifact of the default build. The load cell
 /// stages each mode's sixteen inner maps from this table; preparation
 /// selects the same embedded bytes by identity.
@@ -1282,6 +1410,23 @@ impl BankDirectory {
         {
             return BankPublication::Refused(reason);
         }
+        let existing_banks = self.bank_ids.iter().flatten().count();
+        let new_banks = (0..self.geometry.banks as usize)
+            .filter(|&bank| {
+                self.bank_ids.get(bank).copied().flatten().is_none()
+                    && bank >= (extent.first / self.geometry.cells) as usize
+                    && bank <= ((extent.end - 1) / self.geometry.cells) as usize
+            })
+            .count();
+        let total_after = match existing_banks.checked_add(new_banks) {
+            Some(total) => total,
+            None => return BankPublication::Refused(BankRefusal::Budget),
+        };
+        if let Err(reason) =
+            check_counter_map_memory_for_geometry(self.geometry, io.possible_cpus(), total_after)
+        {
+            return BankPublication::Refused(reason);
+        }
         let charge = match reserve.reserve(retained) {
             Ok(charge) => charge,
             Err(_) => return BankPublication::Refused(BankRefusal::Budget),
@@ -1750,6 +1895,8 @@ impl<'a> CounterPreparation<'a> {
             cpus != 0,
             "private counter preparation requires possible CPUs"
         );
+        check_counter_endpoints_fit(geometry.mode(), cpus, 1)
+            .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
         let parsed = aya_obj::Object::parse(object).context("parsing selected counter artifact")?;
         // Parse and validate actual maps/template before common loading can
         // attach lifecycle roots. An emitted token alone grants no shape.

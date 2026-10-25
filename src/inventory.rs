@@ -13077,6 +13077,24 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn reclaim_without_handoff_records_no_take() {
+        // The reclaim spy sits after the take: a stop with no held
+        // handoff records nothing (mutant B — reclaim does nothing —
+        // must be indistinguishable from this only when no handoff
+        // exists; with one, the take must record).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(driver.pending_install.is_none(), "no handoff held");
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.reclaim_calls,
+            Vec::<PromotionEnd>::new(),
+            "no handoff means no take recorded"
+        );
+    }
+
+    #[test]
     fn wind_down_io_threads_spy_records_the_polling_thread() {
         // The OQ-2 "same worker thread" check is only as good as
         // its spy: poll a gated cleanup twice on a worker thread

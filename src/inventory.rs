@@ -565,8 +565,11 @@ pub(crate) fn start_event_log_guarded<Source: ProcessSource>(
     coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
     started_ns: u64,
-    _pending: bool,
+    pending: bool,
 ) -> Option<anyhow::Error> {
+    if pending {
+        return None;
+    }
     stream.writer.as_ref()?;
     let prologue = Presentation::capture(coordinator, scope_label, started_ns, started_ns, 0);
     stream
@@ -1348,6 +1351,16 @@ fn run_with_terminal_budget(
         (_, error) => error,
     };
     let mut stream_state = StreamState::new();
+    // The opening prior for pending views and the final: the same
+    // pass-zero read as the prologue, so a final always has a prior
+    // even when no pass completed.
+    stream_state.last_stream_view = Some(Presentation::capture(
+        &coordinator,
+        &scope_label,
+        started_ns,
+        started_ns,
+        0,
+    ));
     let deadline = cgroup
         .as_ref()
         .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
@@ -1412,13 +1425,19 @@ fn run_with_terminal_budget(
         let coordinator = &*driver.coordinator;
         match point {
             Publish::Pass { report, now_ns } => {
+                let Some(presentation) = stream_view_guarded(
+                    driver,
+                    &mut stream_state,
+                    &scope_label,
+                    started_ns,
+                    now_ns,
+                ) else {
+                    return Ok(());
+                };
                 for line in progress_lines(coordinator, report) {
                     inventory_diagnostic(&line);
                 }
                 if let Some(error) = stream.attempt("pass publication", |writer| {
-                    let mut presentation =
-                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                    presentation.semantic_capture = driver.semantic_summary();
                     emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
                 }) {
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
@@ -1436,10 +1455,16 @@ fn run_with_terminal_budget(
                 ))
             }),
             Publish::Stop { events, now_ns } => {
+                let Some(presentation) = stream_view_guarded(
+                    driver,
+                    &mut stream_state,
+                    &scope_label,
+                    started_ns,
+                    now_ns,
+                ) else {
+                    return Ok(());
+                };
                 if let Some(error) = stream.attempt("stop publication", |writer| {
-                    let mut presentation =
-                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                    presentation.semantic_capture = driver.semantic_summary();
                     emit_stop_events(
                         writer,
                         &mut stream_state,
@@ -1457,7 +1482,7 @@ fn run_with_terminal_budget(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
-    let semantic_summary = driver.semantic_summary();
+    let presentation = final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     // Both owners stay alive through the final commit, the immutable
     // presentation and every sink attempt; the lane releases after
     // output, beside the native capture it never certified.
@@ -1470,11 +1495,6 @@ fn run_with_terminal_budget(
     if let Some(zero) = &zero_pass {
         inventory_diagnostic(&zero.stderr_line());
     }
-    let ended_ns = now_ns();
-    let passes = coordinator.passes();
-    let mut presentation =
-        Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
-    presentation.semantic_capture = semantic_summary;
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
@@ -1629,8 +1649,8 @@ fn finish_failed_startup<Source: ProcessSource>(
 /// back to a fresh capture: the failure must still be reported.
 #[allow(clippy::too_many_arguments)]
 fn finish_failed_startup_guarded<Source: ProcessSource>(
-    _pending: bool,
-    _prior: Option<&Presentation>,
+    pending: bool,
+    prior: Option<&Presentation>,
     coordinator: &mut InventoryCoordinator<Source>,
     scope_label: &str,
     started_ns: u64,
@@ -1653,13 +1673,16 @@ fn finish_failed_startup_guarded<Source: ProcessSource>(
     coordinator.note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
     let _ = coordinator.commit_batch(false);
     stdout.begin_finalization();
-    let presentation = Presentation::capture(
-        coordinator,
-        scope_label,
-        started_ns,
-        now_ns(),
-        coordinator.passes(),
-    );
+    let presentation = match (pending, prior) {
+        (true, Some(prior)) => prior.clone(),
+        _ => Presentation::capture(
+            coordinator,
+            scope_label,
+            started_ns,
+            now_ns(),
+            coordinator.passes(),
+        ),
+    };
     crate::inventory_capture::finish_native::<FacadeLane, _>(
         None,
         |_| {
@@ -5479,6 +5502,9 @@ fn stream_view_guarded(
     started_ns: u64,
     now_ns: u64,
 ) -> Option<Presentation> {
+    if driver.publication_pending() {
+        return None;
+    }
     let mut presentation = stream_presentation(
         driver.coordinator,
         scope_label,
@@ -5504,6 +5530,9 @@ fn dashboard_pass_guarded(
     started_ns: u64,
     now_ns: u64,
 ) -> Option<(Presentation, Option<String>)> {
+    if driver.publication_pending() {
+        return None;
+    }
     Some(dashboard_stream_pass(
         stream,
         state,
@@ -5526,11 +5555,18 @@ fn dashboard_pass_guarded(
 /// stop must still write its report.
 fn final_view_guarded(
     driver: &ClassicDriver<'_>,
-    _state: &StreamState,
+    state: &StreamState,
     scope_label: &str,
     started_ns: u64,
     ended_ns: u64,
 ) -> Presentation {
+    if driver.publication_pending() {
+        if let Some(prior) = state.last_stream_view.as_ref() {
+            let mut view = prior.clone();
+            view.semantic_capture = driver.semantic_summary();
+            return view;
+        }
+    }
     let mut presentation = Presentation::capture(
         driver.coordinator,
         scope_label,
@@ -5607,6 +5643,16 @@ fn run_dashboard(
     } = run;
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
+    // The opening prior for pending views and the final: the same
+    // pass-zero read as the prologue, so a final always has a prior
+    // even when no pass completed.
+    stream_state.last_stream_view = Some(Presentation::capture(
+        &coordinator,
+        &scope_label,
+        started_ns,
+        started_ns,
+        0,
+    ));
     let initial_error = start_event_log(&mut stream, &coordinator, &scope_label, started_ns);
     let initial_error = match (diagnostics.is_some(), initial_error) {
         (false, Some(error)) => return Err(error),
@@ -5679,17 +5725,18 @@ fn run_dashboard(
     let mut publish = |driver: &mut ClassicDriver<'_>, point: Publish<'_>| {
         match point {
             Publish::Pass { report, now_ns } => {
-                let coordinator = &*driver.coordinator;
-                let (display_view, event_error) = dashboard_stream_pass(
+                let Some((display_view, event_error)) = dashboard_pass_guarded(
+                    driver,
                     &mut stream,
                     &mut stream_state,
                     report,
-                    coordinator,
                     &scope_label,
                     started_ns,
                     now_ns,
-                    driver.semantic_summary(),
-                );
+                ) else {
+                    return Ok(());
+                };
+                let coordinator = &*driver.coordinator;
                 if let Some(display) = driver.display.as_mut() {
                     if let Some(error) = event_error {
                         display.notice(&crate::render::escape_controls(&error));
@@ -5725,10 +5772,16 @@ fn run_dashboard(
             }
             Publish::Stop { events, now_ns } => {
                 let coordinator = &*driver.coordinator;
+                let Some(presentation) = stream_view_guarded(
+                    driver,
+                    &mut stream_state,
+                    &scope_label,
+                    started_ns,
+                    now_ns,
+                ) else {
+                    return Ok(());
+                };
                 if let Some(error) = stream.attempt("stop publication", |writer| {
-                    let mut presentation =
-                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                    presentation.semantic_capture = driver.semantic_summary();
                     emit_stop_events(
                         writer,
                         &mut stream_state,
@@ -5747,12 +5800,12 @@ fn run_dashboard(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
+    let presentation = final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
         .take()
         .expect("the dashboard driver keeps its display");
-    let semantic_summary = driver.semantic_summary();
     let semantic_lane = driver.semantic.take();
     drop(driver);
     display.restore();
@@ -5763,11 +5816,6 @@ fn run_dashboard(
     if let Some(zero) = &zero_pass {
         display.notice(&zero.stderr_line());
     }
-    let passes = coordinator.passes();
-    let ended_ns = now_ns();
-    let mut presentation =
-        Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
-    presentation.semantic_capture = semantic_summary;
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
     let diagnostic_outcome = diagnostic_outcome(
@@ -5831,6 +5879,7 @@ fn run_dashboard(
     }
     // Closing accounting describes the final restore and output notices,
     // including a retry that succeeds after the initial restore was shed.
+    let passes = coordinator.passes();
     for line in dashboard_account_lines(passes, &display.account()) {
         display.notice(&line);
     }
@@ -11711,7 +11760,7 @@ mod tests {
         coordinator.note_scope_gap("baseline gap".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
         let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let driver = driver_with_display(&mut coordinator, headless.display);
         assert!(
             !driver.publication_pending(),
             "the idle driver does not pend"
@@ -11825,7 +11874,7 @@ mod tests {
         coordinator.note_scope_gap("baseline gap".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
         let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let driver = driver_with_display(&mut coordinator, headless.display);
         assert!(
             !driver.publication_pending(),
             "the idle driver does not pend"
@@ -11900,7 +11949,7 @@ mod tests {
         coordinator.note_scope_gap("baseline gap".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
         let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let driver = driver_with_display(&mut coordinator, headless.display);
         assert!(
             !driver.publication_pending(),
             "the idle driver does not pend"
@@ -11966,7 +12015,7 @@ mod tests {
         coordinator.note_scope_gap("baseline gap".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
         let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let driver = driver_with_display(&mut coordinator, headless.display);
         assert!(
             !driver.publication_pending(),
             "the idle driver does not pend"

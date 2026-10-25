@@ -46689,7 +46689,11 @@ fn collected_graph_storage_refusal_keeps_originals() {
     assert_eq!(engine.pinned.revision(), revision);
     assert_eq!(engine.plan.slots, slots);
     assert_eq!(
-        engine.views.iter().map(|owner| owner.id()).collect::<Vec<_>>(),
+        engine
+            .views
+            .iter()
+            .map(|owner| owner.id())
+            .collect::<Vec<_>>(),
         views
     );
     assert_eq!(engine.modules, modules);
@@ -46723,9 +46727,7 @@ fn graph_case_to_native_pending(limit: Option<usize>) -> (usize, usize) {
     let mut case = CollectedFinishGraphCase::new(false);
     case.child.reap().unwrap();
     assert_eq!(case.engine.views[0].original_exited(), Ok(true));
-    case.engine
-        .update_counter_snapshot(&case.session)
-        .unwrap();
+    case.engine.update_counter_snapshot(&case.session).unwrap();
     case.engine.dispatch_lifecycle_record(
         &mut case.session,
         &collected_finish_leader_exit(case.child.pid()),
@@ -46825,9 +46827,7 @@ fn collected_graph_disclosure_only_mark_partial_is_not_refused() {
     let mut case = CollectedFinishGraphCase::new(false);
     case.child.reap().unwrap();
     assert_eq!(case.engine.views[0].original_exited(), Ok(true));
-    case.engine
-        .update_counter_snapshot(&case.session)
-        .unwrap();
+    case.engine.update_counter_snapshot(&case.session).unwrap();
     case.engine.dispatch_lifecycle_record(
         &mut case.session,
         &collected_finish_leader_exit(case.child.pid()),
@@ -46876,9 +46876,7 @@ fn assert_scanned_module_copy_is_exact(copy: &ScannedModule, source: &ScannedMod
         assert_eq!(copied.entries.capacity(), copied.entries.len());
         assert_eq!(copied.null_entries.capacity(), copied.null_entries.len());
         assert_eq!(copied.unpinned.capacity(), copied.unpinned.len());
-        for (copied_entry, original_entry) in
-            copied.entries.iter().zip(original.entries.iter())
-        {
+        for (copied_entry, original_entry) in copied.entries.iter().zip(original.entries.iter()) {
             assert_eq!(copied_entry, original_entry);
             assert_eq!(
                 copied_entry.object_path.capacity(),
@@ -46886,9 +46884,7 @@ fn assert_scanned_module_copy_is_exact(copy: &ScannedModule, source: &ScannedMod
             );
         }
         assert_eq!(copied.null_entries, original.null_entries);
-        for (copied_skip, original_skip) in
-            copied.unpinned.iter().zip(original.unpinned.iter())
-        {
+        for (copied_skip, original_skip) in copied.unpinned.iter().zip(original.unpinned.iter()) {
             assert_eq!(copied_skip, original_skip);
             assert_eq!(copied_skip.subject.capacity(), copied_skip.subject.len());
             assert_eq!(copied_skip.reason.capacity(), copied_skip.reason.len());
@@ -46911,7 +46907,9 @@ fn scanned_module_copy_is_exact() {
     let (child, engine, _) = engine_with_one_accepted_provider();
     let _accepted = SystemScopeChildGuard::new(child);
     let mut source = engine.modules[0].scanned.clone();
-    source.exports.extend(["extra-a".to_string(), "extra-b".to_string()]);
+    source
+        .exports
+        .extend(["extra-a".to_string(), "extra-b".to_string()]);
     if source.interfaces.is_empty() {
         source.interfaces.push(ScannedInterface {
             index: 0,
@@ -46982,7 +46980,7 @@ fn scanned_module_copy_is_exact() {
     // than 10 nulls with everything else identical.
     let mut few = source.clone();
     few.tables[1].null_entries = vec!["null-entry"; 10];
-    let mut count_steps = |module: &ScannedModule| {
+    let count_steps = |module: &ScannedModule| {
         let mut probe = ScannedModuleCopy::new();
         let mut scratch = Vec::with_capacity(1);
         let mut steps = 0usize;

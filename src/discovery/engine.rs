@@ -13,7 +13,7 @@ use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ConservativePinSelection, InstalledModulesBacking, InstalledPinsBacking,
+    ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
     KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
     PinnedObjects, PinnedTimingKey, ReconciledModule, RetainedScannedInputs, RetiredFileHandoff,
     ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe, StaleManifestObject,
@@ -3596,20 +3596,204 @@ struct GraphBacking {
     storage: Option<ResourceLease>,
 }
 
-/// Raw scanned-module copy cursor (§1.6). Inert skeleton: T4a fills the
-/// stepped exact copy; steps report no progress until then.
-struct ScannedModuleCopy;
+/// Raw scanned-module copy cursor (§1.6): exact-capacity clone of one
+/// `ScannedModule` per stepped pass. Every `Vec`/`String` is built with
+/// `with_capacity(source.len())`; each step clones one element (export,
+/// interface, entry, skip) or up to 4096 null entries. The cursor resets
+/// between modules.
+struct ScannedModuleCopy {
+    table: usize,
+    item: usize,
+    stage: u8,
+}
 
-#[allow(dead_code)] // Skeleton: the T4a implementation commit drops this.
 impl ScannedModuleCopy {
     fn new() -> Self {
-        Self
+        Self {
+            table: 0,
+            item: 0,
+            stage: 0,
+        }
     }
 
-    /// One copy leaf; inert until T4a lands (never completes).
-    fn step(&mut self, _source: &ScannedModule, _rows: &mut Vec<ScannedModule>) -> bool {
-        false
+    /// Copies one leaf unit of `source` into `rows`, appending the
+    /// destination shell row on the first step. Returns true when the
+    /// module is fully copied, resetting for the next module.
+    fn step(&mut self, source: &ScannedModule, rows: &mut Vec<ScannedModule>) -> bool {
+        match self.stage {
+            // Base shell: scalars plus exact-capacity vectors.
+            0 => {
+                rows.push(ScannedModule {
+                    mapped_identity: source.mapped_identity,
+                    view: source.view,
+                    mount_namespace: source.mount_namespace,
+                    key: source.key,
+                    double_loaded: source.double_loaded,
+                    path: exact_owned_string(&source.path),
+                    decoder_abi: source.decoder_abi,
+                    exports: Vec::with_capacity(source.exports.len()),
+                    tables: Vec::with_capacity(source.tables.len()),
+                    interfaces: Vec::with_capacity(source.interfaces.len()),
+                });
+                self.item = 0;
+                self.stage = 1;
+                false
+            }
+            // Exports, one per step.
+            1 => {
+                if let Some(text) = source.exports.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .exports
+                        .push(exact_owned_string(text));
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 2;
+                    false
+                }
+            }
+            // Interfaces, one per step.
+            2 => {
+                if let Some(face) = source.interfaces.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .interfaces
+                        .push(ScannedInterface {
+                            index: face.index,
+                            name_class: face.name_class,
+                            name_lossy: face
+                                .name_lossy
+                                .as_ref()
+                                .map(|name| exact_owned_string(name)),
+                            name_private: face.name_private.as_ref().map(|bytes| {
+                                let mut owned = Vec::with_capacity(bytes.len());
+                                owned.extend_from_slice(bytes);
+                                owned
+                            }),
+                            flags: face.flags,
+                            table: face.table,
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.table = 0;
+                    self.stage = 3;
+                    false
+                }
+            }
+            // Table shell.
+            3 => {
+                if let Some(table) = source.tables.get(self.table) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .push(ScannedTable {
+                            version: table.version,
+                            walk: table.walk,
+                            entries: Vec::with_capacity(table.entries.len()),
+                            null_entries: Vec::with_capacity(table.null_entries.len()),
+                            unpinned: Vec::with_capacity(table.unpinned.len()),
+                            address: table.address,
+                            file_offset: table.file_offset,
+                            live_return: table.live_return,
+                            manifest_supported: table.manifest_supported,
+                        });
+                    self.item = 0;
+                    self.stage = 4;
+                    false
+                } else {
+                    self.table = 0;
+                    self.item = 0;
+                    self.stage = 0;
+                    true
+                }
+            }
+            // Entries, one per step.
+            4 => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                if let Some(entry) = table.entries.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .last_mut()
+                        .expect("the table shell is pushed at stage 3")
+                        .entries
+                        .push(ScannedEntry {
+                            name: entry.name,
+                            object: entry.object,
+                            object_path: exact_owned_string(&entry.object_path),
+                            file_offset: entry.file_offset,
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 5;
+                    false
+                }
+            }
+            // Null entries, up to 4096 per step.
+            5 => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                let end = (self.item + 4096).min(table.null_entries.len());
+                rows.last_mut()
+                    .expect("the shell row is pushed at stage 0")
+                    .tables
+                    .last_mut()
+                    .expect("the table shell is pushed at stage 3")
+                    .null_entries
+                    .extend_from_slice(&table.null_entries[self.item..end]);
+                if end < table.null_entries.len() {
+                    self.item = end;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 6;
+                    false
+                }
+            }
+            // Unpinned skips, one per step.
+            _ => {
+                let table = source
+                    .tables
+                    .get(self.table)
+                    .expect("the table shell is pushed at stage 3");
+                if let Some(skip) = table.unpinned.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .tables
+                        .last_mut()
+                        .expect("the table shell is pushed at stage 3")
+                        .unpinned
+                        .push(Skipped {
+                            subject: exact_owned_string(&skip.subject),
+                            reason: exact_owned_string(&skip.reason),
+                        });
+                    self.item += 1;
+                    false
+                } else {
+                    self.table += 1;
+                    self.stage = 3;
+                    false
+                }
+            }
+        }
     }
+}
+
+/// Exact-capacity string clone: capacity always equals length.
+fn exact_owned_string(source: &str) -> String {
+    let mut owned = String::with_capacity(source.len());
+    owned.push_str(source);
+    owned
 }
 
 /// Removed-slot copy cursor (§1.6). Shaped by T4b.
@@ -3662,6 +3846,7 @@ struct CollectedGraph {
     selection: Option<ConservativePinSelection>,
     pins: PinnedConservativeCursor,
     raw_index: usize,
+    raw_included: usize,
     raw_measure: Option<ScannedInputMeasure>,
     raw_copy: Option<ScannedModuleCopy>,
     raw_rows: Vec<ScannedModule>,
@@ -3713,6 +3898,7 @@ impl CollectedGraph {
             selection: None,
             pins: PinnedConservativeCursor::new(),
             raw_index: 0,
+            raw_included: 0,
             raw_measure: None,
             raw_copy: None,
             raw_rows: Vec::new(),
@@ -22179,9 +22365,50 @@ impl Engine {
         }
     }
 
+    /// One graph credit that did work but changed no publication input.
+    fn graph_idle(progressed: bool) -> GraphService {
+        GraphService {
+            changed: false,
+            progressed,
+            named_generation_lost: false,
+        }
+    }
+
+    /// Cancels the phase's active cursor after a pre-mutation refusal
+    /// (§1.9): the rebind and plan cursors mark cancelled; every other
+    /// phase holds no cancellable cursor (pins copies are inert until
+    /// polled, engine-side walks hold no cursor).
+    fn cancel_graph_cursor(graph: &mut CollectedGraph) {
+        match graph.phase {
+            GraphPhase::Rebind => graph.rebind.cancel(),
+            GraphPhase::Plan => graph.plan.cancel(),
+            _ => {}
+        }
+    }
+
+    /// Records a pre-native refusal (§1.9 row 1): cancels the active
+    /// cursor, keeps every original owner and lease, names the reason
+    /// once. No disclosure: the coordinator's `failed` flag takes the
+    /// finite I2 exit with this reason.
+    fn refuse_graph_before_native(&mut self, graph: &mut CollectedGraph) {
+        Self::cancel_graph_cursor(graph);
+        graph.verdict = Some(Verdict::RefusedUntouched);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph refused before native mutation");
+    }
+
+    /// Whether a scanned row survives into the raw copy: its view is not
+    /// retired and its key is not rejected by the graph selection.
+    fn graph_module_retained(graph: &CollectedGraph, source: &ScannedModule) -> bool {
+        graph.selection.as_ref().is_some_and(|selection| {
+            !selection.retired().contains(&source.view)
+                && !selection.rejected().contains(&source.key)
+        })
+    }
+
     /// One phase step. T4 owns Intake and the I1 error rows of the native
-    /// phases; the cursor phases below advance until T4a (Freeze..Plan) and
-    /// T4b (Handoff..Done) fill their bodies, and T4b maps native success.
+    /// phases; T4a fills Freeze..Plan below, T4b fills Handoff..Done and
+    /// maps native success.
     fn step_graph_inner(
         &mut self,
         session: &mut dyn EngineSession,
@@ -22189,63 +22416,75 @@ impl Engine {
         reserve: &SemanticResourceReserver,
         graph: &mut CollectedGraph,
     ) -> GraphService {
-        let idle = GraphService {
-            changed: false,
-            progressed: true,
-            named_generation_lost: false,
-        };
+        // Epoch rule (finding 2): from Freeze through NativePoll, every
+        // credit first compares the graph-input epoch. A mismatch before
+        // native mutation refuses untouched; after mutation the native
+        // debt is retained. Install revalidates with its own scalars.
+        if matches!(
+            graph.phase,
+            GraphPhase::Freeze
+                | GraphPhase::Selection
+                | GraphPhase::Pins
+                | GraphPhase::RawCopy
+                | GraphPhase::Rebind
+                | GraphPhase::Plan
+                | GraphPhase::Facts
+                | GraphPhase::Handoff
+                | GraphPhase::RemovedCopy
+                | GraphPhase::NativePrepare
+                | GraphPhase::NativeBegin
+                | GraphPhase::NativePoll
+        ) && self.graph_inputs_epoch != graph.epoch
+        {
+            if graph.mutated {
+                graph.verdict = Some(Verdict::RefusedRetained);
+                self.collected_graph_refusal
+                    .get_or_insert("native ownership uncertain");
+            } else {
+                self.refuse_graph_before_native(graph);
+            }
+            return Self::graph_idle(true);
+        }
         match graph.phase {
             GraphPhase::Intake => self.step_graph_intake(graph),
             GraphPhase::Freeze => {
+                graph.epoch = self.graph_inputs_epoch;
+                graph.pins_revision = self.pinned.revision();
+                graph.plan_slots = self.plan.slots.len();
                 graph.phase = GraphPhase::Selection;
-                idle
+                Self::graph_idle(true)
             }
-            GraphPhase::Selection => {
-                graph.phase = GraphPhase::Pins;
-                idle
-            }
-            GraphPhase::Pins => {
-                graph.phase = GraphPhase::RawCopy;
-                idle
-            }
-            GraphPhase::RawCopy => {
-                graph.phase = GraphPhase::Rebind;
-                idle
-            }
-            GraphPhase::Rebind => {
-                graph.phase = GraphPhase::Plan;
-                idle
-            }
-            GraphPhase::Plan => {
-                graph.phase = GraphPhase::Facts;
-                idle
-            }
+            GraphPhase::Selection => self.step_graph_selection(graph, reserve),
+            GraphPhase::Pins => self.step_graph_pins(graph, reserve),
+            GraphPhase::RawCopy => self.step_graph_raw_copy(graph, reserve),
+            GraphPhase::Rebind => self.step_graph_rebind(graph, reserve),
+            GraphPhase::Plan => self.step_graph_plan(graph, reserve),
             GraphPhase::Facts => {
                 graph.phase = GraphPhase::Handoff;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::Handoff => {
                 graph.phase = GraphPhase::RemovedCopy;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::RemovedCopy => {
                 graph.phase = GraphPhase::NativePrepare;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::NativePrepare => self.probe_native_prepare(session, q, reserve, graph),
             GraphPhase::NativeBegin => self.probe_native_begin(session, q, graph),
             GraphPhase::NativePoll => self.probe_native_poll(session, q, graph),
             GraphPhase::Install => {
                 graph.phase = GraphPhase::Consume;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::Consume => {
                 graph.phase = GraphPhase::Reclaim;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::Reclaim => {
                 graph.phase = GraphPhase::Done;
-                idle
+                Self::graph_idle(true)
             }
             GraphPhase::Done => GraphService::default(),
         }
@@ -22352,6 +22591,292 @@ impl Engine {
                         "the original process pin could not prove expected exit; retirement remains queued: {error}"
                     ),
                 );
+            }
+        }
+    }
+
+    /// Selection (§1.6): one key per credit, retirements first, then
+    /// rejected keys, through the after-cursors. An empty selection
+    /// finishes at Done with no copy and no publish; otherwise the sets
+    /// seal into a `ConservativePinSelection` (the Engine sets stay the
+    /// owners). A refusal keeps the takes for Reclaim.
+    fn step_graph_selection(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if let Some(next) = match graph.sel_after_view {
+            None => self.pending_retirements.first().copied(),
+            Some(after) => self
+                .pending_retirements
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|view| *view),
+        } {
+            graph.sel_after_view = Some(next);
+            graph.sel_retired.insert(next);
+            graph.sel_count.0 = graph.sel_retired.len();
+            return Self::graph_idle(true);
+        }
+        if let Some(next) = match graph.sel_after_key {
+            None => self.pending_rejected_keys.first().copied(),
+            Some(after) => self
+                .pending_rejected_keys
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|key| *key),
+        } {
+            graph.sel_after_key = Some(next);
+            graph.sel_rejected.insert(next);
+            graph.sel_count.1 = graph.sel_rejected.len();
+            return Self::graph_idle(true);
+        }
+        if graph.sel_retired.is_empty() && graph.sel_rejected.is_empty() {
+            graph.phase = GraphPhase::Done;
+            return Self::graph_idle(true);
+        }
+        let storage = ConservativePinSelection::storage_bound(
+            graph.sel_retired.len(),
+            graph.sel_rejected.len(),
+        )
+        .and_then(|bytes| reserve.reserve(bytes).ok());
+        let Some(storage) = storage else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        let retired = std::mem::take(&mut graph.sel_retired);
+        let rejected = std::mem::take(&mut graph.sel_rejected);
+        match ConservativePinSelection::from_reserved_originals(retired, rejected, storage, reserve)
+        {
+            Ok(selection) => {
+                graph.selection = Some(selection);
+                graph.phase = GraphPhase::Pins;
+            }
+            Err(refusal) => {
+                let (retired, rejected, storage) = refusal.into_originals();
+                graph.sel_retired = retired;
+                graph.sel_rejected = rejected;
+                graph.sel_storage = Some(storage);
+                self.refuse_graph_before_native(graph);
+            }
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Pins (§1.6): one strided conservative copy credit. Ready advances
+    /// to RawCopy; any refusal keeps the originals.
+    fn step_graph_pins(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(selection) = graph.selection.as_ref() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        match self
+            .pinned
+            .poll_conservative_copy(&mut graph.pins, selection, reserve, GRAPH_STRIDE)
+        {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::RawCopy;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// RawCopy (§1.6): surviving scanned rows (view not retired, key not
+    /// rejected) are measured with `ScannedInputMeasure`, reserved, then
+    /// cloned exact by `ScannedModuleCopy` into an exactly preallocated
+    /// `raw_rows`, and sealed into `RetainedScannedInputs`. Each module
+    /// visit costs one leaf; measure and copy steps cost one leaf each,
+    /// up to `GRAPH_STRIDE` per credit.
+    fn step_graph_raw_copy(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.selection.is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if graph.raw_measure.is_none() {
+            match ScannedInputMeasure::new(self.modules.len()) {
+                Ok(measure) => {
+                    graph.raw_measure = Some(measure);
+                    graph.raw_index = 0;
+                    graph.raw_included = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                    return Self::graph_idle(true);
+                }
+            }
+        }
+        if graph.raw_storage.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.modules.get(graph.raw_index) else {
+                    break;
+                };
+                if Self::graph_module_retained(graph, &source.scanned) {
+                    let done = match graph
+                        .raw_measure
+                        .as_mut()
+                        .expect("the measure is seeded above")
+                        .step(&source.scanned)
+                    {
+                        Ok(done) => done,
+                        Err(_) => {
+                            self.refuse_graph_before_native(graph);
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    if done {
+                        graph.raw_included += 1;
+                        graph.raw_index += 1;
+                    }
+                } else {
+                    graph.raw_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.raw_index < self.modules.len() {
+                return Self::graph_idle(true);
+            }
+            let bytes = graph
+                .raw_measure
+                .as_ref()
+                .expect("the measure is seeded above")
+                .bytes();
+            match reserve.reserve(bytes) {
+                Ok(storage) => {
+                    graph.raw_storage = Some(storage);
+                    graph.raw_rows = Vec::with_capacity(graph.raw_included);
+                    graph.raw_copy = Some(ScannedModuleCopy::new());
+                    graph.raw_index = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.raw.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.modules.get(graph.raw_index) else {
+                    break;
+                };
+                if Self::graph_module_retained(graph, &source.scanned) {
+                    let cursor = graph.raw_copy.as_mut().expect("the copy opens at seal");
+                    if cursor.step(&source.scanned, &mut graph.raw_rows) {
+                        graph.raw_index += 1;
+                    }
+                } else {
+                    graph.raw_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.raw_index < self.modules.len() {
+                return Self::graph_idle(true);
+            }
+            let rows = std::mem::take(&mut graph.raw_rows);
+            let storage = graph
+                .raw_storage
+                .take()
+                .expect("the storage is reserved above");
+            debug_assert_eq!(
+                rows.capacity(),
+                rows.len(),
+                "raw rows are preallocated exact"
+            );
+            match RetainedScannedInputs::from_reserved_originals(rows, storage) {
+                Ok(raw) => {
+                    graph.raw = Some(raw);
+                    graph.phase = GraphPhase::Rebind;
+                }
+                Err(refusal) => {
+                    let (rows, storage) = refusal.into_originals();
+                    graph.raw_rows = rows;
+                    graph.raw_storage = Some(storage);
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        graph.phase = GraphPhase::Rebind;
+        Self::graph_idle(true)
+    }
+
+    /// Rebind (§1.6): one strided scanned-rebind credit over the sealed
+    /// raw inputs. Ready advances to Plan; any refusal keeps the
+    /// originals and cancels the rebind cursor.
+    fn step_graph_rebind(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        match graph.pins.poll_scanned_rebind(
+            &mut graph.raw,
+            &mut graph.rebind,
+            reserve,
+            GRAPH_STRIDE,
+        ) {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::Plan;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Plan (§1.6): one strided conservative plan rebuild over the
+    /// rebound modules and the loaned pins output. Ready advances to
+    /// Facts; any refusal (or a missing loaned input) keeps the
+    /// originals and cancels the plan cursor.
+    fn step_graph_plan(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let (Some(modules), Some(pins)) = (graph.rebind.modules(), graph.pins.loaned_output())
+        else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        let facts = &self.capture_facts;
+        let mut stable_id = |object: PinnedObjectId| facts.module_id_for_object(pins, object).ok();
+        let sources =
+            plan::ConservativePlanSources::new(modules, &self.manifests, pins, self.broad_admit);
+        match self.plan.poll_conservative_rebuild(
+            sources,
+            &mut stable_id,
+            &mut graph.plan,
+            reserve,
+            GRAPH_STRIDE,
+        ) {
+            Ok(GraphStep::Ready) => {
+                graph.phase = GraphPhase::Facts;
+                Self::graph_idle(true)
+            }
+            Ok(GraphStep::Advanced) => Self::graph_idle(true),
+            Ok(GraphStep::Yielded) => Self::graph_idle(false),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                Self::graph_idle(true)
             }
         }
     }

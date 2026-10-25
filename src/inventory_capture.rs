@@ -1807,9 +1807,9 @@ pub(crate) fn collect_cgroup_off_thread(
 }
 
 /// Whether the same owned publication reached its actual boundary.
-#[cfg_attr(not(test), allow(dead_code))] // Pending is enabled by B1's explicit driver port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PassCommitProgress {
+    #[cfg_attr(not(test), allow(dead_code))] // No production poll_commit reports Pending yet; tests script it.
     Pending,
     Published,
 }
@@ -1819,7 +1819,6 @@ pub(crate) enum PassCommitProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockDisposition {
     Pending,
-    #[cfg_attr(not(test), allow(dead_code))] // No production driver resolves yet.
     Resolved,
 }
 
@@ -2087,7 +2086,6 @@ pub(crate) enum AppliedPassPhase {
 }
 
 /// One call's cooperative work allowance, separate from the run's stop clock.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RetainedWorkBudget {
     pub(crate) remaining_actions: usize,
     pub(crate) deadline: Instant,
@@ -2142,8 +2140,6 @@ pub(crate) enum RetainedNative<L> {
     Stopped(Stopped<L>),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-// B1 consumes the owned outcome before activation.
 // Move the bounded original owners inline; boxing would add a fallible
 // allocation and resource charge precisely on this failure handoff.
 #[allow(clippy::large_enum_variant)]
@@ -2151,6 +2147,7 @@ pub(crate) enum RetainedPass {
     /// Publication began before any new pass. Never fabricate a collection
     /// or report just to return the existing driver/native ownership.
     BeforeCollection,
+    #[cfg_attr(not(test), allow(dead_code))] // Production matches the variant and discards (C1); only tests read the collection.
     Collected {
         collected: CollectedPass,
         scan_now_ns: u64,
@@ -2166,8 +2163,8 @@ pub(crate) enum RetainedPass {
 
 /// An unfinished completion, any existing pass and the same native owner,
 /// with the loop's original stop accounting. This is not a second work
-/// queue or a terminal receipt.
-#[cfg_attr(not(test), allow(dead_code))] // Default synchronous drivers never retain a run.
+/// queue or a terminal receipt. Default synchronous drivers never
+/// retain a run; only the suspending path builds one.
 pub(crate) struct RetainedClassicRun<L> {
     pub(crate) pass: RetainedPass,
     pub(crate) native: Option<RetainedNative<L>>,
@@ -2186,8 +2183,6 @@ pub(crate) struct RetainedClassicRun<L> {
     terminal_zero_pass: Option<ZeroPassStop>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-// Actual callers must adopt this before enabling Pending.
 // Move the bounded original owners inline; boxing would add a fallible
 // allocation and resource charge precisely on this failure handoff.
 #[allow(clippy::large_enum_variant)]
@@ -2206,7 +2201,6 @@ pub(crate) enum ClassicCompletion<L> {
 impl<L> ClassicOutcome<L> {
     /// A retained result must stay beside its original driver/coordinator.
     /// Reject malformed mixed outcomes without dropping either owner.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::result_large_err)] // Returning the original owners is the failure contract.
     pub(crate) fn into_completion(self) -> std::result::Result<ClassicCompletion<L>, Self> {
         if self.retained.is_some() && (self.stopped.is_some() || self.zero_pass.is_some()) {
@@ -2485,7 +2479,6 @@ where
 /// callback. A deadline limits which actions start; callbacks are not preempted.
 /// The phase-aware driver must restrict its service/terminal hooks to the
 /// original owned work after suspension; this grants no fresh admission.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn poll_retained_classic<Pin, D, L>(
     driver: &mut D,
     mut run: RetainedClassicRun<L>,

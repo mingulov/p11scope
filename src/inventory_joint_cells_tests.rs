@@ -1197,7 +1197,9 @@ fn retire_own_16_body(scene: Scene, event: JointEvent) {
 }
 
 use super::super::tests::{consume_clock, retain_with_cause, retained_run_of};
-use crate::inventory_capture::{ClassicOutcome, FacadeLane, Publish, RetainedClassicRun, ZeroPassCause};
+use crate::inventory_capture::{
+    ClassicOutcome, FacadeLane, Publish, RetainedBlock, RetainedClassicRun, ZeroPassCause,
+};
 
 /// Retain a J12/J13 publication scene through the real loop: the
 /// caller seats the lane, then the pending commit flag (or a
@@ -1236,10 +1238,15 @@ fn retain_publication(
 }
 
 /// Rebuild a consumable outcome from a retained run and its error.
+/// The publication scene owes its publication row: without a live
+/// lane the real loop retains no block, so the test plants the owed
+/// Publication the live closer would carry.
 fn consumable(
     run: RetainedClassicRun<FacadeLane>,
     error: Option<anyhow::Error>,
 ) -> ClassicOutcome<FacadeLane> {
+    let mut run = run;
+    run.block = Some(RetainedBlock::Publication);
     ClassicOutcome {
         stopped: None,
         error,
@@ -1308,8 +1315,8 @@ fn stopdead_pub_body(scene: Scene, event: JointEvent) {
             "E: the first error predates the finite stop: {error:#}"
         );
         assert_eq!(
-            driver.commit_calls, 2,
-            "P: each drain phase commits once, never replayed"
+            driver.commit_calls, 1,
+            "P: the abandon commits once; the error run stays markerless"
         );
         let abandons: Vec<(String, String)> = gaps(&mut driver)
             .into_iter()
@@ -1354,8 +1361,8 @@ fn stopdead_pub_body(scene: Scene, event: JointEvent) {
         "no error on the publish path"
     );
     assert_eq!(
-        driver.commit_calls, 2,
-        "P: each drain phase commits once, never replayed"
+        driver.commit_calls, 1,
+        "P: the delivered stop commits once; the substituted resolve stages nothing"
     );
 }
 
@@ -1492,8 +1499,10 @@ fn replace_pub_body(scene: Scene, event: JointEvent) {
 }
 
 /// J12/J13 × capture_error (O P E / O E): a capture commit fails
-/// once during the drain; the error is kept, nothing replays, and
-/// the lane joins normally.
+/// once during the drain; nothing replays, and the lane joins
+/// normally. J13 keeps its retention error; J12's failure strikes
+/// the best-effort terminal commit (the fault is consumed) and the
+/// F9 rule swallows it, like the sink.
 fn capture_pub_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::CaptureError));
     assert!(matches!(scene.state, JointState::J12 | JointState::J13));
@@ -1516,36 +1525,53 @@ fn capture_pub_body(scene: Scene, event: JointEvent) {
     let clock = consume_clock(&stop_now);
     let (_, error, zero_pass) =
         driver.consume_outcome(consumable(run, error), &clock, &mut |_, _| Ok(()));
-    assert!(
-        zero_pass.is_none(),
-        "no zero-pass report beside a first error"
-    );
-    let error = error.expect("the capture error is kept");
     if state == JointState::J13 {
+        assert!(
+            zero_pass.is_none(),
+            "no zero-pass report beside a retention error"
+        );
+    } else {
+        let zero = zero_pass.expect("the stop delivered before the capture failure");
+        assert_eq!(zero.cause, ZeroPassCause::OperatorStop, "cause kept");
+    }
+    if state == JointState::J13 {
+        let error = error.expect("the capture error is kept");
         assert!(
             format!("{error:#}").contains("the publication failure"),
             "E: the first error predates the capture failure: {error:#}"
         );
     } else {
         assert!(
-            format!("{error:#}").contains("the capture failure"),
-            "E: the capture error is kept: {error:#}"
+            error.is_none(),
+            "E: the best-effort terminal commit swallows the capture failure"
+        );
+        assert!(
+            super::super::take_classic_commit_fault_for_test().is_none(),
+            "E: the capture failure struck once"
         );
     }
     assert_eq!(
-        driver.commit_calls, 2,
-        "P: each drain phase commits once, never replayed"
+        driver.commit_calls, 1,
+        "P: the drain commits once, never replayed"
     );
     let failures: Vec<(String, String)> = gaps(&mut driver)
         .into_iter()
         .filter(|(subject, _)| subject == "inventory capture failed")
         .collect();
-    assert_eq!(
-        failures.len(),
-        1,
-        "E: one failure gap: {:?}",
-        gaps(&mut driver)
-    );
+    if state == JointState::J13 {
+        assert_eq!(
+            failures.len(),
+            1,
+            "E: one failure gap: {:?}",
+            gaps(&mut driver)
+        );
+    } else {
+        assert!(
+            failures.is_empty(),
+            "E: the swallowed failure records nothing: {:?}",
+            gaps(&mut driver)
+        );
+    }
     assert_eq!(driver.joint_begin_calls, 1, "O: the finish begins once");
     assert!(
         driver.semantic.is_none(),
@@ -1588,7 +1614,14 @@ fn sink_pub_body(scene: Scene, event: JointEvent) {
             Ok(())
         },
     );
-    assert_eq!(stops, 1, "P: the failed stop is never re-emitted");
+    if state == JointState::J13 {
+        assert_eq!(
+            stops, 0,
+            "P: the retained error suppresses the stop; the sink never strikes"
+        );
+    } else {
+        assert_eq!(stops, 1, "P: the failed stop is never re-emitted");
+    }
     if state == JointState::J13 {
         let error = error.expect("E: the first error is kept");
         assert!(

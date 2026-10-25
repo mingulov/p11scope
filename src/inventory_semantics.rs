@@ -748,6 +748,10 @@ pub(crate) struct AttestedSemanticLane {
     /// refuse forever; the Session never begins owned detach.
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     exit_retained: bool,
+    /// Set by the wound-down poll that first reports drained
+    /// (§8.3): the recorded wound-down the take requires. Never
+    /// cleared; abandon exit-retains past it and refuses anyway.
+    wound_down_complete: bool,
     /// When the lane's latest batch was staged for commit: the driver
     /// stamps it on stage and clears it on publish, bounding the wait
     /// for receipt-free evidence and backing off failed commits.
@@ -1191,6 +1195,7 @@ impl AttestedSemanticLane {
             collected_finish_requested: false,
             joint_finish_failure: None,
             exit_retained: false,
+            wound_down_complete: false,
             staged_at: None,
             disclosed_calls_shed: 0,
             oversized_drop_shed: BTreeMap::new(),
@@ -1311,6 +1316,7 @@ impl AttestedSemanticLane {
             collected_finish_requested: false,
             joint_finish_failure: None,
             exit_retained: false,
+            wound_down_complete: false,
             staged_at: None,
             disclosed_calls_shed: 0,
             oversized_drop_shed: BTreeMap::new(),
@@ -1651,20 +1657,36 @@ impl AttestedSemanticLane {
                 .map_err(|_| SemanticRefusal::Unavailable)?;
             return match progress {
                 ProducerDetachProgress::Pending => Ok(false),
-                ProducerDetachProgress::Complete => Ok(coordinator.close_retired_graph_files(256)),
+                ProducerDetachProgress::Complete => {
+                    let drained = coordinator.close_retired_graph_files(256);
+                    if drained {
+                        self.wound_down_complete = true;
+                    }
+                    Ok(drained)
+                }
             };
         }
         let Some(live) = self.live.as_mut() else {
             // No native session: nothing to detach; still drain the
             // shared retired-file chain the Engine may hold.
-            return Ok(coordinator.close_retired_graph_files(256));
+            let drained = coordinator.close_retired_graph_files(256);
+            if drained {
+                self.wound_down_complete = true;
+            }
+            return Ok(drained);
         };
         match live
             .session
             .poll_owned_producer_detach(&mut std::io::sink())
         {
             Ok(ProducerDetachProgress::Pending) => Ok(false),
-            Ok(ProducerDetachProgress::Complete) => Ok(coordinator.close_retired_graph_files(256)),
+            Ok(ProducerDetachProgress::Complete) => {
+                let drained = coordinator.close_retired_graph_files(256);
+                if drained {
+                    self.wound_down_complete = true;
+                }
+                Ok(drained)
+            }
             Err(_) => Err(SemanticRefusal::Unavailable),
         }
     }
@@ -1672,8 +1694,10 @@ impl AttestedSemanticLane {
     /// Take the wound-down Session for completion-polled retire
     /// (§8.3): `Some` only after the owned detach joined, Finish
     /// published and no Joint frame retained. Memory-only lane state
-    /// drops with the handoff, like the promotion wind-down; anything
-    /// earlier or an exit-retained lane yields `None` or refuses.
+    /// drops with the handoff, like the promotion wind-down. An
+    /// unfinished or framed lane yields `None`; a finished frameless
+    /// lane without a recorded wound-down refuses, enforcing the
+    /// poll-before-take order in-API. An exit-retained lane refuses.
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn take_joined_session(&mut self) -> Result<Option<Session>, SemanticRefusal> {
         if self.exit_retained {
@@ -1681,6 +1705,9 @@ impl AttestedSemanticLane {
         }
         if !self.is_finished() || self.has_joint_frame() {
             return Ok(None);
+        }
+        if !self.wound_down_complete {
+            return Err(SemanticRefusal::Unavailable);
         }
         #[cfg(test)]
         if self.test_io.is_some() {
@@ -1711,13 +1738,17 @@ impl AttestedSemanticLane {
     /// terminal negatives — justifies the abandon with `reason`,
     /// marks the lane finished and exit-retained, and drops nothing:
     /// later wound-down and take refuse forever and the Session never
-    /// begins owned detach.
+    /// begins owned detach. A second call refuses: the first abandon
+    /// already exit-retained the lane.
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn abandon_finish_for_exit(
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         reason: &'static str,
     ) -> Result<SemanticBatch, SemanticRefusal> {
+        if self.exit_retained {
+            return Err(SemanticRefusal::Unavailable);
+        }
         if !self.joint_finish_disposition_required() {
             return Err(SemanticRefusal::Unavailable);
         }
@@ -4240,19 +4271,28 @@ mod joint_terminal_tests {
     }
 
     #[test]
-    fn take_before_wound_down_returns_none() {
+    fn take_before_wound_down_refuses() {
         let mut lane = shell_lane_for_test();
         assert!(lane.take_joined_session().unwrap().is_none());
+        // A finished frameless lane without a recorded wound-down
+        // refuses: the poll-before-take order is enforced in-API.
         lane.test_finished = true;
-        assert!(lane.take_joined_session().unwrap().is_none());
+        assert!(matches!(
+            lane.take_joined_session(),
+            Err(SemanticRefusal::Unavailable)
+        ));
         // A retained frame blocks the take even when finished.
         lane.set_test_joint_frame(true);
         assert!(lane.take_joined_session().unwrap().is_none());
         lane.set_test_joint_frame(false);
-        // Substituted lanes never ran a native session.
+        // Substituted lanes never ran a native session, but the
+        // recorded wound-down is still required first.
         let (mut lane, _, _) = io_lane_for_test(DetachScript::Complete);
         lane.test_finished = true;
-        assert!(lane.take_joined_session().unwrap().is_none());
+        assert!(matches!(
+            lane.take_joined_session(),
+            Err(SemanticRefusal::Unavailable)
+        ));
     }
 
     #[test]

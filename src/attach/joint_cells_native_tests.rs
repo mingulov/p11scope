@@ -698,7 +698,8 @@ fn joint_cell_j14_stop_body(mut scene: NativeScene, event: JointEvent) {
 }
 
 /// J14×deadline (O N): the table shares the stop row; the Deadline
-/// cause-once is machine-owned, so the native effect twins stop.
+/// cause-once is run-recorded (the J12 x deadline Driver cell pins
+/// it), so the native effect twins stop.
 fn joint_cell_j14_deadline_body(mut scene: NativeScene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
     assert_pending_owner_kept(&mut scene);
@@ -787,7 +788,8 @@ fn joint_cell_j15_stop_body(mut scene: NativeScene, event: JointEvent) {
 }
 
 /// J15×deadline (O E T): the table shares the stop row; the Deadline
-/// cause-once is machine-owned, so the native effect twins stop.
+/// cause-once is run-recorded (the J12 x deadline Driver cell pins
+/// it), so the native effect twins stop.
 fn joint_cell_j15_deadline_body(mut scene: NativeScene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
     assert_unproved_refused_and_kept(&mut scene);
@@ -870,8 +872,8 @@ fn joint_cell_j16_stop_body(mut scene: NativeScene, event: JointEvent) {
 }
 
 /// J16×deadline (idempotent): the table shares the stop row; the
-/// Deadline cause-once is machine-owned, so the native effect twins
-/// stop.
+/// Deadline cause-once is run-recorded (the J12 x deadline Driver
+/// cell pins it), so the native effect twins stop.
 fn joint_cell_j16_deadline_body(mut scene: NativeScene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
     let before = snapshot_completion(&scene);

@@ -22,16 +22,17 @@ use crate::discovery::caller_registry::{
 use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
-    InventoryCoordinator, InventoryScope, PassReport,
+    InventoryCoordinator, InventoryScope, JointCommitProgress, PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::native_binding::NativeIdentity;
 #[cfg(test)]
 use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
-    CgroupJobFailure, ClassicCompletion, ClassicOutcome, CollectJob, CollectedPass, ExitRelease,
-    ExitRetention, FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver,
-    Publish, SERVICE_TICK, Stopped, ZeroPassStop, run_classic_finalizing,
+    BlockDisposition, CgroupJobFailure, ClassicCompletion, ClassicOutcome, CollectJob,
+    CollectedPass, ExitRelease, ExitRetention, FacadeLane, LaneSummary, LaneWindows, LoopClock,
+    NativeLane, PassDriver, Publish, RetainedBlock, RetainedClassicRun, RetainedWorkBudget,
+    SERVICE_TICK, Stopped, ZeroPassStop, poll_retained_classic, run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
@@ -1782,6 +1783,29 @@ enum JointStepOutcome {
     Abandoned,
 }
 
+/// What one NotBegun §8.3 step did: nothing without a lane, one
+/// commit poll that stayed or failed, or a poll plus a begin.
+enum NotBegunStep {
+    Idle,
+    Stepped,
+    Began,
+}
+
+/// The §8.3 item-7 commit rule: storage-retryable refusals stay up
+/// to 100 hooks; anything else fails the finish. Shared by the
+/// winding and final-lane NotBegun steps.
+fn note_commit_refusal_once(
+    retries: &mut u16,
+    reason: crate::inventory_semantics::SemanticRefusal,
+) -> bool {
+    if reason == crate::inventory_semantics::SemanticRefusal::ProviderStorage && *retries < 100 {
+        *retries += 1;
+        true
+    } else {
+        false
+    }
+}
+
 /// A promotion lane winding down inside its retiring domain (§8.6):
 /// the whole lane stays owned across ticks while its detach reaps
 /// (legacy) or its finish steps (Joint).
@@ -1802,15 +1826,9 @@ impl WindingLane {
     /// through 100 hooks, anything else (or the 101st) fails. True
     /// stays `NotBegun`; false notes the failure and takes the
     /// finite stop.
+    #[cfg_attr(not(test), allow(dead_code))] // Production retries through the shared NotBegun step; tests pin the per-lane discipline here.
     fn note_commit_refusal(&mut self, reason: crate::inventory_semantics::SemanticRefusal) -> bool {
-        if reason == crate::inventory_semantics::SemanticRefusal::ProviderStorage
-            && self.commit_retries < 100
-        {
-            self.commit_retries += 1;
-            true
-        } else {
-            false
-        }
+        note_commit_refusal_once(&mut self.commit_retries, reason)
     }
 }
 
@@ -2092,6 +2110,11 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn fail_next_classic_commit_for_test(text: &str) {
     FAIL_NEXT_CLASSIC_COMMIT.with(|fault| fault.replace(Some(text.to_string())));
+}
+
+#[cfg(test)]
+fn take_classic_commit_fault_for_test() -> Option<String> {
+    FAIL_NEXT_CLASSIC_COMMIT.with(|fault| fault.take())
 }
 
 #[cfg(test)]
@@ -2521,6 +2544,10 @@ impl ClassicDriver<'_> {
     /// displacement policy at unification; the handoff waits,
     /// cancellable, and the live lane keeps serving.
     fn drive_pending_install(&mut self) {
+        #[cfg(test)]
+        {
+            self.drive_pending_install_calls += 1;
+        }
         if self.pending_install.is_none() {
             return;
         }
@@ -2633,6 +2660,10 @@ impl ClassicDriver<'_> {
     /// report preparing. Every refusal reports through the mailbox
     /// and the bounded report path; the reservation refunds by drop.
     fn take_promotion_work(&mut self) {
+        #[cfg(test)]
+        {
+            self.take_promotion_work_calls += 1;
+        }
         use crate::inventory_promotion::PromotionRefusal;
         use crate::inventory_promotion::lifecycle::validate_subset_shape;
         // A's promotion wind-down holds B: no preparation or
@@ -2787,18 +2818,22 @@ impl ClassicDriver<'_> {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         cause: &str,
     ) -> String {
+        // A recorded terminal graph refusal predates any later
+        // verdict, so it wins as the abandon reason (§1.9, §6.4).
+        let reason = coordinator
+            .collected_graph_refused()
+            .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
         if !lane.is_finished()
             && latched
-            && let Ok(batch) =
-                lane.abandon_finish_for_exit(coordinator, "joint finish disposition required")
+            && let Ok(batch) = lane.abandon_finish_for_exit(coordinator, reason)
         {
             coordinator.stage_semantic_batch(batch);
             let _ = commit_semantic_finish(coordinator, &mut lane);
         }
         ExitRetention::hold(lane);
         if latched {
-            "joint finish disposition required".to_string()
+            reason.to_string()
         } else {
             cause.to_string()
         }
@@ -3127,7 +3162,18 @@ impl ClassicDriver<'_> {
     /// finish (T16b refines Pending with its publication query); a
     /// retryable refusal stays, anything else notes the failure and
     /// takes the finite stop. Never retires directly.
-    fn step_not_begun_winding(&mut self) -> bool {
+    /// One NotBegun §8.3 step over an explicit lane slot (§6.1,
+    /// §6.3): poll the pending commit — stay while it pends, begin
+    /// once it publishes — or fail the finish through I2 on a
+    /// non-retryable refusal. The winding and final-lane retained
+    /// steps share it; callers count polls and begins.
+    fn step_not_begun_joint_finish(
+        lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
+        finish: &mut JointFinishDriver,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        first_error: &mut Option<String>,
+        commit_retries: &mut u16,
+    ) -> NotBegunStep {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
@@ -3137,74 +3183,150 @@ impl ClassicDriver<'_> {
             Stayed,
             Fail(crate::inventory_semantics::SemanticRefusal),
         }
-        let outcome = {
-            let retiring = self.retiring.as_mut().expect("a winding lane retires");
-            let winding = retiring.winding.as_mut().expect("a winding lane retires");
-            let Some(lane) = winding.lane.as_mut() else {
-                return false;
-            };
-            match lane.poll_joint_commit(&mut *self.coordinator, &mut budget) {
-                Ok(_) => Outcome::Begin,
-                Err(reason) => {
-                    if winding.note_commit_refusal(reason) {
-                        Outcome::Stayed
-                    } else {
-                        Outcome::Fail(reason)
-                    }
-                }
-            }
+        let outcome = match lane.as_mut() {
+            None => return NotBegunStep::Idle,
+            Some(lane) => match lane.poll_joint_commit(coordinator, &mut budget) {
+                Ok(JointCommitProgress::Published(_)) => Outcome::Begin,
+                Ok(JointCommitProgress::Pending) => Outcome::Stayed,
+                Err(reason) if note_commit_refusal_once(commit_retries, reason) => Outcome::Stayed,
+                Err(reason) => Outcome::Fail(reason),
+            },
         };
         match outcome {
-            Outcome::Stayed => false,
+            Outcome::Stayed => NotBegunStep::Stepped,
             Outcome::Begin => {
-                #[cfg(test)]
-                {
-                    self.joint_begin_calls += 1;
-                }
-                let retiring = self.retiring.as_mut().expect("a winding lane retires");
-                let winding = retiring.winding.as_mut().expect("a winding lane retires");
-                let Some(lane) = winding.lane.as_mut() else {
-                    return false;
+                let begun = match lane.as_mut() {
+                    Some(lane) => Self::begin_lane_finish(lane, coordinator),
+                    None => return NotBegunStep::Idle,
                 };
-                match Self::begin_lane_finish(lane, &mut *self.coordinator) {
+                match begun {
                     JointFinishDriver::Abandoned => {
-                        let lane = winding.lane.take().expect("winding lane");
-                        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
-                            lane,
-                            &mut *self.coordinator,
+                        let live = lane.take().expect("a begun lane holds");
+                        *first_error = Some(Self::hold_joint_lane_for_exit(
+                            live,
+                            coordinator,
                             "joint finish disposition required",
                         ));
-                        winding.finish = JointFinishDriver::Abandoned;
+                        *finish = JointFinishDriver::Abandoned;
                     }
                     begun => {
-                        winding.finish = begun;
+                        *finish = begun;
                     }
                 }
-                false
+                NotBegunStep::Began
             }
             Outcome::Fail(reason) => {
-                let retiring = self.retiring.as_mut().expect("a winding lane retires");
-                let winding = retiring.winding.as_mut().expect("a winding lane retires");
-                let Some(lane) = winding.lane.as_mut() else {
-                    return false;
+                let finished = match lane.as_mut() {
+                    Some(inner) => {
+                        inner.note_joint_finish_failure(reason);
+                        inner.is_finished()
+                    }
+                    None => return NotBegunStep::Idle,
                 };
-                lane.note_joint_finish_failure(reason);
-                let finished = lane.is_finished();
-                let lane = winding.lane.take().expect("winding lane");
-                self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
-                    lane,
-                    &mut *self.coordinator,
+                let live = lane.take().expect("a failed lane holds");
+                *first_error = Some(Self::hold_joint_lane_for_exit(
+                    live,
+                    coordinator,
                     "joint finish disposition required",
                 ));
                 if finished {
-                    self.coordinator.note_scope_gap(
+                    let reason = coordinator
+                        .collected_graph_refused()
+                        .unwrap_or("joint finish disposition required");
+                    coordinator.note_scope_gap(
                         "joint finish held for exit".to_string(),
-                        "joint finish disposition required".to_string(),
+                        reason.to_string(),
                     );
                 }
-                winding.finish = JointFinishDriver::Abandoned;
-                false
+                *finish = JointFinishDriver::Abandoned;
+                NotBegunStep::Stepped
             }
+        }
+    }
+
+    fn step_not_begun_winding(&mut self) -> bool {
+        let retiring = self.retiring.as_mut().expect("a winding lane retires");
+        let winding = retiring.winding.as_mut().expect("a winding lane retires");
+        let stepped = Self::step_not_begun_joint_finish(
+            &mut winding.lane,
+            &mut winding.finish,
+            &mut *self.coordinator,
+            &mut self.joint_first_error,
+            &mut winding.commit_retries,
+        );
+        match stepped {
+            NotBegunStep::Began => {
+                #[cfg(test)]
+                {
+                    self.joint_commit_polls += 1;
+                    self.joint_begin_calls += 1;
+                }
+            }
+            NotBegunStep::Stepped => {
+                #[cfg(test)]
+                {
+                    self.joint_commit_polls += 1;
+                }
+            }
+            NotBegunStep::Idle => {}
+        }
+        false
+    }
+
+    /// One retained §8.3 step for the final Joint lane (§6.1, §6.3),
+    /// shared by the suspended tick and Publication disposal:
+    /// NotBegun polls a pending commit or begins; a begun finish
+    /// steps; an abandoned finish rests.
+    fn step_retained_joint_finish(&mut self) {
+        if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            return;
+        }
+        if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
+            if self.joint_commit_pending {
+                let stepped = Self::step_not_begun_joint_finish(
+                    &mut self.semantic,
+                    &mut self.joint_finish,
+                    &mut *self.coordinator,
+                    &mut self.joint_first_error,
+                    &mut self.joint_commit_retries,
+                );
+                match stepped {
+                    NotBegunStep::Began => {
+                        self.joint_commit_pending = false;
+                        #[cfg(test)]
+                        {
+                            self.joint_commit_polls += 1;
+                            self.joint_begin_calls += 1;
+                        }
+                    }
+                    NotBegunStep::Stepped => {
+                        #[cfg(test)]
+                        {
+                            self.joint_commit_polls += 1;
+                        }
+                    }
+                    NotBegunStep::Idle => {}
+                }
+            } else {
+                self.begin_final_joint_finish();
+            }
+            return;
+        }
+        if matches!(self.joint_finish, JointFinishDriver::Abandoned) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.joint_step_calls += 1;
+        }
+        let outcome = Self::step_begun_joint_finish(
+            &mut self.semantic,
+            &mut self.joint_finish,
+            &mut *self.coordinator,
+            &mut self.joint_first_error,
+        );
+        if matches!(outcome, JointStepOutcome::WoundDown) {
+            self.complete_final_joint_lane();
         }
     }
 
@@ -3710,9 +3832,6 @@ pub(crate) fn bind_semantic_candidates(
 /// today's reads; a retained run drains beside its driver, and a
 /// malformed mixture holds its owners and reports.
 impl ClassicDriver<'_> {
-    /// RED scaffolding: the finished arm reads through; the
-    /// retained and mixed arms stay inert until the implementation
-    /// commit wires the poll loop and the I2 exit.
     fn consume_outcome(
         &mut self,
         outcome: ClassicOutcome<FacadeLane>,
@@ -3723,15 +3842,132 @@ impl ClassicDriver<'_> {
         Option<anyhow::Error>,
         Option<ZeroPassStop>,
     ) {
-        let _ = (clock, publish);
         match outcome.into_completion() {
             Ok(ClassicCompletion::Finalized {
                 stopped,
                 error,
                 zero_pass,
-            }) => (stopped, error, zero_pass),
-            Ok(ClassicCompletion::Retained { run: _, error: _ }) => (None, None, None),
-            Err(_) => (None, None, None),
+            }) => {
+                self.complete_published_joint_lane();
+                (stopped, self.fold_retained_joint_error(error), zero_pass)
+            }
+            Ok(ClassicCompletion::Retained { run, error }) => {
+                self.consume_retained_run(run, error, clock, publish)
+            }
+            Err(mixed) => {
+                // Defensive: neither loop mixes retained owners with
+                // stopped evidence. Hold the run for exit and report.
+                if let Some(run) = mixed.retained {
+                    ExitRetention::hold(run);
+                }
+                let error = mixed.error.or_else(|| {
+                    Some(anyhow::anyhow!(
+                        "retained completion mixed stopped and unfinished owners"
+                    ))
+                });
+                (mixed.stopped, error, mixed.zero_pass)
+            }
+        }
+    }
+
+    /// Fold the Joint first error into a retained outcome's error
+    /// channel: the retained error (if any) predates the I2 verdict,
+    /// so it stays first. Synchronous outcomes keep today's reads.
+    fn fold_retained_joint_error(&mut self, error: Option<anyhow::Error>) -> Option<anyhow::Error> {
+        if self.suspended {
+            error.or_else(|| {
+                self.joint_first_error
+                    .take()
+                    .map(|first| anyhow::anyhow!(first))
+            })
+        } else {
+            error
+        }
+    }
+
+    /// Release a Published Joint lane at the terminal consume: no
+    /// further hook will reap it. Steps the wound-down on the 10 ms
+    /// cadence until the lane completes or the finish abandons; the
+    /// detach worker is finite, like the §8.3 hooks. Polling and
+    /// unbegun lanes stay seated for their hooks.
+    fn complete_published_joint_lane(&mut self) {
+        while matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some() {
+            let started = Instant::now();
+            self.step_retained_joint_finish();
+            if matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some()
+            {
+                let elapsed = started.elapsed();
+                if elapsed < Duration::from_millis(10) {
+                    std::thread::sleep(Duration::from_millis(10) - elapsed);
+                }
+            }
+        }
+    }
+
+    /// Drain a retained run beside its driver: every 10 ms poll with
+    /// a 1024-action budget until the run finalizes. An abandoned
+    /// Joint finish exits through the folded first error; the lane
+    /// stays held, never joined or minted.
+    fn consume_retained_run(
+        &mut self,
+        run: RetainedClassicRun<FacadeLane>,
+        error: Option<anyhow::Error>,
+        clock: &LoopClock,
+        publish: &mut dyn FnMut(&mut Self, Publish<'_>) -> Result<()>,
+    ) -> (
+        Option<Stopped<FacadeLane>>,
+        Option<anyhow::Error>,
+        Option<ZeroPassStop>,
+    ) {
+        self.suspended = true;
+        let mut outcome = ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(run),
+        };
+        loop {
+            match outcome.into_completion() {
+                Ok(ClassicCompletion::Finalized {
+                    stopped,
+                    error,
+                    zero_pass,
+                }) => {
+                    self.complete_published_joint_lane();
+                    return (stopped, self.fold_retained_joint_error(error), zero_pass);
+                }
+                Ok(ClassicCompletion::Retained { run, error }) => {
+                    let started = Instant::now();
+                    let mut budget = RetainedWorkBudget {
+                        remaining_actions: 1024,
+                        deadline: started + Duration::from_millis(10),
+                    };
+                    outcome = poll_retained_classic(self, run, error, clock, &mut budget, publish);
+                    // A finalizing poll calls no driver hooks, so the
+                    // consumer keeps the dashboard live once per cycle.
+                    if let Some(display) = self.display.as_mut() {
+                        display.tick();
+                    }
+                    // Pace the wait only: a terminal poll returns now.
+                    if outcome.retained.is_some() {
+                        let elapsed = started.elapsed();
+                        if elapsed < Duration::from_millis(10) {
+                            std::thread::sleep(Duration::from_millis(10) - elapsed);
+                        }
+                    }
+                }
+                Err(mixed) => {
+                    if let Some(run) = mixed.retained {
+                        ExitRetention::hold(run);
+                    }
+                    let error = mixed.error.or_else(|| {
+                        Some(anyhow::anyhow!(
+                            "retained completion mixed stopped and unfinished owners"
+                        ))
+                    });
+                    return (mixed.stopped, error, mixed.zero_pass);
+                }
+            }
         }
     }
 }
@@ -3744,15 +3980,42 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     /// Whether a publication is still owed: a begun-but-unpublished
-    /// Joint commit, or a Joint finish mid-poll. RED scaffolding:
-    /// inert until the implementation commit.
+    /// Joint commit, or a Joint finish mid-poll, beside a live lane.
+    /// A held lane owes nothing further.
     fn publication_pending(&self) -> bool {
-        false
+        self.semantic.is_some()
+            && (self.joint_commit_pending
+                || matches!(self.joint_finish, JointFinishDriver::Polling))
     }
 
     /// The suspension gate (§6.2): latch only, never terminal I/O.
-    /// RED scaffolding: inert until the implementation commit.
-    fn on_publication_suspended(&mut self) {}
+    fn on_publication_suspended(&mut self) {
+        self.suspended = true;
+    }
+
+    /// Spend one retained hook on a blocked publication (§6.1): a
+    /// Joint lane steps its §8.3 driver once, then the block holds
+    /// while anything stays pending. Blocks the loop's table owns —
+    /// collected, scoped completion, native — resolve with no step;
+    /// the N1 wait lives in the table, not here.
+    fn dispose_retained<L>(
+        &mut self,
+        block: RetainedBlock,
+        _run: &mut RetainedClassicRun<L>,
+        _budget: &mut RetainedWorkBudget,
+    ) -> Result<BlockDisposition> {
+        if !matches!(block, RetainedBlock::Publication)
+            || !self.semantic.as_ref().is_some_and(Self::is_joint_lane)
+        {
+            return Ok(BlockDisposition::Resolved);
+        }
+        self.step_retained_joint_finish();
+        if self.publication_pending() {
+            Ok(BlockDisposition::Pending)
+        } else {
+            Ok(BlockDisposition::Resolved)
+        }
+    }
 
     fn collector(&mut self) -> crate::inventory_capture::CollectJob {
         if let Some(cgroup) = &mut self.cgroup {
@@ -3851,6 +4114,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.commit_calls += 1;
+            if let Some(text) = take_classic_commit_fault_for_test() {
+                return Err(anyhow::anyhow!(text));
+            }
+        }
         let receipt = match self.semantic.as_mut() {
             Some(lane) => self
                 .coordinator
@@ -3889,6 +4159,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     fn on_tick(&mut self) {
         if let Some(display) = self.display.as_mut() {
             display.tick();
+        }
+        // While suspended the hook services only the display above
+        // and one retained step of the Joint finish (§6.3): no
+        // promotion, no lane ticks, no new work.
+        if self.suspended {
+            self.step_retained_joint_finish();
+            return;
         }
         // Item 9: while the final Joint finish polls or reaps outside
         // any promotion, the hook runs only the display tick above
@@ -3976,6 +4253,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         &mut self,
         mut capture: Option<&mut dyn crate::inventory_capture::CaptureLane<PidPin>>,
     ) {
+        if self.suspended {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.service_caller_metadata_calls += 1;
+        }
         self.coordinator.service_caller_metadata(
             |original, window| match capture.as_mut() {
                 Some(capture) => capture.observe_caller_image(original, window),
@@ -10354,7 +10638,10 @@ mod tests {
         let (source, mint_polls, _) = CountingSource::scripted(None);
         driver.completion_source = Some(Box::new(source));
         let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
-        let (run, error) = retained_run_of(outcome);
+        let (mut run, error) = retained_run_of(outcome);
+        // G4's closer owes its publication: the retained hook spends
+        // its credit stepping the Joint driver, which sees the latch.
+        run.block = Some(RetainedBlock::Publication);
         let stop = Cell::new(false);
         let stop_now = || stop.get();
         let clock = consume_clock(&stop_now);
@@ -10421,6 +10708,14 @@ mod tests {
             driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, error) = retained_run_of(outcome);
+            run.block = Some(RetainedBlock::Publication);
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
             let stop = Cell::new(false);
             let stop_now = || stop.get();
             let clock = consume_clock(&stop_now);
@@ -10450,6 +10745,14 @@ mod tests {
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
             driver.joint_finish = JointFinishDriver::Published;
+            let (mut run, error) = retained_run_of(outcome);
+            run.block = Some(RetainedBlock::Publication);
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
             let stop = Cell::new(false);
             let stop_now = || stop.get();
             let clock = consume_clock(&stop_now);
@@ -10493,6 +10796,14 @@ mod tests {
             driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, error) = retained_run_of(outcome);
+            run.block = Some(RetainedBlock::Publication);
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
             let stop = Cell::new(false);
             let stop_now = || stop.get();
             let clock = consume_clock(&stop_now);
@@ -10532,6 +10843,16 @@ mod tests {
         let (source, mint_polls, _) = CountingSource::scripted(None);
         driver.completion_source = Some(Box::new(source));
         let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let (mut run, error) = retained_run_of(outcome);
+        // The G6 one-short owes its publication: the drain's first
+        // hook steps the Joint driver, which sees the latch.
+        run.block = Some(RetainedBlock::Publication);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(run),
+        };
         let stop = Cell::new(false);
         let stop_now = || stop.get();
         let clock = consume_clock(&stop_now);

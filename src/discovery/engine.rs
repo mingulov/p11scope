@@ -39,10 +39,8 @@ use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
 use crate::run::OwnedChild;
-#[cfg(test)]
-use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_edge::resources::{
-    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourcePool, SemanticResourceReserver,
 };
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};

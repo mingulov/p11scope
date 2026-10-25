@@ -60,4 +60,10 @@ int p11_journal_marker_read(const struct instance_record *rec, u64 *exec_out);
  * latch and refuses. Returns 1 admitted, 0 refused. */
 int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, u64 exec);
 
+/* Bare reservation: spends one permit below the cap without checking
+ * any marker word. The birth roots charge before they allocate; any
+ * failure trips the failed latch and refuses. Returns 1 reserved,
+ * 0 refused. */
+int p11_journal_marker_reserve(struct journal_admission_control *ctl);
+
 #endif

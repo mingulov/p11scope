@@ -74,20 +74,15 @@ int p11_journal_marker_read(const struct instance_record *rec, u64 *exec_out)
     return P11_JOURNAL_MARKER_READY;
 }
 
-int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, u64 exec)
+int p11_journal_marker_reserve(struct journal_admission_control *ctl)
 {
-    u64 ready, observed;
+    u64 observed;
     int tries;
 
     if (!ctl)
         return 0;
     if (__sync_fetch_and_add(&ctl->failed, 0) != 0)
         return 0;
-    ready = (exec << 2) | P11_JOURNAL_MARKER_READY_STATE;
-    if (marker != ready) {
-        __sync_lock_test_and_set(&ctl->failed, 1);
-        return 0;
-    }
     /* Bounded ATOMIC reservation with the failure-latch protocol:
      * the permit is spent by compare-exchange, so two CPUs observing
      * the last permit cannot both win. Genuine bound-exceed trips the
@@ -111,4 +106,20 @@ int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, 
     }
     __sync_lock_test_and_set(&ctl->failed, 1);
     return 0;
+}
+
+int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, u64 exec)
+{
+    u64 ready;
+
+    if (!ctl)
+        return 0;
+    if (__sync_fetch_and_add(&ctl->failed, 0) != 0)
+        return 0;
+    ready = (exec << 2) | P11_JOURNAL_MARKER_READY_STATE;
+    if (marker != ready) {
+        __sync_lock_test_and_set(&ctl->failed, 1);
+        return 0;
+    }
+    return p11_journal_marker_reserve(ctl);
 }

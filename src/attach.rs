@@ -1382,6 +1382,15 @@ enum OwnedProducerDetach {
     Complete,
 }
 
+/// Non-consuming reap progress: `Pending` keeps the SAME worker thread
+/// and every original lease in place; only a joined receipt reaches
+/// `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProducerDetachProgress {
+    Pending,
+    Complete,
+}
+
 impl OwnedProducerDetach {
     fn started(&self) -> bool {
         !matches!(self, Self::NotStarted)
@@ -1455,6 +1464,31 @@ impl OwnedProducerDetach {
             *self = Self::Complete;
         }
         result
+    }
+
+    /// Non-consuming reap stub (RED): completes early and consumes the
+    /// worker instead of keeping the SAME worker while it is blocked.
+    fn poll(
+        &mut self,
+        _failures: &mut Vec<String>,
+        _detached: &mut bool,
+        _wall_ms: &mut u64,
+        _out: &mut dyn std::io::Write,
+    ) -> Result<ProducerDetachProgress> {
+        if matches!(self, Self::NotStarted) {
+            bail!("owned producer detach not begun");
+        }
+        let prior = std::mem::replace(self, Self::Unproved);
+        match prior {
+            Self::Pending { .. } => Ok(ProducerDetachProgress::Complete),
+            Self::Complete => {
+                *self = Self::Complete;
+                Ok(ProducerDetachProgress::Complete)
+            }
+            Self::NotStarted | Self::Unproved => {
+                bail!("producer detach has no unsettled owned job; completion remains unproven")
+            }
+        }
     }
 }
 
@@ -7405,6 +7439,21 @@ impl Session {
         )
     }
 
+    /// Non-consuming reap of the owned producer detach over this
+    /// Session's exact detach fields. `Pending` keeps the SAME worker;
+    /// only a joined receipt settles the Session.
+    pub(crate) fn poll_owned_producer_detach(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<ProducerDetachProgress> {
+        self.producer_detach.poll(
+            &mut self.detach_failures,
+            &mut self.producers_detached,
+            &mut self.detach_wall_ms,
+            out,
+        )
+    }
+
     /// Existing one-step callers submit and then drive that exact job.
     pub(crate) fn detach_producers_driven(
         &mut self,
@@ -10379,6 +10428,150 @@ mod tests {
         )
         .unwrap();
         assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+    }
+
+    #[test]
+    fn owned_detach_poll_preserves_original_worker_and_leases() {
+        // A poll before begin is refused without consuming: the Session
+        // can still begin its owned detach afterwards.
+        let mut idle = OwnedProducerDetach::NotStarted;
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall = 0;
+        let error = idle
+            .poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink(),
+            )
+            .expect_err("a poll before begin is refused");
+        assert_eq!(format!("{error:#}"), "owned producer detach not begun");
+        assert!(
+            matches!(idle, OwnedProducerDetach::NotStarted),
+            "a refused poll keeps NotStarted for the later begin"
+        );
+        assert!(!detached && failures.is_empty());
+
+        // A real worker with a blocked closer and a real lease file.
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let lease = Arc::downgrade(&file);
+        let mut source = Some(terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        ));
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        worker.submit(
+            source.take().into_iter().collect(),
+            Arc::new(vec![file]),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let original = match &job {
+            OwnedProducerDetach::Pending { worker, .. } => worker.original_thread_id(),
+            _ => None,
+        };
+        assert!(original.is_some(), "the owned worker thread is prestarted");
+        assert!(source.is_none());
+        for _ in 0..3 {
+            let progress = job
+                .poll(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    &mut std::io::sink(),
+                )
+                .unwrap();
+            assert!(
+                matches!(progress, ProducerDetachProgress::Pending),
+                "a blocked close keeps the owned detach pending"
+            );
+            match &job {
+                OwnedProducerDetach::Pending { worker, .. } => assert_eq!(
+                    worker.original_thread_id(),
+                    original,
+                    "a pending poll keeps the SAME worker thread"
+                ),
+                _ => panic!("a pending poll must not consume the owned job"),
+            }
+            assert!(!detached && failures.is_empty());
+            assert!(
+                lease
+                    .upgrade()
+                    .is_some_and(|file| file.metadata().is_ok()),
+                "a pending poll keeps the original leases"
+            );
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    &mut std::io::sink(),
+                )
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(detached && failures.is_empty());
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        // Completion is idempotent: a settled poll stays settled.
+        let progress = job
+            .poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink(),
+            )
+            .unwrap();
+        assert!(matches!(progress, ProducerDetachProgress::Complete));
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+
+        // An unproved job stays unproved and refuses idempotently.
+        let mut job = OwnedProducerDetach::Unproved;
+        let mut detached = false;
+        assert!(
+            job.poll(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                &mut std::io::sink()
+            )
+            .is_err(),
+            "an unproved poll stays a refusal"
+        );
+        assert!(!detached && matches!(job, OwnedProducerDetach::Unproved));
     }
 
     #[test]

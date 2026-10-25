@@ -6,28 +6,24 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.4.0.** This intermediate source checkpoint provides `doctor`,
+> **Status: v0.5.0.** This source provides `doctor`,
 > `inspect` (`--system` is a preview), `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with `--cgroup` scope, offline `diff`
 > comparison and diagnostics), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
-> per-edge entry counts, and schema v3. Object-attribute capture is not
-> enabled in the selected P0 build (`--no-default-features --features
-> stub-object-attributes`; disclosed as structured evidence). Ordinary source
-> builds default to FULL, whose broader installed acceptance remains open. Its
-> [known limitations](../CHANGELOG.md#known-limitations) apply throughout.
-> The [v0.4.0 source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
-> provides no new binary bundles or complete installed/package qualification;
-> [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) preserves
-> revision-specific pre-release evidence. [Install](../README.md#install)
-> distinguishes the source build from the older v0.3.0 binary downloads.
-> The [privacy allowlist](privacy/allowlist-v1.md) defines the capture
-> boundary, and the [profile schema](schema/observed-profile-v3.md) defines
-> public evidence and its authority.
+> per-edge entry counts, FULL object-attribute capture in release builds
+> (P0 stays an explicit option), and schema v3; its
+> [known limitations](../CHANGELOG.md#known-limitations) apply throughout,
+> [Install](../README.md#install) distinguishes the source build from the
+> older v0.3.0 binary downloads, and
+> [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) records what
+> this release was qualified on. The [privacy allowlist](privacy/allowlist-v1.md)
+> and the [profile schema](schema/observed-profile-v3.md) define the capture
+> boundary and public evidence.
 
 `--counter-mode counts|timestamps|latency` is reserved for `profile` or `run`
-with `--mode metrics`. Explicit selections are unavailable in this checkpoint
-and return `counter-mode-unwired` before capture setup or owned-child launch.
+with `--mode metrics`. Explicit selections are unavailable and return
+`counter-mode-unwired` before capture setup or owned-child launch.
 Omit `--counter-mode` to keep existing metrics behavior.
 
 - [What it does](#what-it-does)

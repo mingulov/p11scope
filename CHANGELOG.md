@@ -5,14 +5,101 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [Unreleased]
+## [0.5.0] - UNRELEASED
 
+v0.5.0: official release builds read object attributes by default (FULL),
+with the P0 build staying an explicit option. Text inventory snapshots
+carry a `key operations:` summary line, over-budget inventory plans name
+`--max-endpoints`, reserved `--counter-mode` selections are refused with
+a named error, and discovery handles kernel threads and processes whose
+main thread already exited. User-facing limits live in
+[docs/known-limitations.md](docs/known-limitations.md).
+
+### Scale and --system
+
+- An inventory plan that exceeds the endpoint budget below 8,192 now names
+  the fix: the refusal ends with `raise --max-endpoints (up to 8192)`.
+  At the 8,192 maximum the hint is omitted.
+- System scans treat kernel threads as verified absence: a thread with no
+  memory mappings and the kernel-thread flag is recorded as having no
+  providers instead of an error.
+
+### Inventory output
+
+- Text snapshots carry a `key operations:` summary line from the same
+  shared tally as the dashboard: per-category completed/failed/active
+  counts once object observations are populated, else `key operations:
+  unavailable (<reason>)`. `--json` keeps the full rows.
+- A combined key label is withheld when the class and key type are
+  incompatible, instead of printing a misleading label.
+- Edwards and Montgomery key types are recognized at their standard
+  numbers in FULL object reads.
+
+### Identity and containers
+
+- Discovery follows a surviving thread when the target's main thread
+  already exited, and confirms member-carrying reads through the member
+  executable only.
+- The example Kubernetes DaemonSet raises the observer memory limit to
+  768Mi.
+
+### Privacy and capture
+
+- The FULL object-attribute read set is approved in
+  [allowlist-v3](docs/privacy/allowlist-v3.md): class, key type, token
+  flag, value length, RSA modulus bits and finite EC parameters, with
+  the result rules, retention table and publication section. Nothing
+  else in v3 grants capture.
+- `--counter-mode counts|timestamps|latency` stays reserved for
+  `profile`/`run` with `--mode metrics`: explicit selections return
+  `counter-mode-unwired` before capture setup. Omit the flag to keep
+  existing metrics behavior.
+- Startup readiness bounds are disclosed per kernel (8 s on 6.6+,
+  30 s on 5.15/6.1); see
+  [known limitations](docs/known-limitations.md#known-limitations-v050).
+
+### Packaging
+
+- Official release builds are FULL by default (object-attribute capture
+  on); `--capture-mode p0` selects the P0 variant for the
+  verifier-budget lane.
+- Release packages record the capture mode and feature set in
+  `RELEASE.json`.
 - Update current host builds to Rust 1.99.1. Preserve the pinned BPF nightly,
   linker and historical 1.98.1 baseline; CI selects the host transition
   explicitly and gives each source/configuration its own build target.
 - Bind compiler notices to the selected release and refresh verified Rust,
   LLVM runtime and helper-image inputs. Image/package metadata checks do not
   replace the separate installed and packaging qualification.
+
+### Fixed
+
+- `inspect` and discovery refuse corrupt ELF segments and validate mmap
+  segment ranges instead of misreading them.
+
+### Known limitations
+
+The v0.5.0 limits live in
+[docs/known-limitations.md](docs/known-limitations.md#known-limitations-v050).
+Most important for this release:
+
+- Strict scale and speed numbers apply only on kernels with uprobe_multi
+  (6.6 and later); older kernels stay correct but stop slowly and start
+  slowly.
+- Startup takes about 15–22 s on 5.15/6.1, about 4–7 s on 6.6+.
+- `--counter-mode` selections are reserved and refused; metrics behavior
+  without the flag is unchanged.
+- In containers, a process that loaded a provider before a copy-up is
+  attributed to the copied-up file and its later calls are missed;
+  restart such processes.
+- A timed run shorter than the first full pass reports 0 callers with a
+  `no complete collection pass` gap.
+- Per-call profile/trace capture stays fixed at 512 attach slots.
+- Only 30 minutes of bounded useful activity is claimed.
+
+### Qualification of this release
+
+The kernels, lanes and results this release was qualified on are recorded here at release time.
 
 ## [0.4.0] - 2026-10-21
 

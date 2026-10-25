@@ -24847,6 +24847,18 @@ impl Engine {
                 self.refuse_graph_after_closed(graph);
                 return Self::graph_idle(true);
             }
+            // Every sink is ready before the first swap: a later refusal
+            // must not leave the pins half-swapped. At install step 0 the
+            // plan was never installed, so a present removed list means
+            // Ready (a cancelled or unfinished cursor answers None).
+            if graph.pins.retired_entry_count().is_none()
+                || graph.rebind.modules().is_none()
+                || graph.plan.removed().is_none()
+                || graph.backing_storage.is_none()
+            {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            }
             let pins_backing = match graph.pins.install_ready(&mut self.pinned) {
                 Ok(backing) => backing,
                 Err(_) => {

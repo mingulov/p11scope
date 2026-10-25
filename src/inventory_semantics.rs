@@ -799,6 +799,17 @@ pub(crate) struct AttestedSemanticLane {
     /// Tests-only count of `initialize_joint` calls.
     #[cfg(test)]
     joint_init_calls: usize,
+    /// Tests-only scripted Joint-commit begin outcome: when set,
+    /// `begin_joint_commit` answers it without a live machine, so
+    /// the driver's begin-once wiring runs unprivileged.
+    #[cfg(test)]
+    scripted_joint_begin: Option<Result<(), JointCommitRefusal>>,
+    /// Tests-only count of `begin_joint_commit` calls.
+    #[cfg(test)]
+    joint_commit_begin_calls: usize,
+    /// Tests-only count of `service_joint` calls.
+    #[cfg(test)]
+    joint_service_calls: usize,
     /// Tests-only scripted Finish begin outcome: when set, the begin
     /// answers it without a live machine, so the driver's begin-Ok
     /// arm runs unprivileged. Sticky; tests clear it explicitly.
@@ -1255,6 +1266,12 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             joint_init_calls: 0,
             #[cfg(test)]
+            scripted_joint_begin: None,
+            #[cfg(test)]
+            joint_commit_begin_calls: 0,
+            #[cfg(test)]
+            joint_service_calls: 0,
+            #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
             scripted_finish_poll: None,
@@ -1388,6 +1405,12 @@ impl AttestedSemanticLane {
             scripted_joint_init: None,
             #[cfg(test)]
             joint_init_calls: 0,
+            #[cfg(test)]
+            scripted_joint_begin: None,
+            #[cfg(test)]
+            joint_commit_begin_calls: 0,
+            #[cfg(test)]
+            joint_service_calls: 0,
             #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
@@ -1721,6 +1744,29 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn joint_init_calls_for_test(&self) -> usize {
         self.joint_init_calls
+    }
+
+    /// Script the Joint-commit begin outcome (or clear it with
+    /// `None`): the begin answers it without a live machine, so the
+    /// driver's begin-once wiring runs unprivileged.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_joint_begin_for_test(
+        &mut self,
+        outcome: Option<Result<(), JointCommitRefusal>>,
+    ) {
+        self.scripted_joint_begin = outcome;
+    }
+
+    /// How many `begin_joint_commit` calls this lane served.
+    #[cfg(test)]
+    pub(crate) fn joint_commit_begin_calls_for_test(&self) -> usize {
+        self.joint_commit_begin_calls
+    }
+
+    /// How many `service_joint` calls this lane served.
+    #[cfg(test)]
+    pub(crate) fn joint_service_calls_for_test(&self) -> usize {
+        self.joint_service_calls
     }
 
     /// Script the Finish begin outcome (or clear it with `None`):

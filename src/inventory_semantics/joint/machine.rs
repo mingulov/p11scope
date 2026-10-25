@@ -3208,6 +3208,10 @@ impl AttestedSemanticLane {
         mode: JointServiceMode,
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
+        #[cfg(test)]
+        {
+            self.joint_service_calls += 1;
+        }
         self.with_machine(coordinator, |machine, lane, coordinator, io| {
             machine.service_with_io(lane, coordinator, io, mode, budget)
         })
@@ -3217,6 +3221,14 @@ impl AttestedSemanticLane {
         &mut self,
         engine_changed: bool,
     ) -> Result<(), JointCommitRefusal> {
+        #[cfg(test)]
+        {
+            self.joint_commit_begin_calls += 1;
+        }
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_joint_begin {
+            return scripted;
+        }
         let machine = self
             .live
             .as_deref_mut()

@@ -12437,6 +12437,211 @@ mod tests {
         driver.on_tick();
         assert_eq!(ticks.get(), 2, "a refused lane keeps legacy service");
     }
+
+    #[test]
+    fn joint_poll_commit_begins_once_then_polls_the_commit() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        // The first call carries the engine change and begins; the
+        // poll refuses without a live machine, and the refusal
+        // propagates instead of a fabricated publication.
+        let first = driver.poll_commit(true);
+        assert!(first.is_err(), "the commit poll's refusal propagates");
+        assert!(
+            driver.joint_commit_pending,
+            "a begun commit pends across hooks"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "begin runs once per publication"
+        );
+        assert_eq!(driver.joint_commit_polls, 1, "the first call polls once");
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no legacy commit on the Joint path"
+        );
+        // A retry passes false and resumes polling without re-beginning.
+        let second = driver.poll_commit(false);
+        assert!(second.is_err(), "the resumed poll still refuses");
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "retries never re-begin"
+        );
+        assert_eq!(driver.joint_commit_polls, 2, "every call polls");
+        assert_eq!(
+            driver.commit_calls, 0,
+            "still no legacy commit on the Joint path"
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_begin_refusal_fails_without_polling() {
+        // The natural refusal (no live machine: NotInitialized) and
+        // the scripted DispositionRequired twin share one mapping:
+        // the begin error fails the call with no poll and no flag.
+        for scripted in [
+            None,
+            Some(Err(
+                crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
+            )),
+        ] {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_joint_begin_for_test(scripted);
+            driver.semantic = Some(lane);
+            let outcome = driver.poll_commit(true);
+            assert!(outcome.is_err(), "a refused begin fails the call");
+            assert!(
+                !driver.joint_commit_pending,
+                "a refused begin pends nothing"
+            );
+            assert_eq!(
+                driver
+                    .semantic
+                    .as_ref()
+                    .expect("lane stays seated")
+                    .joint_commit_begin_calls_for_test(),
+                1,
+                "the begin is attempted once"
+            );
+            assert_eq!(
+                driver.joint_commit_polls, 0,
+                "a refused begin never polls"
+            );
+            assert_eq!(
+                driver.commit_calls, 0,
+                "no legacy commit on the Joint path"
+            );
+        }
+    }
+
+    #[test]
+    fn joint_poll_commit_outstanding_begin_resumes_polling() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest,
+        )));
+        driver.semantic = Some(lane);
+        // An outstanding demand without the flag repairs the flag and
+        // resumes polling its original ownership.
+        let outcome = driver.poll_commit(false);
+        assert!(outcome.is_err(), "the resumed poll's refusal propagates");
+        assert!(
+            driver.joint_commit_pending,
+            "the outstanding commit pends across hooks"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "the begin is attempted once"
+        );
+        assert_eq!(driver.joint_commit_polls, 1, "the call polls once");
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no legacy commit on the Joint path"
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_legacy_lane_keeps_sync_commit() {
+        // Lock-in: a legacy lane's poll_commit is today's sync commit
+        // plus Published, with no Joint flag, begin or poll.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
+        let outcome = driver.poll_commit(true);
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a legacy commit publishes at once"
+        );
+        assert_eq!(driver.commit_calls, 1, "one sync commit runs");
+        assert!(
+            !driver.joint_commit_pending,
+            "a legacy commit pends nothing"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            0,
+            "a legacy commit never begins"
+        );
+        assert_eq!(driver.joint_commit_polls, 0, "a legacy commit never polls");
+    }
+
+    #[test]
+    fn joint_service_runs_during_slow_scan_and_staged_retry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        // A Joint lane with a freshly staged quantum: the legacy path
+        // would hold hooks behind the staged gate and retry the commit
+        // at the 1 s staleness deadline; the Joint path services every
+        // hook instead, without waiting out the staged age.
+        let ticks = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.ticks = Rc::clone(&ticks);
+        let mut lane = joint_lane(io, false);
+        lane.note_semantic_staged();
+        driver.semantic = Some(lane);
+        driver.semantic_staged = true;
+        // Thirty hooks is about 300 ms at the 10 ms service cadence:
+        // the same hook body the loop runs while a collection blocks.
+        for _ in 0..30 {
+            driver.on_tick();
+        }
+        let lane = driver.semantic.as_ref().expect("lane stays seated");
+        assert_eq!(
+            lane.joint_service_calls_for_test(),
+            30,
+            "every hook services the Joint lane (contract: at least 20)"
+        );
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no staged-commit retry on the Joint path"
+        );
+        assert_eq!(ticks.get(), 0, "no legacy lane tick on the Joint path");
+        assert!(
+            driver.semantic_staged,
+            "Joint service leaves the staged flag alone"
+        );
+        assert!(
+            lane.staged_semantic_age()
+                .is_some_and(|age| age < STAGED_SEMANTIC_MAX_AGE),
+            "the staged age stays under 1 s: never waited out"
+        );
+    }
 }
 
 #[cfg(test)]

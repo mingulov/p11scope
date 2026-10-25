@@ -179,6 +179,7 @@ impl SemanticResourcePool {
 
     /// A pool with an explicit byte limit. It keeps the permanent 1 MiB
     /// scratch charge, which counts against the limit.
+    #[allow(dead_code)] // Consumed by the dedicated graph pool wiring.
     pub(crate) fn with_limit(limit: usize) -> Self {
         Self::new(limit)
     }

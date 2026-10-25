@@ -11181,7 +11181,7 @@ mod tests {
             }
         }
         #[repr(align(16))]
-        struct OverAligned([u8; 16]);
+        struct OverAligned;
         assert!(
             matches!(
                 plan_tree_bytes::<OverAligned, u64>(1),

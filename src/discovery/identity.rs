@@ -12647,7 +12647,7 @@ mod tests {
             }
         }
         #[repr(align(16))]
-        struct OverAligned([u8; 16]);
+        struct OverAligned;
         assert!(
             conservative_pin_tree_bytes::<OverAligned, u64>(1).is_none(),
             "over-aligned keys refuse"

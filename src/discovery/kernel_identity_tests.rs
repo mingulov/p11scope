@@ -4621,7 +4621,7 @@ fn zombie_request_in_batch_is_named_zombie_batch_fallback() {
         .iter()
         .find(|(_, reason)| **reason == KernelFallbackReason::ZombieBatch)
         .expect("zombie request named in the oracle");
-    assert_eq!(KernelFallbackReason::ZombieBatch.label(), "zombie-batch");
+    assert_eq!(KernelFallbackReason::ZombieBatch.label(), "zombie_batch");
     assert!(
         out.fallback_reads
             .iter()
@@ -4634,7 +4634,7 @@ fn zombie_request_in_batch_is_named_zombie_batch_fallback() {
     assert_ne!(
         out.fallback.first_reason,
         Some(KernelFallbackReason::ZombieBatch),
-        "zombie-batch never surfaces: {:?}",
+        "zombie_batch never surfaces: {:?}",
         out.fallback.first_reason
     );
 }

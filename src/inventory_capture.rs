@@ -943,6 +943,32 @@ impl<L> NativeLane<L> {
         }
     }
 
+    /// Whether `disposition` may stop this lane: the read-only half of
+    /// `into_finite_stop`, shared with retained-block disposal so both
+    /// consult one admission rule.
+    fn finite_stop_admissible<Pin>(
+        &self,
+        disposition: NativeStopDisposition,
+        control: Option<&CollectionControl>,
+    ) -> bool
+    where
+        L: CaptureLane<Pin>,
+    {
+        match disposition {
+            NativeStopDisposition::Error => true,
+            NativeStopDisposition::Completed => self.passes > 0,
+            NativeStopDisposition::CancelledScoped => {
+                self.passes == 0
+                    && matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
+                    && control.is_some_and(|control| control.check().is_err())
+            }
+            NativeStopDisposition::CancelledUnscoped => {
+                self.passes == 0
+                    && !matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
+            }
+        }
+    }
+
     /// Admit the same real stop paths as the blocking adapter while keeping
     /// zero-pass rejection owned. No assertion or fabricated pass substitutes
     /// for scoped cancellation, the F9 latch or an original run failure.
@@ -955,20 +981,7 @@ impl<L> NativeLane<L> {
     where
         L: CaptureLane<Pin>,
     {
-        let valid = match disposition {
-            NativeStopDisposition::Error => true,
-            NativeStopDisposition::Completed => self.passes > 0,
-            NativeStopDisposition::CancelledScoped => {
-                self.passes == 0
-                    && matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
-                    && control.is_some_and(|control| control.check().is_err())
-            }
-            NativeStopDisposition::CancelledUnscoped => {
-                self.passes == 0
-                    && !matches!(self.capture.scope_coverage(), CaptureScopeCoverage::Cgroup)
-            }
-        };
-        if valid {
+        if self.finite_stop_admissible(disposition, control) {
             Ok(NativeStop::new(self))
         } else {
             Err(self)
@@ -1801,6 +1814,15 @@ pub(crate) enum PassCommitProgress {
     Published,
 }
 
+/// What one retained-block disposal concluded: the block still needs its
+/// owning driver (`Pending`) or its owners reconciled (`Resolved`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockDisposition {
+    Pending,
+    #[cfg_attr(not(test), allow(dead_code))] // No production driver resolves yet.
+    Resolved,
+}
+
 /// The classic loop's pass side: one pass's collection, its application at
 /// `now`, and the batch commit.
 pub(crate) trait PassDriver<Pin> {
@@ -1850,6 +1872,20 @@ pub(crate) trait PassDriver<Pin> {
     /// this driver/coordinator beside the returned retained run. The loop
     /// owns the separate once-only host stop gate, including an F9 latch.
     fn on_publication_suspended(&mut self) {}
+    /// Spend one cooperative credit on a retained block's owned
+    /// disposition: one driver step, never a replay of the failed
+    /// callback. `Pending` keeps the block; `Resolved` hands it to the
+    /// loop's disposition table; `Err` keeps the block and the first error.
+    /// The pass reads through `run`: a separate `&RetainedPass` cannot
+    /// borrow beside `&mut run` (E0502).
+    fn dispose_retained<L>(
+        &mut self,
+        _block: RetainedBlock,
+        _run: &mut RetainedClassicRun<L>,
+        _budget: &mut RetainedWorkBudget,
+    ) -> Result<BlockDisposition> {
+        Ok(BlockDisposition::Pending)
+    }
     /// The pass loop ended (stop, deadline, cancellation or error) and
     /// the lane is about to retire: gate promptly anything the stop
     /// must fence before the (possibly slow) retirement runs. Called
@@ -2208,6 +2244,241 @@ impl<L> std::fmt::Debug for ClassicOutcome<L> {
     }
 }
 
+/// Select the retained native stop disposition: an error stops through the
+/// error path, a lane with completed passes through completion, a scoped
+/// lane through scoped cancellation, and any other sampled stop through the
+/// unscoped cancellation. No selection means the stop has no admissible
+/// disposition yet (N1). The loop arm and block disposal share this one rule.
+fn select_native_stop_disposition<Pin, L>(
+    lane: &NativeLane<L>,
+    error_is_some: bool,
+    stop_cause: Option<ZeroPassCause>,
+    host_stopped: bool,
+) -> Option<NativeStopDisposition>
+where
+    L: CaptureLane<Pin>,
+{
+    if error_is_some {
+        Some(NativeStopDisposition::Error)
+    } else if lane.passes > 0 {
+        Some(NativeStopDisposition::Completed)
+    } else if matches!(lane.capture.scope_coverage(), CaptureScopeCoverage::Cgroup) {
+        Some(NativeStopDisposition::CancelledScoped)
+    } else if stop_cause.is_some() && host_stopped {
+        Some(NativeStopDisposition::CancelledUnscoped)
+    } else {
+        None
+    }
+}
+
+/// A published final commit still owes the stop emission while a native
+/// owner or a zero-pass diagnostic remains.
+fn terminal_stop_due<L>(
+    native: &Option<RetainedNative<L>>,
+    terminal_zero_pass: &Option<ZeroPassStop>,
+) -> bool {
+    native.is_some() || terminal_zero_pass.is_some()
+}
+
+/// Apply the retained-block disposition table to a `Resolved` block: set the
+/// next phase with its owned side effect (discard accounting, a first error,
+/// the host gate, the scoped gap). Returns false for a pairing the table
+/// does not cover, so the caller restores the block instead of completing
+/// uncertain work.
+fn resolve_retained_block<Pin, D, L>(
+    driver: &mut D,
+    run: &mut RetainedClassicRun<L>,
+    error: &mut Option<anyhow::Error>,
+    block: RetainedBlock,
+) -> bool
+where
+    D: PassDriver<Pin>,
+    L: CaptureLane<Pin>,
+{
+    let stop_due = terminal_stop_due(&run.native, &run.terminal_zero_pass);
+    match (block, &mut run.pass) {
+        // P1, P3-P5, P7: the failed publication is never replayed; the
+        // terminal failure gap reports the retained first error.
+        (
+            RetainedBlock::Publication,
+            pass @ (RetainedPass::BeforeCollection
+            | RetainedPass::Applied {
+                phase:
+                    AppliedPassPhase::FirstCommitAttempted
+                    | AppliedPassPhase::ScopedReceiptsAttempted
+                    | AppliedPassPhase::EmissionAttempted,
+                ..
+            }
+            | RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::ScopedStartupCommitAttempted,
+            }),
+        ) => {
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::FailureGap,
+            };
+            true
+        }
+        // P2: discard the unapplied collection exactly like C1, then report
+        // the retained publication failure.
+        (RetainedBlock::Publication, pass @ RetainedPass::Collected { .. }) => {
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::FailureGap,
+            };
+            run.discarded_collections += 1;
+            true
+        }
+        // P6: without a collection control there is no startup gap to note;
+        // record that own first error, then report the failure gap.
+        (
+            RetainedBlock::Publication,
+            pass @ RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::ScopedStartupGap,
+            },
+        ) if run
+            .control
+            .as_ref()
+            .is_none_or(|control| control.check().is_ok()) =>
+        {
+            error.get_or_insert(anyhow!("scoped startup gap without collection control"));
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::FailureGap,
+            };
+            true
+        }
+        // P8: back to the native stop, where the set error admits the error
+        // disposition.
+        (
+            RetainedBlock::Publication,
+            pass @ RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::RetiringAttempted,
+            },
+        ) => {
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::NativeStop,
+            };
+            true
+        }
+        // P9: like a published final commit, the stop emission is still due
+        // while a native owner or a zero-pass diagnostic remains.
+        (
+            RetainedBlock::Publication,
+            pass @ RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::FinalCommitAttempted,
+            },
+        ) => {
+            *pass = RetainedPass::Terminal {
+                phase: if stop_due {
+                    RetainedTerminalPhase::EmitStop
+                } else {
+                    RetainedTerminalPhase::Complete
+                },
+            };
+            true
+        }
+        // P10: the failed stop emission never replays; the run completes
+        // with its retained error.
+        (
+            RetainedBlock::Publication,
+            pass @ RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::EmitStopAttempted,
+            },
+        ) => {
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::Complete,
+            };
+            true
+        }
+        // C1: release the unapplied collection's context by dropping it (the
+        // joint raw side stays untouched), count the discard, and continue
+        // with the failure gap on error or the zero-pass gap without one.
+        (RetainedBlock::Collected, pass @ RetainedPass::Collected { .. }) => {
+            *pass = RetainedPass::Terminal {
+                phase: if error.is_some() {
+                    RetainedTerminalPhase::FailureGap
+                } else {
+                    RetainedTerminalPhase::ZeroPassGap
+                },
+            };
+            run.discarded_collections += 1;
+            true
+        }
+        // S1: the mutated report is preserved without retry; note the scoped
+        // gap once (leaving the phase makes a second note impossible), then
+        // report the failure gap.
+        (
+            RetainedBlock::ScopedCompletion,
+            pass @ RetainedPass::Applied {
+                phase:
+                    AppliedPassPhase::ScopedCompletionAttempted
+                    | AppliedPassPhase::ScopedCompletionFailed,
+                ..
+            },
+        ) => {
+            let reason = error.as_ref().map_or_else(
+                || "completion outcome unavailable".to_string(),
+                |error| format!("{error:#}"),
+            );
+            driver
+                .host()
+                .note_scope_gap("scoped completion failed".into(), reason);
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::FailureGap,
+            };
+            true
+        }
+        // N1/N2: back to the native stop. Without a sampled stop there is
+        // nothing to admit yet; with one, gate the host once when needed. A
+        // selected but refused admission records its own first error, which
+        // then admits the error disposition.
+        (
+            RetainedBlock::Native,
+            RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::NativeStop,
+            },
+        ) => {
+            let Some(RetainedNative::Live(lane)) = run.native.as_ref() else {
+                return true;
+            };
+            match select_native_stop_disposition(
+                lane,
+                error.is_some(),
+                run.stop_cause,
+                run.host_stopped,
+            ) {
+                None if run.stop_cause.is_none() => false,
+                None => {
+                    if !run.host_stopped {
+                        driver.host().stop_coordinator();
+                        run.host_stopped = true;
+                    }
+                    true
+                }
+                Some(disposition) => {
+                    if !lane.finite_stop_admissible(disposition, run.control.as_ref()) {
+                        error.get_or_insert(anyhow!("native stop admission refused"));
+                    }
+                    true
+                }
+            }
+        }
+        // N3: a live native owner at completion returns to the native stop;
+        // the capture is never dropped there.
+        (
+            RetainedBlock::Native,
+            pass @ RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::Complete,
+            },
+        ) => {
+            *pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::NativeStop,
+            };
+            true
+        }
+        // No table row covers this pairing: keep the block.
+        _ => false,
+    }
+}
+
 /// Service an already gated, retained run for one finite cooperative slice.
 /// The same driver/coordinator must remain beside every returned owner. This
 /// never launches another collector or invents a disposition for a failed
@@ -2230,7 +2501,7 @@ where
     // In particular, do not sample stateful stop/clock callbacks with zero
     // allowance, or touch a blocked owner without its actual disposition.
     let mut finalized = false;
-    while budget.remaining_actions > 0 && run.block.is_none() {
+    while budget.remaining_actions > 0 {
         let now = clock.now();
         if now >= budget.deadline {
             break;
@@ -2242,6 +2513,29 @@ where
         run.elapsed = run
             .elapsed
             .max(now.saturating_duration_since(run.loop_started_at));
+
+        // A blocked owner spends this credit on one disposal step through
+        // its owning driver. The service cursor never runs while blocked.
+        if let Some(block) = run.block.take() {
+            match driver.dispose_retained(block, &mut run, budget) {
+                Ok(BlockDisposition::Pending) => {
+                    run.block = Some(block);
+                    break;
+                }
+                Err(next) => {
+                    run.block = Some(block);
+                    error.get_or_insert(next);
+                    break;
+                }
+                Ok(BlockDisposition::Resolved) => {
+                    if !resolve_retained_block(driver, &mut run, &mut error, block) {
+                        run.block = Some(block);
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
 
         // A one-action caller resumes the saved service cursor; it cannot
         // restart at poll_commit forever and starve the retained native owner.
@@ -2468,18 +2762,12 @@ where
                 }
                 RetainedTerminalPhase::NativeStop => match run.native.take() {
                     Some(RetainedNative::Live(lane)) => {
-                        let disposition = if error.is_some() {
-                            NativeStopDisposition::Error
-                        } else if lane.passes > 0 {
-                            NativeStopDisposition::Completed
-                        } else if matches!(
-                            lane.capture.scope_coverage(),
-                            CaptureScopeCoverage::Cgroup
-                        ) {
-                            NativeStopDisposition::CancelledScoped
-                        } else if run.stop_cause.is_some() && run.host_stopped {
-                            NativeStopDisposition::CancelledUnscoped
-                        } else {
+                        let Some(disposition) = select_native_stop_disposition(
+                            &lane,
+                            error.is_some(),
+                            run.stop_cause,
+                            run.host_stopped,
+                        ) else {
                             run.native = Some(RetainedNative::Live(lane));
                             run.block = Some(RetainedBlock::Native);
                             continue;
@@ -2522,7 +2810,7 @@ where
                             run.service = RetainedServiceCursor::HoldNative;
                         }
                         Ok(PassCommitProgress::Published) => {
-                            *phase = if run.native.is_some() || run.terminal_zero_pass.is_some() {
+                            *phase = if terminal_stop_due(&run.native, &run.terminal_zero_pass) {
                                 RetainedTerminalPhase::EmitStop
                             } else {
                                 RetainedTerminalPhase::Complete

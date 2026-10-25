@@ -4479,6 +4479,38 @@ mod publication_progress_tests {
         fn on_publication_suspended(&mut self) {
             self.suspended += 1;
         }
+        fn dispose_retained<L>(
+            &mut self,
+            block: RetainedBlock,
+            run: &mut RetainedClassicRun<L>,
+            _budget: &mut RetainedWorkBudget,
+        ) -> Result<BlockDisposition> {
+            self.dispose_calls += 1;
+            if block == RetainedBlock::Native && run.stop_cause.is_none() {
+                // N1 without a sampled stop waits for the in-loop sample;
+                // no scripted driver step is spent on the wait.
+                return Ok(BlockDisposition::Pending);
+            }
+            if !self.dispose_armed {
+                return Ok(BlockDisposition::Pending);
+            }
+            match self.dispose_script.pop_front() {
+                Some(DisposeStep::CommitPoll) => self.dispose_commit_polls += 1,
+                Some(DisposeStep::FinishBegin) => self.dispose_finish_begins += 1,
+                Some(DisposeStep::FinishPoll) => self.dispose_finish_polls += 1,
+                Some(DisposeStep::Fail) => anyhow::bail!("scripted dispose failure"),
+                None => {}
+            }
+            // The scripted publication stays pending while steps remain and
+            // completes as the script drains: one driver step per call, and
+            // resolved only once nothing is pending.
+            self.pending = !self.dispose_script.is_empty();
+            if self.publication_pending() {
+                Ok(BlockDisposition::Pending)
+            } else {
+                Ok(BlockDisposition::Resolved)
+            }
+        }
         fn on_stop_requested(&mut self) {
             self.legacy_stops += 1;
         }

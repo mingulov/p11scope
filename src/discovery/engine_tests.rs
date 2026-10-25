@@ -47839,10 +47839,7 @@ fn collected_graph_wedged_owed_cancel_reaches_finite_incomplete_stop() {
             .and_then(|graph| graph.verdict)
             .is_some()
         {
-            assert!(
-                outcome.progressed,
-                "only the settle credit claims progress"
-            );
+            assert!(outcome.progressed, "only the settle credit claims progress");
             break;
         }
         assert!(
@@ -47873,10 +47870,7 @@ fn collected_graph_wedged_owed_cancel_reaches_finite_incomplete_stop() {
         !graph.native_cancel_owed,
         "the settled cancel clears the owed flag"
     );
-    assert!(
-        graph.removed.is_some(),
-        "the owed cancel returns the input"
-    );
+    assert!(graph.removed.is_some(), "the owed cancel returns the input");
     assert_eq!(
         engine.collected_graph_refused(),
         Some("terminal graph refused before native mutation")
@@ -47965,10 +47959,7 @@ fn collected_graph_slow_owed_cancel_returns_input_without_trip() {
             .and_then(|graph| graph.verdict)
             .is_some()
         {
-            assert!(
-                outcome.progressed,
-                "only the settle credit claims progress"
-            );
+            assert!(outcome.progressed, "only the settle credit claims progress");
             break;
         }
         assert!(
@@ -47976,9 +47967,10 @@ fn collected_graph_slow_owed_cancel_returns_input_without_trip() {
             "interim cancel {credits} claims no progress"
         );
         assert!(
-            case.engine.collected_graph.as_ref().is_some_and(|graph| {
-                graph.native_cancel_owed
-            }),
+            case.engine
+                .collected_graph
+                .as_ref()
+                .is_some_and(|graph| { graph.native_cancel_owed }),
             "still owed with no verdict at interim cancel {credits}"
         );
         assert!(
@@ -48003,10 +47995,7 @@ fn collected_graph_slow_owed_cancel_returns_input_without_trip() {
         !graph.native_cancel_owed,
         "the settled cancel clears the owed flag"
     );
-    assert!(
-        graph.removed.is_some(),
-        "the owed cancel returns the input"
-    );
+    assert!(graph.removed.is_some(), "the owed cancel returns the input");
     assert_eq!(
         case.engine.collected_graph_refused(),
         Some("terminal graph refused before native mutation")

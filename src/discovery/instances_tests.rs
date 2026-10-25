@@ -567,49 +567,143 @@ fn same_epochs_under_unrelated_churn_keep_one_instance() {
 }
 
 #[test]
-fn epoch_move_over_unchanged_mapping_continues_and_remap_mints() {
-    // Continuity is the identity of the mapping, not of the epoch triple:
-    // a local or global bump over identical ranges (a kernel VMA
-    // adjustment or spurious hook fire) keeps the one instance, while a
-    // real remap at a new base mints a successor and keeps the old join.
-    for moved in [(3, 0, 0), (2, 1, 0)] {
-        let mut r = router();
-        r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
-        let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-        r.observe_legacy(observation(moved.0, moved.1, moved.2, load(BASE_A)));
-        let same = joined(r.route(call(
-            2,
-            stamp(moved.0 as u32, moved.1 as u32, moved.2 as u32),
-            ip_in(BASE_A),
-        )));
-        assert_eq!(old, same, "{moved:?}");
-        // A late completion stamped at the old epochs still names the one
-        // incarnation: it ran while that mapping existed.
-        assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
-        assert_eq!(r.instances_minted(), 1);
-    }
+fn local_epoch_move_mints_a_new_instance_and_keeps_the_old_join() {
+    // A move of the process's own (local) epoch always mints, even over
+    // identical ranges: the witness attributed a mapping change to this
+    // process.
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    r.observe_legacy(observation(3, 0, 0, load(BASE_B)));
-    let new = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_B))));
+    assert_eq!(
+        r.observe_legacy(observation(3, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    // A late completion stamped at the old epochs still names the old
+    // incarnation: it ran while that mapping existed.
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+}
+
+#[test]
+fn global_only_move_over_unchanged_mapping_continues() {
+    // A move of only the per-file global epoch over the same merged
+    // mapping continues the current instance: unattributable churn (other
+    // processes' mappings, the observer's own probe) is not a reload.
+    let mut r = router();
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    let same = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_eq!(old, same);
+    // A late completion stamped at the old epochs still joins the one
+    // incarnation: it ran while that mapping existed.
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 1);
+    // A global-only move plus a new base is a real remap and mints.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_B))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_B))));
     assert_ne!(old, new);
     assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
 }
 
 #[test]
-fn same_address_reload_continues_the_unchanged_mapping() {
+fn same_address_reload_never_revives_the_old_instance() {
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let before = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     // dlclose (unmap: +k bumps) and dlopen at the same address (map: +m):
-    // identical ranges, different epochs. Indistinguishable from a VMA
-    // merge here, so the unchanged mapping continues; a file replacement
-    // between still mints through the module key. IDs stay monotonic.
+    // identical ranges, different epochs.
     r.observe_legacy(observation(9, 0, 0, load(BASE_A)));
     let after = joined(r.route(call(2, stamp(9, 0, 0), ip_in(BASE_A))));
-    assert_eq!(before, after);
-    assert_eq!(r.instances_minted(), 1);
+    assert_ne!(before, after);
+    assert!(after > before, "IDs are monotonic, never reused");
+}
+
+#[test]
+fn global_then_local_move_mints() {
+    // Continuity compares against the newest observation: a global-only
+    // move continues, then a local move over the identical ranges mints.
+    let mut r = router();
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A)))), old);
+    assert_eq!(
+        r.observe_legacy(observation(3, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(3, stamp(3, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(4, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(
+        joined(r.route(call(5, stamp(2, 1, 0), ip_in(BASE_A)))),
+        old,
+        "the continued observation keeps the old partitions"
+    );
+    assert_eq!(r.instances_minted(), 2);
+}
+
+#[test]
+fn global_only_move_with_removed_range_mints() {
+    // A global-only advance with a changed mapping mints: a range that
+    // disappeared is an unmap, not unattributable churn.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    let mut unmapped = load(BASE_A);
+    unmapped.pop();
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, unmapped)).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
+}
+
+#[test]
+fn global_only_move_with_exec_bit_flip_mints() {
+    // A global-only advance with a changed mapping mints: an execute
+    // permission flip is a repermission, not unattributable churn. The
+    // flipped text range admits no join, so the mint is pinned by the
+    // outcome and the minted count; the old incarnation keeps joining.
+    // (A write-bit-only protection change carries no executable bit and
+    // continues by design: MapRange compares the executable flag only.)
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    let mut repermissioned = load(BASE_A);
+    repermissioned[1] = MapRange::new(BASE_A + 0x1000, BASE_A + 0x3000, 0x1000, false);
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, repermissioned)).0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::NotExecutable)
+    );
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
 }
 
 #[test]
@@ -919,10 +1013,8 @@ fn instance_ceiling_refuses_at_n_plus_one_and_never_reuses_ids() {
     );
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    // Each ceiling step is a real remap at a new base: identical ranges
-    // would continue the one instance instead of minting.
-    r.observe_legacy(observation(3, 0, 0, load(BASE_B)));
-    let second = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_B))));
+    r.observe_legacy(observation(3, 0, 0, load(BASE_A)));
+    let second = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))));
     assert_eq!(r.instances_minted(), 2);
     r.observe_legacy(observation(4, 0, 0, load(BASE_A)));
     assert_eq!(

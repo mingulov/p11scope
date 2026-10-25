@@ -185,10 +185,12 @@ fn still_mapped_caller_keeps_one_instance_across_three_passes() {
 
 #[test]
 fn epoch_bump_with_unchanged_mapping_keeps_one_instance() {
-    // The live churn shape: the epoch triple advances between passes
-    // (kernel VMA adjustments such as split/merge, or a spurious hook
-    // fire) while the mapped file, addresses, offsets and permissions
-    // stay identical. The mapping is unchanged, so the instance stays.
+    // The live churn shape: only the per-file global epoch advances
+    // between passes (unattributable mappings of the same file by other
+    // processes, or the observer's own self-mapping probe) while the
+    // process's own local epoch and the mapped file, addresses, offsets
+    // and permissions stay identical. The mapping is unchanged and the
+    // witness attributed nothing to this process, so the instance stays.
     let mut scene = workload_scene();
     let pid = std::process::id();
     let caller = admit_mapped(&mut scene, pid);
@@ -199,13 +201,14 @@ fn epoch_bump_with_unchanged_mapping_keeps_one_instance() {
     let batch = scene.tick();
     scene.publish(batch);
     for bump in 1..=2u32 {
+        let (_, local, _) = scene.h0.0.borrow().io.scan_input(0);
         scene
             .h0
             .0
             .borrow_mut()
             .io
             .scan_inputs
-            .insert(0, (0x1000_0000, bump));
+            .insert(0, (0x1000_0000, local, bump));
         crate::inventory_semantics::bind_semantic_callers_inner(
             &mut scene.scene.coordinator,
             &mut scene.lane,
@@ -249,6 +252,168 @@ fn epoch_bump_with_unchanged_mapping_keeps_one_instance() {
 }
 
 #[test]
+fn same_base_local_bump_mints_and_retires_prior() {
+    // The local twin of the global-only continuity test: the process's
+    // own epoch moves at the SAME base (an attributed mapping change,
+    // e.g. a same-address unload+reload the witness saw). This mints a
+    // successor and retires the prior load; the two bursts never join
+    // across the reload.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the local move, got {:?}",
+        instance_summary(&scene)
+    );
+    // Same base, new local epoch: the witness attributed a change here.
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local + 1, global));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the local move mints exactly one successor, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the prior load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the successor stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "each burst joins its own load, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the retired load keeps its history, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-move burst, got {rows:?}"
+    );
+}
+
+#[test]
+fn absence_then_same_base_reload_mints() {
+    // A scan that proves the module unmapped breaks continuity: the next
+    // scan mints even when the reload lands at the same base with the
+    // local epoch unchanged (a global-only reload the witness did not
+    // attribute). Without the break this would continue the old ID and
+    // join two load lifetimes under one instance.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the absence, got {:?}",
+        instance_summary(&scene)
+    );
+    // The module vanishes mid-run: calls still join the current
+    // observation, but the refresh scan proves it unmapped.
+    scene.h0.0.borrow_mut().io.absent_files.insert(0);
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "the absence alone mints nothing, got {:?}",
+        instance_summary(&scene)
+    );
+    // The reload lands at the same base; only the global epoch moved.
+    scene.h0.0.borrow_mut().io.absent_files.remove(&0);
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the reload after proven absence mints, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the pre-absence load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the reloaded mapping stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        6,
+        "all three bursts attribute exactly once, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(4),
+        "the retired load keeps both pre-reload bursts, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-reload burst, got {rows:?}"
+    );
+}
+
+#[test]
 fn remap_mints_new_instance_and_retires_prior_with_reason() {
     let mut scene = workload_scene();
     let pid = std::process::id();
@@ -267,13 +432,15 @@ fn remap_mints_new_instance_and_retires_prior_with_reason() {
     );
     // Unmap + map again: a new load base at a new epoch, the real remap
     // shape. Later calls carry the new stamps; the next pass re-proves.
+    // The local epoch moves (the witness attributed the remap here), so
+    // this mints under both the old triple rule and the local gate.
     scene
         .h0
         .0
         .borrow_mut()
         .io
         .scan_inputs
-        .insert(0, (0x2000_0000, 1));
+        .insert(0, (0x2000_0000, 1, 0));
     for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
         enqueue_live_like(&mut scene, pid, name, *mechanism);
     }

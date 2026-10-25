@@ -183,7 +183,10 @@ struct HeldIo {
     targets: HashMap<u32, (Arc<PidPin>, ImageIdentity)>,
     /// Scripted native input only, installed before H0 observes a scan.
     /// Each file can move independently while sibling proofs stay current.
-    scan_inputs: HashMap<u32, (u64, u32)>,
+    /// (load base, local epoch, global epoch): the global component feeds
+    /// both the scan epochs and the call stamps, so the harness can model
+    /// global-only churn (the live shape) apart from local moves.
+    scan_inputs: HashMap<u32, (u64, u32, u32)>,
     absent_files: BTreeSet<u32>,
 }
 
@@ -221,10 +224,11 @@ impl HeldIo {
         }
     }
 
-    fn scan_input(&self, file: u32) -> (u64, u32) {
+    fn scan_input(&self, file: u32) -> (u64, u32, u32) {
         self.scan_inputs.get(&file).copied().unwrap_or((
             0x1000_0000 + u64::from(file) * 0x100_0000,
             self.script.local,
+            0,
         ))
     }
 
@@ -241,7 +245,7 @@ impl HeldIo {
         let slot = self.slot(file, name);
         let endpoint = self.endpoint(slot).unwrap();
         let fault = u32::try_from(self.script.last_health.fault).unwrap();
-        let (base, local) = self.scan_input(file);
+        let (base, local, global) = self.scan_input(file);
         self.script.call(image.task_cookie, fault);
         let ts_ns = 10 + self.script.records.len() as u64;
         let record = self.script.records.back_mut().unwrap();
@@ -262,6 +266,8 @@ impl HeldIo {
         record.base.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
         record.base.continuity.entry_stamp.epoch = local;
         record.base.continuity.return_stamp.epoch = local;
+        record.base.continuity.entry_stamp.global = global;
+        record.base.continuity.return_stamp.global = global;
         record.base.continuity.entry_ip = base + endpoint.offset;
     }
 
@@ -275,14 +281,14 @@ impl HeldIo {
             return Err(ImageQueryRefusal::Empty);
         }
         let page = endpoint.offset & !0xfff;
-        let (base, local) = self.scan_input(endpoint.file_slot);
+        let (base, local, global) = self.scan_input(endpoint.file_slot);
         acquire_test_scan(
             self.script.domain,
             image,
             endpoint.file_slot,
             CompleteEpochs {
                 local: u64::from(local),
-                global: 0,
+                global: u64::from(global),
                 fault: self.script.last_health.fault,
                 sticky: self.script.last_health.sticky,
                 record_flags: 0,
@@ -332,11 +338,12 @@ impl CaptureIo for HeldIo {
         if let Some(refusal) = self.script.receipt_refusal {
             return Err(refusal);
         }
+        let (_, local, global) = self.scan_input(endpoint.file_slot);
         Ok(ReceiptState {
             image: self.targets[&pin.pid()].1,
             epochs: CompleteEpochs {
-                local: u64::from(self.scan_input(endpoint.file_slot).1),
-                global: 0,
+                local: u64::from(local),
+                global: u64::from(global),
                 fault: self.script.last_health.fault,
                 sticky: self.script.last_health.sticky,
                 record_flags: 0,

@@ -199,7 +199,7 @@ impl JointScene {
         let image = io.targets[&pid].1;
         let slot = io.slot(file, name);
         let endpoint = io.endpoint(slot).unwrap();
-        let (base, epoch) = io.scan_input(file);
+        let (base, epoch, _) = io.scan_input(file);
         let init = name == "C_SignInit";
         let mut begin = begin_bytes_shaped(
             u64::from(pid),

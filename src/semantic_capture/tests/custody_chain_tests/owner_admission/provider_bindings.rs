@@ -868,11 +868,11 @@ fn prepared_provider_b_retirement_uses_its_genuine_fresh_partition() {
         fixture.publish();
         {
             let mut h0 = fixture.scene.h0.0.borrow_mut();
-            let (base, local) = h0.io.held.scan_input(b);
+            let (base, local, global) = h0.io.held.scan_input(b);
             h0.io
                 .held
                 .scan_inputs
-                .insert(b, (base + 0x4000_0000, local + 1));
+                .insert(b, (base + 0x4000_0000, local + 1, global));
         }
         let fresh = fixture.refresh_coverage(b);
         assert!(!fresh.instances().is_empty());

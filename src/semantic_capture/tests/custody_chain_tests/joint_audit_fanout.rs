@@ -717,7 +717,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             .filter(|(file, _)| !io.absent_files.contains(&(*file as u32)))
             .map(|(file, watched)| {
                 let key = watched.object_key();
-                let (base, _) = io.scan_input(file as u32);
+                let (base, _, _) = io.scan_input(file as u32);
                 p11scope_manifest::maps::MapEntry {
                     start: base,
                     end: base + 0x10000,
@@ -987,8 +987,8 @@ impl MachineScene {
     fn make_provider_present(&mut self, file: u32, epoch: u32) {
         let mut held = self.scene.real.h0.0.borrow_mut();
         assert!(held.io.absent_files.remove(&file));
-        let (base, _) = held.io.scan_input(file);
-        held.io.scan_inputs.insert(file, (base, epoch));
+        let (base, _, global) = held.io.scan_input(file);
+        held.io.scan_inputs.insert(file, (base, epoch, global));
     }
 
     fn reach_phase(&mut self, phase: &str) {
@@ -2582,8 +2582,8 @@ fn joint_machine_current_provider_validation_and_storage_preserve_original() {
         let h3 = coordinator.reference_h3_audit_state();
         if refusal == "epoch" {
             let mut held = fixture.scene.real.h0.0.borrow_mut();
-            let (base, epoch) = held.io.scan_input(1);
-            held.io.scan_inputs.insert(1, (base, epoch + 1));
+            let (base, epoch, global) = held.io.scan_input(1);
+            held.io.scan_inputs.insert(1, (base, epoch + 1, global));
         }
         let hold = (refusal == "storage").then(|| {
             reserve
@@ -3912,8 +3912,10 @@ fn joint_machine_begin_slices_and_h0_pending_do_not_repoll() {
     let before_b = fixture.reduced_for(1);
     {
         let mut held = fixture.scene.real.h0.0.borrow_mut();
-        let (base, epoch) = held.io.scan_input(0);
-        held.io.scan_inputs.insert(0, (base + 0x20_000, epoch + 1));
+        let (base, epoch, global) = held.io.scan_input(0);
+        held.io
+            .scan_inputs
+            .insert(0, (base + 0x20_000, epoch + 1, global));
         held.io.script.fail_file = Some(0);
     }
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
@@ -4176,8 +4178,10 @@ fn pending_h0_finish_fixture(
     let b = 1 - a;
     {
         let mut held = fixture.scene.real.h0.0.borrow_mut();
-        let (base, epoch) = held.io.scan_input(a);
-        held.io.scan_inputs.insert(a, (base + 0x20_000, epoch + 1));
+        let (base, epoch, global) = held.io.scan_input(a);
+        held.io
+            .scan_inputs
+            .insert(a, (base + 0x20_000, epoch + 1, global));
         held.io.script.fail_file = Some(a);
     }
     let calls = if reverse {
@@ -4618,8 +4622,10 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
     );
     {
         let mut held = full.real.h0.0.borrow_mut();
-        let (base, epoch) = held.io.scan_input(0);
-        held.io.scan_inputs.insert(0, (base + 0x20_000, epoch + 1));
+        let (base, epoch, global) = held.io.scan_input(0);
+        held.io
+            .scan_inputs
+            .insert(0, (base + 0x20_000, epoch + 1, global));
         held.io.script.fail_file = Some(0);
     }
     full.push(pid, 0, "C_SignInit", 1);

@@ -1501,6 +1501,27 @@ fn finish_discovery_bytes(pid: u32, at: u64) -> Vec<u8> {
     bytes
 }
 
+/// An EXEC discovery record (a process birth): same transport shape
+/// as the exit records, leader pid/tgid, unknown classification.
+fn finish_exec_bytes(pid: u32, at: u64) -> Vec<u8> {
+    let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+    record.case_id = p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = at;
+    // SAFETY: the shared repr(C) transport is completely initialized above,
+    // including padding from zeroed, just as existing discovery fixtures.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+            size_of::<p11scope_ebpf_common::DiscoveryRecord>(),
+        )
+        .to_vec()
+    };
+    assert!(crate::events::decode_discovery(&bytes).is_some());
+    bytes
+}
+
 struct FinishCustody {
     raw: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
     boundary: crate::events::EventsConsumptionCut,
@@ -17508,5 +17529,147 @@ fn joint_machine_finish_grant_predicate_refuses_foreign_producers() {
     assert!(
         !finish_grant_admissible(&q_a, &grant_b, &scene_a.scene.producers),
         "a foreign scene's grant is refused"
+    );
+}
+
+#[path = "joint_cells_machine.rs"]
+mod cells;
+
+/// A promotion Finish drains to Q without entering the Engine
+/// (OD-11): three exit records and one birth before Q are counted
+/// and dropped, the engine's collected-finish entry is never
+/// called, and the Finish still publishes. The twin without the
+/// flag enters the engine. Engine facts have no test reader, so
+/// the zero-call count (the only engine entry on this path) plus
+/// the twin control carry the untouched-engine claim.
+#[test]
+fn joint_machine_promotion_finish_never_enters_engine() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    for promotion in [true, false] {
+        let child = OwnedStoppedChild::new();
+        let exited_pid = child.id();
+        drop(child);
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        fixture.enable_finish_fixture(vec![
+            finish_discovery_bytes(exited_pid, 100),
+            finish_discovery_bytes(exited_pid, 101),
+            finish_discovery_bytes(exited_pid, 102),
+            finish_exec_bytes(exited_pid, 103),
+        ]);
+        if promotion {
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .set_promotion_finish(true);
+        }
+        fixture.begin_finish().unwrap();
+        let mut published = 0;
+        for _ in 0..512 {
+            match fixture.poll_finish(64) {
+                Ok(JointCommitProgress::Published(_)) => {
+                    published += 1;
+                    break;
+                }
+                Ok(JointCommitProgress::Pending) => {}
+                Err(reason) => {
+                    assert!(!promotion, "promotion must publish, not refuse: {reason:?}");
+                }
+            }
+        }
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        if promotion {
+            assert_eq!(published, 1, "promotion publishes");
+            assert_eq!(
+                coordinator.engine_collected_finish_calls(),
+                0,
+                "promotion never enters the engine"
+            );
+            assert_eq!(
+                coordinator.promotion_records_discarded(),
+                4,
+                "3 exits + 1 birth counted and dropped"
+            );
+        } else {
+            assert!(
+                coordinator.engine_collected_finish_calls() > 0,
+                "the twin without the flag enters the engine"
+            );
+        }
+    }
+}
+
+/// Promotion ignores shared engine backlog (N2): seeded engine
+/// work stays outstanding and untouched while the promotion
+/// publishes past it.
+#[test]
+fn joint_machine_promotion_finish_ignores_shared_engine_backlog() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .seed_collected_finish_work_for_test(crate::process::ProcessViewId(4243));
+    let (held_before, outstanding_before) = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_collected_finish_discovery_backlog(0);
+    assert!(
+        outstanding_before,
+        "the seeded work is outstanding before the finish"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .set_promotion_finish(true);
+    fixture.begin_finish().unwrap();
+    let mut published = 0;
+    for _ in 0..512 {
+        match fixture
+            .poll_finish(64)
+            .expect("promotion polls must succeed")
+        {
+            JointCommitProgress::Published(_) => {
+                published += 1;
+                break;
+            }
+            JointCommitProgress::Pending => {}
+        }
+    }
+    assert_eq!(published, 1, "promotion publishes past the backlog");
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.engine_collected_finish_calls(),
+        0,
+        "promotion never enters the engine"
+    );
+    let (held_after, outstanding_after) =
+        coordinator.reference_collected_finish_discovery_backlog(0);
+    assert!(
+        outstanding_after,
+        "the seeded work is still outstanding: ignored and untouched"
+    );
+    assert_eq!(
+        held_after, held_before,
+        "the seeded intent and pending exit are unchanged afterwards"
+    );
+    assert!(
+        !fixture.machine.finish_disposition_required(),
+        "finish_disposition_required() stays false past the backlog"
+    );
+    assert_eq!(
+        coordinator.promotion_records_discarded(),
+        0,
+        "the empty discovery drains nothing"
     );
 }

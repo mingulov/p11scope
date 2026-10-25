@@ -636,6 +636,7 @@ pub(crate) struct AttestedSemanticLane {
     /// Set by the I2 abandon: the lane finished without a published
     /// Finish and stays retained for process exit. Wound-down and take
     /// refuse forever; the Session never begins owned detach.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     exit_retained: bool,
     /// When the lane's latest batch was staged for commit: the driver
     /// stamps it on stage and clears it on publish, bounding the wait
@@ -1325,6 +1326,7 @@ impl AttestedSemanticLane {
     }
 
     /// Whether this lane owns a Joint machine (§8.3).
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_machine(&self) -> bool {
         self.live
             .as_deref()
@@ -1337,6 +1339,7 @@ impl AttestedSemanticLane {
     /// publication marks the lane finished, any lane with a machine
     /// may still hold its frame. Conservative while unfinished, exact
     /// once published; lanes without a machine read false.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_frame(&self) -> bool {
         #[cfg(test)]
         if self.test_joint_frame {
@@ -1358,6 +1361,7 @@ impl AttestedSemanticLane {
     /// closes retired graph files (256 per call) and reports true
     /// only once the chain drains. An Unproved detach or an
     /// exit-retained lane refuses; the first error stays owned.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn poll_wound_down(
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -1400,6 +1404,7 @@ impl AttestedSemanticLane {
     /// published and no Joint frame retained. Memory-only lane state
     /// drops with the handoff, like the promotion wind-down; anything
     /// earlier or an exit-retained lane yields `None` or refuses.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn take_joined_session(&mut self) -> Result<Option<Session>, SemanticRefusal> {
         if self.exit_retained {
             return Err(SemanticRefusal::Unavailable);
@@ -1437,6 +1442,7 @@ impl AttestedSemanticLane {
     /// marks the lane finished and exit-retained, and drops nothing:
     /// later wound-down and take refuse forever and the Session never
     /// begins owned detach.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn abandon_finish_for_exit(
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -1476,6 +1482,7 @@ impl AttestedSemanticLane {
     }
 
     /// Mark the lane finished and exit-retained: nothing else moves.
+    #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     fn finish_for_exit(&mut self) {
         if let Some(live) = self.live.as_mut() {
             live.finished = true;

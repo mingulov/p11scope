@@ -4024,11 +4024,12 @@ impl ClassicDriver<'_> {
     /// Release a Published Joint lane at the terminal consume: no
     /// further hook will reap it. Steps the wound-down on the 10 ms
     /// cadence while the detach still runs; a quick join completes
-    /// with no hold. The wait stays interruptible and bounded: each
-    /// step that still waits checks the second operator signal and
-    /// escalates like the lane stop, and past the run deadline the
-    /// lane is held for exit instead of waited on. Polling and
-    /// unbegun lanes stay seated for their hooks.
+    /// with no hold. The wait mirrors the legacy owned-detach wait:
+    /// it runs until the detach completes, interruptible only by the
+    /// second operator signal (each waiting step escalates like the
+    /// lane stop). The run deadline ends the capture window, not the
+    /// stop, so a normal timed stop gains no hold past it. Polling
+    /// and unbegun lanes stay seated for their hooks.
     fn complete_published_joint_lane(&mut self) {
         while matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some() {
             let started = Instant::now();
@@ -4037,26 +4038,6 @@ impl ClassicDriver<'_> {
             {
                 if self.second_signal.is_some_and(|signal| signal()) {
                     self.escalate_joint_finish();
-                    return;
-                }
-                if self
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
-                    self.snapshot_seated_summary();
-                    if let Some(lane) = self.semantic.take() {
-                        let error = Self::hold_joint_lane_for_exit(
-                            lane,
-                            &mut *self.coordinator,
-                            "joint finish held for exit",
-                        );
-                        self.joint_first_error.get_or_insert(error);
-                    }
-                    self.coordinator.note_scope_gap(
-                        "joint finish held for exit".to_string(),
-                        "the run deadline passed while the joint finish waited".to_string(),
-                    );
-                    self.joint_finish = JointFinishDriver::Abandoned;
                     return;
                 }
                 let elapsed = started.elapsed();

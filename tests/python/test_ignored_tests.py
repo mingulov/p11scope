@@ -20,6 +20,7 @@ Run: python3 -I tests/python/test_ignored_tests.py -v
 """
 
 import json
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-ignored-tests.py"
 INVENTORY = ROOT / "tests" / "ignored-tests.json"
 RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
+CHECKER_MOD = runpy.run_path(str(CHECKER))
 
 CELLS = {
     "privileged": "test cell",
@@ -78,9 +80,17 @@ INTEGRATION_ENTRY = {
     "reason": "needs the kernel lane", "cell": "live-kernel",
 }
 
+# The two src/ live-kernel cells no runner executes: each needs a SKIP
+# entry with a reason, pinned literally so a dropped curation fails here.
+SRC_LIVE_KERNEL_SKIP_EXPECTED = [
+    "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
+    "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
+]
+
 
 def write_fixture(root, sources, entries, registered, wide_registered=(),
-                  integration_registered=()):
+                  integration_registered=(), counter_proof_registered=(),
+                  counter_artifacts_registered=()):
     """A minimal checkable tree: sources {rel: text}, inventory, runner."""
     for rel, text in sources.items():
         path = root / rel
@@ -111,6 +121,8 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("SKIP_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
             ("INTEGRATION_TESTS", integration_registered),
+            ("COUNTER_BANK_PROOF_TESTS", counter_proof_registered),
+            ("COUNTER_ARTIFACTS_TESTS", counter_artifacts_registered),
         )
     )
     runner.write_text(body, encoding="utf-8")
@@ -183,6 +195,20 @@ FEATURE_SOURCES = {
 FEATURE_ENTRY = {
     "file": "src/f.rs", "path": "f::t_feat",
     "reason": "needs feature x", "cell": "feature",
+}
+
+LIVE_KERNEL_SOURCES = {
+    "src/lib.rs": "mod k;\n",
+    "src/k.rs": (
+        '#[test]\n'
+        '#[ignore = "needs the hand-run lane"]\n'
+        'fn t_live_kernel() {}\n'
+    ),
+}
+
+LIVE_KERNEL_ENTRY = {
+    "file": "src/k.rs", "path": "k::t_live_kernel",
+    "reason": "needs the hand-run lane", "cell": "live-kernel",
 }
 
 
@@ -352,23 +378,65 @@ class IgnoredTestsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("non-empty owner", result.stdout)
 
-    def test_feature_entry_with_other_owner_passes(self):
+    def test_counter_bank_proof_entry_must_be_curated(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             entry = dict(FEATURE_ENTRY, owner="counter-bank-proof build")
             write_fixture(root, FEATURE_SOURCES, [entry], [])
             result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_feat", result.stdout)
+        self.assertIn("COUNTER_BANK_PROOF_TESTS", result.stdout)
+
+    def test_counter_bank_proof_entry_passes_when_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="counter-bank-proof build")
+            write_fixture(root, FEATURE_SOURCES, [entry], [],
+                          counter_proof_registered=["src/f.rs:f::t_feat"])
+            result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 inventoried site(s) match", result.stdout)
 
-    def test_feature_entry_with_counter_artifacts_owner_passes(self):
+    def test_counter_bank_proof_member_without_an_entry_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, {"src/lib.rs": ""}, [], [],
+                          counter_proof_registered=["src/f.rs:f::t_nope"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_nope", result.stdout)
+        self.assertIn("COUNTER_BANK_PROOF_TESTS", result.stdout)
+
+    def test_counter_artifacts_entry_must_be_curated(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             entry = dict(FEATURE_ENTRY, owner="counter-artifacts build")
             write_fixture(root, FEATURE_SOURCES, [entry], [])
             result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_feat", result.stdout)
+        self.assertIn("COUNTER_ARTIFACTS_TESTS", result.stdout)
+
+    def test_counter_artifacts_entry_passes_when_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = dict(FEATURE_ENTRY, owner="counter-artifacts build")
+            write_fixture(root, FEATURE_SOURCES, [entry], [],
+                          counter_artifacts_registered=["src/f.rs:f::t_feat"])
+            result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_counter_artifacts_member_without_an_entry_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, {"src/lib.rs": ""}, [], [],
+                          counter_artifacts_registered=["src/f.rs:f::t_nope"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("f::t_nope", result.stdout)
+        self.assertIn("COUNTER_ARTIFACTS_TESTS", result.stdout)
 
     def test_feature_entry_with_unknown_owner_fails(self):
         # A typo'd owner ("wide-detailed-2112" without " runner") must
@@ -401,6 +469,61 @@ class IgnoredTestsTests(unittest.TestCase):
             result = run_checker(root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_src_live_kernel_entry_must_be_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, LIVE_KERNEL_SOURCES, [LIVE_KERNEL_ENTRY],
+                          [])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("k::t_live_kernel", result.stdout)
+        self.assertIn("not curated", result.stdout)
+
+    def test_src_live_kernel_entry_passes_when_curated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, LIVE_KERNEL_SOURCES, [LIVE_KERNEL_ENTRY],
+                          ["k::t_live_kernel"])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
+    def test_src_live_kernel_cells_are_skip_curated(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        for name in SRC_LIVE_KERNEL_SKIP_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn(name, lists["SKIP_TESTS"])
+
+    def test_checker_prints_exact_per_list_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, SOURCES, ENTRIES, REGISTERED, ["m::t_wide"])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "ignored-tests counts: DEFAULT_TESTS=2 ALTERNATIVE_TESTS=0 "
+            "LONG_TESTS=0 SKIP_TESTS=0 WIDE_DETAILED_2112_TESTS=1 "
+            "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
+            "INTEGRATION_TESTS=0",
+            result.stdout,
+        )
+
+    def test_real_tree_per_list_counts_are_exact(self):
+        result = run_checker(ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for pin in (
+            "DEFAULT_TESTS=101",
+            "ALTERNATIVE_TESTS=2",
+            "LONG_TESTS=13",
+            "SKIP_TESTS=34",
+            "WIDE_DETAILED_2112_TESTS=9",
+            "COUNTER_BANK_PROOF_TESTS=3",
+            "COUNTER_ARTIFACTS_TESTS=2",
+            "INTEGRATION_TESTS=5",
+        ):
+            with self.subTest(pin=pin):
+                self.assertIn(pin, result.stdout)
 
     def test_wide_list_mode_accepts_a_wide_binary(self):
         with tempfile.TemporaryDirectory() as tmp:

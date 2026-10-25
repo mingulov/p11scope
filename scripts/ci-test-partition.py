@@ -481,6 +481,34 @@ class _FakeLibtest:
         return 0, "\n".join(lines) + "\n"
 
 
+class _FakeRest:
+    """Canned combined cargo output: Running headers plus libtest summaries."""
+
+    def __init__(self, sections, status=0):
+        # sections: [(binary, src, summary)] where summary is
+        # (passed, failed, ignored, measured) or None for no summary.
+        self.sections, self.status = sections, status
+        self.commands = []
+
+    def __call__(self, command, env, capture_stderr=False):
+        self.commands.append((command, env, capture_stderr))
+        lines = []
+        for binary, src, summary in self.sections:
+            lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
+            lines.append("")
+            if summary is None:
+                continue
+            total = sum(summary)
+            noun = "test" if total == 1 else "tests"
+            lines.append(f"running {total} {noun}")
+            passed, failed, ignored, measured = summary
+            lines.append(
+                f"test result: ok. {passed} passed; {failed} failed; "
+                f"{ignored} ignored; {measured} measured; 0 filtered out; finished in 0.01s"
+            )
+        return self.status, "\n".join(lines) + "\n"
+
+
 def self_test():
     gate = ["cargo", "+1.0.0", "test", "--locked", "--offline", "--workspace", "--all-targets"]
     cov = ["cargo", "+1.0.0", "llvm-cov", "--locked", "--offline", "--workspace", "--all-targets", "--no-report"]
@@ -581,6 +609,64 @@ def self_test():
     run_partition("contracts:2/3", cov, runner=fake, metadata=None, weights=table)
     assert all(env["LLVM_PROFILE_FILE_NAME"] == "p11scope-contracts-2-of-3-%p-%m.profraw"
                for _, env in fake.commands)
+
+    # rest proves a nonzero selection per binary: every binary cargo ran
+    # must print a libtest summary with total > 0, else the partition fails
+    # naming the binary. The exit status rule stays: a failing run fails
+    # without summary verification.
+    healthy = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7891", "tests/alpha.rs", (3, 0, 2, 0)),
+    ])
+    assert run_partition("rest", gate, runner=healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
+    zero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("zeta-1a2b3c4d5e6f7892", "tests/zeta.rs", (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "zeta-1a2b3c4d5e6f7892" in str(error), error
+    else:
+        raise AssertionError("a zero-test rest binary went unnoticed")
+    missing = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7891", "tests/alpha.rs", None),
+    ])
+    try:
+        run_partition("rest", gate, runner=missing,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "alpha-1a2b3c4d5e6f7891" in str(error), error
+    else:
+        raise AssertionError("a rest binary without a summary went unnoticed")
+    failing = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+    ], status=101)
+    assert run_partition("rest", gate, runner=failing,
+                         metadata=lambda c: _fake_metadata()) == 101
+    # The p11scope bin is CLI dispatch only (src/main.rs holds no tests),
+    # so its total-0 summary is pinned, not proved: any other zero-test
+    # binary still fails, and a nonzero bin fails the pin as stale.
+    pinned_zero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/main.rs", (0, 0, 0, 0)),
+    ])
+    assert run_partition("rest", gate, runner=pinned_zero,
+                         metadata=lambda c: _fake_metadata()) == 0
+    pinned_nonzero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/main.rs", (1, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=pinned_nonzero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "REST_ZERO_TEST_PIN" in str(error), error
+    else:
+        raise AssertionError("a stale zero-test pin went unnoticed")
+    assert healthy.commands and healthy.commands[0][2] is True, \
+        "rest must capture stderr so Running headers delimit binaries"
 
     # The checked-in table loads and is a real table.
     default, seconds = load_weights()

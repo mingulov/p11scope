@@ -1989,6 +1989,17 @@ impl<'a> CounterPreparation<'a> {
         backend: super::AttachBackend,
         probe: impl FnOnce() -> BpfLoopVerdict,
     ) -> Result<Self> {
+        Self::new_with_backend_probe_and_cpus(object, envelope, reserve, backend, probe, None)
+    }
+
+    fn new_with_backend_probe_and_cpus(
+        object: &'a [u8],
+        envelope: BankReservation,
+        reserve: &SemanticResourceReserver,
+        backend: super::AttachBackend,
+        probe: impl FnOnce() -> BpfLoopVerdict,
+        cpus_override: Option<usize>,
+    ) -> Result<Self> {
         // Deterministic build checks run before the kernel probe, so a WIDE
         // build on an old kernel reports the build refusal, not the kernel
         // token. Omitted objects (`=0`, SMALL, WIDE) refuse every mode here.
@@ -2033,9 +2044,15 @@ impl<'a> CounterPreparation<'a> {
                     .context("counter parser bound overflow")?,
             "counter parser/loader transient reservation is too small"
         );
-        let cpus = aya::util::nr_cpus().map_err(|(path, error)| {
-            anyhow::Error::new(error).context(format!("reading possible counter CPUs at {path}"))
-        })?;
+        // Production reads the host count; tests inject counts no host
+        // reaches (fixed-exceeds preflight) through the seam.
+        let cpus = match cpus_override {
+            Some(cpus) => cpus,
+            None => aya::util::nr_cpus().map_err(|(path, error)| {
+                anyhow::Error::new(error)
+                    .context(format!("reading possible counter CPUs at {path}"))
+            })?,
+        };
         ensure!(
             cpus != 0,
             "private counter preparation requires possible CPUs"
@@ -5307,6 +5324,7 @@ pub(crate) mod tests {
         assert_eq!(geometry.bank_payload_bytes(1024), Ok(12_582_912));
         for enough in [false, true] {
             let pool = SemanticResourcePool::reference_limit(128 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
             let mut directory = BankDirectory::counts_growth_v2();
             let mut io = GrowthIo::new(&pool);
             io.cpus = 1024;
@@ -5332,9 +5350,15 @@ pub(crate) mod tests {
                     "funded P=1024 refuses the kernel map cap: {result:?}"
                 );
                 assert!(io.trace.is_empty() && io.maps.is_empty());
+                assert!(io.routes.is_empty(), "no route survives the refusal");
+                assert_eq!(directory.allocated_high_water(), 0);
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
             } else {
                 assert_eq!(result, BankPublication::Refused(BankRefusal::Budget));
                 assert!(io.trace.is_empty() && io.maps.is_empty());
+                assert!(io.routes.is_empty(), "no route survives the refusal");
+                assert_eq!(directory.allocated_high_water(), 0);
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
             }
         }
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
@@ -6306,6 +6330,14 @@ pub(crate) mod tests {
     }
 
     fn growth_owned_history_for(mode: CounterMode, last_slot: bool) -> GrowthOwnedHistory {
+        growth_owned_history_with_backend(mode, last_slot, super::super::AttachBackend::Singles)
+    }
+
+    fn growth_owned_history_with_backend(
+        mode: CounterMode,
+        last_slot: bool,
+        backend: super::super::AttachBackend,
+    ) -> GrowthOwnedHistory {
         let (dir, pins, first, second, digest) = growth_provider_fixture();
         let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
         let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
@@ -6375,7 +6407,7 @@ pub(crate) mod tests {
                 directory: Arc::new(Mutex::new(directory)),
                 keepalive,
                 cpus: 2,
-                backend: super::super::AttachBackend::Singles,
+                backend,
                 link_staging: Arc::new(AtomicU64::new(0)),
                 terminal: None,
             },
@@ -7347,6 +7379,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_terminal_cleanup_constant_dominates_derived_bound() {
+        use super::super::{OwnedLink, ProducerProgram};
+        // Both backends retire at most two owned links per endpoint: Singles
+        // carries an entry and a return uprobe per endpoint (the budgets FD
+        // row charges 2*published), and Multi staging reserves at most two
+        // leaves per endpoint (`counter_multi_requirements`).
+        let links: usize = 2 * 8192;
+        // Worker batch: the terminal transfer push-grows one Vec of owned
+        // links; old+new backing coexist during a doubling, so twice the
+        // final backing plus one allocation padding dominates the peak.
+        let batch = links
+            .checked_mul(size_of::<(OwnedLink, ProducerProgram)>())
+            .and_then(|final_backing| final_backing.checked_mul(2))
+            .and_then(|peak| peak.checked_add(OWNED_ALLOCATION_PADDING))
+            .unwrap();
+        // One `retain_counter` box per transferred link, padded each.
+        let boxes = links
+            .checked_mul(
+                size_of::<OwnedLink>()
+                    .checked_add(OWNED_ALLOCATION_PADDING)
+                    .unwrap(),
+            )
+            .unwrap();
+        // One transient single-link transfer Vec at a time.
+        let transient = size_of::<OwnedLink>()
+            .checked_add(OWNED_ALLOCATION_PADDING)
+            .unwrap();
+        // Retirement leases: at most one Arc per slot.
+        let leases = 8192usize
+            .checked_mul(size_of::<std::sync::Arc<std::fs::File>>())
+            .and_then(|n| n.checked_add(2 * OWNED_ALLOCATION_PADDING))
+            .unwrap();
+        // Receipt, worker batch and channel command: fixed small structs and
+        // fixed worker-level strings. The production closer is infallible
+        // (`drop` only), so no per-close failure string can accrue; map close
+        // and keepalive drop free their precharged backing without allocating.
+        let receipts = 4096usize;
+        let bound = batch
+            .checked_add(boxes)
+            .and_then(|n| n.checked_add(transient))
+            .and_then(|n| n.checked_add(leases))
+            .and_then(|n| n.checked_add(receipts))
+            .unwrap();
+        assert!(
+            super::COUNTER_TERMINAL_CLEANUP_BYTES >= bound,
+            "cleanup constant {} must dominate derived {bound} (batch {batch}, boxes {boxes}, transient {transient}, leases {leases}, receipts {receipts})",
+            super::COUNTER_TERMINAL_CLEANUP_BYTES
+        );
+    }
+
+    #[test]
     fn counter_budgets_pin_each_field_against_scripted_session() {
         let owned = growth_owned_history(false);
         assert_eq!(
@@ -7384,6 +7467,32 @@ pub(crate) mod tests {
         let per_bank = super::counter_bank_map_bytes(CounterMode::Counts, 2).unwrap();
         assert_eq!(budgets.memory.charged, fixed + per_bank);
         assert_eq!(budgets.memory.limit, super::COUNTER_MAP_MEMORY_LIMIT);
+    }
+
+    #[test]
+    fn counter_budgets_multi_omits_singles_extra_fd() {
+        let owned = growth_owned_history_with_backend(
+            CounterMode::Counts,
+            false,
+            super::super::AttachBackend::Multi,
+        );
+        assert_eq!(
+            owned
+                .banks
+                .directory
+                .lock()
+                .unwrap()
+                .published_indices()
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        let budgets = owned.banks.budgets(5).unwrap();
+        assert_eq!(budgets.endpoints.published, 2);
+        assert_eq!(budgets.endpoints.holes, 1);
+        assert_eq!(budgets.endpoints.ceiling, 8192);
+        // Parent §3 FD row: Singles projects 2*published + banks + 1 (the
+        // twin above pins 6); Multi projects 2*published + banks, no extra.
+        assert_eq!(budgets.fd.projected, 5);
     }
 
     #[test]
@@ -8925,6 +9034,128 @@ pub(crate) mod tests {
             );
             assert_eq!(pool.snapshot().charged_bytes, charged);
         }
+    }
+
+    #[test]
+    fn counter_preparation_charges_terminal_reserve_from_pool() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        // Omitted-object builds refuse at the build gate before any reserve;
+        // that refusal has its own cell. This cell pins the terminal wiring
+        // through the constructor the Session calls.
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            return;
+        }
+        let object = super::counter_object_for_mode(CounterMode::Counts);
+        assert!(!object.is_empty());
+        let cpus = aya::util::nr_cpus().unwrap();
+        let mode = CounterMode::Counts;
+        let terminal_bytes = super::counter_terminal_reserve_bytes(mode, cpus).unwrap();
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024 * 1024,
+            transient_bytes: 512 * 1024 * 1024,
+            metadata_bytes: 64 * 1024 * 1024,
+            file_descriptors: 1_048_576,
+        };
+        // Success grows charged bytes by retained + transient + terminal.
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        let preparation = CounterPreparation::new_with_backend_and_probe(
+            object,
+            envelope,
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+        )
+        .expect("healthy preparation charges the terminal reserve");
+        assert!(
+            preparation.banks.terminal.is_some(),
+            "preparation must hold the terminal lease"
+        );
+        let (retained, transient) = envelope.charges().unwrap();
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline + retained + transient + terminal_bytes,
+            "preparation charges the terminal reserve from the pool"
+        );
+        drop(preparation);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // A pool one byte short of the terminal figure refuses with the
+        // terminal token and leaves the pool at baseline.
+        let short = SemanticResourcePool::reference_limit(terminal_bytes - 1);
+        let short_baseline = short.snapshot().charged_bytes;
+        let Err(refusal) = CounterPreparation::new_with_backend_and_probe(
+            object,
+            envelope,
+            &short.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+        ) else {
+            panic!("a pool below the terminal reserve must refuse");
+        };
+        let message = format!("{refusal:#}");
+        assert!(
+            message.contains("counter terminal reserve refused"),
+            "{message}"
+        );
+        assert_eq!(short.snapshot().charged_bytes, short_baseline);
+    }
+
+    #[test]
+    fn counter_preparation_memory_preflight_precedes_pool_reserves() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        // Same build gate as the terminal cell above: omitted-object builds
+        // refuse before the preflight.
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            return;
+        }
+        let object = super::counter_object_for_mode(CounterMode::Counts);
+        assert!(!object.is_empty());
+        // P=1024 through the CPU-count seam: the fixed maps alone (~555 MiB)
+        // exceed the 256 MiB cap, so the affordable ceiling is zero. No host
+        // reaches this count; the seam is the only way to stage it.
+        assert_eq!(
+            super::counter_affordable_endpoints(CounterMode::Counts, 1024).unwrap(),
+            0
+        );
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024 * 1024,
+            transient_bytes: 512 * 1024 * 1024,
+            metadata_bytes: 64 * 1024 * 1024,
+            file_descriptors: 1_048_576,
+        };
+        // A funded pool still refuses with the token and stays at baseline.
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        let Err(refusal) = CounterPreparation::new_with_backend_probe_and_cpus(
+            object,
+            envelope,
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+            Some(1024),
+        ) else {
+            panic!("fixed-exceeds preparation must refuse");
+        };
+        let message = format!("{refusal:#}");
+        assert!(message.contains("counter-memory-limit"), "{message}");
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        // A pool too small for keepalive still reports the cap first: the
+        // preflight runs before any pool reservation.
+        let small = SemanticResourcePool::reference_limit(1024 * 1024);
+        let small_baseline = small.snapshot().charged_bytes;
+        let Err(refusal) = CounterPreparation::new_with_backend_probe_and_cpus(
+            object,
+            envelope,
+            &small.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+            Some(1024),
+        ) else {
+            panic!("fixed-exceeds preparation must refuse before keepalive");
+        };
+        let message = format!("{refusal:#}");
+        assert!(message.contains("counter-memory-limit"), "{message}");
+        assert_eq!(small.snapshot().charged_bytes, small_baseline);
     }
 
     #[test]

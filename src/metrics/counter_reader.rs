@@ -3670,6 +3670,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn counter_fatal_faults_route_bank_routing_with_rv_bit_only_exhaustion() {
+        use crate::attach::counter_banks::{
+            BANK_ROUTE_FAULT, BANK_RV_FAULT, BANK_SCOPE_FAULT, BANK_START_FAULT,
+        };
+        // Twin of the RV lower-bound cell: each fatal bit (route/start/scope)
+        // fails the read with `BankRouting`, alone and with the RV bit set,
+        // while `rv_exhausted` is true only when the RV bit is set.
+        for (name, fatal) in [
+            ("route", BANK_ROUTE_FAULT),
+            ("start", BANK_START_FAULT),
+            ("scope", BANK_SCOPE_FAULT),
+        ] {
+            for rv in [0, BANK_RV_FAULT] {
+                let (_dir, history, snapshot, pool) =
+                    crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+                assert_eq!(snapshot.original_indices(), [0, 2]);
+                let mut source = Scripted::sample(CounterMode::Counts, false);
+                let last_stats = source.stats.remove(&1).unwrap();
+                source.stats.insert(2, last_stats);
+                source.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
+                source.fault_bits = fatal | rv;
+                source.published = Some(snapshot);
+                let limits = CounterLimits {
+                    rows: 3,
+                    rv_keys: 12,
+                };
+                let generation = NonZeroU64::new(41).unwrap();
+                assert_eq!(
+                    source.rv_exhausted().unwrap(),
+                    rv != 0,
+                    "{name} fatal with rv bit {rv:#x} reports exhaustion only for the RV bit"
+                );
+                let read =
+                    acquire(&source, generation, &history, limits, &pool.reserver()).unwrap();
+                assert!(
+                    matches!(read.view().rows, Err(CounterIssue::BankRouting)),
+                    "{name} fatal with rv bit {rv:#x} must fail routing: {:?}",
+                    read.view().rows.as_ref().map(|rows| rows.len())
+                );
+            }
+        }
+    }
+
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,

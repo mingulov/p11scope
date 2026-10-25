@@ -45542,27 +45542,19 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     assert_eq!(engine.pending_discovery_records.len(), 1);
     assert!(engine.pending_leader_exit_views.contains(&w_id));
     assert!(!engine.pending_leader_exit_views.contains(&u_id));
-    // Neither advances until Done.
-    let mut done = false;
-    // T4b real phases cost contracted per-credit work (Selection counts,
-    // strided cursors, one Consume row per credit, native handoff); 32 was
-    // T4's vacuous-advance budget, and the async worker close needs margin
-    // under load (256 flaked once in a 39-test battery, solo green).
-    // Bound only; every assertion is unchanged.
-    for _ in 0..1024 {
-        engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
+    // Neither advances until Done. The drive waits on the async worker
+    // close instead of racing it with a fixed count (256 flaked once in
+    // a 39-test battery, solo green); every assertion is unchanged.
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
         if engine.collected_graph.is_none() {
-            done = true;
-            break;
+            return true;
         }
         assert_eq!(engine.pending_discovery_records.len(), 1);
         assert!(engine.pending_leader_exit_views.contains(&w_id));
         assert!(!engine.pending_leader_exit_views.contains(&u_id));
         assert_eq!(engine.collected_graphs_created, 1);
-    }
-    assert!(done, "the graph must reach Done");
+        false
+    });
     assert_eq!(engine.pending_discovery_records.len(), 1);
     assert!(engine.pending_leader_exit_views.contains(&w_id));
     // After Done the record dispatches first, queueing U's assessment behind W's.
@@ -47137,15 +47129,46 @@ fn graph_case_with_exit(release: bool) -> CollectedFinishGraphCase {
     case
 }
 
-/// T4b helper: drives a graph case to `!pending`, returning the credit count.
-/// Panics when the bound runs out.
-fn drive_graph_case_to_drained(case: &mut CollectedFinishGraphCase) -> u64 {
-    for credits in 1..=600u64 {
-        if !case.service(1).pending {
+/// Drives one collected-finish credit per iteration until `settled`
+/// returns true, returning the credit count. Per-credit assertions live
+/// in `settled`, which runs after every credit. 30 s wall-clock hang
+/// guard; sleeps 1 ms only while the graph is in NativePoll or owes a
+/// ticket cancel (the cleanup worker settling the batch), so loaded
+/// hosts wait on the worker instead of racing it with a fixed count.
+fn drive_graph_until(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    mut settled: impl FnMut(&mut Engine, &mut ScriptedSession, BacklogOutcome) -> bool,
+) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut credits = 0u64;
+    loop {
+        let outcome = engine
+            .service_collected_finish_records(session, Vec::new(), 0, 1)
+            .unwrap();
+        credits += 1;
+        if settled(engine, session, outcome) {
             return credits;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the graph did not settle within 30 s ({credits} credits)"
+        );
+        let worker_settling = engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::NativePoll || graph.native_cancel_owed
+        });
+        if worker_settling {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
-    panic!("the graph case did not drain");
+}
+
+/// T4b helper: drives a graph case to `!pending`, returning the credit count.
+/// Panics when the hang guard trips.
+fn drive_graph_case_to_drained(case: &mut CollectedFinishGraphCase) -> u64 {
+    drive_graph_until(&mut case.engine, &mut case.session, |_, _, outcome| {
+        !outcome.pending
+    })
 }
 
 /// T4b helper: a non-blocking native carrier over the engine's current
@@ -47392,19 +47415,15 @@ fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
     case.session.fail_collected_prepare.set(true);
     let mut verdict = None;
     // The release half of the cancel waits on the async worker; the
-    // bound gives it wall time without hanging the suite.
-    for _ in 0..512 {
-        let outcome = case.service(1);
+    // drive waits on it instead of racing it with a fixed count.
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, outcome| {
         assert!(outcome.pending);
-        verdict = case
-            .engine
+        verdict = engine
             .collected_graph
             .as_ref()
             .and_then(|graph| graph.verdict);
-        if verdict.is_some() {
-            break;
-        }
-    }
+        verdict.is_some()
+    });
     assert_eq!(
         verdict,
         Some(Verdict::RefusedUntouched),
@@ -49813,15 +49832,7 @@ fn collected_graph_matches_conservative_reference() {
         .unwrap();
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    for _ in 0..600 {
-        if !engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap()
-            .pending
-        {
-            break;
-        }
-    }
+    drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     assert!(
         !engine
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)

@@ -3557,15 +3557,16 @@ pub(crate) struct BacklogOutcome {
 /// to this many leaf units per credit. Native calls stay `work = 1`.
 pub(crate) const GRAPH_STRIDE: usize = 64;
 
-/// How long a graph tolerates stay-`Pending` native polls that observe no
-/// retirement progress before it takes the finite incomplete stop (§1.9):
-/// a wedged worker never releases, while a healthy retirement always
-/// closes within seconds. Poll counts cannot bound a healthy drain (a
-/// tight driver spins thousands of polls while the worker closes), and no
-/// production constant bounds retirement-close time, so this borrows the
-/// inventory preparation window: a bounded phase that cannot complete in
-/// 30 s fails closed rather than hanging the stop. The trip outcome is
-/// the existing disclosed incomplete stop, never a silent one.
+/// How long a graph tolerates a no-witness native wait that observes no
+/// release before it takes the finite incomplete stop (§1.9): stay-`Pending`
+/// native polls and the owed ticket cancel share this one deadline. A
+/// wedged worker never releases, while a healthy retirement always closes
+/// within seconds. Poll counts cannot bound a healthy drain (a tight driver
+/// spins thousands of polls while the worker closes), and no production
+/// constant bounds retirement-close time, so this borrows the inventory
+/// preparation window: a bounded phase that cannot complete in 30 s fails
+/// closed rather than hanging the stop. The trip outcome is the existing
+/// disclosed incomplete stop, never a silent one.
 const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Fixed accounting limit for the Engine's dedicated collected-graph pool.
@@ -4152,6 +4153,7 @@ struct CollectedGraph {
     ticket: Option<CollectedRetirementTicket>,
     mutated: bool,
     native_poll_since: Option<std::time::Instant>,
+    native_cancel_since: Option<std::time::Instant>,
     native_cancel_owed: bool,
     deferral_done: bool,
     partial_deferred: bool,
@@ -4213,6 +4215,7 @@ impl CollectedGraph {
             ticket: None,
             mutated: false,
             native_poll_since: None,
+            native_cancel_since: None,
             native_cancel_owed: false,
             deferral_done: false,
             partial_deferred: false,
@@ -24646,21 +24649,33 @@ impl Engine {
         Self::graph_idle(true)
     }
 
+    /// Whether a no-witness native wait has run past the shared wedge
+    /// deadline: stamps the first quiet credit, trips once the whole
+    /// deadline observed no release. One constant, one clock for the
+    /// NativePoll wait and the owed-cancel wait (§1.9).
+    fn native_wedge_tripped(since: &mut Option<std::time::Instant>) -> bool {
+        let since = *since.get_or_insert_with(std::time::Instant::now);
+        since.elapsed() >= GRAPH_NATIVE_POLL_WEDGE_DEADLINE
+    }
+
     /// Owed ticket cancel (§1.9 Prepare/Begin row): one cancel credit
     /// per service credit until the release answers untouched (the input
     /// comes back) or retained. Shared by NativePrepare and NativeBegin;
-    /// the caller stays in its phase while the cancel is owed.
+    /// the caller stays in its phase while the cancel is owed. An interim
+    /// cancel claims no progress; a run that observes no release for the
+    /// whole wedge deadline falls through to the post-take incomplete stop.
     fn step_native_cancel_owed(
         &mut self,
         session: &mut dyn EngineSession,
         graph: &mut CollectedGraph,
-    ) {
+    ) -> GraphService {
         match session.cancel_collected_static_retirement(None, graph.ticket.as_ref(), 1) {
             Ok(progress) => match progress.state {
                 CollectedRetirementState::RefusedUntouched(input) => {
                     graph.removed = Some(input);
                     graph.native_cancel_owed = false;
                     self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
                 }
                 CollectedRetirementState::RefusedRetained => {
                     graph.native_cancel_owed = false;
@@ -24668,13 +24683,38 @@ impl Engine {
                         graph,
                         "the post-take cancel retained native ownership".into(),
                     );
+                    Self::graph_idle(true)
                 }
-                // Preparing or any other interim state: stay owed.
-                _ => {}
+                // Preparing or any other interim state: stay owed without
+                // claiming progress. The cancel result carries no
+                // release-advancement witness (`used` is unconditionally 1
+                // here and the dispose/release sub-phase never surfaces), so
+                // no progress was observed. The bound is wall-time: a worker
+                // that releases nothing for the whole deadline is wedged, and
+                // the run falls through to the existing finite incomplete stop
+                // instead of spinning forever.
+                _ => {
+                    if Self::native_wedge_tripped(&mut graph.native_cancel_since) {
+                        // The take happened but the input never came back, so
+                        // the cancel failure keeps the Err row below: native
+                        // ownership is uncertain, never untouched.
+                        graph.native_cancel_owed = false;
+                        self.refuse_graph_native_retained(
+                            graph,
+                            format!(
+                                "native cancel observed no release for {}s",
+                                GRAPH_NATIVE_POLL_WEDGE_DEADLINE.as_secs()
+                            ),
+                        );
+                        return Self::graph_idle(true);
+                    }
+                    Self::graph_idle(false)
+                }
             },
             Err(error) => {
                 graph.native_cancel_owed = false;
                 self.refuse_graph_native_retained(graph, error.to_string());
+                Self::graph_idle(true)
             }
         }
     }
@@ -24743,8 +24783,7 @@ impl Engine {
         // Owed cancel after a post-take prepare error: one cancel credit
         // at a time until the release answers.
         if graph.native_cancel_owed {
-            self.step_native_cancel_owed(session, graph);
-            return Self::graph_idle(true);
+            return self.step_native_cancel_owed(session, graph);
         }
         match session.prepare_collected_static_retirement(q, &mut graph.removed, reserve, 1) {
             Ok(progress) => {
@@ -24805,8 +24844,7 @@ impl Engine {
         graph: &mut CollectedGraph,
     ) -> GraphService {
         if graph.native_cancel_owed {
-            self.step_native_cancel_owed(session, graph);
-            return Self::graph_idle(true);
+            return self.step_native_cancel_owed(session, graph);
         }
         let Some(ticket) = graph.ticket.as_ref() else {
             if graph.mutated {
@@ -25116,10 +25154,7 @@ impl Engine {
                     // whole deadline is wedged, and the run falls through
                     // to the existing finite incomplete stop instead of
                     // spinning forever.
-                    let since = *graph
-                        .native_poll_since
-                        .get_or_insert_with(std::time::Instant::now);
-                    if since.elapsed() >= GRAPH_NATIVE_POLL_WEDGE_DEADLINE {
+                    if Self::native_wedge_tripped(&mut graph.native_poll_since) {
                         // NativePoll is reachable only after native
                         // mutation; the unmutated shape mirrors the Err row
                         // below defensively.

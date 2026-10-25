@@ -14435,6 +14435,45 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn completed_framed_lane_waits_for_the_seal() {
+        // A Published final lane whose seal has not drained keeps
+        // its seat through the wound-down: the not-ready take
+        // holds, and the drained retry completes it.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        let drops = Rc::new(Cell::new(0));
+        io.drop_spy = Some(Rc::clone(&drops));
+        driver.semantic = Some(joint_lane(io, true));
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "the framed lane never abandons"
+        );
+        assert!(
+            driver.semantic.is_some(),
+            "the not-ready take keeps the lane"
+        );
+        assert!(driver.joint_first_error.is_none(), "no error while waiting");
+        assert_eq!(drops.get(), 0, "kept means never dropped");
+        // The seal drains; the retry completes it.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_lane_stopped();
+        assert!(
+            driver.semantic.is_none(),
+            "the drained retry completes the lane"
+        );
+        assert_eq!(drops.get(), 1, "completion drops the shell");
+    }
+
+    #[test]
     fn stop_drains_service_without_installing() {
         use crate::attach::selected_detailed::SelectedPreparationFailure;
         let mut coordinator = coordinator();

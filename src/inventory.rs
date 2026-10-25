@@ -13874,10 +13874,27 @@ mod promotion_driver_tests {
             ticks_before + 8,
             "every hook still ticked the display"
         );
+        // The epoch pins "driver ticks never dirty the graph
+        // inputs" as a tripwire, not as the gate killer: no
+        // on_tick-reachable path bumps it (a full-path probe moves
+        // takes and commits but leaves the epoch at 0), and the
+        // contract's due scan / pending exec transition are
+        // serviced only by the collection loop, so planting them
+        // here would sit unserviced in both paths (R1.4 minor
+        // ruling: fixture theater refused). The take and commit
+        // spies below are the gate killers (mutant A).
         assert_eq!(
             driver.coordinator.graph_inputs_epoch_for_test(),
             epoch,
             "no hook moved the graph inputs"
+        );
+        assert_eq!(
+            driver.take_promotion_work_calls, 0,
+            "no hook took promotion work"
+        );
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no hook attempted the staged commit"
         );
         assert_eq!(
             driver.display.as_ref().expect("display").promotion_state(),

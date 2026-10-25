@@ -1087,6 +1087,17 @@ class PairedPathTwins(unittest.TestCase):
         oracle.cross_totals(joint, single)
 
 
+    def test_mutation_empty_joint_rows_rejected(self):
+        oracle = require_oracle(self)
+        collision, joint, _single = paired(oracle, "poll_msg")
+        joint["key_operations"] = []
+        joint["unknown_key_operations"] = []
+        joint["objects"] = []
+        joint["gaps"]["rows"] = []
+        with self.assertRaisesRegex(oracle.LedgerError, "missing key row"):
+            oracle.compare_joint(collision, joint)
+
+
 class TransferTwins(unittest.TestCase):
     def transfer_pair(self, oracle):
         steps_a = [call(1, "async_begin", "begin", 0, 1),

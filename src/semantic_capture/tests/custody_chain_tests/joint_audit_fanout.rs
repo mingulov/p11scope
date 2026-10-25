@@ -201,6 +201,7 @@ struct MachineNativeRows {
         bool,
     )>,
     fail_after_preparation: bool,
+    fail_births: bool,
     absence_reads: Vec<(u64, ImageIdentity, u32)>,
     birth_outcomes: Vec<(
         u32,
@@ -630,7 +631,9 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         proof: &JournalDomainProof,
         adapter: &JournalAdapter,
     ) -> Result<RetainedBirthWitness, BirthObservationRefusal> {
-        let unmarked = absence.is_some() || input.s1_facts().function == "C_GetSessionInfo";
+        let unmarked = self.native.fail_births
+            || absence.is_some()
+            || input.s1_facts().function == "C_GetSessionInfo";
         let (row, control, _) = self.native.publisher.publish_stamped(
             if unmarked {
                 &["0", "0", "0", "0", "1"]
@@ -1096,6 +1099,7 @@ impl MachineScene {
                 reads: Cell::new((0, 0)),
                 preparations: Vec::new(),
                 fail_after_preparation: false,
+                fail_births: false,
                 absence_reads: Vec::new(),
                 birth_outcomes: Vec::new(),
                 pending_q_resolutions: 0,

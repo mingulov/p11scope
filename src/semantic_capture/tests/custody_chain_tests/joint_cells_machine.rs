@@ -1023,3 +1023,118 @@ joint_cell!(
     CellEvent::SinkFailure,
     j10_error_body
 );
+
+/// Control: the R16 shape WITH journal rows present stages and
+/// publishes. Two providers, many modeled calls in one quantum, every
+/// birth refused (the marker is unwired, so no Joint feed exists), zero
+/// Joint feeds. The H8-absent twin below is the live case.
+#[test]
+fn joint_machine_h8_present_s1only_batch_publishes() {
+    let mut scene = MachineScene::new(2);
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    let mut seq = 1u64;
+    for _ in 0..2 {
+        for file in [0u32, 1] {
+            for name in [
+                "C_CreateObject",
+                "C_SignInit",
+                "C_SignUpdate",
+                "C_SignFinal",
+            ] {
+                scene.scene.push(pid, file, name, seq);
+                seq += 1;
+            }
+        }
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("h8-present-s1only", None);
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "a grant exists: the machine took the ingest path, like live"
+    );
+    assert!(
+        !scene.native.birth_outcomes.is_empty()
+            && scene
+                .native
+                .birth_outcomes
+                .iter()
+                .all(|(_, result)| result.is_err()),
+        "every birth refused, like live: {:?}",
+        scene.native.birth_outcomes
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "zero Joint feeds, like live"
+    );
+    let api: u64 = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    assert_eq!(api, 16, "all sixteen S1-only calls stage their S1 facts");
+}
+
+/// The live R16 case: ordinary EVENTS rows with NO journal rows (the
+/// object-journal BPF is compiled into no flavor, so live emits one
+/// CALL row per call and opens no H8 entry). Every birth refused, zero
+/// Joint feeds. The transaction must still publish its S1 facts.
+#[test]
+fn joint_machine_h8_absent_s1only_batch_publishes() {
+    use p11scope_ebpf_common::object_journal::JournalRecord;
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    let descriptors = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+    for seq in 1..=8u64 {
+        let (_, end) = scene.scene.encoded(pid, 0, "C_SignInit", seq);
+        let payload =
+            match p11scope_ebpf_common::object_journal::decode_journal_record(&end, &descriptors) {
+                Some(JournalRecord::End(end)) => end.payload_base(),
+                other => panic!("the shaped END decodes: {other:?}"),
+            };
+        // The bare CALL row only: no journal BEGIN/END enters the drain,
+        // so ingest opens no H8 entry for these admissions.
+        scene
+            .scene
+            .drain
+            .source_mut()
+            .push_record(crate::events::record_bytes(&payload));
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("h8-absent-s1only", None);
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "a grant exists: the machine took the ingest path, like live"
+    );
+    assert!(
+        !scene.native.birth_outcomes.is_empty()
+            && scene
+                .native
+                .birth_outcomes
+                .iter()
+                .all(|(_, result)| result.is_err()),
+        "every birth refused, like live: {:?}",
+        scene.native.birth_outcomes
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "zero Joint feeds, like live"
+    );
+    let api: u64 = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    assert_eq!(api, 8, "all eight S1-only calls stage their S1 facts");
+}

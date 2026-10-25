@@ -1396,8 +1396,10 @@ impl OwnedProducerDetach {
         !matches!(self, Self::NotStarted)
     }
 
-    /// Snapshot-only readiness for selected preparation cleanup. Attempted is
-    /// not settled: only returned closes count, and this never moves a worker.
+    /// Snapshot-only readiness. Attempted is not settled: only returned
+    /// closes count, and this never moves a worker. Production reaps
+    /// through `poll`; only tests still snapshot readiness.
+    #[cfg(test)]
     fn ready_to_finish(&self) -> bool {
         match self {
             Self::Pending { worker, .. } => {
@@ -1466,29 +1468,63 @@ impl OwnedProducerDetach {
         result
     }
 
-    /// Non-consuming reap stub (RED): completes early and consumes the
-    /// worker instead of keeping the SAME worker while it is blocked.
+    /// Non-consuming reap: while the worker thread is still closing,
+    /// `try_join` reports pending and the SAME worker stays in place
+    /// with every original lease. Only a joined receipt settles, through
+    /// the same `settle_cleanup_exit` + `finish_producer_detach` path as
+    /// `drive`. Nothing is printed: progress lines belong to the
+    /// blocking `drive`.
     fn poll(
         &mut self,
-        _failures: &mut Vec<String>,
-        _detached: &mut bool,
-        _wall_ms: &mut u64,
+        failures: &mut Vec<String>,
+        detached: &mut bool,
+        wall_ms: &mut u64,
         _out: &mut dyn std::io::Write,
     ) -> Result<ProducerDetachProgress> {
-        if matches!(self, Self::NotStarted) {
-            bail!("owned producer detach not begun");
-        }
-        let prior = std::mem::replace(self, Self::Unproved);
-        match prior {
-            Self::Pending { .. } => Ok(ProducerDetachProgress::Complete),
-            Self::Complete => {
-                *self = Self::Complete;
-                Ok(ProducerDetachProgress::Complete)
+        let Self::Pending {
+            worker,
+            started,
+            had_work,
+        } = self
+        else {
+            if matches!(self, Self::Complete) {
+                finish_producer_detach(detached, failures, Ok(()))?;
+                return Ok(ProducerDetachProgress::Complete);
             }
-            Self::NotStarted | Self::Unproved => {
-                bail!("producer detach has no unsettled owned job; completion remains unproven")
+            if matches!(self, Self::NotStarted) {
+                bail!("owned producer detach not begun");
             }
+            *detached = false;
+            bail!("producer detach has no unsettled owned job; completion remains unproven")
+        };
+        let started = *started;
+        let had_work = *had_work;
+        let Some(receipt) = worker.try_join() else {
+            return Ok(ProducerDetachProgress::Pending);
+        };
+        *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
+        let complete = receipt.completed;
+        let result = match cleanup_worker::settle_cleanup_exit(
+            cleanup_worker::CleanupExit::Completed(receipt),
+        ) {
+            Ok(joined_failures) => {
+                failures.extend(joined_failures);
+                if !complete && failures.is_empty() {
+                    failures
+                        .push("joined producer cleanup did not prove complete settlement".into());
+                }
+                Ok(())
+            }
+            Err(interrupted) => Err(interrupted.into()),
+        };
+        let result = finish_producer_detach(detached, failures, result);
+        if result.is_ok() {
+            *self = Self::Complete;
+        } else {
+            *self = Self::Unproved;
         }
+        result?;
+        Ok(ProducerDetachProgress::Complete)
     }
 }
 
@@ -10518,9 +10554,7 @@ mod tests {
             }
             assert!(!detached && failures.is_empty());
             assert!(
-                lease
-                    .upgrade()
-                    .is_some_and(|file| file.metadata().is_ok()),
+                lease.upgrade().is_some_and(|file| file.metadata().is_ok()),
                 "a pending poll keeps the original leases"
             );
         }

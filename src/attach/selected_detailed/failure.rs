@@ -1,6 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Failed preparation retains its original native cleanup owner.
-use super::super::Session;
+use super::super::{ProducerDetachProgress, Session};
 use crate::inventory_semantics::SemanticRefusal;
 
 /// Only the actual joined receipt permits reuse. Pending and Unproved retain
@@ -171,16 +171,14 @@ impl SelectedPreparationFailure {
             self.status = SelectedCleanupStatus::Unproved;
             return self.status;
         }
-        let ready = session.producer_detach.ready_to_finish();
-        if !ready {
-            return SelectedCleanupStatus::Pending;
-        }
-        match session.finish_owned_producer_detach_driven(|| false, out) {
-            Ok(()) => {
+        match session.poll_owned_producer_detach(out) {
+            Ok(ProducerDetachProgress::Pending) => SelectedCleanupStatus::Pending,
+            Ok(ProducerDetachProgress::Complete) => {
                 self.status = SelectedCleanupStatus::Settled;
                 // Joined native owners have closed. Only now release the
                 // remaining maps, targets and query descriptors together.
                 drop(self.session.take());
+                self.status
             }
             Err(error) => {
                 self.diagnostic = anyhow::anyhow!(
@@ -188,9 +186,9 @@ impl SelectedPreparationFailure {
                     self.diagnostic
                 );
                 self.status = SelectedCleanupStatus::Unproved;
+                self.status
             }
         }
-        self.status
     }
 }
 impl std::fmt::Debug for SelectedPreparationFailure {

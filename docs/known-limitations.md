@@ -683,11 +683,15 @@ closes after exit.
   either backend, disclosed). Two mounts over one lower file join on
   the kernel side only before 6.8 (D-C7-2: the kernel correctly
   reports the same underlying file while the userspace side reports a
-  named mismatch), and never join on 6.8+ (lane B). After a copy-up on
-  6.8+ the overlay's stable file number can join the upper mapper to
-  the stale lower anchor on the userspace side while the kernel
-  correctly refuses (D-C7-3): that userspace edge can join a file
-  whose bytes changed (the copy-up wrote new bytes). With xino off,
+  named mismatch), and never join on 6.8+ (lane B). A copy-up on
+  6.8+ keeps the overlay file number (D-C7-3). A process that loaded
+  the provider before the copy-up keeps running the original lower
+  file, but inventory attributes it to the copied-up file on both
+  identity backends: its original edge reads `ended`, its later calls
+  are not counted, and the new edge can read `watched_no_use`. The
+  kernel check refuses such a stale match only inside one pass under
+  `--capture scan`; ordinary captures re-check every pass, so this
+  does not protect long-running processes. With xino off,
   equal real file numbers on distinct layers collide on the overlay
   device on 6.8+ (a named mismatch, never an edge), while before 6.8
   each layer keeps its real device in the key so there is no
@@ -703,23 +707,16 @@ closes after exit.
   only claimed when the stat-based xino check agrees with the
   requested mode (never mountinfo).
 - Disclosure: a refused join surfaces as an `identity_mismatch` loss.
-  Nothing in the output marks a userspace edge that survived a
-  copy-up: it reads like any other edge.
-- Workaround: run system-scope inventory with `--identity-backend
-  kernel`: the kernel check compares the underlying files directly
-  and refuses the copy-up edge (named mismatch, no edge). Confirm the
-  kernel check ran from the report's `observation.identity`
-  (`backend: kernel` with no `fallback`); without kernel-identity
-  support the command refuses to run rather than silently using the
-  userspace side. Under the default backend the false edge can
-  appear. Same-filesystem layer layouts and avoiding post-copy-up
-  attribution windows for replaced providers reduce exposure but do
-  not remove the copy-up edge.
-- Status: investigation verdict: no userspace-side guard fits the
-  already-captured fields (the proof carries device and file numbers
-  only, all unchanged across copy-up), and layer-index tracking needs
-  kernel/container changes rejected for v0.5.0. This disclosure is
-  final.
+  The copy-up misattribution above has no marker in the output: the
+  edges read like any other.
+- Workaround: none for the copy-up case. Restart processes that loaded
+  a provider before the file changed inside the container (for
+  example by chmod, touch or an in-place write). `--identity-backend
+  kernel` does not help here. Same-filesystem layer layouts avoid only
+  the xino-off collision.
+- Status: disclosed for v0.5.0. Marking such an edge unknown with a
+  named gap, when a live caller's mapping stays the same but its
+  module changes, is planned for a later release.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

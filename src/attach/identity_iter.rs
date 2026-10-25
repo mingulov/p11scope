@@ -959,12 +959,25 @@ pub fn link_create_task_vma_tid(
     tid: u32,
 ) -> io::Result<OwnedFd> {
     let (info, len) = encode_tid_selector(tgid, tid)?;
+    link_create_task_vma_tid_encoded(prog_fd, &info, len)
+}
+
+/// Create the member-run link from an already-encoded selector: the
+/// `bpf()` half of [`link_create_task_vma_tid`]. Callers that classify
+/// encode-time refusals (a target that exited before the run) encode
+/// once with [`encode_tid_selector`] and create here, so no second
+/// gate can misclassify the same death as an attempted run.
+pub fn link_create_task_vma_tid_encoded(
+    prog_fd: BorrowedFd<'_>,
+    info: &IterLinkInfo,
+    len: u32,
+) -> io::Result<OwnedFd> {
     let attr = LinkCreateAttr {
         prog_fd: prog_fd.as_raw_fd() as u32,
         target_fd: 0,
         attach_type: BPF_TRACE_ITER,
         flags: 0,
-        iter_info: std::ptr::addr_of!(info).addr() as u64,
+        iter_info: std::ptr::addr_of!(*info).addr() as u64,
         iter_info_len: len,
         reserved: 0,
     };
@@ -2326,6 +2339,9 @@ pub fn attach_and_read_run(
 ) -> Result<Vec<u8>, ProbeError> {
     attach_and_read_run_typed(prog_fd, pid_fd, deadline, max_bytes).map_err(|error| match error {
         OwnedRunError::Attach(error) => error,
+        // Only the member path produces this (its typed caller maps it
+        // first); pass the encode-stage detail through unchanged.
+        OwnedRunError::TargetExited(error) => error,
         OwnedRunError::Read(error) => ProbeError {
             stage: "read",
             detail: format!("{error:?}"),
@@ -2337,6 +2353,9 @@ pub fn attach_and_read_run(
 pub(crate) enum OwnedRunError {
     Attach(ProbeError),
     Read(ReadError),
+    /// The pre-syscall gate refused: the member target exited before
+    /// any syscall ran. A dead selector, never an attempted run.
+    TargetExited(ProbeError),
 }
 
 /// The same owned attach/read/close path, retaining the finite read cause for

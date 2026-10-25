@@ -18,7 +18,7 @@ use super::sweep_attribution::{
 use super::sweep_attribution::{ReservationOwner, SegmentPolicy, Slot};
 use crate::attach::identity_iter::{
     AnchorArena, Expect, OwnedRunError, ProbeError, RunKind, RunMode, ScopeBitmap, StrictIdentity,
-    consume_owned_run, iter_create, link_create_task_vma_tid, parse,
+    consume_owned_run, encode_tid_selector, iter_create, link_create_task_vma_tid_encoded, parse,
 };
 use p11scope_manifest::maps::ObjectKey;
 use std::cmp::Reverse;
@@ -461,7 +461,16 @@ pub(crate) fn attach_and_read_member_run(
     deadline: std::time::Instant,
     max_bytes: usize,
 ) -> Result<Vec<u8>, OwnedRunError> {
-    let link = link_create_task_vma_tid(prog, member.tgid(), member.tid()).map_err(|error| {
+    // Encode once, up front: an encode-time refusal (the target exited
+    // before the run) classifies exactly here, and the link below never
+    // re-gates the same death as an attempted run.
+    let (info, len) = encode_tid_selector(member.tgid(), member.tid()).map_err(|error| {
+        OwnedRunError::TargetExited(ProbeError {
+            stage: "encode",
+            detail: error.to_string(),
+        })
+    })?;
+    let link = link_create_task_vma_tid_encoded(prog, &info, len).map_err(|error| {
         OwnedRunError::Attach(ProbeError {
             stage: "link",
             detail: error.to_string(),
@@ -487,6 +496,10 @@ pub(crate) enum RunFailure {
     AttachOrRead,
     BelowThreshold,
     TargetLimit,
+    /// The member target exited before the run: the pre-syscall gate
+    /// refused, so no syscall ran. A dead selector, never an attempted
+    /// run — the member branch resets without counting or demoting.
+    TargetExited,
 }
 
 /// Finite userspace-fallback cause for one proof request. Labels and details
@@ -549,6 +562,10 @@ impl From<RunFailure> for KernelFallbackReason {
             RunFailure::AttachOrRead => Self::TargetUnavailable,
             RunFailure::BelowThreshold => Self::BelowThreshold,
             RunFailure::TargetLimit => Self::TargetLimit,
+            // The member branch intercepts this before any batch
+            // fallback; if it ever leaks, it surfaces exactly what the
+            // same event produced before the interception existed.
+            RunFailure::TargetExited => Self::TargetUnavailable,
         }
     }
 }
@@ -1028,59 +1045,75 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                         drop(guard);
                         return self.userspace(batch, reason);
                     }
-                    let bytes = match guard
+                    match guard
                         .installed
                         .read_member_typed(selector, deadline, max_bytes)
                     {
-                        Ok(bytes) => {
-                            guard.installed.target_attempts =
-                                guard.installed.target_attempts.saturating_add(1);
-                            bytes
+                        // The target exited between validation and the
+                        // run: the pre-syscall gate refused, so no
+                        // syscall ran. A dead selector, not an attempted
+                        // run: reset the target without counting an
+                        // attempt or demoting later segments; the
+                        // answers below name it per request, like no
+                        // selector at all.
+                        Err(RunFailure::TargetExited) => {
+                            drop(guard);
+                            crate::attach::identity_iter::Run::default()
                         }
-                        Err(reason) => {
-                            // Same attempt policy as ordinary runs:
-                            // only an attempted run's failure demotes
-                            // later segments.
-                            if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
-                                drop(guard);
+                        read => {
+                            let bytes = match read {
+                                Ok(bytes) => {
+                                    guard.installed.target_attempts =
+                                        guard.installed.target_attempts.saturating_add(1);
+                                    bytes
+                                }
+                                Err(reason) => {
+                                    // Same attempt policy as ordinary runs:
+                                    // only an attempted run's failure demotes
+                                    // later segments.
+                                    if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope)
+                                    {
+                                        drop(guard);
+                                        return self.userspace(batch, reason);
+                                    }
+                                    guard.installed.target_attempts =
+                                        guard.installed.target_attempts.saturating_add(1);
+                                    drop(guard);
+                                    self.note_attempted_outcome(reason);
+                                    self.installed.failed_target = Some(reason);
+                                    return self.userspace(batch, reason);
+                                }
+                            };
+                            // Reset before consuming: a stuck target would hijack
+                            // later ordinary runs. Fail closed on a stuck reset.
+                            let reset = guard.installed.replace_member_target(None);
+                            guard.disarm();
+                            if let Err(reason) = reset {
                                 return self.userspace(batch, reason);
                             }
-                            guard.installed.target_attempts =
-                                guard.installed.target_attempts.saturating_add(1);
-                            drop(guard);
-                            self.note_attempted_outcome(reason);
-                            self.installed.failed_target = Some(reason);
-                            return self.userspace(batch, reason);
-                        }
-                    };
-                    // Reset before consuming: a stuck target would hijack
-                    // later ordinary runs. Fail closed on a stuck reset.
-                    let reset = guard.installed.replace_member_target(None);
-                    guard.disarm();
-                    if let Err(reason) = reset {
-                        return self.userspace(batch, reason);
-                    }
-                    ran_as_member = true;
-                    let only_pid = batch
-                        .requests()
-                        .first()
-                        .expect("singleton member batch")
-                        .pid();
-                    match parse(
-                        &bytes,
-                        &Expect {
-                            generation,
-                            slots,
-                            scope: &BTreeSet::from([only_pid]),
-                            mode: RunMode::PerPid,
-                            run: RunKind::Target,
-                        },
-                    ) {
-                        Ok(run) => run,
-                        Err(_) => {
-                            self.note_attempted_outcome(RunFailure::StreamInvalid);
-                            self.installed.failed_target = Some(RunFailure::StreamInvalid);
-                            return self.userspace(batch, RunFailure::StreamInvalid);
+                            ran_as_member = true;
+                            let only_pid = batch
+                                .requests()
+                                .first()
+                                .expect("singleton member batch")
+                                .pid();
+                            match parse(
+                                &bytes,
+                                &Expect {
+                                    generation,
+                                    slots,
+                                    scope: &BTreeSet::from([only_pid]),
+                                    mode: RunMode::PerPid,
+                                    run: RunKind::Target,
+                                },
+                            ) {
+                                Ok(run) => run,
+                                Err(_) => {
+                                    self.note_attempted_outcome(RunFailure::StreamInvalid);
+                                    self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                                    return self.userspace(batch, RunFailure::StreamInvalid);
+                                }
+                            }
                         }
                     }
                 }
@@ -1843,6 +1876,12 @@ impl IdentitySession {
                     crate::attach::identity_iter::OwnedRunError::Attach(_) => {
                         RunFailure::AttachOrRead
                     }
+                    // Unreachable on the ordinary path (its attach never
+                    // pre-screens a member target); fail closed as any
+                    // other attach error if it ever arrives.
+                    crate::attach::identity_iter::OwnedRunError::TargetExited(_) => {
+                        RunFailure::AttachOrRead
+                    }
                     crate::attach::identity_iter::OwnedRunError::Read(error) => error.into(),
                 })
             }
@@ -1872,6 +1911,7 @@ impl IdentitySession {
                 attach_and_read_member_run(loaded.target_fd.as_fd(), selector, deadline, max_bytes)
                     .map_err(|error| match error {
                         OwnedRunError::Attach(_) => RunFailure::AttachOrRead,
+                        OwnedRunError::TargetExited(_) => RunFailure::TargetExited,
                         OwnedRunError::Read(error) => error.into(),
                     })
             }

@@ -4821,6 +4821,81 @@ fn member_run_attempt_cap_counts_target_runs() {
     );
 }
 
+/// A target that exits between validation and the run is a dead
+/// selector, not an attempted run: the pre-syscall gate refuses before
+/// any syscall, so the skip resets the target without counting an
+/// attempt or demoting later segments, and the answers name it per
+/// request.
+#[test]
+fn target_exited_before_member_run_skips_without_demoting() {
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, true],
+        outcomes: vec![
+            MemberOutcome::Failure(RunFailure::TargetExited),
+            MemberOutcome::Slot,
+        ],
+        threshold: None,
+        fail_config: false,
+        fail_config_after: 0,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 2);
+    // The exited target skips its run (userspace proof under its own
+    // per-request name); the later member run still proves by kernel —
+    // no demotion.
+    assert_userspace_mapped(&out.confirmations[0]);
+    assert_kernel_slot(&out.confirmations[1], Slot(0));
+    assert_eq!(out.attempts, 1, "the skip is not an attempt");
+    assert!(out.failed_target.is_none(), "no demotion");
+    // Both reads were entered (the gate refuses inside the read), but
+    // only the second attempted: invocation is not an attempt.
+    assert_eq!(out.tids.len(), 2);
+    assert_eq!(out.tids[0], Some((out.pids[0], out.pids[0])));
+    assert_eq!(out.tids[1], Some((out.pids[1], out.pids[1])));
+    // The name stays in the oracle: per-request ZombieBatch with its
+    // userspace proof, while the surfaced first reason stays empty.
+    assert_eq!(
+        out.per_pid.get(&out.pids[0]),
+        Some(&KernelFallbackReason::ZombieBatch),
+        "the skipped request keeps its own name"
+    );
+    assert!(
+        out.fallback_reads
+            .iter()
+            .any(|(pid, _, _)| *pid == out.pids[0]),
+        "the skipped request falls back to userspace proof"
+    );
+    assert_eq!(out.fallback.passes, 1);
+    assert_eq!(out.fallback.pids, 1);
+    assert_eq!(out.fallback.keys, 1);
+    assert_eq!(
+        out.fallback.first_reason, None,
+        "zombie_batch never surfaces: {:?}",
+        out.fallback.first_reason
+    );
+    // The skipped write named its target, so the resets below pin real
+    // installed targets rather than vacuous zeroes.
+    assert_eq!(
+        out.config_writes.len(),
+        5,
+        "install, skipped target, skip reset, member target, reset"
+    );
+    assert_eq!(
+        (
+            out.config_writes[1].target_tgid,
+            out.config_writes[1].target_tid
+        ),
+        (out.pids[0], out.pids[0]),
+        "the skipped write named its target"
+    );
+    let last = out.config_writes.last().expect("the install wrote");
+    assert_eq!(
+        (last.target_tgid, last.target_tid),
+        (0, 0),
+        "the trailing config write zeroes the member target"
+    );
+}
+
 #[test]
 fn failed_config_write_invalidates_binding() {
     let out = member_cell(MemberCellSpec {

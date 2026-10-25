@@ -365,6 +365,11 @@ fn build_variant_with_proof(
     if bank_proof {
         selected_native_units.push("counter_bank_proof");
     }
+    // H8-D birth marker: the Detailed object alone links the admission
+    // control row; counter and inventory flavors keep no marker state.
+    if matches!(flavor, BpfFlavor::Detailed) && !bank_proof {
+        selected_native_units.push("journal_marker");
+    }
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
         let suffix = if bank_proof {
@@ -435,6 +440,11 @@ fn build_variant_with_proof(
         }
         if bank_proof && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=8192U");
+        }
+        // H8-D wires the exec-birth and scope-gap globals into the
+        // Detailed instance witness only; counter bitcode stays identical.
+        if matches!(flavor, BpfFlavor::Detailed) && *unit == "instance_epoch" {
+            compile.arg("-DP11SCOPE_JOURNAL_MARKER");
         }
         let status = compile
             .status()
@@ -606,6 +616,18 @@ fn build_variant_with_proof(
         append_flag("link-arg=--export=OBJECT_DESCRIPTORS");
         append_flag("-C");
         append_flag("link-arg=--export=OBJECT_ZERO");
+    }
+    // H8-D birth marker globals: Detailed-only exports. Counter and
+    // inventory objects carry neither the map nor the globals.
+    if matches!(flavor, BpfFlavor::Detailed) {
+        for flag in [
+            "-C",
+            "link-arg=--export=p11_instance_exec_birth",
+            "-C",
+            "link-arg=--export=p11_instance_scope_gap",
+        ] {
+            append_flag(flag);
+        }
     }
     for bitcode in native_bitcodes {
         append_flag("-C");

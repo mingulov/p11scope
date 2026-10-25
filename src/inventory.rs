@@ -1410,6 +1410,7 @@ fn run_with_terminal_budget(
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
+    driver.initialize_joint_lane();
     let clock = LoopClock {
         deadline,
         stop,
@@ -2487,9 +2488,24 @@ impl ClassicDriver<'_> {
     }
 
     /// D5 (§5): bind the seated lane's Joint machine before its first
-    /// tick. Scaffolding: the init call lands with the wiring.
+    /// tick. Each lane reaches this exactly once: the run's lane at
+    /// driver construction (classic or dashboard, never both), a
+    /// promoted lane at install. Success makes the lane Joint; refusal
+    /// keeps the legacy one-sided path with one disclosure gap.
     fn initialize_joint_lane(&mut self) {
-        let _ = self.semantic.as_ref();
+        let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
+        let Some(lane) = semantic.as_mut() else {
+            return;
+        };
+        if lane.has_joint_machine() {
+            return;
+        }
+        if let Err(reason) = lane.initialize_joint(coordinator) {
+            coordinator.note_scope_gap(
+                "joint machine unavailable".into(),
+                format!("{reason}"),
+            );
+        }
     }
 
     /// The lane's independent terminal sequence: publish any
@@ -2684,6 +2700,8 @@ impl ClassicDriver<'_> {
         {
             Ok(live) => {
                 self.semantic = Some(live);
+                // D5: lane B initializes before its first service.
+                self.initialize_joint_lane();
                 if let Some(update) = self.lifecycle.note_installed() {
                     self.installed_promotion = Some(InstalledPromotion {
                         capture: update.capture,
@@ -5709,6 +5727,7 @@ fn run_dashboard(
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
+    driver.initialize_joint_lane();
     // The run's promotion capture: the dashboard's DR37 control binds
     // once per run. `started_ns` is nonzero on any live clock; the max
     // closes the theoretical zero the baseline binder refuses.

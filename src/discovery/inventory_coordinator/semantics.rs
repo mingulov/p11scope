@@ -3796,6 +3796,9 @@ mod finalizer_history_tests {
         // calls stay joined (already counted), unknown and pending calls
         // shed once with their route labels.
         let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        // The stash needs the domain's live namespace: the shed waits
+        // there for the commit flush.
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
         let batch = drop_test_batch(
             domain,
             vec![
@@ -3829,6 +3832,70 @@ mod finalizer_history_tests {
                 1
             )],
             "the drop shed keeps its drop label and route labels"
+        );
+    }
+
+    #[test]
+    fn stray_batch_for_retired_domain_creates_no_namespace() {
+        use crate::discovery::instances::UnknownReason;
+        // A stray batch for a retired domain is refused through the
+        // audited path without recreating a finalizer namespace: with
+        // no live namespace the stash has nowhere to flush to, so
+        // nothing is retained — and a later domain stages unrefused.
+        let (mut coordinator, _lane, domain_a) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain_a));
+        coordinator
+            .retire_joint_domain(
+                crate::inventory_promotion::lifecycle::SessionNativeCompletion::scripted(domain_a),
+            )
+            .expect("quiescent A retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&domain_a));
+        let stray = drop_test_batch(
+            domain_a,
+            vec![
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Unknown(UnknownReason::Unobserved),
+            ],
+        );
+        coordinator.stage_semantic_batch(stray);
+        assert!(
+            coordinator.semantic_finalizer.is_none(),
+            "the stray batch recreates no namespace for the retired domain"
+        );
+        let subjects: Vec<String> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            subjects.contains(&"semantic batch refused for an ended domain".to_string()),
+            "the stray refusal stays disclosed, got {subjects:?}"
+        );
+        // A later domain stages into a fresh namespace, unrefused.
+        let domain_b = NativeDomainId::try_mint().expect("test domain mints");
+        coordinator.stage_semantic_batch(drop_test_batch(
+            domain_b,
+            vec![Route::Joined(InstanceId::from_raw(1))],
+        ));
+        let state = coordinator
+            .semantic_finalizer
+            .as_ref()
+            .expect("the later domain stages");
+        assert_eq!(state.domain, domain_b);
+        assert!(state.pending_semantic.is_some(), "B's batch stages");
+        let subjects: Vec<String> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            !subjects
+                .iter()
+                .any(|subject| subject == "semantic batch refused for another Session"),
+            "the later domain is not refused, got {subjects:?}"
         );
     }
 

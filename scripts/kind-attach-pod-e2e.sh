@@ -511,6 +511,19 @@ EOF
             exit 1
         fi
     done
+    # The disclosure vocabulary is frozen, not open-ended: an unknown cause
+    # is refused even with exact 6x250 counts, and every frozen cause
+    # passes on its own.
+    scan_fixture bogus '["pid_namespace","totally_bogus_future_cause"]' 250 "$sst_provider"
+    if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/bogus.json" >/dev/null 2>&1; then
+        echo "unknown scan cause accepted: bogus" >&2
+        exit 1
+    fi
+    for cause in discovery slots unprotected_live_windows; do
+        scan_fixture "only-$cause" "[\"pid_namespace\",\"$cause\"]" 0 '[]'
+        PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/only-$cause.json" >/dev/null \
+            || { echo "frozen scan cause refused: $cause" >&2; exit 1; }
+    done
     # A nested capture without its pid_namespace cause is not this cell.
     scan_fixture nonumbering '["discovery"]' 0 '[]'
     if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/nonumbering.json" >/dev/null 2>&1; then

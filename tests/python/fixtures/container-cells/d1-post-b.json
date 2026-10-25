@@ -1,0 +1,518 @@
+{
+ "capture": {
+  "modules": [
+   {
+    "path": "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   }
+  ],
+  "scope": "cgroup"
+ },
+ "evidence": {
+  "attached_probes": 136,
+  "event_loss": 0,
+  "gap_classes": {
+   "attribution": {
+    "causes": [
+     "semantic_unverified_slots"
+    ],
+    "status": "withheld"
+   },
+   "observation": {
+    "causes": [],
+    "status": "exact"
+   },
+   "open_calls": 0,
+   "semantics": {
+    "causes": [],
+    "status": "not_applicable"
+   },
+   "settlement": "proven",
+   "stdout_data_sink": false
+  },
+  "in_flight_at_end": 0,
+  "pid_namespace": {
+   "kernel_pids": "initial",
+   "observer": "initial",
+   "proc_pids": "observer"
+  },
+  "verdict_detail": "attribution_only"
+ },
+ "functions": [
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Initialize"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Finalize"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetInfo"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetFunctionList"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetSlotList"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetSlotInfo"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetTokenInfo"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetMechanismList"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetMechanismInfo"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_InitToken"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_InitPIN"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SetPIN"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_OpenSession"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_CloseSession"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_CloseAllSessions"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetSessionInfo"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetOperationState"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SetOperationState"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Login"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Logout"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_CreateObject"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_CopyObject"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DestroyObject"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetObjectSize"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetAttributeValue"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SetAttributeValue"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_FindObjectsInit"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_FindObjects"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_FindObjectsFinal"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_EncryptInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Encrypt"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_EncryptUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_EncryptFinal"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DecryptInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Decrypt"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DecryptUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DecryptFinal"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_DigestInit"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_Digest"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DigestUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DigestKey"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DigestFinal"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Sign"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignFinal"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignRecoverInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignRecover"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_VerifyInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_Verify"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_VerifyUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_VerifyFinal"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_VerifyRecoverInit"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_VerifyRecover"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DigestEncryptUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DecryptDigestUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SignEncryptUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DecryptVerifyUpdate"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GenerateKey"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GenerateKeyPair"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_WrapKey"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_UnwrapKey"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_DeriveKey"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_SeedRandom"
+   ]
+  },
+  {
+   "calls": 250,
+   "errors": 0,
+   "names": [
+    "C_GenerateRandom"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_GetFunctionStatus"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_CancelFunction"
+   ]
+  },
+  {
+   "calls": 0,
+   "errors": 0,
+   "names": [
+    "C_WaitForSlotEvent"
+   ]
+  }
+ ]
+}

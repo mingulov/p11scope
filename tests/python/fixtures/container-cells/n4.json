@@ -1,0 +1,152 @@
+{
+ "callers": [
+  {
+   "id": "c255",
+   "pid": 1463596
+  },
+  {
+   "id": "c259",
+   "pid": 1464203
+  }
+ ],
+ "edges": [
+  {
+   "caller": "c255",
+   "entries": {
+    "count": 2400,
+    "coverage": {
+     "lossy": false,
+     "since_ns": 80751960136181,
+     "state": "counted"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80746545211717,
+    "state": "mapped"
+   },
+   "module": "m7"
+  },
+  {
+   "caller": "c259",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": 80777013595881,
+     "state": "watched_no_use"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80774010911420,
+    "state": "mapped"
+   },
+   "module": "m8"
+  }
+ ],
+ "gaps": [
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "459 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "435 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "435 processes in scope; 254 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "460 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers; 1 processes past the cap had no maps snapshot",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": "m7",
+   "pid": null,
+   "reason": "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so: native witness rows of this module were not bound to a caller incarnation (first: no live caller incarnation held the tgid when the row was read); module-level positive use only, never attributed by pid",
+   "subject": "used by an unidentified caller image"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "431 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "436 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  }
+ ],
+ "modules": [
+  {
+   "id": "m4",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 35
+    },
+    "inode": 356176
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m7",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 412
+    },
+    "inode": 29663139
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m8",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 138
+    },
+    "inode": 29663351
+   },
+   "paths": [
+    "/tmp/private/libsofthsm2.so"
+   ]
+  }
+ ],
+ "observation": {
+  "identity": {
+   "backend": "kernel",
+   "fallback": "below_threshold"
+  }
+ },
+ "pid_namespace": {
+  "kernel_pids": "initial",
+  "observer": "initial",
+  "proc_pids": "observer"
+ },
+ "schema": "p11scope/inventory/v1"
+}

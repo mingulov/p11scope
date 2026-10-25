@@ -1,0 +1,224 @@
+{
+ "callers": [
+  {
+   "id": "c251",
+   "pid": 1452406
+  },
+  {
+   "id": "c252",
+   "pid": 1452576
+  },
+  {
+   "id": "c257",
+   "pid": 1454781
+  }
+ ],
+ "edges": [
+  {
+   "caller": "c251",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": 80226149968934,
+     "state": "watched_no_use"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80223451676725,
+    "state": "mapped"
+   },
+   "module": "m7"
+  },
+  {
+   "caller": "c252",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": null,
+     "state": "unknown"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80223451676725,
+    "state": "mapped"
+   },
+   "module": "m7"
+  },
+  {
+   "caller": "c252",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": 80230198346043,
+     "state": "watched_no_use"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80227152722990,
+    "state": "mapped"
+   },
+   "module": "m8"
+  },
+  {
+   "caller": "c257",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": 80230198346043,
+     "state": "watched_no_use"
+    }
+   },
+   "mapping": {
+    "evidence": "maps_match",
+    "first_seen_ns": 80227152722990,
+    "state": "mapped"
+   },
+   "module": "m8"
+  }
+ ],
+ "gaps": [
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "mapping ObjectKey { device: Device { major: 0, minor: 140 }, inode: 29662859 } was collapsed onto ObjectKey { device: Device { major: 0, minor: 138 }, inode: 29662859 } by the overlayfs + inode metadata + SHA-256 heuristic, which cannot prove physical identity across overlay instances; calls through a distinct byte-identical instance would not be probed",
+   "subject": "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so (ObjectKey { device: Device { major: 0, minor: 140 }, inode: 29662859 })"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "459 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "466 processes in scope; 256 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "465 processes in scope; 254 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "464 processes in scope; 256 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "464 processes in scope; 254 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "461 processes in scope; 256 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "468 processes in scope; 254 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "465 processes in scope; 256 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  },
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "465 processes in scope; 255 deep-scanned by provider rarity (limit 256); 2 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  }
+ ],
+ "modules": [
+  {
+   "id": "m4",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 35
+    },
+    "inode": 356176
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m5",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 307
+    },
+    "inode": 3161916
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m7",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 138
+    },
+    "inode": 29662859
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m8",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 140
+    },
+    "inode": 29662859
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  }
+ ],
+ "observation": {
+  "identity": {
+   "backend": "kernel",
+   "fallback": "anchor_not_installed"
+  }
+ },
+ "pid_namespace": {
+  "kernel_pids": "initial",
+  "observer": "initial",
+  "proc_pids": "observer"
+ },
+ "schema": "p11scope/inventory/v1"
+}

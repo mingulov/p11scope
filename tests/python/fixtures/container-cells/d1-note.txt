@@ -1,0 +1,1 @@
+copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process is attributed to the upper copy on both identity backends (known issue, disclosed). The second mapper in B is attributed to the upper copy on both backends. No named identity loss is expected on any leg.

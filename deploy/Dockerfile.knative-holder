@@ -29,8 +29,8 @@ COPY --from=build /src/gated /usr/local/bin/p11scope-ledger-gated
 # K3_GATE/K3_LEDGER_LOG/K3_RAN/K3_LEDGER_TIMEOUT_S are self-test hooks; the
 # image defaults are the /tmp paths the entry script prepares.
 RUN cat > /server.py <<'PYEOF'
-# K3-SERVER-BEGIN
 #!/usr/bin/env python3
+# K3-SERVER-BEGIN
 # SPDX-License-Identifier: GPL-3.0-or-later
 """K3 holder HTTP handler: one GET on /ledger releases the gated SoftHSM2
 ledger run and returns its LEDGER line. Any other path answers 200 without
@@ -103,8 +103,8 @@ PYEOF
 # background, then become the gated ledger client (PID 1 maps the provider
 # from pod start; one GET releases its single ledger run).
 RUN cat > /usr/local/bin/knative-holder-entry <<'SHEOF'
-# K3-ENTRY-BEGIN
 #!/bin/sh
+# K3-ENTRY-BEGIN
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Test-only entry for the K3 Knative holder image.
 set -eu

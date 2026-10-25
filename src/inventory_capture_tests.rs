@@ -5945,7 +5945,16 @@ mod publication_progress_tests {
                 assert!(matches!(run.pass, RetainedPass::BeforeCollection));
                 assert_eq!(run.completed_passes, u64::from(between_passes));
                 assert_eq!(run.discarded_collections, 0);
-                assert_eq!((driver.collected_ptr, driver.report_ptr), (0, 0));
+                if between_passes {
+                    assert_ne!((driver.collected_ptr, driver.report_ptr), (0, 0));
+                    assert_eq!(
+                        (driver.scene.scans, driver.applies, driver.emissions),
+                        (1, 1, 1),
+                        "the completed pass stays counted once"
+                    );
+                } else {
+                    assert_eq!((driver.collected_ptr, driver.report_ptr), (0, 0));
+                }
                 let polls = driver.changes.len();
                 assert_eq!(polls, if between_passes { 2 } else { 1 });
 

@@ -2461,8 +2461,10 @@ mod tests {
     /// first 512-endpoint stage without it (1026 > 1024); the product check
     /// is correct, so the cell provides the OS budget it stages against.
     fn growth_fd_soft_floor(final_count: usize) -> u64 {
-        let _ = final_count;
-        0
+        // Two retained links per endpoint, plus one worst fresh-extent
+        // charge (512 endpoints: 512 * 2 links + 1 bank + 1 transient) and
+        // slack for session maps, fixtures and pipes.
+        (2 * final_count as u64) + 4096
     }
 
     fn ensure_fd_budget_with(
@@ -2470,8 +2472,14 @@ mod tests {
         get: impl FnOnce() -> std::io::Result<(u64, u64)>,
         set: impl FnOnce(u64, u64) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        let _ = (need, get, set);
-        Ok(())
+        let (soft, hard) = get()?;
+        if soft >= need {
+            return Ok(());
+        }
+        if hard >= need {
+            return set(need, hard);
+        }
+        set(need, need)
     }
 
     fn ensure_growth_fd_budget(final_count: usize) {

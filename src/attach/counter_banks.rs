@@ -308,9 +308,9 @@ pub(crate) fn counter_affordable_endpoints(
     mode: CounterMode,
     cpus: usize,
 ) -> Result<usize, BankRefusal> {
-    Ok(counter_affordable_banks(mode, cpus)?
+    counter_affordable_banks(mode, cpus)?
         .checked_mul(512)
-        .ok_or(BankRefusal::Budget)?)
+        .ok_or(BankRefusal::Budget)
 }
 
 /// Growth-gate check for a total bank count: fixed plus banks times
@@ -7160,7 +7160,7 @@ pub(crate) mod tests {
         let cpus = 256usize;
         let ceiling = counter_affordable_endpoints(mode, cpus).unwrap();
         assert!(
-            ceiling > 512 && ceiling < 8192 && ceiling % 512 == 0,
+            ceiling > 512 && ceiling < 8192 && ceiling.is_multiple_of(512),
             "latency P=256 must have a partial ceiling, got {ceiling}"
         );
         let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);

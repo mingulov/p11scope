@@ -109,6 +109,45 @@ impl PromotionBaselineBatch {
         }
     }
 
+    /// Tests-only batch like `scripted_for_test` plus one acquired row
+    /// (caller, incarnation, custody, cookie, exec): `matches_view`
+    /// passes and `for_request` can genuinely derive a baseline for
+    /// the matching live original. The custody must be a
+    /// `WeakProcessCustody::pinned_for_test` over that original; the
+    /// cookie/exec are scripted native observations (unobservable
+    /// unprivileged). Reclaim-path scenes only (I4).
+    #[cfg(test)]
+    pub(crate) fn scripted_with_row_for_test(
+        capture: CaptureId,
+        presentation: Arc<Presentation>,
+        caller: CallerId,
+        incarnation: u32,
+        custody: WeakProcessCustody,
+        cookie: u64,
+        exec_id: u64,
+    ) -> Self {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let storage = pool
+            .reserve(requested_bytes(1).expect("one row sizes"))
+            .expect("the test pool reserves");
+        Self {
+            capture,
+            presentation,
+            core: KernelBaselineBatch {
+                domain: NativeDomainId::mint(),
+                generation: 9,
+                rows: vec![ImageRow {
+                    caller,
+                    incarnation,
+                    original: custody,
+                    cookie,
+                    exec_id,
+                }],
+            },
+            _storage: storage,
+        }
+    }
+
     pub(crate) fn matches_view(
         &self,
         capture: CaptureId,

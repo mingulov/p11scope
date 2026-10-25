@@ -781,6 +781,21 @@ impl WeakProcessCustody {
             .upgrade()
             .is_some_and(|held| Arc::ptr_eq(&held, original))
     }
+
+    /// Tests-only custody over a caller-held live pin: downgrades the
+    /// pin with a test-pool charge, so `matches_original` passes for
+    /// that pin through the real upgrade + ptr_eq check. Reclaim-path
+    /// scenes only (I4): production custody comes from acquisition.
+    #[cfg(test)]
+    pub(crate) fn pinned_for_test(pin: &Arc<PidPin>) -> Self {
+        let pool = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let charge = CustodyCharge::reserve::<PidPin>(&pool.reserver(), 0)
+            .expect("the test pool charges one custody");
+        Self {
+            original: Arc::downgrade(pin),
+            _charge: charge,
+        }
+    }
 }
 
 impl PidPin {

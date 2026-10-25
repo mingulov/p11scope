@@ -771,6 +771,32 @@ pub(crate) struct SelectedConstructionPermit {
     baseline: baseline::PromotionImageBaseline,
 }
 impl SelectedConstructionPermit {
+    /// Tests-only permit bundling caller-supplied values: coherent by
+    /// construction (the scene aligns domain/generation/image with the
+    /// proof binding and the baseline row), but never `validate()`d —
+    /// validation needs live native maps. Reclaim-path scenes only
+    /// (I4): the lane must dispose, never install.
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(
+        events: crate::events::EventsDomain,
+        original: std::sync::Arc<crate::process::PidPin>,
+        parent: super::Scope,
+        domain: super::capture::NativeDomainId,
+        image: ImageIdentity,
+        generation: u64,
+        baseline: baseline::PromotionImageBaseline,
+    ) -> Self {
+        Self {
+            owner: SelectedSessionIdentity(events),
+            original,
+            parent,
+            domain,
+            image,
+            generation,
+            baseline,
+        }
+    }
+
     pub(crate) fn identity(&self) -> &SelectedSessionIdentity {
         &self.owner
     }

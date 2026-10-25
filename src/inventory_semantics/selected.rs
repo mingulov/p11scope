@@ -111,6 +111,24 @@ impl ProvisionalSelectedLane {
             .poll_cleanup(out)
     }
 
+    /// Tests-only sealed lane over a unit-test lane shell plus a
+    /// scripted permit: the proof binding reads off the permit, so a
+    /// proof minted over the same binding genuinely authorizes this
+    /// lane. No live Session (disposal settles vacuously through the
+    /// real `poll_dispose` path). Reclaim-path scenes only (I4): the
+    /// lane must dispose, never install.
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(
+        lane: AttestedSemanticLane,
+        permit: crate::attach::selected_detailed::SelectedConstructionPermit,
+    ) -> Self {
+        Self {
+            lane,
+            permit,
+            disposing: None,
+        }
+    }
+
     /// Consume the sealed lane into a live lane for coordinator
     /// install, gated on the activation proof naming exactly this
     /// lane's binding. A mismatched proof (or a lane that started

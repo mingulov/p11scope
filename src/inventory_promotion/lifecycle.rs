@@ -985,6 +985,17 @@ impl SelectedLifecycleService {
         }
     }
 
+    /// Tests-only pose of the `Installing` state for a handoff the
+    /// scene built: stands in for the worker + poll + CAS + mint chain
+    /// (unrunnable unprivileged). Panics unless Idle. The posed
+    /// request must be the handoff's own taken request. Reclaim-path
+    /// scenes only (I4).
+    #[cfg(test)]
+    pub(crate) fn seed_installing_for_test(&mut self, request: PromotionRequest) {
+        assert!(self.is_idle(), "Installing poses only from Idle");
+        self.state = ServiceState::Installing { request };
+    }
+
     /// The driver could not install (cancelled while held, or the
     /// install entry refused): reclaim the handoff for genuine lane
     /// disposal. `end` selects the terminal status once disposal
@@ -1319,6 +1330,62 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
     ))
 }
 
+/// Tests-only view like `scripted_promotion_view_for_test` plus one
+/// Mapped caller row and a paired baseline batch carrying that
+/// caller's acquired row: `for_request` genuinely derives a baseline
+/// for the matching live original. The cookie/exec/incarnation are
+/// scripted native observations (unobservable unprivileged).
+/// Reclaim-path scenes only (I4).
+#[cfg(test)]
+pub(crate) fn scripted_promotion_view_with_baseline_for_test(
+    pid: u32,
+    start_time: Option<u64>,
+    incarnation: u32,
+    custody: crate::process::WeakProcessCustody,
+    cookie: u64,
+    exec_id: u64,
+) -> std::sync::Arc<super::PromotionView> {
+    use crate::discovery::caller_registry::{CallerId, CallerLifecycle, ImageAuthority};
+    let mut presentation = (**scripted_promotion_view_for_test().presentation()).clone();
+    presentation
+        .callers
+        .push(crate::inventory_present::CallerView {
+            id: CallerId(3),
+            pid,
+            start_time,
+            incarnation,
+            exe: None,
+            exec_observed: true,
+            authority: ImageAuthority::ScanPinned,
+            lifecycle: CallerLifecycle::Mapped,
+            lifecycle_reason: None,
+            first_seen_ns: 0,
+            last_seen_ns: 0,
+            retired: false,
+        });
+    let presentation = std::sync::Arc::new(presentation);
+    let batch = std::sync::Arc::new(
+        crate::attach::selected_detailed::baseline::PromotionBaselineBatch::scripted_with_row_for_test(
+            super::CaptureId::new(11),
+            std::sync::Arc::clone(&presentation),
+            CallerId(3),
+            incarnation,
+            custody,
+            cookie,
+            exec_id,
+        ),
+    );
+    std::sync::Arc::new(
+        super::PromotionView::with_baseline(
+            super::CaptureId::new(11),
+            super::ViewRevision::new(3),
+            presentation,
+            batch,
+        )
+        .expect("the scripted batch pairs with its frame"),
+    )
+}
+
 /// Tests-only taken request over the scripted view, with its live
 /// promoter for applying the service status updates.
 #[cfg(test)]
@@ -1403,6 +1470,45 @@ mod tests {
             }),
             calls,
         )
+    }
+
+    #[test]
+    fn scripted_baseline_view_derives_for_live_original() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        use crate::inventory_promotion::{CaptureId, Promoter};
+        // The I4 fixture chain, pinned at home: a real self-pin, a
+        // paired baseline view, a live promoter request, and a genuine
+        // `for_request` derivation through every real check.
+        let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        let custody = crate::process::WeakProcessCustody::pinned_for_test(&pin);
+        let incarnation = 1u32;
+        let view = scripted_promotion_view_with_baseline_for_test(
+            pin.pid(),
+            pin.start_time(),
+            incarnation,
+            custody,
+            0xC00,
+            0xE9E,
+        );
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(CaptureId::new(11)));
+        promoter
+            .request(Arc::clone(&view), CallerId(3), ModuleId(5))
+            .expect("exact pair queues");
+        let request = promoter.take_request().expect("mailbox holds it");
+        let baseline = view
+            .baseline()
+            .expect("paired")
+            .for_request(&request, &pin, incarnation)
+            .expect("genuine derivation");
+        assert!(
+            baseline.matches_request(&request),
+            "the derived baseline qualifies its request"
+        );
+        assert!(
+            baseline.matches_original_and_exec(&pin, 0xE9E),
+            "the row names the live original and exec"
+        );
     }
 
     /// Poll until an event or the bound; tests fail loudly past it

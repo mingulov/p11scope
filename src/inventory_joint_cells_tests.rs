@@ -202,17 +202,97 @@ fn install_promotion_active(driver: &mut ClassicDriver<'_>) -> NativeDomainId {
     domain
 }
 
-/// The held-install scenes hold no handoff: `PendingInstall`
-/// parts are unforgeable in unit tests (no scripted Session,
-/// sealed attachment or construction permit exists), so the H
-/// asserts pin the reclaim ATTEMPT, never a reclaimed handoff
-/// (I4 ruling; mutant B survives by construction). Fails loudly
-/// if a future fixture plants a real handoff, so the H wording
-/// must be revisited then.
-fn assert_no_held_handoff(driver: &ClassicDriver<'_>) {
+/// Plant a real held install handoff (I4): B's request through a live
+/// promoter, a baseline genuinely derived for the live self-pin, a proof
+/// minted over the lane's binding through the real validator, a really
+/// reserved capacity, and a sealed lane over a unit shell — posed as the
+/// Installing handoff the stop reclaims. The only scripted atoms are the
+/// native image observations (cookie/exec) and fresh counters,
+/// unobservable unprivileged; every checkable relation holds through the
+/// production constructors and validators. The sealed lane's shell domain
+/// is its own (nothing on the reclaim path joins it to the binding).
+fn plant_held_install(driver: &mut ClassicDriver<'_>) {
+    use crate::attach::selected_detailed::SelectedConstructionPermit;
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    use crate::inventory_promotion::lifecycle::{
+        NativeCasReceipt, PendingInstall, SelectedActivationBinding, SelectedActivationProof,
+        scripted_promotion_view_with_baseline_for_test,
+    };
+    use crate::inventory_promotion::{CaptureId, Promoter};
+    use crate::inventory_semantics::selected::ProvisionalSelectedLane;
+    use p11scope_ebpf_common::ImageIdentity;
+    use std::sync::Arc;
+
+    let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+    let custody = crate::process::WeakProcessCustody::pinned_for_test(&pin);
+    let incarnation = 1u32;
+    let (cookie, exec_id) = (0xC00u64, 0xE9Eu64);
+    let view = scripted_promotion_view_with_baseline_for_test(
+        pin.pid(),
+        pin.start_time(),
+        incarnation,
+        custody,
+        cookie,
+        exec_id,
+    );
+    let mut promoter = Promoter::new();
+    assert!(promoter.enable(CaptureId::new(11)));
+    promoter
+        .request(Arc::clone(&view), CallerId(3), ModuleId(5))
+        .expect("exact pair queues");
+    let request = promoter.take_request().expect("mailbox holds it");
+    let baseline = view
+        .baseline()
+        .expect("paired")
+        .for_request(&request, &pin, incarnation)
+        .expect("genuine derivation");
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+    let generation = 7u64;
+    let image = ImageIdentity {
+        task_cookie: cookie,
+        exec_id,
+    };
+    let binding = SelectedActivationBinding::new(domain, generation, image);
+    let receipt = NativeCasReceipt::scripted(binding);
+    let proof =
+        SelectedActivationProof::mint(&request, binding, receipt).expect("receipt matches");
+    let capacity = driver
+        .coordinator
+        .reserve_promotion_install()
+        .expect("capacity reserves");
+    let permit = SelectedConstructionPermit::scripted_for_test(
+        crate::events::EventsDomain::test_standin(pin.pid() as u64),
+        Arc::clone(&pin),
+        crate::attach::Scope::Pid(pin.pid()),
+        domain,
+        image,
+        generation,
+        baseline,
+    );
+    let lane = wind_down_lane(WindDownIo::completing());
+    let sealed = ProvisionalSelectedLane::scripted_for_test(lane, permit);
     assert!(
-        driver.pending_install.is_none(),
-        "H: the scene holds no install handoff"
+        proof.matches_lane(sealed.activation_binding()),
+        "the proof authorizes exactly this lane"
+    );
+    driver.lifecycle.seed_installing_for_test(request);
+    driver.pending_install = Some(PendingInstall::from_parts(proof, sealed, capacity));
+}
+
+/// The H aftermath (I4): the stop took the planted handoff, the service
+/// genuinely disposed it through the real poll path and now idles, and
+/// the terminal end is honestly reported.
+fn assert_reclaim_settled(driver: &mut ClassicDriver<'_>) {
+    assert!(
+        driver.lifecycle.is_idle(),
+        "H: the disposal settles the service"
+    );
+    assert!(
+        gaps(driver)
+            .iter()
+            .any(|(subject, _)| subject == "selected promotion ended"),
+        "H: the terminal end reports honestly: {:?}",
+        gaps(driver)
     );
 }
 
@@ -426,7 +506,7 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
     install_promotion_active(&mut driver);
-    assert_no_held_handoff(&driver);
+    plant_held_install(&mut driver);
     driver.on_stop_requested();
     assert_eq!(driver.joint_begin_calls, 1, "R: the finish begins once");
     assert_eq!(
@@ -436,8 +516,8 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(
         driver.reclaim_calls,
-        Vec::<PromotionEnd>::new(),
-        "H: without a handoff the stop records no take"
+        vec![PromotionEnd::RunStopped],
+        "H: the held install reclaims once with RunStopped"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -462,6 +542,7 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(seat.drops.get(), 1, "O: released after the join");
     assert_eq!(driver.joint_begin_calls, 1, "R: never re-begun");
+    assert_reclaim_settled(&mut driver);
 }
 
 /// J0–J8 × sigint2 (O T): the second stop holds the lane through
@@ -640,7 +721,7 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
     install_promotion_active(&mut driver);
-    assert_no_held_handoff(&driver);
+    plant_held_install(&mut driver);
     let (source, mint_polls, _) = CountingSource::scripted(None);
     driver.completion_source = Some(Box::new(source));
     driver.on_stop_requested();
@@ -666,13 +747,14 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(
         driver.reclaim_calls,
-        Vec::<PromotionEnd>::new(),
-        "H: without a handoff the stop records no take"
+        vec![PromotionEnd::RunStopped],
+        "H: the held install reclaims once with RunStopped"
     );
     assert!(
         driver.pending_install.is_none(),
         "H: nothing installs after the stop"
     );
+    assert_reclaim_settled(&mut driver);
 }
 
 /// J9/J11 × sigint2 (O T E): the first stop already abandons; the
@@ -1047,7 +1129,7 @@ fn heldinstall_graph_body(scene: Scene, event: JointEvent) {
     let seat = seat_state_lane(&mut driver, state);
     driver.joint_finish = JointFinishDriver::Polling;
     install_promotion_active(&mut driver);
-    assert_no_held_handoff(&driver);
+    plant_held_install(&mut driver);
     driver.on_stop_requested();
     assert_eq!(
         driver.joint_begin_calls, 0,
@@ -1065,13 +1147,14 @@ fn heldinstall_graph_body(scene: Scene, event: JointEvent) {
     assert_eq!(seat.drops.get(), 0, "O: held means kept");
     assert_eq!(
         driver.reclaim_calls,
-        Vec::<PromotionEnd>::new(),
-        "H: without a handoff the stop records no take"
+        vec![PromotionEnd::RunStopped],
+        "H: the held install reclaims once with RunStopped"
     );
     assert!(
         driver.pending_install.is_none(),
         "H: nothing installs after the stop"
     );
+    assert_reclaim_settled(&mut driver);
 }
 
 /// J10 × sigint2 (O T): the second stop holds the in-flight
@@ -1775,8 +1858,8 @@ fn sink_pub_body(scene: Scene, event: JointEvent) {
 }
 
 /// J12/J13 × held_install (O P H / O E H): the stop begins the
-/// active finish once and attempts the held-install reclaim once
-/// with RunStopped; nothing installs, the lane stays live.
+/// active finish once and reclaims the held install once with
+/// RunStopped; nothing installs, the lane stays live.
 fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::HeldInstall));
     assert!(matches!(scene.state, JointState::J12 | JointState::J13));
@@ -1793,12 +1876,12 @@ fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     let domain = driver.semantic.as_ref().expect("lane").domain();
     let (_, error) = retain_publication(&mut driver, state, event, false);
     install_promotion_active(&mut driver);
-    assert_no_held_handoff(&driver);
+    plant_held_install(&mut driver);
     driver.on_stop_requested();
     assert_eq!(
         driver.reclaim_calls,
-        Vec::<PromotionEnd>::new(),
-        "H: without a handoff the stop records no take"
+        vec![PromotionEnd::RunStopped],
+        "H: the held install reclaims once with RunStopped"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -1826,6 +1909,7 @@ fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     } else {
         assert!(error.is_none(), "J12 retains no error");
     }
+    assert_reclaim_settled(&mut driver);
 }
 
 /// J12/J13 × sigint2 (O T G / O T E): the second stop holds the

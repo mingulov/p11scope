@@ -14,7 +14,7 @@ mod tabled_readiness;
 use crate::discovery::identity::test_fixture::{
     SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
     overlay as overlay_key, pins as overlay_pins, real_scan_pin as overlay_real_scan_pin,
-    reback as overlay_reback, view_pin as overlay_view_pin,
+    reback as overlay_reback, record_scan_ownership, view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
     ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
@@ -47564,21 +47564,21 @@ fn collected_graph_retired_pin_file_stays_open_until_handoff_close() {
     );
     assert_eq!(closes, 1, "exactly one retired file");
     // Files carry no pool charge: the close drops the last Arc while
-    // the pool keeps the baseline plus the live backing (the installed
-    // pins/modules/plan backing leases, the backing box, and the
-    // handoff lease). The cursor backing sizes are private to the
-    // identity cursors, so the live total is bounded rather than
-    // summed; the sizing test pins the scale peak.
+    // the pool keeps the baseline plus the live backing.
     assert_eq!(
         case.engine.collected_test_pool.snapshot().charged_bytes,
         charged_at_done,
         "closing files moves no pool charge"
     );
-    let live_backing = charged_at_done - baseline;
-    assert!(
-        live_backing >= std::mem::size_of::<GraphBacking>() + OWNED_ALLOCATION_PADDING
-            && live_backing < 256 * 1024,
-        "live backing {live_backing} covers the box within a tight bound"
+    // Exact release: the installed backing and the retired-file handoff
+    // are Engine-owned live graph state; dropping both returns the pool
+    // to its baseline (§1.6 Done chains the handoff with a live lease).
+    drop(case.engine.graph_backing.take());
+    drop(case.engine.retired_files.take());
+    assert_eq!(
+        case.engine.collected_test_pool.snapshot().charged_bytes,
+        baseline,
+        "the graph releases to baseline"
     );
 }
 
@@ -47821,19 +47821,14 @@ fn collected_graph_singles_logical_retire_matches_multi_report() {
     );
     assert_eq!(multi.engine.tail_stats(), (0, 1));
     assert_eq!(single.engine.tail_stats(), (1, 0));
-    // The Multi twin reclaims cleanly: its native close releases the
-    // session retention mid-graph. The Singles twin keeps two
-    // structural disclosures: the logical text (no native call) and
-    // the reclamation row. The session holds its retained exports
-    // until the terminal detach — after the graph — so reclaim step 2
-    // cannot prove unique ownership and the graph is forgotten per
-    // §1.9 item 19 (counted, disclosed once). G24's "one skip" names
-    // the logical disclosure; the reclamation row is the required
-    // containment for session-held ownership, and every converged
-    // field above shows it is not a report divergence.
+    // Both twins reclaim cleanly: installed reclaim drops the
+    // session-shared exports clone as one leaf instead of taking the
+    // forget path, so neither graph is forgotten. The Singles twin
+    // keeps exactly its logical disclosure (no native call); the Multi
+    // twin stays quiet.
     assert!(multi.engine.counters.object_skips.is_empty());
     assert_eq!(multi.engine.collected_graph_reclaim_forgotten, 0);
-    assert_eq!(single.engine.collected_graph_reclaim_forgotten, 1);
+    assert_eq!(single.engine.collected_graph_reclaim_forgotten, 0);
     assert_eq!(
         single
             .engine
@@ -47842,7 +47837,7 @@ fn collected_graph_singles_logical_retire_matches_multi_report() {
             .iter()
             .map(|skip| skip.subject.as_str())
             .collect::<Vec<_>>(),
-        ["global native retirement", "collected graph reclamation"],
+        ["global native retirement"],
     );
 }
 
@@ -47951,7 +47946,7 @@ fn insert_sizing_selection_rows(engine: &mut Engine, views: u32) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "scale: system-population graph sizing; run by exact selector at V2 and L"]
 fn collected_graph_peak_fits_pool_at_system_scale() {
     // FD headroom for the 4096 pin files plus the 16384 native links.
     // Unprivileged: the soft cap rises only within the hard cap, and the
@@ -47974,9 +47969,10 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     // One shared tempfile backs all 4096 pins: real pins (matching the
     // opened file, so retention succeeds) with distinct overridden keys.
     // Pin lookup keys on the (key, path) pair, so the scanned rows reuse
-    // the tempfile path while distinct keys keep every row distinct.
+    // the tempfile path while distinct keys keep every row distinct. The
+    // 8 KiB size covers both table entry offsets below.
     let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
-    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 4096]).expect("pin bytes");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
     let shared_path = shared_file.path().to_path_buf();
     let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
     let keys: Vec<ObjectKey> = (0..VIEWS)
@@ -47997,6 +47993,15 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ));
         assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        // Product shape: the absorb path bypasses
+        // `record_scanned_candidate`, so attach each view's scan-time
+        // ownership (one owned pin plus its raw row) explicitly.
+        record_scan_ownership(
+            &mut pins,
+            ProcessViewId(index as u32),
+            *key,
+            &shared_path_text,
+        );
     }
     // §13 backs the population through one shared file: reback collapses
     // the 4096 opens onto a single share (measure-neutral; fds uncharged).
@@ -48004,7 +48009,8 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
         &mut pins,
         &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
     );
-    // 4096 scanned modules: 2 tables x 1 entry and 16 exports each.
+    // 4096 scanned modules: 2 tables x 1 entry with distinct entry
+    // offsets, and 16 exports each.
     let scanned: Vec<ScannedModule> = keys
         .iter()
         .enumerate()
@@ -48018,8 +48024,10 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
             module.tables[0].entries[0]
                 .object_path
                 .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
             let mut second = module.tables[0].clone();
             second.address += 0x1000;
+            second.entries[0].file_offset = 0x1800;
             module.tables.push(second);
             module
         })
@@ -48027,43 +48035,49 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
     assert!(lost.is_empty(), "every sizing row must reconcile");
     assert_eq!(reconciled.len(), VIEWS as usize);
-    // Engine assembly: 8192 slots, one binding/claim/table per view.
-    // `build_from_reconciled_modules` admits within the 512 release
-    // ceiling, so the population extends the built plan with well-formed
-    // manual slots (distinct index and target offset, cloned shape).
-    // They stay inert to the rebuild indexes (absent from the private
-    // key map) and retire as unyielded targets, which is exactly the
-    // removal load the helper sizes.
+    // Product shape: every view kept its scan-time ownership row through
+    // reconcile (one owned pin each); without it the per-view tree bounds
+    // would undercharge the product.
+    for index in 0..VIEWS {
+        let claims = pins
+            .view_claims(ProcessViewId(index))
+            .expect("scan ownership survives reconcile for every view");
+        assert_eq!(claims.pins.len(), 1, "one owned pin per sizing view");
+    }
+    // Engine assembly: the Inventory policy admits the full 8192-endpoint
+    // union (4096 views x 2 tables) with one binding/claim/table per view.
+    // The Detailed 512 ceiling never models system scale.
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
     engine.pinned = pins;
     engine.modules = reconciled;
-    engine.plan = plan::build_from_reconciled_modules(&engine.modules);
-    assert_eq!(engine.plan.slots.len(), 512, "the release ceiling admits");
-    let template = engine.plan.slots[0].clone();
-    for index in 512..8192u32 {
-        let mut slot = template.clone();
-        slot.index = index;
-        slot.descriptor_index = index;
-        slot.file_offset = 0x1000 + u64::from(index) * 8;
-        engine.plan.slots.push(slot);
-    }
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(8192)).unwrap(),
+        ),
+    );
     assert_eq!(engine.plan.slots.len(), 8192);
+    assert!(
+        matches!(
+            engine.plan.admission_policy(),
+            plan::AdmissionPolicy::Inventory(_)
+        ),
+        "the sizing plan carries the Inventory policy"
+    );
     insert_sizing_selection_rows(&mut engine, VIEWS);
     engine.next_view_id = VIEWS;
     // A non-blocking native carrier over all slots.
     let mut session = ScriptedSession::default();
     let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
-    // The pool carries a 64 MiB limit with a held 32 MiB baseline; the
-    // graphs may peak at 48 MiB total (16 MiB of graph charge).
+    // The dedicated graph pool pays both graphs; no held lease. The
+    // baseline is the pool's own scratch charge.
     engine
         .collected_test_pool
-        .reference_set_limit(64 * 1024 * 1024);
-    let held = engine
-        .collected_test_pool
-        .reserver()
-        .reserve(32 * 1024 * 1024)
-        .expect("the held baseline fits");
+        .reference_set_limit(COLLECTED_GRAPH_POOL_BYTES);
+    let baseline = engine.collected_test_pool.snapshot().charged_bytes;
     // Graph 1 retires 512 pre-Q views (cause None: Consume needs no
     // ProcessView). The modules name the views, so the collected branch
     // requests the graph.
@@ -48104,18 +48118,166 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
         "graph 2 retires its views"
     );
     assert_eq!(engine.collected_graphs_created, 2);
+    assert!(
+        engine.collected_graph_refused().is_none(),
+        "no graph refuses at system scale"
+    );
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
     let elapsed = start.elapsed();
     let peak = engine.collected_test_pool.snapshot().peak_charged_bytes;
-    eprintln!("sizing: peak={peak} credits={credits} elapsed={elapsed:?}");
+    eprintln!(
+        "sizing: peak={peak} above_baseline={} credits={credits} elapsed={elapsed:?} slots={}",
+        peak - baseline,
+        engine.plan.slots.len()
+    );
     assert!(
-        peak <= 48 * 1024 * 1024,
-        "peak graph charge {peak} exceeds 48 MiB"
+        peak <= COLLECTED_GRAPH_POOL_BYTES * 3 / 4,
+        "peak graph charge {peak} exceeds 75% of the graph pool"
     );
     assert!(
         credits as u128 * 50_000 + elapsed.as_nanos() <= 15_000_000_000,
         "credits={credits} elapsed={elapsed:?} exceeds the 15 s budget"
     );
-    drop(held);
+    // Exact release: the installed backing and every retired-file handoff
+    // are Engine-owned live graph state; dropping both returns the pool to
+    // its baseline (§1.6 Done chains each handoff with a live lease, so
+    // the backing alone cannot release).
+    drop(engine.graph_backing.take());
+    drop(engine.retired_files.take());
+    assert_eq!(
+        engine.collected_test_pool.snapshot().charged_bytes,
+        baseline,
+        "the graphs release to baseline"
+    );
+}
+
+#[test]
+fn collected_graph_charge_covers_requested_heap() {
+    // Positive control: the tightened bounds still cover the real heap a
+    // graph allocates. 32 views / 64 endpoints retire in one graph; the
+    // heap probe tracks this thread's allocations across the same run the
+    // pool peak charges.
+    const VIEWS: u32 = 32;
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path
+        .to_str()
+        .expect("a utf-8 pin path")
+        .to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        record_scan_ownership(
+            &mut pins,
+            ProcessViewId(index as u32),
+            *key,
+            &shared_path_text,
+        );
+    }
+    overlay_reback(
+        &mut pins,
+        &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
+    );
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut module = overlay_module(*key);
+            module.view = ProcessViewId(index as u32);
+            module.path.clone_from(&shared_path_text);
+            module.exports = (0..16)
+                .map(|slot| format!("export-{index}-{slot}"))
+                .collect();
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
+            let mut second = module.tables[0].clone();
+            second.address += 0x1000;
+            second.entries[0].file_offset = 0x1800;
+            module.tables.push(second);
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every twin row must reconcile");
+    assert_eq!(reconciled.len(), VIEWS as usize);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(64)).unwrap(),
+        ),
+    );
+    assert_eq!(engine.plan.slots.len(), 64);
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    engine
+        .collected_test_pool
+        .reference_set_limit(COLLECTED_GRAPH_POOL_BYTES);
+    let baseline = engine.collected_test_pool.snapshot().charged_bytes;
+    engine
+        .pending_retirements
+        .extend((0..VIEWS).map(ProcessViewId));
+    let (drained, heap) = crate::test_alloc::requested_peak_during(|| {
+        for _ in 0..20_000 {
+            let outcome = engine
+                .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+                .unwrap();
+            if !outcome.pending {
+                return true;
+            }
+        }
+        false
+    });
+    assert!(drained, "the twin graph drains");
+    assert!(engine.pending_retirements.is_empty());
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert!(engine.collected_graph_refused().is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
+    assert!(!heap.incomplete, "the heap probe stayed complete");
+    assert_eq!(heap.failed_requests, 0);
+    assert!(
+        heap.peak_bytes >= 64 * 1024,
+        "the probe saw a real graph heap ({} bytes)",
+        heap.peak_bytes
+    );
+    let charged_peak = engine.collected_test_pool.snapshot().peak_charged_bytes;
+    eprintln!(
+        "heap-cover: pool_peak_above_baseline={} heap_peak={} heap_blocks={}",
+        charged_peak - baseline,
+        heap.peak_bytes,
+        heap.live_blocks
+    );
+    assert!(
+        charged_peak - baseline >= heap.peak_bytes,
+        "pool charge {} covers the requested heap {}",
+        charged_peak - baseline,
+        heap.peak_bytes
+    );
 }
 
 /// T5 helper: the deterministic (exe, libc) provider pair for one

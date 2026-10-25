@@ -7033,6 +7033,259 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// Two-view retirement population behind the coordinator's Engine for
+    /// the graph-pool twins: the retiring view owns one absorbed pin and
+    /// one reconciled module, while only the retained module feeds the
+    /// plan — so the retiring view removes no slots and its graph closes
+    /// without a native carrier. The T4 seed leaves one retirement intent
+    /// plus one leader-exit assessment, as a reaped exit would; the view
+    /// stays live, so Intake disposes the intent as unproven while the
+    /// pre-seeded pending retirement drives the Selection copy. Returns
+    /// the coordinator, the retiring view, and the shared pin file (kept
+    /// alive for the absorbed pins' paths).
+    fn collected_graph_pool_engine() -> (
+        InventoryCoordinator<OsProcessSource>,
+        crate::process::ProcessViewId,
+        tempfile::NamedTempFile,
+    ) {
+        use crate::discovery::identity::test_fixture;
+        use crate::discovery::identity::{PinnedObjects, reconcile_scanned_modules};
+        use crate::process::{ProcessView, ProcessViewId};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        let mut coordinator = coordinator();
+        let view = ProcessViewId(coordinator.engine.next_view_id);
+        let retained = ProcessViewId(coordinator.engine.next_view_id + 1);
+        coordinator.engine.next_view_id += 2;
+        let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+        std::fs::write(shared_file.path(), vec![0x7fu8; 8192]).expect("pin bytes");
+        let shared_path = shared_file.path().to_path_buf();
+        let shared_path_text = shared_path
+            .to_str()
+            .expect("a utf-8 pin path")
+            .to_string();
+        let mut pins = PinnedObjects::empty();
+        let mut keys = Vec::new();
+        for (slot, id) in [(0u64, view), (1, retained)] {
+            let key = ObjectKey {
+                device: Device {
+                    major: 8,
+                    minor: slot,
+                },
+                inode: 1000 + slot,
+            };
+            let absorbed = pins.absorb(test_fixture::real_scan_pin(
+                &shared_path,
+                Some(key),
+                slot,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ));
+            assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+            keys.push((key, id));
+        }
+        let scanned: Vec<crate::discovery::scan::ScannedModule> = keys
+            .iter()
+            .map(|(key, id)| {
+                let mut module = test_fixture::module(*key);
+                module.view = *id;
+                module.path.clone_from(&shared_path_text);
+                module
+            })
+            .collect();
+        let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+        assert!(lost.is_empty(), "both twin rows reconcile");
+        assert_eq!(reconciled.len(), 2);
+        // Only the retained module feeds the plan: the retiring view owns
+        // pins but no slots, so its graph closes without native work.
+        let retained_module = reconciled
+            .iter()
+            .find(|module| module.scanned.view == retained)
+            .expect("the retained module reconciled")
+            .clone();
+        coordinator.engine.pinned = pins;
+        coordinator.engine.modules = reconciled;
+        coordinator.engine.plan =
+            crate::plan::build_from_reconciled_modules(std::slice::from_ref(&retained_module));
+        // A plain engine behind the coordinator transport: the overwritten
+        // Detailed plan must not meet the inventory constructor's state.
+        coordinator.engine.inventory = None;
+        coordinator
+            .engine
+            .views
+            .push(ProcessView::open(view, std::process::id()).expect("a live process view"));
+        coordinator.seed_collected_finish_work_for_test(view);
+        assert!(coordinator.engine.pending_retirements.insert(view));
+        (coordinator, view, shared_file)
+    }
+
+    /// Empty discovery drain at Q for the fixture transport: no records,
+    /// nothing staged, so transport is at Q on the first credit and the
+    /// Finish exercises only Engine work.
+    struct CollectedFinishTransport {
+        producers: crate::attach::SessionDrainProducers,
+        observer: crate::attach::CollectedFinishQObserverForTest,
+        staged: crate::attach::DiscoveryStage,
+        q: crate::attach::CollectedFinishQ,
+    }
+
+    fn collected_finish_transport_at_q() -> CollectedFinishTransport {
+        use crate::attach::capture::NativeDomainId;
+        use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+
+        let events = EventsDomain::test_standin(0x51);
+        let producers = crate::attach::SessionDrainProducers::test_pair(
+            NativeDomainId::try_mint().expect("a native test domain"),
+            events.clone(),
+        );
+        let observer = crate::attach::CollectedFinishQObserverForTest::with_discovery_bytes(
+            &producers,
+            Vec::<Vec<u8>>::new(),
+        );
+        let drain = EventDrain::over_domain(
+            ScriptedRecords::records(Vec::<Vec<u8>>::new(), 0),
+            events,
+        );
+        observer.request_stop();
+        let q = observer
+            .observe(&producers, None, &drain)
+            .expect("Q observation reads the original rings")
+            .expect("STOP with no records mints Q");
+        CollectedFinishTransport {
+            producers,
+            observer,
+            staged: crate::attach::DiscoveryStage::default(),
+            q,
+        }
+    }
+
+    #[test]
+    fn collected_graph_charges_dedicated_pool_not_registry() {
+        let (mut coordinator, view, _shared) = collected_graph_pool_engine();
+        let mut transport = collected_finish_transport_at_q();
+        let registry_before = coordinator.registry().semantic_resource_snapshot();
+        let pool_baseline = coordinator
+            .engine
+            .collected_graph_pool
+            .snapshot()
+            .charged_bytes;
+        let mut drained = false;
+        let mut failed = false;
+        for _ in 0..600 {
+            let outcome = coordinator
+                .service_collected_finish_discovery(
+                    &transport.q,
+                    &transport.producers,
+                    transport.observer.discovery_drain_mut(),
+                    &mut transport.staged,
+                    1,
+                )
+                .expect("the fixture transport serves the seeded work");
+            failed = outcome.failed;
+            if !outcome.backlog {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "one graph drains through the fixture transport");
+        assert!(!failed, "the lane does not fail");
+        assert_eq!(coordinator.engine.collected_graphs_created, 1);
+        assert!(coordinator.engine.pending_retirements.is_empty());
+        assert!(coordinator.engine.collected_graph_refused().is_none());
+        assert_eq!(coordinator.engine.collected_graph_reclaim_forgotten, 0);
+        assert!(
+            coordinator
+                .engine
+                .views
+                .iter()
+                .any(|owner| owner.id() == view),
+            "the unproven live view stays"
+        );
+        assert!(
+            coordinator
+                .engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| {
+                    skip.subject == "live discovery lifecycle"
+                        && skip.reason.starts_with("1 retirements not proven")
+                }),
+            "the live intent disposes as unproven"
+        );
+        assert_eq!(
+            coordinator.registry().semantic_resource_snapshot(),
+            registry_before,
+            "the graph charges no registry byte"
+        );
+        assert!(
+            coordinator
+                .engine
+                .collected_graph_pool
+                .snapshot()
+                .peak_charged_bytes
+                > pool_baseline,
+            "the graph pool paid the copy"
+        );
+    }
+
+    #[test]
+    fn collected_graph_pool_refusal_fails_lane_without_registry_refusal() {
+        let (mut coordinator, _view, _shared) = collected_graph_pool_engine();
+        let mut transport = collected_finish_transport_at_q();
+        let registry_before = coordinator.registry().semantic_resource_snapshot();
+        // The graph pool pays nothing beyond its baseline, so the
+        // barrier's box reservation refuses before any graph work.
+        let pool_baseline = coordinator
+            .engine
+            .collected_graph_pool
+            .snapshot()
+            .charged_bytes;
+        coordinator
+            .engine
+            .collected_graph_pool
+            .reference_set_limit(pool_baseline);
+        let mut refused = false;
+        let mut failed = false;
+        for _ in 0..64 {
+            let outcome = coordinator
+                .service_collected_finish_discovery(
+                    &transport.q,
+                    &transport.producers,
+                    transport.observer.discovery_drain_mut(),
+                    &mut transport.staged,
+                    1,
+                )
+                .expect("a refused graph stays contained");
+            failed = outcome.failed;
+            if coordinator.engine.collected_graph_refused().is_some() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the box refuses against the baseline limit");
+        assert_eq!(
+            coordinator.engine.collected_graph_refused(),
+            Some("terminal graph refused before native mutation")
+        );
+        assert_eq!(coordinator.engine.collected_graphs_created, 0);
+        assert!(coordinator.engine.collected_graph.is_none());
+        assert!(failed, "the lane reports the refusal");
+        assert!(
+            coordinator
+                .engine
+                .collected_graph_pool
+                .snapshot()
+                .refused
+                >= 1,
+            "the graph pool counts the refusal"
+        );
+        assert_eq!(
+            coordinator.registry().semantic_resource_snapshot(),
+            registry_before,
+            "no registry byte moves on a graph-pool refusal"
+        );
+    }
+
     /// The source holds real OS custody but refuses to share it with a first
     /// Detailed owner. Known H0 custody must remain independently reusable.
     struct RefusingSharedCustodySource {

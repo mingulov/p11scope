@@ -1054,9 +1054,11 @@ maps_provider "$PID_B3" || fail_cell "round-2 twin does not map the provider"
 STAT_B3=$(prov_stat "$PID_B3") || fail_cell "cannot stat the round-2 twin's provider"
 [ "$STAT_B3" = "$STAT_B_PRE" ] || fail_cell "round-2 twin does not map the lower copy (stat $STAT_B3, want $STAT_B_PRE)"
 fact "pid-b3=$PID_B3 stat-b3=$STAT_B3"
-# Let the spans settle on the twin before the copy-up. The twin still never
-# takes the collapsed old module: B's lowest-pid process holds the collapse's
-# deep-scan slot, so the twin's first own scan follows the copy-up.
+# Let the spans settle on the twin before the copy-up. Which span shape the
+# twin takes depends on host process count vs the 256 deep-scan cap
+# (src/discovery/engine.rs:4013): over-cap hosts first scan the twin after
+# the collapse resolves (new-only), under-cap hosts deep-scan every pid so
+# the twin's first scan precedes the copy-up (old-ended-plus-new).
 R2M_K0=$(pass_count span-kernel)
 R2M_U0=$(pass_count span-userspace)
 fact "round2-passes-at-map=$R2M_K0,$R2M_U0"

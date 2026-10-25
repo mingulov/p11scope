@@ -12,7 +12,10 @@
 //! If the recorded truth ever shows map_files rendering the backing
 //! file on ext4 layers instead, the N4 identity-key branch takes over:
 //! the key is its own identity, the kernel leg classifies "no kernel
-//! proof (identity key)", and no lane-A row flips as kernel parity.
+//! proof (identity key)", and no lane-A row flips as kernel parity. A
+//! row that takes the branch prints a distinct verdict and trips the
+//! cell: the top level then fails named instead of printing its table
+//! verdict, so a ready pair can never qualify silently.
 //! The stat-based xino verdict (never mountinfo) gates the requested
 //! mode; a contradiction fails the cell.
 
@@ -1558,6 +1561,54 @@ fn overlay_backing_render_is_identity_key_no_proof() {
     );
 }
 
+/// The N4 tripwire: a row whose truths render backing on either side
+/// takes the identity-key branch (never the parity shape), and once any
+/// row has taken it the top-level gate fails the cell named — a ready
+/// pair can never qualify silently.
+#[test]
+fn overlay_n4_branch_tripwire_fails_the_cell() {
+    let truth = |line: &str, backing: bool| OverlayTruth {
+        maps_line: line.into(),
+        map_files_dev: 42,
+        map_files_ino: 7,
+        statfs_magic: p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC,
+        held_fstat: (42, 7),
+        xino_effective: true,
+        xino_auto: "N".into(),
+        map_files_backing: backing,
+        xino_off_copy_up_stable: None,
+    };
+    let line = "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so";
+    let backing = truth(line, true);
+    let overlay = truth(line, false);
+    assert!(
+        takes_identity_key_branch(&backing, &backing),
+        "backing on both sides takes the branch"
+    );
+    assert!(
+        takes_identity_key_branch(&backing, &overlay),
+        "backing on the target side alone takes the branch"
+    );
+    assert!(
+        takes_identity_key_branch(&overlay, &backing),
+        "backing on the anchor side alone takes the branch"
+    );
+    assert!(
+        !takes_identity_key_branch(&overlay, &overlay),
+        "overlay rendering on both sides stays on the parity shape"
+    );
+    assert_eq!(
+        n4_gate(false),
+        Ok(()),
+        "a dormant branch leaves the table verdict"
+    );
+    assert_eq!(
+        n4_gate(true),
+        Err("N4 active: lane cannot qualify as kernel parity".to_string()),
+        "an active branch fails the cell named"
+    );
+}
+
 /// Every preflight miss fails with its named reason; nothing skips.
 /// Unprivileged this observes the root gate; privileged it observes
 /// the pass (or a later named probe).
@@ -1721,12 +1772,20 @@ fn privileged_d4_overlay_xino_backend_parity() {
         generation: 0,
         lane,
         mode: XinoMode::On,
+        n4_active: false,
     };
     for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
         rows.mode = mode;
         let work = tempfile::tempdir().unwrap();
         rows.run_all(work.path())
             .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    // N4: backing rendering on any row means overlay keys are identity
+    // keys — the lane never qualifies as kernel parity, even if every
+    // row passed. Fail named instead of printing the table verdict.
+    if let Err(message) = n4_gate(rows.n4_active) {
+        eprintln!("D4_OVERLAY lane={lane:?} modes=on,off,same-fs {message}");
+        panic!("{message}");
     }
     eprintln!("D4_OVERLAY lane={lane:?} modes=on,off,same-fs verdict=table");
 }
@@ -1801,14 +1860,34 @@ fn overlay_copy_up_userspace_edge_absent() {
     );
 }
 
-/// One ignored run's shared kernel session, generation counter, lane
-/// and mode. Every row mounts a fresh fixture (row isolation: copy-ups
-/// and upper files never leak across rows).
+/// Whether this row's recorded truths take the N4 identity-key
+/// branch: map_files renders the backing file on either side (lane A
+/// only — lane B refuses backing outright at every row).
+fn takes_identity_key_branch(target: &OverlayTruth, anchor: &OverlayTruth) -> bool {
+    target.map_files_backing || anchor.map_files_backing
+}
+
+/// The N4 top-level gate: once any row has taken the identity-key
+/// branch, overlay keys on ext4 layers are identity keys and the lane
+/// can never qualify as kernel parity — the cell fails named instead
+/// of printing its table verdict.
+fn n4_gate(n4_active: bool) -> Result<(), String> {
+    if n4_active {
+        Err("N4 active: lane cannot qualify as kernel parity".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// One ignored run's shared kernel session, generation counter, lane,
+/// mode and N4 trip flag. Every row mounts a fresh fixture (row
+/// isolation: copy-ups and upper files never leak across rows).
 struct OverlayRows<'s> {
     session: &'s mut crate::discovery::kernel_identity::IdentitySession,
     generation: u64,
     lane: OverlayLane,
     mode: XinoMode,
+    n4_active: bool,
 }
 
 impl OverlayRows<'_> {
@@ -1863,7 +1942,8 @@ impl OverlayRows<'_> {
         )?;
         let pid = target.pid as u32;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
-        if t_truth.map_files_backing || a_truth.map_files_backing {
+        let branch = takes_identity_key_branch(&t_truth, &a_truth);
+        if branch {
             if self.lane != OverlayLane::A {
                 return Err("unexpected backing rendering on lane B".into());
             }
@@ -1886,6 +1966,7 @@ impl OverlayRows<'_> {
                 &evidence,
                 OverlayExpect::IdentityKeyNoProof,
             )?;
+            self.n4_active = true;
         } else {
             self.generation += 1;
             let (kernel, evidence) = d4_overlay_kernel_attribution_for_pid(
@@ -1907,10 +1988,16 @@ impl OverlayRows<'_> {
                 OverlayExpect::Parity(true),
             )?;
         }
+        let verdict = if branch {
+            "N4-identity-key-no-proof"
+        } else {
+            "parity-edge"
+        };
         eprintln!(
-            "D4_OVERLAY mode={:?} row=lower lane={:?} verdict=parity-edge target-{}",
+            "D4_OVERLAY mode={:?} row=lower lane={:?} verdict={} target-{}",
             self.mode,
             self.lane,
+            verdict,
             truth_verdict(&t_truth)
         );
         Ok(())
@@ -2076,7 +2163,7 @@ impl OverlayRows<'_> {
         )?;
         let pid = target.pid as u32;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
-        let rendered_backing = t_truth.map_files_backing || a_truth.map_files_backing;
+        let rendered_backing = takes_identity_key_branch(&t_truth, &a_truth);
         match self.lane {
             OverlayLane::A if rendered_backing => {
                 self.generation += 1;
@@ -2098,6 +2185,7 @@ impl OverlayRows<'_> {
                     &evidence,
                     OverlayExpect::IdentityKeyNoProof,
                 )?;
+                self.n4_active = true;
             }
             OverlayLane::A => {
                 self.generation += 1;
@@ -2146,14 +2234,19 @@ impl OverlayRows<'_> {
                 )?;
             }
         }
+        let verdict = if rendered_backing && self.lane == OverlayLane::A {
+            "N4-identity-key-no-proof"
+        } else {
+            match self.lane {
+                OverlayLane::A => "D-C7-2",
+                OverlayLane::B => "parity-none",
+            }
+        };
         eprintln!(
             "D4_OVERLAY mode={:?} row=two-mounts lane={:?} verdict={} target-{}",
             self.mode,
             self.lane,
-            match self.lane {
-                OverlayLane::A => "D-C7-2",
-                OverlayLane::B => "parity-none",
-            },
+            verdict,
             truth_verdict(&t_truth)
         );
         Ok(())

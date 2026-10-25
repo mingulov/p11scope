@@ -1169,8 +1169,7 @@ impl InstanceRouter {
             self.absent.insert((key, file));
         } else {
             self.absence_overflowed = true;
-            self.counters.absence_overflows =
-                self.counters.absence_overflows.saturating_add(1);
+            self.counters.absence_overflows = self.counters.absence_overflows.saturating_add(1);
         }
     }
 

@@ -817,10 +817,7 @@ fn same_epoch_scan_under_absence_overflow_continues_without_consuming() {
         ObserveOutcome::New,
         "the latch survived the same-epoch scan"
     );
-    assert_ne!(
-        joined(r.route(call(3, stamp(2, 1, 0), ip_in(BASE_A)))),
-        old
-    );
+    assert_ne!(joined(r.route(call(3, stamp(2, 1, 0), ip_in(BASE_A)))), old);
 }
 
 #[test]

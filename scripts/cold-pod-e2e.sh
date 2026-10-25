@@ -477,6 +477,30 @@ EOF
         echo "phantom edge accepted" >&2
         exit 1
     fi
+    # The twin's positive control: the twin capture must still be a healthy
+    # scan -- caller A keeps its edge, idle still scanned edgeless -- before
+    # B's absence proves anything. An empty or broken twin capture refuses,
+    # so the twin proves absence against a healthy scan, never vacuously.
+    cat > "$tst_stub/twin-healthy.json" <<'EOF'
+{"schema":"p11scope/inventory/v1","callers":[{"id":"c0","pid":10},{"id":"c1","pid":12}],"modules":[{"id":"m0","paths":["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],"edges":[{"caller":"c0","module":"m0"}],"gaps":[{"subject":"pid namespace","caller":null,"module":null,"pid":null}],"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"}}
+EOF
+    cat > "$tst_stub/twin-empty.json" <<'EOF'
+{"schema":"p11scope/inventory/v1","callers":[],"modules":[],"edges":[],"gaps":[],"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"}}
+EOF
+    cat > "$tst_stub/twin-a-edgeless.json" <<'EOF'
+{"schema":"p11scope/inventory/v1","callers":[{"id":"c0","pid":10},{"id":"c1","pid":12}],"modules":[{"id":"m0","paths":["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],"edges":[],"gaps":[{"subject":"pid namespace","caller":null,"module":null,"pid":null}],"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"}}
+EOF
+    # The healthy twin capture is a genuine twin: B's pid is gone from it.
+    PATH="$tst_stub:$PATH" absent_or_edgeless "$tst_stub/twin-healthy.json" 11 >/dev/null \
+        || { echo "twin capture without B refused" >&2; exit 1; }
+    twin_positive_control "$tst_stub/twin-healthy.json" 10 12 >/dev/null \
+        || { echo "healthy twin scan refused" >&2; exit 1; }
+    for bad in twin-empty twin-a-edgeless; do
+        if twin_positive_control "$tst_stub/$bad.json" 10 12 >/dev/null 2>&1; then
+            echo "broken twin scan accepted: $bad" >&2
+            exit 1
+        fi
+    done
 }
 
 # Cleanup deletes its own cluster and images, keeps nothing by default, and

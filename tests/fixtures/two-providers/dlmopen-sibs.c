@@ -367,8 +367,10 @@ int main(int argc, char **argv) {
     }
     int gated = argc == 6;
     if (gated && !failed) {
+        /* Poll the stop flag: pause() would lose a signal that arrives
+         * between the flag test and the sleep. */
         while (!stop) {
-            pause();
+            usleep(10000);
         }
     }
     close_sibling(&sib_a);

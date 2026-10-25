@@ -10,8 +10,10 @@
 # inodes; DEST/softhsm2.conf points at DEST/tokens. Run late-b beside this
 # file with SOFTHSM2_CONF=DEST/softhsm2.conf. Prints the provider paths
 # with their (device, inode) identity plus the conf path on stdout.
-# Test-only PINs (1234); nothing here is captured or secret.
+# Test-only PINs (P11SCOPE_KEY_FIXTURE_PIN, default 1234); nothing here
+# is captured or secret.
 set -eu
+: "${P11SCOPE_KEY_FIXTURE_PIN:=1234}"
 
 DEST=${1:?usage: mk-providers.sh DEST}
 mkdir -p "$DEST"
@@ -53,9 +55,11 @@ printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\n' \
     "$DEST" >"$DEST/softhsm2.conf"
 export SOFTHSM2_CONF="$DEST/softhsm2.conf"
 softhsm2-util --init-token --free --label "P11SCOPE-A" \
-    --pin 1234 --so-pin 1234 >/dev/null
+    --pin "$P11SCOPE_KEY_FIXTURE_PIN" \
+    --so-pin "$P11SCOPE_KEY_FIXTURE_PIN" >/dev/null
 softhsm2-util --init-token --free --label "P11SCOPE-B" \
-    --pin 1234 --so-pin 1234 >/dev/null
+    --pin "$P11SCOPE_KEY_FIXTURE_PIN" \
+    --so-pin "$P11SCOPE_KEY_FIXTURE_PIN" >/dev/null
 
 echo "PROVIDER_A path=$DEST/provider-a.so dev=$DEV_A ino=$INO_A"
 echo "PROVIDER_B path=$DEST/provider-b.so dev=$DEV_B ino=$INO_B"

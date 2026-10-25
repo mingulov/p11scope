@@ -510,6 +510,9 @@ def _compare_merge(summary, snapshot, instances, key_rows, associations):
     for instance_id, key_row in key_rows.items():
         _require(key_row["started"] == 0 and key_row["completed"] == 0,
                  f"double-loaded calls claim a positive on {instance_id}")
+        _require(key_row["failed"] == 0 and key_row["unknown"] == 0,
+                 f"double-loaded calls claim failures or unknowns "
+                 f"on {instance_id}")
     return {"path": "merge", "feeds": sorted(summary["feeds"]),
             "issued": summary["issued"],
             "associations": associations["associations"]}

@@ -34064,7 +34064,7 @@ fn pressure_parked_head_waits_for_unprotected_service() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1_000 + u64::from(offset)))
         );
     }
-    assert!(engine.request_refresh_consumed(5_000_000, Some(2_000)));
+    assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(2_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
@@ -34093,7 +34093,7 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         "the parked head was serviced, not dropped"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&5_000_000),
+        !engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unprotected request was serviced"
     );
     let head = engine
@@ -35135,7 +35135,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+    assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     // Only the retained pid is protected here (the parked loader names it);
     // the fake requests are unprotected stale entries, of which the service
@@ -35195,7 +35195,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         );
     }
     assert!(
-        engine.refresh_requested.contains_key(&5_000_000),
+        engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unselected unprotected request is retained, not cleared"
     );
     assert_eq!(
@@ -35274,7 +35274,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+    assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     let pid_before = engine.refresh_requested[&pid].clone();
     let pid2_before = engine.refresh_requested[&pid2].clone();
@@ -35322,7 +35322,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         "the diverted selection keeps its serial and age"
     );
     assert!(
-        engine.refresh_requested.contains_key(&5_000_000),
+        engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale entry waits for the next opportunity"
     );
     assert_eq!(
@@ -35384,7 +35384,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&5_000_000),
+        !engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale selection freed the slot"
     );
     assert_eq!(
@@ -36524,7 +36524,7 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
             ));
         }
         if pressure {
-            assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+            assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
             assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
         } else {
             assert_eq!(
@@ -36948,7 +36948,7 @@ fn combined_cap_scenario(precharge: u64) -> (Engine, tempfile::TempDir) {
     assert!(engine.budget.charge(precharge));
     let script = |base: u32| {
         (0..base).map(|index| {
-            let mut record = exec_record_for(5_000_000 + index % 200);
+            let mut record = exec_record_for(FAKE_PID_FLOOR + index % 200);
             record.hook_ts_ns = u64::MAX;
             Ok(Some(crate::events::DiscoveryItem::Record(record)))
         })
@@ -37121,16 +37121,16 @@ fn combined_cap_scenario(precharge: u64) -> (Engine, tempfile::TempDir) {
         .chain(0..STAGED)
         .chain(0..TAIL)
         .chain(0..NESTED)
-        .map(|index| 5_000_000 + (index % 200) as u32)
+        .map(|index| FAKE_PID_FLOOR + (index % 200) as u32)
         .collect();
     assert_eq!(dispatch_order.len(), ACQUIRED);
     let mut lasts: Vec<(usize, u32)> = (0..200u32)
         .map(|pid| {
             let last = dispatch_order
                 .iter()
-                .rposition(|owner| *owner == 5_000_000 + pid)
+                .rposition(|owner| *owner == FAKE_PID_FLOOR + pid)
                 .unwrap();
-            (last, 5_000_000 + pid)
+            (last, FAKE_PID_FLOOR + pid)
         })
         .collect();
     lasts.sort();
@@ -37193,7 +37193,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
     let mut session = ScriptedSession::default();
     session.dequeues.extend((0..2_000).map(|index| {
-        let mut record = exec_record_for(5_000_000 + index % 200);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + index % 200);
         record.hook_ts_ns = u64::MAX;
         Ok(Some(crate::events::DiscoveryItem::Record(record)))
     }));
@@ -37201,7 +37201,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
     engine.drain_discovery_from(&mut session).unwrap();
     engine.frame_work_budget_ns = u64::MAX;
     session.dequeues.extend((0..595).map(|index| {
-        let mut record = exec_record_for(5_000_000 + index % 200);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + index % 200);
         record.hook_ts_ns = u64::MAX;
         Ok(Some(crate::events::DiscoveryItem::Record(record)))
     }));
@@ -37210,7 +37210,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
         Engine::collect_discovery_records_budgeted(&mut session, &budget, 595).unwrap();
     assert_eq!(tail.len(), 595, "the tail reads fresh before staging");
     session.dequeues.extend((0..1_500).map(|index| {
-        let mut record = exec_record_for(5_000_000 + index % 200);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + index % 200);
         record.hook_ts_ns = u64::MAX;
         Ok(Some(crate::events::DiscoveryItem::Record(record)))
     }));
@@ -37218,7 +37218,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
         .stage_discovery(1_500, engine.discovery_held_len())
         .unwrap();
     session.dequeues.extend((0..1_000).map(|index| {
-        let mut record = exec_record_for(5_000_000 + index % 200);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + index % 200);
         record.hook_ts_ns = u64::MAX;
         Ok(Some(crate::events::DiscoveryItem::Record(record)))
     }));
@@ -37255,7 +37255,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
     let mut session = ScriptedSession::default();
     session.dequeues.extend((0..200).map(|index| {
         Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
-            5_000_000 + index,
+            FAKE_PID_FLOOR + index,
         ))))
     }));
     session.dequeues.extend(malformed_dequeues(100));
@@ -37301,7 +37301,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
     let mut session = ScriptedSession::default();
     session.dequeues.extend((0..100).map(|index| {
         Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
-            5_000_000 + index,
+            FAKE_PID_FLOOR + index,
         ))))
     }));
     session.dequeues.extend(malformed_dequeues(7));
@@ -37328,7 +37328,7 @@ fn discovery_backlog_combined_cap_survives_nested_collection() {
     let mut session = ScriptedSession::default();
     session.dequeues.extend((0..10).map(|index| {
         Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
-            5_000_000 + index,
+            FAKE_PID_FLOOR + index,
         ))))
     }));
     session
@@ -37367,7 +37367,7 @@ fn discovery_capacity_block_is_not_terminal_empty() {
     session
         .dequeues
         .extend((0..DISCOVERY_HELD_CAP).map(|index| {
-            let mut record = exec_record_for(5_000_000 + (index % 200) as u32);
+            let mut record = exec_record_for(FAKE_PID_FLOOR + (index % 200) as u32);
             record.hook_ts_ns = u64::MAX;
             Ok(Some(crate::events::DiscoveryItem::Record(record)))
         }));
@@ -37434,7 +37434,7 @@ fn discovery_capacity_block_is_not_terminal_empty() {
     session
         .dequeues
         .extend((0..DISCOVERY_HELD_CAP).map(|index| {
-            let mut record = exec_record_for(5_000_000 + (index % 200) as u32);
+            let mut record = exec_record_for(FAKE_PID_FLOOR + (index % 200) as u32);
             record.hook_ts_ns = u64::MAX;
             Ok(Some(crate::events::DiscoveryItem::Record(record)))
         }));
@@ -37515,7 +37515,7 @@ fn discovery_terminal_capacity_failure_is_visible_and_finite() {
     let (_view, owner) = attach_live_loader_context(&mut engine, pid);
     let mut session = ScriptedSession::default();
     session.dequeues.extend((0..3_840).map(|index| {
-        let mut record = exec_record_for(5_000_000 + (index % 200) as u32);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + (index % 200) as u32);
         record.hook_ts_ns = u64::MAX;
         Ok(Some(crate::events::DiscoveryItem::Record(record)))
     }));

@@ -2357,9 +2357,22 @@ impl BankIo for NativeIo<'_> {
 /// the named counter-mode refusal. Only a genuine BPF_PROG_LOAD E2BIG (the
 /// program is too complex for this kernel's verifier) is rewritten, with a
 /// finite reason that never embeds the raw verifier log; every other error
-/// passes through unchanged.
+/// passes through unchanged. Detection walks the io errors in the chain: a
+/// program-load failure carries its syscall errno as the chain source, so no
+/// direct match on the loader's private error shape is needed at this seam.
 fn map_counter_verifier_budget_refusal(error: anyhow::Error) -> anyhow::Error {
-    error
+    let budget = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| super::is_verifier_budget_errno(io.raw_os_error()))
+    });
+    if budget {
+        anyhow::anyhow!(
+            "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)"
+        )
+    } else {
+        error
+    }
 }
 
 impl Session {

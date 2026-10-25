@@ -18,9 +18,12 @@
 # in the observer pod while the serving pod lives (primary: serving PID has an
 # edge to the provider, nested observer, the one `pid namespace` scope gap),
 # then scale back to zero, run the gated secondary (`profile --system`
-# spanning one request: exact LEDGER total, event_loss == 0) and the failure
-# twin (inventory after scale-to-zero: the dead serving PID is absent with no
-# stale edge).
+# spanning one woken request: wake with GET /, wait the attach window, run
+# the ledger on the same pod, exact LEDGER total, event_loss == 0), scale
+# back to zero, run the reported-only boundary (`profile --system` spanning
+# one cold-first request: a BOUNDARY line, never gated except on a partial
+# total) and the failure twin (inventory after scale-to-zero: the dead
+# serving PID is absent with no stale edge).
 #
 # The CONTROLLER runs every docker/kind/kubectl/curl command below. Workers
 # only run `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves
@@ -51,6 +54,15 @@ PROVIDER_SUFFIX=libsofthsm2.so
 ITERS_DEFAULT=200
 SLEEP_US_DEFAULT=200
 PROFILE_SECONDS=60
+# Worst-case live-admission bound for a mid-capture provider, doubled:
+# profile frames tick every 1 s (src/run.rs PROFILE_CADENCE) and every 5th
+# frame forces a full /proc sweep (src/run.rs FULL_DISCOVERY_EVERY_N_FRAMES),
+# so a quiet-skip deferral is bounded to 5 frame intervals; the sweep's
+# newcomers admit same-tick (at most 64, scheduler MAX_NEW_VIEWS_PER_TICK;
+# measured queue ages 17-39 ms in the K3 diag runs) and attach takes ~20 ms.
+# Worst case ~= 7 s; 15 s is generous. It fits Knative's 30 s scale-to-zero
+# grace, and the same-pod check fails closed on any pod churn in between.
+ATTACH_WAIT_S=15
 OBS_NS=p11scope
 KNS=p11scope-knative
 KSVC=p11scope-k3
@@ -87,6 +99,8 @@ Environment:
 
 Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 UNRUN (cell not run, see SUMMARY reason).
 Every run prints a single SUMMARY line: SUMMARY cell=K3 verdict=... reason="...".
+A passing run also prints one BOUNDARY k3-cold-start counted=<n> of <N> ... line
+for the reported-only cold-first-request measurement (a partial total fails named).
 
 CONTROLLER (from the repo root; needs docker, kind, kubectl, curl):
   sh scripts/knative-e2e.sh --token <TOKEN>
@@ -249,6 +263,13 @@ wait_pf_ready() {
     return 1
 }
 
+# Sleep the attach window so a pod woken inside the capture is discovered
+# and attached before its ledger runs. Too short a wait can only fail the
+# exact oracle below, never pass it.
+wait_attach_window() {
+    sleep "$ATTACH_WAIT_S"
+}
+
 # Exactly one Running serving pod, by name, from `kubectl get pods -o json`.
 serving_pod() {
     python3 -I - "$1" <<'PY'
@@ -285,6 +306,19 @@ def cid(entry):
 print(cid(user[0]))
 print(cid(proxy[0]))
 PY
+}
+
+# Both pod listings hold exactly one Running serving pod, and it is the same
+# one: prints its name. A pod churn between the wake and the ledger would
+# silently re-enter the cold race, so any difference refuses.
+same_serving_pod() {
+    sp_wake=$(serving_pod "$1") || return 1
+    sp_during=$(serving_pod "$2") || return 1
+    [ -n "$sp_wake" ] && [ "$sp_wake" = "$sp_during" ] || {
+        echo "serving pod is not stable across wake and ledger" >&2
+        return 1
+    }
+    printf '%s\n' "$sp_wake"
 }
 
 # A container's init PID as the node numbers it (hostPID observer view).
@@ -354,6 +388,51 @@ if len(names) != 6:
 PY
 }
 
+# ONE request; the response must carry exactly one complete 6xN ledger.
+request_ledger() {
+    curl --fail --silent --show-error -H "Host: $HOST" \
+        "http://127.0.0.1:$PF_PORT/ledger" --max-time 120 -o "$1" \
+        || fail_cell "request to the service failed"
+    response_ledger_is "$1" "$ITERS" || fail_cell "response is not exactly one 6x$ITERS ledger"
+    fact "ledger-response[$(basename "$1")]=$(cat "$1")"
+}
+
+# The wake answer is exactly "ready\n": any other body (notably a LEDGER
+# line, which would mean the gate moved) refuses.
+response_wake_is() {
+    printf 'ready\n' | cmp -s - "$1" || {
+        echo "wake response is not exactly ready" >&2
+        return 1
+    }
+}
+
+# Wake the scale-from-zero pod with a request that cannot release the ledger
+# gate: any path other than /ledger answers 200 without touching it, so the
+# exact "ready\n" body proves the pod (not the activator) served the wake.
+wake_service() {
+    curl --fail --silent --show-error -H "Host: $HOST" \
+        "http://127.0.0.1:$PF_PORT/" --max-time 120 -o "$1" \
+        || fail_cell "wake request to the service failed"
+    response_wake_is "$1" || fail_cell "wake response is not exactly ready"
+    fact "wake-response=$(cat "$1")"
+}
+
+# The deterministic secondary's mid-capture requests in order: wake (no gate
+# release), one pod proven, attach window waited, ledger run, same pod
+# proven. Prints the shared serving pod name. The pod still starts from zero
+# inside the capture; only the ledger waits for the attach.
+deterministic_requests() {
+    wake_service "$WORK/response-wake.txt"
+    kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-wake.json" \
+        || fail_cell "cannot list serving pods after wake"
+    wait_attach_window
+    request_ledger "$WORK/response-secondary.txt"
+    kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-during.json" \
+        || fail_cell "cannot list serving pods mid-capture"
+    same_serving_pod "$WORK/serving-wake.json" "$WORK/serving-during.json" \
+        || fail_cell "wake and ledger did not share one serving pod"
+}
+
 # Gated secondary: `profile --system` spanning one request counts exactly the
 # LEDGER total with zero loss. Any ambient row breaks exactness (refused, never
 # merged); extra observation causes beyond the nested numbering are recorded
@@ -392,6 +471,52 @@ if names != want:
     raise SystemExit(f"wrong function set: {sorted(names)}")
 print(json.dumps({"check": "profile-system-exact", "ok": True,
       "calls": sum(r["calls"] for r in rows), "observed_causes": sorted(causes)}))
+PY
+}
+
+# Reported-only cold-start measurement: the /ledger request as the pod's
+# first request. Prints the BOUNDARY line plus a record-only JSON line (never
+# "ok": true, so the gated count stays exact). Exit 0 when the six named
+# rows total exactly N or exactly 0; exit 2 on a partial total (the driver
+# fails that named); exit 1 when the document is unreadable.
+boundary_report() {
+    python3 -I - "$1" "$2" <<'PY'
+import json, sys
+path, iters = sys.argv[1], int(sys.argv[2])
+total = 6 * iters
+document = json.load(open(path, encoding="utf-8"))
+evidence = document["evidence"]
+want = {"C_GenerateRandom", "C_DigestInit", "C_Digest",
+        "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"}
+named = [f for f in document["functions"]
+         if len(f.get("names") or []) == 1 and f["names"][0] in want]
+counted = sum(f.get("calls") or 0 for f in named)
+extra = [f for f in document["functions"]
+         if (f.get("calls") or 0)
+         and not (len(f.get("names") or []) == 1 and f["names"][0] in want)]
+extra_calls = sum(f.get("calls") or 0 for f in extra)
+row_errors = sum(f.get("errors") or 0 for f in document["functions"])
+causes = ",".join(sorted(evidence["gap_classes"]["observation"]["causes"])) or "none"
+newcomer = evidence["scheduling"]["newcomer_queue"]
+dlopen_unproven = evidence["loader_discovery"]["dlopen_timing"]["unproven"]
+def field(value):
+    return "null" if value is None else str(value)
+print(f"BOUNDARY k3-cold-start counted={counted} of {total} "
+      f"event_loss={evidence['event_loss']} "
+      f"attached_probes={evidence['attached_probes']} "
+      f"completeness={evidence['completeness']} causes={causes} "
+      f"pid_descendant_gaps={evidence['pid_descendant_gaps']} "
+      f"dlopen_unproven={dlopen_unproven} "
+      f"newcomer_admitted={newcomer['admitted']} "
+      f"newcomer_max_age_ms={field(newcomer['max_admitted_age_ms'])} "
+      f"attach_gap_ms={field(evidence['attach_gap_ms'])} "
+      f"discovery_ring_loss={evidence['discovery_ring_loss']} "
+      f"unprotected_windows={evidence['unprotected_live_windows']} "
+      f"in_flight={evidence['in_flight_at_end']} "
+      f"extra_rows={len(extra)} extra_calls={extra_calls} row_errors={row_errors}")
+print(json.dumps({"check": "boundary-k3-cold-start", "record_only": True,
+      "counted": counted, "of": total, "extra_rows": len(extra)}))
+sys.exit(0 if counted in (0, total) else 2)
 PY
 }
 
@@ -1075,7 +1200,7 @@ PY
     boundary_report "$stub/boundary-empty.json" 200 > "$stub/bnd-empty.txt" \
         || { echo "empty boundary refused" >&2; exit 1; }
     k3_boundary_line_is "$stub/bnd-empty.txt" "counted=0 of 1200" \
-        "causes=pid_namespace,pid_descendant_gaps,skipped" "dlopen_unproven=1"
+        "causes=pid_descendant_gaps,pid_namespace,skipped" "dlopen_unproven=1"
     boundary_report "$stub/boundary-extra.json" 200 > "$stub/bnd-extra.txt" \
         || { echo "boundary with ambient rows refused" >&2; exit 1; }
     k3_boundary_line_is "$stub/bnd-extra.txt" "counted=1200 of 1200" \
@@ -1189,9 +1314,10 @@ EOF
     ) || { echo "deterministic requests refused" >&2; exit 1; }
     [ "$got" = k3-00002-deployment-xyz ] \
         || { echo "wrong stable pod: $got" >&2; exit 1; }
-    [ "$(cat "$stub/seq-order.txt")" = "/
- /ledger" ] && [ "$(cat "$stub/seq-sleep.txt")" = 15 ] \
+    [ "$(cat "$stub/seq-order.txt")" = "$(printf '/\n/ledger')" ] \
         || { echo "wake/wait/ledger order lost" >&2; exit 1; }
+    [ "$(cat "$stub/seq-sleep.txt")" = 15 ] \
+        || { echo "attach wait lost" >&2; exit 1; }
     grep -Fq 'wake-response=ready' "$seq/facts.txt" \
         || { echo "wake response missing from facts" >&2; exit 1; }
     grep -Fq 'ledger-response[response-secondary.txt]=LEDGER ' "$seq/facts.txt" \
@@ -1339,7 +1465,7 @@ valid_count "$ITERS" || usage
 . scripts/lib.sh
 require_non_root_caller || unrun "run as a non-root user with passwordless sudo"
 [ "$(uname -m)" = x86_64 ] || unrun "the images are x86-64 only"
-for command in docker kind kubectl python3 timeout curl sha256sum awk grep stat; do
+for command in docker kind kubectl python3 timeout curl sha256sum awk grep stat cmp; do
     command -v "$command" >/dev/null || unrun "$command required"
 done
 
@@ -1424,15 +1550,6 @@ start_port_forward() {
     CAPTURE_PIDS="$CAPTURE_PIDS $PF_PID"
     wait_pf_ready "$PF_PORT" 60 || fail_cell "port-forward never became ready"
     fact "port-forward=127.0.0.1:$PF_PORT -> kourier-internal:80"
-}
-
-# ONE request; the response must carry exactly one complete 6xN ledger.
-request_ledger() {
-    curl --fail --silent --show-error -H "Host: $HOST" \
-        "http://127.0.0.1:$PF_PORT/ledger" --max-time 120 -o "$1" \
-        || fail_cell "request to the service failed"
-    response_ledger_is "$1" "$ITERS" || fail_cell "response is not exactly one 6x$ITERS ledger"
-    fact "ledger-response[$(basename "$1")]=$(cat "$1")"
 }
 
 # Resolve the live serving pod and its node PIDs. No capture may be running:
@@ -1606,19 +1723,21 @@ PRIMARY_PID=$SERVING_PID
 say "=== scale back to zero ==="
 wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled back to zero"
 
-say "=== secondary: system profile spanning one request ==="
+say "=== secondary: system profile spanning one woken request ==="
 lock_step
 kc -n "$OBS_NS" exec "$OBS" -- p11scope profile --system --duration "$PROFILE_SECONDS" \
     -o /tmp/k3-system.json >"$WORK/system.out" 2>"$WORK/system.err" &
 SEC_PID=$!
 CAPTURE_PIDS="$CAPTURE_PIDS $SEC_PID"
 wait_ready system "$SEC_PID" || fail_cell "system profile never became ready"
-# The request and the API read below are the only mid-capture contact: the
-# curl runs on the host (invisible to the node observer) and no exec enters
+# The requests and the API reads below are the only mid-capture contact: the
+# curls run on the host (invisible to the node observer) and no exec enters
 # any container while the capture runs.
-request_ledger "$WORK/response-secondary.txt"
-kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-during.json" \
-    || fail_cell "cannot list serving pods mid-capture"
+deterministic_requests > "$WORK/secondary-pod.txt"
+fact "secondary-pod=$(cat "$WORK/secondary-pod.txt")"
+# The ledger must finish while the capture still runs: a window miss is a
+# named harness failure, never a silent 0-count.
+kill -0 "$SEC_PID" 2>/dev/null || fail_cell "system profile ended before the ledger request finished"
 fact "serving-during=$(python3 -I -c 'import json,sys; print(sorted(i["metadata"]["name"] for i in json.load(open(sys.argv[1]))["items"]))' "$WORK/serving-during.json")"
 wait "$SEC_PID" || fail_cell "system profile failed"
 kc -n "$OBS_NS" cp "$OBS:/tmp/k3-system.json" "$WORK/k3-system.json" >/dev/null \
@@ -1629,6 +1748,50 @@ record "$RESULT"
 
 say "=== scale back to zero ==="
 wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled to zero after the secondary"
+
+say "=== boundary: cold-first-request profile (reported only) ==="
+lock_step
+kc -n "$OBS_NS" exec "$OBS" -- p11scope profile --system --duration "$PROFILE_SECONDS" \
+    -o /tmp/k3-boundary.json >"$WORK/boundary.out" 2>"$WORK/boundary.err" &
+BND_PID=$!
+CAPTURE_PIDS="$CAPTURE_PIDS $BND_PID"
+wait_ready boundary "$BND_PID" || fail_cell "boundary profile never became ready"
+# This ledger request is the pod's first: the scale-from-zero race, measured
+# and reported, never gated. Host-side curl plus API reads only, as above.
+request_ledger "$WORK/response-boundary.txt"
+kill -0 "$BND_PID" 2>/dev/null || fail_cell "boundary profile ended before the ledger request finished"
+kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-boundary.json" \
+    || fail_cell "cannot list serving pods mid-capture"
+BND_POD=$(serving_pod "$WORK/serving-boundary.json") || fail_cell "no single boundary pod"
+fact "boundary-pod=$BND_POD"
+wait "$BND_PID" || fail_cell "boundary profile failed"
+kc -n "$OBS_NS" cp "$OBS:/tmp/k3-boundary.json" "$WORK/k3-boundary.json" >/dev/null \
+    || fail_cell "cannot fetch the boundary profile"
+unlock_step
+BND_STATUS=0
+BND_OUT=$(boundary_report "$WORK/k3-boundary.json" "$ITERS") || BND_STATUS=$?
+BND_LINE=$(printf '%s\n' "$BND_OUT" | sed -n '1p')
+BND_JSON=$(printf '%s\n' "$BND_OUT" | sed -n '2p')
+case $BND_STATUS in
+    0) : ;;
+    2)
+        say "$BND_LINE"
+        fact "$BND_LINE"
+        record "$BND_JSON"
+        fail_cell "boundary k3-cold-start counted a partial total"
+        ;;
+    *) fail_cell "boundary report failed" ;;
+esac
+case $BND_LINE in
+    "BOUNDARY k3-cold-start "*) : ;;
+    *) fail_cell "boundary report printed no BOUNDARY line" ;;
+esac
+say "$BND_LINE"
+fact "$BND_LINE"
+record "$BND_JSON"
+
+say "=== scale back to zero ==="
+wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled to zero after the boundary"
 
 say "=== failure twin: no stale edge after scale-to-zero ==="
 lock_step

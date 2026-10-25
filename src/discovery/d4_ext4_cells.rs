@@ -1,13 +1,16 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! D4 ext4 cells: direct-replacement inode reuse is refused, never
-//! joined. A mapper of the replaced file keeps a ` (deleted)` line with
-//! the recycled key; the user-view path identifies the risk and the
-//! bytes resolve it, so both legs refuse with the named loss while a
-//! live holder still edges. ext4 keys are identity keys (no per-range
-//! proof), so every kernel leg classifies "no kernel proof (identity
-//! key)" with zero target runs — never kernel parity. Each privileged
-//! row also records its BRSV (stat-vs-map_files pair) and fails closed
-//! when the rendering changes; the 5.15 shutdown leg is included.
+//! D4 ext4 cells: a recycled inode number never joins a stale holder to
+//! the new file. The recycled row exits the original holder, deletes and
+//! re-creates the path (different bytes, same number), maps the new file
+//! in a new holder, and refuses the stale sweep on both backends; the
+//! equal-bytes twin proves identical content still refuses. A separate
+//! deleted-mapping row pins the live ` (deleted)` refusal (temp+rename
+//! takes a fresh number, so that row is not inode reuse). ext4 keys are
+//! identity keys (no per-range proof), so every kernel leg classifies
+//! "no kernel proof (identity key)" with zero target runs — never kernel
+//! parity. Each privileged row also records its BRSV (stat-vs-map_files
+//! pair) and fails closed when the rendering changes; the 5.15 shutdown
+//! leg is included.
 
 use super::*;
 use std::time::{Duration, Instant};
@@ -218,6 +221,20 @@ fn assert_brsv_live(truth: &Ext4Truth) -> Result<(), String> {
     Ok(())
 }
 
+/// The replaced-path BRSV with a FRESH number: map_files still names
+/// the old (deleted) file while the path names its temp+rename
+/// replacement. A recycled number here would fail the row — a live
+/// deleted-mapping holder and a recycled number cannot coexist.
+fn assert_brsv_changed(truth: &Ext4Truth) -> Result<(), String> {
+    if truth.brsv_ino_equal() {
+        return Err(format!(
+            "ext4 BRSV: temp+rename must take a fresh number, map_files {:?} vs path {:?}",
+            truth.map_files, truth.path_stat
+        ));
+    }
+    Ok(())
+}
+
 /// One-token BRSV summary for the verdict log.
 fn brsv_verdict(truth: &Ext4Truth) -> &'static str {
     if truth.brsv_equal() {
@@ -229,10 +246,10 @@ fn brsv_verdict(truth: &Ext4Truth) -> &'static str {
     }
 }
 
-/// Direct replacement through a temp sibling plus rename: the old
-/// inode is freed and the new file takes its number on a quiet tiny
-/// filesystem. Returns the old and new inode numbers; the rows fail
-/// closed when they differ.
+/// Replacement through a temp sibling plus rename: the new file takes
+/// a FRESH number (allocated while the old file still exists), so this
+/// never recycles — the deleted-mapping row's shape, never inode reuse.
+/// Returns the old and new inode numbers.
 fn replace_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt as _;
     let old_ino = std::fs::metadata(path)
@@ -247,6 +264,34 @@ fn replace_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<(u64, u64), St
         .map_err(|error| format!("ext4 replace restat {}: {error}", path.display()))?
         .ino();
     Ok((old_ino, new_ino))
+}
+
+/// A filesystem identity number pair: (st_dev, st_ino).
+type Ext4Identity = (u64, u64);
+
+/// Delete-then-create replacement: the old path is unlinked BEFORE the
+/// new bytes are written, so a freed inode number is immediately
+/// reusable on a journaled ext4. `between` runs after the unlink and
+/// before the create (the ordinary guard observes the path missing
+/// there). Returns the old and new identity; the rows fail closed
+/// when the number is not recycled.
+fn replace_by_delete_create(
+    path: &std::path::Path,
+    bytes: Vec<u8>,
+    mut between: impl FnMut(),
+) -> Result<(Ext4Identity, Ext4Identity), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let old = std::fs::metadata(path)
+        .map_err(|error| format!("ext4 replace stat {}: {error}", path.display()))?;
+    let before = (old.dev(), old.ino());
+    std::fs::remove_file(path)
+        .map_err(|error| format!("ext4 replace unlink {}: {error}", path.display()))?;
+    between();
+    std::fs::write(path, bytes)
+        .map_err(|error| format!("ext4 replace write {}: {error}", path.display()))?;
+    let new = std::fs::metadata(path)
+        .map_err(|error| format!("ext4 replace restat {}: {error}", path.display()))?;
+    Ok((before, (new.dev(), new.ino())))
 }
 
 fn find_line(snapshot: &[MapEntry], range: (u64, u64), perms: [u8; 4]) -> Result<MapEntry, String> {
@@ -320,21 +365,25 @@ fn ext4_index(
 /// What the kernel leg observably did: the fallback ledger, the
 /// userspace reads it performed, and the index preconditions. ext4
 /// keys are identity keys, so every leg carries the no-proof
-/// classification with no per-range key and no slots.
+/// classification with no per-range key. (Installed anchor slots are
+/// asserted on the index directly by the drivers: anchors install for
+/// arena-mapped files on any filesystem.)
 struct Ext4LegEvidence {
     fallback: crate::discovery::kernel_identity::KernelFallbackTotals,
     userspace_reads: usize,
-    slots_nonempty: bool,
     per_range_key: bool,
     no_proof_classification: Option<&'static str>,
 }
 
-/// The tabled outcome for one ext4 row: the dead holder's named
-/// refusal, the live holder's identity edge, the wrong-file negative
-/// or the data-only zero-demand row.
+/// The tabled outcome for one ext4 row: the stale sweep's refusal
+/// under a recycled number, the deleted line's named refusal under a
+/// fresh number, the live holder's identity edge, the wrong-file
+/// negative or the data-only zero-demand row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ext4Expect {
     DeadHolderRejected,
+    RecycledRefused,
+    DeletedMappingRefused,
     LiveHolderEdge,
     WrongFileNone,
     DataOnlyNone,
@@ -380,6 +429,25 @@ fn ext4_deleted(out: &SweepAttribution, side: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The exited-holder refusal: the stale sweep probed once, the holder
+/// was provably gone, and nothing joined on either backend.
+fn ext4_exited(pid: u32, out: &SweepAttribution, side: &str) -> Result<(), String> {
+    if !out.members.is_empty()
+        || !out.losses.is_empty()
+        || out.probed != 1
+        || out.exited != BTreeSet::from([pid])
+    {
+        return Err(format!(
+            "ext4 {side}: expected exited-holder refusal, members {:?} losses {:?} probed {} exited {:?}",
+            out.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
+            out.losses,
+            out.probed,
+            out.exited
+        ));
+    }
+    Ok(())
+}
+
 fn ext4_no_candidate(out: &SweepAttribution, side: &str) -> Result<(), String> {
     if !out.members.is_empty() || out.probed != 0 || !out.losses.is_empty() {
         return Err(format!(
@@ -411,8 +479,12 @@ fn assert_ext4_outcome(
         if evidence.no_proof_classification != Some("no kernel proof (identity key)") {
             return Err("ext4 kernel: every ext4 leg needs its no-proof classification".into());
         }
-        if evidence.per_range_key || evidence.slots_nonempty {
-            return Err("ext4 kernel: an identity key takes no per-range proof or slots".into());
+        // Identity keys skip per-range proof through the map_files_keys
+        // exclusion, not through missing slots: anchors install for
+        // arena-mapped files on any filesystem, and the drivers assert
+        // the installed slots directly.
+        if evidence.per_range_key {
+            return Err("ext4 kernel: an identity key takes no per-range proof".into());
         }
         Ok(())
     }
@@ -459,6 +531,39 @@ fn assert_ext4_outcome(
             zero_run(evidence)?;
             Ok(())
         }
+        Ext4Expect::RecycledRefused => {
+            if target.maps_line.contains("(deleted)") || anchor.maps_line.contains("(deleted)") {
+                return Err("ext4 recycled premise needs two live lines".into());
+            }
+            if !keys_equal {
+                return Err("ext4 recycled premise needs the recycled key".into());
+            }
+            assert_brsv_live(target)?;
+            assert_brsv_live(anchor)?;
+            ext4_exited(pid, userspace, "userspace")?;
+            ext4_exited(pid, kernel, "kernel")?;
+            classified(evidence)?;
+            zero_run(evidence)?;
+            Ok(())
+        }
+        Ext4Expect::DeletedMappingRefused => {
+            if !target.maps_line.contains("(deleted)") {
+                return Err("ext4 deleted-mapping premise needs the (deleted) line".into());
+            }
+            if anchor.maps_line.contains("(deleted)") {
+                return Err("ext4 deleted-mapping premise needs a live anchor line".into());
+            }
+            if keys_equal {
+                return Err("ext4 deleted-mapping premise needs a fresh number".into());
+            }
+            assert_brsv_changed(target)?;
+            assert_brsv_live(anchor)?;
+            ext4_deleted(userspace, "userspace")?;
+            ext4_deleted(kernel, "kernel")?;
+            classified(evidence)?;
+            zero_run(evidence)?;
+            Ok(())
+        }
         Ext4Expect::LiveHolderEdge => {
             if target.maps_line.contains("(deleted)") || anchor.maps_line.contains("(deleted)") {
                 return Err("ext4 live-holder premise needs live lines".into());
@@ -470,7 +575,8 @@ fn assert_ext4_outcome(
             assert_brsv_live(anchor)?;
             ext4_edge(pid, row_key, userspace, "userspace")?;
             // The kernel leg reaches the same edge through its
-            // AnchorNotInstalled userspace fallback, proving nothing.
+            // AnchorNotInstalled userspace fallback, proving nothing —
+            // and reading nothing, since the prove set is empty.
             ext4_edge(pid, row_key, kernel, "kernel")?;
             classified(evidence)?;
             if evidence.fallback.first_reason
@@ -481,8 +587,8 @@ fn assert_ext4_outcome(
                     evidence.fallback.first_reason
                 ));
             }
-            if evidence.userspace_reads == 0 {
-                return Err("ext4 live-holder fallback performs userspace reads".into());
+            if evidence.userspace_reads != 0 {
+                return Err("ext4 live-holder: the identity-key fallback reads nothing".into());
             }
             Ok(())
         }
@@ -530,11 +636,11 @@ fn d4_ext4_attribute_pid(
     )
 }
 
-/// Kernel leg for a row no confirm runs on (the recycled key refuses
-/// before probing, the keys differ, or a data-only mapping): an
-/// identity key with no slots, zero fallback and zero reads — so a
-/// vacuous kernel leg cannot pass. The outcome carries the refusal or
-/// nothing, per row.
+/// Kernel leg for a row whose confirm never reaches proof (the stale
+/// sweep names an exited holder, the line is unusable, the keys differ,
+/// or a data-only mapping): zero fallback and zero reads — so a vacuous
+/// kernel leg cannot pass. The outcome carries the refusal or nothing,
+/// per row.
 #[allow(clippy::too_many_arguments)]
 fn d4_ext4_kernel_no_run_identity_for_pid(
     pid: u32,
@@ -580,8 +686,8 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
             index
                 .match_slots
                 .get(&key)
-                .is_none_or(|slots| slots.is_empty()),
-            "identity key holds no slots"
+                .is_some_and(|slots| !slots.is_empty()),
+            "anchors install for the arena-mapped file on any filesystem"
         );
         let mut budget = CaptureWorkBudget::default();
         assert!(
@@ -609,16 +715,15 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
-        slots_nonempty: false,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
     (out, evidence)
 }
 
-/// Kernel leg for the live holder: the identity key carries no
-/// slots, and the edge arrives through the AnchorNotInstalled
-/// userspace fallback — never kernel parity.
+/// Kernel leg for the live holder: the identity key draws an empty
+/// proof scope, and the edge arrives through the AnchorNotInstalled
+/// userspace fallback with zero reads — never kernel parity.
 #[allow(clippy::too_many_arguments)]
 fn d4_ext4_kernel_live_holder_for_pid(
     pid: u32,
@@ -664,8 +769,8 @@ fn d4_ext4_kernel_live_holder_for_pid(
             index
                 .match_slots
                 .get(&key)
-                .is_none_or(|slots| slots.is_empty()),
-            "identity key holds no slots"
+                .is_some_and(|slots| !slots.is_empty()),
+            "anchors install for the arena-mapped file on any filesystem"
         );
         let mut budget = CaptureWorkBudget::default();
         assert!(
@@ -689,14 +794,13 @@ fn d4_ext4_kernel_live_holder_for_pid(
         "identity-key edge classifies AnchorNotInstalled: {fallback:?}"
     );
     let reads = trace.lock().unwrap().reads.len();
-    assert!(
-        reads > 0,
-        "the identity-key fallback proves by userspace reads"
+    assert_eq!(
+        reads, 0,
+        "the identity-key fallback reads nothing: the prove set is empty"
     );
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
-        slots_nonempty: false,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -874,6 +978,314 @@ fn ext4_reuse_evaluator_rejects_recycled_identity() {
     .expect("a live pair with no candidates is the zero-demand row");
 }
 
+/// The recycled replacement deletes before it creates: the between-hook
+/// observes the path missing exactly once, the old identity is recorded
+/// and the new bytes land. (A temp+rename mutant keeps the path present
+/// under the hook and fails this test.)
+#[test]
+fn ext4_recycled_replacement_deletes_before_it_creates() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lib.so");
+    std::fs::write(&path, vec![0xE4u8; 8]).unwrap();
+    let before_stat = std::fs::metadata(&path).unwrap();
+    let before_id = (before_stat.dev(), before_stat.ino());
+    let mut visits = 0;
+    let mut saw_missing = false;
+    let (before, _after) = replace_by_delete_create(&path, vec![0xE5u8; 8], || {
+        visits += 1;
+        saw_missing |= std::fs::metadata(&path).is_err();
+    })
+    .expect("delete-then-create replaces");
+    assert_eq!(visits, 1, "the between-hook runs once");
+    assert!(saw_missing, "the path is missing between delete and create");
+    assert_eq!(
+        before, before_id,
+        "the recorded old identity is the deleted file's"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), vec![0xE5u8; 8]);
+}
+
+/// The recycled evaluator refuses the stale sweep: two live truths under
+/// the recycled key with an exited-holder oracle on both backends — while
+/// an edge, a deleted line or differing keys fail.
+#[test]
+fn ext4_recycled_evaluator_refuses_the_stale_sweep() {
+    let pid = 4345u32;
+    let live = |size: u64, mtime: i64| Ext4Stat {
+        dev: libc::makedev(7, 2),
+        ino: 13,
+        size,
+        mtime_secs: mtime,
+        mtime_nanos: 0,
+    };
+    // Position 0: the recorded live line of the exited holder against
+    // the new holder's live line — same recycled key, both coherent.
+    let target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: live(8192, 100),
+        path_stat: live(8192, 100),
+        statfs_magic: 0xef53,
+    };
+    let anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: live(4096, 200),
+        path_stat: live(4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(target.maps_key() == anchor.maps_key(), "recycled key");
+    let exited = synthetic_exited(pid);
+    assert_ext4_outcome(
+        pid,
+        &target,
+        &anchor,
+        &exited,
+        &exited,
+        &synthetic_no_run_identity_evidence(),
+        Ext4Expect::RecycledRefused,
+    )
+    .expect("the stale sweep of the exited holder refuses");
+    // An edge for the recycled key joins and must fail.
+    let edged = synthetic_edged(pid, target.maps_key());
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::RecycledRefused,
+        )
+        .is_err(),
+        "the recycled identity must never join"
+    );
+    // A deleted line is the deleted-mapping row, not this one.
+    let deleted = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so (deleted)".into(),
+        map_files: live(8192, 100),
+        path_stat: live(4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &deleted,
+            &anchor,
+            &exited,
+            &exited,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::RecycledRefused,
+        )
+        .is_err(),
+        "refusal needs two live lines"
+    );
+    // Differing keys are the wrong-file row, not this one.
+    let other = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 14 /lib.so".into(),
+        map_files: Ext4Stat {
+            dev: libc::makedev(7, 2),
+            ino: 14,
+            size: 4096,
+            mtime_secs: 200,
+            mtime_nanos: 0,
+        },
+        path_stat: Ext4Stat {
+            dev: libc::makedev(7, 2),
+            ino: 14,
+            size: 4096,
+            mtime_secs: 200,
+            mtime_nanos: 0,
+        },
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &other,
+            &exited,
+            &exited,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::RecycledRefused,
+        )
+        .is_err(),
+        "refusal needs the recycled key"
+    );
+}
+
+/// The deleted-mapping evaluator refuses the unusable line: a deleted
+/// target line against a live anchor line under a FRESH number — while
+/// recycled numbers, live lines or an edge fail.
+#[test]
+fn ext4_deleted_evaluator_refuses_the_unusable_mapping() {
+    let pid = 4346u32;
+    let stat = |ino: u64, size: u64, mtime: i64| Ext4Stat {
+        dev: libc::makedev(7, 2),
+        ino,
+        size,
+        mtime_secs: mtime,
+        mtime_nanos: 0,
+    };
+    // Position 0: the live holder's deleted line (old number) against
+    // the current file's live line (fresh number from temp+rename).
+    let target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so (deleted)".into(),
+        map_files: stat(13, 8192, 100),
+        path_stat: stat(14, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    let anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 14 /lib.so".into(),
+        map_files: stat(14, 4096, 200),
+        path_stat: stat(14, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(target.maps_key() != anchor.maps_key(), "a fresh number");
+    let refused = synthetic_deleted();
+    assert_ext4_outcome(
+        pid,
+        &target,
+        &anchor,
+        &refused,
+        &refused,
+        &synthetic_no_run_identity_evidence(),
+        Ext4Expect::DeletedMappingRefused,
+    )
+    .expect("the deleted line refuses with its named loss");
+    // Recycled numbers under a deleted line are not this row: a live
+    // deleted-mapping holder and a recycled number cannot coexist.
+    let recycled_anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13, 4096, 200),
+        path_stat: stat(13, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &recycled_anchor,
+            &refused,
+            &refused,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::DeletedMappingRefused,
+        )
+        .is_err(),
+        "temp+rename takes a fresh number"
+    );
+    // Two live lines are not a deleted mapping.
+    let live_target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13, 8192, 100),
+        path_stat: stat(13, 8192, 100),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &live_target,
+            &anchor,
+            &refused,
+            &refused,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::DeletedMappingRefused,
+        )
+        .is_err(),
+        "refusal needs the deleted line"
+    );
+}
+
+/// The live-holder evaluator edges without per-range proof: a live pair
+/// under one key with an edge on both backends, the kernel leg through
+/// its AnchorNotInstalled fallback with zero reads — while a refusal, a
+/// reading fallback or a deleted line fail.
+#[test]
+fn ext4_live_evaluator_edges_without_per_range_proof() {
+    let pid = 4347u32;
+    let live = |size: u64, mtime: i64| Ext4Stat {
+        dev: libc::makedev(7, 2),
+        ino: 13,
+        size,
+        mtime_secs: mtime,
+        mtime_nanos: 0,
+    };
+    let truth = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: live(8192, 100),
+        path_stat: live(8192, 100),
+        statfs_magic: 0xef53,
+    };
+    let edged = synthetic_edged(pid, truth.maps_key());
+    assert_ext4_outcome(
+        pid,
+        &truth,
+        &truth,
+        &edged,
+        &edged,
+        &synthetic_live_identity_evidence(),
+        Ext4Expect::LiveHolderEdge,
+    )
+    .expect("the live holder edges on both backends");
+    // The identity-key fallback reads nothing: the prove set is empty.
+    let reading = Ext4LegEvidence {
+        userspace_reads: 1,
+        ..synthetic_live_identity_evidence()
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &truth,
+            &truth,
+            &edged,
+            &edged,
+            &reading,
+            Ext4Expect::LiveHolderEdge,
+        )
+        .is_err(),
+        "the identity-key fallback reads nothing"
+    );
+    // A refusal is not a live edge.
+    let refused = synthetic_deleted();
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &truth,
+            &truth,
+            &refused,
+            &refused,
+            &synthetic_live_identity_evidence(),
+            Ext4Expect::LiveHolderEdge,
+        )
+        .is_err(),
+        "the live holder edges"
+    );
+}
+
+fn synthetic_exited(pid: u32) -> SweepAttribution {
+    SweepAttribution {
+        probed: 1,
+        exited: BTreeSet::from([pid]),
+        ..SweepAttribution::default()
+    }
+}
+
+fn synthetic_live_identity_evidence() -> Ext4LegEvidence {
+    Ext4LegEvidence {
+        fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 0,
+            first_reason: Some(
+                crate::discovery::kernel_identity::KernelFallbackReason::AnchorNotInstalled,
+            ),
+        },
+        userspace_reads: 0,
+        per_range_key: false,
+        no_proof_classification: Some("no kernel proof (identity key)"),
+    }
+}
+
 fn synthetic_edged(pid: u32, key: ObjectKey) -> SweepAttribution {
     SweepAttribution {
         members: vec![SweptMember {
@@ -919,7 +1331,6 @@ fn synthetic_quad_evidence() -> Ext4LegEvidence {
             first_reason: None,
         },
         userspace_reads: 0,
-        slots_nonempty: true,
         per_range_key: true,
         no_proof_classification: None,
     }
@@ -934,20 +1345,20 @@ fn synthetic_no_run_identity_evidence() -> Ext4LegEvidence {
             first_reason: None,
         },
         userspace_reads: 0,
-        slots_nonempty: false,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     }
 }
 
-/// ext4 inode-reuse confirmation parity: direct file replacement
-/// recycles the inode number, so the dead holder's ` (deleted)` line
-/// carries the current key — and both legs refuse it with the named
-/// loss while a live holder still edges. Every kernel leg classifies
-/// "no kernel proof (identity key)" with zero target runs (never
-/// kernel parity); every row records its BRSV and fails closed when
-/// the rendering changes. On pre-6 kernels the BPF denial is asserted
-/// (shutdown included) with userspace-only legs plus BRSVs.
+/// ext4 inode-reuse confirmation parity: delete-then-create recycles
+/// the inode number after the holder exits, so the stale sweep names a
+/// live recycled key — and both legs refuse it while a live holder
+/// still edges. The deleted-mapping row pins the live ` (deleted)`
+/// refusal separately (temp+rename takes a fresh number). Every kernel
+/// leg classifies "no kernel proof (identity key)" with zero target
+/// runs (never kernel parity); every row records its BRSV and fails
+/// closed when the rendering changes. On pre-6 kernels the BPF denial
+/// is asserted (shutdown included) with userspace-only legs plus BRSVs.
 #[test]
 #[ignore = "root: loop ext4 mounts plus eligible BTF/task_vma identity (5.15 shutdown included)"]
 fn privileged_d4_ext4_inode_reuse_confirmation_parity() {
@@ -993,45 +1404,161 @@ struct Ext4Rows<'s> {
 
 impl Ext4Rows<'_> {
     fn run_all(&mut self, work: &std::path::Path) -> Result<(), String> {
-        self.row_dead_holder(work)?;
-        self.row_live_holder(work)?;
+        // The live holder runs last: its AnchorNotInstalled note is
+        // cumulative in the shared session, and any later no-run row
+        // would fail its absolute-zero fallback assert.
+        self.row_recycled(work)?;
+        self.row_deleted_mapping(work)?;
         self.row_wrong_file(work)?;
         self.row_data_only(work)?;
         self.row_equal_bytes(work)?;
+        self.row_live_holder(work)?;
         Ok(())
     }
 
-    /// Direct replacement: the dead holder keeps a ` (deleted)` line
-    /// with the recycled key, and both legs refuse it with the named
+    /// Recycled identity, different bytes: the original holder maps
+    /// the file and genuinely edges; then it exits (reaped), the path is
+    /// deleted and re-created with different bytes under the recycled
+    /// number, and a new holder maps the new file. The stale sweep
+    /// refuses on both backends (probed once, holder exited). The kernel
+    /// leg proves nothing (identity key, zero runs).
+    fn row_recycled(&mut self, work: &std::path::Path) -> Result<(), String> {
+        self.row_recycled_shape("recycled", vec![0xE5u8; 4096], false, work)
+    }
+
+    /// The recycled-identity shape shared by the recycled and
+    /// equal-bytes rows: exit, delete-then-create, new holder, stale
+    /// refusal. `bytes_must_equal` selects the G28 premise (identical
+    /// bytes) over the differing-bytes premise.
+    fn row_recycled_shape(
+        &mut self,
+        row: &str,
+        new_bytes: Vec<u8>,
+        bytes_must_equal: bool,
+        work: &std::path::Path,
+    ) -> Result<(), String> {
+        eprintln!("D4_EXT4 start row={row}");
+        let _ = work;
+        let fs = Ext4Loop::new();
+        let path = fs.mount.join("lib.so");
+        let old_bytes = vec![0xE4u8; 8192];
+        std::fs::write(&path, &old_bytes).map_err(|error| format!("ext4 {row} write: {error}"))?;
+        let holder = SwapChild::spawn(&path);
+        let stale_pid = holder.pid as u32;
+        let stale_range = child_range(&holder);
+        let sweep = holder.maps();
+        let pre_line = find_line(&sweep, stale_range, *b"r-xp")?;
+        let key = ObjectKey::of(&pre_line);
+        let recorded = record_ext4_truth(stale_pid, stale_range, &path)?;
+        assert_brsv_live(&recorded)?;
+        // The recorded holder genuinely edges before the replacement: a
+        // stale sweep that never edged would refuse vacuously. The pins
+        // drop here — the open file would pin the inode across the
+        // unlink and the number could never recycle.
+        {
+            let (pins, object) = ext4_pin(&path, key)?;
+            let index = ext4_index(key, object, &pins);
+            let live = d4_ext4_attribute_pid(stale_pid, sweep.clone(), &index);
+            ext4_edge(stale_pid, key, &live, "userspace")?;
+        }
+        drop(holder);
+        if std::fs::metadata(format!("/proc/{stale_pid}")).is_ok() {
+            return Err(format!("ext4 {row}: the holder must be reaped"));
+        }
+        let (before, after) = replace_by_delete_create(&path, new_bytes, || {})?;
+        if before != after {
+            return Err(format!(
+                "ext4 {row}: ino not recycled (was {before:?}, now {after:?})"
+            ));
+        }
+        let current =
+            std::fs::read(&path).map_err(|error| format!("ext4 {row} reread: {error}"))?;
+        if current == old_bytes && !bytes_must_equal {
+            return Err(format!("ext4 {row}: premise needs different bytes"));
+        }
+        if current != old_bytes && bytes_must_equal {
+            return Err(format!("ext4 {row}: premise needs identical bytes"));
+        }
+        let anchor = SwapChild::spawn(&path);
+        let anchor_pid = anchor.pid as u32;
+        if anchor_pid == stale_pid {
+            return Err(format!("ext4 {row}: pid reuse across the replacement"));
+        }
+        let anchor_range = child_range(&anchor);
+        let anchor_snap = anchor.maps();
+        let anchor_line = find_line(&anchor_snap, anchor_range, *b"r-xp")?;
+        if ObjectKey::of(&anchor_line) != key {
+            return Err(format!(
+                "ext4 {row}: premise needs the recycled key live again"
+            ));
+        }
+        let live_truth = record_ext4_truth(anchor_pid, anchor_range, &path)?;
+        assert_brsv_live(&live_truth)?;
+        let (pins, object) = ext4_pin(&path, key)?;
+        let index = ext4_index(key, object, &pins);
+        let userspace = d4_ext4_attribute_pid(stale_pid, sweep.clone(), &index);
+        ext4_exited(stale_pid, &userspace, "userspace")?;
+        if let Some(session) = self.session.as_deref_mut() {
+            self.generation += 1;
+            let (kernel, evidence) = d4_ext4_kernel_no_run_identity_for_pid(
+                stale_pid,
+                sweep,
+                &pins,
+                object,
+                key,
+                session,
+                self.generation,
+            );
+            assert_ext4_outcome(
+                stale_pid,
+                &recorded,
+                &live_truth,
+                &userspace,
+                &kernel,
+                &evidence,
+                Ext4Expect::RecycledRefused,
+            )?;
+        }
+        eprintln!(
+            "D4_EXT4 row={row} verdict=stale-refused target-{}",
+            brsv_verdict(&recorded)
+        );
+        Ok(())
+    }
+
+    /// Deleted mapping (not inode reuse): the live holder keeps a
+    /// ` (deleted)` line under the old number while temp+rename takes a
+    /// fresh one, and both legs refuse the unusable line with the named
     /// loss. The kernel leg proves nothing (identity key, zero runs).
-    fn row_dead_holder(&mut self, work: &std::path::Path) -> Result<(), String> {
-        eprintln!("D4_EXT4 start row=dead-holder");
+    fn row_deleted_mapping(&mut self, work: &std::path::Path) -> Result<(), String> {
+        eprintln!("D4_EXT4 start row=deleted-mapping");
         let _ = work;
         let fs = Ext4Loop::new();
         let path = fs.mount.join("lib.so");
         std::fs::write(&path, vec![0xE4u8; 8192])
-            .map_err(|error| format!("ext4 dead-holder write: {error}"))?;
+            .map_err(|error| format!("ext4 deleted-mapping write: {error}"))?;
         let target = SwapChild::spawn(&path);
         let pre = target.maps();
         let pre_line = find_line(&pre, child_range(&target), *b"r-xp")?;
         let key = ObjectKey::of(&pre_line);
         let (old_ino, new_ino) = replace_file(&path, vec![0xE5u8; 4096])?;
-        if old_ino != new_ino {
-            return Err(format!(
-                "ext4 dead-holder: ino not recycled (was {old_ino}, now {new_ino})"
-            ));
+        if old_ino == new_ino {
+            return Err("ext4 deleted-mapping: temp+rename must take a fresh number".into());
         }
         let post = target.maps();
         let post_line = find_line_deleted(&post, child_range(&target))?;
         let anchor = SwapChild::spawn(&path);
         let a_snap = anchor.maps();
         let a_line = find_line(&a_snap, child_range(&anchor), *b"r-xp")?;
+        if ObjectKey::of(&a_line) == key {
+            return Err("ext4 deleted-mapping: premise needs a fresh number".into());
+        }
         let (pins, object) = ext4_pin(&path, key)?;
         let index = ext4_index(key, object, &pins);
         let t_truth = record_ext4_truth(target.pid as u32, child_range(&target), &path)?;
         let a_truth = record_ext4_truth(anchor.pid as u32, child_range(&anchor), &path)?;
         let _ = (&pre_line, &post_line, &a_line);
-        assert_brsv_replaced(&t_truth)?;
+        assert_brsv_changed(&t_truth)?;
         assert_brsv_live(&a_truth)?;
         let pid = target.pid as u32;
         let userspace = d4_ext4_attribute_pid(pid, post, &index);
@@ -1054,11 +1581,11 @@ impl Ext4Rows<'_> {
                 &userspace,
                 &kernel,
                 &evidence,
-                Ext4Expect::DeadHolderRejected,
+                Ext4Expect::DeletedMappingRefused,
             )?;
         }
         eprintln!(
-            "D4_EXT4 row=dead-holder verdict=named-refusal target-{}",
+            "D4_EXT4 row=deleted-mapping verdict=named-refusal target-{}",
             brsv_verdict(&t_truth)
         );
         Ok(())
@@ -1230,72 +1757,11 @@ impl Ext4Rows<'_> {
         Ok(())
     }
 
-    /// Equal-bytes mutation: the replacement carries identical bytes,
-    /// yet the recycled identity is still rejected both ways — equal
-    /// bytes are not physical identity.
+    /// G28 equal-bytes mutation: the same recycled shape, but the
+    /// replacement carries identical bytes — equal bytes are not
+    /// physical identity, so the stale sweep still refuses both ways.
     fn row_equal_bytes(&mut self, work: &std::path::Path) -> Result<(), String> {
-        eprintln!("D4_EXT4 start row=equal-bytes");
-        let _ = work;
-        let fs = Ext4Loop::new();
-        let path = fs.mount.join("lib.so");
-        std::fs::write(&path, vec![0xE4u8; 8192])
-            .map_err(|error| format!("ext4 equal-bytes write: {error}"))?;
-        let target = SwapChild::spawn(&path);
-        let pre = target.maps();
-        let pre_line = find_line(&pre, child_range(&target), *b"r-xp")?;
-        let key = ObjectKey::of(&pre_line);
-        let (old_ino, new_ino) = replace_file(&path, vec![0xE4u8; 8192])?;
-        if old_ino != new_ino {
-            return Err(format!(
-                "ext4 equal-bytes: ino not recycled (was {old_ino}, now {new_ino})"
-            ));
-        }
-        let post = target.maps();
-        let post_line = find_line_deleted(&post, child_range(&target))?;
-        let anchor = SwapChild::spawn(&path);
-        let a_snap = anchor.maps();
-        let a_line = find_line(&a_snap, child_range(&anchor), *b"r-xp")?;
-        let (pins, object) = ext4_pin(&path, key)?;
-        let index = ext4_index(key, object, &pins);
-        let t_truth = record_ext4_truth(target.pid as u32, child_range(&target), &path)?;
-        let a_truth = record_ext4_truth(anchor.pid as u32, child_range(&anchor), &path)?;
-        let _ = (&pre_line, &post_line, &a_line);
-        // Equal bytes, recycled numbers — yet replaced: only the
-        // timestamps tell them apart.
-        if t_truth.map_files.size != t_truth.path_stat.size {
-            return Err("ext4 equal-bytes: premise needs equal sizes".into());
-        }
-        assert_brsv_replaced(&t_truth)?;
-        assert_brsv_live(&a_truth)?;
-        let pid = target.pid as u32;
-        let userspace = d4_ext4_attribute_pid(pid, post, &index);
-        ext4_deleted(&userspace, "userspace")?;
-        if let Some(session) = self.session.as_deref_mut() {
-            self.generation += 1;
-            let (kernel, evidence) = d4_ext4_kernel_no_run_identity_for_pid(
-                pid,
-                target.maps(),
-                &pins,
-                object,
-                key,
-                session,
-                self.generation,
-            );
-            assert_ext4_outcome(
-                pid,
-                &t_truth,
-                &a_truth,
-                &userspace,
-                &kernel,
-                &evidence,
-                Ext4Expect::DeadHolderRejected,
-            )?;
-        }
-        eprintln!(
-            "D4_EXT4 row=equal-bytes verdict=named-refusal target-{}",
-            brsv_verdict(&t_truth)
-        );
-        Ok(())
+        self.row_recycled_shape("equal-bytes", vec![0xE4u8; 8192], true, work)
     }
 }
 

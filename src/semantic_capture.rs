@@ -3181,6 +3181,14 @@ impl SemanticCapture {
             let attempt_deadline = slice_end.min(job.deadline);
             let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
             let healthy = self.audit(io, &mut report);
+            // The break is recorded from the already-obtained result
+            // before the expiry branch: a scan that proves the module
+            // unmapped breaks continuity even when the job expires on
+            // this same tick.
+            if matches!(result, Err(ImageQueryRefusal::Empty)) {
+                self.router
+                    .note_proven_absence(job.image, job.endpoint.file_slot);
+            }
             if io.now() >= job.deadline {
                 self.expire(job.image, &mut report);
             } else if healthy && io.now() < attempt_deadline {
@@ -3266,6 +3274,14 @@ impl SemanticCapture {
             let attempt_deadline = slice_end.min(proof_deadline);
             let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
             let healthy = self.audit(io, &mut report);
+            // The break is recorded from the already-obtained result
+            // before the slice check: a scan that proves the module
+            // unmapped breaks continuity even when the slice elapsed
+            // mid-scan.
+            if matches!(result, Err(ImageQueryRefusal::Empty)) {
+                self.router
+                    .note_proven_absence(job.image, job.endpoint.file_slot);
+            }
             if io.now() >= attempt_deadline {
                 report.scan_refusals.push(ImageQueryRefusal::Deadline);
             } else if healthy {

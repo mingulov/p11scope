@@ -3221,7 +3221,18 @@ impl ClassicDriver<'_> {
                 true
             }
             Err((completion, refusal)) => {
+                // Only a completion for another domain is foreign:
+                // A's own late completion with no live finalizer
+                // state stays silent. The gap words the foreign
+                // domain relationally: NativeDomainId is
+                // equality-only (no Display; numeric access is
+                // journal-only), so no id is printed.
+                let foreign = self
+                    .retiring
+                    .as_ref()
+                    .is_some_and(|retiring| retiring.domain != completion.domain());
                 if fresh
+                    && foreign
                     && matches!(
                         refusal,
                         crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain
@@ -3229,7 +3240,8 @@ impl ClassicDriver<'_> {
                 {
                     self.coordinator.note_scope_gap(
                         "selected promotion completion failed".to_string(),
-                        format!("foreign completion for {:?}", completion.domain()),
+                        "foreign completion for a domain with no live finalizer state"
+                            .to_string(),
                     );
                 }
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");

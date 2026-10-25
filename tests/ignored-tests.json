@@ -728,6 +728,12 @@
     },
     {
       "file": "src/inventory_privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64",
+      "reason": "root-owned live BPF lane; live joint machine begin to Published to WoundDown through the finish driver",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory_privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",
       "cell": "privileged"

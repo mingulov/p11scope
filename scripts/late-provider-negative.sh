@@ -328,7 +328,7 @@ dockerd_argv() {
 # N4 records the storage driver but never gates on it: the never-seen late
 # provider boundary is about scan/admission timing, not overlay identity.
 record_docker_facts() {
-    drv=$(dcli info --format '{{.Driver}} {{.Server.Version}}' 2>/dev/null) \
+    drv=$(dcli info --format '{{.Driver}} {{.ServerVersion}}' 2>/dev/null) \
         || { echo "docker info failed" >&2; return 1; }
     fact "docker-info=$drv"
     driver_only=$(dcli info --format '{{.Driver}}' 2>/dev/null) \

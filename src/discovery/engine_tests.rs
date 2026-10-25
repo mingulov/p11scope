@@ -48036,13 +48036,18 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     assert!(lost.is_empty(), "every sizing row must reconcile");
     assert_eq!(reconciled.len(), VIEWS as usize);
     // Product shape: every view kept its scan-time ownership row through
-    // reconcile (one owned pin each); without it the per-view tree bounds
-    // would undercharge the product.
+    // reconcile — one scan row plus the module and entry rows (two tables
+    // x one entry); without the scan row the per-view tree bounds would
+    // undercharge the product.
     for index in 0..VIEWS {
         let claims = pins
             .view_claims(ProcessViewId(index))
             .expect("scan ownership survives reconcile for every view");
-        assert_eq!(claims.pins.len(), 1, "one owned pin per sizing view");
+        assert_eq!(
+            claims.pins.len(),
+            4,
+            "one scan row plus module and entry rows per sizing view"
+        );
     }
     // Engine assembly: the Inventory policy admits the full 8192-endpoint
     // union (4096 views x 2 tables) with one binding/claim/table per view.
@@ -48067,6 +48072,7 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
         ),
         "the sizing plan carries the Inventory policy"
     );
+    engine.bind_plan_module_ids_for_test();
     insert_sizing_selection_rows(&mut engine, VIEWS);
     engine.next_view_id = VIEWS;
     // A non-blocking native carrier over all slots.
@@ -48086,7 +48092,13 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
         .extend((0..512u32).map(ProcessViewId));
     let start = std::time::Instant::now();
     let mut credits = 0u64;
-    for _ in 0..200_000 {
+    // Hang-guard cap per graph: graph 1 needs ~390k service calls at
+    // system scale (a ~140k-credit native preflight over the 8192-slot
+    // registry at one step per credit, plus worker-timing poll variance),
+    // so the inherited 200k cap cannot host completion. 1M keeps hang
+    // detection at seconds while covering loaded-host variance.
+    const CREDITS_PER_GRAPH: u64 = 1_000_000;
+    for _ in 0..CREDITS_PER_GRAPH {
         credits += 1;
         let outcome = engine
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
@@ -48104,7 +48116,7 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     engine
         .pending_retirements
         .extend((512..1024u32).map(ProcessViewId));
-    for _ in 0..200_000 {
+    for _ in 0..CREDITS_PER_GRAPH {
         credits += 1;
         let outcome = engine
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
@@ -48231,6 +48243,7 @@ fn collected_graph_charge_covers_requested_heap() {
         ),
     );
     assert_eq!(engine.plan.slots.len(), 64);
+    engine.bind_plan_module_ids_for_test();
     insert_sizing_selection_rows(&mut engine, VIEWS);
     engine.next_view_id = VIEWS;
     let mut session = ScriptedSession::default();

@@ -7089,6 +7089,9 @@ pub(crate) mod tests {
                 let mut module = test_fixture::module(*key);
                 module.view = *id;
                 module.path.clone_from(&shared_path_text);
+                module.tables[0].entries[0]
+                    .object_path
+                    .clone_from(&shared_path_text);
                 module
             })
             .collect();
@@ -7106,6 +7109,7 @@ pub(crate) mod tests {
         coordinator.engine.modules = reconciled;
         coordinator.engine.plan =
             crate::plan::build_from_reconciled_modules(std::slice::from_ref(&retained_module));
+        coordinator.engine.bind_plan_module_ids_for_test();
         // A plain engine behind the coordinator transport: the overwritten
         // Detailed plan must not meet the inventory constructor's state.
         coordinator.engine.inventory = None;

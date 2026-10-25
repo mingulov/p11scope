@@ -4403,8 +4403,9 @@ pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 /// Whether the embedded Detailed object carries stubbed attribute capture.
 /// Entry capture is inlined, so prove its scalar reader is called. Identify
 /// the return adapter exactly, without confusing its closure with its body.
-/// Panics on missing, ambiguous or half-wired evidence. Production continues
-/// to derive the flavor from the feature; these tests check the actual bytes.
+/// Panics on missing, ambiguous or half-wired evidence. Production probes
+/// the same bytes through the checked twin; these tests cross-check the
+/// actual bytes independently.
 #[cfg(test)]
 pub(crate) fn embedded_object_is_stubbed() -> bool {
     let parsed =
@@ -4412,7 +4413,6 @@ pub(crate) fn embedded_object_is_stubbed() -> bool {
     embedded_object_capture_is_stubbed(parsed)
 }
 
-#[cfg(test)]
 fn embedded_adapter_symbol_matches(symbol: &str, helper: &str) -> bool {
     let Some(path) = symbol.strip_prefix("_RNvC") else {
         return false;
@@ -4609,29 +4609,215 @@ impl std::fmt::Display for FlavorProbeError {
 
 impl std::error::Error for FlavorProbeError {}
 
+/// Production byte probe: link the entry root and locate the request
+/// reader. Checked twin of the test-only `embedded_object_capture_entry`:
+/// the same exact-symbol rules, but every missing or ambiguous input is
+/// an error (a refusal), never a panic.
+fn probed_capture_entry(
+    mut parsed: aya_obj::Object,
+) -> Result<(aya_obj::Function, u32), FlavorProbeError> {
+    let reader = "p11_request_cell";
+    let mut matches = parsed
+        .functions
+        .values()
+        .filter(|function| function.name == reader);
+    let function = matches
+        .next()
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks request reader"))?;
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new("ambiguous embedded request reader"));
+    }
+    let reader_id = parsed
+        .btf
+        .as_ref()
+        .ok_or_else(|| FlavorProbeError::new("embedded object needs original BTF"))?
+        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
+        .map_err(|_| FlavorProbeError::new("embedded request reader needs original BTF FUNC"))?;
+    if function.func_info.func_info.len() != 1 {
+        return Err(FlavorProbeError::new("ambiguous request function info"));
+    }
+    if function.func_info.func_info[0].type_id != reader_id {
+        return Err(FlavorProbeError::new(
+            "request reader function info must bind its original BTF FUNC",
+        ));
+    }
+    let entry = parsed
+        .programs
+        .get("p11_entry")
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks entry"))?;
+    let key = entry.function_key();
+    if parsed
+        .functions
+        .values()
+        .filter(|function| function.name == "p11_entry")
+        .count()
+        != 1
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded entry function"));
+    }
+    if parsed.functions[&key].name != "p11_entry" {
+        return Err(FlavorProbeError::new("ambiguous embedded entry function"));
+    }
+    let text_sections = parsed
+        .functions
+        .keys()
+        .map(|(section, _)| *section)
+        .collect();
+    // Link only the entry root. Inspect return size independently, so changing
+    // a return body cannot fabricate entry-reader reachability.
+    parsed.programs.retain(|name, _| name == "p11_entry");
+    parsed.relocate_calls(&text_sections).map_err(|error| {
+        FlavorProbeError::new(format!("embedded entry calls do not relocate: {error}"))
+    })?;
+    let entry = parsed
+        .functions
+        .remove(&key)
+        .ok_or_else(|| FlavorProbeError::new("linked entry went missing after relocation"))?;
+    Ok((entry, reader_id))
+}
+
+/// Production byte probe: whether the linked entry reaches the request
+/// reader through real calls. Checked twin of the test-only
+/// `embedded_entry_reaches_reader`: malformed function info is an error,
+/// never a panic.
+fn probed_entry_reaches_reader(
+    entry: &aya_obj::Function,
+    reader_id: u32,
+) -> Result<bool, FlavorProbeError> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let functions: BTreeMap<_, _> = entry
+        .func_info
+        .func_info
+        .iter()
+        .map(|info| (info.insn_off as usize, info.type_id))
+        .collect();
+    if functions.len() != entry.func_info.func_info.len() {
+        return Err(FlavorProbeError::new("ambiguous linked function info"));
+    }
+    if functions.first_key_value().map(|(start, _)| *start) != Some(0) {
+        return Err(FlavorProbeError::new(
+            "linked entry function info must start at 0",
+        ));
+    }
+    if !functions
+        .keys()
+        .all(|start| *start < entry.instructions.len())
+    {
+        return Err(FlavorProbeError::new(
+            "linked entry function info out of range",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![0];
+    while let Some(start) = pending.pop() {
+        if !seen.insert(start) {
+            continue;
+        }
+        let end = functions
+            .range((Excluded(start), Unbounded))
+            .next()
+            .map_or(entry.instructions.len(), |(end, _)| *end);
+        for (at, instruction) in entry.instructions.iter().enumerate().take(end).skip(start) {
+            if instruction.code == 0x85 && instruction.src_reg() == 1 {
+                let target = (at + 1)
+                    .checked_add_signed(instruction.imm as isize)
+                    .ok_or_else(|| {
+                        FlavorProbeError::new("linked entry call target is out of range")
+                    })?;
+                if !functions.contains_key(&target) {
+                    return Err(FlavorProbeError::new(
+                        "linked entry call lacks exact function info",
+                    ));
+                }
+                pending.push(target);
+            }
+        }
+    }
+    Ok(seen.iter().any(|start| functions[start] == reader_id))
+}
+
 /// Production byte probe: stubbed vs wired attribute capture from parsed
-/// bytes. STUB until the probe lands: returns the build feature so the
-/// byte-reading tests fail.
-fn probed_capture_is_stubbed(_parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
-    Ok(cfg!(feature = "stub-object-attributes"))
+/// bytes. Same exact-symbol rules as the test-only twin: the return
+/// adapter must match exactly and be small exactly when the entry root
+/// does not reach the request reader. Missing, ambiguous or half-wired
+/// evidence is an error (a refusal), never a panic.
+fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    let mut matches = parsed.functions.values().filter(|function| {
+        embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+    });
+    let emit = matches
+        .next()
+        .ok_or_else(|| {
+            FlavorProbeError::new("embedded Detailed object has no exact return adapter")
+        })?
+        .instructions
+        .len();
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new(
+            "embedded Detailed object has several exact return adapters",
+        ));
+    }
+    let emit_stub = emit < 300;
+    let (entry, reader_id) = probed_capture_entry(parsed)?;
+    let entry_stub = !probed_entry_reaches_reader(&entry, reader_id)?;
+    if entry_stub != emit_stub {
+        return Err(FlavorProbeError::new(format!(
+            "half-wired embedded object (entry reader {}, emit {emit} instructions)",
+            !entry_stub
+        )));
+    }
+    Ok(entry_stub)
 }
 
 /// Production byte probe: whether the unsafe-unvalidated-metadata decoders
-/// are present in parsed bytes. STUB until the probe lands.
-fn probed_unsafe_is_present(_parsed: &aya_obj::Object) -> Result<bool, FlavorProbeError> {
-    Ok(cfg!(feature = "unsafe-unvalidated-metadata"))
+/// are present. Present means every unsafe entry program and every
+/// unsafe-only policy map is in the object; absent means none is. Any
+/// mixture is half-wired evidence and an error, never a guess.
+fn probed_unsafe_is_present(parsed: &aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    let mut present = Vec::new();
+    let mut absent = Vec::new();
+    for name in UNSAFE_PROGRAMS {
+        if parsed.programs.contains_key(name) {
+            present.push(name);
+        } else {
+            absent.push(name);
+        }
+    }
+    for (name, _) in FEATURE_POLICY_MAPS {
+        if parsed.maps.contains_key(name) {
+            present.push(name);
+        } else {
+            absent.push(name);
+        }
+    }
+    if absent.is_empty() {
+        Ok(true)
+    } else if present.is_empty() {
+        Ok(false)
+    } else {
+        Err(FlavorProbeError::new(format!(
+            "half-wired embedded object (unsafe markers present: {}, absent: {})",
+            present.join(","),
+            absent.join(",")
+        )))
+    }
 }
 
 /// Probe the flavor of one Detailed object's bytes: parse, then derive
 /// stubbed-vs-wired capture and unsafe-decoder presence from the bytes.
-/// STUB until the probe lands: reports the build features without reading
-/// `object`, so the byte controls fail.
+/// Unparseable bytes and missing, ambiguous or half-wired evidence are
+/// errors (a refusal), never a panic.
 pub(crate) fn embedded_flavor_from_bytes(
-    _object: &[u8],
+    object: &[u8],
 ) -> Result<EmbeddedFlavor, FlavorProbeError> {
+    let parsed = aya_obj::Object::parse(object).map_err(|error| {
+        FlavorProbeError::new(format!("embedded Detailed object does not parse: {error}"))
+    })?;
+    let unsafe_present = probed_unsafe_is_present(&parsed)?;
+    let stubbed = probed_capture_is_stubbed(parsed)?;
     Ok(EmbeddedFlavor {
-        stubbed: cfg!(feature = "stub-object-attributes"),
-        unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        stubbed,
+        unsafe_present,
     })
 }
 
@@ -4725,6 +4911,15 @@ pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<Embed
         );
     }
     Ok(probed)
+}
+
+/// Probed unsafe presence for attach grouping. Preparation already refused
+/// on mismatch or undeterminable bytes, so the fallback never runs on a
+/// live path; absent is the safe direction (safe entry programs).
+fn probed_unsafe_for_grouping() -> bool {
+    embedded_flavor()
+        .map(|flavor| flavor.unsafe_present)
+        .unwrap_or(false)
 }
 
 /// The cached probed flavor, refused unless it matches the build features.
@@ -5682,7 +5877,10 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<counter_banks::CounterPreparation<'_>>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
-        if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
+        // The bytes rule before anything loads or attaches: a stale or
+        // mismatched embedded object refuses here with both values named.
+        let flavor = checked_embedded_flavor()?;
+        if policy.uses_unsafe_decoders() && !flavor.unsafe_present {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
         let counter_collection_generation = counter_generation::allocate()?;
@@ -5716,7 +5914,7 @@ impl Session {
         .context("loading BPF object with required task storage")?;
         let native_selection =
             selected_detailed::NativeSelection::publish(&mut ebpf, scope, selected)?;
-        let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
+        let object_has_unsafe = flavor.unsafe_present;
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         let generation_token = pause_key.map(|key| key.generation_token);
         let mut uprobe_scope = UProbeScope::AllProcesses;
@@ -6750,7 +6948,7 @@ impl Session {
             attach_targets_observed_with_roots(
                 targets,
                 self.policy,
-                cfg!(feature = "unsafe-unvalidated-metadata"),
+                probed_unsafe_for_grouping(),
                 roots,
                 |slot| {
                     Ok(attach_targets
@@ -6907,7 +7105,7 @@ impl Session {
         let groups = group_static_slots_with_roots(
             targets,
             self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
+            probed_unsafe_for_grouping(),
             attach_targets,
             roots,
         )?;
@@ -7479,7 +7677,7 @@ impl Session {
         let groups = group_static_slots(
             &regrouped,
             self.policy,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
+            probed_unsafe_for_grouping(),
             &targets,
         );
         let rebuilt_groups = affected_group_count(&self.links, affected);
@@ -8581,13 +8779,20 @@ impl Session {
         self.backend_fallback.as_deref()
     }
 
-    /// Object-attribute capture availability in this build: build scope,
-    /// so every session of this binary reports the same status. Stubbed
-    /// (P0) builds disclaim attribute coverage;
-    /// FULL builds report available. The consistency test pins this
-    /// against the probed embedded bytes in every flavor.
+    /// Object-attribute capture availability in the embedded bytes: byte
+    /// scope, so every session of this binary reports the same status.
+    /// Stubbed (P0) bytes disclaim attribute coverage; FULL bytes report
+    /// available. The consistency test pins this against the probed
+    /// embedded bytes in every flavor.
     pub(crate) fn object_capture_evidence() -> crate::render::ObjectCaptureEvidence {
-        crate::render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes"))
+        // The bytes rule: report the embedded object's capture, not the
+        // build feature. Setup already refused on mismatch or
+        // undeterminable bytes, so the fallback never reaches output;
+        // FULL (available) is the disclose-not-hide direction.
+        let stubbed = embedded_flavor()
+            .map(|flavor| flavor.stubbed)
+            .unwrap_or(false);
+        crate::render::ObjectCaptureEvidence::for_build(stubbed)
     }
 
     /// Under PID scope, what keeps other processes out of the static

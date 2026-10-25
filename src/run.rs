@@ -2334,11 +2334,10 @@ fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<C
         (Kind::Profile, true) => "metrics",
         (Kind::Profile, false) => "profile",
     };
-    CapturePolicy::from_cli(
-        mode,
-        unsafe_requested,
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    )
+    // The bytes rule before anything else runs: a stale or mismatched
+    // embedded object refuses here with both values named.
+    let flavor = crate::attach::checked_embedded_flavor()?;
+    CapturePolicy::from_cli(mode, unsafe_requested, flavor.unsafe_present)
 }
 
 /// The `-o` sink, opened by the caller *before* the attach so a bad path fails
@@ -16996,29 +16995,24 @@ mod tests {
     }
 
     /// Capture policy follows the probed unsafe presence, not the feature:
-    /// planted decoders admit the unsafe flag in a safe build, and planted
-    /// absence in an unsafe build refuses as a mismatch. Fails while
-    /// policy passes the feature through.
+    /// a planted presence disagreement refuses as a mismatch in both
+    /// directions, naming the unsafe decoders. Fails while policy passes
+    /// the feature through.
     #[test]
     fn capture_policy_uses_probed_unsafe_presence() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let error = capture_policy(Kind::Profile, false, true).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
         if cfg!(feature = "unsafe-unvalidated-metadata") {
-            let planted = crate::attach::EmbeddedFlavor {
-                stubbed: cfg!(feature = "stub-object-attributes"),
-                unsafe_present: false,
-            };
-            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-            let error = capture_policy(Kind::Profile, false, true).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains("stale or mismatched"), "{message}");
-            assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
+            assert!(message.contains("lack"), "{message}");
         } else {
-            let planted = crate::attach::EmbeddedFlavor {
-                stubbed: cfg!(feature = "stub-object-attributes"),
-                unsafe_present: true,
-            };
-            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-            let policy = capture_policy(Kind::Profile, false, true).unwrap();
-            assert_eq!(policy, CapturePolicy::UnsafeUnvalidatedMetadata);
+            assert!(message.contains("contain"), "{message}");
         }
     }
 

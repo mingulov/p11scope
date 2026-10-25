@@ -644,20 +644,24 @@ fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
 /// The object-capture row's by-design warning in P0 (stub) builds.
 const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
 
-/// Build scope, identical on every host: P0 (stub) builds do not
-/// capture object attributes, so the row warns
-/// by design (a [`BUILD_LIMIT_ROWS`] member); FULL builds wire it.
+/// Byte scope, identical on every host, read from the embedded object:
+/// FULL bytes wire capture, P0 (stub) bytes warn by design (a
+/// [`BUILD_LIMIT_ROWS`] member). A stale or mismatched object fails the
+/// row with the same reason capture setup refuses with.
 fn object_capture_check() -> Check {
-    if crate::attach::Session::object_capture_evidence().available {
-        Check {
+    match crate::attach::checked_embedded_flavor() {
+        Err(error) => Check {
+            name: "object-attribute capture".into(),
+            status: Status::Fail(format!("{error:#}")),
+        },
+        Ok(flavor) if !flavor.stubbed => Check {
             name: "object-attribute capture".into(),
             status: Status::Ok("enabled".into()),
-        }
-    } else {
-        Check {
+        },
+        Ok(_) => Check {
             name: "object-attribute capture".into(),
             status: Status::Warn(OBJECT_CAPTURE_P0.into()),
-        }
+        },
     }
 }
 

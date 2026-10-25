@@ -33,7 +33,11 @@
 //! that (image, file) key, so the next scan mints even at an unchanged
 //! local epoch. A move of the witness's storage_null counter since the
 //! key's last observation also mints: an unattributed hook event may
-//! hide a real mapping change behind unchanged epochs. A range that
+//! hide a real mapping change behind unchanged epochs. When the
+//! absence-flag table is full a proven absence latches an overflow
+//! instead: the next observation that would otherwise continue mints
+//! and consumes the latch, so one dropped flag costs at most one
+//! spurious split. A range that
 //! *appears* at an unchanged triple is impossible under hook completeness
 //! and latches a sticky coverage fault for that (process, file). Only
 //! the executable flag compares: a write-bit-only protection change

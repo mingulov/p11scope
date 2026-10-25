@@ -8,6 +8,7 @@
 //! checked nonzero allocation; an old Session can never be revived as new.
 
 use super::KernelEvidence;
+use super::counter_reader::ReaderShapeCause;
 use crate::plan::{AttachKey, Slot};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -461,7 +462,7 @@ impl CounterRead {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadStage {
-    Shape,
+    Shape(ReaderShapeCause),
     Budget,
     Stats,
     Rvs,

@@ -132,7 +132,7 @@ pub(crate) struct BankExtent {
 impl BankExtent {
     fn checked(first: u32, end: u32, limit: u32) -> Result<Self, BankRefusal> {
         if first >= end || end > limit {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::ExtentBounds));
         }
         Ok(Self { first, end })
     }
@@ -167,7 +167,7 @@ impl BankGeometry {
 
     fn checked(mode: CounterMode, banks: u32, cells: u32) -> Result<Self, BankRefusal> {
         if (banks, cells) != (16, 512) || banks.checked_mul(cells) != Some(8192) {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::GeometryDims));
         }
         Ok(Self {
             mode,
@@ -193,7 +193,7 @@ impl BankGeometry {
         if self.is_legacy() || Self::checked(self.mode, self.banks, self.cells) == Ok(self) {
             Ok(())
         } else {
-            Err(BankRefusal::Shape)
+            Err(BankRefusal::Shape(BankShapeCause::GeometryInvalid))
         }
     }
 
@@ -203,7 +203,7 @@ impl BankGeometry {
             "counts-bank-growth-v2" => Self::checked(CounterMode::Counts, 16, 512),
             "timestamps-bank-growth-v2" => Self::checked(CounterMode::Timestamps, 16, 512),
             "latency-bank-growth-v2" => Self::checked(CounterMode::Latency, 16, 512),
-            _ => Err(BankRefusal::Shape),
+            _ => Err(BankRefusal::Shape(BankShapeCause::UnknownProfile)),
         }
     }
 
@@ -226,7 +226,7 @@ impl BankGeometry {
 
     fn locate(self, slot: u32) -> Result<(u32, u32), BankRefusal> {
         if slot >= self.limit() {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::SlotOutsideLimit));
         }
         Ok((slot / self.cells, slot % self.cells))
     }
@@ -282,7 +282,7 @@ fn bank_mode_artifact(token: &str) -> Result<BankModeArtifact, BankRefusal> {
         .iter()
         .find(|artifact| artifact.token == token)
         .copied()
-        .ok_or(BankRefusal::Shape)
+        .ok_or(BankRefusal::Shape(BankShapeCause::TestArtifactUnknown))
 }
 
 /// The emitted growth token for a counter mode. Preparation admits a mode
@@ -307,17 +307,17 @@ fn production_geometry_for(object: &[u8], outputs: &str) -> Result<BankGeometry,
     ] {
         if object == counter_object_for_mode(mode) {
             if selected.is_some() {
-                return Err(BankRefusal::Shape);
+                return Err(BankRefusal::Shape(BankShapeCause::ObjectAmbiguous));
             }
             selected = Some(mode);
         }
     }
-    let mode = selected.ok_or(BankRefusal::Shape)?;
+    let mode = selected.ok_or(BankRefusal::Shape(BankShapeCause::ObjectUnknown))?;
     if !outputs
         .split(',')
         .any(|token| token == bank_growth_token(mode))
     {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::TokenNotEmitted));
     }
     BankGeometry::selected(bank_growth_token(mode))
 }
@@ -391,7 +391,7 @@ impl StagedExtent {
             || routes.len() != extent.len()
             || bank_ids.len() != (last_bank - first_bank + 1) as usize
         {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::StagedExtentMismatch));
         }
         for (index, &(bank, id)) in bank_ids.iter().enumerate() {
             if bank != first_bank + index as u32
@@ -440,7 +440,6 @@ enum CommitObservation {
 /// origin, so diagnostics name the failing gate; the public refusal token
 /// stays undifferentiated. Name-parameterized map funnels share the per-map
 /// variants through a map-name mapper; every other site owns its variant.
-#[allow(dead_code)] // Wired to each refusal site in the following commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankShapeCause {
     AttachEndOverflow,
@@ -503,7 +502,6 @@ pub(crate) enum BankShapeCause {
     VerifyRetainedBank,
 }
 
-#[allow(dead_code)] // Wired to each refusal site in the following commit.
 impl BankShapeCause {
     pub(crate) const ALL: [Self; 58] = [
         Self::AttachEndOverflow,
@@ -569,7 +567,7 @@ impl BankShapeCause {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankRefusal {
-    Shape,
+    Shape(BankShapeCause),
     Topology,
     Allocated,
     Exhausted,
@@ -1147,19 +1145,19 @@ impl BankDirectory {
     #[cfg(test)]
     fn legacy_published_mask(&self) -> Result<u64, BankRefusal> {
         if !self.geometry.is_legacy() {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::TestNonLegacyMask));
         }
         legacy_indices_mask(self.published_indices())
     }
 
     fn validate_plan(&self, plan: &AttachPlan) -> Result<(), BankRefusal> {
         let crate::plan::AdmissionPolicy::Counters(budget) = plan.admission_policy() else {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::PlanNotCounters));
         };
         if budget.validate_count(plan.slots.len()).is_err()
             || plan.slots.len() > self.geometry.limit() as usize
         {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::PlanBudgetMismatch));
         }
         if self.budget.is_some_and(|old| old != budget)
             || plan.counter_consumed_end() as usize != self.positions.len()
@@ -1469,7 +1467,7 @@ fn legacy_indices_mask(indices: impl IntoIterator<Item = u32>) -> Result<u64, Ba
     let mut mask = 0;
     for index in indices {
         if index >= BANKS as u32 || mask & (1 << index) != 0 {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::TestLegacyIndexInvalid));
         }
         mask |= 1 << index;
     }
@@ -1478,7 +1476,7 @@ fn legacy_indices_mask(indices: impl IntoIterator<Item = u32>) -> Result<u64, Ba
 
 fn legacy_commit(commit: CountsBankCommit) -> Result<BankCommit, BankRefusal> {
     if commit.configuration != BANK_CONFIG {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::LegacyCommitConfig));
     }
     let extent = BankExtent::checked(commit.first, commit.end, BANKS as u32)?;
     Ok(BankCommit {
@@ -1497,7 +1495,7 @@ fn legacy_route(slot: u32, route: CountsBankRoute) -> Result<BankMetadata, BankR
         || slot < extent.first
         || slot >= extent.end
     {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::LegacyRouteFields));
     }
     Ok(BankMetadata {
         transaction: route.transaction,
@@ -1889,14 +1887,14 @@ impl<'a> CounterPreparation<'a> {
     }
 }
 
-fn map_data(map: &Map) -> Result<&MapData, BankRefusal> {
+fn map_data(map: &Map, cause: BankShapeCause) -> Result<&MapData, BankRefusal> {
     match map {
         Map::HashOfMaps(data)
         | Map::Array(data)
         | Map::HashMap(data)
         | Map::PerCpuArray(data)
         | Map::PerCpuHashMap(data) => Ok(data),
-        _ => Err(BankRefusal::Shape),
+        _ => Err(BankRefusal::Shape(cause)),
     }
 }
 
@@ -1909,14 +1907,15 @@ fn exact_map(
     entries: u32,
     flags: u32,
 ) -> Result<(), BankRefusal> {
-    let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
-    let actual = super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape)?;
+    let cause = profile_map_cause(name);
+    let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape(cause))?, cause)?;
+    let actual = super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape(cause))?;
     super::compare_map_metadata(
         name,
         actual,
         super::map_metadata(kind, key, value, entries, flags),
     )
-    .map_err(|_| BankRefusal::Shape)
+    .map_err(|_| BankRefusal::Shape(cause))
 }
 
 fn exact_map_metadata(
@@ -1926,21 +1925,23 @@ fn exact_map_metadata(
     value: u32,
     entries: u32,
     flags: u32,
+    cause: BankShapeCause,
 ) -> Result<(), BankRefusal> {
-    let actual = super::read_map_metadata("retained counter bank", map_data(map)?)
+    let actual = super::read_map_metadata("retained counter bank", map_data(map, cause)?)
         .map_err(|_| BankRefusal::Native)?;
     super::compare_map_metadata(
         "retained counter bank",
         actual,
         super::map_metadata(kind, key, value, entries, flags),
     )
-    .map_err(|_| BankRefusal::Shape)
+    .map_err(|_| BankRefusal::Shape(cause))
 }
 
 fn validate_maps(ebpf: &Ebpf, geometry: BankGeometry) -> Result<(), BankRefusal> {
     validate_maps_for(geometry, |name| {
-        let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
-        super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape)
+        let cause = profile_map_cause(name);
+        let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape(cause))?, cause)?;
+        super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape(cause))
     })
 }
 
@@ -1959,6 +1960,24 @@ fn profile_maps(geometry: BankGeometry) -> &'static [(&'static str, super::Exact
     }
 }
 
+/// The shape cause for a profile-map check, by map name. The
+/// name-parameterized validation funnels (live, binding and object-parse)
+/// share these per-map causes; the map identity is the diagnostic payload.
+fn profile_map_cause(name: &str) -> BankShapeCause {
+    match name {
+        "COUNTER_BANKS" => BankShapeCause::BanksOuterShape,
+        "COUNTER_BANK_META" => BankShapeCause::MetaShape,
+        "COUNTER_BANK_COMMIT" => BankShapeCause::CommitShape,
+        "COUNTER_BANK_FAULT" => BankShapeCause::FaultShape,
+        "COUNTER_HEALTH" => BankShapeCause::HealthShape,
+        "STATS" => BankShapeCause::StatsShape,
+        "RV_COUNTS" => BankShapeCause::RvShape,
+        "START" => BankShapeCause::StartShape,
+        "SLOT_FILE" => BankShapeCause::SlotFileShape,
+        _ => BankShapeCause::UnknownMapShape,
+    }
+}
+
 fn validate_maps_for(
     geometry: BankGeometry,
     mut metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
@@ -1966,7 +1985,7 @@ fn validate_maps_for(
     geometry.validate()?;
     for &(name, expected) in profile_maps(geometry) {
         super::compare_map_metadata(name, metadata(name)?, expected)
-            .map_err(|_| BankRefusal::Shape)?;
+            .map_err(|_| BankRefusal::Shape(profile_map_cause(name)))?;
     }
     Ok(())
 }
@@ -2064,7 +2083,7 @@ fn validate_object_maps<'a>(
 ) -> Result<(), BankRefusal> {
     geometry.validate()?;
     for &(name, expected) in profile_maps(geometry) {
-        let actual = map(name).ok_or(BankRefusal::Shape)?;
+        let actual = map(name).ok_or(BankRefusal::Shape(profile_map_cause(name)))?;
         if (
             actual.map_type(),
             actual.key_size(),
@@ -2078,12 +2097,12 @@ fn validate_object_maps<'a>(
             expected.max_entries,
             expected.flags,
         ) {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(profile_map_cause(name)));
         }
     }
     let inner = map("COUNTER_BANKS")
         .and_then(aya_obj::Map::inner)
-        .ok_or(BankRefusal::Shape)?;
+        .ok_or(BankRefusal::Shape(BankShapeCause::InnerTemplateMissing))?;
     if (
         inner.map_type(),
         inner.key_size(),
@@ -2098,7 +2117,7 @@ fn validate_object_maps<'a>(
         0,
     ) || inner.inner().is_some()
     {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::InnerTemplateShape));
     }
     Ok(())
 }
@@ -2118,7 +2137,7 @@ fn outer_id(ebpf: &Ebpf, geometry: BankGeometry, key: u32) -> Result<Option<u32>
         128,
     )?;
     let Some(Map::HashOfMaps(data)) = ebpf.map("COUNTER_BANKS") else {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::OuterNotHashOfMaps));
     };
     let mut value = 0u32;
     let attr = super::BpfMapElementAttr {
@@ -2144,18 +2163,20 @@ fn observe_route(
     slot: u32,
     expected: CountsBankRoute,
 ) -> Result<Option<bool>, BankRefusal> {
-    let map = ebpf.map("COUNTER_BANK_META").ok_or(BankRefusal::Shape)?;
+    let map = ebpf
+        .map("COUNTER_BANK_META")
+        .ok_or(BankRefusal::Shape(BankShapeCause::MetaMapMissing))?;
     if geometry.is_legacy() {
-        let map: HashMap<_, u32, BankMetadata> =
-            HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+        let map: HashMap<_, u32, BankMetadata> = HashMap::try_from(map)
+            .map_err(|_| BankRefusal::Shape(BankShapeCause::MetaViewLegacy))?;
         match map.get(&slot, 0) {
             Ok(actual) => Ok(Some(actual == legacy_route(slot, expected)?)),
             Err(MapError::KeyNotFound) => Ok(None),
             Err(_) => Err(BankRefusal::Native),
         }
     } else {
-        let map: HashMap<_, u32, CountsBankRoute> =
-            HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+        let map: HashMap<_, u32, CountsBankRoute> = HashMap::try_from(map)
+            .map_err(|_| BankRefusal::Shape(BankShapeCause::MetaViewGrowth))?;
         match map.get(&slot, 0) {
             Ok(actual) => Ok(Some(actual == expected)),
             Err(MapError::KeyNotFound) => Ok(None),
@@ -2298,7 +2319,7 @@ impl BankIo for NativeIo<'_> {
     fn allocate_bank(&mut self, bank: u32, _: &[Slot]) -> Result<u32, BankRefusal> {
         let index = bank as usize;
         if bank >= self.geometry.banks {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::BankIndexOutsideGeometry));
         }
         if self.custody.banks[index].is_some() {
             return Err(BankRefusal::Allocated);
@@ -2338,10 +2359,14 @@ impl BankIo for NativeIo<'_> {
             self.session
                 .ebpf
                 .map_mut("COUNTER_BANKS")
-                .ok_or(BankRefusal::Shape)?,
+                .ok_or(BankRefusal::Shape(BankShapeCause::InsertInnerOuterMissing))?,
         )
-        .map_err(|_| BankRefusal::Shape)?;
-        let result = outer.insert(bank, map_data(&held.map)?, super::BPF_NOEXIST);
+        .map_err(|_| BankRefusal::Shape(BankShapeCause::InsertInnerOuterView))?;
+        let result = outer.insert(
+            bank,
+            map_data(&held.map, BankShapeCause::InsertInnerHeldVariant)?,
+            super::BPF_NOEXIST,
+        );
         match outer_id(&self.session.ebpf, self.geometry, bank)? {
             Some(id) if id == expected_id && result.is_ok() => Ok(()),
             None if result.is_err() => {
@@ -2367,14 +2392,14 @@ impl BankIo for NativeIo<'_> {
             .session
             .ebpf
             .map_mut("COUNTER_BANK_META")
-            .ok_or(BankRefusal::Shape)?;
+            .ok_or(BankRefusal::Shape(BankShapeCause::InsertRouteMetaMissing))?;
         let result = if self.geometry.is_legacy() {
-            let mut map: HashMap<_, u32, BankMetadata> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::InsertRouteMetaViewLegacy))?;
             map.insert(slot, legacy_route(slot, route)?, super::BPF_NOEXIST)
         } else {
-            let mut map: HashMap<_, u32, CountsBankRoute> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u32, CountsBankRoute> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::InsertRouteMetaViewGrowth))?;
             map.insert(slot, route, super::BPF_NOEXIST)
         };
         match observe_route(&self.session.ebpf, self.geometry, slot, route) {
@@ -2392,12 +2417,12 @@ impl BankIo for NativeIo<'_> {
             .ok_or(BankRefusal::Topology)?
             .index
             .checked_add(1)
-            .ok_or(BankRefusal::Shape)?;
+            .ok_or(BankRefusal::Shape(BankShapeCause::AttachEndOverflow))?;
         let banks = self
             .session
             .counter_banks
             .as_ref()
-            .ok_or(BankRefusal::Shape)?;
+            .ok_or(BankRefusal::Shape(BankShapeCause::AttachWithoutBanks))?;
         let _stage = banks.begin_link_stage((u64::from(first) << 32) | u64::from(end))?;
         let (failed, mut completed) = self
             .session
@@ -2472,7 +2497,9 @@ impl BankIo for NativeIo<'_> {
             else {
                 return CandidateCheck::Contradictory;
             };
-            let Ok(data) = map_data(&held.map) else {
+            // The candidate cause never escapes as a refusal here: a foreign
+            // variant contradicts the candidate instead.
+            let Ok(data) = map_data(&held.map, BankShapeCause::VerifyRetainedBank) else {
                 return CandidateCheck::Contradictory;
             };
             let Ok(info) = data.info() else {
@@ -2487,6 +2514,7 @@ impl BankIo for NativeIo<'_> {
                     self.geometry.mode().stats_bytes() as u32,
                     self.geometry.cells,
                     0,
+                    BankShapeCause::VerifyRetainedBank,
                 )
                 .is_err()
             {
@@ -2522,15 +2550,15 @@ impl BankIo for NativeIo<'_> {
             .session
             .ebpf
             .map_mut("COUNTER_BANK_COMMIT")
-            .ok_or(BankRefusal::Shape)?;
+            .ok_or(BankRefusal::Shape(BankShapeCause::InsertCommitMissing))?;
         if self.geometry.is_legacy() {
-            let mut map: HashMap<_, u64, BankCommit> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u64, BankCommit> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::InsertCommitViewLegacy))?;
             map.insert(transaction, legacy_commit(commit)?, super::BPF_NOEXIST)
                 .map_err(|_| BankRefusal::Commit)
         } else {
-            let mut map: HashMap<_, u64, CountsBankCommit> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u64, CountsBankCommit> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::InsertCommitViewGrowth))?;
             map.insert(transaction, commit, super::BPF_NOEXIST)
                 .map_err(|_| BankRefusal::Commit)
         }
@@ -2563,14 +2591,14 @@ impl BankIo for NativeIo<'_> {
             .session
             .ebpf
             .map_mut("COUNTER_BANK_META")
-            .ok_or(BankRefusal::Shape)?;
+            .ok_or(BankRefusal::Shape(BankShapeCause::RemoveRouteMetaMissing))?;
         if self.geometry.is_legacy() {
-            let mut map: HashMap<_, u32, BankMetadata> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u32, BankMetadata> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::RemoveRouteMetaViewLegacy))?;
             map.remove(&slot).map_err(|_| BankRefusal::Ownership)
         } else {
-            let mut map: HashMap<_, u32, CountsBankRoute> =
-                HashMap::try_from(map).map_err(|_| BankRefusal::Shape)?;
+            let mut map: HashMap<_, u32, CountsBankRoute> = HashMap::try_from(map)
+                .map_err(|_| BankRefusal::Shape(BankShapeCause::RemoveRouteMetaViewGrowth))?;
             map.remove(&slot).map_err(|_| BankRefusal::Ownership)
         }
     }
@@ -2590,9 +2618,9 @@ impl BankIo for NativeIo<'_> {
             self.session
                 .ebpf
                 .map_mut("COUNTER_BANKS")
-                .ok_or(BankRefusal::Shape)?,
+                .ok_or(BankRefusal::Shape(BankShapeCause::RemoveBankOuterMissing))?,
         )
-        .map_err(|_| BankRefusal::Shape)?;
+        .map_err(|_| BankRefusal::Shape(BankShapeCause::RemoveBankOuterView))?;
         outer.remove(&bank).map_err(|_| BankRefusal::Ownership)?;
         if outer_id(&self.session.ebpf, self.geometry, bank)?.is_some() {
             return Err(BankRefusal::Ownership);
@@ -2758,7 +2786,9 @@ impl Session {
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
         let Some(banks) = &self.counter_banks else {
-            return BankPublication::Refused(BankRefusal::Shape);
+            return BankPublication::Refused(BankRefusal::Shape(
+                BankShapeCause::StagedWithoutBanks,
+            ));
         };
         let directory = Arc::clone(&banks.directory);
         let keepalive = Arc::clone(&banks.keepalive);
@@ -2768,7 +2798,9 @@ impl Session {
             return BankPublication::Refused(BankRefusal::Quarantined);
         };
         if directory.geometry != geometry {
-            return BankPublication::Refused(BankRefusal::Shape);
+            return BankPublication::Refused(BankRefusal::Shape(
+                BankShapeCause::StagedGeometryChanged,
+            ));
         }
         let Ok(mut custody) = keepalive.custody.lock() else {
             return BankPublication::Refused(BankRefusal::Quarantined);
@@ -2908,7 +2940,7 @@ fn reader_profile_with(
         return Err(BankRefusal::Quarantined);
     }
     if directory.geometry != banks.geometry {
-        return Err(BankRefusal::Shape);
+        return Err(BankRefusal::Shape(BankShapeCause::BindingGeometryChanged));
     }
     directory.geometry.validate()?;
     drop(directory);
@@ -2964,7 +2996,8 @@ impl Session {
         reader_profile_with(
             self.counter_banks.as_ref(),
             |name| {
-                let data = map_data(self.ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
+                let cause = profile_map_cause(name);
+                let data = map_data(self.ebpf.map(name).ok_or(BankRefusal::Shape(cause))?, cause)?;
                 super::read_map_metadata(name, data).map_err(|_| BankRefusal::Native)
             },
             || aya::util::nr_cpus().map_err(|_| BankRefusal::Native),
@@ -3072,7 +3105,7 @@ impl CounterBanks {
             .lock()
             .map_err(|_| BankRefusal::Quarantined)?;
         if directory.geometry != self.geometry {
-            return Err(BankRefusal::Shape);
+            return Err(BankRefusal::Shape(BankShapeCause::SnapshotGeometryChanged));
         }
         directory.validate_read_plan(plan)?;
         if plan.slots.len() != directory.positions.len()
@@ -3202,9 +3235,10 @@ impl CounterBankView {
                     geometry.mode().stats_bytes() as u32,
                     geometry.cells,
                     0,
+                    BankShapeCause::RoutingRetainedBank,
                 )
                 .is_err()
-                    || map_data(&held.map)?
+                    || map_data(&held.map, BankShapeCause::RoutingHeldVariant)?
                         .info()
                         .map_err(|_| BankRefusal::Native)?
                         .id()
@@ -3243,7 +3277,10 @@ impl Session {
         objects: &PinnedObjects,
         reserve: &SemanticResourceReserver,
     ) -> Result<CounterBankView, BankRefusal> {
-        let banks = self.counter_banks.as_ref().ok_or(BankRefusal::Shape)?;
+        let banks = self
+            .counter_banks
+            .as_ref()
+            .ok_or(BankRefusal::Shape(BankShapeCause::BanksMissingForView))?;
         let snapshot = banks.published_snapshot(plan, objects, reserve)?;
         let custody = banks
             .keepalive
@@ -3852,9 +3889,17 @@ pub(crate) mod tests {
                 3 => map.def.max_entries = 8192,
                 _ => map.def.value_size = 40,
             }
+            let expected = match damage {
+                0 => BankShapeCause::BanksOuterShape,
+                1 => BankShapeCause::InnerTemplateShape,
+                2 => BankShapeCause::MetaShape,
+                3 => BankShapeCause::CommitShape,
+                _ => BankShapeCause::StatsShape,
+            };
             assert_eq!(
                 validate_format1_object_maps(|name| changed.get(name)),
-                Err(BankRefusal::Shape)
+                Err(BankRefusal::Shape(expected)),
+                "damage {damage}"
             );
         }
         assert_eq!(
@@ -3865,7 +3910,7 @@ pub(crate) mod tests {
                     format1.get(name)
                 }
             }),
-            Err(BankRefusal::Shape)
+            Err(BankRefusal::Shape(BankShapeCause::MetaShape))
         );
     }
 
@@ -4174,7 +4219,7 @@ pub(crate) mod tests {
             let reason = match case {
                 0 => {
                     history = AttachPlan::from_slots(vec![slot(0, 1)]);
-                    BankRefusal::Shape
+                    BankRefusal::Shape(BankShapeCause::PlanNotCounters)
                 }
                 1 => {
                     history.slots[0].index = 1;
@@ -5455,7 +5500,7 @@ pub(crate) mod tests {
         let mut directory = BankDirectory::default();
         assert_eq!(
             directory.stage_with(&mut native, &mut plan(3), reservation(), &pool.reserver()),
-            BankPublication::Refused(BankRefusal::Shape),
+            BankPublication::Refused(BankRefusal::Shape(BankShapeCause::PlanBudgetMismatch)),
         );
         let mut aliases = plan(2);
         aliases.slots[1].object = aliases.slots[0].object;
@@ -5686,7 +5731,11 @@ pub(crate) mod tests {
             "STATS" => (MapType::PerCpuArray, 4, 24, 512, 0),
             "RV_COUNTS" => (MapType::PerCpuHash, 16, 8, 4096, 0),
             "START" => (MapType::Hash, 16, 288, 16384, 0),
-            _ => return Err(BankRefusal::Shape),
+            _ => {
+                return Err(BankRefusal::Shape(
+                    BankShapeCause::TestReaderMetadataUnknown,
+                ));
+            }
         };
         Ok(super::super::map_metadata(kind, key, value, entries, flags))
     }
@@ -7153,7 +7202,10 @@ pub(crate) mod tests {
             "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
         ] {
             assert!(
-                matches!(bank_mode_artifact(bad), Err(BankRefusal::Shape)),
+                matches!(
+                    bank_mode_artifact(bad),
+                    Err(BankRefusal::Shape(BankShapeCause::TestArtifactUnknown))
+                ),
                 "{bad:?}"
             );
         }
@@ -7228,7 +7280,10 @@ pub(crate) mod tests {
             "latency-bank-growth-v2,timestamps-bank-growth-v2",
         ] {
             assert!(
-                matches!(BankGeometry::selected(bad), Err(BankRefusal::Shape)),
+                matches!(
+                    BankGeometry::selected(bad),
+                    Err(BankRefusal::Shape(BankShapeCause::UnknownProfile))
+                ),
                 "{bad:?}"
             );
         }
@@ -7265,7 +7320,7 @@ pub(crate) mod tests {
                 let maps = format2_object_maps(wrong);
                 assert_eq!(
                     validate_object_maps(geometry, |name| maps.get(name)),
-                    Err(BankRefusal::Shape),
+                    Err(BankRefusal::Shape(BankShapeCause::InnerTemplateShape)),
                     "{mode:?} must refuse a {wrong}-byte inner template"
                 );
             }
@@ -7276,7 +7331,7 @@ pub(crate) mod tests {
             outer.inner_def = None;
             assert_eq!(
                 validate_object_maps(geometry, |name| maps.get(name)),
-                Err(BankRefusal::Shape),
+                Err(BankRefusal::Shape(BankShapeCause::InnerTemplateMissing)),
                 "{mode:?} must refuse a missing inner template"
             );
         }
@@ -7290,7 +7345,7 @@ pub(crate) mod tests {
                 BankGeometry::checked(CounterMode::Timestamps, 16, 512).unwrap(),
                 |name| maps.get(name)
             ),
-            Err(BankRefusal::Shape),
+            Err(BankRefusal::Shape(BankShapeCause::StatsShape)),
             "a timestamps-shaped aggregate map cannot relabel the bank template"
         );
     }
@@ -7830,7 +7885,7 @@ pub(crate) mod tests {
                 |_| panic!("incomplete format2 must refuse before map I/O"),
                 || panic!("incomplete format2 must refuse before CPU I/O")
             ),
-            Err(BankRefusal::Shape)
+            Err(BankRefusal::Shape(BankShapeCause::BindingGeometryChanged))
         ));
     }
 
@@ -7863,7 +7918,7 @@ pub(crate) mod tests {
                     },
                     || Ok(2)
                 ),
-                Err(BankRefusal::Shape)
+                Err(BankRefusal::Shape(BankShapeCause::StatsShape))
             ),
             "a timestamps-shaped map cannot relabel this Counts preparation"
         );

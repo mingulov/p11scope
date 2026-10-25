@@ -31,7 +31,6 @@ const NATIVE_STARTS: u32 = 16384;
 /// origin, so diagnostics name the failing gate; the public refusal token
 /// stays undifferentiated. The shared map-shape helper takes the caller's
 /// variant, so each checked map keeps its own cause.
-#[allow(dead_code)] // Wired to each refusal site in the following commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReaderShapeCause {
     BankInnerShape,
@@ -72,7 +71,6 @@ pub(super) enum ReaderShapeCause {
     StatsViewTimestamps,
 }
 
-#[allow(dead_code)] // Wired to each refusal site in the following commit.
 impl ReaderShapeCause {
     pub(super) const ALL: [Self; 36] = [
         Self::BankInnerShape,
@@ -148,7 +146,7 @@ pub(super) fn read_banked(
     let binding = session
         .counter_reader_binding()
         .map_err(bank_read_stage)?
-        .ok_or(ReadStage::Shape)?;
+        .ok_or(ReadStage::Shape(ReaderShapeCause::BindingAbsent))?;
     read_bound(binding, plan, objects, limits, reserve)
 }
 
@@ -188,7 +186,14 @@ pub(super) fn read_bound(
         .ebpf
         .map("COUNTER_BANK_FAULT")
         .ok_or(ReadStage::Health)?;
-    shape(fault, MapType::PerCpuArray, 4, 8, 1)?;
+    shape(
+        fault,
+        MapType::PerCpuArray,
+        4,
+        8,
+        1,
+        ReaderShapeCause::FaultShape,
+    )?;
     let source = BankedSource {
         native,
         view: &view,
@@ -256,7 +261,7 @@ fn acquire(
             if source.mode() != snapshot.mode()
                 || source.possible_cpus() != snapshot.possible_cpus()
             {
-                return Err(ReadStage::Shape);
+                return Err(ReadStage::Shape(ReaderShapeCause::SnapshotModeMismatch));
             }
             snapshot.validate_plan(plan).map_err(bank_read_stage)?;
             (
@@ -278,7 +283,7 @@ fn acquire(
             .enumerate()
             .any(|(index, slot)| slot.index as usize != index)
     {
-        return Err(ReadStage::Shape);
+        return Err(ReadStage::Shape(ReaderShapeCause::PlanLimitsMismatch));
     }
     let transient = transient_bytes(source.mode(), source.possible_cpus(), limits.rv_keys)
         .and_then(|n| n.checked_add(logical_slots))
@@ -291,9 +296,12 @@ fn acquire(
     let mut targets = Vec::with_capacity(row_count);
     if let Some(snapshot) = published {
         for &index in snapshot.original_indices() {
-            let slot = plan.slots.get(index as usize).ok_or(ReadStage::Shape)?;
+            let slot = plan
+                .slots
+                .get(index as usize)
+                .ok_or(ReadStage::Shape(ReaderShapeCause::PublishedIndexMissing))?;
             if membership[index as usize] != 0 {
-                return Err(ReadStage::Shape);
+                return Err(ReadStage::Shape(ReaderShapeCause::PublishedIndexDuplicate));
             }
             membership[index as usize] = 1;
             targets.push(crate::plan::AttachKey {
@@ -312,7 +320,7 @@ fn acquire(
     }
     targets.sort_unstable();
     if targets.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(ReadStage::Shape);
+        return Err(ReadStage::Shape(ReaderShapeCause::DuplicateTargets));
     }
 
     let mut rvs = Vec::with_capacity(limits.rv_keys);
@@ -477,6 +485,7 @@ impl CounterSource for BankedSource<'_> {
             4,
             mode.stats_bytes() as usize,
             cells,
+            ReaderShapeCause::BankInnerShape,
         )?;
         let rvs = || rvs.iter().copied();
         Ok(match mode {
@@ -538,22 +547,23 @@ fn shape(
     key: usize,
     value: usize,
     capacity: u32,
+    cause: ReaderShapeCause,
 ) -> Result<(), ReadStage> {
     let data = match map {
         Map::PerCpuArray(data)
         | Map::PerCpuHashMap(data)
         | Map::Array(data)
         | Map::HashMap(data) => data,
-        _ => return Err(ReadStage::Shape),
+        _ => return Err(ReadStage::Shape(cause)),
     };
-    let info = data.info().map_err(|_| ReadStage::Shape)?;
-    if info.map_type().map_err(|_| ReadStage::Shape)? != kind
+    let info = data.info().map_err(|_| ReadStage::Shape(cause))?;
+    if info.map_type().map_err(|_| ReadStage::Shape(cause))? != kind
         || info.key_size() as usize != key
         || info.value_size() as usize != value
         || info.max_entries() != capacity
         || info.map_flags() != 0
     {
-        return Err(ReadStage::Shape);
+        return Err(ReadStage::Shape(cause));
     }
     Ok(())
 }
@@ -572,28 +582,34 @@ impl<'a> NativeSource<'a> {
         start_rows: u32,
         expected_cpus: Option<usize>,
     ) -> Result<Self, ReadStage> {
-        let required = |name| lookup(name).ok_or(ReadStage::Shape);
-        let stats = required("STATS")?;
-        let rvs = required("RV_COUNTS")?;
-        let starts = required("START")?;
-        let health = required("COUNTER_HEALTH")?;
-        let evidence = required("EVIDENCE")?;
-        let owner = required("OWNER_CTL")?;
-        let cookie = required("COOKIE_CTL")?;
-        let root = required("ROOT_CTL")?;
+        let stats = lookup("STATS").ok_or(ReadStage::Shape(ReaderShapeCause::StatsMapMissing))?;
+        let rvs = lookup("RV_COUNTS").ok_or(ReadStage::Shape(ReaderShapeCause::RvMapMissing))?;
+        let starts = lookup("START").ok_or(ReadStage::Shape(ReaderShapeCause::StartsMapMissing))?;
+        let health =
+            lookup("COUNTER_HEALTH").ok_or(ReadStage::Shape(ReaderShapeCause::HealthMapMissing))?;
+        let evidence =
+            lookup("EVIDENCE").ok_or(ReadStage::Shape(ReaderShapeCause::EvidenceMapMissing))?;
+        let owner =
+            lookup("OWNER_CTL").ok_or(ReadStage::Shape(ReaderShapeCause::OwnerMapMissing))?;
+        let cookie =
+            lookup("COOKIE_CTL").ok_or(ReadStage::Shape(ReaderShapeCause::CookieMapMissing))?;
+        let root = lookup("ROOT_CTL").ok_or(ReadStage::Shape(ReaderShapeCause::RootMapMissing))?;
         shape(
             stats,
             MapType::PerCpuArray,
             4,
             stats_shape.stats_bytes() as usize,
             NATIVE_SLOTS as u32,
+            ReaderShapeCause::StatsShape,
         )?;
         shape(
             rvs,
             MapType::PerCpuHash,
             size_of::<RvKey>(),
             8,
-            u32::try_from(rv_keys).map_err(|_| ReadStage::Shape)?,
+            u32::try_from(rv_keys)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::RvKeysOverflow))?,
+            ReaderShapeCause::RvShape,
         )?;
         shape(
             starts,
@@ -601,16 +617,39 @@ impl<'a> NativeSource<'a> {
             size_of::<StartKey>(),
             size_of::<CallStart>(),
             start_rows,
+            ReaderShapeCause::StartsShape,
         )?;
-        shape(health, MapType::PerCpuArray, 4, 8, 2)?;
-        shape(evidence, MapType::PerCpuArray, 4, 8, EVIDENCE_CELLS)?;
-        shape(owner, MapType::Array, 4, size_of::<ThreadOwnerControl>(), 1)?;
+        shape(
+            health,
+            MapType::PerCpuArray,
+            4,
+            8,
+            2,
+            ReaderShapeCause::HealthShape,
+        )?;
+        shape(
+            evidence,
+            MapType::PerCpuArray,
+            4,
+            8,
+            EVIDENCE_CELLS,
+            ReaderShapeCause::EvidenceShape,
+        )?;
+        shape(
+            owner,
+            MapType::Array,
+            4,
+            size_of::<ThreadOwnerControl>(),
+            1,
+            ReaderShapeCause::OwnerShape,
+        )?;
         shape(
             cookie,
             MapType::Array,
             4,
             size_of::<ImageIdentityControl>(),
             1,
+            ReaderShapeCause::CookieShape,
         )?;
         shape(
             root,
@@ -618,31 +657,42 @@ impl<'a> NativeSource<'a> {
             4,
             size_of::<RootAffiliationControl>(),
             1,
+            ReaderShapeCause::RootShape,
         )?;
-        let cpus = aya::util::nr_cpus().map_err(|_| ReadStage::Shape)?;
+        let cpus = aya::util::nr_cpus()
+            .map_err(|_| ReadStage::Shape(ReaderShapeCause::CpuCountUnavailable))?;
         if cpus == 0 || expected_cpus.is_some_and(|expected| expected != cpus) {
-            return Err(ReadStage::Shape);
+            return Err(ReadStage::Shape(ReaderShapeCause::CpuCountMismatch));
         }
         Ok(Self {
             mode,
             cpus,
             stats: match mode {
-                CounterMode::Counts => {
-                    NativeStats::Counts(PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?)
-                }
+                CounterMode::Counts => NativeStats::Counts(
+                    PerCpuArray::try_from(stats)
+                        .map_err(|_| ReadStage::Shape(ReaderShapeCause::StatsViewCounts))?,
+                ),
                 CounterMode::Timestamps => NativeStats::Timestamps(
-                    PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?,
+                    PerCpuArray::try_from(stats)
+                        .map_err(|_| ReadStage::Shape(ReaderShapeCause::StatsViewTimestamps))?,
                 ),
                 CounterMode::Latency => NativeStats::Latency(
-                    PerCpuArray::try_from(stats).map_err(|_| ReadStage::Shape)?,
+                    PerCpuArray::try_from(stats)
+                        .map_err(|_| ReadStage::Shape(ReaderShapeCause::StatsViewLatency))?,
                 ),
             },
-            rvs: PerCpuHashMap::try_from(rvs).map_err(|_| ReadStage::Shape)?,
-            health: PerCpuArray::try_from(health).map_err(|_| ReadStage::Shape)?,
-            evidence: PerCpuArray::try_from(evidence).map_err(|_| ReadStage::Shape)?,
-            owner: Array::try_from(owner).map_err(|_| ReadStage::Shape)?,
-            cookie: Array::try_from(cookie).map_err(|_| ReadStage::Shape)?,
-            root: Array::try_from(root).map_err(|_| ReadStage::Shape)?,
+            rvs: PerCpuHashMap::try_from(rvs)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::RvView))?,
+            health: PerCpuArray::try_from(health)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::HealthView))?,
+            evidence: PerCpuArray::try_from(evidence)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::EvidenceView))?,
+            owner: Array::try_from(owner)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::OwnerView))?,
+            cookie: Array::try_from(cookie)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::CookieView))?,
+            root: Array::try_from(root)
+                .map_err(|_| ReadStage::Shape(ReaderShapeCause::RootView))?,
         })
     }
 
@@ -1226,7 +1276,7 @@ mod tests {
                     &pool.reserver()
                 )
                 .err(),
-                Some(ReadStage::Shape)
+                Some(ReadStage::Shape(ReaderShapeCause::PlanLimitsMismatch))
             );
         }
         for cpus in [0, 3] {
@@ -1240,7 +1290,8 @@ mod tests {
                     &pool.reserver()
                 )
                 .err(),
-                Some(ReadStage::Shape)
+                Some(ReadStage::Shape(ReaderShapeCause::SnapshotModeMismatch)),
+                "possible CPUs {cpus} against a 2-CPU preparation"
             );
         }
         source.cpus = 2;
@@ -1254,7 +1305,7 @@ mod tests {
                 &pool.reserver()
             )
             .err(),
-            Some(ReadStage::Shape)
+            Some(ReadStage::Shape(ReaderShapeCause::SnapshotModeMismatch))
         );
         assert!(transient_bytes(CounterMode::Counts, usize::MAX, 65536).is_none());
         for mode in [
@@ -1272,7 +1323,7 @@ mod tests {
                     &pool.reserver()
                 )
                 .err(),
-                Some(ReadStage::Shape),
+                Some(ReadStage::Shape(ReaderShapeCause::PlanLimitsMismatch)),
                 "format2 bounds must not broaden any ordinary fixed artifact"
             );
         }
@@ -1330,7 +1381,7 @@ mod tests {
                         &pool.reserver(),
                     )
                     .err(),
-                    Some(ReadStage::Shape),
+                    Some(ReadStage::Shape(ReaderShapeCause::SnapshotModeMismatch)),
                     "{requested:?} source against {prepared:?} preparation"
                 );
             }
@@ -2111,16 +2162,26 @@ mod tests {
             "ROOT_CTL",
         ] {
             let removed = maps.remove(name).unwrap();
+            let expected = match name {
+                "STATS" => ReaderShapeCause::StatsMapMissing,
+                "RV_COUNTS" => ReaderShapeCause::RvMapMissing,
+                "START" => ReaderShapeCause::StartsMapMissing,
+                "COUNTER_HEALTH" => ReaderShapeCause::HealthMapMissing,
+                "EVIDENCE" => ReaderShapeCause::EvidenceMapMissing,
+                "OWNER_CTL" => ReaderShapeCause::OwnerMapMissing,
+                "COOKIE_CTL" => ReaderShapeCause::CookieMapMissing,
+                _ => ReaderShapeCause::RootMapMissing,
+            };
             assert_eq!(
                 NativeSource::new(|name| maps.get(name), CounterMode::Counts).err(),
-                Some(ReadStage::Shape),
+                Some(ReadStage::Shape(expected)),
                 "missing {name}"
             );
             maps.insert(name, removed);
         }
         assert_eq!(
             NativeSource::new(|name| maps.get(name), CounterMode::Latency).err(),
-            Some(ReadStage::Shape)
+            Some(ReadStage::Shape(ReaderShapeCause::StatsShape))
         );
         for (name, kind, key_bytes, value_bytes, capacity) in [
             ("STATS", BPF_MAP_TYPE_PERCPU_ARRAY, 4, 40, 512),
@@ -2137,9 +2198,17 @@ mod tests {
             let previous = maps
                 .insert(name, native_map(kind, key_bytes, value_bytes, capacity))
                 .unwrap();
+            let expected = match name {
+                "STATS" => ReaderShapeCause::StatsShape,
+                "RV_COUNTS" => ReaderShapeCause::RvShape,
+                "START" => ReaderShapeCause::StartsShape,
+                "COUNTER_HEALTH" => ReaderShapeCause::HealthShape,
+                "EVIDENCE" => ReaderShapeCause::EvidenceShape,
+                _ => ReaderShapeCause::OwnerShape,
+            };
             assert_eq!(
                 NativeSource::new(|name| maps.get(name), CounterMode::Counts).err(),
-                Some(ReadStage::Shape),
+                Some(ReadStage::Shape(expected)),
                 "wrong {name}"
             );
             maps.insert(name, previous);

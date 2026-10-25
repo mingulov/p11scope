@@ -109,7 +109,7 @@ impl CounterFailure {
     fn name(self) -> &'static str {
         match self {
             Self::Read(stage) => match stage {
-                ReadStage::Shape => "read_shape",
+                ReadStage::Shape(_) => "read_shape",
                 ReadStage::Budget => "read_budget",
                 ReadStage::Stats => "read_stats",
                 ReadStage::Rvs => "read_rvs",
@@ -1011,11 +1011,13 @@ pub(super) mod tests {
 
     #[test]
     fn consumer_selection_uses_prepared_presence_and_never_falls_back_on_refusal() {
-        use crate::attach::counter_banks::BankRefusal;
+        use crate::attach::counter_banks::{BankRefusal, BankShapeCause};
         let (_file, plan, pins) = fixture();
         for binding in [
             Err(BankRefusal::Quarantined),
-            Err(BankRefusal::Shape),
+            // Representative cause; this mock input is cause-agnostic by
+            // design (any shape refusal must refuse without fallback).
+            Err(BankRefusal::Shape(BankShapeCause::BindingGeometryChanged)),
             Ok(Some(())),
         ] {
             let mut collection = CaptureCollection::new(None);

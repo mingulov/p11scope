@@ -2935,12 +2935,26 @@ impl ClassicDriver<'_> {
                     Ok(true) => JointStepOutcome::WoundDown,
                     Ok(false) => JointStepOutcome::Stayed,
                     Err(refusal) => {
-                        let cause = format!("wound-down refused: {}", refusal.code());
+                        // The gap carries the detach error text; the
+                        // mapped refusal code is only the fallback
+                        // when no detach ran, mirroring the legacy path.
+                        let cause = lane
+                            .as_mut()
+                            .and_then(|lane| lane.take_wound_down_error_text())
+                            .unwrap_or_else(|| {
+                                format!("wound-down refused: {}", refusal.code())
+                            });
                         coordinator
                             .note_scope_gap("joint wound-down failed".to_string(), cause.clone());
                         if let Some(owned) = lane.take() {
-                            *first_error =
-                                Some(Self::hold_joint_lane_for_exit(owned, coordinator, &cause));
+                            // The first error is kept: a pre-set
+                            // disposition survives this later failure.
+                            // The hold always runs; only the error keeps.
+                            first_error.get_or_insert(Self::hold_joint_lane_for_exit(
+                                owned,
+                                coordinator,
+                                &cause,
+                            ));
                         }
                         *finish = JointFinishDriver::Abandoned;
                         JointStepOutcome::Abandoned
@@ -3234,18 +3248,26 @@ impl ClassicDriver<'_> {
                     .retiring
                     .as_ref()
                     .is_some_and(|retiring| retiring.domain != completion.domain());
-                if fresh
-                    && foreign
-                    && matches!(
-                        refusal,
-                        crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain
-                    )
-                {
+                let not_live = matches!(
+                    refusal,
+                    crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain
+                );
+                if fresh && foreign && not_live {
                     self.coordinator.note_scope_gap(
                         "selected promotion completion failed".to_string(),
                         "foreign completion for a domain with no live finalizer state"
                             .to_string(),
                     );
+                }
+                // An own-domain completion that finds no live
+                // finalizer clears like the lane-less tail: drained
+                // with nothing to retire is done, and no path can
+                // make the domain's finalizer live again, so
+                // holding would block the successor silently.
+                if !foreign && not_live {
+                    self.coordinator.set_promotion_finish(false);
+                    self.retiring = None;
+                    return true;
                 }
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 retiring.completion = Some(completion);
@@ -4004,8 +4026,11 @@ impl ClassicDriver<'_> {
 
     /// Release a Published Joint lane at the terminal consume: no
     /// further hook will reap it. Steps the wound-down on the 10 ms
-    /// cadence until the lane completes or the finish abandons; the
-    /// detach worker is finite, like the §8.3 hooks. Polling and
+    /// cadence while the detach still runs; a quick join completes
+    /// with no hold. The wait stays interruptible and bounded: each
+    /// step that still waits checks the second operator signal and
+    /// escalates like the lane stop, and past the run deadline the
+    /// lane is held for exit instead of waited on. Polling and
     /// unbegun lanes stay seated for their hooks.
     fn complete_published_joint_lane(&mut self) {
         while matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some() {
@@ -4013,6 +4038,30 @@ impl ClassicDriver<'_> {
             self.step_retained_joint_finish();
             if matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some()
             {
+                if self.second_signal.is_some_and(|signal| signal()) {
+                    self.escalate_joint_finish();
+                    return;
+                }
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.snapshot_seated_summary();
+                    if let Some(lane) = self.semantic.take() {
+                        let error = Self::hold_joint_lane_for_exit(
+                            lane,
+                            &mut *self.coordinator,
+                            "joint finish held for exit",
+                        );
+                        self.joint_first_error.get_or_insert(error);
+                    }
+                    self.coordinator.note_scope_gap(
+                        "joint finish held for exit".to_string(),
+                        "the run deadline passed while the joint finish waited".to_string(),
+                    );
+                    self.joint_finish = JointFinishDriver::Abandoned;
+                    return;
+                }
                 let elapsed = started.elapsed();
                 if elapsed < Duration::from_millis(10) {
                     std::thread::sleep(Duration::from_millis(10) - elapsed);

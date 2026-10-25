@@ -3385,7 +3385,7 @@ mod tests {
         let (_dir, pins, slots) = envelope_shape_slots(GROWTH_ENDPOINTS, |i| {
             format!("counter_bank_growth_e{i:04x}")
         });
-        // The largest real requirement: counts at P=12, final growth stage.
+        // A real requirement (the first RED row: counts at P=12, final growth stage).
         let required = estimate_counter_stage_reservation(
             CounterMode::Counts,
             16,

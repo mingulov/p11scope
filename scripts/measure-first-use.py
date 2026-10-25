@@ -30,6 +30,7 @@ UNKNOWN_LABEL = "Unknown executable"
 MAX_ROWS = 1024
 MAX_LINE_BYTES = 65536
 MAX_LEDGER_BYTES = 1024 * 1024
+MAX_WORD = (1 << 64) - 1
 
 
 class MeasureError(ValueError):
@@ -63,7 +64,19 @@ def _shown(value):
 
 
 def _integer(value, minimum=0):
-    return type(value) is int and value >= minimum
+    return type(value) is int and minimum <= value <= MAX_WORD
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        _require(key not in result, "duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _invalid_constant(_value):
+    raise MeasureError("nonfinite JSON number")
 
 
 def read_rows(stream):
@@ -81,7 +94,8 @@ def read_rows(stream):
         if not line.strip():
             continue
         try:
-            rows.append(json.loads(line))
+            rows.append(json.loads(line, object_pairs_hook=_unique_object,
+                                   parse_constant=_invalid_constant))
         except json.JSONDecodeError as error:
             raise MeasureError("invalid ledger row") from error
     return rows
@@ -124,6 +138,9 @@ def validate_cell(rows):
     _require(delay_us in DELAYS_US, f"unknown delay {_shown(delay_us)}")
     armed = body.get("armed")
     _require(armed in ARMS, f"unknown armed {_shown(armed)}")
+    for phase in ("table_verified", "entry_executed", "entry_returned"):
+        _require(sum(1 for row in rows if row["phase"] == phase) <= 1,
+                 f"ledger must carry at most one {phase} row")
     verified = next((row for row in rows
                      if row["phase"] == "table_verified"), None)
     executed = next((row for row in rows
@@ -261,7 +278,11 @@ def cell_verdict(cell, observer):
 
 
 def check_bounds(entries, bound_table):
-    """Check per-cell missed counts against a delay-indexed bound table."""
+    """Check per-cell missed counts against a delay-indexed bound table.
+
+    Part B always passes the full 4-key table, even for subset checks
+    such as the Fedora 0/1000us corners (delays without entries are
+    simply never looked up); subset tables stay refused."""
     _require(type(bound_table) is dict and
              set(bound_table) == {"0", "10", "100", "1000"} and
              all(_integer(bound_table[key]) for key in bound_table),
@@ -293,7 +314,8 @@ def _read_object(path, what):
     _require(len(text.encode("utf-8", "replace")) <= MAX_LEDGER_BYTES,
              f"{what} byte limit")
     try:
-        value = json.loads(text)
+        value = json.loads(text, object_pairs_hook=_unique_object,
+                           parse_constant=_invalid_constant)
     except json.JSONDecodeError as error:
         raise MeasureError(f"invalid {what}") from error
     _require(type(value) is dict, f"{what} must be an object")

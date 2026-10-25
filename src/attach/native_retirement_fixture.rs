@@ -27,6 +27,7 @@ pub(crate) struct RetirementFixture {
     gaps: Retirements,
     worker: CleanupWorker,
     collected: Option<Box<CollectedLeaf>>,
+    deferred_slots: BTreeSet<u32>,
     pub(crate) begins: usize,
     pub(crate) polls: usize,
 }
@@ -72,8 +73,50 @@ impl RetirementFixture {
                 Arc::new(|| std::time::Duration::ZERO),
             ),
             collected: None,
+            deferred_slots: BTreeSet::new(),
             begins: 0,
             polls: 0,
+        }
+    }
+
+    /// Merge single-slot original links into the given shared-Multi
+    /// groups (one entry and one return link per group, group order
+    /// preserved, original fds kept). Slots outside every group keep
+    /// their single-slot links.
+    pub(crate) fn combine_slot_groups(&mut self, groups: &[&[u32]]) {
+        for program in ["p11_entry", "p11_return"] {
+            for group in groups {
+                let mut members = Vec::new();
+                let mut owned = Vec::new();
+                for slot in group.iter() {
+                    let found = self.links.iter().position(|link| {
+                        let RegisteredLink::MultiUProbe {
+                            program: member_program,
+                            slots: member_slots,
+                            ..
+                        } = link
+                        else {
+                            return false;
+                        };
+                        *member_program == program
+                            && member_slots.len() == 1
+                            && member_slots[0] == *slot
+                    });
+                    let found = found.expect("every grouped slot starts with one single link");
+                    let RegisteredLink::MultiUProbe { slots, fds, .. } = self.links.remove(found)
+                    else {
+                        panic!("actual multi fixture ownership");
+                    };
+                    members.extend(slots);
+                    owned.extend(fds);
+                }
+                self.links.push(RegisteredLink::MultiUProbe {
+                    program,
+                    slots: members,
+                    fds: owned,
+                    registration: self.pairs.register(),
+                });
+            }
         }
     }
 
@@ -181,6 +224,47 @@ impl RetirementFixture {
         )
     }
 
+    pub(crate) fn collected_defer(
+        &mut self,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        let Self {
+            retirement,
+            links,
+            retained,
+            pairs,
+            collected,
+            deferred_slots,
+            ..
+        } = self;
+        let Some(leaf) = collected.as_ref() else {
+            bail!("retirement fixture has no collected leaf");
+        };
+        if !leaf.observer.collected_defer_entry_open() {
+            bail!(super::DEFER_ENTRY_REFUSAL);
+        }
+        retirement.defer_collected_with(
+            &*leaf.q as *const super::super::CollectedFinishQ as usize,
+            input,
+            links,
+            retained,
+            pairs,
+            deferred_slots,
+            reserve,
+            work,
+        )
+    }
+
+    pub(crate) fn deferred_slots(&self) -> &BTreeSet<u32> {
+        &self.deferred_slots
+    }
+
+    pub(crate) fn allocation_for_test(&self) -> &Arc<()> {
+        self.retirement.allocation_for_test()
+    }
+
     pub(crate) fn collected_begin(
         &mut self,
         ticket: &CollectedRetirementTicket,
@@ -194,6 +278,7 @@ impl RetirementFixture {
             gaps,
             worker,
             collected,
+            deferred_slots,
             begins,
             ..
         } = self;
@@ -221,6 +306,7 @@ impl RetirementFixture {
             },
             events,
             discovery,
+            deferred_slots,
             work,
         )?;
         if matches!(progress.state, CollectedRetirementState::Pending)
@@ -283,13 +369,13 @@ pub(super) struct CollectedRetirementFixture {
     transfers: std::cell::Cell<usize>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OriginalLink {
-    program: &'static str,
-    slots: Vec<u32>,
+    pub(super) program: &'static str,
+    pub(super) slots: Vec<u32>,
     fds: Vec<std::os::fd::RawFd>,
-    registration: Option<super::super::pid_continuity::RegistrationId>,
-    generations: Vec<Option<u64>>,
+    pub(super) registration: Option<super::super::pid_continuity::RegistrationId>,
+    pub(super) generations: Vec<Option<u64>>,
 }
 
 fn seal_collected(
@@ -366,6 +452,83 @@ impl CollectedRetirementFixture {
             .expect("the retained observer still sees STOP/count0")
     }
 
+    pub(super) fn set_gate_word_for_test(&self, word: u64) {
+        self.observer.set_gate_word_for_test(word);
+    }
+
+    pub(super) fn defer(
+        &mut self,
+        q: &super::super::CollectedFinishQ,
+        input: &mut Option<RetainedRetirementInput>,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        if !self.observer.collected_defer_entry_open() {
+            bail!(super::DEFER_ENTRY_REFUSAL);
+        }
+        self.native.retirement.defer_collected_with(
+            q as *const super::super::CollectedFinishQ as usize,
+            input,
+            &self.native.links,
+            &self.native.retained,
+            &self.native.pairs,
+            &mut self.native.deferred_slots,
+            reserve,
+            work,
+        )
+    }
+
+    pub(super) fn deferred_slots(&self) -> &BTreeSet<u32> {
+        self.native.deferred_slots()
+    }
+
+    pub(super) fn allocation_for_test(&self) -> &Arc<()> {
+        self.native.allocation_for_test()
+    }
+
+    pub(super) fn has_slot_link(&self, slot: u32) -> bool {
+        self.native.has_slot_link(slot)
+    }
+
+    pub(super) fn combine_slot_groups(&mut self, groups: &[&[u32]]) {
+        self.native.combine_slot_groups(groups);
+    }
+
+    /// Terminal-detach emulation: submit every remaining link that avoids
+    /// the held slots, and report the submitted slots. Mirrors the
+    /// Session terminal take (every remaining link, DetachOrder).
+    pub(super) fn submit_terminal_links(&mut self, hold_touching: &BTreeSet<u32>) -> BTreeSet<u32> {
+        let mut submitted = BTreeSet::new();
+        let mut held = Vec::new();
+        let mut owned = Vec::new();
+        for original in std::mem::take(&mut self.native.links) {
+            if original
+                .slots()
+                .iter()
+                .any(|slot| hold_touching.contains(slot))
+            {
+                held.push(original);
+                continue;
+            }
+            submitted.extend(original.slots().iter().copied());
+            let producer = original.producer();
+            let RegisteredLink::MultiUProbe { fds, .. } = original else {
+                panic!("real owned fixture FD");
+            };
+            owned.push((OwnedLink::Multi(fds), producer));
+        }
+        self.native.links = held;
+        let leases = Arc::new(
+            self.native
+                .retained
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
+        self.native.worker.submit(owned, leases, DetachOrder);
+        submitted
+    }
+
     pub(super) fn prepare(
         &mut self,
         q: &super::super::CollectedFinishQ,
@@ -417,6 +580,7 @@ impl CollectedRetirementFixture {
             },
             events,
             discovery,
+            &self.native.deferred_slots,
             work,
         )
     }

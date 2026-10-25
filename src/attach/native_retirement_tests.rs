@@ -2443,13 +2443,22 @@ fn collected_partial_group_deferral_refuses_selective_detach_and_rebuild() {
     let ticket = collected_prepare_to_ticket(&mut native, &q, &mut whole, &reserve).unwrap();
     collected_submit(&mut native, &q, &ticket);
     drop(collected_close(&mut native, &q, &ticket));
+    assert!(
+        native.retained_slots().is_empty(),
+        "the re-named batch consumes the retained targets while its links wait"
+    );
     assert_eq!(native.original_links().len(), 2);
     for link in native.original_links() {
-        let original = before
+        let mut original = before
             .iter()
             .find(|candidate| candidate.program == link.program && candidate.slots == link.slots)
-            .expect("the skipped link is the original");
-        assert_eq!(&link, original);
+            .expect("the skipped link is the original")
+            .clone();
+        // The re-named whole batch takes the pair stamps and retained
+        // targets; the skipped link keeps its program, slots, fds and
+        // registration for the terminal close.
+        original.generations = vec![None; original.slots.len()];
+        assert_eq!(&link, &original);
     }
     assert_eq!(native.deferred_slots(), &BTreeSet::from([2]));
 }

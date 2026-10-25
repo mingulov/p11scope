@@ -57,6 +57,7 @@ pub(super) struct NativeRetirement {
     pending: Option<Pending>,
     preflight: Option<CollectedPreflight>,
     collected: Option<Box<CollectedCursor>>,
+    defer_scan: Option<CollectedDeferScan>,
 }
 
 struct Pending {
@@ -359,6 +360,95 @@ pub(crate) enum CollectedRetirementState {
     Closed(RetainedRetirementInput),
     RefusedUntouched(RetainedRetirementInput),
     RefusedRetained,
+}
+
+/// Entry refusal shared by every collected-deferral caller: a deferral
+/// parks original removals until the Session's terminal detach, which is
+/// only sound once the stop is requested and no native body is admitted.
+pub(super) const DEFER_ENTRY_REFUSAL: &str =
+    "collected group deferral requires a requested stop with proven quiescence";
+
+/// Receipt for removed members of partially covered shared-Multi groups.
+/// Their logical retirement proceeds; their physical close waits for the
+/// Session's terminal detach. The receipt is intentionally not `Clone`:
+/// the recorded slots leave through exactly one terminal submission.
+#[derive(Debug)]
+pub(crate) struct CollectedGroupDeferral {
+    owner: Arc<()>,
+    q: usize,
+    registrations: Vec<RegistrationId>,
+}
+
+impl CollectedGroupDeferral {
+    #[cfg(test)]
+    pub(super) fn owner(&self) -> &Arc<()> {
+        &self.owner
+    }
+
+    #[cfg(test)]
+    pub(super) fn q(&self) -> usize {
+        self.q
+    }
+
+    #[cfg(test)]
+    pub(super) fn registrations(&self) -> &[RegistrationId] {
+        &self.registrations
+    }
+}
+
+/// One deferral credit classifies at most one removed member. `Split`
+/// carries the whole input onward and the deferral receipt for the
+/// partial members; `NoPartial` returns the caller input untouched.
+pub(crate) enum DeferralProgress {
+    Yielded,
+    Scanning,
+    Split {
+        whole: RetainedRetirementInput,
+        deferred: CollectedGroupDeferral,
+    },
+    NoPartial(RetainedRetirementInput),
+}
+
+impl std::fmt::Debug for DeferralProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yielded => f.write_str("Yielded"),
+            Self::Scanning => f.write_str("Scanning"),
+            Self::Split { whole, deferred } => f
+                .debug_struct("Split")
+                .field("whole", &whole.removed.len())
+                .field("deferred", deferred)
+                .finish(),
+            Self::NoPartial(input) => f
+                .debug_tuple("NoPartial")
+                .field(&input.removed.len())
+                .finish(),
+        }
+    }
+}
+
+/// Incremental deferral scan over one caller input. The removed-index set
+/// and the per-member marks are Session-side working memory bounded by
+/// the input. The receipt takes no separate reservation: the split caps
+/// its registrations at two per removed slot and verifies the input
+/// lease covers the receipt, refusing foreign or undercharged payment.
+struct CollectedDeferScan {
+    input: NonZeroU64,
+    q: usize,
+    fence: RegistryFence,
+    removed: BTreeSet<u32>,
+    marks: Vec<bool>,
+    index: usize,
+    len: usize,
+}
+
+/// A removed member is partial when any link holding it also holds a slot
+/// outside the removal. Members with no link stay whole: the prepare step
+/// keeps its own errors for unlinkable removals.
+fn defer_member_is_partial(links: &[RegisteredLink], removed: &BTreeSet<u32>, member: u32) -> bool {
+    links.iter().any(|link| {
+        link.slots().contains(&member) && link.slots().iter().any(|slot| !removed.contains(slot))
+    })
 }
 
 impl RetirementProgress {
@@ -1416,6 +1506,7 @@ impl NativeRetirement {
         mut transfer: impl FnMut(RegisteredLink) -> Result<Vec<OwnedLink>>,
         read_events: impl FnOnce() -> Result<crate::events::EventsConsumptionCut>,
         read_discovery: impl FnOnce() -> Result<aya::maps::ring_buf::RingBufPositions>,
+        deferred: &BTreeSet<u32>,
         work: usize,
     ) -> Result<RetirementProgress> {
         if work == 0 {
@@ -1479,7 +1570,13 @@ impl NativeRetirement {
                     cursor.phase = CollectedPhase::Transfer { rank: 0, chunk: 0 };
                 } else {
                     let index = end - 1;
-                    if cursor.choices[index].selected {
+                    // A selected link that still holds a deferred slot keeps
+                    // its physical close for the terminal detach: skipping
+                    // from the back preserves the choice/link alignment.
+                    let skip_deferred = links.get(index).is_some_and(|link| {
+                        link.slots().iter().any(|slot| deferred.contains(slot))
+                    });
+                    if cursor.choices[index].selected && !skip_deferred {
                         let original = links.swap_remove(index);
                         let rank = DetachOrder.rank(&original.producer()) as usize;
                         cursor.buckets[rank].push(original);
@@ -1766,6 +1863,138 @@ impl Drop for NativeRetirement {
             // together until process exit; no foreground native destructor.
             std::mem::forget(cursor);
         }
+    }
+}
+
+impl NativeRetirement {
+    /// Partition one removal into whole groups (which proceed natively)
+    /// and partial shared-Multi members (whose physical close waits for
+    /// the terminal detach). One credit classifies at most one member;
+    /// the scan borrows the caller input and takes it only on a checked
+    /// terminal. `deferred_out` grows only on a successful split.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn defer_collected_with(
+        &mut self,
+        q: usize,
+        input: &mut Option<RetainedRetirementInput>,
+        links: &[RegisteredLink],
+        retained: &BTreeMap<u32, RetainedStaticTarget>,
+        pairs: &PairBook,
+        deferred_out: &mut BTreeSet<u32>,
+        reserve: &SemanticResourceReserver,
+        work: usize,
+    ) -> Result<DeferralProgress> {
+        if work == 0 {
+            return Ok(DeferralProgress::Yielded);
+        }
+        let caller = input
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("collected caller input is missing"))?;
+        if self.defer_scan.is_none() {
+            if caller.removed.is_empty() {
+                let input = input.take().expect("deferral input is present");
+                return Ok(DeferralProgress::NoPartial(input));
+            }
+            let removed = caller.removed.iter().map(|slot| slot.index).collect();
+            self.defer_scan = Some(CollectedDeferScan {
+                input: caller.identity,
+                q,
+                fence: RegistryFence::new(links, retained, pairs),
+                removed,
+                marks: Vec::new(),
+                index: 0,
+                len: caller.removed.len(),
+            });
+        }
+        let scan = self
+            .defer_scan
+            .as_mut()
+            .expect("deferral scan starts above");
+        if scan.input != caller.identity
+            || scan.q != q
+            || scan.len != caller.removed.len()
+            || !scan.fence.matches(links, retained, pairs)
+        {
+            self.defer_scan = None;
+            anyhow::bail!("collected deferral input/owner/registry changed");
+        }
+        if scan.index < caller.removed.len() {
+            let member = caller.removed[scan.index].index;
+            let partial = defer_member_is_partial(links, &scan.removed, member);
+            scan.marks.push(partial);
+            scan.index += 1;
+            return Ok(DeferralProgress::Scanning);
+        }
+        let scan = self.defer_scan.take().expect("deferral scan starts above");
+        debug_assert_eq!(caller.removed.len(), scan.marks.len());
+        if scan.marks.iter().all(|mark| !mark) {
+            let input = input.take().expect("deferral input is present");
+            return Ok(DeferralProgress::NoPartial(input));
+        }
+        let deferred_members: BTreeSet<u32> = caller
+            .removed
+            .iter()
+            .zip(scan.marks.iter())
+            .filter(|(_, mark)| **mark)
+            .map(|(slot, _)| slot.index)
+            .collect();
+        let mut registrations = Vec::new();
+        for link in links {
+            if !link
+                .slots()
+                .iter()
+                .any(|slot| deferred_members.contains(slot))
+            {
+                continue;
+            }
+            let registration = match link {
+                RegisteredLink::MultiUProbe { registration, .. } => registration,
+                RegisteredLink::UProbe { registration, .. } => registration,
+                _ => continue,
+            };
+            registrations.push(registration.ok_or_else(|| {
+                anyhow::anyhow!("collected deferral original registration is missing")
+            })?);
+        }
+        if registrations.len() > caller.removed.len().saturating_mul(2) {
+            anyhow::bail!("collected deferral registration bound exceeded");
+        }
+        let record_bytes = std::mem::size_of::<CollectedGroupDeferral>()
+            + array_bytes::<RegistrationId>(registrations.len())?;
+        if !reserve.covers(&caller.storage, record_bytes) {
+            anyhow::bail!(
+                "collected group deferral refuses a foreign or undercharged retained payment"
+            );
+        }
+        let RetainedRetirementInput {
+            removed,
+            storage,
+            identity,
+        } = input.take().expect("deferral input is present");
+        let mut whole_slots = Vec::new();
+        for (slot, deferred) in removed.into_iter().zip(scan.marks.iter()) {
+            if *deferred {
+                deferred_out.insert(slot.index);
+            } else {
+                whole_slots.push(slot);
+            }
+        }
+        let whole = RetainedRetirementInput {
+            removed: whole_slots,
+            storage,
+            identity,
+        };
+        let deferred = CollectedGroupDeferral {
+            owner: Arc::clone(&self.allocation),
+            q: scan.q,
+            registrations,
+        };
+        Ok(DeferralProgress::Split { whole, deferred })
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocation_for_test(&self) -> &Arc<()> {
+        &self.allocation
     }
 }
 

@@ -58,8 +58,9 @@ mod object_stop;
 pub(crate) use native_retirement::fixture::RetirementFixture;
 #[allow(unused_imports)] // Shared crate-private ports consumed by the next Engine packet.
 pub(crate) use native_retirement::{
-    CollectedRetirementState, CollectedRetirementTicket, RetainedInputMeasure,
-    RetainedRetirementInput, RetainedRetirementInputRefusal, RetirementProgress,
+    CollectedGroupDeferral, CollectedRetirementState, CollectedRetirementTicket, DeferralProgress,
+    RetainedInputMeasure, RetainedRetirementInput, RetainedRetirementInputRefusal,
+    RetirementProgress,
 };
 pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
@@ -1340,6 +1341,14 @@ pub struct Session {
     pid_pairs: pid_continuity::PairBook,
     global_retirements: global_retirement::Retirements,
     native_retirement: native_retirement::NativeRetirement,
+    /// Removed members of partially covered shared-Multi groups. Their
+    /// links stay in `links` until the terminal detach closes them; every
+    /// selective mutation guard refuses while this is nonempty, and the
+    /// native mint requires these slots proven terminally submitted.
+    deferred_group_slots: BTreeSet<u32>,
+    /// Slots of the links the terminal detach actually submitted. The
+    /// mint proves `deferred_group_slots` against this set.
+    submitted_terminal_slots: BTreeSet<u32>,
     pid_health: pid_continuity::OwnerHealth,
     prepared_owner_limit: u64,
     pid_lifecycle: Option<PidLifecycleTap>,
@@ -1843,6 +1852,13 @@ fn find_partial_multi_member(links: &[RegisteredLink], slots: &BTreeSet<u32>) ->
 /// entry-refused member shares its sibling's entry bundle). Returns `None`
 /// when no multi bundle is partially covered, i.e. the plain detach path
 /// applies: whole bundles, singles, and unlinked slots.
+/// True when every deferred group slot was terminally submitted.
+/// The mint proves the deferred set against the submitted set; an empty
+/// deferral proves vacuously.
+fn deferred_slots_proven(deferred: &BTreeSet<u32>, submitted: &BTreeSet<u32>) -> bool {
+    deferred.iter().all(|slot| submitted.contains(slot))
+}
+
 fn plan_group_rebuild(
     links: &[RegisteredLink],
     requested: &BTreeSet<u32>,
@@ -5765,6 +5781,8 @@ impl Session {
                 pid_pairs: pid_continuity::PairBook::default(),
                 global_retirements: global_retirement::Retirements::default(),
                 native_retirement: native_retirement::NativeRetirement::default(),
+                deferred_group_slots: BTreeSet::new(),
+                submitted_terminal_slots: BTreeSet::new(),
                 pid_health: pid_continuity::OwnerHealth::default(),
                 prepared_owner_limit: prepared_owner_limit
                     .expect("identity preparation retained exact owner limit"),
@@ -7071,6 +7089,7 @@ impl Session {
                     .map_err(|reason| anyhow!("collected EVENTS cut refused: {reason:?}"))
             },
             || Ok(events::discovery_drain_positions(discovery)),
+            &self.deferred_group_slots,
             work,
         )
     }
@@ -8755,6 +8774,18 @@ mod tests {
 
         pub(crate) fn request_stop(&self) {
             self.gate.gate.request_stop();
+        }
+
+        /// The collected-deferral entry condition over the live gate word.
+        pub(crate) fn collected_defer_entry_open(&self) -> bool {
+            self.gate.gate.stop_requested() && self.gate.gate.quiescent()
+        }
+
+        /// Set the gate word directly. Production STOP never clears and
+        /// never admits a body after quiescence; the states this reaches
+        /// exist only to prove the deferral entry reads live state.
+        pub(crate) fn set_gate_word_for_test(&self, word: u64) {
+            self.gate.native_word(word);
         }
 
         pub(crate) fn discovery_domain(&self) -> &crate::events::DiscoveryDomain {

@@ -3520,6 +3520,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn counter_terminal_transient_matches_reader() {
+        use crate::attach::counter_banks::counter_read_transient_bytes;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for cpus in [1usize, 2, 12, 256] {
+                for (rv_keys, logical_slots, row_count) in
+                    [(12usize, 8192usize, 512usize), (65536, 8192, 8192)]
+                {
+                    let expected = transient_bytes(mode, cpus, rv_keys)
+                        .and_then(|n| n.checked_add(logical_slots))
+                        .and_then(|n| {
+                            n.checked_add(
+                                row_count.checked_mul(size_of::<crate::plan::AttachKey>())?,
+                            )
+                        })
+                        .and_then(|n| n.checked_add(2 * OWNED_ALLOCATION_PADDING))
+                        .unwrap();
+                    assert_eq!(
+                        counter_read_transient_bytes(mode, cpus, rv_keys, logical_slots, row_count)
+                            .unwrap(),
+                        expected,
+                        "{mode:?} P={cpus} rv={rv_keys} rows={row_count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counter_terminal_storage_dominates_read_reservation() {
+        use crate::attach::counter_banks::counter_read_storage_bytes;
+        use crate::metrics::counter_collector::CounterRow;
+        assert!(
+            size_of::<CounterRow>() <= 1024,
+            "the per-row bound must dominate CounterRow"
+        );
+        for (rows, rv_keys) in [(2usize, 4usize), (512, 12), (8192, 65536)] {
+            let pool = test_pool();
+            let baseline = pool.snapshot().charged_bytes;
+            let storage =
+                ReadReservation::reserve(rows, rv_keys, &pool.reserver()).unwrap();
+            let actual = pool.snapshot().charged_bytes - baseline;
+            drop(storage);
+            let bound = counter_read_storage_bytes(rows, rv_keys).unwrap();
+            assert!(
+                bound >= actual,
+                "storage bound {bound} must dominate actual {actual} for {rows} rows {rv_keys} RVs"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_rv_exhaustion_is_lower_bound_and_keeps_endpoint_counts() {
+        use crate::attach::counter_banks::BANK_RV_FAULT;
+        let (_dir, history, snapshot, pool) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+        assert_eq!(snapshot.original_indices(), [0, 2]);
+        let mut first = Scripted::sample(CounterMode::Counts, false);
+        let last_stats = first.stats.remove(&1).unwrap();
+        first.stats.insert(2, last_stats);
+        first.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
+        first.fault_bits = BANK_RV_FAULT;
+        first.published = Some(snapshot);
+        let limits = CounterLimits { rows: 3, rv_keys: 12 };
+        let generation = NonZeroU64::new(41).unwrap();
+        assert!(first.rv_exhausted().unwrap(), "the RV fault marks a lower bound");
+        let read = acquire(&first, generation, &history, limits, &pool.reserver()).unwrap();
+        let rows = read.view().rows.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| (row.view().slot, row.view().entered, row.view().returned, row.view().errors)).collect::<Vec<_>>(),
+            [(0, 3, 5, 1), (2, 1, 1, 0)],
+            "entered/returned/errors stay exact under RV exhaustion"
+        );
+        assert_eq!(rows[0].view().rv_counts.get(&HIGH_RV), Some(&1));
+        assert_eq!(rows[1].view().rv_counts.get(&0x1_0000_0204), Some(&1));
+        let mut collector = CounterCollector::new(limits, pool.reserver());
+        assert_eq!(collector.observe(Ok(read)), CounterObservation::Initial);
+        let (_dir2, history2, snapshot2, _) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+        assert_eq!(history2.slots.len(), history.slots.len());
+        let mut second = Scripted::sample(CounterMode::Counts, true);
+        let last_stats = second.stats.remove(&1).unwrap();
+        second.stats.insert(2, last_stats);
+        second.rvs.push((key(2, 0x1_0000_0204), [2, 0]));
+        second.fault_bits = BANK_RV_FAULT;
+        second.published = Some(snapshot2);
+        assert!(second.rv_exhausted().unwrap());
+        let read2 = acquire(&second, generation, &history, limits, &pool.reserver()).unwrap();
+        let rows2 = read2.view().rows.unwrap();
+        assert_eq!(
+            rows2.iter().map(|row| (row.view().slot, row.view().entered, row.view().returned)).collect::<Vec<_>>(),
+            [(0, 8, 9), (2, 2, 2)],
+            "existing keys keep counting"
+        );
+        assert_eq!(rows2[0].view().rv_counts.get(&HIGH_RV), Some(&2));
+        match collector.observe(Ok(read2)) {
+            CounterObservation::Advanced { deltas, .. } => {
+                assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4));
+                assert_eq!(deltas[0].rv_counts.get(&HIGH_RV), Some(&1));
+            }
+            other => panic!("exhaustion must not stop existing keys: {other:?}"),
+        }
+    }
+
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,

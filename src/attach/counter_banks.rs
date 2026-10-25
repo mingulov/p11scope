@@ -7045,6 +7045,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_growth_cannot_consume_terminal_reserve() {
+        use super::{counter_read_storage_bytes, counter_read_transient_bytes, counter_snapshot_bytes_for, counter_terminal_reserve_bytes};
+        let mode = CounterMode::Counts;
+        let cpus = 2usize;
+        let pool = SemanticResourcePool::reference_limit(45 * 1024 * 1024);
+        let terminal = counter_terminal_reserve_bytes(mode, cpus).unwrap();
+        assert!(terminal > 30 * 1024 * 1024, "the terminal hold must dominate: {terminal}");
+        let _hold = pool.reserver().reserve(terminal).unwrap();
+        let mut directory = BankDirectory::growth_v2_for(mode);
+        let mut history = plan(512);
+        let mut io = GrowthIo::new(&pool);
+        io.cpus = cpus;
+        let first_plan = plan(512);
+        let first_envelope = estimate_counter_stage_reservation(
+            mode, 16, 512, &first_plan.slots, 0, 512, 0, cpus, 1, 0, None,
+        )
+        .unwrap();
+        assert!(matches!(
+            directory.stage_with(&mut io, &mut history, first_envelope, &pool.reserver()),
+            BankPublication::Published { extent, .. }
+                if extent == BankExtent { first: 0, end: 512 }
+        ));
+        let second_plan = plan(1024);
+        let second_need = estimate_counter_stage_reservation(
+            mode, 16, 512, &second_plan.slots, 512, 1024, 512, cpus, 1, 0, None,
+        )
+        .unwrap();
+        let available = pool.snapshot().limit_bytes - pool.snapshot().charged_bytes;
+        let second_charge = second_need.retained_bytes + second_need.metadata_bytes + second_need.transient_bytes;
+        assert!(
+            second_charge > available,
+            "the second stage must need the reserve: {second_charge} > {available}"
+        );
+        history.extend_exact(plan(1024)).unwrap();
+        io.next_stage();
+        let result = directory.stage_with(
+            &mut io,
+            &mut history,
+            second_need,
+            &pool.reserver(),
+        );
+        assert_eq!(
+            result,
+            BankPublication::Refused(BankRefusal::Budget),
+            "growth needing the reserve refuses Budget: {result:?}"
+        );
+        let published: Vec<u32> = directory.published_indices().collect();
+        assert_eq!(published.len(), 512, "the published prefix stays intact");
+        assert_eq!(io.routes.len(), 512, "routes keep the prefix");
+        assert_eq!(directory.allocated_high_water(), 512);
+        let small_transient =
+            counter_read_transient_bytes(mode, cpus, 12, 8192, 512).unwrap();
+        let small_storage = counter_read_storage_bytes(512, 12).unwrap();
+        let small_snapshot = counter_snapshot_bytes_for(512, 512).unwrap();
+        let fresh = small_transient + small_storage + small_snapshot;
+        let available_after = pool.snapshot().limit_bytes - pool.snapshot().charged_bytes;
+        assert!(
+            fresh <= available_after,
+            "the terminal fresh must fit: {fresh} <= {available_after}"
+        );
+        pool.reserver().reserve(fresh).unwrap();
+    }
+
+    #[test]
+    fn counter_budgets_pin_each_field_against_scripted_session() {
+        let owned = growth_owned_history(false);
+        assert_eq!(
+            owned.banks.directory.lock().unwrap().published_indices().collect::<Vec<_>>(),
+            [0, 2]
+        );
+        let budgets = owned.banks.budgets(5).unwrap();
+        assert_eq!(budgets.endpoints.published, 2);
+        assert_eq!(budgets.endpoints.holes, 1);
+        assert_eq!(budgets.endpoints.ceiling, 8192);
+        assert_eq!(budgets.rv_keys.used, 5);
+        assert_eq!(budgets.rv_keys.limit, 65536);
+        assert_eq!(budgets.start.limit, 16384);
+        assert_eq!(budgets.fd.projected, 6);
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        if limit.rlim_cur == libc::RLIM_INFINITY {
+            assert_eq!(budgets.fd.soft, None);
+        } else {
+            assert_eq!(budgets.fd.soft, Some(limit.rlim_cur));
+        }
+        let fixed = super::counter_fixed_map_bytes(2).unwrap();
+        let per_bank = super::counter_bank_map_bytes(CounterMode::Counts, 2).unwrap();
+        assert_eq!(budgets.memory.charged, fixed + per_bank);
+        assert_eq!(budgets.memory.limit, super::COUNTER_MAP_MEMORY_LIMIT);
+    }
+
+    #[test]
     fn counter_bank_multi_storage_remains_paid_after_clean_rollback() {
         use super::super::RegisteredLink;
         for short in [None, Some(0), Some(1), Some(2)] {

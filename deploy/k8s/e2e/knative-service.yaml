@@ -1,0 +1,42 @@
+# Test-only Knative Service for cell K3 (scripts/knative-e2e.sh). NOT for production.
+# One revision, scale-to-zero, one request per pod: the image serves $PORT and
+# runs exactly one ledgered SoftHSM2 run per pod (see
+# deploy/Dockerfile.knative-holder), so each request makes an exactly known
+# number of PKCS#11 calls. The driver fills the image digest (node-resolved
+# after `kind load`) before applying; imagePullPolicy Never keeps the pod on
+# the loaded image.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: p11scope-knative
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: k3-knative
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: p11scope-k3
+  namespace: p11scope-knative
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: k3-knative
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/min-scale: "0"
+        autoscaling.knative.dev/max-scale: "1"
+    spec:
+      containerConcurrency: 1
+      timeoutSeconds: 60
+      containers:
+        - name: workload
+          image: p11scope-knative-holder@sha256:KNATIVE_HOLDER_DIGEST
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi

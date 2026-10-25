@@ -231,15 +231,14 @@ fn main() {
     }
     if counter_bank_proof {
         println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_proof.c");
-        build_variant_with_proof(
+        println!("cargo:rerun-if-changed=crates/ebpf/native/counter_bank_timing.c");
+        for flavor in [
             BpfFlavor::CounterCounts,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-        );
+            BpfFlavor::CounterTimestamps,
+            BpfFlavor::CounterLatency,
+        ] {
+            build_variant_with_proof(flavor, false, false, false, false, false, true);
+        }
     }
     // Selection is an emitted contract, never an inference from stale files.
     println!(
@@ -249,7 +248,7 @@ fn main() {
     println!(
         "cargo:rustc-env=P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS={}",
         if counter_bank_proof {
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         } else {
             ""
         }
@@ -363,7 +362,13 @@ fn build_variant_with_proof(
     };
     let mut selected_native_units = native_units.to_vec();
     if bank_proof {
-        selected_native_units.push("counter_bank_proof");
+        // Exactly one bank unit per flavor: the checker requires exactly the
+        // untimed pair for counts and exactly the timed pair for timing.
+        selected_native_units.push(match flavor {
+            BpfFlavor::CounterCounts => "counter_bank_proof",
+            BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => "counter_bank_timing",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        });
     }
     // H8-D birth marker: the Detailed object alone links the admission
     // control row; counter and inventory flavors keep no marker state.
@@ -376,7 +381,12 @@ fn build_variant_with_proof(
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
         let suffix = if bank_proof {
-            "counts-bank-growth-v2"
+            match flavor {
+                BpfFlavor::CounterCounts => "counts-bank-growth-v2",
+                BpfFlavor::CounterTimestamps => "timestamps-bank-growth-v2",
+                BpfFlavor::CounterLatency => "latency-bank-growth-v2",
+                _ => unreachable!("bank proof builds only counter flavors"),
+            }
         } else {
             match flavor {
                 BpfFlavor::Detailed => "detailed",
@@ -449,6 +459,14 @@ fn build_variant_with_proof(
         if journal_marker && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_JOURNAL_MARKER");
         }
+        if bank_proof && *unit == "counter_bank_timing" {
+            compile.arg("-DP11SCOPE_COUNTER_BANK_PROOF");
+            compile.arg(match flavor {
+                BpfFlavor::CounterTimestamps => "-DP11SCOPE_BANK_MODE_TIMESTAMPS",
+                BpfFlavor::CounterLatency => "-DP11SCOPE_BANK_MODE_LATENCY",
+                _ => unreachable!("the timing bank unit needs its mode"),
+            });
+        }
         let status = compile
             .status()
             .expect("failed to spawn clang-18 for native state");
@@ -471,7 +489,12 @@ fn build_variant_with_proof(
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
     let target_dir = out_dir.join(if bank_proof {
-        "ebpf-counts-bank-growth-v2-target"
+        match flavor {
+            BpfFlavor::CounterCounts => "ebpf-counts-bank-growth-v2-target",
+            BpfFlavor::CounterTimestamps => "ebpf-timestamps-bank-growth-v2-target",
+            BpfFlavor::CounterLatency => "ebpf-latency-bank-growth-v2-target",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        }
     } else {
         match flavor {
             BpfFlavor::Detailed => "ebpf-target",
@@ -501,11 +524,26 @@ fn build_variant_with_proof(
         BpfFlavor::InventoryGlobal => features.push("inventory-only"),
         BpfFlavor::InventoryCallers => features.push("inventory-callers"),
         BpfFlavor::CounterCounts => features.push("counter-counts"),
-        BpfFlavor::CounterTimestamps => features.push("counter-timestamps"),
-        BpfFlavor::CounterLatency => features.push("counter-latency"),
+        // Bank objects share the counts Rust shape so the ordinary maps
+        // stay identical; only the fixed-512 artifacts take their flavor.
+        BpfFlavor::CounterTimestamps => features.push(if bank_proof {
+            "counter-counts"
+        } else {
+            "counter-timestamps"
+        }),
+        BpfFlavor::CounterLatency => features.push(if bank_proof {
+            "counter-counts"
+        } else {
+            "counter-latency"
+        }),
     }
     if bank_proof {
-        features.push("counts-bank-proof");
+        features.push(match flavor {
+            BpfFlavor::CounterCounts => "counts-bank-proof",
+            BpfFlavor::CounterTimestamps => "timestamps-bank-proof",
+            BpfFlavor::CounterLatency => "latency-bank-proof",
+            _ => unreachable!("bank proof builds only counter flavors"),
+        });
     }
     // P0-only ship vehicle: the Detailed object alone carries attribute
     // adapters, so only it takes the stub feature. Inventory flavors
@@ -554,7 +592,14 @@ fn build_variant_with_proof(
         append_flag("link-arg=--export=p11_link_current_identity");
     }
     if bank_proof {
-        for name in ["p11_bank_enter", "p11_bank_complete"] {
+        let bank_exports: &[&str] = match flavor {
+            BpfFlavor::CounterCounts => &["p11_bank_enter", "p11_bank_complete"],
+            BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => {
+                &["p11_bank_enter_timed", "p11_bank_complete_timed"]
+            }
+            _ => unreachable!("bank proof builds only counter flavors"),
+        };
+        for name in bank_exports {
             append_flag("-C");
             append_flag(&format!("link-arg=--export={name}"));
         }
@@ -685,7 +730,12 @@ fn build_variant_with_proof(
     std::fs::copy(
         &built,
         out_dir.join(if bank_proof {
-            "p11scope-ebpf-counts-bank-growth-v2"
+            match flavor {
+                BpfFlavor::CounterCounts => "p11scope-ebpf-counts-bank-growth-v2",
+                BpfFlavor::CounterTimestamps => "p11scope-ebpf-timestamps-bank-growth-v2",
+                BpfFlavor::CounterLatency => "p11scope-ebpf-latency-bank-growth-v2",
+                _ => unreachable!("bank proof builds only counter flavors"),
+            }
         } else {
             match flavor {
                 BpfFlavor::Detailed => "p11scope-ebpf",

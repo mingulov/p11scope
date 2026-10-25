@@ -240,16 +240,54 @@ struct BankModeArtifact {
 }
 
 #[cfg(test)]
-fn bank_mode_artifact(_token: &str) -> Result<BankModeArtifact, BankRefusal> {
-    Err(BankRefusal::Shape)
+const TIMESTAMPS_GROWTH_V2_CONFIG: u64 = 0x0200_0028_0010_0200;
+#[cfg(test)]
+const LATENCY_GROWTH_V2_CONFIG: u64 = 0x0200_0128_0010_0200;
+
+#[cfg(test)]
+const BANK_MODE_ARTIFACTS: [BankModeArtifact; 3] = [
+    BankModeArtifact {
+        token: "counts-bank-growth-v2",
+        object: "p11scope-ebpf-counts-bank-growth-v2",
+        value_bytes: 24,
+        configuration: COUNTS_GROWTH_V2_CONFIG,
+    },
+    BankModeArtifact {
+        token: "timestamps-bank-growth-v2",
+        object: "p11scope-ebpf-timestamps-bank-growth-v2",
+        value_bytes: 40,
+        configuration: TIMESTAMPS_GROWTH_V2_CONFIG,
+    },
+    BankModeArtifact {
+        token: "latency-bank-growth-v2",
+        object: "p11scope-ebpf-latency-bank-growth-v2",
+        value_bytes: 296,
+        configuration: LATENCY_GROWTH_V2_CONFIG,
+    },
+];
+
+#[cfg(test)]
+fn bank_mode_artifact(token: &str) -> Result<BankModeArtifact, BankRefusal> {
+    BANK_MODE_ARTIFACTS
+        .iter()
+        .find(|artifact| artifact.token == token)
+        .copied()
+        .ok_or(BankRefusal::Shape)
 }
 
-fn proof_counts_token(_outputs: &str) -> Result<&str, BankRefusal> {
-    Err(BankRefusal::Shape)
+fn proof_counts_token(outputs: &str) -> Result<&str, BankRefusal> {
+    outputs
+        .split(',')
+        .find(|token| *token == "counts-bank-growth-v2")
+        .ok_or(BankRefusal::Shape)
 }
 
-fn production_geometry(_outputs: &str) -> Result<CountsBankGeometry, BankRefusal> {
-    Err(BankRefusal::Shape)
+fn production_geometry(outputs: &str) -> Result<CountsBankGeometry, BankRefusal> {
+    if outputs.contains(',') {
+        CountsBankGeometry::selected(proof_counts_token(outputs)?)
+    } else {
+        CountsBankGeometry::selected(outputs)
+    }
 }
 
 struct StagedExtent {
@@ -1482,7 +1520,7 @@ impl<'a> CounterPreparation<'a> {
             )),
             "private Counts bank preparation requires its fixed artifact configuration"
         );
-        let geometry = CountsBankGeometry::selected(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"))
+        let geometry = production_geometry(env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"))
             .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
         let (retained, transient) = envelope
             .charges()

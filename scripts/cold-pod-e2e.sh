@@ -13,9 +13,11 @@
 #     cmd1   per-pod profile of the cold pod: exactly 6x250
 #     cmd2   node-wide `inventory --system`: both A and B are callers
 #            with edges to the provider, idle is scanned with no edge
-#   twin     delete B and re-run inventory: the old B pid is absent from
-#            callers or present-with-no-edge (never an edge), and the
-#            positive oracle refuses that JSON, proving it distinguishes
+#   twin     delete B and re-run inventory: the capture must first pass
+#            as a healthy scan (caller A keeps its edge, idle scanned
+#            edgeless), then the old B pid is absent from callers or
+#            present-with-no-edge (never an edge), and the positive
+#            oracle refuses that JSON, proving it distinguishes
 #            included from not.
 # Every capture is checked with scripts/kind-e2e-oracle.py
 # --expect-observer nested (the node is a container, so the observer is
@@ -790,6 +792,17 @@ print(json.dumps({"check": "failure-twin", "ok": True, "shape": "present-with-no
 PY
 }
 
+# The twin's positive control: the twin capture must still be a healthy
+# scan (caller A keeps its edge, idle still scanned edgeless) before B's
+# absence proves anything; without it an empty twin capture passes
+# vacuously (absent B, refused positive oracle).
+twin_positive_control() {
+    oracle_inventory "$1" --caller "$2" --non-caller "$3" || {
+        echo "twin inventory is not a healthy scan" >&2
+        return 1
+    }
+}
+
 oracle_profile() {
     python3 -I "$ORACLE" --expect-observer nested profile-exact "$1" "$2"
 }
@@ -1040,6 +1053,9 @@ observe p11scope inventory --system --caller-metadata none -o /tmp/c3-inv-nob.js
     }
 kc -n "$OBS_NS" cp "$OBS:/tmp/c3-inv-nob.json" "$WORK/c3-inv-nob.json" >/dev/null \
     || fail_cell "twin inventory copy failed"
+RESULT=$(twin_positive_control "$WORK/c3-inv-nob.json" "$PID_A" "$PID_IDLE") \
+    || fail_cell "twin inventory is not a healthy scan (caller A lost its edge)"
+record "$RESULT"
 RESULT=$(absent_or_edgeless "$WORK/c3-inv-nob.json" "$PID_B") \
     || fail_cell "deleted B still has an edge (phantom attribution)"
 record "$RESULT"

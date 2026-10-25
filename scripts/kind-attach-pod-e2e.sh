@@ -181,6 +181,9 @@ case " $* " in
     *" kubectl version --client"*) printf '%s\n' "Client Version: v0.0.0-stub" ;;
     *" command -v kubectl "*) [ "${STUB_NODE_KUBECTL-1}" = 1 ]; exit $? ;;
     *" crictl inspect "*) printf '%s\n' "${STUB_NODE_PID-1234}" ;;
+    *" exec node-stub cat /tmp/"*)
+        [ -n "${STUB_NODE_FILE-}" ] || exit 1
+        printf '%s\n' "$STUB_NODE_FILE" ;;
     *"{{.Driver}} {{.ServerVersion}}"*) printf '%s\n' "overlayfs 29.8.1" ;;
     *"{{.CgroupDriver}}"*) printf '%s\n' "systemd" ;;
     *"{{.DockerRootDir}}"*) printf '%s\n' "/var/lib/docker" ;;
@@ -404,6 +407,28 @@ LEDGER good" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
         echo "absent LEDGER waited out as present" >&2
         exit 1
     fi
+    # Report fetch: kind mounts the node's /tmp as tmpfs, which `docker cp`
+    # cannot read, so the report is streamed out with `docker exec cat`; a
+    # missing or empty report fails the capture.
+    : > "$cst_stub/calls.txt"
+    (sleep 0 &
+     STUB_NODE_FILE='{"schema":"stub"}' WORK=$cst_stub/work NODE=node-stub \
+        STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
+        finish_attach fetch /tmp/k2-fetch.json "$cst_stub/work/k2-fetch.json" $!) \
+        || { echo "report fetch refused" >&2; exit 1; }
+    [ "$(cat "$cst_stub/work/k2-fetch.json")" = '{"schema":"stub"}' ] \
+        || { echo "report fetch lost the node report" >&2; exit 1; }
+    for fetch_bad in "" " "; do
+        rm -f "$cst_stub/work/k2-fetch-bad.json"
+        if (sleep 0 &
+            STUB_NODE_FILE=$fetch_bad WORK=$cst_stub/work NODE=node-stub \
+                STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
+                finish_attach fetch /tmp/k2-fetch.json "$cst_stub/work/k2-fetch-bad.json" $!) \
+                >/dev/null 2>&1; then
+            echo "missing or empty node report accepted: '$fetch_bad'" >&2
+            exit 1
+        fi
+    done
     # Pod identity: the container id reaches crictl on the node, and a
     # malformed id or uid is refused before it gets there.
     cst_cid=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -898,7 +923,7 @@ start_attach() {
 }
 
 # finish_attach NAME NODE_OUT LOCAL PID: the capture must exit 0, then its
-# report is copied out of the node.
+# report is streamed out of the node.
 finish_attach() {
     fa_status=0
     wait "$4" || fa_status=$?
@@ -907,7 +932,10 @@ finish_attach() {
         cat "$WORK/$1.err" >&2
         return 1
     }
-    docker cp "$NODE:$2" "$3" || return 1
+    # kind mounts the node's /tmp as tmpfs, which `docker cp` cannot read:
+    # stream the report out instead, and refuse a missing or blank one.
+    docker exec "$NODE" cat "$2" >"$3" || return 1
+    grep -q '[^[:space:]]' "$3" || { echo "capture $1 wrote an empty report" >&2; return 1; }
 }
 
 # Its own cluster and image, nothing else (the trap calls this).

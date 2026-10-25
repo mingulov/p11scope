@@ -17,11 +17,12 @@
 #   negative attach to idle: no module, no call, with a visibility line
 #            from k8s-profile-entry proving the pod was seen
 #   scan     attach to idle, then exec a ledger run inside it (the provider
-#            is mapped AFTER attach): the late provider must not be silently
-#            zero -- either discovered-live with a named pre-attach gap, or
-#            absent-with-disclosure. runc exec stages are excluded from the
-#            disclosure set, and the twin fails if the exec artifacts are the
-#            only gap.
+#            is mapped AFTER attach): every ledger function must count
+#            exactly its LEDGER successful value (leg counted-exact,
+#            whatever the disclosure causes) or zero with a named
+#            disclosure for the miss (legs absent/attached-zero); loss,
+#            partial counts and silent zeros fail. Setup calls on other
+#            functions are allowed and reported as extra_calls.
 #
 # The CONTROLLER runs every docker/kind/kubectl command below. Workers only run
 # `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves the arg
@@ -937,50 +938,105 @@ pod_ledger_is() {
     }
 }
 
-# The late-provider rule: the capture must name a disclosure beyond the PID
-# numbering and the runc exec artifacts (src/render.rs observation causes).
-# Either accepted shape passes -- discovered-live with a named pre-attach
-# gap, or absent-with-disclosure -- and every silent shape fails, including
-# an exact count across the attach-time scan limit. The disclosure
-# vocabulary is frozen: an unknown cause fails loudly, never passes as
-# disclosure.
+# The late-provider rule: the scan leg's report is judged against its own
+# LEDGER line (the exec log). Each ledger function must count exactly its
+# LEDGER successful value -- summed across duplicate rows -- or zero. All
+# exact passes as counted-exact whatever the disclosure causes; all zero
+# passes only with a disclosure naming the miss (the late provider never
+# attached, or attached after the burst); any other shape fails as a
+# partial count, a false failure rather than a false pass, as the K3
+# boundary does. Loss fails every leg; every other cause is recorded in
+# the verdict, never gated, so a new disclosure cause cannot refuse a
+# good run the way the frozen vocabulary did.
 scan_limit_check() {
-    python3 -I - "$1" <<'PY'
+    python3 -I - "$1" "$2" <<'PY'
 import json, sys
-# Frozen scan-disclosure vocabulary (OQ4 pattern): discovery/slots are the
-# built binary's absent-leg output (K1 negative.json: an idle cgroup with
-# no provider); unprotected_live_windows is the expected live-leg cause
-# (src/render.rs gap_classes, observed-profile-v3.md); skipped is what the
-# first live K2 run (k2-dev-3, binary 5ce42784) printed for the nested
-# observer: evidence.skipped "discovery subject: discovery unavailable"
-# (src/render.rs "skipped" cause), with the late provider counted exactly.
-# Anything else -- loss, failure, future or misspelled cause -- fails
-# loudly for triage from facts.log.
-ALLOWED_SCAN_DISCLOSURE = {
-    "discovery": "K1 negative.json observation causes (built binary)",
-    "slots": "K1 negative.json observation causes (built binary)",
-    "unprotected_live_windows": "src/render.rs gap_classes",
-    "skipped": "live K2 run 3 scan leg (nested observer, discovery unavailable)",
+report_path, exec_path = sys.argv[1], sys.argv[2]
+# Loss: the observation dropped, corrupted or unattributed counted data,
+# so the numbers are untrustworthy even when they match. Any of these
+# observation causes (src/render.rs gap_classes, :1403-1508) refuses the
+# leg, whatever the counts.
+SCAN_LOSS_CAUSES = {
+    "event_loss",             # render.rs:1439 (oracle gates == 0)
+    "discovery_ring_loss",    # render.rs:1471
+    "in_flight_at_end",       # render.rs:1425 (oracle gates == 0)
+    "attach_failures",        # render.rs:1415
+    "provider_changed",       # render.rs:1446 (R-39: later calls unjoined)
+    "kernel_control",         # render.rs:1449 ("loss, never attribution")
+    "discovery_state_failures",  # render.rs:1472
+    "discovery_read_failures",   # render.rs:1477
+    "task_uprobe_link_losses",   # render.rs:1483
+    "start_insert_failures",  # render.rs:1440
+    "unmatched_returns",      # render.rs:1441
+    "rv_update_failures",     # render.rs:1442
+    "malformed_records",      # render.rs:1445
+    "scheduling.terminal_drain_truncated",  # render.rs:1490
+    "scheduling.sink_dropped_bytes",        # render.rs:1495
+    "trace_truncated",        # render.rs:1500
 }
-BENIGN_SCAN_CAUSES = {"pid_namespace", "proc_namespace_mismatch", "pid_descendant_gaps"}
-document = json.load(open(sys.argv[1], encoding="utf-8"))
+# A zero leg is honest only with a disclosure naming the miss (R-42/R-45:
+# a silent zero still fails): the late provider never attached -- nothing
+# discovered, planned or scanned, modules or subjects skipped -- or it
+# attached after the burst -- a live window, a loader race, truncated
+# discovery records.
+SCAN_ZERO_DISCLOSURE = {
+    "discovery",              # render.rs:1403 no modules discovered
+    "slots",                  # render.rs:1404 no slots planned
+    "scan_unavailable",       # render.rs:1405 no scan ran
+    "modules_skipped",        # render.rs:1410 discovery skipped modules
+    "skipped",                # render.rs:1416 named evidence.skipped entries
+    "unprotected_live_windows",  # render.rs:1466 live attach window
+    "discovery_truncated",    # render.rs:1482 discovery records truncated
+    "loader_discovery",       # render.rs:1489 loader timing unproven
+}
+ledgers = []
+with open(exec_path, encoding="utf-8") as handle:
+    for line in handle:
+        if line.startswith("LEDGER "):
+            ledgers.append(json.loads(line[len("LEDGER "):]))
+if len(ledgers) != 1:
+    raise SystemExit(f"scan ledger ambiguous: want 1 LEDGER line in {exec_path}, got {len(ledgers)}")
+ledger = ledgers[0]
+if ledger.get("complete") is not True:
+    raise SystemExit("scan ledger incomplete: the burst never finished")
+expected = {row["name"]: row["successful"] for row in ledger.get("functions") or []}
+if not expected:
+    raise SystemExit("scan ledger names no functions")
+document = json.load(open(report_path, encoding="utf-8"))
 causes = set(document["evidence"]["gap_classes"]["observation"]["causes"])
 if "pid_namespace" not in causes:
     raise SystemExit("nested capture without its pid_namespace cause")
-unknown = causes - BENIGN_SCAN_CAUSES - set(ALLOWED_SCAN_DISCLOSURE)
-if unknown:
-    raise SystemExit(f"unknown scan cause: {sorted(unknown)} "
-                     f"(frozen disclosure: {sorted(ALLOWED_SCAN_DISCLOSURE)})")
-disclosure = causes - BENIGN_SCAN_CAUSES
-counted = sum(row["calls"] for row in document["functions"] if row["calls"])
+loss = causes & SCAN_LOSS_CAUSES
+if loss:
+    raise SystemExit(f"scan loss refuses the leg: {sorted(loss)}")
+counted = {name: 0 for name in expected}
+extra_calls = {}
+for row in document["functions"]:
+    for name in row["names"]:
+        if name in counted:
+            counted[name] += row["calls"]
+        else:
+            extra_calls[name] = extra_calls.get(name, 0) + row["calls"]
+extra_calls = {name: calls for name, calls in extra_calls.items() if calls}
+errors = sum(row["errors"] for row in document["functions"])
 modules = document["capture"]["modules"]
-if not disclosure:
-    raise SystemExit(f"late provider silently resolved: {counted} calls, causes {sorted(causes)}")
-leg = "discovered-live" if (counted or modules) else "absent"
+exact = [name for name in expected if 0 < expected[name] == counted[name]]
+zero = [name for name in expected if counted[name] == 0]
+if len(exact) == len(expected):
+    leg, disclosure = "counted-exact", []
+elif len(zero) == len(expected):
+    disclosure = sorted(causes & SCAN_ZERO_DISCLOSURE)
+    if not disclosure:
+        raise SystemExit(f"late provider silently zero: 0 calls, {len(modules)} module(s), causes {sorted(causes)}")
+    leg = "absent" if not modules else "attached-zero"
+else:
+    raise SystemExit(f"partial scan count: {counted} vs ledger {expected}")
 print(json.dumps({"check": "scan-limit", "ok": True, "leg": leg,
-                  "counted_calls": counted, "modules": len(modules),
-                  "disclosure": sorted(disclosure), "causes": sorted(causes)},
-                 sort_keys=True))
+                  "ledger": expected, "counted": counted,
+                  "counted_calls": sum(counted.values()),
+                  "extra_calls": extra_calls, "errors": errors,
+                  "modules": len(modules), "causes": sorted(causes),
+                  "disclosure": disclosure}, sort_keys=True))
 PY
 }
 
@@ -1193,7 +1249,8 @@ ledger_check "$WORK/k2-scan-exec.log" "$ITERS_SCAN_DEFAULT" \
 grep -h '^LEDGER ' "$WORK/k2-scan-exec.log" >>"$FACTS"
 finish_attach k2-scan /tmp/k2-scan.json "$WORK/k2-scan.json" "$PID_SCAN" \
     || fail_cell "scan capture failed"
-RESULT=$(scan_limit_check "$WORK/k2-scan.json") || fail_cell "scan-limit twin failed: late provider silently zero"
+RESULT=$(scan_limit_check "$WORK/k2-scan.json" "$WORK/k2-scan-exec.log" 2>"$WORK/k2-scan-check.err") \
+    || fail_cell "scan-limit twin failed: $(cat "$WORK/k2-scan-check.err")"
 record "$RESULT"
 fact "scan-limit=$RESULT"
 

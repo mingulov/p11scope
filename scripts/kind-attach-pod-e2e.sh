@@ -410,7 +410,7 @@ LEDGER good" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
     PATH="$cst_stub:$PATH" ledger_check "$cst_stub/good.log" 400 \
         || { echo "good LEDGER refused" >&2; exit 1; }
     printf '%s\n' 'READY pid=1' 'LEDGER iterations=400 nonzero_rv=0' > "$cst_stub/legacy.log"
-    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[]}' \
+    printf '%s\n' 'READY pid=1' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
         > "$cst_stub/incomplete.log"
     printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":399,"successful":399}]}' \
         > "$cst_stub/short.log"

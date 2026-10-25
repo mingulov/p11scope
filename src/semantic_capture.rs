@@ -2469,6 +2469,13 @@ impl SemanticCapture {
             self.router.fence()
         });
         let healthy = self.audit(io, &mut report);
+        // The break is recorded from the already-obtained result
+        // before the slice check: a scan that proves the module
+        // unmapped breaks continuity even when the slice elapsed
+        // mid-scan.
+        if matches!(result, Err(ImageQueryRefusal::Empty)) {
+            self.note_refresh_absence(&pin, endpoint.file_slot);
+        }
         if io.now() >= scan_deadline {
             report.scan_refusals.push(ImageQueryRefusal::Deadline);
         } else if healthy {

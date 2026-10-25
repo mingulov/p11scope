@@ -529,11 +529,14 @@ non-null values needs a new allowlist row.
   `unknown (count-only slot)` (count-only or unrecognized producing
   slots), `unknown (no operation evidence)` (an authorized feed
   observed only lifecycle traffic, failed `Init`s, or orphan calls
-  that establish no claim), or `unknown (same-file double-load)`
+  that establish no claim), `unknown (same-file double-load)`
   (scan evidence shows the object loaded twice in the caller's
   process — duplicate executable file-offset coverage — so no
   observed call can attribute to one instance and every call voids;
-  the `same-file double-load detected` gap names the edge).
+  the `same-file double-load detected` gap names the edge), or
+  `unknown (per-edge summary withheld; see semantic children)`
+  (claimed semantic children hold this edge's rows, so no per-edge
+  summary is attempted — read the children instead).
   Unsupported or ambiguous semantics render `unknown`, never
   invented.
 - `edges[].mechanisms` (S1, `null` when no mechanism was

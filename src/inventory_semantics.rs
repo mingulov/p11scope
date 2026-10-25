@@ -783,6 +783,13 @@ pub(crate) struct AttestedSemanticLane {
     /// `has_joint_frame` (mirrors `test_finished`).
     #[cfg(test)]
     test_joint_frame: bool,
+    /// Tests-only joint-machine answer, checked first by
+    /// `has_joint_machine`: substituted lanes carry no live
+    /// machine, so the seam marks Joint lanes joint. Independent
+    /// of the frame: a drained seal (frame clear) stays joint,
+    /// exactly like a live machine past its finish.
+    #[cfg(test)]
+    test_joint_machine: bool,
     /// Tests-only scripted Finish begin outcome: when set, the begin
     /// answers it without a live machine, so the driver's begin-Ok
     /// arm runs unprivileged. Sticky; tests clear it explicitly.
@@ -1233,6 +1240,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             test_joint_frame: false,
             #[cfg(test)]
+            test_joint_machine: false,
+            #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
             scripted_finish_poll: None,
@@ -1360,6 +1369,8 @@ impl AttestedSemanticLane {
             test_finished: false,
             #[cfg(test)]
             test_joint_frame: false,
+            #[cfg(test)]
+            test_joint_machine: false,
             #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
@@ -1641,6 +1652,10 @@ impl AttestedSemanticLane {
     /// Whether this lane owns a Joint machine (§8.3).
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_machine(&self) -> bool {
+        #[cfg(test)]
+        if self.test_joint_machine {
+            return true;
+        }
         self.live
             .as_deref()
             .is_some_and(|live| live.joint_machine.is_some())
@@ -1665,6 +1680,13 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn set_test_joint_frame(&mut self, on: bool) {
         self.test_joint_frame = on;
+    }
+
+    /// Mark the lane Joint through the machine seam (independent of
+    /// the frame): substituted lanes carry no live machine.
+    #[cfg(test)]
+    pub(crate) fn set_test_joint_machine(&mut self, on: bool) {
+        self.test_joint_machine = on;
     }
 
     /// Script the Finish begin outcome (or clear it with `None`):
@@ -1798,11 +1820,12 @@ impl AttestedSemanticLane {
         if self.test_io.is_some() {
             // Substituted lanes never ran a native session, but the
             // handoff still happened: production takes the live
-            // Session here, so finished and the retained frame go
-            // with it. A later `is_finished` reads false, exactly
-            // like a taken live lane.
+            // Session here, so finished, the retained frame and the
+            // machine answer go with it. A later `is_finished`
+            // reads false, exactly like a taken live lane.
             self.test_finished = false;
             self.test_joint_frame = false;
+            self.test_joint_machine = false;
             return Ok(None);
         }
         let Some(live) = self.live.as_mut() else {
@@ -4396,6 +4419,7 @@ mod joint_terminal_tests {
         let (mut lane, _, _) = io_lane_for_test(DetachScript::Complete);
         lane.test_finished = true;
         lane.set_test_joint_frame(true);
+        lane.set_test_joint_machine(true);
         assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
         lane.set_test_joint_frame(false);
         assert!(lane.take_joined_session().unwrap().is_none());
@@ -4406,6 +4430,10 @@ mod joint_terminal_tests {
         assert!(
             !lane.has_joint_frame(),
             "the handoff takes the retained frame too"
+        );
+        assert!(
+            !lane.has_joint_machine(),
+            "the handoff takes the machine answer with the session"
         );
         // A second take stays not-ready, never a refusal: nothing is
         // left to hand off, exactly like a taken live lane.

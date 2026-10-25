@@ -3000,14 +3000,21 @@ impl ClassicDriver<'_> {
 
     /// Complete a wound-down final Joint lane: take the joined
     /// session and drop it (the detach already joined), then release
-    /// the lane shell. A take refusal keeps the lane for the next
-    /// hook, whose wound-down poll re-verifies it.
+    /// the lane shell. Only a handoff releases: production took its
+    /// live Session, substituted lanes cleared their seams. A
+    /// not-ready take (framed, or a re-polled pending detach) or a
+    /// refusal keeps the lane for the next hook, whose wound-down
+    /// poll re-verifies it.
     fn complete_final_joint_lane(&mut self) {
         self.snapshot_seated_summary();
         let Some(lane) = self.semantic.as_mut() else {
             return;
         };
-        if lane.take_joined_session().is_ok() {
+        let handed_off = match lane.take_joined_session() {
+            Ok(_) => !lane.is_finished(),
+            Err(_) => return,
+        };
+        if handed_off {
             self.semantic = None;
         }
     }
@@ -10184,6 +10191,7 @@ mod tests {
             io.ticks = Rc::clone(&ticks);
             let mut lane = joint_lane(io, false);
             lane.set_test_joint_frame(false);
+            lane.set_test_joint_machine(false);
             driver.semantic = Some(lane);
             driver.suspended = true;
             for _ in 0..8 {
@@ -10570,6 +10578,7 @@ mod tests {
                 let mut lane = joint_lane(WindDownIo::completing(), true);
                 if !joint {
                     lane.set_test_joint_frame(false);
+                    lane.set_test_joint_machine(false);
                 }
                 driver.semantic = Some(lane);
                 driver.joint_finish = JointFinishDriver::Polling;
@@ -11955,6 +11964,7 @@ mod promotion_driver_tests {
             assert!(lane.is_finished(), "the H0 stop finishes the lane");
         }
         lane.set_test_joint_frame(true);
+        lane.set_test_joint_machine(true);
         assert!(lane.has_joint_frame(), "the seam marks a Joint lane");
         lane
     }
@@ -13379,6 +13389,12 @@ mod promotion_driver_tests {
             assert_eq!(driver.joint_step_calls, 1, "the hook stepped once");
             // The joined detach completes the final lane.
             release_gate(&gate);
+            // The seal drains before the completion, as in production.
+            driver
+                .semantic
+                .as_mut()
+                .expect("lane")
+                .set_test_joint_frame(false);
             driver.on_lane_stopped();
             assert!(driver.semantic.is_none(), "the wound-down lane completes");
         }
@@ -13454,6 +13470,12 @@ mod promotion_driver_tests {
             "5a: no hook polled the finish past Published"
         );
         release_gate(&gate);
+        // The seal drains before the completion, as in production.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
         driver.on_tick();
         assert!(
             driver.semantic.is_none(),
@@ -14307,6 +14329,12 @@ mod promotion_driver_tests {
         let seated = lane.semantic_summary();
         driver.semantic = Some(lane);
         driver.joint_finish = JointFinishDriver::Published;
+        // The seal drains before the completion, as in production.
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
         driver.on_lane_stopped();
         assert!(
             driver.semantic.is_none(),

@@ -407,6 +407,12 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
         "H: the live lane stays A"
     );
     assert_eq!(seat.drops.get(), 0, "O: the lane is kept until joined");
+    // The seal drains before the completion, as in production.
+    driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .set_test_joint_frame(false);
     driver.on_lane_stopped();
     assert_eq!(seat.completes.get(), 1, "N: one joined receipt");
     assert!(
@@ -1395,6 +1401,12 @@ fn stopdead_pub_body(scene: Scene, event: JointEvent) {
     assert!(error.is_none(), "J12 retains no error");
     // The pending commit publishes; the wound-down chain runs after.
     driver.joint_commit_pending = false;
+    // The seal drains before the completion, as in production.
+    driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .set_test_joint_frame(false);
     // A stop clock during the drain: the recorded cause survives it.
     let stop = Cell::new(true);
     let stop_now = || stop.get();
@@ -1589,6 +1601,12 @@ fn capture_pub_body(scene: Scene, event: JointEvent) {
     let (run, error) = retain_publication(&mut driver, state, event, true);
     // The pending commit publishes; the capture error strikes the drain.
     driver.joint_commit_pending = false;
+    // The seal drains before the completion, as in production.
+    driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .set_test_joint_frame(false);
     super::super::fail_next_classic_commit_for_test("the capture failure");
     let stop = Cell::new(false);
     let stop_now = || stop.get();
@@ -1669,6 +1687,12 @@ fn sink_pub_body(scene: Scene, event: JointEvent) {
     let (run, error) = retain_publication(&mut driver, state, event, true);
     // The pending commit publishes; the sink fails on the stop.
     driver.joint_commit_pending = false;
+    // The seal drains before the completion, as in production.
+    driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .set_test_joint_frame(false);
     let mut stops = 0;
     let stop = Cell::new(false);
     let stop_now = || stop.get();

@@ -239,13 +239,23 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
     let Scene {
         mut coordinator,
         display,
-        state,
+        ..
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
-    let seat = seat_state_lane(&mut driver, state);
-    install_promotion_for_wind_down(&mut driver);
+    // Gated detach: the cancel winds A down through the real
+    // stopping leg while the seal drains; the drained retry retires
+    // on one joined receipt.
+    let (io, gate) = WindDownIo::gated();
+    let submits = Rc::clone(&io.submits);
+    let completes = Rc::clone(&io.completes);
+    let drops = Rc::new(Cell::new(0));
+    let mut io = io;
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let domain = install_promotion_for_wind_down(&mut driver);
+    quiesce_domain_for_retire(&mut *driver.coordinator, domain);
     let (source, _, _) = CountingSource::scripted(Some(
-        SessionNativeCompletion::scripted(seat.domain),
+        SessionNativeCompletion::scripted(domain),
     ));
     driver.completion_source = Some(Box::new(source));
     driver.on_tick();
@@ -264,11 +274,12 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(
         driver.retiring_domain(),
-        Some(seat.domain),
-        "the held frame holds the retire"
+        Some(domain),
+        "the pending detach holds the retire"
     );
-    assert_eq!(seat.drops.get(), 0, "O: the lane is kept until joined");
+    assert_eq!(drops.get(), 0, "O: the lane is kept until joined");
     set_winding_frame(&mut driver, false);
+    release_gate(&gate);
     driver.on_tick();
     assert_eq!(
         driver.retiring_domain(),
@@ -276,11 +287,12 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
         "R: the finish completes once"
     );
     assert_eq!(
-        seat.completes.get(),
+        completes.get(),
         1,
         "N: one joined receipt across the hold"
     );
-    assert_eq!(seat.drops.get(), 1, "O: released after the join");
+    assert_eq!(submits.get(), 1, "N: one submit across the hold");
+    assert_eq!(drops.get(), 1, "O: released after the join");
     assert_eq!(
         driver.joint_begin_calls, 1,
         "R: a further cancel never re-begins"
@@ -288,7 +300,7 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
     driver
         .coordinator
         .stage_semantic_batch(crate::inventory_semantics::SemanticBatch::scripted(
-            seat.domain,
+            domain,
             Vec::new(),
             9,
         ));
@@ -320,13 +332,23 @@ fn promote_pre_body(scene: Scene, event: JointEvent) {
     let Scene {
         mut coordinator,
         display,
-        state,
+        ..
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
-    let seat = seat_state_lane(&mut driver, state);
-    install_promotion_for_wind_down(&mut driver);
+    // Gated detach: the cancel winds A down through the real
+    // stopping leg while the seal drains; the drained retry retires
+    // on one joined receipt.
+    let (io, gate) = WindDownIo::gated();
+    let submits = Rc::clone(&io.submits);
+    let completes = Rc::clone(&io.completes);
+    let drops = Rc::new(Cell::new(0));
+    let mut io = io;
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let domain = install_promotion_for_wind_down(&mut driver);
+    quiesce_domain_for_retire(&mut *driver.coordinator, domain);
     let (source, _, _) = CountingSource::scripted(Some(
-        SessionNativeCompletion::scripted(seat.domain),
+        SessionNativeCompletion::scripted(domain),
     ));
     driver.completion_source = Some(Box::new(source));
     driver.on_tick();
@@ -335,16 +357,17 @@ fn promote_pre_body(scene: Scene, event: JointEvent) {
     driver.on_tick();
     assert_eq!(
         driver.retiring_domain(),
-        Some(seat.domain),
-        "A holds while its frame stays live"
+        Some(domain),
+        "A holds while its detach stays pending"
     );
     assert_b_untouched(&mut driver);
     assert!(
         driver.semantic.is_none(),
         "B installs nothing while A winds down (B)"
     );
-    assert_eq!(seat.drops.get(), 0, "O: the lane is kept until joined");
+    assert_eq!(drops.get(), 0, "O: the lane is kept until joined");
     set_winding_frame(&mut driver, false);
+    release_gate(&gate);
     driver.on_tick();
     assert_eq!(
         driver.retiring_domain(),
@@ -352,10 +375,11 @@ fn promote_pre_body(scene: Scene, event: JointEvent) {
         "R: the finish completes once"
     );
     assert_eq!(
-        seat.completes.get(),
+        completes.get(),
         1,
         "N: one joined receipt across the hold"
     );
+    assert_eq!(submits.get(), 1, "N: one submit across the hold");
     assert_eq!(
         driver.display.as_ref().expect("display").promotion_state(),
         PromotionState::Refused(PromotionRefusal::ProviderUnloaded),

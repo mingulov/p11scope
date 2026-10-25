@@ -34,6 +34,10 @@ pub struct ElfSnapshot {
     executable_ranges: Vec<(u64, u64)>,
 }
 
+/// Structural classification only (ELF magic, endianness, class/machine);
+/// segment ranges are unchecked. Never translate addresses or offsets from
+/// the returned object — use `classified_validated_object` for any export
+/// walk or range query.
 pub fn classified_object(data: &[u8]) -> Result<(object::File<'_>, ElfAbi), String> {
     let object = object::File::parse(data)
         .map_err(|error| format!("not parseable as an ELF object: {error}"))?;

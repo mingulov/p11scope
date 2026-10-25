@@ -218,6 +218,9 @@ trait CounterSource {
     fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
         Ok(None)
     }
+    fn rv_exhausted(&self) -> Result<bool, ReadStage> {
+        Ok(false)
+    }
     fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_;
     fn rv_total(&self, key: &RvKey) -> Result<Result<u64, CounterIssue>, ReadStage>;
     fn fold_row(
@@ -439,7 +442,9 @@ impl CounterSource for BankedSource<'_> {
         Some(self.view.snapshot())
     }
     fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
-        use crate::attach::counter_banks::BankReadStatus;
+        use crate::attach::counter_banks::{
+            BANK_ROUTE_FAULT, BANK_RV_FAULT, BANK_SCOPE_FAULT, BANK_START_FAULT, BankReadStatus,
+        };
         let status = self
             .view
             .routing(self.ebpf, self.plan, self.objects)
@@ -448,14 +453,24 @@ impl CounterSource for BankedSource<'_> {
         // of ordinary counter health and all KernelEvidence/control cells.
         let values = self.fault.get(&0, 0).map_err(|_| ReadStage::Health)?;
         self.native.cpu_count(values.len(), ReadStage::Health)?;
+        let bits = values.iter().fold(0u64, |bits, &value| bits | value);
+        let fatal = BANK_ROUTE_FAULT | BANK_START_FAULT | BANK_SCOPE_FAULT;
         Ok(match status {
             BankReadStatus::Quarantined => Some(CounterIssue::BankQuarantined),
             BankReadStatus::Routing => Some(CounterIssue::BankRouting),
-            BankReadStatus::Healthy if values.iter().any(|&value| value != 0) => {
-                Some(CounterIssue::BankRouting)
-            }
-            BankReadStatus::Healthy => None,
+            BankReadStatus::Healthy if bits & fatal != 0 => Some(CounterIssue::BankRouting),
+            // An RV-only fault keeps endpoint counts exact; the RV table is a
+            // lower bound reported via `rv_exhausted`, and existing keys keep
+            // counting.
+            BankReadStatus::Healthy if bits & !BANK_RV_FAULT == 0 => None,
+            BankReadStatus::Healthy => Some(CounterIssue::BankRouting),
         })
+    }
+    fn rv_exhausted(&self) -> Result<bool, ReadStage> {
+        use crate::attach::counter_banks::BANK_RV_FAULT;
+        let values = self.fault.get(&0, 0).map_err(|_| ReadStage::Health)?;
+        self.native.cpu_count(values.len(), ReadStage::Health)?;
+        Ok(values.iter().fold(0u64, |bits, &value| bits | value) & BANK_RV_FAULT != 0)
     }
     fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_ {
         self.native.rv_keys()
@@ -946,6 +961,7 @@ mod tests {
         health: CounterHealth,
         kernel: KernelEvidence,
         routing: Option<CounterIssue>,
+        fault_bits: u64,
         fail: Option<ReadStage>,
         accesses: Cell<usize>,
         rv_reads: Cell<usize>,
@@ -1004,6 +1020,7 @@ mod tests {
                 kernel: KernelEvidence::default(),
                 fail: None,
                 routing: None,
+                fault_bits: 0,
                 accesses: Cell::new(0),
                 rv_reads: Cell::new(0),
                 clocks: if later {
@@ -1038,7 +1055,17 @@ mod tests {
             self.published.as_ref()
         }
         fn routing(&self) -> Result<Option<CounterIssue>, ReadStage> {
+            use crate::attach::counter_banks::{
+                BANK_ROUTE_FAULT, BANK_SCOPE_FAULT, BANK_START_FAULT,
+            };
+            if self.fault_bits & (BANK_ROUTE_FAULT | BANK_START_FAULT | BANK_SCOPE_FAULT) != 0 {
+                return Ok(Some(CounterIssue::BankRouting));
+            }
             Ok(self.routing)
+        }
+        fn rv_exhausted(&self) -> Result<bool, ReadStage> {
+            use crate::attach::counter_banks::BANK_RV_FAULT;
+            Ok(self.fault_bits & BANK_RV_FAULT != 0)
         }
         fn rv_keys(&self) -> impl Iterator<Item = Result<RvKey, ReadStage>> + '_ {
             self.rvs.iter().map(|(key, _)| Ok(*key))

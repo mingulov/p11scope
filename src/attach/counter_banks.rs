@@ -27,6 +27,14 @@ const BANKS: usize = 2;
 const GROWTH_BANKS: usize = 16;
 pub(super) const PROGRAMS: [&str; 2] = ["p11_counter_bank_entry", "p11_counter_bank_return"];
 
+/// Sticky `COUNTER_BANK_FAULT` bits, matching the native bank programs.
+/// Route/start/scope faults fail the read; an RV-only fault keeps endpoint
+/// counts exact while the RV table is a lower bound.
+pub(crate) const BANK_ROUTE_FAULT: u64 = 1;
+pub(crate) const BANK_START_FAULT: u64 = 2;
+pub(crate) const BANK_RV_FAULT: u64 = 4;
+pub(crate) const BANK_SCOPE_FAULT: u64 = 8;
+
 /// Caller-requested allocation envelope. Payload capacities and this explicit
 /// metadata allowance are charged; neither is process RSS or a guarantee of
 /// total kernel memory. FD slots are a caller reservation, not an OS limit.
@@ -368,6 +376,147 @@ pub(crate) fn check_counter_endpoints_fit(
         ));
     }
     Ok(())
+}
+
+/// Read transient bytes for a counter scrape: the per-CPU scratch plus RV
+/// staging plus membership and target checks. This replicates the reader's
+/// `transient_bytes` plus its acquire extras exactly; the reader test pins
+/// equality for every mode and CPU count.
+pub(crate) fn counter_read_transient_bytes(
+    mode: CounterMode,
+    cpus: usize,
+    rv_keys: usize,
+    logical_slots: usize,
+    row_count: usize,
+) -> Result<usize, BankRefusal> {
+    use p11scope_ebpf_common::RvKey;
+    if cpus == 0 {
+        return Err(BankRefusal::Topology);
+    }
+    let value = usize::try_from(mode.stats_bytes())
+        .ok()
+        .and_then(|value| value.checked_next_multiple_of(8))
+        .ok_or(BankRefusal::Budget)?;
+    let capacity = cpus.checked_next_power_of_two().ok_or(BankRefusal::Budget)?.max(4);
+    let cells = cpus
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(capacity.checked_mul(2)?))
+        .ok_or(BankRefusal::Budget)?;
+    value
+        .checked_mul(cells)
+        .and_then(|n| n.checked_add(rv_keys.checked_mul(size_of::<(RvKey, u64)>())?))
+        .and_then(|n| n.checked_add(5 * OWNED_ALLOCATION_PADDING))
+        .and_then(|n| n.checked_add(logical_slots))
+        .and_then(|n| n.checked_add(row_count.checked_mul(size_of::<AttachKey>())?))
+        .and_then(|n| n.checked_add(2 * OWNED_ALLOCATION_PADDING))
+        .ok_or(BankRefusal::Budget)
+}
+
+/// Conservative upper bound for one `ReadReservation` (row Vec plus RV
+/// trees plus view overhead). The per-row 1024 bytes dominate `CounterRow`;
+/// the tree formula matches the collector's node bound for `u64,u64`.
+pub(crate) fn counter_read_storage_bytes(
+    rows: usize,
+    rv_keys: usize,
+) -> Result<usize, BankRefusal> {
+    let vector = rows
+        .checked_mul(1024)
+        .and_then(|n| n.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(BankRefusal::Budget)?;
+    let node = 16usize
+        .checked_add(11usize.checked_mul(16).ok_or(BankRefusal::Budget)?)
+        .and_then(|n| n.checked_add(12 * 8))
+        .and_then(|n| n.checked_add(OWNED_ALLOCATION_PADDING))
+        .ok_or(BankRefusal::Budget)?;
+    let tree = rv_keys
+        .checked_add(rows)
+        .and_then(|entries| entries.checked_add(8))
+        .and_then(|entries| entries.checked_mul(node))
+        .ok_or(BankRefusal::Budget)?;
+    vector
+        .checked_add(tree)
+        .and_then(|n| n.checked_add(1024))
+        .ok_or(BankRefusal::Budget)
+}
+
+/// Snapshot bytes for a published selection: rows plus indices plus
+/// endpoint evidence plus the physical prefix and view overhead. Shared by
+/// the live snapshot and the terminal reserve, so both move together.
+pub(crate) fn counter_snapshot_bytes_for(
+    published: usize,
+    positions: usize,
+) -> Result<usize, BankRefusal> {
+    published
+        .checked_mul(size_of::<PublishedRow>() + size_of::<u32>() + size_of::<(u64, u64, u64)>())
+        .and_then(|n| {
+            n.checked_add(positions.checked_mul(size_of::<AttachKey>() + 1)?)
+        })
+        .and_then(|n| n.checked_add(size_of::<CounterBankView>() + 5 * OWNED_ALLOCATION_PADDING))
+        .ok_or(BankRefusal::Budget)
+}
+
+/// Terminal close bookkeeping: link retire, map close and keepalive drop.
+/// Fixed 1 MiB upper bound; the terminal hold keeps it unspendable too.
+pub(crate) const COUNTER_TERMINAL_CLEANUP_BYTES: usize = 1024 * 1024;
+
+/// Terminal-read lease for the ceiling: storage plus transient at
+/// (8192 rows, 65536 RV keys, P possible CPUs) plus the snapshot and
+/// cleanup bookkeeping. Growth can never spend it.
+pub(crate) fn counter_terminal_reserve_bytes(
+    mode: CounterMode,
+    cpus: usize,
+) -> Result<usize, BankRefusal> {
+    let storage = counter_read_storage_bytes(8192, 65536)?;
+    let transient = counter_read_transient_bytes(mode, cpus, 65536, 8192, 8192)?;
+    let snapshot = counter_snapshot_bytes_for(8192, 8192)?;
+    storage
+        .checked_add(transient)
+        .and_then(|n| n.checked_add(snapshot))
+        .and_then(|n| n.checked_add(COUNTER_TERMINAL_CLEANUP_BYTES))
+        .ok_or(BankRefusal::Budget)
+}
+
+/// Typed counter budgets view. No public output yet; A2.10 renders it.
+/// Endpoints come from the directory, RV/START limits from the geometry,
+/// RV used from the reader's bounded iteration, FD soft from the OS, memory
+/// from the fixed precharge plus allocated banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterEndpointBudgets {
+    pub published: usize,
+    pub holes: usize,
+    pub ceiling: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterRvBudgets {
+    pub used: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterStartBudgets {
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterFdBudgets {
+    pub projected: usize,
+    pub soft: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterMemoryBudgets {
+    pub charged: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterBudgets {
+    pub endpoints: CounterEndpointBudgets,
+    pub rv_keys: CounterRvBudgets,
+    pub start: CounterStartBudgets,
+    pub fd: CounterFdBudgets,
+    pub memory: CounterMemoryBudgets,
 }
 
 /// One private per-mode bank artifact of the default build. The load cell
@@ -1782,6 +1931,7 @@ pub(super) struct CounterBanks {
     backend: super::AttachBackend,
     // Immutable geometry avoids reentering the Directory lock during stage.
     link_staging: Arc<AtomicU64>,
+    terminal: Option<ResourceLease>,
 }
 
 pub(super) struct CounterPreparation<'a> {
@@ -1897,6 +2047,11 @@ impl<'a> CounterPreparation<'a> {
         );
         check_counter_endpoints_fit(geometry.mode(), cpus, 1)
             .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+        let terminal_bytes = counter_terminal_reserve_bytes(geometry.mode(), cpus)
+            .map_err(|_| anyhow::anyhow!("counter terminal reserve overflow"))?;
+        let terminal = reserve
+            .reserve(terminal_bytes)
+            .map_err(|_| anyhow::anyhow!("counter terminal reserve refused"))?;
         let parsed = aya_obj::Object::parse(object).context("parsing selected counter artifact")?;
         // Parse and validate actual maps/template before common loading can
         // attach lifecycle roots. An emitted token alone grants no shape.
@@ -1968,6 +2123,7 @@ impl<'a> CounterPreparation<'a> {
                 geometry,
                 backend,
                 link_staging: Arc::new(AtomicU64::new(0)),
+                terminal: Some(terminal),
             },
             _scratch: scratch,
         })
@@ -2967,6 +3123,60 @@ impl CounterBanks {
         self.geometry.mode()
     }
 
+    fn budgets(&self, rv_used: usize) -> Result<CounterBudgets, BankRefusal> {
+        let directory = self
+            .directory
+            .lock()
+            .map_err(|_| BankRefusal::Quarantined)?;
+        if directory.geometry != self.geometry {
+            return Err(BankRefusal::Shape(BankShapeCause::SnapshotGeometryChanged));
+        }
+        self.geometry.validate()?;
+        let published = directory.published_indices().count();
+        let holes = directory
+            .positions
+            .iter()
+            .filter(|position| matches!(position.state, PositionState::NeverPublishedRetired))
+            .count();
+        let ceiling = self.geometry.limit() as usize;
+        let rv_limit = self.geometry.rv_keys();
+        if rv_used > rv_limit {
+            return Err(BankRefusal::Topology);
+        }
+        let allocated_banks = directory.bank_ids.iter().flatten().count();
+        let projected = published
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(allocated_banks))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(BankRefusal::Budget)?;
+        let soft = match read_fd_snapshot()?.soft_limit {
+            FdLimit::Finite(limit) => Some(limit),
+            FdLimit::Unlimited => None,
+        };
+        let fixed = counter_fixed_map_bytes(self.cpus)?;
+        let per_bank = self.geometry.bank_payload_bytes(self.cpus)?;
+        let charged = fixed
+            .checked_add(allocated_banks.checked_mul(per_bank).ok_or(BankRefusal::Budget)?)
+            .ok_or(BankRefusal::Budget)?;
+        Ok(CounterBudgets {
+            endpoints: CounterEndpointBudgets {
+                published,
+                holes,
+                ceiling,
+            },
+            rv_keys: CounterRvBudgets {
+                used: rv_used,
+                limit: rv_limit,
+            },
+            start: CounterStartBudgets { limit: 16384 },
+            fd: CounterFdBudgets { projected, soft },
+            memory: CounterMemoryBudgets {
+                charged,
+                limit: COUNTER_MAP_MEMORY_LIMIT,
+            },
+        })
+    }
+
     pub(super) fn validate_backend(
         &self,
         backend: super::AttachBackend,
@@ -3259,22 +3469,7 @@ impl CounterBanks {
             return Err(BankRefusal::Topology);
         }
         let count = directory.published_indices().count();
-        let bytes = count
-            .checked_mul(
-                size_of::<PublishedRow>() + size_of::<u32>() + size_of::<(u64, u64, u64)>(),
-            )
-            .and_then(|n| {
-                n.checked_add(
-                    directory
-                        .positions
-                        .len()
-                        .checked_mul(size_of::<AttachKey>() + 1)?,
-                )
-            })
-            .and_then(|n| {
-                n.checked_add(size_of::<CounterBankView>() + 5 * OWNED_ALLOCATION_PADDING)
-            })
-            .ok_or(BankRefusal::Budget)?;
+        let bytes = counter_snapshot_bytes_for(count, directory.positions.len())?;
         let storage = reserve.reserve(bytes).map_err(|_| BankRefusal::Budget)?;
         let custody = self
             .keepalive
@@ -3436,6 +3631,16 @@ impl Session {
             banks: custody.banks.clone(),
             snapshot,
         })
+    }
+
+    pub(crate) fn counter_budgets(
+        &self,
+        rv_used: usize,
+    ) -> Result<CounterBudgets, BankRefusal> {
+        self.counter_banks
+            .as_ref()
+            .ok_or(BankRefusal::Shape(BankShapeCause::BanksMissingForView))?
+            .budgets(rv_used)
     }
 }
 
@@ -5582,6 +5787,7 @@ pub(crate) mod tests {
             cpus: 2,
             backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
+            terminal: None,
         };
         let targets = plan(2).slots;
         assert!(!banks.permits_link_stage(&targets));
@@ -6046,6 +6252,7 @@ pub(crate) mod tests {
             cpus: 2,
             backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
+            terminal: None,
         }
     }
 
@@ -6164,6 +6371,7 @@ pub(crate) mod tests {
                 cpus: 2,
                 backend: super::super::AttachBackend::Singles,
                 link_staging: Arc::new(AtomicU64::new(0)),
+                terminal: None,
             },
             pool,
             digest,
@@ -7402,6 +7610,7 @@ pub(crate) mod tests {
                 cpus: 2,
                 geometry,
                 link_staging: Arc::new(AtomicU64::new(0)),
+                terminal: None,
                 backend,
             };
             let foreign = if backend == AttachBackend::Singles {

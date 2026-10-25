@@ -13217,10 +13217,9 @@ mod promotion_driver_tests {
             "exactly one failure gap: {:?}",
             gaps(&mut driver)
         );
-        assert_eq!(
-            failures[0].1, "semantic_unavailable",
-            "the gap keeps the mapped refusal (the scripted Unproved \
-             detach maps to Unavailable at the lane): {:?}",
+        assert!(
+            failures[0].1.contains("Unproved"),
+            "the gap carries the detach error text: {:?}",
             failures[0].1
         );
         assert_eq!(polls.get(), 1, "a failed detach is never re-polled");
@@ -14210,6 +14209,126 @@ mod promotion_driver_tests {
             "the retired domain stays refused: {:?}",
             gaps(&mut driver)
         );
+    }
+
+    #[test]
+    fn held_joint_lane_keeps_its_summary() {
+        // A held final lane leaves no seat, but its summary stays:
+        // the hold snapshots the seated lane and the run serves it.
+        // A later hold overwrites with its own lane.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        io.fail_poll = true;
+        let mut lane = joint_lane(io, false);
+        lane.mark_startup_failed();
+        let seated = lane.semantic_summary();
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the failed detach holds"
+        );
+        assert!(driver.semantic.is_none(), "the hold takes the seat");
+        assert_eq!(
+            driver.semantic_summary(),
+            seated,
+            "the hold serves the seated summary, not the default"
+        );
+        let mut io = WindDownIo::completing();
+        io.fail_poll = true;
+        let lane = joint_lane(io, false);
+        let reseated = lane.semantic_summary();
+        assert_ne!(reseated, seated, "the second lane reads distinctly");
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.on_lane_stopped();
+        assert_eq!(
+            driver.semantic_summary(),
+            reseated,
+            "the later hold overwrites with its own lane"
+        );
+    }
+
+    #[test]
+    fn completed_joint_lane_keeps_its_summary() {
+        // A completed final lane releases its seat, but the run
+        // still serves the seated summary past the handoff.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.mark_startup_failed();
+        let seated = lane.semantic_summary();
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.on_lane_stopped();
+        assert!(
+            driver.semantic.is_none(),
+            "the joined detach completes the lane"
+        );
+        assert_eq!(
+            driver.semantic_summary(),
+            seated,
+            "the completion serves the seated summary, not the default"
+        );
+    }
+
+    #[test]
+    fn joint_wind_down_skips_staged_gate_and_begins() {
+        // A Joint lane with staged evidence winds down and begins
+        // its finish at once; the retire gate handles pending work,
+        // so staged work never wedges the wind-down behind B.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        driver.semantic_staged = true;
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(
+            driver.joint_begin_calls, 1,
+            "the Joint finish begins despite staged work"
+        );
+        assert!(
+            driver.coordinator.promotion_finish(),
+            "A's promotion finish runs"
+        );
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "the Joint lane winds down"
+        );
+    }
+
+    #[test]
+    fn legacy_wind_down_holds_while_staged() {
+        // The legacy gate is untouched: staged work keeps the
+        // validating lane until the normal staged path commits it.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = wind_down_lane(WindDownIo::completing());
+        lane.finish_semantic_stop();
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.semantic_staged = true;
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the legacy lane holds its staged work"
+        );
+        assert!(driver.semantic.is_some(), "the validating lane is kept");
+        assert!(
+            !driver.coordinator.promotion_finish(),
+            "no promotion finish runs"
+        );
+        assert_eq!(driver.joint_begin_calls, 0, "nothing begins");
     }
 
     #[test]

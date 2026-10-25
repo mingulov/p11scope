@@ -6674,6 +6674,230 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_map_memory_table_reports_fixed_per_bank_and_ceiling() {
+        use super::{
+            COUNTER_MAP_MEMORY_LIMIT, check_counter_map_memory, counter_affordable_banks,
+            counter_affordable_endpoints, counter_bank_map_bytes, counter_fixed_map_bytes,
+        };
+        let modes = [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ];
+        let cpus_list = [1usize, 4, 12, 64, 128, 172, 256];
+        println!("mode P fixed per_bank banks endpoints total");
+        for mode in modes {
+            for cpus in cpus_list {
+                let fixed = counter_fixed_map_bytes(cpus).unwrap();
+                let per_bank = counter_bank_map_bytes(mode, cpus).unwrap();
+                let banks = counter_affordable_banks(mode, cpus).unwrap();
+                let endpoints = counter_affordable_endpoints(mode, cpus).unwrap();
+                assert_eq!(endpoints, banks * 512, "{mode:?} P={cpus}");
+                assert!(banks <= 16, "{mode:?} P={cpus}: {banks} banks");
+                let total = fixed
+                    .checked_add(banks.checked_mul(per_bank).unwrap())
+                    .unwrap();
+                assert!(
+                    total <= COUNTER_MAP_MEMORY_LIMIT,
+                    "{mode:?} P={cpus}: {total} > {COUNTER_MAP_MEMORY_LIMIT}"
+                );
+                if banks < 16 {
+                    let next = fixed
+                        .checked_add((banks + 1).checked_mul(per_bank).unwrap())
+                        .unwrap();
+                    assert!(
+                        next > COUNTER_MAP_MEMORY_LIMIT,
+                        "{mode:?} P={cpus}: next {next} still fits"
+                    );
+                    let refusal = check_counter_map_memory(mode, cpus, banks + 1);
+                    assert!(
+                        matches!(
+                            refusal,
+                            Err(BankRefusal::BudgetExhausted {
+                                resource: "counter-memory-limit",
+                                ..
+                            })
+                        ),
+                        "{mode:?} P={cpus}: {refusal:?}"
+                    );
+                }
+                assert!(
+                    check_counter_map_memory(mode, cpus, banks).is_ok(),
+                    "{mode:?} P={cpus}: affordable {banks} banks must fit"
+                );
+                println!(
+                    "{} {cpus} {fixed} {per_bank} {banks} {endpoints} {total}",
+                    mode.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counter_fixed_map_bytes_match_configured_payload() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            return;
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let embedded = super::counter_object_for_mode(mode);
+            let object = aya_obj::Object::parse(embedded).unwrap();
+            for cpus in [1usize, 12, 256] {
+                let mut fixed = 0usize;
+                for name in ["RV_COUNTS", "START", "STATS"] {
+                    let map = object.maps.get(name).unwrap();
+                    fixed = fixed
+                        .checked_add(super::configured_payload(map, cpus).unwrap())
+                        .unwrap();
+                }
+                assert_eq!(
+                    super::counter_fixed_map_bytes(cpus).unwrap(),
+                    fixed,
+                    "{mode:?} P={cpus}: fixed must equal the configured payload"
+                );
+            }
+            let stats = object.maps.get("STATS").unwrap();
+            assert_eq!(stats.value_size(), 24, "{mode:?} aggregate template");
+        }
+    }
+
+    #[test]
+    fn counter_map_memory_preflight_names_mode_cpus_and_ceiling() {
+        use super::{counter_affordable_endpoints, counter_bank_map_bytes, counter_fixed_map_bytes};
+        for (mode, cpus) in [
+            (CounterMode::Counts, 256usize),
+            (CounterMode::Timestamps, 256),
+            (CounterMode::Latency, 256),
+            (CounterMode::Latency, 12),
+        ] {
+            let fixed = counter_fixed_map_bytes(cpus).unwrap();
+            let per_bank = counter_bank_map_bytes(mode, cpus).unwrap();
+            let ceiling = counter_affordable_endpoints(mode, cpus).unwrap();
+            assert!(
+                super::check_counter_endpoints_fit(mode, cpus, ceiling).is_ok(),
+                "{mode:?} P={cpus}: ceiling {ceiling} must fit"
+            );
+            if ceiling < 8192 {
+                let refusal = super::check_counter_endpoints_fit(mode, cpus, ceiling + 1)
+                    .expect_err("N+1 must refuse");
+                for word in [
+                    "counter-memory-limit",
+                    mode.name(),
+                    &cpus.to_string(),
+                    &fixed.to_string(),
+                    &per_bank.to_string(),
+                    &ceiling.to_string(),
+                ] {
+                    assert!(
+                        refusal.contains(word),
+                        "{mode:?} P={cpus}: message names {word}: {refusal}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counter_memory_growth_to_ceiling_then_n_plus_one_refuses() {
+        use super::{BankExtent, BankGeometry, counter_affordable_endpoints};
+        let mode = CounterMode::Latency;
+        let cpus = 256usize;
+        let ceiling = counter_affordable_endpoints(mode, cpus).unwrap();
+        assert!(
+            ceiling > 512 && ceiling < 8192 && ceiling % 512 == 0,
+            "latency P=256 must have a partial ceiling, got {ceiling}"
+        );
+        let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+        let mut directory = BankDirectory::growth_v2_for(mode);
+        let mut history = plan(512);
+        let mut io = GrowthIo::new(&pool);
+        io.cpus = cpus;
+        let envelope_for = |all: usize, first: u32, end: u32, old_capacity: usize, new_banks: usize| {
+            let all_plan = plan(all as u32);
+            estimate_counter_stage_reservation(
+                mode,
+                16,
+                512,
+                &all_plan.slots,
+                first,
+                end,
+                old_capacity,
+                cpus,
+                new_banks,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                envelope_for(512, 0, 512, 0, 1),
+                &pool.reserver()
+            ),
+            BankPublication::Published { extent, .. }
+                if extent == BankExtent { first: 0, end: 512 }
+        ));
+        history.extend_exact(plan(ceiling as u32)).unwrap();
+        io.next_stage();
+        let banks_after_first = 1usize;
+        let banks_after_second = ceiling / 512;
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                envelope_for(
+                    ceiling,
+                    512,
+                    ceiling as u32,
+                    512,
+                    banks_after_second - banks_after_first
+                ),
+                &pool.reserver()
+            ),
+            BankPublication::Published { extent, .. }
+                if extent == BankExtent { first: 512, end: ceiling as u32 }
+        ));
+        let published_before: Vec<u32> = directory.published_indices().collect();
+        assert_eq!(published_before.len(), ceiling);
+        history.extend_exact(plan(ceiling as u32 + 1)).unwrap();
+        io.next_stage();
+        let result = directory.stage_with(
+            &mut io,
+            &mut history,
+            envelope_for(ceiling + 1, ceiling as u32, ceiling as u32 + 1, ceiling, 1),
+            &pool.reserver(),
+        );
+        assert!(
+            matches!(
+                result,
+                BankPublication::Refused(BankRefusal::BudgetExhausted {
+                    resource: "counter-memory-limit",
+                    ..
+                })
+            ),
+            "N+1 must refuse the memory cap: {result:?}"
+        );
+        let published_after: Vec<u32> = directory.published_indices().collect();
+        assert_eq!(
+            published_after, published_before,
+            "the published prefix stays intact"
+        );
+        assert_eq!(io.routes.len(), ceiling, "routes keep the prefix");
+        assert_eq!(
+            directory.allocated_high_water(),
+            ceiling,
+            "no hole consumes the refused extent"
+        );
+        let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
+        let _ = geometry;
+    }
+
+    #[test]
     fn counter_bank_multi_storage_remains_paid_after_clean_rollback() {
         use super::super::RegisteredLink;
         for short in [None, Some(0), Some(1), Some(2)] {

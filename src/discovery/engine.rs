@@ -22983,11 +22983,9 @@ impl Engine {
                 graph.phase = GraphPhase::Done;
                 return Self::graph_idle(true);
             }
-            let storage = ConservativePinSelection::storage_bound(
-                graph.sel_count.0,
-                graph.sel_count.1,
-            )
-            .and_then(|bytes| reserve.reserve(bytes).ok());
+            let storage =
+                ConservativePinSelection::storage_bound(graph.sel_count.0, graph.sel_count.1)
+                    .and_then(|bytes| reserve.reserve(bytes).ok());
             let Some(storage) = storage else {
                 self.refuse_graph_before_native(graph);
                 return Self::graph_idle(true);
@@ -23490,9 +23488,7 @@ impl Engine {
                 .map(|plan| plan.skipped.len())
                 .unwrap_or(0);
             let skips_len = graph.facts.skips.len();
-            let total = old_len
-                .saturating_add(cursor_len)
-                .saturating_add(skips_len);
+            let total = old_len.saturating_add(cursor_len).saturating_add(skips_len);
             let from = graph.facts.index;
             let until = total.min(from.saturating_add(GRAPH_STRIDE));
             let mut bytes = graph.facts.measure_bytes;
@@ -23892,11 +23888,7 @@ impl Engine {
         if graph.facts.substep == 1 {
             // Cursor-plan slot index for proof target lookups, sliced
             // directly off the cursor plan: no whole-plan Vec per credit.
-            let slots_len = graph
-                .plan
-                .plan()
-                .map(|plan| plan.slots.len())
-                .unwrap_or(0);
+            let slots_len = graph.plan.plan().map(|plan| plan.slots.len()).unwrap_or(0);
             let from = graph.facts.index;
             let until = slots_len.min(from.saturating_add(GRAPH_STRIDE));
             let cursor = graph.plan.plan().expect("cursor checked above");

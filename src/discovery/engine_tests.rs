@@ -47154,9 +47154,10 @@ fn drive_graph_until(
             std::time::Instant::now() < deadline,
             "the graph did not settle within 30 s ({credits} credits)"
         );
-        let worker_settling = engine.collected_graph.as_ref().is_some_and(|graph| {
-            graph.phase == GraphPhase::NativePoll || graph.native_cancel_owed
-        });
+        let worker_settling = engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll || graph.native_cancel_owed);
         if worker_settling {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -47517,10 +47518,7 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
         "the owed cancel settles within bounded credits ({credits})"
     );
     let graph = case.engine.collected_graph.as_ref().expect("boxed");
-    assert!(
-        graph.removed.is_some(),
-        "the owed cancel returns the input"
-    );
+    assert!(graph.removed.is_some(), "the owed cancel returns the input");
     assert!(
         !case
             .session
@@ -48045,7 +48043,10 @@ fn collected_graph_reclaim_drains_removed_rows_and_selection() {
         graph.removed.is_none(),
         "Closed splits the input into removed rows"
     );
-    eprintln!("reclaim-drain: removed rows at Install: {}", graph.removed_rows.len());
+    eprintln!(
+        "reclaim-drain: removed rows at Install: {}",
+        graph.removed_rows.len()
+    );
     assert!(
         !graph.removed_rows.is_empty(),
         "the removed rows move into removed_rows"

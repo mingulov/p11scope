@@ -13064,6 +13064,36 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn wind_down_io_threads_spy_records_the_polling_thread() {
+        // The OQ-2 "same worker thread" check is only as good as
+        // its spy: poll a gated cleanup twice on a worker thread
+        // (the I/O is built inside, so nothing !Send crosses) and
+        // prove the recorded ids are the worker's, not the test
+        // thread's.
+        use crate::inventory_semantics::LaneTestIo;
+        let test_thread = std::thread::current().id();
+        let (recorded, worker) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let (mut io, _gate) = WindDownIo::gated();
+                    let mut sink = std::io::sink();
+                    for _ in 0..2 {
+                        let _ = io.poll_terminal_detach(&mut sink);
+                    }
+                    (io.threads.borrow().clone(), std::thread::current().id())
+                })
+                .join()
+                .expect("the worker polls twice")
+        });
+        assert_ne!(worker, test_thread, "the worker is not the test thread");
+        assert_eq!(
+            recorded,
+            vec![worker, worker],
+            "the spy records the polling thread"
+        );
+    }
+
+    #[test]
     fn wind_down_cancel_returns_promptly_and_retains_pending_cleanup() {
         let mut coordinator = coordinator();
         let headless = headless_display();
@@ -13150,10 +13180,22 @@ mod promotion_driver_tests {
         assert_eq!(submits.get(), 1, "the cleanup submits once");
         assert!(polls.get() >= 3, "every tick reaps without joining");
         {
+            // The reaps run on the tick thread with no hop; the
+            // spy itself is proved faithful on a worker thread by
+            // `wind_down_io_threads_spy_records_the_polling_thread`.
+            // Running full ticks on a worker thread needs the
+            // driver (Rc spies, `Box<dyn LaneTestIo>`) to turn
+            // Send — refused as fixture churn for this minor
+            // (R1.4 minor ruling).
             let threads = threads.borrow();
             assert!(
                 threads.len() >= 3 && threads.iter().all(|id| *id == threads[0]),
                 "the same worker thread reaps every poll"
+            );
+            assert_eq!(
+                threads[0],
+                std::thread::current().id(),
+                "the reaps run on the tick thread"
             );
         }
         release_gate(&gate);

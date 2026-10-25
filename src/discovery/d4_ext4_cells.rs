@@ -352,15 +352,17 @@ fn ext4_index(
 }
 
 /// What the kernel leg observably did: the fallback ledger, the
-/// userspace reads it performed, and the index preconditions. Identity
-/// rows carry the no-proof classification with no per-range key; the
-/// stale-key row carries its unusable-line classification with the key in
-/// the prove set (refused before proof). (Installed anchor slots are
-/// asserted on the index directly by the drivers: anchors install for
-/// arena-mapped files on any filesystem.)
+/// userspace reads it performed, the instrumented `bpf()` wrapper calls
+/// across the leg, and the index preconditions. Identity rows carry the
+/// no-proof classification with no per-range key; the stale-key row
+/// carries its unusable-line classification with the key in the prove
+/// set (refused before proof). (Installed anchor slots are asserted on
+/// the index directly by the drivers: anchors install for arena-mapped
+/// files on any filesystem.)
 struct Ext4LegEvidence {
     fallback: crate::discovery::kernel_identity::KernelFallbackTotals,
     userspace_reads: usize,
+    bpf_calls: u64,
     per_range_key: bool,
     no_proof_classification: Option<&'static str>,
 }
@@ -724,6 +726,7 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
+        bpf_calls: 0,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -814,6 +817,7 @@ fn d4_ext4_kernel_no_run_stale_key_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
+        bpf_calls: 0,
         per_range_key: true,
         no_proof_classification: Some("no kernel proof (unusable line)"),
     };
@@ -900,6 +904,7 @@ fn d4_ext4_kernel_live_holder_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
+        bpf_calls: 0,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -971,6 +976,26 @@ fn ext4_reuse_kernel_leg_runs_zero_targets() {
         )
         .is_err(),
         "zero targets means no kernel-proof evidence"
+    );
+    // A leg that issued bpf() calls ran a target (one run needs at
+    // least link + iterator creation): zero targets means a zero
+    // instrumented delta.
+    let called = Ext4LegEvidence {
+        bpf_calls: 2,
+        ..synthetic_no_run_identity_evidence()
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &exited,
+            &exited,
+            &called,
+            Ext4Expect::RecycledRefused,
+        )
+        .is_err(),
+        "zero targets means zero bpf() calls"
     );
 }
 
@@ -1302,6 +1327,25 @@ fn ext4_stale_key_evaluator_refuses_before_proof() {
         .is_err(),
         "a stale classification with per_range_key=false must fail"
     );
+    // The stale leg runs zero targets too: a nonzero instrumented
+    // delta (one run needs at least link + iterator creation) fails.
+    let called = Ext4LegEvidence {
+        bpf_calls: 2,
+        ..synthetic_no_run_stale_evidence()
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &refused,
+            &refused,
+            &called,
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "the stale leg runs zero targets: zero bpf() calls"
+    );
     // An edge for the stale key joins and must fail.
     let edged = synthetic_edged(pid, target.maps_key());
     assert!(
@@ -1409,6 +1453,25 @@ fn ext4_live_evaluator_edges_without_per_range_proof() {
         .is_err(),
         "the identity-key fallback reads nothing"
     );
+    // The identity-key fallback reaches its edge without a target run:
+    // a nonzero instrumented delta fails.
+    let called = Ext4LegEvidence {
+        bpf_calls: 2,
+        ..synthetic_live_identity_evidence()
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &truth,
+            &truth,
+            &edged,
+            &edged,
+            &called,
+            Ext4Expect::LiveHolderEdge,
+        )
+        .is_err(),
+        "the live edge without proof runs zero targets"
+    );
     // A refusal is not a live edge.
     let refused = synthetic_deleted();
     assert!(
@@ -1445,6 +1508,7 @@ fn synthetic_live_identity_evidence() -> Ext4LegEvidence {
             ),
         },
         userspace_reads: 0,
+        bpf_calls: 0,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     }
@@ -1491,6 +1555,7 @@ fn synthetic_quad_evidence() -> Ext4LegEvidence {
             first_reason: None,
         },
         userspace_reads: 0,
+        bpf_calls: 0,
         per_range_key: true,
         no_proof_classification: None,
     }
@@ -1505,6 +1570,7 @@ fn synthetic_no_run_identity_evidence() -> Ext4LegEvidence {
             first_reason: None,
         },
         userspace_reads: 0,
+        bpf_calls: 0,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     }
@@ -1519,6 +1585,7 @@ fn synthetic_no_run_stale_evidence() -> Ext4LegEvidence {
             first_reason: None,
         },
         userspace_reads: 0,
+        bpf_calls: 0,
         per_range_key: true,
         no_proof_classification: Some("no kernel proof (unusable line)"),
     }

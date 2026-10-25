@@ -247,6 +247,36 @@ fn inventory_exit_retention_completed_finalizer_still_reclaims_normally() {
     );
 }
 
+#[test]
+fn exit_retention_holds_without_drop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropSpy {
+        drops: std::sync::Arc<AtomicUsize>,
+    }
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct HeldOwner {
+        _spy: DropSpy,
+        _file: std::sync::Arc<std::fs::File>,
+    }
+
+    let drops = std::sync::Arc::new(AtomicUsize::new(0));
+    let file = std::sync::Arc::new(tempfile::tempfile().unwrap());
+    let pin = std::sync::Arc::downgrade(&file);
+    ExitRetention::hold(HeldOwner {
+        _spy: DropSpy {
+            drops: std::sync::Arc::clone(&drops),
+        },
+        _file: file,
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(pin.upgrade().is_some());
+}
+
 /// The existing scripted capture through the real PID-pin runtime seam.
 /// It supplies no kernel identity or privileged capture evidence.
 pub(crate) fn cgroup_runtime_lane() -> (

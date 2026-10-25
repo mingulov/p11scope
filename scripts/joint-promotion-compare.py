@@ -458,7 +458,10 @@ def _window_end(index, req):
 
 
 def compare_promotion(rows, events):
-    """Join ledger rows to evidence rows. Both must have been validated."""
+    """Join ledger rows to evidence rows. Both must have been validated.
+
+    The comparison needs populations on both sides: at least one drawn
+    request and at least one A hold window or B call, else it refuses."""
     begins, ends, calls, cancels, retires, alive = _ledger_index(rows)
     index = _events_index(events)
     drawn = index["drawn"]
@@ -567,10 +570,16 @@ def compare_promotion(rows, events):
             _require(stamp >= floor,
                      f"B admitted before A retires req {_shown(req)}")
     elif index["transfers"]:
+        _require(ends, "transfer without an A hold window")
         floor = max(t1 for _ref, t1 in ends.values())
         for req, (stamp, _seal) in sorted(index["transfers"].items()):
             _require(stamp >= floor,
                      f"B admitted before the A completion req {_shown(req)}")
+    # Minimum-population floor, checked after the specific joins so their
+    # reasons keep precedence: a comparison with zero populations on
+    # either side refuses instead of passing vacuously.
+    _require(drawn, "comparison without drawn populations")
+    _require(begins or calls, "comparison without ledger populations")
     return {"reqs": len(drawn),
             "detailed": len(detailed),
             "transfers": len(index["transfers"])}

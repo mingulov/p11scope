@@ -665,37 +665,51 @@ capture behavior or establish the provenance of its input files.
 ### Overlay xino/copy-up identity divergences (D-C7-2/D-C7-3)
 
 - What the user sees: provider files reached through an overlay merge
-  can attribute differently by lane and xino mode. Before 6.8 a copy-up
-  splits identity: the pre-copy-up anchor names the lower file while new
-  mappers name the upper file, so neither leg joins (parity none,
-  disclosed). Two mounts over one lower join on the kernel side only
-  (D-C7-2, lanes A: a kernel edge against physical truth with a
-  userspace named mismatch) and never join on lane B. After a copy-up
-  on lane B the stable overlay inode can join the upper mapper to the
-  stale lower anchor on the userspace side while the kernel correctly
-  refuses (D-C7-3, lanes B). With xino off, equal real inode numbers on
-  distinct layers collide on the overlay device on lane B (a named
-  mismatch, never an edge), while on lane A each layer keeps its real
-  device in the key so there is no collision (parity none); with xino
-  off × post-copy-up the userspace edge follows recorded truth because
-  st_ino is non-persistent.
+  can attribute differently depending on the kernel and on whether a
+  file was copied up (the first write through the merge copies the
+  lower file to the upper layer). Before 6.8 (lane A) a copy-up splits
+  identity: the pre-copy-up anchor names the lower file while new
+  mappers name the upper file, so neither side joins (no edge on
+  either backend, disclosed). Two mounts over one lower file join on
+  the kernel side only before 6.8 (D-C7-2: the kernel correctly
+  reports the same underlying file while the userspace side reports a
+  named mismatch), and never join on 6.8+ (lane B). After a copy-up on
+  6.8+ the overlay's stable file number can join the upper mapper to
+  the stale lower anchor on the userspace side while the kernel
+  correctly refuses (D-C7-3): that userspace edge can join a file
+  whose bytes changed (the copy-up wrote new bytes). With xino off,
+  equal real file numbers on distinct layers collide on the overlay
+  device on 6.8+ (a named mismatch, never an edge), while before 6.8
+  each layer keeps its real device in the key so there is no
+  collision; with xino off after a copy-up the userspace edge follows
+  what the filesystem reports because file numbers there are
+  non-persistent.
 - Kernels/conditions: overlayfs merges with xino on, off, or
-  same-filesystem layers; the tabled cells qualify 6.1/6.6 (lane A) and
-  6.8+/7.x (lane B). Same-layer layouts behave like xino on. An overlay
-  row is only claimed when the stat-based xino check agrees with the
+  same-filesystem layers. Measured on 6.1.188 and 6.6.157 (lane A)
+  and on 7.0 (lane B: host, plus a 7.0.14 guest run); other 6.8+
+  kernels (6.8.0-142, 6.12.111, 7.2.6) have not run these cells.
+  Same-layer layouts behave like xino on: that avoids only the
+  xino-off collision, not the copy-up false edge. An overlay row is
+  only claimed when the stat-based xino check agrees with the
   requested mode (never mountinfo).
-- Disclosure: per-row `D4_OVERLAY` cell verdicts with recorded ground
-  truth, and `identity_mismatch` losses where a join is refused. A D-C7-3
-  userspace edge stands disclosed as backend-divergent until the copy-up
-  investigation lands its guard.
-- Workaround: same-filesystem layer layouts (behave like xino on);
-  avoid post-copy-up attribution windows for replaced providers.
-- Status: the overlay rows are ready, and the ext4 row qualified on
-  host 7.0 and guests 6.1.188, 6.6.157 and 7.0.14. Investigation
-  verdict: no E3 userspace guard fits already-captured fields (the proof
-  boundary carries dev/ino only, all stable across copy-up), and E4
-  layer-index tracking is rejected for v0.5.0 (needs kernel/container
-  changes). The RED copy-up reproducer stays; this disclosure is final.
+- Disclosure: a refused join surfaces as an `identity_mismatch` loss.
+  Nothing in the output marks a userspace edge that survived a
+  copy-up: it reads like any other edge.
+- Workaround: run system-scope inventory with `--identity-backend
+  kernel`: the kernel check compares the underlying files directly
+  and refuses the copy-up edge (named mismatch, no edge). Confirm the
+  kernel check ran from the report's `observation.identity`
+  (`backend: kernel` with no `fallback`); without kernel-identity
+  support the command refuses to run rather than silently using the
+  userspace side. Under the default backend the false edge can
+  appear. Same-filesystem layer layouts and avoiding post-copy-up
+  attribution windows for replaced providers reduce exposure but do
+  not remove the copy-up edge.
+- Status: investigation verdict: no userspace-side guard fits the
+  already-captured fields (the proof carries device and file numbers
+  only, all unchanged across copy-up), and layer-index tracking needs
+  kernel/container changes rejected for v0.5.0. This disclosure is
+  final.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

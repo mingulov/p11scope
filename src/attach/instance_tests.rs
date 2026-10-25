@@ -1113,8 +1113,10 @@ fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> 
     target.command(b'c')?;
     let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
 
-    // A real external shared-mm mutation must still renew the instance.
-    // Establish this before the preservation assertion, including on RED.
+    // A real external shared-mm mutation advances only the per-file
+    // global epoch: the target's mapping and own epoch are unchanged, so
+    // the instance continues. Establish this before the preservation
+    // assertion, including on RED.
     let mutation_before = harness.session.instance_maps().counters()?;
     ensure!(target.command(b'v')? == "SHARER");
     let mutation_after = harness.session.instance_maps().counters()?;
@@ -1123,10 +1125,22 @@ fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> 
     ensure!(
         mutation_after.global_bumps > mutation_before.global_bumps
             && mutation_after.shared > mutation_before.shared
-            && after_mutation != first,
-        "real shared-mm mutation did not renew the watched instance: \
+            && mutation_after.local_bumps == mutation_before.local_bumps
+            && after_mutation == first,
+        "a foreign shared-mm mutation did not continue the watched instance: \
          {mutation_before:?} -> {mutation_after:?}"
     );
+
+    // Renewing control: the target's own mapping changes still mint.
+    // Later checks compare against the last own instance.
+    target.command(b'p')?;
+    target.command(b'c')?;
+    let own = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(own != first, "the target's own mapping kept the instance");
+    target.command(b'P')?;
+    target.command(b'c')?;
+    let own2 = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(own2 != own, "the target's own unmap kept the instance");
 
     // The unexcluded anchor path must also exercise the actual native
     // witness. Excluding selected files changes no BPF hook semantics.
@@ -1157,8 +1171,10 @@ fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> 
     target.command(b'c')?;
     let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(
-        unexcluded_after.global > unexcluded_before.global && original != after_mutation,
-        "unexcluded System identity anchors did not renew the actual watched instance"
+        unexcluded_after.global > unexcluded_before.global
+            && unexcluded_after.local == unexcluded_before.local
+            && original == own2,
+        "unexcluded System identity anchors did not continue the actual watched instance"
     );
 
     let retained = harness
@@ -1295,18 +1311,34 @@ fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
     // Establish the genuine global-mutation control before the regression
     // assertion, so RED still proves that the real hooks and router respond.
     // The existing fixture's short-lived CLONE_VM child is reaped by 'v'.
+    // A foreign mutation moves only the global epoch, so it continues.
     let external_before = harness.session.instance_maps().counters()?;
     ensure!(target.command(b'v')? == "SHARER");
     let external_after = harness.session.instance_maps().counters()?;
     target.command(b'c')?;
-    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let after_external = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(
         external_after.global_bumps > external_before.global_bumps
             && external_after.shared > external_before.shared
-            && original != first,
-        "a real external shared-mm mutation must change the instance: \
+            && external_after.local_bumps == external_before.local_bumps
+            && after_external == first,
+        "a real external shared-mm mutation did not continue the instance: \
          {external_before:?} -> {external_after:?}"
     );
+
+    // Renewing control: the target's own mapping changes still mint.
+    // Later checks compare against the last own instance.
+    target.command(b'p')?;
+    target.command(b'c')?;
+    let own = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        own != after_external,
+        "the target's own mapping kept the instance"
+    );
+    target.command(b'P')?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(original != own, "the target's own unmap kept the instance");
     let pid = target.pid();
     let pin = target.pin.clone();
     let cookie = harness
@@ -1478,19 +1510,23 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     let d = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(d != moved, "provider unmap kept the instance");
     // A CLONE_VM non-thread child mutating the provider in the shared mm:
-    // marked at fork, its mutations go to the file's global epoch, which
-    // ends this process's incarnation too.
+    // marked at fork, its mutations go to the file's global epoch only.
+    // The target's mapping and own epoch are unchanged, so it continues.
     let shared_before = harness.session.instance_maps().counters()?;
     target.command(b'v')?;
     let shared_after = harness.session.instance_maps().counters()?;
     ensure!(
         shared_after.shared >= shared_before.shared + 2
-            && shared_after.global_bumps >= shared_before.global_bumps + 2,
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
         "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
     );
     target.command(b'c')?;
     let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
-    ensure!(after_sharer != d, "a sharer's mutation kept the instance");
+    ensure!(
+        after_sharer == d,
+        "a sharer's mutation did not continue the instance"
+    );
     // dlmopen sibling: two loads of one file, two instances.
     target.command(b'd')?;
     target.command(b'c')?;
@@ -2087,8 +2123,9 @@ fn held_sharer_exits_when_parent_dies_before_wake() {
 
 /// P2-2: a CLONE_VM non-thread sharer that predates the attach carries no
 /// SHARED_MM mark (marking happens on forks observed after attachment);
-/// its watched mutations must still globalize — the mm has users beyond
-/// the thread group — ending this process's incarnation.
+/// its watched mutations still globalize — the mm has users beyond the
+/// thread group — but the target's mapping and own epoch are unchanged,
+/// so this process's incarnation continues.
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
@@ -2112,13 +2149,15 @@ fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
     ensure!(woke == "SHARER_WOKE", "{woke}");
     let after = harness.session.instance_maps().counters()?;
     ensure!(
-        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        after.shared >= before.shared + 2
+            && after.global_bumps >= before.global_bumps + 2
+            && after.local_bumps == before.local_bumps,
         "pre-attachment sharer was not globalized: {before:?} -> {after:?}"
     );
     let b = call(&mut harness, &mut target)?;
     ensure!(
-        b != a,
-        "a pre-attachment sharer's mutation kept the instance"
+        b == a,
+        "a pre-attachment sharer's mutation did not continue the instance"
     );
     eprintln!("T3A_PRESHARER counters={after:?} scans={:?}", harness.scan);
     ensure!(harness.false_joins().is_empty());
@@ -2129,10 +2168,11 @@ fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
 
 /// F3 soundness: a zombie group leader still counted in `nr_threads` plus
 /// one live external CLONE_VM sharer — mm_users 2 against nr_threads 2
-/// under the old equality — must still globalize, since the zombie holds
-/// no mm reference. The window predates the attach (no fork marks); the
-/// fixture self-validates it (leader State Z, Threads 2, sharer alive)
-/// and fails loudly when it is not live.
+/// under the old equality — still globalizes, since the zombie holds
+/// no mm reference, but the target's mapping and own epoch are unchanged,
+/// so its incarnation continues. The window predates the attach (no fork
+/// marks); the fixture self-validates it (leader State Z, Threads 2,
+/// sharer alive) and fails loudly when it is not live.
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
@@ -2156,13 +2196,16 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
     ensure!(woke == "ZOMBIE_WOKE", "{woke}");
     let after = harness.session.instance_maps().counters()?;
     ensure!(
-        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        after.shared >= before.shared + 2
+            && after.global_bumps >= before.global_bumps + 2
+            && after.local_bumps == before.local_bumps
+            && after.storage_null == before.storage_null,
         "zombie-leader sharer was not globalized: {before:?} -> {after:?}"
     );
     let b = call(&mut harness, &mut target)?;
     ensure!(
-        b != a,
-        "a zombie-leader sharer's mutation kept the instance"
+        b == a,
+        "a zombie-leader sharer's mutation did not continue the instance"
     );
     eprintln!("T3A_ZOMBIE counters={after:?} scans={:?}", harness.scan);
     ensure!(harness.false_joins().is_empty());

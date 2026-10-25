@@ -15930,7 +15930,7 @@ mod tests {
                 .clone();
             for name in super::UNSAFE_PROGRAMS {
                 assert!(
-                    parsed.programs.get(name).is_none(),
+                    !parsed.programs.contains_key(name),
                     "default bytes carry {name}"
                 );
                 parsed.programs.insert(name.to_string(), program.clone());
@@ -15943,7 +15943,7 @@ mod tests {
                 .clone();
             for (name, _) in super::FEATURE_POLICY_MAPS {
                 assert!(
-                    parsed.maps.get(name).is_none(),
+                    !parsed.maps.contains_key(name),
                     "default bytes carry {name}"
                 );
                 parsed.maps.insert(name.to_string(), map.clone());

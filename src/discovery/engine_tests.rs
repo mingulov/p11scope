@@ -46952,15 +46952,11 @@ fn collected_graph_disclosure_only_mark_partial_is_not_refused() {
     // The §1.3 disclosure twin: a sticky counter dirties facts, never the
     // graph-input epoch, so the graph closes and installs.
     case.session.counters.ring_loss = 1;
-    let mut drained = false;
-    for _ in 0..600 {
-        let outcome = case.service(1);
-        if !outcome.pending {
-            drained = true;
-            break;
-        }
-    }
-    assert!(drained, "disclosure alone must not refuse the graph");
+    // Disclosure alone must not refuse the graph: the drive waits on the
+    // worker instead of racing it with a fixed count.
+    drive_graph_until(&mut case.engine, &mut case.session, |_, _, outcome| {
+        !outcome.pending
+    });
     assert_eq!(case.engine.collected_graph_refused(), None);
     assert!(
         case.engine
@@ -48023,20 +48019,12 @@ fn collected_graph_reclaim_drains_removed_rows_and_selection() {
     // storage instead of riding whole to Done; Reclaim drains the rows
     // and the selection in bounded steps before Done.
     let mut case = graph_case_with_exit(true);
-    let mut installed = false;
-    for _ in 0..2000 {
-        if case
-            .engine
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == GraphPhase::Install)
-        {
-            installed = true;
-            break;
-        }
-        case.service(1);
-    }
-    assert!(installed, "the graph reaches Install");
+    });
     let graph = case.engine.collected_graph.as_ref().expect("boxed");
     assert_eq!(graph.verdict, Some(Verdict::Closed));
     assert!(
@@ -48060,39 +48048,28 @@ fn collected_graph_reclaim_drains_removed_rows_and_selection() {
         "the selection seals before Install"
     );
     // Reclaim drains both before Done, in bounded steps.
-    let mut reclaimed = false;
-    for _ in 0..200 {
-        case.service(1);
-        if case
-            .engine
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == GraphPhase::Reclaim)
-        {
-            reclaimed = true;
-            break;
-        }
-    }
-    assert!(reclaimed, "the graph reaches Reclaim");
-    let mut reclaim_credits = 0u32;
+    });
     let mut rows_drained_in_reclaim = false;
     let mut selection_drained_in_reclaim = false;
-    for _ in 0..200 {
-        if case.engine.collected_graph.is_none() {
-            break;
+    let reclaim_credits = drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        if engine.collected_graph.is_none() {
+            return true;
         }
-        case.service(1);
-        reclaim_credits += 1;
-        if let Some(graph) = case.engine.collected_graph.as_ref() {
-            assert_eq!(graph.phase, GraphPhase::Reclaim);
-            if graph.removed_rows.is_empty() {
-                rows_drained_in_reclaim = true;
-            }
-            if graph.selection.is_none() {
-                selection_drained_in_reclaim = true;
-            }
+        let graph = engine.collected_graph.as_ref().expect("boxed");
+        assert_eq!(graph.phase, GraphPhase::Reclaim);
+        if graph.removed_rows.is_empty() {
+            rows_drained_in_reclaim = true;
         }
-    }
+        if graph.selection.is_none() {
+            selection_drained_in_reclaim = true;
+        }
+        false
+    });
     assert!(
         case.engine.collected_graph.is_none(),
         "the graph reaches Done"
@@ -48191,21 +48168,12 @@ fn collected_graph_reclaim_drains_removed_rows_and_selection() {
     engine
         .pending_retirements
         .extend((0..40u32).map(ProcessViewId));
-    let mut wide_installed = false;
-    for _ in 0..20_000 {
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
         engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == GraphPhase::Install)
-        {
-            wide_installed = true;
-            break;
-        }
-    }
-    assert!(wide_installed, "the wide graph reaches Install");
+    });
     let staged = engine
         .collected_graph
         .as_ref()
@@ -48219,20 +48187,21 @@ fn collected_graph_reclaim_drains_removed_rows_and_selection() {
     );
     // The drain passes through a partial length: never whole at Done.
     let mut partial = false;
-    for _ in 0..200 {
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
         if engine.collected_graph.is_none() {
-            break;
+            return true;
         }
-        engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if let Some(graph) = engine.collected_graph.as_ref() {
-            let len = graph.removed_rows.len();
-            if len > 0 && len < staged {
-                partial = true;
-            }
+        let len = engine
+            .collected_graph
+            .as_ref()
+            .expect("boxed")
+            .removed_rows
+            .len();
+        if len > 0 && len < staged {
+            partial = true;
         }
-    }
+        false
+    });
     assert!(
         engine.collected_graph.is_none(),
         "the wide graph reaches Done"
@@ -49089,17 +49058,7 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
     engine
         .pending_retirements
         .extend((0..16u32).map(ProcessViewId));
-    let mut drained = false;
-    for _ in 0..20_000 {
-        let outcome = engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if !outcome.pending {
-            drained = true;
-            break;
-        }
-    }
-    assert!(drained, "graph 1 drains");
+    drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     assert!(engine.pending_retirements.is_empty());
     assert_eq!(engine.collected_graphs_created, 1);
     assert!(engine.collected_graph_refused().is_none());
@@ -49117,21 +49076,12 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
     engine
         .pending_retirements
         .extend((16..32u32).map(ProcessViewId));
-    let mut reclaimed = false;
-    for _ in 0..20_000 {
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
         engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == GraphPhase::Reclaim)
-        {
-            reclaimed = true;
-            break;
-        }
-    }
-    assert!(reclaimed, "graph 2 reaches reclaim");
+    });
     let graph = engine.collected_graph.as_ref().expect("graph 2 boxed");
     assert_eq!(
         graph
@@ -49143,17 +49093,7 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
         6,
         "graph 2's install moves graph 1's facts leases to the handoff"
     );
-    drained = false;
-    for _ in 0..20_000 {
-        let outcome = engine
-            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-            .unwrap();
-        if !outcome.pending {
-            drained = true;
-            break;
-        }
-    }
-    assert!(drained, "graph 2 drains");
+    drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     assert_eq!(engine.collected_graphs_created, 2);
     assert!(engine.collected_graph_refused().is_none());
     assert_eq!(engine.collected_graph_reclaim_forgotten, 0);

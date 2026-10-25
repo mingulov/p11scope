@@ -667,16 +667,18 @@ capture behavior or establish the provenance of its input files.
 - What the user sees: provider files reached through an overlay merge
   can attribute differently by lane and xino mode. Before 6.8 a copy-up
   splits identity: the pre-copy-up anchor names the lower file while new
-  mappers name the upper file, so the legs disagree on which side proved
-  what. Two mounts over one lower join on the kernel side only (D-C7-2,
-  lanes A: a kernel edge against physical truth with a userspace named
-  mismatch) and never join on lane B. After a copy-up on lane B the
-  stable overlay inode can join the upper mapper to the stale lower
-  anchor on the userspace side while the kernel correctly refuses
-  (D-C7-3, lanes B). With xino off, equal real inode numbers on distinct
-  layers collide on the overlay device (a named mismatch, never an
-  edge); with xino off × post-copy-up the userspace edge follows
-  recorded truth because st_ino is non-persistent.
+  mappers name the upper file, so neither leg joins (parity none,
+  disclosed). Two mounts over one lower join on the kernel side only
+  (D-C7-2, lanes A: a kernel edge against physical truth with a
+  userspace named mismatch) and never join on lane B. After a copy-up
+  on lane B the stable overlay inode can join the upper mapper to the
+  stale lower anchor on the userspace side while the kernel correctly
+  refuses (D-C7-3, lanes B). With xino off, equal real inode numbers on
+  distinct layers collide on the overlay device on lane B (a named
+  mismatch, never an edge), while on lane A each layer keeps its real
+  device in the key so there is no collision (parity none); with xino
+  off × post-copy-up the userspace edge follows recorded truth because
+  st_ino is non-persistent.
 - Kernels/conditions: overlayfs merges with xino on, off, or
   same-filesystem layers; the tabled cells qualify 6.1/6.6 (lane A) and
   6.8+/7.x (lane B). Same-layer layouts behave like xino on. An overlay
@@ -688,12 +690,12 @@ capture behavior or establish the provenance of its input files.
   investigation lands its guard.
 - Workaround: same-filesystem layer layouts (behave like xino on);
   avoid post-copy-up attribution windows for replaced providers.
-- Planned: v0.5.0 (guest-lane qualification; registry rows flip only
-  after the guest cells qualify). Investigation verdict: no E3 userspace
-  guard fits already-captured fields (the proof boundary carries dev/ino
-  only, all stable across copy-up), and E4 layer-index tracking is
-  rejected for v0.5.0 (needs kernel/container changes). The RED copy-up
-  reproducer stays; this disclosure is final.
+- Status: the overlay rows are ready, and the ext4 row qualified on
+  host 7.0 and guests 6.1.188, 6.6.157 and 7.0.14. Investigation
+  verdict: no E3 userspace guard fits already-captured fields (the proof
+  boundary carries dev/ino only, all stable across copy-up), and E4
+  layer-index tracking is rejected for v0.5.0 (needs kernel/container
+  changes). The RED copy-up reproducer stays; this disclosure is final.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

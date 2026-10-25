@@ -8172,7 +8172,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
     fn format2_preparation_charges_custody_and_payload_together() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
@@ -8206,6 +8205,9 @@ pub(crate) mod tests {
             + 2 * size_of::<usize>()
             + 3 * OWNED_ALLOCATION_PADDING;
         let transient = bytes.len().checked_mul(32).unwrap();
+        // The Counts object selects the Counts geometry, so preparation holds
+        // the same terminal figure production reserves for it.
+        let terminal = super::counter_terminal_reserve_bytes(CounterMode::Counts, cpus).unwrap();
         drop(parsed);
         for (one_short, healthy) in [(0, true), (1, false)] {
             let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
@@ -8229,7 +8231,7 @@ pub(crate) mod tests {
                 );
                 assert_eq!(
                     pool.snapshot().charged_bytes,
-                    baseline + combined_floor + transient
+                    baseline + combined_floor + transient + terminal
                 );
             } else {
                 assert!(

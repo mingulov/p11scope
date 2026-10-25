@@ -46,12 +46,6 @@
     },
     {
       "file": "src/attach/counter_banks.rs",
-      "path": "attach::counter_banks::tests::format2_preparation_charges_custody_and_payload_together",
-      "reason": "requires the explicitly selected format2 artifact; parses only, no native load",
-      "cell": "privileged"
-    },
-    {
-      "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::format2_preparation_rejects_mixed_profiles_before_lifecycle",
       "reason": "requires the explicitly selected format2 artifact; parses only, no native load",
       "cell": "privileged"

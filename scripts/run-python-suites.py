@@ -146,6 +146,7 @@ DRIVEN = {
     "test_prepared_container_driver.py": _ARTIFACT_CONTRACTS,
     "test_prepared_four_callers.py": _ARTIFACT_CONTRACTS,
     "test_prepared_release_drivers.py": _ARTIFACT_CONTRACTS,
+    "test_process_session_dying_members.py": _ARTIFACT_CONTRACTS,
     "test_process_session_snapshot.py": _ARTIFACT_CONTRACTS,
     "test_product_build.py": _ARTIFACT_CONTRACTS,
     "test_receipt_borrowed_descriptor_admission.py": _RECEIPTS,

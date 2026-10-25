@@ -3605,6 +3605,238 @@ fn user_process_session_snapshot_only_tolerates_initial_disappearance() {
 }
 
 #[test]
+fn user_process_session_snapshot_dying_members() {
+    run_ok(
+        "python3",
+        &[
+            "-I",
+            "tests/python/test_process_session_dying_members.py",
+            "DyingMemberSnapshotTests",
+        ],
+    );
+}
+
+#[test]
+fn snapshot_omits_a_zombie_member_and_lists_the_live_leader() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
+    sh -c 'sleep 0.2 & echo $! > "$1/zombie.pid"; exec sleep 30' sh "$work"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+zombie=$(cat "$work/zombie.pid")
+attempt=0
+while [ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" != Z ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "child never became a zombie" >&2; exit 1; }
+    sleep 0.05
+done
+snapshot_user_process_session "$sid" > "$work/members.json"
+python3 - "$work/members.json" "$leader" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(members) == 1, members
+assert members[0]["pid"] == int(sys.argv[2])
+assert members[0]["argv"] == ["sleep", "30"]
+assert set(members[0]) == {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}
+PY
+[ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" = Z ]
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise zombie-member snapshot");
+    assert!(
+        output.status.success(),
+        "zombie-member snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn snapshot_lists_live_members_with_exact_argv() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+sleeper=
+trap 'for victim in "$leader" "$sleeper"; do [ -n "$victim" ] && kill -KILL "$victim" 2>/dev/null || true; done; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
+    sh -c 'sleep 30 & echo $! > "$1/sleeper.pid"; wait' sh "$work"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+sleeper=$(cat "$work/sleeper.pid")
+snapshot_user_process_session "$sid" > "$work/members.json"
+python3 - "$work/members.json" "$leader" "$sleeper" <<'PY'
+import json
+import re
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+leader, sleeper = int(sys.argv[2]), int(sys.argv[3])
+assert len(members) == 2, members
+by_pid = {member["pid"]: member for member in members}
+assert set(by_pid) == {leader, sleeper}
+for member in members:
+    assert set(member) == {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}
+    assert member["pgid"] == leader and member["sid"] == leader
+    assert re.fullmatch(r"[0-9a-f]{64}", member["exe_sha256"])
+assert by_pid[sleeper]["argv"] == ["sleep", "30"]
+assert by_pid[leader]["argv"][0:2] == ["sh", "-c"]
+assert len(by_pid[leader]["argv"]) == 5
+assert by_pid[leader]["exe_sha256"] != by_pid[sleeper]["exe_sha256"]
+PY
+kill -TERM "$sleeper"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+sleeper=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise live-member snapshot");
+    assert!(
+        output.status.success(),
+        "live-member snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn snapshot_never_omits_a_live_execing_member_and_still_fails() {
+    let directory = tempfile::tempdir().expect("temporary exec-race directory");
+    let script = directory.path().join("exec-race.sh");
+    let exec_a = directory.path().join("exec_a.py");
+    let exec_b = directory.path().join("exec_b.py");
+    fs::write(
+        &exec_a,
+        format!(
+            "import os\nimport sys\nos.execv(sys.executable, [\"python3\", \"{}\", \"marker-b\"])\n",
+            exec_b.display(),
+        ),
+    )
+    .expect("write exec-a leg");
+    fs::write(
+        &exec_b,
+        format!(
+            "import os\nimport sys\nos.execv(sys.executable, [\"python3\", \"{}\", \"marker-a\"])\n",
+            exec_a.display(),
+        ),
+    )
+    .expect("write exec-b leg");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi' EXIT
+launch_user_recorded_process_group "$WORK/leader.pid" "$WORK/leader.log" \
+    python3 "$WORK/exec_a.py"
+leader=$USER_PROCESS_PID
+starttime=$USER_PROCESS_STARTTIME
+sid=$USER_PROCESS_SID
+attempt=0
+while ! tr '\0' ' ' < "/proc/$leader/cmdline" 2>/dev/null | grep -Fq marker; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "leader never started execing" >&2; exit 1; }
+    sleep 0.05
+done
+failures=0
+successes=0
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    attempt=$((attempt + 1))
+    if snapshot_user_process_session "$sid" > "$WORK/members.json"; then
+        successes=$((successes + 1))
+        python3 - "$WORK/members.json" "$leader" "$starttime" "$WORK" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+leader, starttime, work = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+assert len(members) == 1, members
+member = members[0]
+assert (member["pid"], member["starttime"], member["sid"]) == (leader, starttime, leader)
+shapes = (
+    ["python3", work + "/exec_a.py", "marker-a"],
+    ["python3", work + "/exec_b.py", "marker-b"],
+)
+assert member["argv"] in shapes, member["argv"]
+PY
+    else
+        failures=$((failures + 1))
+    fi
+done
+[ "$failures" -ge 1 ]
+[ "$successes" -ge 1 ]
+process_matches_starttime "$leader" "$starttime"
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+"#,
+    )
+    .expect("write exec-race script");
+    // SLACK hang guard: the script's own waits are event-driven or bounded,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(30);
+    let output = Command::new("timeout")
+        .args([bound.as_str(), "sh"])
+        .arg(&script)
+        .env("WORK", directory.path())
+        .output()
+        .expect("exercise exec-race snapshot");
+    assert!(
+        output.status.success(),
+        "exec-race snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn user_process_session_lifecycle_is_identity_pinned() {
     let output = Command::new("sh")
         .args([

@@ -2373,14 +2373,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if counted.is_empty() {
             return;
         }
-        // The ended-domain arm refuses before any namespace exists; the
-        // stash retains one so the shed survives to the commit flush.
-        let state = self
+        // Never recreate a namespace for a retired domain: without a
+        // live same-domain namespace there is nowhere to flush to, and
+        // a recreated one would refuse every later domain.
+        let Some(state) = self
             .semantic_finalizer
-            .get_or_insert_with(|| SessionFinalizerState::new(batch.domain()));
-        if state.domain != batch.domain() {
+            .as_mut()
+            .filter(|state| state.domain == batch.domain())
+        else {
             return;
-        }
+        };
         let slot = state.pending_drop_shed.entry(drop).or_default();
         for (label, count) in counted {
             let cell = slot.entry(label).or_default();
@@ -3863,6 +3865,8 @@ mod finalizer_history_tests {
             coordinator.semantic_finalizer.is_none(),
             "the stray batch recreates no namespace for the retired domain"
         );
+        // Gaps stage at refusal and publish at commit.
+        coordinator.commit_batch(false).unwrap();
         let subjects: Vec<String> = coordinator
             .registry()
             .gaps()
@@ -3885,6 +3889,7 @@ mod finalizer_history_tests {
             .expect("the later domain stages");
         assert_eq!(state.domain, domain_b);
         assert!(state.pending_semantic.is_some(), "B's batch stages");
+        coordinator.commit_batch(false).unwrap();
         let subjects: Vec<String> = coordinator
             .registry()
             .gaps()

@@ -220,6 +220,79 @@ class CellValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(oracle.MeasureError, "source identity"):
             oracle.validate_cell(rows)
 
+    def test_second_table_verified_row_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        rows.insert(4, dict(rows[3]))
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "at most one table_verified row"):
+            oracle.validate_cell(rows)
+
+    def test_second_entry_executed_row_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        second = dict(rows[5])
+        second["body_count"] = 5
+        rows.insert(6, second)
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "at most one entry_executed row"):
+            oracle.validate_cell(rows)
+
+    def test_second_entry_returned_row_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        rows.insert(7, dict(rows[6]))
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "at most one entry_returned row"):
+            oracle.validate_cell(rows)
+
+    def test_empty_ledger_is_refused(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "cell ledger must be non-empty"):
+            oracle.validate_cell([])
+
+
+class ReaderGuardTests(unittest.TestCase):
+    def ledger_text(self, rows):
+        return "".join(json.dumps(row) + "\n" for row in rows)
+
+    def duplicate_key_line(self, row, junk="junk"):
+        text = json.dumps(row)
+        return json.dumps({"phase": junk})[:-1] + ", " + text[1:]
+
+    def test_duplicate_key_in_ledger_row_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        lines = [json.dumps(row) for row in rows]
+        lines[4] = self.duplicate_key_line(rows[4])
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "duplicate JSON key"):
+            oracle.read_rows(io.StringIO("\n".join(lines) + "\n"))
+
+    def test_nonfinite_number_in_ledger_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        rows[0]["mono_ns"] = float("nan")
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "nonfinite JSON number"):
+            oracle.read_rows(io.StringIO(self.ledger_text(rows)))
+
+    def test_huge_integer_is_refused(self):
+        oracle = require_oracle(self)
+        rows = healthy_cell()
+        rows[0]["mono_ns"] = 1 << 64
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "mono_ns out of range"):
+            oracle.validate_cell(rows)
+        observer = healthy_observer(1)
+        observer["observed_calls"] = 1 << 64
+        observer["caller_rows"] = []
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "observer must carry observed_calls"):
+            oracle.attribution(oracle.validate_cell(healthy_cell()),
+                               observer)
+
 
 class MissedCallTests(unittest.TestCase):
     def test_exact_missed_count_is_reported(self):
@@ -417,6 +490,12 @@ class BoundTableTests(unittest.TestCase):
         with self.assertRaisesRegex(oracle.MeasureError, "bound table"):
             oracle.check_bounds(entries, {"0": 1, "10": 1, "100": 0,
                                           "1000": -1})
+
+    def test_empty_entries_are_refused(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "bounds need cell entries"):
+            oracle.check_bounds([], dict(self.TABLE))
 
 
 class FirstUseKnobFixtureTests(unittest.TestCase):
@@ -699,6 +778,37 @@ class OracleCliTests(unittest.TestCase):
         code, _, err = self.run_cli([str(ledger), str(seen)])
         self.assertEqual(code, 1)
         self.assertIn("first-use refused", err)
+
+    def test_cli_duplicate_key_in_observer_is_refused(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger = Path(work.name) / "ledger.jsonl"
+        with open(ledger, "w", encoding="utf-8") as stream:
+            for row in healthy_cell():
+                stream.write(json.dumps(row) + "\n")
+        text = json.dumps(healthy_observer(1))
+        seen = Path(work.name) / "observer.json"
+        seen.write_text('{"observed_calls": 999, ' + text[1:])
+        code, _, err = self.run_cli([str(ledger), str(seen)])
+        self.assertEqual(code, 1)
+        self.assertIn("first-use refused: duplicate JSON key", err)
+
+    def test_cli_nonfinite_number_in_observer_is_refused(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger = Path(work.name) / "ledger.jsonl"
+        with open(ledger, "w", encoding="utf-8") as stream:
+            for row in healthy_cell():
+                stream.write(json.dumps(row) + "\n")
+        observer = healthy_observer(1)
+        observer["observed_calls"] = float("nan")
+        seen = Path(work.name) / "observer.json"
+        seen.write_text(json.dumps(observer))
+        code, _, err = self.run_cli([str(ledger), str(seen)])
+        self.assertEqual(code, 1)
+        self.assertIn("first-use refused: nonfinite JSON number", err)
 
     def test_cli_bounds_flag_gates_the_cell(self):
         require_oracle(self)

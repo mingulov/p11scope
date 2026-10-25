@@ -57,6 +57,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
+      "reason": "privileged: nonleader anchor run installs nothing live (root strict BPF load; run by hand on a live kernel lane, outside the lib runner)",
+      "cell": "live-kernel"
+    },
+    {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32",
       "reason": "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof",
@@ -539,6 +545,12 @@
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
       "reason": "RED by design: post-copy-up re-edge stands; root loop overlay mounts (lanes B only), never qualifies",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_zombie_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; zombie survivor collision parity, run by hand on a live kernel lane, outside the lib runner",
+      "cell": "live-kernel"
     },
     {
       "file": "src/discovery/engine_tests.rs",

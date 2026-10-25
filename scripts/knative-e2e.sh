@@ -6,7 +6,7 @@
 # knative-v1.23.0 CRDs + core and net-kourier knative-v1.23.0, all three YAMLs
 # sha256-verified before apply, no Istio), the KService
 # (deploy/k8s/e2e/knative-service.yaml: scale-to-zero, containerConcurrency 1,
-# image by node-resolved digest) and the documented DaemonSet (same render as
+# kind.local image tag, node image id checked) and the documented DaemonSet (same render as
 # scripts/kind-e2e.sh). The serving pod's main process is the ledgered `gated`
 # client (deploy/Dockerfile.knative-holder): one GET on /ledger releases its
 # single ledger run and the HTTP handler returns the LEDGER line, so the pod
@@ -62,7 +62,7 @@ usage: scripts/knative-e2e.sh [--token TOKEN] [--work DIR] [--iters N] [--keep]
 
   Cell K3 driver. Its own kind cluster (run token, refuse reuse, private
   kubeconfig), Knative Serving + Kourier knative-v1.23.0 from sha256-verified
-  YAMLs, the KService at its node-resolved image digest, the documented
+  YAMLs, the KService by its kind.local tag (node image id checked), the documented
   DaemonSet, one request per serving pod, inventory + system-profile evidence
   checked with scripts/kind-e2e-oracle.py.
 
@@ -198,25 +198,30 @@ render_daemonset() {
         || { echo "daemonset render lost its image anchor" >&2; return 1; }
 }
 
-# Fill the KService digest placeholder with the node-resolved digest reference
-# (verbatim from crictl, shape-validated: repo@sha256:64 lowercase hex).
+# Fill the KService tag placeholder with the kind.local holder reference.
+# `kind load` gives the image no registry digest, and Knative skips registry
+# tag resolution for kind.local (serving-core config-deployment
+# registries-skipping-tag-resolving), so the revision runs the loaded image by
+# tag; resolve_serving then proves the running container uses the node image
+# id recorded before the apply.
 render_ksvc() {
     rk_ref=$3
     case $rk_ref in
-        *@sha256:*) ;;
-        *) echo "not a digest reference: $rk_ref" >&2; return 1 ;;
+        kind.local/p11scope-knative-holder:*) ;;
+        *) echo "not a kind.local holder reference: $rk_ref" >&2; return 1 ;;
     esac
-    rk_hex=${rk_ref##*@sha256:}
-    rk_repo=${rk_ref%@sha256:*}
-    [ "${#rk_hex}" -eq 64 ] || { echo "bad digest length" >&2; return 1; }
-    case $rk_hex in ''|*[!0-9a-f]*) echo "bad digest hex" >&2; return 1 ;; esac
-    case $rk_repo in
-        ''|*[!a-z0-9./:_-]*|*..*|*//*) echo "bad digest repo: $rk_repo" >&2; return 1 ;;
-    esac
-    [ "$(grep -Fc 'image: p11scope-knative-holder@sha256:KNATIVE_HOLDER_DIGEST' "$1")" -eq 1 ] \
-        || { echo "ksvc lost its digest placeholder" >&2; return 1; }
-    sed "s#image: p11scope-knative-holder@sha256:KNATIVE_HOLDER_DIGEST#image: $rk_ref#" "$1" > "$2" || return 1
-    grep -Fq "image: $rk_ref" "$2" || { echo "ksvc render lost its digest" >&2; return 1; }
+    rk_tag=${rk_ref#kind.local/p11scope-knative-holder:}
+    case $rk_tag in ''|*[!A-Za-z0-9._-]*) echo "bad holder tag: $rk_tag" >&2; return 1 ;; esac
+    [ "$(grep -Fc 'image: kind.local/p11scope-knative-holder:KNATIVE_HOLDER_TAG' "$1")" -eq 1 ] \
+        || { echo "ksvc lost its tag placeholder" >&2; return 1; }
+    sed "s#image: kind.local/p11scope-knative-holder:KNATIVE_HOLDER_TAG#image: $rk_ref#" "$1" > "$2" || return 1
+    grep -Fq "image: $rk_ref" "$2" || { echo "ksvc render lost its tag" >&2; return 1; }
+}
+
+# The running serving container's image ref must equal the node image id.
+serving_image_is() {
+    [ -n "$1" ] && [ "$1" = "$2" ] \
+        || { echo "serving container runs '$1', not the loaded $2" >&2; return 1; }
 }
 
 wait_scale_zero() {
@@ -304,20 +309,18 @@ with open(facts, "a", encoding="utf-8") as out:
 PY
 }
 
-# The node's own digest for our loaded tag, verbatim (exactly one, or refuse).
-resolve_holder_digest() {
+# The node's own image id for our loaded tag, verbatim (exactly one, or refuse).
+resolve_holder_id() {
     python3 -I - "$1" "$2" <<'PY'
 import json, re, sys
 path, tag = sys.argv[1], sys.argv[2]
-digests = []
-for image in json.load(open(path, encoding="utf-8")).get("images") or []:
-    if tag in (image.get("repoTags") or []):
-        digests.extend(image.get("repoDigests") or [])
-if len(digests) != 1:
-    raise SystemExit(f"want exactly 1 node digest for {tag}, got {len(digests)}")
-if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", digests[0]):
-    raise SystemExit(f"bad node digest: {digests[0]!r}")
-print(digests[0])
+ids = [image.get("id") for image in json.load(open(path, encoding="utf-8")).get("images") or []
+       if tag in (image.get("repoTags") or [])]
+if len(ids) != 1:
+    raise SystemExit(f"want exactly 1 node image for {tag}, got {len(ids)}")
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", ids[0] or ""):
+    raise SystemExit(f"bad node image id: {ids[0]!r}")
+print(ids[0])
 PY
 }
 
@@ -518,9 +521,9 @@ self_test() {
     server_block | python3 -c 'import sys; compile(sys.stdin.read(), "server.py", "exec")' \
         || { echo "embedded server does not compile" >&2; exit 1; }
     entry_block | sh -n || { echo "embedded entry does not parse" >&2; exit 1; }
-    # The KService shape: digest placeholder, scale-to-zero, one request.
-    [ "$(grep -c 'image: p11scope-knative-holder@sha256:KNATIVE_HOLDER_DIGEST' "$KNATIVE_KSVC")" -eq 1 ] \
-        || { echo "ksvc lost its digest placeholder" >&2; exit 1; }
+    # The KService shape: kind.local tag placeholder, scale-to-zero, one request.
+    [ "$(grep -c 'image: kind.local/p11scope-knative-holder:KNATIVE_HOLDER_TAG' "$KNATIVE_KSVC")" -eq 1 ] \
+        || { echo "ksvc lost its tag placeholder" >&2; exit 1; }
     grep -Fq 'containerConcurrency: 1' "$KNATIVE_KSVC" \
         || { echo "ksvc lost containerConcurrency: 1" >&2; exit 1; }
     grep -Fq 'autoscaling.knative.dev/min-scale: "0"' "$KNATIVE_KSVC" \
@@ -655,19 +658,20 @@ EOF
         echo "anchorless daemonset rendered" >&2
         exit 1
     fi
-    # KService render: the digest placeholder is filled with a validated
-    # node-resolved digest reference, nothing else moves.
-    printf 'image: p11scope-knative-holder@sha256:KNATIVE_HOLDER_DIGEST\n' > "$stub/ksvc.yaml"
+    # KService render: the tag placeholder is filled with the validated
+    # kind.local holder reference, nothing else moves.
+    printf 'image: kind.local/p11scope-knative-holder:KNATIVE_HOLDER_TAG\n' > "$stub/ksvc.yaml"
     PATH="$stub:$PATH" render_ksvc "$stub/ksvc.yaml" "$stub/ksvc-out.yaml" \
-        "docker.io/library/p11scope-knative-holder@sha256:$good_sha" \
+        "kind.local/p11scope-knative-holder:k3-t1" \
         || { echo "ksvc render refused" >&2; exit 1; }
-    grep -Fq "image: docker.io/library/p11scope-knative-holder@sha256:$good_sha" "$stub/ksvc-out.yaml" \
-        || { echo "render lost the digest" >&2; exit 1; }
-    for bad_ref in "img:t" "img@sha256:xyz" "img@md5:$good_sha" "" \
-            "img@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; do
+    grep -Fq "image: kind.local/p11scope-knative-holder:k3-t1" "$stub/ksvc-out.yaml" \
+        || { echo "render lost the tag" >&2; exit 1; }
+    for bad_ref in "p11scope-knative-holder:k3-t1" "docker.io/library/p11scope-knative-holder:k3-t1" \
+            "kind.local/other:k3-t1" "kind.local/p11scope-knative-holder:" \
+            "kind.local/p11scope-knative-holder:k3 t1" "kind.local/p11scope-knative-holder:k3#t1" ""; do
         if PATH="$stub:$PATH" render_ksvc "$stub/ksvc.yaml" "$stub/ksvc-bad.yaml" "$bad_ref" \
                 >/dev/null 2>&1; then
-            echo "bad digest reference accepted: $bad_ref" >&2
+            echo "bad holder reference accepted: $bad_ref" >&2
             exit 1
         fi
     done
@@ -808,32 +812,49 @@ EOF
         || { echo "controller image missing from facts" >&2; exit 1; }
     grep -Fq 'image-download: kourier-system/kourier-abc/kourier gcr.io/kourier@sha256:bbbb gcr.io/kourier@sha256:bbbb' "$stub/facts.txt" \
         || { echo "kourier image missing from facts" >&2; exit 1; }
-    # Node digest resolution: exactly one repo digest for our tag, verbatim.
+    # Node image id: exactly one node image carries our tag; its id, verbatim.
     cat > "$stub/images.json" <<EOF
-{"images": [{"repoTags": ["p11scope-knative-holder:e2e-t"],
-  "repoDigests": ["docker.io/library/p11scope-knative-holder@sha256:$good_sha"]}]}
+{"images": [{"id": "sha256:$good_sha", "repoTags": ["kind.local/p11scope-knative-holder:k3-t"],
+  "repoDigests": []}]}
 EOF
-    [ "$(resolve_holder_digest "$stub/images.json" p11scope-knative-holder:e2e-t)" \
-        = "docker.io/library/p11scope-knative-holder@sha256:$good_sha" ] \
-        || { echo "node digest missed" >&2; exit 1; }
+    [ "$(resolve_holder_id "$stub/images.json" kind.local/p11scope-knative-holder:k3-t)" \
+        = "sha256:$good_sha" ] \
+        || { echo "node image id missed" >&2; exit 1; }
     cat > "$stub/images-none.json" <<'EOF'
-{"images": [{"repoTags": ["p11scope-knative-holder:e2e-t"], "repoDigests": []}]}
+{"images": [{"id": "sha256:aaaa", "repoTags": ["docker.io/library/p11scope-knative-holder:k3-t"]}]}
 EOF
-    if resolve_holder_digest "$stub/images-none.json" p11scope-knative-holder:e2e-t \
+    if resolve_holder_id "$stub/images-none.json" kind.local/p11scope-knative-holder:k3-t \
             >/dev/null 2>&1; then
-        echo "digestless image accepted" >&2
+        echo "untagged node image accepted" >&2
         exit 1
     fi
     cat > "$stub/images-two.json" <<EOF
-{"images": [{"repoTags": ["p11scope-knative-holder:e2e-t"],
-  "repoDigests": ["docker.io/library/p11scope-knative-holder@sha256:$good_sha",
-    "docker.io/library/p11scope-knative-holder@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}]}
+{"images": [{"id": "sha256:$good_sha", "repoTags": ["kind.local/p11scope-knative-holder:k3-t"]},
+  {"id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "repoTags": ["kind.local/p11scope-knative-holder:k3-t"]}]}
 EOF
-    if resolve_holder_digest "$stub/images-two.json" p11scope-knative-holder:e2e-t \
+    if resolve_holder_id "$stub/images-two.json" kind.local/p11scope-knative-holder:k3-t \
             >/dev/null 2>&1; then
-        echo "ambiguous digests accepted" >&2
+        echo "ambiguous node images accepted" >&2
         exit 1
     fi
+    cat > "$stub/images-badid.json" <<'EOF'
+{"images": [{"id": "sha256:XYZ", "repoTags": ["kind.local/p11scope-knative-holder:k3-t"]}]}
+EOF
+    if resolve_holder_id "$stub/images-badid.json" kind.local/p11scope-knative-holder:k3-t \
+            >/dev/null 2>&1; then
+        echo "malformed node image id accepted" >&2
+        exit 1
+    fi
+    # The running serving container must use that node image id.
+    serving_image_is "sha256:$good_sha" "sha256:$good_sha" \
+        || { echo "matching serving image refused" >&2; exit 1; }
+    for bad_image in "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ""; do
+        if serving_image_is "$bad_image" "sha256:$good_sha" >/dev/null 2>&1; then
+            echo "foreign serving image accepted: $bad_image" >&2
+            exit 1
+        fi
+    done
 }
 
 k3_ledger_fixture() {
@@ -1068,7 +1089,7 @@ OBSERVER_BIN=${P11SCOPE_KNATIVE_OBSERVER_BIN:-}
 LOCK=${P11SCOPE_KNATIVE_LOCK:-}
 [ -z "$LOCK" ] || command -v flock >/dev/null || { echo "flock required for P11SCOPE_KNATIVE_LOCK" >&2; exit 2; }
 OBS_IMAGE=p11scope-observer:k3-$TOKEN
-KNATIVE_IMAGE=p11scope-knative-holder:k3-$TOKEN
+KNATIVE_IMAGE=kind.local/p11scope-knative-holder:k3-$TOKEN
 prepare_work || exit 2
 FACTS=$WORK/facts.log
 SUMMARY_JSONL=$WORK/summary.jsonl
@@ -1159,6 +1180,9 @@ resolve_serving() {
     cids=$(serving_cids "$WORK/serving-pod.json") || fail_cell "cannot select serving containers"
     SERVING_CID=$(printf '%s\n' "$cids" | sed -n '1p')
     PROXY_CID=$(printf '%s\n' "$cids" | sed -n '2p')
+    SERVING_IMAGE=$(docker exec "$NODE" crictl inspect -o go-template --template '{{.status.imageRef}}' "$SERVING_CID") \
+        || fail_cell "cannot read the serving container image"
+    serving_image_is "$SERVING_IMAGE" "$HOLDER_ID" || fail_cell "serving container image is not the loaded holder"
     SERVING_PID=$(crictl_pid "$NODE" "$SERVING_CID") || fail_cell "no node pid for the serving container"
     PROXY_PID=$(crictl_pid "$NODE" "$PROXY_CID") || fail_cell "no node pid for queue-proxy"
     fact "serving-pod=$SERVING_POD serving-pid=$SERVING_PID proxy-pid=$PROXY_PID"
@@ -1266,15 +1290,15 @@ kc get pods -A -o json > "$WORK/pods-all.json" || fail_cell "cannot list cluster
 dump_pod_images "$WORK/pods-all.json" || fail_cell "cannot dump pod images"
 fact "downloads: 3 Knative YAMLs (release lines above) + kind node image (node-image lines above) + every image-download line above + base $HOLDER_BASE"
 
-say "=== apply the KService at its node-resolved digest ==="
+say "=== apply the KService by its kind.local tag (node image id recorded) ==="
 docker exec "$NODE" crictl images -o json > "$WORK/node-images.json" \
     || fail_cell "cannot list node images"
-HOLDER_DIGEST=$(resolve_holder_digest "$WORK/node-images.json" "$KNATIVE_IMAGE") \
-    || fail_cell "no single node digest for $KNATIVE_IMAGE"
-fact "holder-node-digest=$HOLDER_DIGEST"
-docker exec "$NODE" crictl inspecti "$HOLDER_DIGEST" >/dev/null \
-    || fail_cell "node does not resolve $HOLDER_DIGEST"
-render_ksvc "$KNATIVE_KSVC" "$WORK/knative-service.yaml" "$HOLDER_DIGEST" \
+HOLDER_ID=$(resolve_holder_id "$WORK/node-images.json" "$KNATIVE_IMAGE") \
+    || fail_cell "no single node image for $KNATIVE_IMAGE"
+fact "holder-node-image-id=$HOLDER_ID"
+docker exec "$NODE" crictl inspecti "$HOLDER_ID" >/dev/null \
+    || fail_cell "node does not resolve $HOLDER_ID"
+render_ksvc "$KNATIVE_KSVC" "$WORK/knative-service.yaml" "$KNATIVE_IMAGE" \
     || fail_cell "kservice render failed"
 kc apply -f "$WORK/knative-service.yaml" || fail_cell "kservice apply failed"
 kc wait --for=condition=Ready "ksvc/$KSVC" -n "$KNS" --timeout=180s \

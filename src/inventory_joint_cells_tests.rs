@@ -275,9 +275,10 @@ fn cancel_pre_body(scene: Scene, event: JointEvent) {
         None,
         "R: the finish completes once"
     );
-    assert!(
-        seat.completes.get() >= 1,
-        "O: joined before release (each hold tick reaps idempotently)"
+    assert_eq!(
+        seat.completes.get(),
+        1,
+        "N: one joined receipt across the hold"
     );
     assert_eq!(seat.drops.get(), 1, "O: released after the join");
     assert_eq!(
@@ -350,9 +351,10 @@ fn promote_pre_body(scene: Scene, event: JointEvent) {
         None,
         "R: the finish completes once"
     );
-    assert!(
-        seat.completes.get() >= 1,
-        "O: joined before release (each hold tick reaps idempotently)"
+    assert_eq!(
+        seat.completes.get(),
+        1,
+        "N: one joined receipt across the hold"
     );
     assert_eq!(
         driver.display.as_ref().expect("display").promotion_state(),

@@ -704,7 +704,7 @@ def self_test():
     assert healthy["known_issue"] == {"pid": 102, "old_module": "m7",
                                       "new_module": "m8"}
     assert healthy["b_pre_round2"] == {"measured": False}
-    assert "checked no container edge" in healthy["kernel_proof"]["finding"]
+    assert "no proof attempted" in healthy["kernel_proof"]["finding"]
     assert copy_up(**good_copy_up("A"))["lane"] == "A"
     assert known_issue_line(102, "m7", "m8") == \
         "KNOWN_ISSUE cell=D1 copy-up-stale-caller pid=102 old_module=m7 new_module=m8"
@@ -748,10 +748,33 @@ def self_test():
                 pre_kernel=good_inventory(st_pre_edges(), [st_collapse()],
                                           backend="userspace", fallback=None,
                                           modules=ST_MODULES_PRE))
-    mutate_copy("pre-kernel without fallback",
+    # Fedora d1fed1 (under the 256 cap): the sweep never runs, so no
+    # kernel proof is attempted and forced-kernel runs report null.
+    fedora_none = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        fedora_none[key]["observation"]["identity"]["fallback"] = None
+    assert copy_up(**fedora_none)["ok"] is True
+    assert copy_up(**fedora_none)["kernel_proof"]["runs"]["span-kernel"] == \
+        {"backend": "kernel", "fallback": None}
+    mutate_copy("pre-kernel with an unknown fallback",
                 pre_kernel=good_inventory(st_pre_edges(), [st_collapse()],
-                                          backend="kernel", fallback=None,
+                                          backend="kernel",
+                                          fallback="frobnicate",
                                           modules=ST_MODULES_PRE))
+    # Fallback null without backend agreement is not a pass: both legs
+    # ran the same userspace attribution, so any divergence fails named.
+    none_split = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        none_split[key]["observation"]["identity"]["fallback"] = None
+    split_edges = [item if (item["pid"], item["module"]) != (102, "m8")
+                   else st_edge(102, "m8", cov="counted", count=9,
+                                since=3000, first_seen=2000)
+                   for item in st_span_edges()]
+    none_split["span_userspace"] = good_inventory(
+        split_edges, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    refuses_with("fallback null without backend agreement", "disagree",
+                 lambda: copy_up(**none_split))
     mutate_copy("B key already in pre modules",
                 pre_kernel=good_inventory(st_pre_edges(), [st_collapse()],
                                           backend="kernel", modules=ST_MODULES_SPAN))
@@ -843,25 +866,135 @@ def self_test():
     round2_twin["b_pre_round2_pid"] = 105
     assert copy_up(**round2_twin)["b_pre_round2"]["pid"] == 105
     assert copy_up(**round2_twin)["b_pre_round2"]["span_kernel"]["m7_entries"] is None
-    # The run-5/6 twin shape is new-only: an old-module edge for a caller
-    # first scanned after the collapse resolves is forbidden.
-    twin_old = [st_edge(101, "m7"),
-                st_edge(102, "m7", state="ended"),
-                st_edge(102, "m8", cov="watched_no_use", since=3000,
-                       first_seen=2000),
-                st_edge(104, "m8", evidence="maps_match"),
-                st_edge(105, "m7", state="ended"),
-                st_edge(105, "m8", evidence="maps_match", cov="watched_no_use",
-                       since=3000, first_seen=2000)]
+    assert copy_up(**round2_twin)["b_pre_round2"]["twin_shape"] == "new-only"
+    assert copy_up(**round2_twin)["b_pre_round2"]["span_kernel"]["counted"] == 0
+    # The Fedora twin shape is old-ended plus new-mapped, both deep_scan:
+    # first scanned before the collapse resolves (under the cap every pid
+    # is deep-scanned). The measured total is old + new entries together.
+    fedora_twin = [st_edge(101, "m7"),
+                   st_edge(102, "m7", state="ended"),
+                   st_edge(102, "m8", cov="watched_no_use", since=3000,
+                          first_seen=2000),
+                   st_edge(104, "m8", evidence="maps_match"),
+                   st_edge(105, "m7", state="ended"),
+                   st_edge(105, "m8", cov="watched_no_use", since=3000,
+                          first_seen=2000)]
     round2_twin_old = good_copy_up("B")
     round2_twin_old["b_pre_round2_calls"] = 1500
     round2_twin_old["b_pre_round2_pid"] = 105
-    round2_twin_old["span_kernel"] = good_inventory(twin_old, [st_collapse()],
-                                                    backend="kernel",
-                                                    modules=ST_MODULES_SPAN)
-    refuses_with("round-2 twin must not have an old-module edge",
-                 "must not have an old-module edge",
-                 lambda: copy_up(**round2_twin_old))
+    round2_twin_old["span_kernel"] = good_inventory(
+        fedora_twin, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    round2_twin_old["span_userspace"] = good_inventory(
+        fedora_twin, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    fedora_round2 = copy_up(**round2_twin_old)["b_pre_round2"]
+    assert fedora_round2["twin_shape"] == "old-ended-plus-new"
+    assert fedora_round2["span_kernel"]["m7_entries"] == 0
+    assert fedora_round2["span_kernel"]["counted"] == 0
+    assert fedora_round2["span_userspace"]["counted"] == 0
+    # Shape (b) boundaries: the old edge must be ended and both deep_scan.
+    twin_old_mapped = [item if (item["pid"], item["module"]) != (105, "m7")
+                       else st_edge(105, "m7")
+                       for item in fedora_twin]
+    round2_old_mapped = good_copy_up("B")
+    round2_old_mapped["b_pre_round2_calls"] = 1500
+    round2_old_mapped["b_pre_round2_pid"] = 105
+    round2_old_mapped["span_kernel"] = good_inventory(
+        twin_old_mapped, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin old edge mapped", "is not ended",
+                 lambda: copy_up(**round2_old_mapped))
+    twin_old_match = [item if (item["pid"], item["module"]) != (105, "m7")
+                      else st_edge(105, "m7", evidence="maps_match",
+                                   state="ended")
+                      for item in fedora_twin]
+    round2_old_match = good_copy_up("B")
+    round2_old_match["b_pre_round2_calls"] = 1500
+    round2_old_match["b_pre_round2_pid"] = 105
+    round2_old_match["span_kernel"] = good_inventory(
+        twin_old_match, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin old edge not deep_scan", "deep_scan",
+                 lambda: copy_up(**round2_old_match))
+    twin_new_match = [item if (item["pid"], item["module"]) != (105, "m8")
+                      else st_edge(105, "m8", evidence="maps_match",
+                                   cov="watched_no_use", since=3000,
+                                   first_seen=2000)
+                      for item in fedora_twin]
+    round2_new_match = good_copy_up("B")
+    round2_new_match["b_pre_round2_calls"] = 1500
+    round2_new_match["b_pre_round2_pid"] = 105
+    round2_new_match["span_kernel"] = good_inventory(
+        twin_new_match, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin new edge not deep_scan", "deep_scan",
+                 lambda: copy_up(**round2_new_match))
+    # Shape (b) measurement: old + new together, missed or fully counted.
+    twin_b_counted = [item if (item["pid"], item["module"]) != (105, "m8")
+                      else st_edge(105, "m8", cov="counted", count=1500,
+                                   since=3000, first_seen=2000)
+                      for item in fedora_twin]
+    round2_b_counted = good_copy_up("B")
+    round2_b_counted["b_pre_round2_calls"] = 1500
+    round2_b_counted["b_pre_round2_pid"] = 105
+    round2_b_counted["span_kernel"] = good_inventory(
+        twin_b_counted, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    round2_b_counted["span_userspace"] = good_inventory(
+        twin_b_counted, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    assert copy_up(**round2_b_counted)["b_pre_round2"]["span_kernel"]["counted"] == 1500
+    # Old-edge entries count too: all 1500 on the ended edge is fixed.
+    twin_b_old_counted = [item if (item["pid"], item["module"]) != (105, "m7")
+                          else st_edge(105, "m7", state="ended", count=1500,
+                                       cov="counted", since=3000,
+                                       first_seen=2000)
+                          for item in fedora_twin]
+    round2_b_old_counted = good_copy_up("B")
+    round2_b_old_counted["b_pre_round2_calls"] = 1500
+    round2_b_old_counted["b_pre_round2_pid"] = 105
+    round2_b_old_counted["span_kernel"] = good_inventory(
+        twin_b_old_counted, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    round2_b_old_counted["span_userspace"] = good_inventory(
+        twin_b_old_counted, [st_collapse()], backend="userspace",
+        fallback=None, modules=ST_MODULES_SPAN)
+    assert copy_up(**round2_b_old_counted)["b_pre_round2"]["span_kernel"]["counted"] == 1500
+    twin_b_partial = [item if (item["pid"], item["module"]) != (105, "m8")
+                      else st_edge(105, "m8", cov="counted", count=9,
+                                   since=3000, first_seen=2000)
+                      for item in fedora_twin]
+    round2_b_partial = good_copy_up("B")
+    round2_b_partial["b_pre_round2_calls"] = 1500
+    round2_b_partial["b_pre_round2_pid"] = 105
+    round2_b_partial["span_kernel"] = good_inventory(
+        twin_b_partial, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin shape (b) partial count refused", "partial",
+                 lambda: copy_up(**round2_b_partial))
+    twin_b_old_partial = [item if (item["pid"], item["module"]) != (105, "m7")
+                          else st_edge(105, "m7", state="ended", count=9,
+                                       cov="counted", since=3000,
+                                       first_seen=2000)
+                          for item in fedora_twin]
+    round2_b_old_partial = good_copy_up("B")
+    round2_b_old_partial["b_pre_round2_calls"] = 1500
+    round2_b_old_partial["b_pre_round2_pid"] = 105
+    round2_b_old_partial["span_kernel"] = good_inventory(
+        twin_b_old_partial, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin shape (b) old-edge partial refused", "partial",
+                 lambda: copy_up(**round2_b_old_partial))
+    # The two backends must agree on the twin shape, not just the count.
+    round2_shape_split = good_copy_up("B")
+    round2_shape_split["b_pre_round2_calls"] = 1500
+    round2_shape_split["b_pre_round2_pid"] = 105
+    round2_shape_split["span_kernel"] = good_inventory(
+        fedora_twin, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    refuses_with("round-2 backends disagree on the twin shape", "twin shape",
+                 lambda: copy_up(**round2_shape_split))
     # A future fix that counts every post-copy-up call passes too.
     twin_counted_edges = [st_edge(101, "m7"),
                           st_edge(102, "m7", state="ended"),

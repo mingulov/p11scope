@@ -46830,6 +46830,79 @@ fn collected_graph_exact_fit_reaches_native() {
 }
 
 #[test]
+fn collected_graph_selection_reserves_before_inserting() {
+    // Count through the after-cursors, reserve, then insert: the
+    // reservation precedes every selection insert.
+    let (_guard, mut engine, mut session, view) = engine_with_ready_graph_intent();
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Selection);
+    // Step to the reservation: at that moment nothing is inserted yet.
+    let mut reserved = false;
+    for _ in 0..64 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        let graph = engine.collected_graph.as_ref().expect("boxed");
+        if graph.phase != GraphPhase::Selection {
+            break;
+        }
+        assert!(graph.verdict.is_none());
+        if graph.sel_storage.is_some() {
+            assert!(
+                graph.sel_retired.is_empty() && graph.sel_rejected.is_empty(),
+                "the reservation precedes every insert"
+            );
+            assert_eq!(graph.sel_count, (1, 0));
+            reserved = true;
+            break;
+        }
+    }
+    assert!(reserved, "Selection reserves before inserting");
+    // The sealed selection still carries the retirement to Pins.
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Pins);
+    let graph = engine.collected_graph.as_ref().expect("boxed");
+    assert!(
+        graph
+            .selection
+            .as_ref()
+            .expect("sealed")
+            .retired()
+            .contains(&view)
+    );
+}
+
+#[test]
+fn collected_graph_selection_reserve_refusal_inserts_nothing() {
+    // Twin: when the selection reservation refuses, the sets stay
+    // unchanged (nothing was inserted before the reserve).
+    let (_guard, mut engine, mut session, view) = engine_with_ready_graph_intent();
+    drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Selection);
+    let charged = engine.collected_test_pool.snapshot().charged_bytes;
+    engine.collected_test_pool.reference_set_limit(charged);
+    let mut verdict = None;
+    for _ in 0..64 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(outcome.pending);
+        verdict = engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict);
+        if verdict.is_some() {
+            break;
+        }
+    }
+    assert_eq!(verdict, Some(Verdict::RefusedUntouched));
+    let graph = engine.collected_graph.as_ref().expect("boxed");
+    assert!(
+        graph.sel_retired.is_empty() && graph.sel_rejected.is_empty(),
+        "a refused reservation inserts nothing"
+    );
+    assert!(graph.selection.is_none());
+    assert!(engine.pending_retirements.contains(&view));
+}
+
+#[test]
 fn collected_graph_source_change_before_native_is_refused_untouched() {
     let (_guard, mut engine, mut session, view) = engine_with_ready_graph_intent();
     drive_engine_graph_to_phase(&mut engine, &mut session, GraphPhase::Pins);

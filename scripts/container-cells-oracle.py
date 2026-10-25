@@ -6,18 +6,19 @@ Subcommands: copy-up (D1 shared-layer / copy-up), late-reported (N4 never-seen
 late provider), --self-test. Every check ships a mutation this oracle refuses;
 see --self-test and tests/python/test_container_cells_oracle.py.
 
-D1 follows the live run-4 shape (Opus D1 identity investigation): pre-copy-up
+D1 follows the live run-5/6 shape (Opus D1 identity investigation): pre-copy-up
 both backends collapse B onto A's module (same lower file, honest); the span
 shows B-pre's old edge ended plus a mapped edge to the new module with B's
-overlay key, and B2 mapped to that module, on BOTH backends with no named
-identity loss (B-pre's new edge is the known issue copy-up-stale-caller: B-pre
-still runs the lower file, and its later calls are not counted). Every kernel
-run reports backend kernel with a non-null fallback, recorded as "kernel proof
-checked no container edge", never as qualification. The copy-up itself is
-proven from facts.log (a different real inode in B's upper layer, same
-sha256). Fresh captures after B restarts attribute B exactly on lane B. The
-observer runs on the host in the initial PID namespace, so no pid_namespace
-cause is allowed.
+overlay key, and B2 plus the round-2 twin mapped to that module new-only, on
+BOTH backends with no named identity loss (B-pre's new edge is the known issue
+copy-up-stale-caller: B-pre still runs the lower file, and its later calls are
+not counted; the twin's post-copy-up calls are measured as missed or fully
+counted, never partial). Every kernel run reports backend kernel with a
+non-null fallback, recorded as "kernel proof checked no container edge", never
+as qualification. The copy-up itself is proven from facts.log (a different
+real inode in B's upper layer, same sha256). Fresh captures after B restarts
+attribute B exactly on lane B. The observer runs on the host in the initial
+PID namespace, so no pid_namespace cause is allowed.
 
 N4 follows the run-1 ruling: O exact and gap-free; L passes when scanned and
 EITHER a named gap from the frozen vocabulary references the late module OR
@@ -173,6 +174,11 @@ def known_issue_line(pid, old_module, new_module):
             f"old_module={old_module} new_module={new_module}")
 
 
+def measured_issue_line(pid, ledger, counted, module):
+    return ("KNOWN_ISSUE cell=D1 copy-up-stale-caller measured: "
+            f"ledger={ledger} counted={counted} pid={pid} module={module}")
+
+
 def boundary_line(unwatched_ns, entries):
     return (f"BOUNDARY cell=N4 late-provider unwatched_ns={unwatched_ns} "
             f"entries={entries}")
@@ -234,7 +240,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             pid_a, pid_b_pre, pid_b_span, pid_b_post, iters_a, iters_b, lane, dc73_note,
             facts_text, b_pre_round2_calls=None, b_pre_round2_pid=None,
             module_suffix=PROVIDER):
-    """D1: pre collapse, the run-4 span shape on both backends, fresh exactness.
+    """D1: pre collapse, the run-5/6 span shape on both backends, fresh exactness.
 
     pid_b_pre is B's first process (lower mapper, alive through the span);
     pid_b_span is the second process in B that maps the upper copy inside the
@@ -244,8 +250,11 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     LEDGER total of the round-2 caller b_pre_round2_pid (default pid_b_pre)
     when the driver ran that round, else None (unmeasured). The driver runs
     round 2 on a second pre-copy-up mapper (gated.c runs one round per
-    process); the oracle asserts only that the new edge claims none of those
-    calls.
+    process); that twin is first scanned after the collapse resolves, so its
+    only provider edge is the new module. The oracle accepts exactly two
+    outcomes for its post-copy-up calls: missed (counted 0, the R-41 known
+    issue) or fully counted (a future fix); anything in between fails named.
+    The same two outcomes apply to B-pre's own later calls when measured.
     """
     assert lane in ("A", "B"), lane
     assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
@@ -387,17 +396,31 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             old_id, new_id = span_shapes[label.replace("_", "-")]
             assert (round2_pid, new_id) in records, \
                 (label, "no new-module edge for the round-2 caller", round2_pid)
-            assert (round2_pid, old_id) in records, \
-                (label, "no old-module edge for the round-2 caller", round2_pid)
-            m7_entries = records[(round2_pid, old_id)]["entries"]["count"]
             m8_record = records[(round2_pid, new_id)]
+            assert m8_record["mapping"]["state"] == "mapped", \
+                (label, "the round-2 new edge is not mapped", round2_pid)
+            if round2_pid == pid_b_pre:
+                # B-pre was first scanned before the collapse resolved, so it
+                # keeps its ended old edge next to the new one.
+                assert (round2_pid, old_id) in records, \
+                    (label, "no old-module edge for B-pre", round2_pid)
+                m7_entries = records[(round2_pid, old_id)]["entries"]["count"]
+            else:
+                # A B process first scanned after the collapse resolves never
+                # had the old module: the twin is new-only by construction.
+                assert (round2_pid, old_id) not in records, \
+                    (label, "round-2 twin must not have an old-module edge",
+                     round2_pid)
+                m7_entries = None
             m8_entries = m8_record["entries"]["count"]
             m8_status = m8_record["entries"]["coverage"]["state"]
-            assert m8_entries == 0, \
-                (label, "the new edge claims the round-2 caller's post-copy-up calls",
-                 round2_pid, m8_entries)
+            assert m8_entries == 0 or m8_entries == b_pre_round2_calls, \
+                (label, "partial round-2 count: neither missed nor fully counted",
+                 round2_pid, m8_entries, b_pre_round2_calls)
             legs[label] = {"m7_entries": m7_entries, "m8_entries": m8_entries,
                            "m8_status": m8_status}
+        assert legs["span_kernel"]["m8_entries"] == legs["span_userspace"]["m8_entries"], \
+            ("span backends disagree on the round-2 count", legs)
         b_pre_round2 = {"measured": True, "calls": b_pre_round2_calls,
                         "pid": round2_pid, **legs}
 
@@ -1110,6 +1133,12 @@ def main(argv):
         print(known_issue_line(known["pid"], known["old_module"],
                                known["new_module"]),
               file=sys.stderr)
+        round2 = result["b_pre_round2"]
+        if round2.get("measured"):
+            print(measured_issue_line(round2["pid"], round2["calls"],
+                                      round2["span_kernel"]["m8_entries"],
+                                      known["new_module"]),
+                  file=sys.stderr)
     elif options.command == "late-reported":
         with open(options.file, encoding="utf-8") as handle:
             document = json.load(handle)

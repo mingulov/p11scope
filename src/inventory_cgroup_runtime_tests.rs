@@ -57,6 +57,9 @@ impl<'a> ObservedDriver<'a> {
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
                 joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,
                 #[cfg(test)]
@@ -65,6 +68,16 @@ impl<'a> ObservedDriver<'a> {
                 joint_begin_calls: 0,
                 #[cfg(test)]
                 joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
             },
             wrapper: None,
             tick: None,

@@ -29,9 +29,9 @@ use crate::discovery::native_binding::NativeIdentity;
 #[cfg(test)]
 use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
-    CgroupJobFailure, CollectJob, CollectedPass, ExitRelease, ExitRetention, FacadeLane,
-    LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
-    run_classic_finalizing,
+    CgroupJobFailure, ClassicCompletion, ClassicOutcome, CollectJob, CollectedPass, ExitRelease,
+    ExitRetention, FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver,
+    Publish, SERVICE_TICK, Stopped, ZeroPassStop, run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
@@ -1352,6 +1352,9 @@ fn run_with_terminal_budget(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -1360,6 +1363,16 @@ fn run_with_terminal_budget(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
@@ -1374,64 +1387,55 @@ fn run_with_terminal_budget(
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
     };
-    let running = run_classic_finalizing(
-        &mut driver,
-        lane,
-        &clock,
-        initial_error,
-        &mut |driver: &mut ClassicDriver<'_>, point| {
-            let coordinator = &*driver.coordinator;
-            match point {
-                Publish::Pass { report, now_ns } => {
-                    for line in progress_lines(coordinator, report) {
-                        inventory_diagnostic(&line);
-                    }
-                    if let Some(error) = stream.attempt("pass publication", |writer| {
-                        let mut presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                        presentation.semantic_capture = driver.semantic_summary();
-                        emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
-                    }) {
-                        let _ =
-                            crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
-                    }
+    let mut publish = |driver: &mut ClassicDriver<'_>, point: Publish<'_>| {
+        let coordinator = &*driver.coordinator;
+        match point {
+            Publish::Pass { report, now_ns } => {
+                for line in progress_lines(coordinator, report) {
+                    inventory_diagnostic(&line);
                 }
-                Publish::Retiring {
-                    attached,
-                    links,
-                    budget,
-                } => retiring_stdout(stdout, || {
-                    inventory_diagnostic(&format!(
-                        "p11scope: stopping: detaching the native probes of {attached} endpoints \
-                     in {links} links (up to {} s)",
-                        budget.as_secs()
-                    ))
-                }),
-                Publish::Stop { events, now_ns } => {
-                    if let Some(error) = stream.attempt("stop publication", |writer| {
-                        let mut presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                        presentation.semantic_capture = driver.semantic_summary();
-                        emit_stop_events(
-                            writer,
-                            &mut stream_state,
-                            events,
-                            coordinator.passes(),
-                            &presentation,
-                            now_ns,
-                        )
-                    }) {
-                        let _ =
-                            crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
-                    }
+                if let Some(error) = stream.attempt("pass publication", |writer| {
+                    let mut presentation =
+                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                    presentation.semantic_capture = driver.semantic_summary();
+                    emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
+                }) {
+                    let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
             }
-            Ok(())
-        },
-    );
-    let stopped = running.stopped;
-    let capture_error = running.error;
-    let zero_pass = running.zero_pass;
+            Publish::Retiring {
+                attached,
+                links,
+                budget,
+            } => retiring_stdout(stdout, || {
+                inventory_diagnostic(&format!(
+                    "p11scope: stopping: detaching the native probes of {attached} endpoints \
+                     in {links} links (up to {} s)",
+                    budget.as_secs()
+                ))
+            }),
+            Publish::Stop { events, now_ns } => {
+                if let Some(error) = stream.attempt("stop publication", |writer| {
+                    let mut presentation =
+                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                    presentation.semantic_capture = driver.semantic_summary();
+                    emit_stop_events(
+                        writer,
+                        &mut stream_state,
+                        events,
+                        coordinator.passes(),
+                        &presentation,
+                        now_ns,
+                    )
+                }) {
+                    let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
+                }
+            }
+        }
+        Ok(())
+    };
+    let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
+    let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
     let semantic_summary = driver.semantic_summary();
     // Both owners stay alive through the final commit, the immutable
     // presentation and every sink attempt; the lane releases after
@@ -1906,8 +1910,24 @@ struct ClassicDriver<'a> {
     /// refusal, or the escalation note. Never overwritten by later
     /// best-effort work.
     joint_first_error: Option<String>,
+    /// The retained consumer owns this driver (§6.3): native service
+    /// stops, ticks service only the display and the Joint finish,
+    /// and no new work is admitted. Set by the suspension gate and
+    /// by the consumer on retention; never cleared.
+    suspended: bool,
+    /// A Joint commit is begun but unpublished (§6.1, §6.3): the
+    /// retained finish step polls it instead of beginning. R1.4 runs
+    /// no commits, so production never sets this; the R1.5 commit
+    /// path owns it and tests pose it directly.
+    joint_commit_pending: bool,
+    /// Storage-retryable commit refusals on the final lane's
+    /// retained step (§8.3 item 7): ProviderStorage retries up to
+    /// 100 hooks, mirroring the winding counter.
+    joint_commit_retries: u16,
     /// Tests-only spies: terminal-sequence runs, reclaim calls with
-    /// their end, finish-begin attempts, driver steps.
+    /// their end, finish-begin attempts, driver steps, joint commit
+    /// polls, promotion-work takes, held-install drives, caller
+    /// metadata services, classic commits.
     #[cfg(test)]
     terminal_seq_calls: usize,
     #[cfg(test)]
@@ -1916,6 +1936,16 @@ struct ClassicDriver<'a> {
     joint_begin_calls: usize,
     #[cfg(test)]
     joint_step_calls: usize,
+    #[cfg(test)]
+    joint_commit_polls: usize,
+    #[cfg(test)]
+    take_promotion_work_calls: usize,
+    #[cfg(test)]
+    drive_pending_install_calls: usize,
+    #[cfg(test)]
+    service_caller_metadata_calls: usize,
+    #[cfg(test)]
+    commit_calls: usize,
 }
 
 /// Exercise the actual caller refresh/admission path with substituted lane I/O.
@@ -1956,6 +1986,9 @@ pub(crate) fn classic_semantic_tick_for_test(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -1964,6 +1997,16 @@ pub(crate) fn classic_semantic_tick_for_test(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     driver.on_tick();
     driver.semantic.take().unwrap()
@@ -2001,6 +2044,9 @@ pub(crate) fn classic_semantic_pass_for_test(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -2009,6 +2055,16 @@ pub(crate) fn classic_semantic_pass_for_test(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     let report = driver.apply(collected, identity, now_ns()).unwrap();
     driver.commit(report.engine_changed).unwrap();
@@ -2022,6 +2078,20 @@ thread_local! {
     // Substitute only the fallible publication boundary, after real H0
     // Finish exists. No receipt, semantic row or native success is scripted.
     static FAIL_TERMINAL_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CLASSIC_COMMIT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm one classic commit failure: the next `ClassicDriver::commit`
+/// attempt counts, then fails with `text` instead of publishing.
+/// Tests a capture-side fault without touching the commit path.
+#[cfg(test)]
+pub(crate) fn fail_next_classic_commit_for_test(text: &str) {
+    FAIL_NEXT_CLASSIC_COMMIT.with(|fault| fault.replace(Some(text.to_string())));
 }
 
 #[cfg(test)]
@@ -2065,6 +2135,9 @@ pub(crate) fn classic_semantic_stop_for_test(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -2073,6 +2146,16 @@ pub(crate) fn classic_semantic_stop_for_test(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     driver.on_stop_requested();
     // Repeated stop hooks cannot submit the same native owners again.
@@ -2143,6 +2226,9 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -2151,6 +2237,16 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     let started = Instant::now();
     loop {
@@ -3610,12 +3706,53 @@ pub(crate) fn bind_semantic_candidates(
     }
 }
 
+/// The retained consumer (§6.4): a finished outcome keeps
+/// today's reads; a retained run drains beside its driver, and a
+/// malformed mixture holds its owners and reports.
+impl ClassicDriver<'_> {
+    /// RED scaffolding: the finished arm reads through; the
+    /// retained and mixed arms stay inert until the implementation
+    /// commit wires the poll loop and the I2 exit.
+    fn consume_outcome(
+        &mut self,
+        outcome: ClassicOutcome<FacadeLane>,
+        clock: &LoopClock,
+        publish: &mut dyn FnMut(&mut Self, Publish<'_>) -> Result<()>,
+    ) -> (
+        Option<Stopped<FacadeLane>>,
+        Option<anyhow::Error>,
+        Option<ZeroPassStop>,
+    ) {
+        let _ = (clock, publish);
+        match outcome.into_completion() {
+            Ok(ClassicCompletion::Finalized {
+                stopped,
+                error,
+                zero_pass,
+            }) => (stopped, error, zero_pass),
+            Ok(ClassicCompletion::Retained { run: _, error: _ }) => (None, None, None),
+            Err(_) => (None, None, None),
+        }
+    }
+}
+
 impl PassDriver<PidPin> for ClassicDriver<'_> {
     type Host = InventoryCoordinator<OsProcessSource>;
 
     fn host(&mut self) -> &mut Self::Host {
         self.coordinator
     }
+
+    /// Whether a publication is still owed: a begun-but-unpublished
+    /// Joint commit, or a Joint finish mid-poll. RED scaffolding:
+    /// inert until the implementation commit.
+    fn publication_pending(&self) -> bool {
+        false
+    }
+
+    /// The suspension gate (§6.2): latch only, never terminal I/O.
+    /// RED scaffolding: inert until the implementation commit.
+    fn on_publication_suspended(&mut self) {}
 
     fn collector(&mut self) -> crate::inventory_capture::CollectJob {
         if let Some(cgroup) = &mut self.cgroup {
@@ -4899,6 +5036,9 @@ fn run_dashboard(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -4907,6 +5047,16 @@ fn run_dashboard(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
         identity: identity_shared.clone(),
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
@@ -4925,85 +5075,77 @@ fn run_dashboard(
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
     };
-    let running = run_classic_finalizing(
-        &mut driver,
-        lane,
-        &clock,
-        initial_error,
-        &mut |driver: &mut ClassicDriver<'_>, point| {
-            match point {
-                Publish::Pass { report, now_ns } => {
-                    let coordinator = &*driver.coordinator;
-                    let (display_view, event_error) = dashboard_stream_pass(
-                        &mut stream,
-                        &mut stream_state,
-                        report,
-                        coordinator,
-                        &scope_label,
-                        started_ns,
-                        now_ns,
-                        driver.semantic_summary(),
-                    );
-                    if let Some(display) = driver.display.as_mut() {
-                        if let Some(error) = event_error {
-                            display.notice(&crate::render::escape_controls(&error));
-                        }
-                        // The pass line is progress; its events and gaps
-                        // must outlive the screen.
-                        for (index, line) in progress_lines(coordinator, report).iter().enumerate()
-                        {
-                            if index == 0 {
-                                display.log(line);
-                            } else {
-                                display.warn(line);
-                            }
-                        }
-                        display.offer(display_view);
-                    }
-                }
-                Publish::Retiring {
-                    attached,
-                    links,
-                    budget,
-                } => {
-                    retiring_stdout(stdout, || {
-                        // Termios and the bounded screen restore precede JSON.
-                        if let Some(display) = driver.display.as_mut() {
-                            display.restore();
-                            display.notice(&format!(
-                                "p11scope: stopping: detaching the native probes of {attached} \
-                             endpoints in {links} links (up to {} s)",
-                                budget.as_secs()
-                            ));
-                        }
-                    });
-                }
-                Publish::Stop { events, now_ns } => {
-                    let coordinator = &*driver.coordinator;
-                    if let Some(error) = stream.attempt("stop publication", |writer| {
-                        let mut presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                        presentation.semantic_capture = driver.semantic_summary();
-                        emit_stop_events(
-                            writer,
-                            &mut stream_state,
-                            events,
-                            coordinator.passes(),
-                            &presentation,
-                            now_ns,
-                        )
-                    }) && let Some(display) = driver.display.as_mut()
-                    {
+    let mut publish = |driver: &mut ClassicDriver<'_>, point: Publish<'_>| {
+        match point {
+            Publish::Pass { report, now_ns } => {
+                let coordinator = &*driver.coordinator;
+                let (display_view, event_error) = dashboard_stream_pass(
+                    &mut stream,
+                    &mut stream_state,
+                    report,
+                    coordinator,
+                    &scope_label,
+                    started_ns,
+                    now_ns,
+                    driver.semantic_summary(),
+                );
+                if let Some(display) = driver.display.as_mut() {
+                    if let Some(error) = event_error {
                         display.notice(&crate::render::escape_controls(&error));
                     }
+                    // The pass line is progress; its events and gaps
+                    // must outlive the screen.
+                    for (index, line) in progress_lines(coordinator, report).iter().enumerate() {
+                        if index == 0 {
+                            display.log(line);
+                        } else {
+                            display.warn(line);
+                        }
+                    }
+                    display.offer(display_view);
                 }
             }
-            Ok(())
-        },
-    );
-    let stopped = running.stopped;
-    let capture_error = running.error;
-    let zero_pass = running.zero_pass;
+            Publish::Retiring {
+                attached,
+                links,
+                budget,
+            } => {
+                retiring_stdout(stdout, || {
+                    // Termios and the bounded screen restore precede JSON.
+                    if let Some(display) = driver.display.as_mut() {
+                        display.restore();
+                        display.notice(&format!(
+                            "p11scope: stopping: detaching the native probes of {attached} \
+                             endpoints in {links} links (up to {} s)",
+                            budget.as_secs()
+                        ));
+                    }
+                });
+            }
+            Publish::Stop { events, now_ns } => {
+                let coordinator = &*driver.coordinator;
+                if let Some(error) = stream.attempt("stop publication", |writer| {
+                    let mut presentation =
+                        stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                    presentation.semantic_capture = driver.semantic_summary();
+                    emit_stop_events(
+                        writer,
+                        &mut stream_state,
+                        events,
+                        coordinator.passes(),
+                        &presentation,
+                        now_ns,
+                    )
+                }) && let Some(display) = driver.display.as_mut()
+                {
+                    display.notice(&crate::render::escape_controls(&error));
+                }
+            }
+        }
+        Ok(())
+    };
+    let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
+    let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
     begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
@@ -9271,6 +9413,9 @@ mod tests {
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
                 joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,
                 #[cfg(test)]
@@ -9279,6 +9424,16 @@ mod tests {
                 joint_begin_calls: 0,
                 #[cfg(test)]
                 joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
             };
             // The first tick stages; a fresh staged batch stays staged
             // across further ticks instead of committing early.
@@ -9367,6 +9522,9 @@ mod tests {
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
                 joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,
                 #[cfg(test)]
@@ -9375,6 +9533,16 @@ mod tests {
                 joint_begin_calls: 0,
                 #[cfg(test)]
                 joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
             };
             assert!(driver.semantic_staged, "one quantum stages");
             assert_eq!(driver.coordinator.registry().instances().count(), 0);
@@ -9403,6 +9571,1346 @@ mod tests {
                 "the safety net publishes nothing twice"
             );
         }
+    }
+
+    // Retained dispositions, suspension and the finite-stop consumer
+    // (§6.1, §6.3, §6.4, §7): the driver fixtures live beside the
+    // promotion tests; only the coordinator stays local (it would
+    // collide with this module's own).
+    use super::promotion_driver_tests::{
+        CountingSource, WindDownIo, driver_with_display, gaps, headless_display, joint_lane,
+        queue_request,
+    };
+    use crate::inventory_capture::{
+        BlockDisposition, ClassicCompletion, ClassicOutcome, FacadeLane, LoopClock, Publish,
+        RetainedBlock, RetainedClassicRun, RetainedWorkBudget, Stopped, ZERO_PASS_GAP_SUBJECT,
+        ZeroPassCause, ZeroPassStop,
+    };
+    use crate::inventory_promotion::PromotionState;
+
+    /// A consumption clock over a caller-held stop closure: the
+    /// retained run already sampled its cause, so this clock only
+    /// bounds native steps. Shared with the Driver cells.
+    pub(crate) fn consume_clock(stop_now: &dyn Fn() -> bool) -> LoopClock<'_> {
+        LoopClock {
+            deadline: None,
+            stop: stop_now,
+            now: &std::time::Instant::now,
+            interval: super::inventory_test_poll_interval(),
+            tick: crate::inventory_capture::SERVICE_TICK,
+            collection_tick: crate::inventory_capture::SERVICE_TICK,
+        }
+    }
+
+    /// Retain through the real classic loop: the caller presets the
+    /// pending publication (Polling, or the commit flag) and seats
+    /// the lane; the loop suspends at its first wait site with the
+    /// requested stop cause, before any collection. Scan lane: no
+    /// native owner, no BPF. Shared with the Driver cells.
+    pub(crate) fn retain_with_cause(
+        driver: &mut ClassicDriver<'_>,
+        cause: ZeroPassCause,
+        initial_error: Option<anyhow::Error>,
+    ) -> crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane> {
+        let stop = cause == ZeroPassCause::OperatorStop;
+        let stop_now = || stop;
+        let clock = LoopClock {
+            deadline: (cause == ZeroPassCause::Deadline)
+                .then(|| std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            stop: &stop_now,
+            now: &std::time::Instant::now,
+            interval: super::inventory_test_poll_interval(),
+            tick: crate::inventory_capture::SERVICE_TICK,
+            collection_tick: crate::inventory_capture::SERVICE_TICK,
+        };
+        crate::inventory_capture::run_classic_finalizing(
+            driver,
+            None,
+            &clock,
+            initial_error,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// Retain with an error but no stop cause: the initial-error
+    /// path suspends on the pending publication without sampling
+    /// any stop. The N1 wait needs its causeless run.
+    pub(crate) fn retain_with_error_no_stop(
+        driver: &mut ClassicDriver<'_>,
+        text: &str,
+    ) -> crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane> {
+        let stop_now = || false;
+        let clock = LoopClock {
+            deadline: None,
+            stop: &stop_now,
+            now: &std::time::Instant::now,
+            interval: super::inventory_test_poll_interval(),
+            tick: crate::inventory_capture::SERVICE_TICK,
+            collection_tick: crate::inventory_capture::SERVICE_TICK,
+        };
+        crate::inventory_capture::run_classic_finalizing(
+            driver,
+            None,
+            &clock,
+            Some(anyhow::anyhow!("{text}")),
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// The retained run beside its driver, or an assertion failure
+    /// naming the missing retention. Shared with the Driver cells.
+    pub(crate) fn retained_run_of(
+        outcome: crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane>,
+    ) -> (
+        RetainedClassicRun<crate::inventory_capture::FacadeLane>,
+        Option<anyhow::Error>,
+    ) {
+        assert!(
+            outcome.retained.is_some(),
+            "the loop retains its run beside the driver"
+        );
+        match outcome.into_completion() {
+            Ok(ClassicCompletion::Retained { run, error }) => (run, error),
+            _ => panic!("retention keeps the run"),
+        }
+    }
+
+    #[test]
+    fn suspended_hooks_service_only_joint_frame_and_finish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // The suspension gate latches only (§6.2): no terminal I/O,
+        // no drain, no publication, no owner extraction.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.on_publication_suspended();
+            assert!(driver.suspended, "the hook latches suspension");
+            assert_eq!(driver.terminal_seq_calls, 0, "no terminal sequence");
+            assert_eq!(driver.joint_begin_calls, 0, "no finish begin");
+            assert_eq!(driver.joint_step_calls, 0, "no driver step");
+            assert_eq!(driver.joint_commit_polls, 0, "no commit poll");
+            assert_eq!(driver.commit_calls, 0, "no commit");
+            assert!(driver.semantic.is_some(), "no owner extraction at the gate");
+            assert!(
+                !driver
+                    .semantic
+                    .as_ref()
+                    .expect("lane")
+                    .joint_finish_disposition_required(),
+                "no latch at the gate"
+            );
+        }
+
+        // Eight suspended cycles over a polling Joint lane: the
+        // finish polls, everything else stays quiet.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            let mut io = WindDownIo::completing();
+            let ticks = Rc::new(Cell::new(0));
+            io.ticks = Rc::clone(&ticks);
+            driver.semantic = Some(joint_lane(io, true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            driver.suspended = true;
+            queue_request(driver.display.as_mut().expect("display"));
+            let display_ticks = driver.display.as_ref().expect("display").account().ticks;
+            for _ in 0..8 {
+                driver.on_native_service(None);
+                driver.on_tick();
+            }
+            assert_eq!(
+                driver.take_promotion_work_calls, 0,
+                "suspension takes no promotion work"
+            );
+            assert_eq!(
+                driver.drive_pending_install_calls, 0,
+                "suspension drives no held install"
+            );
+            assert_eq!(
+                driver.service_caller_metadata_calls, 0,
+                "suspension services no caller metadata"
+            );
+            assert_eq!(ticks.get(), 0, "suspension ticks no lane");
+            assert_eq!(
+                driver.display.as_ref().expect("display").promotion_state(),
+                PromotionState::Queued,
+                "the queued request waits untouched"
+            );
+            assert!(
+                driver.lifecycle.is_idle(),
+                "no preparation starts while suspended"
+            );
+            assert!(
+                gaps(&mut driver)
+                    .iter()
+                    .all(|(subject, _)| subject != "selected promotion refused"),
+                "no refusal while suspended: {:?}",
+                gaps(&mut driver)
+            );
+            assert_eq!(
+                driver.joint_step_calls, 8,
+                "every cycle polls the joint finish"
+            );
+            assert_eq!(
+                driver.joint_commit_polls, 0,
+                "no pending commit means no commit poll"
+            );
+            assert_eq!(driver.joint_begin_calls, 0, "polling never re-begins");
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Polling,
+                "a finished lane polls without latching"
+            );
+            assert!(driver.semantic.is_some(), "the polling lane is kept");
+            assert_eq!(
+                driver.display.as_ref().expect("display").account().ticks,
+                display_ticks + 8,
+                "every cycle still ticks the display"
+            );
+        }
+
+        // A legacy lane gets nothing while suspended: no lane tick,
+        // and the lane survives (no finish step exists for it).
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            let mut io = WindDownIo::completing();
+            let ticks = Rc::new(Cell::new(0));
+            io.ticks = Rc::clone(&ticks);
+            let mut lane = joint_lane(io, false);
+            lane.set_test_joint_frame(false);
+            driver.semantic = Some(lane);
+            driver.suspended = true;
+            for _ in 0..8 {
+                driver.on_tick();
+            }
+            assert_eq!(ticks.get(), 0, "a legacy lane is not ticked");
+            assert_eq!(driver.joint_begin_calls, 0, "no begin for legacy");
+            assert_eq!(driver.joint_step_calls, 0, "no step for legacy");
+            assert!(
+                driver.semantic.is_some(),
+                "the legacy lane survives suspension"
+            );
+            // Positive control: unsuspended, the same lane ticks.
+            driver.suspended = false;
+            driver.on_tick();
+            assert_eq!(ticks.get(), 1, "the spy observes a real lane tick");
+        }
+
+        // A pending commit polls the joint commit, never begins.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.joint_commit_pending = true;
+            driver.suspended = true;
+            driver.on_tick();
+            assert_eq!(
+                driver.joint_commit_polls, 1,
+                "one suspended cycle polls the pending commit"
+            );
+            assert_eq!(
+                driver.joint_begin_calls, 0,
+                "a pending commit never begins the finish"
+            );
+        }
+
+        // After the commit completes, the finish begins once; a
+        // polling lane then polls its finish every cycle.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.suspended = true;
+            driver.on_tick();
+            assert_eq!(
+                driver.joint_begin_calls, 1,
+                "after the commit completes, the finish begins once"
+            );
+            assert_eq!(
+                driver.joint_commit_polls, 0,
+                "no pending commit means no commit poll"
+            );
+
+            {
+                let mut coordinator2 = coordinator();
+                let headless = headless_display();
+                let mut driver = driver_with_display(&mut coordinator2, headless.display);
+                driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+                driver.joint_finish = JointFinishDriver::Polling;
+                driver.suspended = true;
+                for _ in 0..8 {
+                    driver.on_tick();
+                }
+                assert!(
+                    driver.joint_step_calls >= 1,
+                    "a polling lane polls its finish: {}",
+                    driver.joint_step_calls
+                );
+            }
+        }
+
+        // Positive controls: unsuspended hooks run everything the
+        // suspended cycles above skipped.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            queue_request(driver.display.as_mut().expect("display"));
+            driver.on_native_service(None);
+            driver.on_tick();
+            assert_eq!(
+                driver.service_caller_metadata_calls, 1,
+                "the metadata spy observes a real service"
+            );
+            assert_eq!(
+                driver.take_promotion_work_calls, 1,
+                "the take spy observes a real take"
+            );
+            assert_eq!(
+                driver.drive_pending_install_calls, 1,
+                "the install spy observes a real drive"
+            );
+            assert_ne!(
+                driver.display.as_ref().expect("display").promotion_state(),
+                PromotionState::Queued,
+                "unsuspended, the request is taken"
+            );
+        }
+    }
+
+    #[test]
+    fn joint_driver_retained_path_begins_finish_from_suspended_tick() {
+        // The retained path begins from the suspended tick, never
+        // through the stop request: an unfinished lane abandons
+        // through the begin refusal with the stop unlatched.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.suspended = true;
+            driver.on_tick();
+            assert_eq!(
+                driver.joint_begin_calls, 1,
+                "the suspended tick begins the retained finish once"
+            );
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "the begin refusal abandons"
+            );
+            assert!(
+                !driver.stop_requested,
+                "the retained path never calls on_stop_requested"
+            );
+            assert_eq!(
+                driver.terminal_seq_calls, 0,
+                "no terminal sequence on the retained path"
+            );
+            assert!(driver.suspended, "suspension sticks");
+        }
+        // Twin: a finished lane resumes at the wound-down phase.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            driver.suspended = true;
+            driver.on_tick();
+            assert_eq!(driver.joint_begin_calls, 1, "the tick begins once");
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Published,
+                "a finished lane resumes at the wound-down phase"
+            );
+            assert!(
+                !driver.stop_requested,
+                "the retained path never calls on_stop_requested"
+            );
+            assert!(
+                driver.semantic.is_some(),
+                "the published lane is kept for the wound-down"
+            );
+        }
+    }
+
+    #[test]
+    fn dispose_retained_publication_steps_joint_driver_once_per_call() {
+        use std::time::{Duration, Instant};
+
+        fn budget() -> RetainedWorkBudget {
+            RetainedWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            }
+        }
+
+        // NotBegun with a pending commit: one commit poll, no begin.
+        // The pending commit itself suspends the loop.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.joint_commit_pending = true;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, _) = retained_run_of(outcome);
+            assert!(driver.suspended, "retention suspends the driver");
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::NotBegun,
+                "retention begins nothing"
+            );
+            let mut budget = budget();
+            let disposition: Result<BlockDisposition, anyhow::Error> =
+                driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+            assert_eq!(driver.joint_commit_polls, 1, "one call polls once");
+            assert_eq!(driver.joint_begin_calls, 0, "a pending commit never begins");
+            assert_eq!(driver.joint_step_calls, 0, "no begun step runs");
+            // The substituted commit refusal takes the finite stop, so
+            // nothing stays pending afterwards.
+            assert_eq!(
+                disposition.unwrap(),
+                BlockDisposition::Resolved,
+                "the held lane leaves nothing pending"
+            );
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "the commit refusal abandons"
+            );
+            assert!(driver.semantic.is_none(), "the lane is held");
+        }
+
+        // NotBegun with no pending commit: one begin, no commit poll.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, _) = retained_run_of(outcome);
+            driver.joint_finish = JointFinishDriver::NotBegun;
+            let mut budget = budget();
+            let disposition: Result<BlockDisposition, anyhow::Error> =
+                driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+            assert_eq!(driver.joint_begin_calls, 1, "one call begins once");
+            assert_eq!(driver.joint_commit_polls, 0, "no pending commit, no poll");
+            assert_eq!(
+                disposition.unwrap(),
+                BlockDisposition::Resolved,
+                "the held lane leaves nothing pending"
+            );
+        }
+
+        // Polling: each call polls the finish once and stays pending.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, _) = retained_run_of(outcome);
+            let mut budget = budget();
+            for step in 1..=3 {
+                let disposition: Result<BlockDisposition, anyhow::Error> =
+                    driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+                assert_eq!(
+                    driver.joint_step_calls, step,
+                    "call {step} spends one finish poll"
+                );
+                assert_eq!(
+                    disposition.unwrap(),
+                    BlockDisposition::Pending,
+                    "a polling finish holds its block"
+                );
+            }
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Polling,
+                "a finished lane polls without latching"
+            );
+            assert!(driver.semantic.is_some(), "the polling lane is kept");
+            assert_eq!(driver.joint_begin_calls, 0, "polling never re-begins");
+            assert_eq!(driver.joint_commit_polls, 0, "polling polls no commit");
+        }
+
+        // Published: one wound-down poll; the published publication
+        // resolves while the detach keeps reaping on ticks.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            let (io, gate) = WindDownIo::gated();
+            let polls = std::rc::Rc::clone(&io.polls);
+            driver.semantic = Some(joint_lane(io, true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let (mut run, _) = retained_run_of(outcome);
+            driver.joint_finish = JointFinishDriver::Published;
+            let mut budget = budget();
+            let disposition: Result<BlockDisposition, anyhow::Error> =
+                driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+            assert_eq!(polls.get(), 1, "one call reaps the detach once");
+            assert_eq!(
+                disposition.unwrap(),
+                BlockDisposition::Resolved,
+                "a published finish resolves its publication block"
+            );
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Published,
+                "the pending detach keeps its phase"
+            );
+            assert!(driver.semantic.is_some(), "the lane is kept");
+            assert!(
+                driver.joint_first_error.is_none(),
+                "no error on the wound-down path"
+            );
+            // Our gate handle drops; the detach stays pending, never joined.
+            drop(gate);
+        }
+    }
+
+    #[test]
+    fn dispose_retained_publication_abandons_on_i2_trigger() {
+        use std::time::{Duration, Instant};
+
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        let mut io = WindDownIo::completing();
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        io.drop_spy = Some(std::rc::Rc::clone(&drops));
+        let detach_polls = std::rc::Rc::clone(&io.polls);
+        let mut lane = joint_lane(io, false);
+        lane.note_joint_finish_failure(crate::inventory_semantics::SemanticRefusal::Unavailable);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let (mut run, _) = retained_run_of(outcome);
+        let revision_before = driver.coordinator.registry().facts_revision();
+        let mut budget = RetainedWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let disposition: Result<BlockDisposition, anyhow::Error> =
+            driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+        assert_eq!(
+            disposition.unwrap(),
+            BlockDisposition::Resolved,
+            "the abandoned lane leaves nothing pending"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the I2 trigger abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(drops.get(), 0, "held means never dropped");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the first error is kept"
+        );
+        assert_eq!(detach_polls.get(), 0, "the abandon never joins");
+        assert_eq!(
+            driver.coordinator.registry().facts_revision(),
+            revision_before + 1,
+            "the abandon commits once, best effort"
+        );
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(
+            abandons.len(),
+            1,
+            "exactly one abandon gap: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn dispose_retained_non_joint_blocks_resolve_through_table() {
+        use std::time::{Duration, Instant};
+
+        // Blocks the loop's table owns resolve with no driver step,
+        // on joint and legacy lanes alike.
+        for joint in [true, false] {
+            for block in [
+                RetainedBlock::Publication,
+                RetainedBlock::Collected,
+                RetainedBlock::ScopedCompletion,
+                RetainedBlock::Native,
+            ] {
+                // A joint lane only reaches this arm for non-joint
+                // blocks; Publication on a joint lane steps above.
+                if joint && block == RetainedBlock::Publication {
+                    continue;
+                }
+                let mut coord = coordinator();
+                let headless = headless_display();
+                let mut driver = driver_with_display(&mut coord, headless.display);
+                let mut lane = joint_lane(WindDownIo::completing(), true);
+                if !joint {
+                    lane.set_test_joint_frame(false);
+                }
+                driver.semantic = Some(lane);
+                driver.joint_finish = JointFinishDriver::Polling;
+                let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+                let (mut run, _) = retained_run_of(outcome);
+                if !joint {
+                    driver.joint_finish = JointFinishDriver::NotBegun;
+                }
+                let mut budget = RetainedWorkBudget {
+                    remaining_actions: 1024,
+                    deadline: Instant::now() + Duration::from_millis(10),
+                };
+                let disposition: Result<BlockDisposition, anyhow::Error> =
+                    driver.dispose_retained(block, &mut run, &mut budget);
+                assert_eq!(
+                    disposition.unwrap(),
+                    BlockDisposition::Resolved,
+                    "joint={joint} block={block:?} resolves without a step"
+                );
+                assert_eq!(driver.joint_begin_calls, 0, "no begin");
+                assert_eq!(driver.joint_step_calls, 0, "no step");
+                assert_eq!(driver.joint_commit_polls, 0, "no commit poll");
+            }
+        }
+    }
+
+    #[test]
+    fn classic_consumer_retains_run_driver_and_coordinator() {
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        driver.display = None;
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        // The suspension gate ran inside retention and did nothing else.
+        assert!(driver.suspended, "retention suspends the driver");
+        assert_eq!(
+            driver.terminal_seq_calls, 0,
+            "the gate runs no terminal I/O"
+        );
+        assert_eq!(driver.joint_begin_calls, 0, "the gate begins nothing");
+        assert_eq!(driver.joint_step_calls, 0, "the gate steps nothing");
+        assert_eq!(driver.commit_calls, 0, "the gate commits nothing");
+        // The same run, driver and coordinator stay together.
+        let (run, error) = retained_run_of(outcome);
+        assert_eq!(run.stop_cause, Some(ZeroPassCause::OperatorStop));
+        assert_eq!(run.completed_passes, 0);
+        assert!(error.is_none(), "no error on the stop path");
+        assert!(driver.semantic.is_some(), "the driver keeps its lane");
+        assert_eq!(driver.coordinator.passes(), 0, "the coord stays queryable");
+        // The consumer drains the retained run to its terminal outcome.
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(run),
+        };
+        let (stopped, error, zero_pass) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(stopped.is_none(), "a scan run stops no native lane");
+        assert!(error.is_none(), "no error on the stop path");
+        let zero = zero_pass.expect("zero passes by stop report once");
+        assert_eq!(zero.cause, ZeroPassCause::OperatorStop, "cause kept");
+        assert_eq!(zero.discarded, 0, "nothing collected past the stop");
+        let zeros: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == ZERO_PASS_GAP_SUBJECT)
+            .collect();
+        assert_eq!(zeros.len(), 1, "one zero-pass gap: {:?}", gaps(&mut driver));
+        assert!(
+            driver.semantic.is_some(),
+            "the polling lane is kept, never spuriously abandoned"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "no latch means no finite stop"
+        );
+
+        // A synchronous outcome keeps today's reads even with a
+        // joint first error: the fold is the retained consumer's.
+        {
+            let mut coordinator2 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator2, headless.display);
+            driver.display = None;
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            assert!(
+                outcome.retained.is_none(),
+                "no pending publication means no retention"
+            );
+            assert!(!driver.suspended, "a synchronous run never suspends");
+            assert!(
+                driver.joint_first_error.is_some(),
+                "the stop hook kept its first error"
+            );
+            let stop = std::cell::Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let (_, error, zero_pass) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(error.is_none(), "today's reads keep no error");
+            assert!(
+                zero_pass.is_some(),
+                "today's reads keep the zero-pass report"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_consumer_retains_run_driver_and_coordinator() {
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let (run, error) = retained_run_of(outcome);
+        assert!(driver.display.is_some(), "the dashboard keeps its display");
+        let display_ticks = driver.display.as_ref().expect("display").account().ticks;
+        let mut passes = 0;
+        let mut stops = 0;
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error,
+            zero_pass: None,
+            retained: Some(run),
+        };
+        let (stopped, error, zero_pass) =
+            driver.consume_outcome(outcome, &clock, &mut |_, point| {
+                match point {
+                    Publish::Pass { .. } => passes += 1,
+                    Publish::Stop { .. } => stops += 1,
+                    Publish::Retiring { .. } => {}
+                }
+                Ok(())
+            });
+        assert!(stopped.is_none(), "a scan run stops no native lane");
+        assert!(error.is_none(), "no error on the stop path");
+        assert_eq!(
+            zero_pass.map(|zero| zero.cause),
+            Some(ZeroPassCause::OperatorStop),
+            "cause kept"
+        );
+        assert_eq!(passes, 0, "retention precedes the first pass");
+        assert_eq!(stops, 1, "the stop publishes once");
+        assert!(
+            driver.display.as_ref().expect("display").account().ticks > display_ticks,
+            "retained service still ticks the dashboard display"
+        );
+        assert!(
+            driver.semantic.is_some(),
+            "the polling lane is kept, never spuriously abandoned"
+        );
+    }
+
+    #[test]
+    fn uncertain_native_stop_exits_with_first_error_without_mint() {
+        use crate::inventory_semantics::SemanticRefusal;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        // The I2 trigger fires on the first retained hook after the
+        // verdict: one poll abandons, holds and keeps the first error.
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        let mut io = WindDownIo::nonempty_completing();
+        let drops = Rc::new(Cell::new(0));
+        io.drop_spy = Some(Rc::clone(&drops));
+        let detach_polls = Rc::clone(&io.polls);
+        let mut lane = joint_lane(io, false);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        let (source, mint_polls, _) = CountingSource::scripted(None);
+        driver.completion_source = Some(Box::new(source));
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let (run, error) = retained_run_of(outcome);
+        let stop = Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let mut budget = RetainedWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let outcome = crate::inventory_capture::poll_retained_classic(
+            &mut driver,
+            run,
+            error,
+            &clock,
+            &mut budget,
+            &mut |_, _| Ok(()),
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "one hook after the verdict abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(drops.get(), 0, "held means never dropped");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the first error is kept"
+        );
+        assert_eq!(detach_polls.get(), 0, "the abandon never joins");
+        // The consumer exits with that first error: no mint, no join.
+        let stop = Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let (stopped, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(stopped.is_none(), "nothing minted a completion");
+        let error = error.expect("the process outcome carries the first error");
+        assert!(
+            format!("{error:#}").contains("joint finish disposition required"),
+            "the first error exits: {error:#}"
+        );
+        assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint on abandon");
+        assert_eq!(drops.get(), 0, "held means never dropped");
+        assert_eq!(detach_polls.get(), 0, "the exit never joins");
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(
+            abandons.len(),
+            1,
+            "exactly one abandon gap: {:?}",
+            gaps(&mut driver)
+        );
+
+        // Twin: a gated detach never blocks the exit — the finite
+        // stop holds without joining while the gate stays shut.
+        {
+            let mut coordinator2 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator2, headless.display);
+            let (io, gate) = WindDownIo::gated();
+            let detach_polls = Rc::clone(&io.polls);
+            let mut lane = joint_lane(io, false);
+            lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+            driver.semantic = Some(lane);
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let stop = Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(
+                error.is_some(),
+                "the exit carries the first error without the gate"
+            );
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "the gated lane still abandons"
+            );
+            assert_eq!(detach_polls.get(), 0, "a gated detach is never polled");
+            drop(gate);
+        }
+
+        // The Published wound-down error path skips the abandon: the
+        // finish already published, so the hold is direct.
+        {
+            let mut coordinator3 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator3, headless.display);
+            let mut io = WindDownIo::completing();
+            io.fail_poll = true;
+            driver.semantic = Some(joint_lane(io, true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            driver.joint_finish = JointFinishDriver::Published;
+            let stop = Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(
+                error.is_some(),
+                "the wound-down refusal exits with its error"
+            );
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "the failed wound-down abandons"
+            );
+            assert!(
+                gaps(&mut driver)
+                    .iter()
+                    .all(|(subject, _)| subject != "joint finish abandoned for exit"),
+                "a published finish skips the abandon: {:?}",
+                gaps(&mut driver)
+            );
+            let failures: Vec<(String, String)> = gaps(&mut driver)
+                .into_iter()
+                .filter(|(subject, _)| subject == "joint wound-down failed")
+                .collect();
+            assert_eq!(
+                failures.len(),
+                1,
+                "exactly one wound-down gap: {:?}",
+                gaps(&mut driver)
+            );
+        }
+
+        // A latch on an already-finished lane (the missing-receipt
+        // case) skips the abandon too.
+        {
+            let mut coordinator4 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator4, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), true);
+            lane.note_joint_finish_failure(SemanticRefusal::Unavailable);
+            driver.semantic = Some(lane);
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+            let stop = Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(error.is_some(), "the latched error exits");
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Abandoned,
+                "the latched finish abandons"
+            );
+            assert!(
+                gaps(&mut driver)
+                    .iter()
+                    .all(|(subject, _)| subject != "joint finish abandoned for exit"),
+                "a finished lane skips the abandon: {:?}",
+                gaps(&mut driver)
+            );
+        }
+    }
+
+    #[test]
+    fn untouched_graph_refusal_exits_finitely_with_its_reason() {
+        use crate::inventory_semantics::SemanticRefusal;
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering;
+
+        let mut coord = coordinator();
+        // The G6 one-short refusal, seeded where the engine leaves it.
+        coord
+            .seed_collected_graph_refusal_for_test("terminal graph refused before native mutation");
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        let (source, mint_polls, _) = CountingSource::scripted(None);
+        driver.completion_source = Some(Box::new(source));
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let stop = Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the refused graph takes the finite stop"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        let error = error.expect("the refusal reason exits");
+        assert!(
+            format!("{error:#}").contains("terminal graph refused before native mutation"),
+            "the exit carries the refusal reason: {error:#}"
+        );
+        assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint on abandon");
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(
+            abandons.len(),
+            1,
+            "exactly one abandon gap: {:?}",
+            gaps(&mut driver)
+        );
+        assert_eq!(
+            abandons[0].1, "terminal graph refused before native mutation",
+            "the abandon records the refusal reason"
+        );
+    }
+
+    #[test]
+    fn zero_pass_stop_cause_reaches_presentation_once() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        // A deadline-retained run reports its cause once: the sampled
+        // cause survives a later stop signal unchanged.
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::Deadline, None);
+        let (run, error) = retained_run_of(outcome);
+        assert_eq!(run.stop_cause, Some(ZeroPassCause::Deadline));
+        // A later operator stop never overwrites the recorded cause.
+        let stop = Cell::new(true);
+        let stop_now = || stop.get();
+        let clock = LoopClock {
+            deadline: None,
+            stop: &stop_now,
+            now: &std::time::Instant::now,
+            interval: super::inventory_test_poll_interval(),
+            tick: crate::inventory_capture::SERVICE_TICK,
+            collection_tick: crate::inventory_capture::SERVICE_TICK,
+        };
+        let mut budget = RetainedWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let outcome = crate::inventory_capture::poll_retained_classic(
+            &mut driver,
+            run,
+            error,
+            &clock,
+            &mut budget,
+            &mut |_, _| Ok(()),
+        );
+        let stop = Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let (stopped, error, zero_pass) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(stopped.is_none(), "a scan run stops no native lane");
+        assert!(error.is_none(), "no error on the stop path");
+        let zero = zero_pass.expect("zero passes by deadline report once");
+        assert_eq!(zero.cause, ZeroPassCause::Deadline, "cause kept");
+        assert_eq!(zero.discarded, 0, "nothing collected past the stop");
+        let reason = zero.gap_reason();
+        assert!(
+            reason.contains("deadline"),
+            "the gap reason names the cause: {reason}"
+        );
+        let line = zero.stderr_line();
+        assert!(
+            line.contains("deadline"),
+            "the stderr line names the cause: {line}"
+        );
+        let zeros: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == ZERO_PASS_GAP_SUBJECT)
+            .collect();
+        assert_eq!(zeros.len(), 1, "one zero-pass gap: {:?}", gaps(&mut driver));
+
+        // Twin: a retained first error is never overwritten by the
+        // zero-pass staging, which stays suppressed under error.
+        {
+            let mut coordinator2 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator2, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_cause(
+                &mut driver,
+                ZeroPassCause::OperatorStop,
+                Some(anyhow::anyhow!("the retained failure")),
+            );
+            let stop = Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let (_, error, zero_pass) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            let error = error.expect("the first error is kept");
+            assert!(
+                format!("{error:#}").contains("the retained failure"),
+                "the first error is never overwritten: {error:#}"
+            );
+            assert!(
+                zero_pass.is_none(),
+                "no zero-pass report beside a first error"
+            );
+            let failures: Vec<(String, String)> = gaps(&mut driver)
+                .into_iter()
+                .filter(|(subject, _)| subject == "inventory capture failed")
+                .collect();
+            assert_eq!(
+                failures.len(),
+                1,
+                "one failure gap: {:?}",
+                gaps(&mut driver)
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_keeps_mixed_outcome_and_reports() {
+        // Defensive: a retained run beside stopped evidence holds
+        // its owners and reports instead of completing either.
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        let (run, _) = retained_run_of(outcome);
+        let mixed = ClassicOutcome {
+            stopped: None::<Stopped<FacadeLane>>,
+            error: None,
+            zero_pass: Some(ZeroPassStop {
+                cause: ZeroPassCause::Deadline,
+                discarded: 0,
+                elapsed: std::time::Duration::from_secs(0),
+            }),
+            retained: Some(run),
+        };
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let (stopped, error, zero_pass) = driver.consume_outcome(mixed, &clock, &mut |_, _| Ok(()));
+        assert!(stopped.is_none(), "no stopped owner is minted");
+        let error = error.expect("the malformed outcome reports");
+        assert!(
+            format!("{error:#}").contains("mixed"),
+            "the report names the mixture: {error:#}"
+        );
+        assert_eq!(
+            zero_pass.map(|zero| zero.cause),
+            Some(ZeroPassCause::Deadline),
+            "the zero-pass evidence passes through"
+        );
+        assert_eq!(driver.joint_step_calls, 0, "nothing polls a mixed outcome");
+        assert_eq!(driver.commit_calls, 0, "nothing commits a mixed outcome");
+        assert!(
+            driver.semantic.is_some(),
+            "the mixed arm keeps the driver's lane"
+        );
+    }
+
+    #[test]
+    fn dispose_retained_native_waits_in_table_without_stop() {
+        use crate::inventory_capture::{RetainedPass, RetainedTerminalPhase};
+        use std::time::{Duration, Instant};
+
+        // A planted Native block beside no stop: the driver resolves
+        // (it owns no native step) and the table holds the uncovered
+        // pairing across polls — finite, inventing nothing. The live
+        // N1 wait is the capture loop's (T16a).
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = retain_with_error_no_stop(&mut driver, "the retained failure");
+        let (mut run, error) = retained_run_of(outcome);
+        assert_eq!(run.stop_cause, None, "no stop was sampled");
+        run.block = Some(RetainedBlock::Native);
+        let mut run = Some(run);
+        let mut error = error;
+        for hook in 1..=3 {
+            let stop = std::cell::Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let mut budget = RetainedWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            };
+            let outcome = crate::inventory_capture::poll_retained_classic(
+                &mut driver,
+                run.take().expect("held across hooks"),
+                error,
+                &clock,
+                &mut budget,
+                &mut |_, _| Ok(()),
+            );
+            let held = retained_run_of(outcome);
+            run = Some(held.0);
+            error = held.1;
+            assert_eq!(
+                run.as_ref().expect("held").block,
+                Some(RetainedBlock::Native),
+                "hook {hook} holds the uncovered pairing"
+            );
+        }
+        let error = error.expect("the retained failure is kept");
+        assert!(
+            format!("{error:#}").contains("the retained failure"),
+            "no error is invented while waiting: {error:#}"
+        );
+        assert!(driver.semantic.is_some(), "the waiting lane is kept");
+
+        // The N1 arm shape without a live lane resolves through as
+        // a no-op: nothing waits, nothing errors.
+        {
+            let mut coordinator2 = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator2, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            driver.joint_finish = JointFinishDriver::Polling;
+            let outcome = retain_with_error_no_stop(&mut driver, "the retained failure");
+            let (mut run, error) = retained_run_of(outcome);
+            run.block = Some(RetainedBlock::Native);
+            run.pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::NativeStop,
+            };
+            let stop = std::cell::Cell::new(false);
+            let stop_now = || stop.get();
+            let clock = consume_clock(&stop_now);
+            let mut budget = RetainedWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_millis(10),
+            };
+            let outcome = crate::inventory_capture::poll_retained_classic(
+                &mut driver,
+                run,
+                error,
+                &clock,
+                &mut budget,
+                &mut |_, _| Ok(()),
+            );
+            // The no-op arm clears the block and the planted terminal
+            // phase drains to its outcome: nothing waits, nothing errors.
+            match outcome.into_completion() {
+                Ok(ClassicCompletion::Finalized { error, .. }) => {
+                    let error = error.expect("the retained failure is kept");
+                    assert!(
+                        format!("{error:#}").contains("the retained failure"),
+                        "no error is invented: {error:#}"
+                    );
+                }
+                _ => panic!("the no-op arm drains"),
+            }
+        }
+    }
+
+    #[test]
+    fn take_joined_session_without_recorded_wound_down_refuses() {
+        // The §8.3 order enforced in-API: no recorded wound-down,
+        // no take — even finished and frameless.
+        let coord = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_test_joint_frame(false);
+        assert!(
+            matches!(
+                lane.take_joined_session(),
+                Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+            ),
+            "a take without a recorded wound-down refuses"
+        );
+        // The earlier gates keep their answers: unfinished and
+        // framed lanes stay not-ready, not refused.
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_test_joint_frame(false);
+        assert!(
+            lane.take_joined_session().unwrap().is_none(),
+            "an unfinished lane stays not-ready"
+        );
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        assert!(
+            lane.take_joined_session().unwrap().is_none(),
+            "a framed lane stays not-ready"
+        );
+        drop(coord);
+    }
+
+    #[test]
+    fn take_joined_session_after_recorded_wound_down_proceeds() {
+        // Control: once the wound-down poll records its success,
+        // the take proceeds (a substituted lane hands no session).
+        let mut coord = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_test_joint_frame(false);
+        assert!(
+            matches!(lane.poll_wound_down(&mut coord), Ok(true)),
+            "the completing detach joins"
+        );
+        assert!(
+            lane.take_joined_session().unwrap().is_none(),
+            "the recorded wound-down admits the take"
+        );
+    }
+
+    #[test]
+    fn abandon_finish_for_exit_refuses_second_call() {
+        use crate::inventory_semantics::SemanticRefusal;
+
+        let mut coord = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        lane.abandon_finish_for_exit(&mut coord, "native ownership uncertain")
+            .expect("the first abandon is admitted");
+        coord.commit_batch(false).expect("a fresh coord commits");
+        assert_eq!(coord.registry().gaps().len(), 1, "one abandon, one gap");
+        assert!(
+            matches!(
+                lane.abandon_finish_for_exit(&mut coord, "native ownership uncertain"),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "a second abandon refuses"
+        );
+        coord.commit_batch(false).expect("a fresh coord commits");
+        assert_eq!(
+            coord.registry().gaps().len(),
+            1,
+            "the refused abandon records nothing more"
+        );
+        assert!(lane.is_finished(), "the lane stays finished");
+        assert!(
+            matches!(
+                lane.take_joined_session(),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "the lane stays retained"
+        );
+    }
+
+    #[test]
+    fn abandon_finish_for_exit_first_call_abandons() {
+        use crate::inventory_semantics::SemanticRefusal;
+
+        // Control: the first abandon still builds its terminal batch
+        // and retains the lane.
+        let mut coord = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        let domain = lane.domain();
+        let batch = lane
+            .abandon_finish_for_exit(&mut coord, "native ownership uncertain")
+            .expect("disposition-required admits the abandon");
+        assert!(lane.is_finished(), "the abandon finishes the lane");
+        assert_eq!(batch.domain(), domain, "the batch names the lane");
+        assert!(batch.is_empty(), "an empty finish abandons empty");
+        assert!(
+            matches!(
+                lane.poll_wound_down(&mut coord),
+                Err(SemanticRefusal::Unavailable)
+            ),
+            "the retained lane refuses the wound-down"
+        );
     }
 }
 
@@ -9468,12 +10976,12 @@ mod promotion_driver_tests {
 
     /// A headless display: frames go to /dev/null, no keys, stderr
     /// left alone. The file stays alive with the display.
-    struct HeadlessDisplay {
+    pub(crate) struct HeadlessDisplay {
         _null: std::fs::File,
-        display: Display,
+        pub(crate) display: Display,
     }
 
-    fn headless_display() -> HeadlessDisplay {
+    pub(crate) fn headless_display() -> HeadlessDisplay {
         let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
         let io = DashboardIo {
             output: null.as_raw_fd(),
@@ -9489,7 +10997,7 @@ mod promotion_driver_tests {
         }
     }
 
-    fn driver_with_display<'a>(
+    pub(crate) fn driver_with_display<'a>(
         coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
         display: Display,
     ) -> ClassicDriver<'a> {
@@ -9514,6 +11022,9 @@ mod promotion_driver_tests {
             joint_finish: JointFinishDriver::NotBegun,
             stop_requested: false,
             joint_first_error: None,
+            suspended: false,
+            joint_commit_pending: false,
+            joint_commit_retries: 0,
             #[cfg(test)]
             terminal_seq_calls: 0,
             #[cfg(test)]
@@ -9522,10 +11033,20 @@ mod promotion_driver_tests {
             joint_begin_calls: 0,
             #[cfg(test)]
             joint_step_calls: 0,
+            #[cfg(test)]
+            joint_commit_polls: 0,
+            #[cfg(test)]
+            take_promotion_work_calls: 0,
+            #[cfg(test)]
+            drive_pending_install_calls: 0,
+            #[cfg(test)]
+            service_caller_metadata_calls: 0,
+            #[cfg(test)]
+            commit_calls: 0,
         }
     }
 
-    fn queue_request(display: &mut Display) {
+    pub(crate) fn queue_request(display: &mut Display) {
         use crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test;
         assert!(display.promotion_enable(CaptureId::new(11)));
         display
@@ -9608,18 +11129,18 @@ mod promotion_driver_tests {
     /// variants join at once, a gated one stays Pending until its
     /// gate releases. Shared counters observe submits, polls, joins
     /// and drops without disturbing the substituted verdicts.
-    struct WindDownIo {
+    pub(crate) struct WindDownIo {
         cleanup: WindDownCleanup,
         nonempty_finish: bool,
         gate: Option<Arc<(Mutex<bool>, Condvar)>>,
-        fail_poll: bool,
+        pub(crate) fail_poll: bool,
         quiescent: bool,
         submits: Rc<Cell<usize>>,
-        polls: Rc<Cell<usize>>,
+        pub(crate) polls: Rc<Cell<usize>>,
         completes: Rc<Cell<usize>>,
-        ticks: Rc<Cell<usize>>,
+        pub(crate) ticks: Rc<Cell<usize>>,
         threads: Rc<RefCell<Vec<std::thread::ThreadId>>>,
-        drop_spy: Option<Rc<Cell<usize>>>,
+        pub(crate) drop_spy: Option<Rc<Cell<usize>>>,
         submitted: bool,
     }
 
@@ -9632,7 +11153,7 @@ mod promotion_driver_tests {
     }
 
     impl WindDownIo {
-        fn completing() -> Self {
+        pub(crate) fn completing() -> Self {
             Self {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: false,
@@ -9652,7 +11173,7 @@ mod promotion_driver_tests {
         /// A completing cleanup beneath a nonempty Finish (Stopped at
         /// 7): the uncertainty twin's terminal loss, which must stay
         /// disposable without restoring positives.
-        fn nonempty_completing() -> Self {
+        pub(crate) fn nonempty_completing() -> Self {
             Self {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: true,
@@ -9672,7 +11193,7 @@ mod promotion_driver_tests {
         /// A gated cleanup: the detach stays Pending until the test
         /// releases the gate, then joins. The synchronous consume
         /// boundary refuses while held, so only the poll path retires.
-        fn gated() -> (Self, Arc<(Mutex<bool>, Condvar)>) {
+        pub(crate) fn gated() -> (Self, Arc<(Mutex<bool>, Condvar)>) {
             let gate = Arc::new((Mutex::new(false), Condvar::new()));
             let mut io = Self::completing();
             io.gate = Some(Arc::clone(&gate));
@@ -9906,7 +11427,7 @@ mod promotion_driver_tests {
 
     /// Publish staged mutations, then read the committed gaps:
     /// gap records stage and apply at publication, like production.
-    fn gaps(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> {
+    pub(crate) fn gaps(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> {
         driver.coordinator.registry_mut().publish();
         driver
             .coordinator
@@ -9934,14 +11455,14 @@ mod promotion_driver_tests {
 
     /// A completion source that counts polls and wound-down notes:
     /// "no mint" is zero polls, a handed session is one note.
-    struct CountingSource {
+    pub(crate) struct CountingSource {
         inner: StubCompletionSource,
         polls: Arc<AtomicUsize>,
         notes: Arc<AtomicUsize>,
     }
 
     impl CountingSource {
-        fn scripted(
+        pub(crate) fn scripted(
             completion: Option<SessionNativeCompletion>,
         ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
             let polls = Arc::new(AtomicUsize::new(0));
@@ -9982,7 +11503,7 @@ mod promotion_driver_tests {
     /// machine, which unit tests cannot build; the seam drives the
     /// same driver branch). Finished when asked through the real H0
     /// stop; the scaffolding Finish batch is dropped unstaged.
-    fn joint_lane(
+    pub(crate) fn joint_lane(
         io: WindDownIo,
         finished: bool,
     ) -> crate::inventory_semantics::AttestedSemanticLane {
@@ -11977,6 +13498,9 @@ mod promotion_driver_tests {
             joint_finish: JointFinishDriver::NotBegun,
             stop_requested: false,
             joint_first_error: None,
+            suspended: false,
+            joint_commit_pending: false,
+            joint_commit_retries: 0,
             #[cfg(test)]
             terminal_seq_calls: 0,
             #[cfg(test)]
@@ -11985,6 +13509,16 @@ mod promotion_driver_tests {
             joint_begin_calls: 0,
             #[cfg(test)]
             joint_step_calls: 0,
+            #[cfg(test)]
+            joint_commit_polls: 0,
+            #[cfg(test)]
+            take_promotion_work_calls: 0,
+            #[cfg(test)]
+            drive_pending_install_calls: 0,
+            #[cfg(test)]
+            service_caller_metadata_calls: 0,
+            #[cfg(test)]
+            commit_calls: 0,
         };
         driver.on_tick();
         assert!(driver.lifecycle.is_idle());

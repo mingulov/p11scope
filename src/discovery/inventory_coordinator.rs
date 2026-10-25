@@ -1409,6 +1409,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.seed_collected_finish_work_for_test(view);
     }
 
+    /// The terminal graph refusal the Engine recorded, if any (§1.9):
+    /// the retained consumer abandons with this reason when present.
+    pub(crate) fn collected_graph_refused(&self) -> Option<&'static str> {
+        self.engine.collected_graph_refused()
+    }
+
+    /// Test seam seeding the terminal graph refusal where the Engine
+    /// leaves it. The refusal-setting itself is engine-tested (G6);
+    /// consumers read it through [`Self::collected_graph_refused`].
+    #[cfg(test)]
+    pub(crate) fn seed_collected_graph_refusal_for_test(&mut self, reason: &'static str) {
+        self.engine.collected_graph_refusal = Some(reason);
+    }
+
     /// Existing retained Engine work and actual Session FIFO occupancy only.
     #[cfg(test)]
     pub(crate) fn reference_collected_finish_discovery_backlog(

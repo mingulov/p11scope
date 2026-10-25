@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Driver home of the Joint state×event cells (§8.7): J0–J11 ×
 // {cancel, promote, held_install, replace_foreign, sigint2}, J9/J11 ×
-// {stop, deadline, capture_error, sink_failure}, J16 × retire_own =
-// 69 cells. The 18 J12/J13 cells stay `Deferred(R1.5)` rows (T16b),
-// not ignored tests.
+// {stop, deadline, capture_error, sink_failure}, J16 × retire_own,
+// J12/J13 × {stop, deadline, cancel, promote, replace_foreign,
+// capture_error, sink_failure, held_install, sigint2} = 87 cells.
 //
 // Scenes are driver-level: a substituted lane with the retained-frame
 // seam set (production jointness is the live machine, which unit
@@ -13,12 +13,20 @@
 // J0–J8 share the pre-finish scene (machine phases are
 // Machine-home detail); J9/J11 share the dispositioned scene with
 // per-state latch reasons; J10 presets the in-flight finish; J16
-// presets the post-publish retire. Every cell asserts its codes
-// from the §8.7 table: R (begin once, publish once, retire once),
-// O (kept until joined, held after), N (the wound-down chain), E
-// (first error kept), B (B untouched), X (proof retained
-// unchanged), H (reclaim once with RunStopped, never installs), T
-// (typed exit: held, no join, no mint), U (the finite stop).
+// presets the post-publish retire. J12/J13 retain a publication
+// through the real loop — pending (flag) or failed (flag plus the
+// retention error) — and drive the event against the suspended
+// driver; cells whose codes exclude U retain through a polling
+// finish or clear the flag once the pending commit publishes, so
+// the substituted commit refusal (which unit lanes always raise)
+// never invents a finite stop the codes do not claim. Every cell
+// asserts its codes from the §8.7 table: R (begin once, publish
+// once, retire once), O (kept until joined, held after), N (the
+// wound-down chain), E (first error kept), B (B untouched), X
+// (proof retained unchanged), H (reclaim once with RunStopped,
+// never installs), T (typed exit: held, no join, no mint), U (the
+// finite stop), P (no commit replay, attempt 1), G (the suspension
+// gate does no terminal I/O).
 
 use super::*;
 
@@ -34,7 +42,8 @@ macro_rules! joint_cell {
     };
 }
 
-/// The Driver home's states: J0–J11 plus the retiring J16.
+/// The Driver home's states: J0–J11 plus the retiring J16 and the
+/// retained publications J12/J13.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JointState {
     J0,
@@ -49,6 +58,8 @@ enum JointState {
     J9,
     J10,
     J11,
+    J12,
+    J13,
     J16,
 }
 
@@ -655,7 +666,8 @@ fn stop_disp_body(scene: Scene, event: JointEvent) {
 }
 
 /// J9/J11 × deadline (U E): like stop; the Deadline cause-once is
-/// machine-owned, so the driver twins stop.
+/// driver-recorded (pinned by the J12 × deadline cell), so the
+/// driver twins stop.
 fn deadline_disp_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
     assert!(matches!(scene.state, JointState::J9 | JointState::J11));
@@ -1184,6 +1196,525 @@ fn retire_own_16_body(scene: Scene, event: JointEvent) {
     assert_eq!(drops.get(), 0, "the winding lane is kept");
 }
 
+use super::super::tests::{consume_clock, retain_with_cause, retained_run_of};
+use crate::inventory_capture::{ClassicOutcome, FacadeLane, Publish, RetainedClassicRun, ZeroPassCause};
+
+/// Retain a J12/J13 publication scene through the real loop: the
+/// caller seats the lane, then the pending commit flag (or a
+/// polling finish for cells whose codes exclude U) suspends before
+/// any collection. J13 adds the retention error of the failed
+/// publication. Returns the retained run beside its error after
+/// pinning the suspension gate (G).
+fn retain_publication(
+    driver: &mut ClassicDriver<'_>,
+    state: JointState,
+    event: JointEvent,
+    via_flag: bool,
+) -> (RetainedClassicRun<FacadeLane>, Option<anyhow::Error>) {
+    if via_flag {
+        driver.joint_commit_pending = true;
+    } else {
+        driver.joint_finish = JointFinishDriver::Polling;
+    }
+    let cause = if event == JointEvent::Deadline {
+        ZeroPassCause::Deadline
+    } else {
+        ZeroPassCause::OperatorStop
+    };
+    let initial = (state == JointState::J13).then(|| anyhow::anyhow!("the publication failure"));
+    let outcome = retain_with_cause(driver, cause, initial);
+    assert!(driver.suspended, "G: retention suspends the driver");
+    assert_eq!(
+        driver.terminal_seq_calls, 0,
+        "G: the gate runs no terminal I/O"
+    );
+    assert_eq!(driver.joint_begin_calls, 0, "G: the gate begins nothing");
+    assert_eq!(driver.joint_step_calls, 0, "G: the gate steps nothing");
+    assert_eq!(driver.joint_commit_polls, 0, "G: the gate polls nothing");
+    assert_eq!(driver.commit_calls, 0, "G: the gate commits nothing");
+    retained_run_of(outcome)
+}
+
+/// Rebuild a consumable outcome from a retained run and its error.
+fn consumable(
+    run: RetainedClassicRun<FacadeLane>,
+    error: Option<anyhow::Error>,
+) -> ClassicOutcome<FacadeLane> {
+    ClassicOutcome {
+        stopped: None,
+        error,
+        zero_pass: None,
+        retained: Some(run),
+    }
+}
+
+/// J12/J13 × stop, deadline: J12 (O P G, N after publish) records
+/// its cause once and runs the wound-down chain after the pending
+/// commit publishes; J13 (O E P, then U) keeps its first error and
+/// takes the finite stop through the refused commit.
+fn stopdead_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::Stop | JointEvent::Deadline));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    let polls = Rc::clone(&io.polls);
+    driver.semantic = Some(joint_lane(io, state == JointState::J12));
+    let (run, error) = retain_publication(&mut driver, state, event, true);
+    let cause = if event == JointEvent::Deadline {
+        ZeroPassCause::Deadline
+    } else {
+        ZeroPassCause::OperatorStop
+    };
+    assert_eq!(
+        run.stop_cause,
+        Some(cause),
+        "the run records the event cause"
+    );
+    assert!(driver.semantic.is_some(), "O: the lane is kept");
+    assert_eq!(drops.get(), 0, "O: kept means never dropped");
+    assert_eq!(driver.commit_calls, 0, "P: nothing attempted yet");
+    if state == JointState::J13 {
+        {
+            let error = error.as_ref().expect("J13 retains its failure");
+            assert!(
+                format!("{error:#}").contains("the publication failure"),
+                "E: the failed publication keeps its error: {error:#}"
+            );
+        }
+        // The failed commit's poll refuses; the finite stop takes it.
+        let stop = Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = consume_clock(&stop_now);
+        let (_, error, _) =
+            driver.consume_outcome(consumable(run, error), &clock, &mut |_, _| Ok(()));
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "U: the refused commit takes the finite stop"
+        );
+        assert!(driver.semantic.is_none(), "U: the lane is held");
+        assert_eq!(drops.get(), 0, "O: held means never dropped");
+        assert_eq!(polls.get(), 0, "U: the abandon never joins");
+        let error = error.expect("U: the finite stop exits with an error");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the first error predates the finite stop: {error:#}"
+        );
+        assert_eq!(
+            driver.commit_calls, 2,
+            "P: each drain phase commits once, never replayed"
+        );
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(
+            abandons.len(),
+            1,
+            "U: exactly one abandon gap: {:?}",
+            gaps(&mut driver)
+        );
+        return;
+    }
+    assert!(error.is_none(), "J12 retains no error");
+    // The pending commit publishes; the wound-down chain runs after.
+    driver.joint_commit_pending = false;
+    // A stop clock during the drain: the recorded cause survives it.
+    let stop = Cell::new(true);
+    let stop_now = || stop.get();
+    let clock = consume_clock(&stop_now);
+    let (_, error, zero_pass) =
+        driver.consume_outcome(consumable(run, error), &clock, &mut |_, _| Ok(()));
+    assert!(error.is_none(), "no error on the publish path");
+    let zero = zero_pass.expect("zero passes report once");
+    assert_eq!(
+        zero.cause, cause,
+        "the recorded cause reaches presentation once"
+    );
+    assert_eq!(driver.joint_begin_calls, 1, "N: the finish begins once");
+    assert!(
+        polls.get() >= 1,
+        "N: the detach reaps: {}",
+        polls.get()
+    );
+    assert!(
+        driver.semantic.is_none(),
+        "N: the wound-down lane completes"
+    );
+    assert_eq!(drops.get(), 1, "O: released after the join");
+    assert!(
+        driver.joint_first_error.is_none(),
+        "no error on the publish path"
+    );
+    assert_eq!(
+        driver.commit_calls, 2,
+        "P: each drain phase commits once, never replayed"
+    );
+}
+
+/// J12/J13 × cancel (O P / O E): the cancel parks but never winds
+/// down while suspended: the install waits, the lane is kept, and
+/// nothing commits or begins.
+fn cancel_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::Cancel));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let (_, error) = retain_publication(&mut driver, state, event, false);
+    install_promotion_for_wind_down(&mut driver);
+    for _ in 0..8 {
+        driver.on_tick();
+    }
+    assert!(
+        driver.installed_promotion.is_some(),
+        "the install waits while suspended"
+    );
+    assert!(
+        driver.retiring.is_none(),
+        "no wind-down starts while suspended"
+    );
+    assert!(driver.semantic.is_some(), "O: the lane is kept");
+    assert_eq!(drops.get(), 0, "O: kept means never dropped");
+    assert_eq!(
+        driver.joint_finish,
+        JointFinishDriver::Polling,
+        "no latch, no finite stop"
+    );
+    assert_eq!(driver.joint_begin_calls, 0, "P: nothing begins");
+    assert_eq!(driver.commit_calls, 0, "P: nothing commits");
+    assert!(
+        driver.joint_first_error.is_none(),
+        "no error is invented"
+    );
+    if state == JointState::J13 {
+        let error = error.as_ref().expect("J13 retains its failure");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the failed publication keeps its error: {error:#}"
+        );
+    } else {
+        assert!(error.is_none(), "J12 retains no error");
+    }
+}
+
+/// J12/J13 × promote (O P B / O E B): the queued request waits
+/// untouched while suspended; the lane is kept and nothing commits.
+fn promote_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::Promote));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let (_, error) = retain_publication(&mut driver, state, event, false);
+    queue_request(driver.display.as_mut().expect("display"));
+    for _ in 0..8 {
+        driver.on_tick();
+    }
+    assert_b_untouched(&mut driver);
+    assert!(driver.semantic.is_some(), "O: the lane is kept");
+    assert_eq!(drops.get(), 0, "O: kept means never dropped");
+    assert_eq!(driver.commit_calls, 0, "P: nothing commits");
+    assert!(
+        driver.joint_first_error.is_none(),
+        "no error is invented"
+    );
+    if state == JointState::J13 {
+        let error = error.as_ref().expect("J13 retains its failure");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the failed publication keeps its error: {error:#}"
+        );
+    } else {
+        assert!(error.is_none(), "J12 retains no error");
+    }
+}
+
+/// J12/J13 × replace_foreign (X O): a foreign completion refuses
+/// with its proof unchanged; the retained lane is kept.
+fn replace_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::ReplaceForeign));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    let mut lane = joint_lane(io, true);
+    let domain = lane.domain();
+    quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+    lane.set_test_joint_frame(false);
+    driver.semantic = Some(lane);
+    let (_, _) = retain_publication(&mut driver, state, event, false);
+    let foreign = NativeDomainId::try_mint().expect("mintable");
+    let offered = SessionNativeCompletion::scripted(foreign);
+    let lane = driver.semantic.as_ref().expect("lane");
+    match driver
+        .coordinator
+        .retire_joint_domain_with_lane(lane, offered)
+    {
+        Err((returned, crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain)) => {
+            assert_eq!(
+                returned.domain(),
+                foreign,
+                "X: the refusal returns the completion unchanged"
+            );
+        }
+        outcome => panic!("a foreign completion refuses, got {outcome:?}"),
+    }
+    assert!(driver.semantic.is_some(), "O: the lane is kept");
+    assert_eq!(drops.get(), 0, "O: kept means never dropped");
+}
+
+/// J12/J13 × capture_error (O P E / O E): a capture commit fails
+/// once during the drain; the error is kept, nothing replays, and
+/// the lane joins normally.
+fn capture_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::CaptureError));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let (run, error) = retain_publication(&mut driver, state, event, true);
+    // The pending commit publishes; the capture error strikes the drain.
+    driver.joint_commit_pending = false;
+    super::super::fail_next_classic_commit_for_test("the capture failure");
+    let stop = Cell::new(false);
+    let stop_now = || stop.get();
+    let clock = consume_clock(&stop_now);
+    let (_, error, zero_pass) =
+        driver.consume_outcome(consumable(run, error), &clock, &mut |_, _| Ok(()));
+    assert!(
+        zero_pass.is_none(),
+        "no zero-pass report beside a first error"
+    );
+    let error = error.expect("the capture error is kept");
+    if state == JointState::J13 {
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the first error predates the capture failure: {error:#}"
+        );
+    } else {
+        assert!(
+            format!("{error:#}").contains("the capture failure"),
+            "E: the capture error is kept: {error:#}"
+        );
+    }
+    assert_eq!(
+        driver.commit_calls, 2,
+        "P: each drain phase commits once, never replayed"
+    );
+    let failures: Vec<(String, String)> = gaps(&mut driver)
+        .into_iter()
+        .filter(|(subject, _)| subject == "inventory capture failed")
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "E: one failure gap: {:?}",
+        gaps(&mut driver)
+    );
+    assert_eq!(driver.joint_begin_calls, 1, "O: the finish begins once");
+    assert!(
+        driver.semantic.is_none(),
+        "O: the wound-down lane completes"
+    );
+    assert_eq!(drops.get(), 1, "O: released after the join");
+    assert!(
+        driver.joint_first_error.is_none(),
+        "no finish error beside the capture failure"
+    );
+}
+
+/// J12/J13 × sink_failure (E P): the stop sink fails once during
+/// the drain; the error is kept, the stop is never re-emitted.
+fn sink_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::SinkFailure));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+    let (run, error) = retain_publication(&mut driver, state, event, true);
+    // The pending commit publishes; the sink fails on the stop.
+    driver.joint_commit_pending = false;
+    let mut stops = 0;
+    let stop = Cell::new(false);
+    let stop_now = || stop.get();
+    let clock = consume_clock(&stop_now);
+    let (_, error, _) = driver.consume_outcome(
+        consumable(run, error),
+        &clock,
+        &mut |_, point| {
+            if matches!(point, Publish::Stop { .. }) {
+                stops += 1;
+                return Err(anyhow::anyhow!("the sink failure"));
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(stops, 1, "P: the failed stop is never re-emitted");
+    if state == JointState::J13 {
+        let error = error.expect("E: the first error is kept");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the first error predates the sink failure: {error:#}"
+        );
+    } else {
+        assert!(
+            error.is_none(),
+            "E: the best-effort sink failure keeps the run-status channel"
+        );
+    }
+}
+
+/// J12/J13 × held_install (O P H / O E H): the stop begins the
+/// active finish once and reclaims the held install once with
+/// RunStopped; nothing installs, the lane stays live.
+fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::HeldInstall));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    driver.semantic = Some(joint_lane(io, true));
+    let domain = driver.semantic.as_ref().expect("lane").domain();
+    let (_, error) = retain_publication(&mut driver, state, event, false);
+    install_promotion_active(&mut driver);
+    driver.on_stop_requested();
+    assert_eq!(
+        driver.reclaim_calls,
+        vec![PromotionEnd::RunStopped],
+        "H: the held install reclaims once with RunStopped"
+    );
+    assert!(
+        driver.pending_install.is_none(),
+        "H: nothing installs after the stop"
+    );
+    assert!(
+        driver
+            .semantic
+            .as_ref()
+            .is_some_and(|lane| lane.domain() == domain),
+        "H: the live lane stays"
+    );
+    assert_eq!(drops.get(), 0, "O: the lane is kept until joined");
+    assert_eq!(driver.commit_calls, 0, "P: the stop commits nothing");
+    assert_eq!(
+        driver.terminal_seq_calls, 0,
+        "the joint stop runs no terminal sequence"
+    );
+    if state == JointState::J13 {
+        let error = error.as_ref().expect("J13 retains its failure");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the failed publication keeps its error: {error:#}"
+        );
+    } else {
+        assert!(error.is_none(), "J12 retains no error");
+    }
+}
+
+/// J12/J13 × sigint2 (O T G / O T E): the second stop holds the
+/// retained lane through the typed exit: no join, no mint.
+fn sigint2_pub_body(scene: Scene, event: JointEvent) {
+    assert!(matches!(event, JointEvent::Sigint2));
+    assert!(matches!(scene.state, JointState::J12 | JointState::J13));
+    let Scene {
+        mut coordinator,
+        display,
+        state,
+    } = scene;
+    let mut driver = driver_with_display(&mut coordinator, display);
+    let mut io = WindDownIo::completing();
+    let drops = Rc::new(Cell::new(0));
+    io.drop_spy = Some(Rc::clone(&drops));
+    let polls = Rc::clone(&io.polls);
+    driver.semantic = Some(joint_lane(io, true));
+    let (source, mint_polls, _) = CountingSource::scripted(None);
+    driver.completion_source = Some(Box::new(source));
+    let (_, error) = retain_publication(&mut driver, state, event, false);
+    driver.on_stop_requested();
+    driver.on_stop_requested();
+    assert_eq!(
+        driver.joint_finish,
+        JointFinishDriver::Abandoned,
+        "T: the second stop abandons"
+    );
+    assert!(driver.semantic.is_none(), "T: the lane is held");
+    assert_eq!(drops.get(), 0, "O: held means never dropped");
+    assert_eq!(polls.get(), 0, "T: the typed exit never joins");
+    assert_eq!(
+        mint_polls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "T: the typed exit never mints"
+    );
+    assert_eq!(
+        driver.terminal_seq_calls, 0,
+        "G: the stops run no terminal I/O"
+    );
+    let holds: Vec<(String, String)> = gaps(&mut driver)
+        .into_iter()
+        .filter(|(subject, _)| subject == "joint finish held for exit")
+        .collect();
+    assert_eq!(
+        holds.len(),
+        1,
+        "T: exactly one hold gap: {:?}",
+        gaps(&mut driver)
+    );
+    if state == JointState::J13 {
+        let error = error.as_ref().expect("J13 retains its failure");
+        assert!(
+            format!("{error:#}").contains("the publication failure"),
+            "E: the failed publication keeps its error: {error:#}"
+        );
+    } else {
+        assert!(error.is_none(), "J12 retains no error");
+    }
+}
+
 joint_cell!(
     joint_cell_j0_cancel,
     JointState::J0,
@@ -1597,4 +2128,112 @@ joint_cell!(
     JointState::J16,
     JointEvent::RetireOwn,
     retire_own_16_body
+);
+joint_cell!(
+    joint_cell_j12_stop,
+    JointState::J12,
+    JointEvent::Stop,
+    stopdead_pub_body
+);
+joint_cell!(
+    joint_cell_j12_deadline,
+    JointState::J12,
+    JointEvent::Deadline,
+    stopdead_pub_body
+);
+joint_cell!(
+    joint_cell_j12_cancel,
+    JointState::J12,
+    JointEvent::Cancel,
+    cancel_pub_body
+);
+joint_cell!(
+    joint_cell_j12_promote,
+    JointState::J12,
+    JointEvent::Promote,
+    promote_pub_body
+);
+joint_cell!(
+    joint_cell_j12_replace_foreign,
+    JointState::J12,
+    JointEvent::ReplaceForeign,
+    replace_pub_body
+);
+joint_cell!(
+    joint_cell_j12_capture_error,
+    JointState::J12,
+    JointEvent::CaptureError,
+    capture_pub_body
+);
+joint_cell!(
+    joint_cell_j12_sink_failure,
+    JointState::J12,
+    JointEvent::SinkFailure,
+    sink_pub_body
+);
+joint_cell!(
+    joint_cell_j12_held_install,
+    JointState::J12,
+    JointEvent::HeldInstall,
+    heldinstall_pub_body
+);
+joint_cell!(
+    joint_cell_j12_sigint2,
+    JointState::J12,
+    JointEvent::Sigint2,
+    sigint2_pub_body
+);
+joint_cell!(
+    joint_cell_j13_stop,
+    JointState::J13,
+    JointEvent::Stop,
+    stopdead_pub_body
+);
+joint_cell!(
+    joint_cell_j13_deadline,
+    JointState::J13,
+    JointEvent::Deadline,
+    stopdead_pub_body
+);
+joint_cell!(
+    joint_cell_j13_cancel,
+    JointState::J13,
+    JointEvent::Cancel,
+    cancel_pub_body
+);
+joint_cell!(
+    joint_cell_j13_promote,
+    JointState::J13,
+    JointEvent::Promote,
+    promote_pub_body
+);
+joint_cell!(
+    joint_cell_j13_replace_foreign,
+    JointState::J13,
+    JointEvent::ReplaceForeign,
+    replace_pub_body
+);
+joint_cell!(
+    joint_cell_j13_capture_error,
+    JointState::J13,
+    JointEvent::CaptureError,
+    capture_pub_body
+);
+joint_cell!(
+    joint_cell_j13_sink_failure,
+    JointState::J13,
+    JointEvent::SinkFailure,
+    sink_pub_body
+);
+joint_cell!(
+    joint_cell_j13_held_install,
+    JointState::J13,
+    JointEvent::HeldInstall,
+    heldinstall_pub_body
+);
+joint_cell!(
+    joint_cell_j13_sigint2,
+    JointState::J13,
+    JointEvent::Sigint2,
+    sigint2_pub_body
 );

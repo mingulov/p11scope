@@ -241,6 +241,11 @@ inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 # env): it scales only this cell's 100 ms tick-gap bound and its pass
 # floor. The runner refuses a value outside 1..4 and records a set one.
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
+# R1.4 live joint-finish cell: a real semantic lane over a SoftHSM2 ledger
+# target drives the T14 finish driver from begin to Published to WoundDown
+# (the M1/M3 arms unit tests cannot build a live machine for). Prints
+# JOINT_LIVE lines.
+inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

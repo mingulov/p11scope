@@ -400,6 +400,9 @@ fn drive<L: CaptureLane<PidPin>>(
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -408,6 +411,16 @@ fn drive<L: CaptureLane<PidPin>>(
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     let stop = Cell::new(false);
     let stop_now = || stop.get();
@@ -2576,6 +2589,9 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
         joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
         #[cfg(test)]
@@ -2584,6 +2600,16 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         joint_begin_calls: 0,
         #[cfg(test)]
         joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
     };
     let stop = || flag.stopped();
     let clock = LoopClock {
@@ -3512,5 +3538,288 @@ fn privileged_identity_kernel_multipass_reuse_lp64() -> Result<()> {
         sweep.holder_ranges.iter().map(Vec::len).collect::<Vec<_>>(),
         IdentitySweep::sha256_file(&sweep.provider)?,
     );
+    Ok(())
+}
+
+/// A SoftHSM2 manifest for the live joint-finish cell: the recipe is
+/// the fixture manifest's (attach privileged tests), with the entry
+/// offsets discovered from the installed provider's ELF.
+fn softhsm_joint_manifest(workload: &Workload) -> Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+    use p11scope_manifest::manifest::*;
+    let path = std::path::Path::new(SOFTHSM);
+    ensure!(path.exists(), "SoftHSM2 provider {SOFTHSM} is missing");
+    let file = open_object(path).map_err(anyhow::Error::msg)?;
+    let inspected = inspect_file(&file).map_err(anyhow::Error::msg)?;
+    let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+    let elf = std::fs::File::open(path)?;
+    let snapshot = p11scope_manifest::elf::ElfSnapshot::read(&elf).map_err(anyhow::Error::msg)?;
+    let mut offsets = Vec::new();
+    for name in ["C_SignInit", "C_Sign"] {
+        let fact = snapshot
+            .defined_symbol(name)
+            .map_err(anyhow::Error::msg)?
+            .with_context(|| format!("SoftHSM2 exports no {name}"))?;
+        offsets.push(fact.file_offset);
+    }
+    let functions = match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        },
+    }) {
+        pkcs11_module::TableSet::Walk(spans) => spans
+            .iter()
+            .flat_map(|span| span.fields())
+            .map(|field| {
+                let resolution = match field.name {
+                    "C_SignInit" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[0],
+                    },
+                    "C_Sign" => Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[1],
+                    },
+                    _ => Resolution::NullPointer,
+                };
+                FunctionRecord {
+                    name: field.name.into(),
+                    resolution,
+                }
+            })
+            .collect(),
+        _ => anyhow::bail!("2.40 is a full standard table"),
+    };
+    let path = path.to_str().context("SoftHSM2 path")?.to_string();
+    let manifest = Manifest {
+        schema: SCHEMA.into(),
+        module_path: path.clone(),
+        objects: vec![ObjectRecord {
+            id: 0,
+            path: path.clone(),
+            identity: inspected.identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path,
+            device_major: mapping.device_major,
+            device_minor: mapping.device_minor,
+            inode: mapping.inode,
+            identity: inspected.identity,
+        }],
+        interface_list: Acquisition::Absent,
+        surfaces: vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Ok,
+            version: Some(Version {
+                major: 2,
+                minor: 40,
+            }),
+            walk: WalkOutcome::Full,
+            functions,
+        }],
+        vendor_interfaces: Vec::new(),
+        alias_groups: Vec::new(),
+        selection_evidence: Default::default(),
+    };
+    ensure!(
+        crate::manifest_input::validate_structure(&manifest).is_empty(),
+        "the SoftHSM2 manifest is well-formed"
+    );
+    let manifest_path = workload.path("joint-live.dr37.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    Ok(manifest_path)
+}
+
+/// R1.4 live-machine joint-finish cell: a real semantic lane over a
+/// SoftHSM2 ledger target drives the T14 finish driver from begin
+/// to Published to WoundDown. The begin returning Ok (M1) and the
+/// poll reaching Published (M3) are the only arms unit tests cannot
+/// build a live machine for; both are asserted here, then the lane
+/// finishes H0, winds down and hands its session over. Prints
+/// JOINT_LIVE lines. Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live joint machine begin to Published to WoundDown through the T14 driver"]
+fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::{Duration, Instant};
+
+    let workload = Workload::build()?;
+    let gate = workload.path("gate");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let target = workload.spawn(
+        "target",
+        &[
+            "mech", "--cell", "T", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "--hold",
+        ],
+    )?;
+    let manifest = softhsm_joint_manifest(&workload)?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    coordinator.set_semantic_manifests(vec![manifest]);
+    let scope = Scope::Pid(target.pid());
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the SoftHSM2 subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+    )
+    .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    ensure!(
+        !lane.has_joint_machine(),
+        "no machine before initialization"
+    );
+    lane.initialize_joint(&mut coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    eprintln!("JOINT_LIVE attach=ok machine=ok");
+
+    // Let the ledgered calls flow, then drive the T14 finish driver.
+    if !gate.exists() {
+        std::fs::write(&gate, b"")?;
+    }
+    let started = Instant::now();
+    while !target.has("DONE ") {
+        ensure!(
+            started.elapsed() < Duration::from_secs(120),
+            "the ledger never finished: {:?}",
+            target.lines()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let mut driver = ClassicDriver {
+        coordinator: &mut coordinator,
+        inventory_scope: Some(InventoryScope::Pid(target.pid())),
+        scope: InventoryRunScope::Pid(target.pid()),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
+        identity: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
+    };
+    driver.begin_final_joint_finish();
+    ensure!(
+        driver.joint_finish == JointFinishDriver::Polling,
+        "M1: the live begin returns Ok and polls, got {:?}",
+        driver.joint_finish
+    );
+    ensure!(
+        !driver
+            .semantic
+            .as_ref()
+            .expect("lane")
+            .joint_finish_disposition_required(),
+        "M1: the Ok begin latches nothing"
+    );
+    eprintln!("JOINT_LIVE begin=ok polling");
+
+    let mut polls = 0;
+    loop {
+        let outcome = {
+            let (coordinator, semantic, finish, first_error) = (
+                &mut *driver.coordinator,
+                &mut driver.semantic,
+                &mut driver.joint_finish,
+                &mut driver.joint_first_error,
+            );
+            ClassicDriver::step_begun_joint_finish(semantic, finish, coordinator, first_error)
+        };
+        polls += 1;
+        // The publish lands in the driver state; the step outcome
+        // only reports staying, wound-down or abandoned.
+        if driver.joint_finish == JointFinishDriver::Published {
+            break;
+        }
+        ensure!(
+            !matches!(outcome, JointStepOutcome::Abandoned),
+            "M3: the live poll never abandons"
+        );
+        ensure!(
+            polls < 200,
+            "M3: the live poll reaches Published within 200 polls"
+        );
+    }
+    ensure!(
+        driver.joint_finish == JointFinishDriver::Published,
+        "M3: the live poll publishes, got {:?} after {polls} polls",
+        driver.joint_finish
+    );
+    eprintln!("JOINT_LIVE published_after={polls}");
+
+    // H0 stops through the production finish path, then the detach
+    // joins and the session hands over.
+    {
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        if let Some(finish) = lane.finish_semantic_stop() {
+            coordinator.stage_semantic_batch(finish);
+            lane.note_semantic_staged();
+            commit_semantic_finish(coordinator, lane)?;
+            lane.note_semantic_published();
+        }
+        ensure!(lane.is_finished(), "H0 stops");
+    }
+    let mut wound_polls = 0;
+    loop {
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        match lane.poll_wound_down(coordinator) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(refusal) => anyhow::bail!("the live wound-down never refuses: {refusal}"),
+        }
+        wound_polls += 1;
+        ensure!(wound_polls < 600, "the live detach joins within 600 polls");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lane = driver.semantic.as_mut().expect("lane");
+    let session = lane
+        .take_joined_session()
+        .map_err(|refusal| anyhow::anyhow!("the wound-down lane hands its session: {refusal}"))?;
+    ensure!(session.is_some(), "the live take hands the session");
+    eprintln!("JOINT_LIVE wound_down_after={wound_polls} take=some");
     Ok(())
 }

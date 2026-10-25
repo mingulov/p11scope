@@ -1,10 +1,11 @@
 # p11scope node-observer image: musl-static binary on Alpine + the
 # in-cluster entry script. Built from the repository root context:
 #   docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
-# Requires the static binary (pure-Rust deps + aya make this work):
+# Requires the FULL static binary (default features; pure-Rust deps + aya
+# make this work):
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
 #     cargo +"$(cat .release-rust-version)" build --locked --release \
-#     --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
+#     --target x86_64-unknown-linux-musl --bin p11scope
 # (musl-tools provides the linker; the target-scoped env var keeps the
 # nested bpfel-unknown-none build inside build.rs on its own linker.)
 # scripts/kind-e2e.sh does all of this from a staged minimal context.

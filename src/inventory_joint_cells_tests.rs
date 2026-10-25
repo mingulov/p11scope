@@ -202,6 +202,20 @@ fn install_promotion_active(driver: &mut ClassicDriver<'_>) -> NativeDomainId {
     domain
 }
 
+/// The held-install scenes hold no handoff: `PendingInstall`
+/// parts are unforgeable in unit tests (no scripted Session,
+/// sealed attachment or construction permit exists), so the H
+/// asserts pin the reclaim ATTEMPT, never a reclaimed handoff
+/// (I4 ruling; mutant B survives by construction). Fails loudly
+/// if a future fixture plants a real handoff, so the H wording
+/// must be revisited then.
+fn assert_no_held_handoff(driver: &ClassicDriver<'_>) {
+    assert!(
+        driver.pending_install.is_none(),
+        "H: the scene holds no install handoff"
+    );
+}
+
 /// B waits: queued, idle, nothing parked (B).
 fn assert_b_untouched(driver: &mut ClassicDriver<'_>) {
     assert_eq!(
@@ -412,6 +426,7 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
     install_promotion_active(&mut driver);
+    assert_no_held_handoff(&driver);
     driver.on_stop_requested();
     assert_eq!(driver.joint_begin_calls, 1, "R: the finish begins once");
     assert_eq!(
@@ -422,7 +437,7 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     assert_eq!(
         driver.reclaim_calls,
         vec![PromotionEnd::RunStopped],
-        "H: the held install reclaims once with RunStopped"
+        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -625,6 +640,7 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
     install_promotion_active(&mut driver);
+    assert_no_held_handoff(&driver);
     let (source, mint_polls, _) = CountingSource::scripted(None);
     driver.completion_source = Some(Box::new(source));
     driver.on_stop_requested();
@@ -651,7 +667,7 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(
         driver.reclaim_calls,
         vec![PromotionEnd::RunStopped],
-        "H: the held install reclaims once with RunStopped"
+        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -1031,6 +1047,7 @@ fn heldinstall_graph_body(scene: Scene, event: JointEvent) {
     let seat = seat_state_lane(&mut driver, state);
     driver.joint_finish = JointFinishDriver::Polling;
     install_promotion_active(&mut driver);
+    assert_no_held_handoff(&driver);
     driver.on_stop_requested();
     assert_eq!(
         driver.joint_begin_calls, 0,
@@ -1049,7 +1066,7 @@ fn heldinstall_graph_body(scene: Scene, event: JointEvent) {
     assert_eq!(
         driver.reclaim_calls,
         vec![PromotionEnd::RunStopped],
-        "H: the held install reclaims once with RunStopped"
+        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -1758,8 +1775,8 @@ fn sink_pub_body(scene: Scene, event: JointEvent) {
 }
 
 /// J12/J13 × held_install (O P H / O E H): the stop begins the
-/// active finish once and reclaims the held install once with
-/// RunStopped; nothing installs, the lane stays live.
+/// active finish once and attempts the held-install reclaim once
+/// with RunStopped; nothing installs, the lane stays live.
 fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::HeldInstall));
     assert!(matches!(scene.state, JointState::J12 | JointState::J13));
@@ -1776,11 +1793,12 @@ fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     let domain = driver.semantic.as_ref().expect("lane").domain();
     let (_, error) = retain_publication(&mut driver, state, event, false);
     install_promotion_active(&mut driver);
+    assert_no_held_handoff(&driver);
     driver.on_stop_requested();
     assert_eq!(
         driver.reclaim_calls,
         vec![PromotionEnd::RunStopped],
-        "H: the held install reclaims once with RunStopped"
+        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
     );
     assert!(
         driver.pending_install.is_none(),

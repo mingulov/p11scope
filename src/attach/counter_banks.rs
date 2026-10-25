@@ -282,6 +282,12 @@ pub(crate) fn counter_fixed_map_bytes(cpus: usize) -> Result<usize, BankRefusal>
 /// Per-bank kernel map bytes for a counter mode: 512 cells times the
 /// mode value size times P possible CPUs. This reuses the same
 /// `bank_payload_bytes` the staging charge uses, never a second formula.
+/// It intentionally equals the staging charge (key-excluded `512*B*P`, the
+/// ruled parent §1 formula), not `configured_payload` for the inner
+/// PERCPU_ARRAY: the 4-byte inner key there adds 2 KiB per bank (the type-6
+/// arm adds the key; the `FORMAT2_MAPS` inner template is key 4, value B,
+/// 512 entries). No ceiling moves: every current B (24/40/296) is a
+/// multiple of 8, so alignment is identity and only the key differs.
 pub(crate) fn counter_bank_map_bytes(mode: CounterMode, cpus: usize) -> Result<usize, BankRefusal> {
     BankGeometry::checked(mode, 16, 512)?.bank_payload_bytes(cpus)
 }
@@ -450,9 +456,28 @@ pub(crate) fn counter_snapshot_bytes_for(
         .ok_or(BankRefusal::Budget)
 }
 
-/// Terminal close bookkeeping: link retire, map close and keepalive drop.
-/// Fixed 1 MiB upper bound; the terminal hold keeps it unspendable too.
-pub(crate) const COUNTER_TERMINAL_CLEANUP_BYTES: usize = 1024 * 1024;
+/// Terminal close bookkeeping: link retire, map close, keepalive drop and
+/// the cleanup receipt. Fixed 4 MiB upper bound; the terminal hold keeps it
+/// unspendable too. Derivation at the 8,192-endpoint ceiling, both backends
+/// (Singles carries entry+return uprobes per endpoint; Multi reserves at
+/// most two leaves per endpoint, `src/attach/counter_banks.rs:1089`): at
+/// most 16,384 owned links transfer once, either through the foreground
+/// terminal detach (`src/attach.rs:7620`, `src/attach.rs:1757`) or
+/// `Session::drop` (`src/attach.rs:8681`), via `take_owned_links`
+/// (`src/attach.rs:8513`, one `OwnedLink` per link) into one push-grown
+/// worker batch (old+new backing <= 2x final: 16,384 x 72 x 2 + 32 =
+/// 2,359,328), each boxed once by `retain_counter`
+/// (`src/attach/cleanup_worker.rs:44`: 16,384 x (48 + 32) = 1,310,720),
+/// plus one transient single-link Vec (80), retirement leases of at most
+/// one `Arc` per slot (`src/attach.rs:1608`, `src/attach.rs:2359`: 8,192 x
+/// 8 + 64 = 65,600) and a 4,096 receipt/batch allowance. Map close and
+/// keepalive drop only free their precharged backing, and the production
+/// closer is infallible `drop` (`src/attach/cleanup_worker.rs:640`), so the
+/// receipt carries only fixed worker-level strings. Total 3,739,824 (72-
+/// byte batch tuples, 48-byte links, 32-byte padding), rounded up to 4 MiB;
+/// the dominance test recomputes it from `size_of`. Transfer-failure
+/// strings (diagnostic only) are outside this figure.
+pub(crate) const COUNTER_TERMINAL_CLEANUP_BYTES: usize = 4 * 1024 * 1024;
 
 /// Terminal-read lease for the ceiling: storage plus transient at
 /// (8192 rows, 65536 RV keys, P possible CPUs) plus the snapshot and
@@ -2026,24 +2051,9 @@ impl<'a> CounterPreparation<'a> {
         let (retained, transient) = envelope
             .charges()
             .map_err(|_| anyhow::anyhow!("invalid counter reservation"))?;
-        let keepalive = if geometry.is_legacy() {
-            CounterKeepalive::precharge(reserve, retained)?
-        } else {
-            CounterKeepalive::precharge_with_geometry(reserve, retained, geometry)?
-        };
-        let scratch = reserve
-            .reserve(transient)
-            .map_err(|_| anyhow::anyhow!("counter load overlap reservation refused"))?;
-        // The caller bounds this parser/loader overlap explicitly. A raw byte
-        // length is a necessary input bound, never an exact allocator estimate.
-        ensure!(
-            transient
-                >= object
-                    .len()
-                    .checked_mul(32)
-                    .context("counter parser bound overflow")?,
-            "counter parser/loader transient reservation is too small"
-        );
+        // The memory preflight and the terminal reserve run before any pool
+        // reservation, so a fixed-exceeds request fails before keepalive or
+        // scratch can charge.
         // Production reads the host count; tests inject counts no host
         // reaches (fixed-exceeds preflight) through the seam.
         let cpus = match cpus_override {
@@ -2064,6 +2074,24 @@ impl<'a> CounterPreparation<'a> {
         let terminal = reserve
             .reserve(terminal_bytes)
             .map_err(|_| anyhow::anyhow!("counter terminal reserve refused"))?;
+        let keepalive = if geometry.is_legacy() {
+            CounterKeepalive::precharge(reserve, retained)?
+        } else {
+            CounterKeepalive::precharge_with_geometry(reserve, retained, geometry)?
+        };
+        let scratch = reserve
+            .reserve(transient)
+            .map_err(|_| anyhow::anyhow!("counter load overlap reservation refused"))?;
+        // The caller bounds this parser/loader overlap explicitly. A raw byte
+        // length is a necessary input bound, never an exact allocator estimate.
+        ensure!(
+            transient
+                >= object
+                    .len()
+                    .checked_mul(32)
+                    .context("counter parser bound overflow")?,
+            "counter parser/loader transient reservation is too small"
+        );
         let parsed = aya_obj::Object::parse(object).context("parsing selected counter artifact")?;
         // Parse and validate actual maps/template before common loading can
         // attach lifecycle roots. An emitted token alone grants no shape.
@@ -3156,10 +3184,16 @@ impl CounterBanks {
             return Err(BankRefusal::Topology);
         }
         let allocated_banks = directory.bank_ids.iter().flatten().count();
+        // Parent §3 FD row: Singles projects 2*published + banks + 1, Multi
+        // projects 2*published + banks.
+        let extra = match self.backend {
+            super::AttachBackend::Singles => 1,
+            super::AttachBackend::Multi => 0,
+        };
         let projected = published
             .checked_mul(2)
             .and_then(|n| n.checked_add(allocated_banks))
-            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_add(extra))
             .ok_or(BankRefusal::Budget)?;
         let soft = match read_fd_snapshot()?.soft_limit {
             FdLimit::Finite(limit) => Some(limit),
@@ -7301,7 +7335,10 @@ pub(crate) mod tests {
         };
         let mode = CounterMode::Counts;
         let cpus = 2usize;
-        let pool = SemanticResourcePool::reference_limit(45 * 1024 * 1024);
+        // The old 45 MiB plus the 3 MiB terminal cleanup raise (1 to 4 MiB):
+        // available-after-hold stays byte-identical, so every margin below
+        // evaluates exactly as before.
+        let pool = SemanticResourcePool::reference_limit(48 * 1024 * 1024);
         let terminal = counter_terminal_reserve_bytes(mode, cpus).unwrap();
         assert!(
             terminal > 30 * 1024 * 1024,

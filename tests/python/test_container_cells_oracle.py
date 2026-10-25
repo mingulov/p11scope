@@ -143,15 +143,16 @@ def pre_edges():
 
 def span_edges(b_pre_m8_cov="watched_no_use", b_pre_m8_since=3000,
                b_pre_m8_count=0, b3_m8_cov="watched_no_use", b3_m8_count=0):
+    # Live runs 5/6: the twin is new-only maps_match (first scanned after
+    # the collapse resolves); B-pre keeps old-ended plus new-mapped.
     return [edge(PID_A, "m7"),
             edge(PID_B_PRE, "m7", state="ended"),
             edge(PID_B_PRE, "m8", cov=b_pre_m8_cov, since=b_pre_m8_since,
                  count=b_pre_m8_count, first_seen=2000),
             edge(PID_B_SPAN, "m8", evidence="maps_match", cov="watched_no_use",
                  since=3000, first_seen=2000),
-            edge(PID_B3, "m7", state="ended"),
-            edge(PID_B3, "m8", cov=b3_m8_cov, since=3000,
-                 count=b3_m8_count, first_seen=2000)]
+            edge(PID_B3, "m8", evidence="maps_match", cov=b3_m8_cov,
+                 since=3000, count=b3_m8_count, first_seen=2000)]
 
 
 def good_copy_up_inputs(lane="B"):
@@ -467,6 +468,63 @@ class CopyUpTest(unittest.TestCase):
         self.assertEqual(record["span_kernel"]["m8_entries"], 0)
         self.assertEqual(record["span_userspace"]["m8_entries"], 0)
         self.assertEqual(record["span_kernel"]["m8_status"], "watched_no_use")
+        self.assertIsNone(record["span_kernel"]["m7_entries"])
+
+    def test_round2_twin_old_edge_fails(self):
+        """A twin first scanned after the collapse resolves is new-only."""
+        edges = span_edges() + [edge(PID_B3, "m7", state="ended")]
+        bad = inventory(edges, [collapse_gap()], backend="kernel",
+                        modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "must not have an old-module edge"):
+            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
+                          b_pre_round2_pid=PID_B3)
+
+    def test_round2_twin_counted_passes(self):
+        """A future fix that counts every post-copy-up call passes."""
+        counted = span_edges(b3_m8_cov="counted", b3_m8_count=1500)
+        kernel = inventory(counted, [collapse_gap()], backend="kernel",
+                           modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(counted, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=kernel, span_userspace=userspace,
+                               b_pre_round2_calls=1500,
+                               b_pre_round2_pid=PID_B3)
+        self.assertEqual(result["b_pre_round2"]["span_kernel"]["m8_entries"], 1500)
+
+    def test_round2_twin_partial_fails_named(self):
+        with self.assertRaisesRegex(AssertionError, "partial"):
+            check_copy_up(
+                span_kernel=inventory(
+                    span_edges(b3_m8_cov="counted", b3_m8_count=9),
+                    [collapse_gap()], backend="kernel",
+                    modules=dict(D1_MODULES_SPAN)),
+                b_pre_round2_calls=1500, b_pre_round2_pid=PID_B3)
+
+    def test_round2_b_pre_counted_passes(self):
+        counted = span_edges(b_pre_m8_cov="counted", b_pre_m8_count=1500)
+        kernel = inventory(counted, [collapse_gap()], backend="kernel",
+                           modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(counted, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=kernel, span_userspace=userspace,
+                               b_pre_round2_calls=1500)
+        self.assertEqual(result["b_pre_round2"]["span_kernel"]["m8_entries"], 1500)
+
+    def test_round2_b_pre_partial_fails_named(self):
+        bad = inventory(
+            span_edges(b_pre_m8_cov="counted", b_pre_m8_count=9),
+            [collapse_gap()], backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "partial"):
+            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500)
+
+    def test_round2_backends_disagree_fails(self):
+        userspace = inventory(
+            span_edges(b3_m8_cov="counted", b3_m8_count=1500),
+            [collapse_gap()], backend="userspace", fallback=None,
+            modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "disagree"):
+            check_copy_up(span_userspace=userspace, b_pre_round2_calls=1500,
+                          b_pre_round2_pid=PID_B3)
 
     def test_round2_pid_claim_fails(self):
         bad = inventory(
@@ -812,6 +870,9 @@ class OracleCliTest(unittest.TestCase):
             completed = run_oracle(*self.copy_up_args(work, inputs))
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout)["b_pre_round2"]["pid"], PID_B3)
+            self.assertIn(
+                "copy-up-stale-caller measured: ledger=1500 counted=0",
+                completed.stderr)
 
     def test_copy_up_cli_refuses_mutation(self):
         inputs = good_copy_up_inputs()

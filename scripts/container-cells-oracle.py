@@ -605,15 +605,17 @@ def st_pre_edges():
 
 
 def st_span_edges():
+    # Live runs 5/6: B-pre keeps old-ended plus new-mapped (deep_scan, first
+    # scanned before the collapse resolves); the round-2 twin (105) and B2
+    # (104) are first scanned after it resolves, so new-only maps_match.
     return [st_edge(101, "m7"),
             st_edge(102, "m7", state="ended"),
             st_edge(102, "m8", cov="watched_no_use", since=3000,
                     first_seen=2000),
             st_edge(104, "m8", evidence="maps_match", cov="watched_no_use",
                     since=3000, first_seen=2000),
-            st_edge(105, "m7", state="ended"),
-            st_edge(105, "m8", cov="watched_no_use", since=3000,
-                    first_seen=2000)]
+            st_edge(105, "m8", evidence="maps_match", cov="watched_no_use",
+                    since=3000, first_seen=2000)]
 
 
 def good_copy_up(lane="B"):
@@ -657,6 +659,17 @@ def refuses(label, check):
     try:
         check()
     except (AssertionError, KeyError, IndexError, TypeError, ValueError):
+        print(f"container-cells mutation rejected: {label}")
+        return
+    raise SystemExit(f"container-cells mutation accepted: {label}")
+
+
+def refuses_with(label, text, check):
+    """The check must fail with `text` in its message (a named failure)."""
+    try:
+        check()
+    except (AssertionError, KeyError, IndexError, TypeError, ValueError) as error:
+        assert text in str(error), (label, "unnamed failure", str(error))
         print(f"container-cells mutation rejected: {label}")
         return
     raise SystemExit(f"container-cells mutation accepted: {label}")
@@ -806,22 +819,89 @@ def self_test():
     round2_twin["b_pre_round2_calls"] = 1500
     round2_twin["b_pre_round2_pid"] = 105
     assert copy_up(**round2_twin)["b_pre_round2"]["pid"] == 105
+    assert copy_up(**round2_twin)["b_pre_round2"]["span_kernel"]["m7_entries"] is None
+    # The run-5/6 twin shape is new-only: an old-module edge for a caller
+    # first scanned after the collapse resolves is forbidden.
+    twin_old = [st_edge(101, "m7"),
+                st_edge(102, "m7", state="ended"),
+                st_edge(102, "m8", cov="watched_no_use", since=3000,
+                       first_seen=2000),
+                st_edge(104, "m8", evidence="maps_match"),
+                st_edge(105, "m7", state="ended"),
+                st_edge(105, "m8", evidence="maps_match", cov="watched_no_use",
+                       since=3000, first_seen=2000)]
+    round2_twin_old = good_copy_up("B")
+    round2_twin_old["b_pre_round2_calls"] = 1500
+    round2_twin_old["b_pre_round2_pid"] = 105
+    round2_twin_old["span_kernel"] = good_inventory(twin_old, [st_collapse()],
+                                                    backend="kernel",
+                                                    modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin must not have an old-module edge",
+                 "must not have an old-module edge",
+                 lambda: copy_up(**round2_twin_old))
+    # A future fix that counts every post-copy-up call passes too.
+    twin_counted_edges = [st_edge(101, "m7"),
+                          st_edge(102, "m7", state="ended"),
+                          st_edge(102, "m8", cov="watched_no_use", since=3000,
+                                 first_seen=2000),
+                          st_edge(104, "m8", evidence="maps_match"),
+                          st_edge(105, "m8", evidence="maps_match", cov="counted",
+                                 count=1500, since=3000, first_seen=2000)]
+    round2_twin_counted = good_copy_up("B")
+    round2_twin_counted["b_pre_round2_calls"] = 1500
+    round2_twin_counted["b_pre_round2_pid"] = 105
+    round2_twin_counted["span_kernel"] = good_inventory(
+        twin_counted_edges, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    round2_twin_counted["span_userspace"] = good_inventory(
+        twin_counted_edges, [st_collapse()], backend="userspace",
+        fallback=None, modules=ST_MODULES_SPAN)
+    assert copy_up(**round2_twin_counted)["b_pre_round2"]["span_kernel"]["m8_entries"] == 1500
+    # Anything between missed (0) and fully counted (ledger) fails named.
     twin_claimed = [st_edge(101, "m7"),
                     st_edge(102, "m7", state="ended"),
                     st_edge(102, "m8", cov="watched_no_use", since=3000,
                            first_seen=2000),
                     st_edge(104, "m8", evidence="maps_match"),
-                    st_edge(105, "m7", state="ended"),
-                    st_edge(105, "m8", cov="counted", count=9, since=3000,
-                           first_seen=2000)]
+                    st_edge(105, "m8", evidence="maps_match", cov="counted",
+                           count=9, since=3000, first_seen=2000)]
     round2_twin_bad = good_copy_up("B")
     round2_twin_bad["b_pre_round2_calls"] = 1500
     round2_twin_bad["b_pre_round2_pid"] = 105
     round2_twin_bad["span_kernel"] = good_inventory(twin_claimed, [st_collapse()],
                                                     backend="kernel",
                                                     modules=ST_MODULES_SPAN)
-    refuses("round-2 twin calls claimed by the new edge",
-            lambda: copy_up(**round2_twin_bad))
+    refuses_with("round-2 twin partial count refused", "partial",
+                 lambda: copy_up(**round2_twin_bad))
+    # Same two outcomes for B-pre's own later calls when measured.
+    b_pre_counted_edges = [st_edge(101, "m7"),
+                           st_edge(102, "m7", state="ended"),
+                           st_edge(102, "m8", cov="counted", count=1500,
+                                  since=3000, first_seen=2000),
+                           st_edge(104, "m8", evidence="maps_match")]
+    round2_b_pre_counted = good_copy_up("B")
+    round2_b_pre_counted["b_pre_round2_calls"] = 1500
+    round2_b_pre_counted["span_kernel"] = good_inventory(
+        b_pre_counted_edges, [st_collapse()], backend="kernel",
+        modules=ST_MODULES_SPAN)
+    round2_b_pre_counted["span_userspace"] = good_inventory(
+        b_pre_counted_edges, [st_collapse()], backend="userspace",
+        fallback=None, modules=ST_MODULES_SPAN)
+    assert copy_up(**round2_b_pre_counted)["b_pre_round2"]["span_kernel"]["m8_entries"] == 1500
+    refuses_with("round-2 B-pre partial count refused", "partial",
+                 lambda: copy_up(**round2_bad))
+    # The two backends must agree on missed vs counted.
+    round2_split = good_copy_up("B")
+    round2_split["b_pre_round2_calls"] = 1500
+    round2_split["b_pre_round2_pid"] = 105
+    round2_split["span_userspace"] = good_inventory(
+        twin_counted_edges, [st_collapse()], backend="userspace",
+        fallback=None, modules=ST_MODULES_SPAN)
+    refuses_with("round-2 backends disagree on the count", "disagree",
+                 lambda: copy_up(**round2_split))
+    assert measured_issue_line(105, 1500, 0, "m8") == \
+        ("KNOWN_ISSUE cell=D1 copy-up-stale-caller measured: ledger=1500 "
+         "counted=0 pid=105 module=m8")
     twin_missing = good_copy_up("B")
     twin_missing["b_pre_round2_calls"] = 1500
     twin_missing["b_pre_round2_pid"] = 105

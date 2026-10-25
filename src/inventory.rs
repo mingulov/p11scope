@@ -2502,10 +2502,7 @@ impl ClassicDriver<'_> {
             return;
         }
         if let Err(reason) = lane.initialize_joint(coordinator) {
-            coordinator.note_scope_gap(
-                "joint machine unavailable".into(),
-                format!("{reason}"),
-            );
+            coordinator.note_scope_gap("joint machine unavailable".into(), format!("{reason}"));
         }
     }
 
@@ -3393,10 +3390,7 @@ impl ClassicDriver<'_> {
     /// fail the call with no poll; an outstanding demand without the
     /// flag repairs the flag and resumes polling. A refused poll
     /// propagates: the retained consumer owns the outcome.
-    fn poll_joint_commit_path(
-        &mut self,
-        engine_changed: bool,
-    ) -> Result<PassCommitProgress> {
+    fn poll_joint_commit_path(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
         use crate::inventory_semantics::JointCommitRefusal;
         if !self.joint_commit_pending {
             let begin = {
@@ -3406,7 +3400,9 @@ impl ClassicDriver<'_> {
             match begin {
                 Ok(()) => self.joint_commit_pending = true,
                 Err(JointCommitRefusal::NotInitialized) => {
-                    return self.commit(engine_changed).map(|()| PassCommitProgress::Published);
+                    return self
+                        .commit(engine_changed)
+                        .map(|()| PassCommitProgress::Published);
                 }
                 Err(JointCommitRefusal::OutstandingRequest) => {
                     self.joint_commit_pending = true;
@@ -12564,10 +12560,7 @@ mod tests {
             "begin runs once per publication"
         );
         assert_eq!(driver.joint_commit_polls, 1, "the first call polls once");
-        assert_eq!(
-            driver.commit_calls, 0,
-            "no legacy commit on the Joint path"
-        );
+        assert_eq!(driver.commit_calls, 0, "no legacy commit on the Joint path");
         // A retry passes false and resumes polling without re-beginning.
         let second = driver.poll_commit(false);
         assert!(second.is_err(), "the resumed poll still refuses");
@@ -12606,10 +12599,7 @@ mod tests {
             "the fallback publishes at once"
         );
         assert_eq!(driver.commit_calls, 1, "one legacy commit runs");
-        assert!(
-            !driver.joint_commit_pending,
-            "the fallback pends nothing"
-        );
+        assert!(!driver.joint_commit_pending, "the fallback pends nothing");
         assert_eq!(
             driver
                 .semantic
@@ -12619,10 +12609,7 @@ mod tests {
             1,
             "the begin is attempted once"
         );
-        assert_eq!(
-            driver.joint_commit_polls, 0,
-            "the fallback never polls"
-        );
+        assert_eq!(driver.joint_commit_polls, 0, "the fallback never polls");
     }
 
     #[test]
@@ -12653,10 +12640,7 @@ mod tests {
             1,
             "the begin is attempted once"
         );
-        assert_eq!(
-            driver.joint_commit_polls, 0,
-            "a refused begin never polls"
-        );
+        assert_eq!(driver.joint_commit_polls, 0, "a refused begin never polls");
         assert_eq!(
             driver.commit_calls, 0,
             "no legacy commit past a refusing machine"
@@ -12691,10 +12675,7 @@ mod tests {
             "the begin is attempted once"
         );
         assert_eq!(driver.joint_commit_polls, 1, "the call polls once");
-        assert_eq!(
-            driver.commit_calls, 0,
-            "no legacy commit on the Joint path"
-        );
+        assert_eq!(driver.commit_calls, 0, "no legacy commit on the Joint path");
     }
 
     #[test]

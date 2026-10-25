@@ -1920,12 +1920,25 @@ fn official_build_is_safe_only() {
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
         "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
         "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
-        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
-        "        --features stub-object-attributes \\",
+        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release \"$@\" \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
     .join("\n");
     assert!(official.contains(&command));
+    // FULL (default features) is the official capture mode; P0 is an explicit
+    // selection, and an unknown mode refuses before the build.
+    let modes = [
+        "case ${RELEASE_CAPTURE_MODE-full} in",
+        "    full) set -- ;;",
+        "    p0) set -- --no-default-features --features stub-object-attributes ;;",
+        "    *) echo \"invalid release capture mode: ${RELEASE_CAPTURE_MODE-}\" >&2; exit 1 ;;",
+        "esac",
+    ]
+    .join("\n");
+    assert!(
+        official.contains(&modes),
+        "official build capture-mode selection"
+    );
     // The official bytes carry no build-host paths: the remap roots are the
     // resolved checkout and the refused-then-default Cargo and rustup homes.
     for definition in [
@@ -1955,9 +1968,8 @@ fn official_build_is_safe_only() {
     }
 }
 
-/// P0-only ship vehicle: the official release bytes build with the
-/// attribute gate shut. v0.4.0 ships P0-only; FULL stays the default
-/// for diet/qualification work.
+/// The official release bytes keep the explicit P0 option (attribute gate
+/// shut) for the verifier-budget lane; FULL is the default.
 #[test]
 fn official_build_is_p0_only() {
     let release = read("scripts/build-release.sh");
@@ -1973,9 +1985,9 @@ fn official_build_is_p0_only() {
 }
 
 /// Canary builds select FULL or P0 explicitly in both safe and diagnostic
-/// lanes. The release caller keeps its explicit P0 selection until FULL
-/// qualification completes. Behavioral argv/oracle controls live in the
-/// dual-build caller suite.
+/// lanes. The release caller passes its capture mode through (FULL by
+/// default). Behavioral argv/oracle controls live in the dual-build caller
+/// suite.
 #[test]
 fn canary_builds_bind_declared_capture_mode() {
     let canaries = read("scripts/verify-canaries.sh");
@@ -1997,13 +2009,14 @@ fn canary_builds_bind_declared_capture_mode() {
         );
     }
     assert!(
-        read("scripts/build-release.sh").contains("scripts/verify-canaries.sh --capture-mode p0")
+        read("scripts/build-release.sh")
+            .contains("scripts/verify-canaries.sh --capture-mode \"${RELEASE_CAPTURE_MODE-full}\"")
     );
 }
 
-/// P0-only ship vehicle: the attach-e2e lane builds P0 bytes (with or
-/// without the skip-attribution diagnostic), so live attach
-/// qualification loads on 1M-budget kernels.
+/// The attach-e2e lane's explicit P0 option builds P0 bytes (with or
+/// without the skip-attribution diagnostic), so live attach qualification
+/// can load on 1M-budget kernels.
 #[test]
 fn attach_e2e_build_is_p0_only() {
     let attach = read("scripts/verify-attach-e2e.sh");

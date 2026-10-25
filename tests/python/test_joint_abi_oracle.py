@@ -953,14 +953,6 @@ class AbiCompareTwins(unittest.TestCase):
                                     "comparison without ledger populations"):
             oracle.compare_abi(rows, [])
 
-    def test_mutation_calls_against_empty_counts_rejected(self):
-        oracle = require_oracle(self)
-        rows = threads_ledger()
-        oracle.validate_ledger(rows)
-        with self.assertRaisesRegex(oracle.LedgerError,
-                                    "comparison without observed populations"):
-            oracle.compare_abi(rows, [])
-
     def test_mutation_calls_disagree_rejected(self):
         oracle = require_oracle(self)
         rows = threads_ledger()

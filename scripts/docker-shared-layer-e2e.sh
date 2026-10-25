@@ -189,7 +189,9 @@ EOF
             *) echo "dockerd argv lost its pin: $pin" >&2; exit 1 ;;
         esac
     done
-    # Storage-driver gate: overlay2 proceeds, anything else is UNRUN.
+    # Storage-driver gate: overlay2 (classic store) and overlayfs (the
+    # containerd image store snapshotter, Docker 29 default) proceed;
+    # anything else is UNRUN.
     cat > "$stub/docker" <<'EOF'
 #!/bin/sh
 if [ "$1" = "info" ]; then printf '%s\n' "$STUB_DRIVER"; exit 0; fi
@@ -198,6 +200,8 @@ EOF
     chmod +x "$stub/docker"
     STUB_DRIVER=overlay2 PRIVATE=0 PATH="$stub:$PATH" require_overlay2 \
         || { echo "overlay2 wrongly refused" >&2; exit 1; }
+    STUB_DRIVER=overlayfs PRIVATE=0 PATH="$stub:$PATH" require_overlay2 \
+        || { echo "overlayfs wrongly refused" >&2; exit 1; }
     if STUB_DRIVER=btrfs PRIVATE=0 PATH="$stub:$PATH" require_overlay2 \
             >/dev/null 2>&1; then
         echo "btrfs wrongly accepted" >&2
@@ -346,12 +350,15 @@ dockerd_argv() {
     printf '%s\n' "dockerd --data-root $TASK_ROOT/docker-data --exec-root $TASK_ROOT/docker-exec --pidfile $TASK_ROOT/dockerd.pid -H unix://$TASK_ROOT/docker.sock --bridge=none --iptables=false"
 }
 
-# D1 rows are overlay-specific: any other storage driver is UNRUN, recorded.
+# D1 rows are overlay-specific: overlay2 (classic store) or overlayfs (the
+# containerd snapshotter); any other storage driver is UNRUN, recorded.
 require_overlay2() {
     drv=$(dcli info --format '{{.Driver}}' 2>/dev/null) \
         || { echo "docker info failed" >&2; return 1; }
-    [ "$drv" = "overlay2" ] \
-        || { echo "storage driver is $drv, want overlay2" >&2; return 1; }
+    case $drv in
+        overlay2|overlayfs) ;;
+        *) echo "storage driver is $drv, want overlay2 or overlayfs" >&2; return 1 ;;
+    esac
 }
 
 assert_name_free() {
@@ -760,7 +767,7 @@ if [ "$PRIVATE" -eq 1 ]; then
     fact "dockerd-log=$TASK_ROOT/dockerd.log"
 fi
 
-docker_info=$(dcli info --format '{{.Driver}} {{.Server.Version}}' 2>/dev/null) \
+docker_info=$(dcli info --format '{{.Driver}} {{.ServerVersion}}' 2>/dev/null) \
     || unrun "docker info failed"
 fact "docker-info=$docker_info"
 cgroup_driver=$(dcli info --format '{{.CgroupDriver}}' 2>/dev/null) \
@@ -769,7 +776,7 @@ fact "cgroup-driver=$cgroup_driver"
 docker_root=$(dcli info --format '{{.DockerRootDir}}' 2>/dev/null) \
     || unrun "docker info failed"
 fact "docker-root=$docker_root backing-fs=$(stat -f -c '%T' "$docker_root" 2>/dev/null)"
-require_overlay2 || unrun "storage driver is not overlay2; D1 rows are overlay-specific"
+require_overlay2 || unrun "storage driver is not overlay2/overlayfs; D1 rows are overlay-specific"
 grep -E ' overlay ' /proc/mounts | head -5 >>"$FACTS" || true
 assert_name_free "$D1_A" || unrun "container $D1_A already exists"
 assert_name_free "$D1_B" || unrun "container $D1_B already exists"

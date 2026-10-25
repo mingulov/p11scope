@@ -926,6 +926,55 @@ mod tests {
         }
     }
 
+    /// S4: the self-probe attaches, so it holds the embedded-flavor gate
+    /// itself instead of trusting every caller to check first. A planted
+    /// mismatch refuses with the same message capture setup refuses with,
+    /// before any load — which is also what makes this twin pass
+    /// unprivileged. Fails while the gate lives only at call sites.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_refuses_a_flavor_mismatch_before_loading() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let expected = format!(
+            "{:#}",
+            crate::attach::checked_embedded_flavor().unwrap_err()
+        );
+        assert!(expected.contains("stale or mismatched"), "{expected}");
+        let error = probe_kernel_inner().unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(
+            message, expected,
+            "the self-probe must refuse with the gate's message"
+        );
+    }
+
+    /// Positive control for the self-probe gate: agreeing flavors proceed
+    /// past it, so whatever the probe reports (a verdict, or a downstream
+    /// load failure without privilege) never names a flavor mismatch.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_passes_the_gate_when_flavors_agree() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        match probe_kernel_inner() {
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    !message.contains("stale or mismatched"),
+                    "agreeing flavors must pass the gate: {message}"
+                );
+            }
+        }
+    }
+
     /// HIGH-1: EPERM from loading the probe's BPF, or EACCES from its uprobe
     /// attach, is missing privilege; a verifier EACCES or anything else stays
     /// an unknown kernel verdict.

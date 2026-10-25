@@ -2382,6 +2382,31 @@ mod tests {
         assert!(!extra_strict_violations(&[check]).is_empty());
     }
 
+    /// Twin of the stub-direction row test: a planted unsafe-decoder
+    /// disagreement fails the object-capture row with the same reason
+    /// capture setup refuses with, naming the unsafe feature. Fails while
+    /// the row derives the flavor from the feature, or maps only the
+    /// stub direction to `Fail`.
+    #[test]
+    fn object_capture_check_fails_on_unsafe_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "mismatched unsafe decoders must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+        assert!(detail.contains("unsafe-unvalidated-metadata"), "{detail}");
+        assert!(!extra_strict_violations(&[check]).is_empty());
+    }
+
     /// A budget refusal names its cause: E2BIG through preflight formats
     /// as a verifier-budget refusal with the bounded log excerpt.
     #[test]

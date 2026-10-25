@@ -1564,7 +1564,10 @@ fn overlay_backing_render_is_identity_key_no_proof() {
 /// The N4 tripwire: a row whose truths render backing on either side
 /// takes the identity-key branch (never the parity shape), and once any
 /// row has taken it the top-level gate fails the cell named — a ready
-/// pair can never qualify silently.
+/// pair can never qualify silently. All six branch-taking rows trip the
+/// flag on lane A (row_lower, row_upper, row_two_mounts, row_collision,
+/// row_wrong_file, row_data_only); lane B refuses backing outright at
+/// every row.
 #[test]
 fn overlay_n4_branch_tripwire_fails_the_cell() {
     let truth = |line: &str, backing: bool| OverlayTruth {
@@ -2160,7 +2163,7 @@ impl OverlayRows<'_> {
         )?;
         let _ = t_line;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
-        let backing = t_truth.map_files_backing || a_truth.map_files_backing;
+        let branch = takes_identity_key_branch(&t_truth, &a_truth);
         match self.lane {
             OverlayLane::A => {
                 self.generation += 1;
@@ -2172,7 +2175,7 @@ impl OverlayRows<'_> {
                     key,
                     &mut *self.session,
                     self.generation,
-                    backing,
+                    branch,
                 );
                 assert_overlay_outcome(
                     pid,
@@ -2183,9 +2186,12 @@ impl OverlayRows<'_> {
                     &evidence,
                     OverlayExpect::Parity(false),
                 )?;
+                if branch {
+                    self.n4_active = true;
+                }
             }
             OverlayLane::B => {
-                if backing {
+                if branch {
                     return Err("unexpected backing rendering on lane B".into());
                 }
                 self.generation += 1;
@@ -2214,6 +2220,7 @@ impl OverlayRows<'_> {
             self.mode,
             self.lane,
             match self.lane {
+                OverlayLane::A if branch => "N4-identity-key-no-proof",
                 OverlayLane::A => "parity-none",
                 OverlayLane::B => "D-C7-3",
             },
@@ -2401,7 +2408,7 @@ impl OverlayRows<'_> {
         )?;
         let pid = target.pid as u32;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
-        let backing = t_truth.map_files_backing || a_truth.map_files_backing;
+        let branch = takes_identity_key_branch(&t_truth, &a_truth);
         match self.lane {
             OverlayLane::A => {
                 self.generation += 1;
@@ -2413,7 +2420,7 @@ impl OverlayRows<'_> {
                     key,
                     &mut *self.session,
                     self.generation,
-                    backing,
+                    branch,
                 );
                 assert_overlay_outcome(
                     pid,
@@ -2424,9 +2431,12 @@ impl OverlayRows<'_> {
                     &evidence,
                     OverlayExpect::Parity(false),
                 )?;
+                if branch {
+                    self.n4_active = true;
+                }
             }
             OverlayLane::B => {
-                if backing {
+                if branch {
                     return Err("unexpected backing rendering on lane B".into());
                 }
                 self.generation += 1;
@@ -2455,6 +2465,7 @@ impl OverlayRows<'_> {
             self.mode,
             self.lane,
             match self.lane {
+                OverlayLane::A if branch => "N4-identity-key-no-proof",
                 OverlayLane::A => "parity-none",
                 OverlayLane::B => "named-mismatch-negative",
             },
@@ -2503,6 +2514,10 @@ impl OverlayRows<'_> {
         )?;
         let pid = target.pid as u32;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
+        let branch = takes_identity_key_branch(&t_truth, &a_truth);
+        if branch && self.lane != OverlayLane::A {
+            return Err("unexpected backing rendering on lane B".into());
+        }
         self.generation += 1;
         let (kernel, evidence) = d4_overlay_kernel_no_run_for_pid(
             pid,
@@ -2512,7 +2527,7 @@ impl OverlayRows<'_> {
             key,
             &mut *self.session,
             self.generation,
-            t_truth.map_files_backing || a_truth.map_files_backing,
+            branch,
         );
         assert_overlay_outcome(
             pid,
@@ -2523,10 +2538,19 @@ impl OverlayRows<'_> {
             &evidence,
             OverlayExpect::Parity(false),
         )?;
+        if branch {
+            self.n4_active = true;
+        }
+        let verdict = if branch {
+            "N4-identity-key-no-proof"
+        } else {
+            "parity-none"
+        };
         eprintln!(
-            "D4_OVERLAY mode={:?} row=wrong-file lane={:?} verdict=parity-none target-{}",
+            "D4_OVERLAY mode={:?} row=wrong-file lane={:?} verdict={} target-{}",
             self.mode,
             self.lane,
+            verdict,
             truth_verdict(&t_truth)
         );
         Ok(())
@@ -2572,6 +2596,10 @@ impl OverlayRows<'_> {
         )?;
         let pid = target.pid as u32;
         let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
+        let branch = takes_identity_key_branch(&t_truth, &a_truth);
+        if branch && self.lane != OverlayLane::A {
+            return Err("unexpected backing rendering on lane B".into());
+        }
         self.generation += 1;
         let (kernel, evidence) = d4_overlay_kernel_no_run_for_pid(
             pid,
@@ -2581,7 +2609,7 @@ impl OverlayRows<'_> {
             key,
             &mut *self.session,
             self.generation,
-            t_truth.map_files_backing || a_truth.map_files_backing,
+            branch,
         );
         assert_overlay_outcome(
             pid,
@@ -2592,10 +2620,19 @@ impl OverlayRows<'_> {
             &evidence,
             OverlayExpect::DataOnly,
         )?;
+        if branch {
+            self.n4_active = true;
+        }
+        let verdict = if branch {
+            "N4-identity-key-no-proof"
+        } else {
+            "zero-demand"
+        };
         eprintln!(
-            "D4_OVERLAY mode={:?} row=data-only lane={:?} verdict=zero-demand target-{}",
+            "D4_OVERLAY mode={:?} row=data-only lane={:?} verdict={} target-{}",
             self.mode,
             self.lane,
+            verdict,
             truth_verdict(&t_truth)
         );
         Ok(())

@@ -4100,7 +4100,12 @@ impl Drop for SleepChild {
 }
 
 /// Fake pin for member cells (no FD; custody lives in the member).
-struct MemberPin;
+/// The fixture confirm pin: the real open result, so the mint derives
+/// its original from the confirm pin like production (never a numeric
+/// reopen). `open` stays infallible; the mint propagates a stored error.
+struct MemberPin {
+    pin: Result<Arc<PidPin>, String>,
+}
 
 /// `ConfirmIo` serving canned entries, with an optional REAL member mint.
 /// The mint path exercises genuine custody (tgkill, pidfd, birth
@@ -4112,7 +4117,7 @@ struct MemberIo {
     mint: bool,
     member_owner: ReservationOwner,
     stashed: Option<RetainedGroupMember>,
-    minter: Option<Arc<PidPin>>,
+    minter: Option<super::super::sweep_attribution::ReservedPin<Arc<PidPin>>>,
     fallback_reads: Rc<RefCell<Vec<(u32, u64, u64)>>>,
 }
 
@@ -4134,7 +4139,9 @@ impl MemberIo {
                 path: Some("member-fixture".into()),
             },
             mint,
-            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 1)),
+            // Two retained slots, like the production member owner: the
+            // member directory plus the dup'd original pidfd.
+            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 2)),
             stashed: None,
             minter: None,
             fallback_reads,
@@ -4145,8 +4152,10 @@ impl MemberIo {
 impl super::super::sweep_attribution::ConfirmIo for MemberIo {
     type Pin = MemberPin;
 
-    fn open(&mut self, _: u32) -> Result<Self::Pin, String> {
-        Ok(MemberPin)
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        Ok(MemberPin {
+            pin: PidPin::open(pid).map(Arc::new),
+        })
     }
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
@@ -4192,6 +4201,7 @@ impl super::super::sweep_attribution::ConfirmIo for MemberIo {
     fn mint_member(
         &mut self,
         pid: u32,
+        pin: &Self::Pin,
         budget: &mut crate::discovery::scan::CaptureWorkBudget,
     ) -> Result<(), super::super::sweep_attribution::Confirmation> {
         use super::super::sweep_attribution::Confirmation;
@@ -4200,15 +4210,30 @@ impl super::super::sweep_attribution::ConfirmIo for MemberIo {
         if !self.mint {
             return Ok(());
         }
+        // The original derives from the confirm pin (duplicated), never
+        // a numeric reopen; its lease is reserved before the dup, like
+        // production.
+        let held = pin
+            .pin
+            .clone()
+            .map_err(|error| Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error))?;
+        let lease = self
+            .member_owner
+            .batch()
+            .pin()
+            .map_err(|error| Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error))?;
         let original =
-            Arc::new(PidPin::open(pid).map_err(|error| {
+            Arc::new(held.try_clone().map_err(|error| {
                 Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error)
             })?);
         let deadline = Instant::now() + Duration::from_secs(10);
         match RetainedGroupMember::acquire(&original, pid, &self.member_owner, budget, deadline) {
             Ok(member) => {
                 self.stashed = Some(member);
-                self.minter = Some(original);
+                self.minter = Some(super::super::sweep_attribution::ReservedPin {
+                    pin: original,
+                    _lease: Some(lease),
+                });
                 Ok(())
             }
             Err(error) => Err(Confirmation::Lost(
@@ -5026,6 +5051,38 @@ fn healthy_member_exe_confirms_at_finish() {
         matches!(confirmation, Confirmation::Confirmed(_)),
         "a healthy member confirms: {confirmation:?}"
     );
+    drop(child);
+}
+
+/// The member's original pidfd is leased on the member owner like every
+/// other held FD: a live mint holds two retained leases (the member
+/// directory plus the original), not one.
+#[test]
+fn member_original_pidfd_is_leased_on_the_member_owner() {
+    use super::super::sweep_attribution::prepare_confirmation;
+    let child = SleepChild::spawn();
+    let pid = child.pid();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut io = MemberIo::canned(
+        vec![],
+        FileIdentity { dev: 1, ino: 2 },
+        true,
+        Rc::new(RefCell::new(vec![])),
+    );
+    let prepared = prepare_confirmation(&mut io, pid, &BTreeSet::new(), &mut budget, None)
+        .expect("member request prepares");
+    assert!(
+        prepared.member.is_some(),
+        "the preparation carries its member"
+    );
+    assert!(io.minter.is_some(), "mint stashes its original");
+    let (used, _, _, _) = io.member_owner.state_for_test();
+    assert_eq!(
+        used,
+        [2, 0, 0, 0],
+        "the member directory plus the original pidfd hold retained leases: {used:?}"
+    );
+    drop(prepared);
     drop(child);
 }
 

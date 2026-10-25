@@ -7,6 +7,7 @@
 //! mappings on Btrfs.
 
 use super::*;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
 /// A thread group whose leader is an unreaped zombie with one live
@@ -335,6 +336,59 @@ fn zombie_group_with_live_survivor_prepares_through_member() {
         crate::discovery::caller_registry::read_exe_identity(std::process::id())
             .expect("self exe reads")
     );
+}
+
+/// The member's original is the confirm pin's own pidfd (duplicated),
+/// never a fresh numeric reopen: both fds name the same open file
+/// description (`kcmp KCMP_FILE`). A numeric reopen would name the same
+/// process through a different description — and the wrong process
+/// after a pid recycle.
+#[test]
+fn member_original_is_the_confirm_pin_not_a_numeric_reopen() {
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let mut io = OsConfirmIo::default();
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+        .expect("a zombie group with a live survivor prepares");
+    assert!(
+        prepared.member.is_some(),
+        "prepare carries the survivor member"
+    );
+    let minter = io.minter.as_ref().expect("mint stashes its original");
+    let confirm = prepared.pin.pin.pidfd().expect("confirm pin has a pidfd");
+    let original = minter.pin.pidfd().expect("original has a pidfd");
+    assert!(
+        same_open_file_description(confirm, original),
+        "the member original is the confirm pin's own pidfd, not a numeric reopen"
+    );
+}
+
+/// Whether two fds of this process name the same open file description.
+/// `kcmp` has no libc wrapper on Linux, so this issues the raw syscall
+/// (`KCMP_FILE`); same-process comparison needs no privilege. A broken
+/// probe fails the twin rather than passing vacuously.
+fn same_open_file_description(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> bool {
+    const KCMP_FILE: libc::c_long = 0;
+    let pid = std::process::id() as libc::c_long;
+    // SAFETY: a pure comparison of two owned fds; sends nothing.
+    let compared = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            pid,
+            pid,
+            KCMP_FILE,
+            first.as_raw_fd() as libc::c_long,
+            second.as_raw_fd() as libc::c_long,
+        )
+    };
+    if compared != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        assert_eq!(errno, 0, "the kcmp probe itself failed");
+        return false;
+    }
+    true
 }
 
 #[test]
@@ -857,7 +911,12 @@ fn zombie_leader_esrch() -> String {
     std::io::Error::from_raw_os_error(libc::ESRCH).to_string()
 }
 
-struct ZombieProofPin;
+/// The fixture confirm pin: the real open result, so the mint derives
+/// its original from the confirm pin like production (never a numeric
+/// reopen). `open` stays infallible; the mint propagates a stored error.
+struct ZombieProofPin {
+    pin: Result<std::sync::Arc<crate::process::PidPin>, String>,
+}
 
 /// `ConfirmIo` whose leader-path range reads fail exactly like the real
 /// kernel for a zombie leader (ESRCH) and whose member-path reads
@@ -868,7 +927,7 @@ struct ZombieProofIo {
     survivor: u32,
     member_owner: ReservationOwner,
     stashed: Option<crate::discovery::retained_member::RetainedGroupMember>,
-    minter: Option<std::sync::Arc<crate::process::PidPin>>,
+    minter: Option<ReservedPin<std::sync::Arc<crate::process::PidPin>>>,
     member_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
     leader_reads: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
 }
@@ -883,7 +942,9 @@ impl ZombieProofIo {
         Self {
             entries,
             survivor,
-            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 1)),
+            // Two retained slots, like the production member owner: the
+            // member directory plus the dup'd original pidfd.
+            member_owner: ReservationOwner::new(SegmentPolicy::from_headroom(64, 1, 2)),
             stashed: None,
             minter: None,
             member_reads,
@@ -903,8 +964,10 @@ impl ZombieProofIo {
 impl ConfirmIo for ZombieProofIo {
     type Pin = ZombieProofPin;
 
-    fn open(&mut self, _: u32) -> Result<Self::Pin, String> {
-        Ok(ZombieProofPin)
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        Ok(ZombieProofPin {
+            pin: crate::process::PidPin::open(pid).map(std::sync::Arc::new),
+        })
     }
 
     fn start_time(&self, _: &Self::Pin) -> Option<u64> {
@@ -950,6 +1013,7 @@ impl ConfirmIo for ZombieProofIo {
     fn mint_member(
         &mut self,
         pid: u32,
+        pin: &Self::Pin,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(), Confirmation> {
         use crate::discovery::retained_member::RetainedGroupMember;
@@ -958,8 +1022,20 @@ impl ConfirmIo for ZombieProofIo {
         if !crate::process::process_is_zombie(pid) {
             return Ok(());
         }
+        // The original derives from the confirm pin (duplicated), never
+        // a numeric reopen; its lease is reserved before the dup, like
+        // production.
+        let held = pin
+            .pin
+            .clone()
+            .map_err(|error| Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error))?;
+        let lease = self
+            .member_owner
+            .batch()
+            .pin()
+            .map_err(|error| Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error))?;
         let original =
-            std::sync::Arc::new(crate::process::PidPin::open(pid).map_err(|error| {
+            std::sync::Arc::new(held.try_clone().map_err(|error| {
                 Confirmation::Lost(AttributionLoss::MapFilesUnavailable, error)
             })?);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -972,7 +1048,10 @@ impl ConfirmIo for ZombieProofIo {
         ) {
             Ok(member) => {
                 self.stashed = Some(member);
-                self.minter = Some(original);
+                self.minter = Some(ReservedPin {
+                    pin: original,
+                    _lease: Some(lease),
+                });
                 Ok(())
             }
             Err(_) => Ok(()),

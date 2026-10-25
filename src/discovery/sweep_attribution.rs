@@ -1517,14 +1517,17 @@ pub(crate) trait ConfirmIo {
     fn gone(&self, pid: u32) -> bool;
     /// Mint (and stash) the validated group member for a zombie-leader
     /// confirm, so reads route to the live survivor. Called once per
-    /// prepare, right after `open`; `Ok` with no stash means the
-    /// ordinary path (a live leader, no lone survivor, or any custody
-    /// refusal — a zombie then stays exited). `Err` only when the proof
-    /// could not be attempted (spent budget or deadline), which the
-    /// caller reports as the loss instead of an exit.
+    /// prepare, right after `open`, with the confirm pin the member's
+    /// original must derive from (never a fresh numeric reopen); `Ok`
+    /// with no stash means the ordinary path (a live leader, no lone
+    /// survivor, or any custody refusal — a zombie then stays exited).
+    /// `Err` only when the proof could not be attempted (spent budget
+    /// or deadline), which the caller reports as the loss instead of
+    /// an exit.
     fn mint_member(
         &mut self,
         _pid: u32,
+        _pin: &Self::Pin,
         _budget: &mut CaptureWorkBudget,
     ) -> Result<(), Confirmation> {
         Ok(())
@@ -1699,8 +1702,9 @@ pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
         return Err(stopped_confirmation());
     }
     // The open phase routes zombie leaders to member custody before any
-    // read: exe, maps and map_files then serve the live survivor.
-    io.mint_member(pid, budget)?;
+    // read: exe, maps and map_files then serve the live survivor. The
+    // mint derives its original from this confirm pin, never by number.
+    io.mint_member(pid, &pin.pin, budget)?;
     let before = io.exe(pid).ok_or_else(|| {
         lost_with(
             io,
@@ -1892,12 +1896,14 @@ pub(crate) struct OsConfirmIo<'p> {
     member: Option<(u32, RetainedGroupMember)>,
     /// The member's minter, kept alive exactly while the member lives:
     /// the member only borrows it, so dropping this first would refuse
-    /// every member read.
-    minter: Option<Arc<crate::process::PidPin>>,
-    /// The member's private reservation owner: exactly one retained
-    /// slot plus one transient unit, sized for a single confirm. The
-    /// confirm path that needs no shared owner (and the shared census,
-    /// which never sees member leases) both stay untouched.
+    /// every member read. A `ReservedPin`: the dup'd pidfd closes before
+    /// its member-owner lease returns, like every other held FD.
+    minter: Option<ReservedPin<Arc<crate::process::PidPin>>>,
+    /// The member's private reservation owner: exactly two retained
+    /// slots (the member directory plus the dup'd original pidfd) plus
+    /// one transient unit, sized for a single confirm. The confirm path
+    /// that needs no shared owner (and the shared census, which never
+    /// sees member leases) both stay untouched.
     member_owner: ReservationOwner,
 }
 
@@ -1913,13 +1919,14 @@ impl Default for OsConfirmIo<'_> {
 const MINT_DEADLINE_GRACE: Duration = Duration::from_secs(1);
 
 fn member_owner() -> ReservationOwner {
-    // Exactly the reserved envelope for one member (one retained slot
-    // plus one transient unit, inside the immediate floor): the minimal
-    // policy `ReservationOwner::new` accepts.
+    // Exactly the reserved envelope for one member (two retained slots —
+    // the member directory plus the dup'd original pidfd — and one
+    // transient unit, inside the immediate floor): the minimal policy
+    // `ReservationOwner::new` accepts.
     ReservationOwner::new(SegmentPolicy {
-        headroom: 6,
+        headroom: 7,
         workers: 1,
-        retained: 1,
+        retained: 2,
         max_ranges: 0,
     })
 }
@@ -2218,6 +2225,7 @@ impl ConfirmIo for OsConfirmIo<'_> {
     fn mint_member(
         &mut self,
         pid: u32,
+        pin: &Self::Pin,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(), Confirmation> {
         // A fresh stash every prepare: an early `Err` return skips the
@@ -2234,7 +2242,15 @@ impl ConfirmIo for OsConfirmIo<'_> {
             Some(tid) => tid,
             None => return Ok(()),
         };
-        let original = match crate::process::PidPin::open(pid) {
+        // The original is the confirm pin's own pidfd (duplicated),
+        // never a fresh numeric reopen: a reopen could name a recycled
+        // pid's new process. Its lease is reserved before the dup, like
+        // every other held FD.
+        let lease = match self.member_owner.batch().pin() {
+            Ok(lease) => lease,
+            Err(_) => return Ok(()),
+        };
+        let original = match pin.try_clone() {
             Ok(pin) => Arc::new(pin),
             Err(_) => return Ok(()),
         };
@@ -2242,7 +2258,10 @@ impl ConfirmIo for OsConfirmIo<'_> {
         match RetainedGroupMember::acquire(&original, tid, &self.member_owner, budget, deadline) {
             Ok(member) => {
                 self.member = Some((pid, member));
-                self.minter = Some(original);
+                self.minter = Some(ReservedPin {
+                    pin: original,
+                    _lease: Some(lease),
+                });
                 Ok(())
             }
             // Any custody refusal keeps the ordinary path (a zombie

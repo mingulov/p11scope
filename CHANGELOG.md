@@ -95,7 +95,8 @@ Most important for this release:
 - A timed run shorter than the first full pass reports 0 callers with a
   `no complete collection pass` gap.
 - Per-call profile/trace capture stays fixed at 512 attach slots.
-- Only 30 minutes of bounded useful activity is claimed.
+- Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
+  are not qualified yet.
 
 ### Qualification of this release
 

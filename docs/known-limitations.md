@@ -1,4 +1,65 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+# Known limitations (v0.5.0)
+
+v0.5.0 release builds read object attributes by default (FULL); the P0
+build without attribute reads stays an explicit option. The entries
+under Prior releases below still apply unless this section says
+otherwise.
+
+Strict scale and speed numbers apply only on kernels where the capture
+actually uses uprobe_multi (6.6 and later, decided by a functional
+probe, never a version check). On older kernels without uprobe_multi
+(5.15, 6.1, and `--pid` captures where the kernel pid filter is not
+proven) captures stay correct and stop in finite time, but slowly:
+teardown detaches one link at a time at about 18 ms per link (5.15
+guest) and 50–73 ms per link on newer kernels stopping one link at a
+time, and startup takes about 15–22 s on 5.15/6.1 versus about 4–7 s
+on 6.6+. The report always discloses which backend was used
+(`observation.attach`, `evidence.attach_backend`). On 5.15, per-copy
+module attribution and calls held across a non-leader exec stay
+unqualified (see below).
+
+Measurement modes stay reserved: `--counter-mode counts|timestamps|
+latency` is refused with `counter-mode-unwired` before capture setup.
+Omitting the flag keeps existing metrics behavior. Per-call
+profile/trace capture stays fixed at 512 attach slots (2,112 only in
+the WIDE source build).
+
+A timed run shorter than the first full pass (5–10 s on a busy host)
+discards the collection and reports 0 callers with a `no complete
+collection pass` gap and one informational stderr line. The first
+calls a provider makes after a late load can be missed before its
+probes land, and use before admission voids that watch (`unknown`,
+`use_before_admission`). Very short-lived callers can stay unbound or
+unattributed (see below); tracking them needs a later opt-in mode.
+
+In containers, a process that loaded a provider before the file was
+copied up is attributed to the copied-up file and its later calls are
+missed, with no marker in the output; restarting such processes is the
+workaround, and the kernel identity backend does not help (full entry
+below).
+
+Only 30 minutes of bounded useful activity is claimed; longer
+continuous runs are not qualified. Startup and stop figures above are
+declared per kernel, not a product guarantee.
+
+## Planned for later versions
+
+- Longer bounded runs (4 h, 24 h).
+- Faster teardown on kernels without uprobe_multi.
+- Activating the reserved measurement modes (`--counter-mode`),
+  including a per-mechanism view.
+- Finer key-operation detail (per-mechanism rows).
+- A named unknown edge for the copy-up case above instead of silent
+  misattribution, and for a late provider's unwatched window.
+- Tracking short-lived processes that exit before their first binding.
+- Parallel BPF program loading for faster startup.
+- Post-quantum key details, cluster aggregation, telemetry,
+  enforcement, AArch64, extra capture fields and syscall/network
+  correlation.
+
+## Prior releases
+
 # Known limitations (v0.4.0)
 
 v0.4.0 is an intermediate source checkpoint with no new binary bundles.
@@ -31,8 +92,6 @@ include `p11scope/observed-profile/v3`, `p11scope/observed-profile/v3-metrics`
 and the inventory v1 family; see the
 [schema-identifier rules](../RELEASING.md#version-and-schema-identifier-rules).
 Their version spellings grant no cross-schema compatibility.
-
-## Prior releases
 
 # Known limitations (v0.3.0)
 

@@ -11,24 +11,19 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.4.0** (intermediate source checkpoint), adds `inventory --cgroup`
-> scope, offline `inventory diff` comparison, inventory diagnostics, executable
-> naming for trace and inspect output, and hardened final-output semantics across `doctor`,
-> `inspect`, `profile`, `trace` and `run`. Object-attribute capture is not
-> enabled in the selected P0 build (`--no-default-features --features
-> stub-object-attributes`; disclosed as structured evidence). Ordinary source
-> builds default to FULL; FULL and broader installed qualification remain open.
-> Read the [known limitations](CHANGELOG.md#known-limitations)
-> and [docs/known-limitations.md](docs/known-limitations.md) before relying
-> on a capture; `--system` is a preview. The [v0.4.0 source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
-> has no new binary bundles or complete installed/package qualification;
-> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
-> revision-specific pre-release evidence.
+> **Status: v0.5.0** adds FULL object-attribute capture in release builds
+> (P0 stays an explicit option), a `key operations:` line in text inventory
+> snapshots, a named `--max-endpoints` hint on over-budget plans, and
+> discovery for kernel threads and zombie leaders. Read the
+> [known limitations](CHANGELOG.md#known-limitations) and
+> [docs/known-limitations.md](docs/known-limitations.md) before relying on a
+> capture; `--system` is a preview, and
+> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what
+> this release was qualified on.
 
-The development checkpoint retains legacy metrics when
-`--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
-selections are reserved and return an error before capture setup; public
-activation of those modes remains future work.
+Omitting `--counter-mode` keeps existing metrics behavior. Explicit
+`counts`, `timestamps` and `latency` selections are reserved and return
+a `counter-mode-unwired` error before capture setup.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -47,7 +42,7 @@ known limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
-The v0.4.0 user-facing limits live in
+The v0.5.0 user-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
 Saved inventories can be compared offline with
@@ -113,16 +108,16 @@ assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.4.0 is an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0).
-Build that checkpoint with the explicit P0 feature selection in
-[Build locally from source](#build-locally-from-source). No v0.4.0 binary
-bundles or curated source export were published with the tag. GitHub's
+p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
+with no binary bundles. No v0.5.0 tag or binary bundles are published
+yet; build current source as described in
+[Build locally from source](#build-locally-from-source). GitHub's
 automatic source archive still needs the dependency inputs described above.
 
 The older [v0.3.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 provides a static x86-64 Linux observer bundle, optional glibc and musl discovery
 helper bundles, and a source export. The examples below install **v0.3.0**;
-they do not include the newer checkpoint's commands and fixes.
+they do not include the newer source's commands and fixes.
 Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.

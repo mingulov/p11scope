@@ -1772,7 +1772,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// DR37 wind-down gate: whether the domain's finalizer namespace
     /// still holds unpublished work that needs its validating lane. A
     /// staged quantum always needs the lane (it still requires its
-    /// audited finalization/drop), as does staged h3 evidence. A drop
+    /// audited finalization/drop). Staged h3 evidence does not hold
+    /// this shared gate: every finalized batch stages it, and only the
+    /// Joint seal audit takes it, so a legacy lane would never wind
+    /// down; Joint lanes refuse retire on it through
+    /// `retire_joint_domain_with_lane`. A drop
     /// shadow needs the lane only while the domain stays live: once
     /// the domain is permanently refused, its terminal loss is
     /// disposable without restoring positives, so the wind-down
@@ -1787,7 +1791,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_finalizer.as_ref().is_some_and(|state| {
             state.domain == domain
                 && (state.pending_semantic.is_some()
-                    || state.h3_pending.is_some()
                     || (state.pending_drop.is_some()
                         && !self.refused_semantic_domains.contains(&domain)))
         })
@@ -1817,6 +1820,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// `retire_joint_domain_with_lane`, which refuses while h3
     /// evidence, staged h9 entries or the lane's joint frame are
     /// still live; this entry keeps the namespace-quiescence gate.
+    /// Legacy lanes have no seal audit to drain h3, so their evidence
+    /// drops with the namespace here, as before the Joint path.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by the driver on completion.
     pub(crate) fn retire_joint_domain(
         &mut self,
@@ -1857,8 +1862,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Seal-drained retirement: refuse `PendingWork`, returning the
     /// completion unchanged, while the joint ledger still stages h9
-    /// entries, the validating lane still holds a joint frame, or
-    /// the domain still has pending work. A drained domain
+    /// entries, the validating lane still holds a joint frame, h3
+    /// evidence is still staged, or the domain still has pending work. A drained domain
     /// delegates to `retire_joint_domain`, which reports a foreign
     /// completion as `NotLiveDomain`.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED: the promotion driver wires the lane; tests exercise it.
@@ -1868,8 +1873,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         completion: SessionNativeCompletion,
     ) -> Result<(), (SessionNativeCompletion, JointRetireRefusal)> {
         let domain = completion.domain();
+        let h3_pending = self
+            .semantic_finalizer
+            .as_ref()
+            .is_some_and(|state| state.domain == domain && state.h3_pending.is_some());
         if self.joint_capture.ledger().staged() != 0
             || lane.has_joint_frame()
+            || h3_pending
             || self.joint_domain_has_pending_work(domain)
         {
             return Err((completion, JointRetireRefusal::PendingWork));
@@ -4257,8 +4267,8 @@ mod promotion_lifecycle_tests {
         finalizer.h3_pending = Some(H3DispositionEvidence::genesis());
         coordinator.semantic_finalizer = Some(finalizer);
         assert!(
-            coordinator.joint_domain_has_pending_work(a),
-            "h3 evidence needs its lane"
+            !coordinator.joint_domain_has_pending_work(a),
+            "h3 evidence does not hold the shared wind-down gate"
         );
         let (completion, err) = coordinator
             .retire_joint_domain_with_lane(&lane, SessionNativeCompletion::scripted(a))

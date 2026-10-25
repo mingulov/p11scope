@@ -432,4 +432,56 @@ mod tests {
         drop(lease);
         assert_eq!(pool.snapshot().charged_bytes, base);
     }
+
+    #[test]
+    fn pool_with_limit_charges_scratch_against_limit() {
+        const LIMIT: usize = 256 * 1024 * 1024;
+        let pool = SemanticResourcePool::with_limit(LIMIT);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.limit_bytes, LIMIT);
+        assert_eq!(snapshot.charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+        assert_eq!(snapshot.peak_charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+        assert_eq!(snapshot.refused, 0);
+        let reserver = pool.reserver();
+        let lease = reserver.reserve(1024).unwrap();
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 1024
+        );
+        assert!(reserver.covers(&lease, 1024));
+        assert!(!reserver.covers(&lease, 1025));
+        drop(lease);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH
+        );
+        assert_eq!(
+            pool.snapshot().peak_charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 1024
+        );
+    }
+
+    #[test]
+    fn pool_with_limit_refuses_beyond_limit_without_touching_charges() {
+        let pool = SemanticResourcePool::with_limit(SEMANTIC_TRANSITION_SCRATCH + 1024);
+        let reserver = pool.reserver();
+        let lease = reserver.reserve(1024).unwrap();
+        let charged = pool.snapshot().charged_bytes;
+        assert_eq!(charged, SEMANTIC_TRANSITION_SCRATCH + 1024);
+        let refusal = reserver.reserve(1).unwrap_err();
+        assert_eq!(refusal.limit_bytes, SEMANTIC_TRANSITION_SCRATCH + 1024);
+        assert_eq!(refusal.requested_bytes, charged + 1);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert_eq!(pool.snapshot().refused, 1);
+        let foreign = SemanticResourcePool::with_limit(SEMANTIC_TRANSITION_SCRATCH + 2048);
+        let foreign_lease = foreign.reserver().reserve(512).unwrap();
+        assert!(!reserver.covers(&foreign_lease, 0));
+        assert!(!foreign.reserver().covers(&lease, 0));
+        drop(lease);
+        drop(foreign_lease);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH
+        );
+    }
 }

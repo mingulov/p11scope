@@ -826,8 +826,8 @@ def export_canary_inputs(destination, work, mode, bits, build_mode, revision, tr
 # wiring lands with the controller's completion). D4_CELLS maps each
 # obligation to its qualifying libtest selectors; D4_LANES to the lanes
 # that may qualify it; D4_READY carries the qualified (obligation, lane)
-# pairs. The overlay pairs below qualified on their lanes; ext4 flips
-# only when the fixed cell qualifies; D4:btrfs rows are owned by the
+# pairs. The overlay and ext4 pairs below qualified on their lanes
+# (ext4 on host, 6.1.188 and 6.6.157); D4:btrfs rows are owned by the
 # zombie/batch jobs and are not staged here.
 D4_CELLS = {
     "D4:overlay-6.1": ("discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",),
@@ -841,7 +841,16 @@ D4_LANES = {
     "D4:overlay-6.8+": ("6.8.0-142-generic", "6.12.111", "7.2.6", "host"),
     "D4:ext4-inode-reuse": ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "7.2.6", "host"),
 }
-D4_READY = frozenset({("D4:overlay-6.1", "6.1.188"), ("D4:overlay-6.6", "6.6.157"), ("D4:overlay-6.8+", "host")})
+D4_READY = frozenset(
+    {
+        ("D4:overlay-6.1", "6.1.188"),
+        ("D4:overlay-6.6", "6.6.157"),
+        ("D4:overlay-6.8+", "host"),
+        ("D4:ext4-inode-reuse", "6.1.188"),
+        ("D4:ext4-inode-reuse", "6.6.157"),
+        ("D4:ext4-inode-reuse", "host"),
+    }
+)
 
 def selection(lane, lib_tests=None, public_cells=None, scan=True, object_cells=()):
     require(lane in LANES, "unregistered kernel lane: " + lane)

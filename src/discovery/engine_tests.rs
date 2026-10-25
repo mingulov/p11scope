@@ -47503,23 +47503,71 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
 
 #[test]
 fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
-    // The native cleanup worker is alive but wedged: the closer never
-    // releases, so the retirement batch stays Pending forever. The graph
-    // must not spin in NativePoll without bound: a stay-Pending poll
-    // claims no progress, and a bounded run of them falls through to the
-    // existing post-mutation incomplete stop with its existing disclosure.
-    let mut case = graph_case_with_exit(false);
-    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+    // The native cleanup worker is alive but wedged: the closer blocks
+    // forever (no release deadline), so the retirement batch stays Pending
+    // forever. The graph must not spin in NativePoll without bound: a
+    // stay-Pending poll claims no progress, and a run that observes no
+    // retirement progress for the whole wedge deadline falls through to
+    // the existing post-mutation incomplete stop with its existing
+    // disclosure. The bound is wall-time, not a poll count: a tight driver
+    // spins thousands of polls while a healthy worker closes.
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
+    let mut child = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let view = engine.views[0].id();
+    let admission = engine.views[0].view_admission();
+    let original_slot = engine.plan.slots[0].clone();
+    let original_owner = engine.plan.module_of_slot(original_slot.index).unwrap();
+    let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let gate = std::sync::Arc::clone(&release);
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (returned_sender, returned) = std::sync::mpsc::channel();
+    let retirement = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(move |owned, producer| {
+            if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                entered_sender.send(()).map_err(|error| error.to_string())?;
+                let (lock, changed) = &*gate;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = changed.wait(ready).map_err(|error| error.to_string())?;
+                }
+                returned_sender
+                    .send(())
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let mut session = ScriptedSession::default();
+    session.global_retirement = Some(std::cell::RefCell::new(retirement));
+    child.reap().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+    engine.update_counter_snapshot(&session).unwrap();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &collected_finish_leader_exit(child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(engine.pending_leader_exit_views.contains(&view));
+    let service = |engine: &mut Engine, session: &mut ScriptedSession| {
+        engine
+            .service_collected_finish_records(session, Vec::new(), 0, 1)
+            .unwrap()
+    };
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
         engine
             .collected_graph
             .as_ref()
             .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
     });
-    case.entered
+    entered
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("the live worker enters the blocked closer");
     assert!(
-        case.session
+        session
             .global_retirement
             .as_ref()
             .unwrap()
@@ -47527,54 +47575,67 @@ fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
             .blocking(),
         "the native cursor is still held while the worker is wedged"
     );
-    // Tight loop, no worker-settle sleep: the bound below must trip long
-    // before the closer's 5 s release deadline, so the trip cannot be the
-    // closer timing out. One yield window of slack past the bound; the
-    // spin on a boundless poll is unbounded, so any slack still reds.
-    let cap = crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT;
+    // Fast RED on a boundless poll: the first stay-Pending polls claim no
+    // progress. The 30 s wait below only runs once the gating holds.
     let start = std::time::Instant::now();
-    let mut polls = 0u64;
-    let mut progressed_polls = 0u64;
-    loop {
+    for parked in 1..=4u32 {
         assert!(
-            polls <= cap + 64,
-            "NativePoll spun past its bound ({polls} stay-Pending polls)"
+            engine.collected_graph.as_ref().is_some_and(|graph| {
+                graph.phase == GraphPhase::NativePoll && graph.verdict.is_none()
+            }),
+            "still polling with no verdict at parked poll {parked}"
         );
-        let outcome = case.service(1);
-        polls += 1;
-        if outcome.progressed {
-            progressed_polls += 1;
-        }
+        let outcome = service(&mut engine, &mut session);
+        assert!(
+            !outcome.progressed,
+            "stay-Pending poll {parked} claims no progress"
+        );
         assert!(outcome.pending, "the wedged debt keeps Finish pending");
-        if case.engine.collected_graph_refused().is_some() {
+    }
+    // Polite wait: poll for the trip on a 10 ms cadence so this 30 s test
+    // does not starve sibling tests of CPU. The 60 s fail-safe only fires
+    // when the deadline never trips.
+    let mut polls = 0u64;
+    loop {
+        let outcome = service(&mut engine, &mut session);
+        polls += 1;
+        assert!(outcome.pending, "the wedged debt keeps Finish pending");
+        if engine.collected_graph_refused().is_some() {
+            assert!(
+                outcome.progressed,
+                "only the refusal credit claims progress"
+            );
             break;
         }
+        assert!(!outcome.progressed, "stay-Pending poll claims no progress");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "NativePoll never reached the finite stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    eprintln!(
-        "wedged-native-poll: tripped after {polls} polls in {:?}",
-        start.elapsed()
+    let elapsed = start.elapsed();
+    eprintln!("wedged-native-poll: tripped after {polls} polls in {elapsed:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(30),
+        "the trip waits out the deadline, tripped after {elapsed:?}"
     );
-    assert_eq!(polls, cap, "the bound trips exactly at the cap");
-    assert_eq!(
-        progressed_polls, 1,
-        "only the refusal credit claims progress"
-    );
-    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    let graph = engine.collected_graph.as_ref().expect("boxed");
     assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
     assert_eq!(
-        case.engine.collected_graph_refused(),
+        engine.collected_graph_refused(),
         Some("native ownership uncertain")
     );
     assert!(
         graph
             .first_error
             .as_ref()
-            .is_some_and(|error| error.contains("consecutive pending")),
-        "the kept first error names the bound: {:?}",
+            .is_some_and(|error| error.contains("no retirement progress for 30s")),
+        "the kept first error names the deadline: {:?}",
         graph.first_error
     );
     assert_eq!(
-        case.engine
+        engine
             .counters
             .object_skips
             .iter()
@@ -47590,11 +47651,11 @@ fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
     // Still wedged at the trip: the closer never returned (sender alive),
     // so the worker was running and the batch was Pending throughout.
     assert_eq!(
-        case.returned.try_recv(),
+        returned.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
     );
     assert!(
-        case.session
+        session
             .global_retirement
             .as_ref()
             .unwrap()
@@ -47602,15 +47663,44 @@ fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
             .blocking(),
         "the native cursor is still held at the trip"
     );
-    case.assert_original_pending();
-    // Later credits stay contained: Ok, pending, quiet, sticky refusal.
+    CollectedFinishGraphCase::assert_original_pending_in(
+        &mut engine,
+        &session,
+        view,
+        &admission,
+        &original_slot,
+        original_owner,
+    );
+    // The worker was alive throughout: releasing now lets it close, and
+    // the trip stays terminal with its disclosure exactly once.
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    returned
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the released worker closes the batch");
     for _ in 0..4 {
-        let outcome = case.service(1);
+        let outcome = service(&mut engine, &mut session);
         assert!(outcome.pending && !outcome.progressed);
     }
+    let graph = engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
     assert_eq!(
-        case.engine.collected_graph_refused(),
+        engine.collected_graph_refused(),
         Some("native ownership uncertain")
+    );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "global native retirement"
+                    && skip.reason
+                        == "original static ownership remains uncertain; replacement admission is blocked"
+            })
+            .count(),
+        1,
+        "the disclosure still ships exactly once after release"
     );
 }
 

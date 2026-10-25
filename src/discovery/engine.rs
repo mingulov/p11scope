@@ -23357,7 +23357,8 @@ impl Engine {
             let Some(lease) = self.facts_reserve(graph, reserve, bound) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            // Live: refusal skips move into the counters at Install.
+            graph.facts.live_storage.push(lease);
             graph.facts.skips.reserve(tables);
             graph.facts.measured = true;
         }
@@ -23447,14 +23448,19 @@ impl Engine {
             return Self::graph_idle(true);
         }
         if !graph.facts.measured {
-            // Strided measure over old counters plus cursor skips.
+            // Strided measure over old counters, cursor skips and graph
+            // skips. The plan delta takes old plus graph skips live; the
+            // cursor skips only seed the private dedup sets.
             let old_len = self.counters.object_skips.len();
             let cursor_len = graph
                 .plan
                 .plan()
                 .map(|plan| plan.skipped.len())
                 .unwrap_or(0);
-            let total = old_len.saturating_add(cursor_len);
+            let skips_len = graph.facts.skips.len();
+            let total = old_len
+                .saturating_add(cursor_len)
+                .saturating_add(skips_len);
             let from = graph.facts.index;
             let until = total.min(from.saturating_add(GRAPH_STRIDE));
             let mut bytes = graph.facts.measure_bytes;
@@ -23462,8 +23468,10 @@ impl Engine {
             for position in from..until {
                 let skip = if position < old_len {
                     &self.counters.object_skips[position]
-                } else {
+                } else if position - old_len < cursor_len {
                     &graph.plan.plan().expect("cursor checked above").skipped[position - old_len]
+                } else {
+                    &graph.facts.skips[position - old_len - cursor_len]
                 };
                 match facts_skip_bound(skip.subject.len(), skip.reason.len())
                     .and_then(|bound| bytes.checked_add(bound))
@@ -23481,14 +23489,25 @@ impl Engine {
             if until < total {
                 return Self::graph_idle(true);
             }
-            let extra = total
-                .checked_add(graph.facts.skips.len())
-                .and_then(|n| n.checked_mul(FACTS_TREE_ENTRY_OVERHEAD * 2 + 1))
-                .and_then(|extra| bytes.checked_add(extra));
-            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+            let private = old_len
+                .checked_add(cursor_len)
+                .and_then(|n| n.checked_add(skips_len))
+                .and_then(|n| n.checked_mul(FACTS_TREE_ENTRY_OVERHEAD * 2 + 1));
+            // Live: the plan-delta skip entries plus their deque buffer;
+            // the deque may allocate up to twice the reserved capacity.
+            let live = old_len
+                .checked_add(skips_len)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<Skipped>() * 2))
+                .and_then(|buffer| bytes.checked_add(buffer));
+            let Some(live_lease) = self.facts_reserve(graph, reserve, live) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
             graph
                 .facts
                 .plan_skipped
@@ -23592,7 +23611,7 @@ impl Engine {
             if until < old_len {
                 return Self::graph_idle(true);
             }
-            let extra = self
+            let private = self
                 .plan
                 .modules
                 .len()
@@ -23609,12 +23628,18 @@ impl Engine {
                             .checked_add(std::mem::size_of::<(usize, u8)>())?
                             .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
                     )
-                })
-                .and_then(|extra| bytes.checked_add(extra));
-            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                });
+            // Live: the retained corroboration entries; private: the
+            // old-plan object index. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
             graph.facts.corroboration.reserve(old_len);
             graph.facts.measured = true;
             graph.facts.substep = 1;
@@ -23805,20 +23830,25 @@ impl Engine {
             let per = std::mem::size_of::<plan::AttachKey>()
                 .checked_add(std::mem::size_of::<usize>())
                 .and_then(|per| per.checked_add(FACTS_TREE_ENTRY_OVERHEAD));
-            let extra = per
-                .and_then(|per| {
-                    graph
-                        .plan
-                        .plan()
-                        .map(|plan| plan.slots.len())
-                        .unwrap_or(0)
-                        .checked_mul(per)
-                })
-                .and_then(|extra| bytes.checked_add(extra));
-            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+            let private = per.and_then(|per| {
+                graph
+                    .plan
+                    .plan()
+                    .map(|plan| plan.slots.len())
+                    .unwrap_or(0)
+                    .checked_mul(per)
+            });
+            // Live: the retained fallback entries; private: the
+            // cursor-plan slot index. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
             graph.facts.fallbacks.reserve(old_len);
             graph.facts.measured = true;
             graph.facts.substep = 1;
@@ -23951,7 +23981,7 @@ impl Engine {
             if range.len() >= GRAPH_STRIDE {
                 return Self::graph_idle(true);
             }
-            let extra = self
+            let private = self
                 .views
                 .len()
                 .checked_add(self.plan.slots.len())
@@ -23960,12 +23990,18 @@ impl Engine {
                         std::mem::size_of::<plan::AttachKey>()
                             .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
                     )
-                })
-                .and_then(|extra| bytes.checked_add(extra));
-            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                });
+            // Live: the retained claims; private: the live-view and
+            // active-key sets. Same total as one reservation.
+            let Some(live_lease) = self.facts_reserve(graph, reserve, Some(bytes)) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
             graph.facts.measured = true;
             graph.facts.substep = 1;
             graph.facts.index = 0;
@@ -24166,7 +24202,7 @@ impl Engine {
             if range.len() >= GRAPH_STRIDE {
                 return Self::graph_idle(true);
             }
-            let extra = graph
+            let provider = graph
                 .rebind
                 .modules()
                 .map(|modules| modules.len())
@@ -24179,12 +24215,33 @@ impl Engine {
                             .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?
                             .checked_add(FACTS_TIMING_KEY_STRINGS)?,
                     )
-                })
-                .and_then(|extra| bytes.checked_add(extra));
-            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                });
+            // Live: the retained tables plus the admission-skip deque
+            // buffer (skips move into the counters at Install; their
+            // unbounded reason strings ride pool slack, as before).
+            // Private: the provider index plus the dropped-claim buffer.
+            // Both buffers may allocate up to twice the reservation.
+            let live = graph
+                .facts
+                .claims
+                .len()
+                .checked_mul(std::mem::size_of::<Skipped>() * 2)
+                .and_then(|buffer| bytes.checked_add(buffer));
+            let private = graph
+                .facts
+                .claims
+                .len()
+                .checked_mul(std::mem::size_of::<SelectionClaimKey>() * 2)
+                .and_then(|buffer| provider.and_then(|index| index.checked_add(buffer)));
+            let Some(live_lease) = self.facts_reserve(graph, reserve, live) else {
                 return Self::graph_idle(true);
             };
-            graph.facts.storage.push(lease);
+            let Some(private_lease) = self.facts_reserve(graph, reserve, private) else {
+                drop(live_lease);
+                return Self::graph_idle(true);
+            };
+            graph.facts.live_storage.push(live_lease);
+            graph.facts.storage.push(private_lease);
             graph.facts.table_skips.reserve(graph.facts.claims.len());
             graph.facts.drop_claims.reserve(graph.facts.claims.len());
             graph.facts.measured = true;
@@ -24820,7 +24877,7 @@ impl Engine {
                 modules: modules_backing,
                 plan: plan_backing,
                 storage: Some(backing_storage),
-                facts: Vec::new(),
+                facts: std::mem::take(&mut graph.facts.live_storage),
             }));
             std::mem::swap(&mut graph.facts.claims, &mut self.selection_claims);
             std::mem::swap(&mut graph.facts.tables, &mut self.selection_tables);

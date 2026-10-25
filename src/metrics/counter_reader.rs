@@ -1128,6 +1128,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn banked_source_reports_prepared_mode_and_refuses_mismatch() {
+        use crate::attach::counter_banks::tests::growth_snapshot_fixture_for;
+        let modes = [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ];
+        for mode in modes {
+            let (_dir, history, snapshot, pool) = growth_snapshot_fixture_for(mode, false);
+            assert_eq!(snapshot.original_indices(), [0, 2]);
+            let mut source = Scripted::sample(mode, false);
+            let last_stats = source.stats.remove(&1).unwrap();
+            source.stats.insert(2, last_stats);
+            source.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
+            source.published = Some(snapshot);
+            let read = acquire(
+                &source,
+                NonZeroU64::new(41).unwrap(),
+                &history,
+                LIMITS,
+                &pool.reserver(),
+            )
+            .unwrap();
+            let view = read.view();
+            assert_eq!(view.mode, mode);
+            let rows = view.rows.unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.view().slot).collect::<Vec<_>>(),
+                [0, 2]
+            );
+            assert!(rows.iter().all(|row| row.view().mode == mode));
+        }
+        for prepared in modes {
+            for requested in modes {
+                if requested == prepared {
+                    continue;
+                }
+                let (_dir, history, snapshot, pool) = growth_snapshot_fixture_for(prepared, false);
+                let mut source = Scripted::sample(requested, false);
+                let last_stats = source.stats.remove(&1).unwrap();
+                source.stats.insert(2, last_stats);
+                source.published = Some(snapshot);
+                assert_eq!(
+                    acquire(
+                        &source,
+                        NonZeroU64::new(41).unwrap(),
+                        &history,
+                        LIMITS,
+                        &pool.reserver(),
+                    )
+                    .err(),
+                    Some(ReadStage::Shape),
+                    "{requested:?} source against {prepared:?} preparation"
+                );
+            }
+        }
+    }
+
     fn banked_scripted_sample(
         snapshot: crate::attach::counter_banks::CounterPublishedSnapshot,
         later: bool,

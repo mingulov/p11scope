@@ -957,11 +957,16 @@ fn validate_provider_union(
 
 impl BankDirectory {
     #[cfg(test)]
-    fn counts_growth_v2() -> Self {
+    fn growth_v2_for(mode: CounterMode) -> Self {
         Self {
-            geometry: CountsBankGeometry::checked(16, 512).expect("closed Counts geometry"),
+            geometry: BankGeometry::checked(mode, 16, 512).expect("closed growth geometry"),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    fn counts_growth_v2() -> Self {
+        Self::growth_v2_for(CounterMode::Counts)
     }
 
     fn allocated_high_water(&self) -> usize {
@@ -5518,9 +5523,13 @@ pub(crate) mod tests {
     }
 
     fn growth_owned_history(last_slot: bool) -> GrowthOwnedHistory {
+        growth_owned_history_for(CounterMode::Counts, last_slot)
+    }
+
+    fn growth_owned_history_for(mode: CounterMode, last_slot: bool) -> GrowthOwnedHistory {
         let (dir, pins, first, second, digest) = growth_provider_fixture();
         let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
-        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
         let keepalive =
             CounterKeepalive::precharge_with_geometry(&pool.reserver(), 16 * 1024 * 1024, geometry)
                 .unwrap();
@@ -5528,7 +5537,7 @@ pub(crate) mod tests {
             crate::capacity::CounterBudget::new(8192).unwrap(),
         );
         let mut history = AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
-        let mut directory = BankDirectory::counts_growth_v2();
+        let mut directory = BankDirectory::growth_v2_for(mode);
         let mut io = GrowthIo::new(&pool);
         io.target_store = Some(&pins);
         io.provider_owner = Some(&keepalive.custody);
@@ -5605,7 +5614,21 @@ pub(crate) mod tests {
         super::CounterPublishedSnapshot,
         SemanticResourcePool,
     ) {
-        let owned = growth_owned_history(last_slot);
+        growth_snapshot_fixture_for(CounterMode::Counts, last_slot)
+    }
+
+    /// The same charged selection for a timing preparation. The publication
+    /// shape is mode-independent; only the geometry word differs.
+    pub(crate) fn growth_snapshot_fixture_for(
+        mode: CounterMode,
+        last_slot: bool,
+    ) -> (
+        tempfile::TempDir,
+        AttachPlan,
+        super::CounterPublishedSnapshot,
+        SemanticResourcePool,
+    ) {
+        let owned = growth_owned_history_for(mode, last_slot);
         let snapshot = owned
             .banks
             .published_snapshot(
@@ -6917,57 +6940,220 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn bank_proof_counts_token_selects_counts_from_emitted_outputs() {
-        assert_eq!(
-            proof_counts_token("counts-bank-growth-v2"),
-            Ok("counts-bank-growth-v2")
-        );
-        assert_eq!(
-            proof_counts_token(
-                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
-            ),
-            Ok("counts-bank-growth-v2")
-        );
-        for bad in [
-            "",
-            "counts-bank-proof",
-            "timestamps-bank-growth-v2",
-            "latency-bank-growth-v2,timestamps-bank-growth-v2",
-        ] {
-            assert!(
-                matches!(proof_counts_token(bad), Err(BankRefusal::Shape)),
-                "{bad:?}"
+    fn format2_object_maps(inner_value: u32) -> BTreeMap<&'static str, aya_obj::Map> {
+        let mut maps = BTreeMap::new();
+        for (name, expected) in FORMAT2_MAPS {
+            maps.insert(
+                name,
+                aya_obj::Map::new_from_params(
+                    expected.map_type as u32,
+                    expected.key_size,
+                    expected.value_size,
+                    expected.max_entries,
+                    expected.flags,
+                ),
             );
         }
+        let aya_obj::Map::Legacy(outer) = maps.get_mut("COUNTER_BANKS").unwrap() else {
+            unreachable!();
+        };
+        outer.inner_def = Some(aya_obj::maps::bpf_map_def {
+            map_type: 6,
+            key_size: 4,
+            value_size: inner_value,
+            max_entries: 512,
+            ..Default::default()
+        });
+        maps
     }
 
     #[test]
-    fn bank_proof_production_geometry_stays_counts() {
-        let growth = CountsBankGeometry::checked(16, 512).unwrap();
-        assert_eq!(production_geometry("counts-bank-growth-v2"), Ok(growth));
-        assert_eq!(
-            production_geometry(
-                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+    fn bank_geometry_selects_exactly_three_modes_and_legacy() {
+        // Token twins: exactly the three growth tokens plus legacy.
+        for (token, mode, configuration) in [
+            (
+                "counts-bank-growth-v2",
+                CounterMode::Counts,
+                COUNTS_GROWTH_V2_CONFIG,
             ),
-            Ok(growth)
-        );
-        assert!(
-            production_geometry("counts-bank-proof")
-                .unwrap()
-                .is_legacy()
-        );
+            (
+                "timestamps-bank-growth-v2",
+                CounterMode::Timestamps,
+                TIMESTAMPS_GROWTH_V2_CONFIG,
+            ),
+            (
+                "latency-bank-growth-v2",
+                CounterMode::Latency,
+                LATENCY_GROWTH_V2_CONFIG,
+            ),
+        ] {
+            let geometry = BankGeometry::selected(token).unwrap();
+            assert_eq!(geometry.mode(), mode);
+            assert_eq!(geometry.configuration, configuration);
+            assert_eq!((geometry.banks, geometry.cells), (16, 512));
+            assert_eq!(geometry.limit(), 8192);
+            // The configuration word carries the per-cell value size.
+            assert_eq!((configuration >> 32) & 0xffff, mode.stats_bytes());
+            assert_eq!(BankGeometry::checked(mode, 16, 512).unwrap(), geometry);
+        }
+        let legacy = BankGeometry::selected("counts-bank-proof").unwrap();
+        assert!(legacy.is_legacy());
+        assert_eq!(legacy.mode(), CounterMode::Counts);
+        assert_eq!(legacy.configuration, BANK_CONFIG);
         for bad in [
             "",
             "counts-bank-growth-v3",
-            "timestamps-bank-growth-v2",
-            "latency-bank-growth-v2",
+            "Counts-Bank-Growth-v2",
+            "timestamps-bank-growth-v3",
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
             "latency-bank-growth-v2,timestamps-bank-growth-v2",
         ] {
             assert!(
-                matches!(production_geometry(bad), Err(BankRefusal::Shape)),
+                matches!(BankGeometry::selected(bad), Err(BankRefusal::Shape)),
                 "{bad:?}"
             );
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for (banks, cells) in [(0, 512), (16, 0), (2, 1), (17, 512), (16, 513)] {
+                assert!(
+                    BankGeometry::checked(mode, banks, cells).is_err(),
+                    "{mode:?} {banks}x{cells}"
+                );
+            }
+        }
+        // Value-size twins: the inner bank template must match the mode, and
+        // the legacy aggregate template stays 24 bytes in every bank object.
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
+            let value = mode.stats_bytes() as u32;
+            let maps = format2_object_maps(value);
+            assert_eq!(
+                validate_object_maps(geometry, |name| maps.get(name)),
+                Ok(())
+            );
+            for wrong in [24u32, 40, 296] {
+                if wrong == value {
+                    continue;
+                }
+                let maps = format2_object_maps(wrong);
+                assert_eq!(
+                    validate_object_maps(geometry, |name| maps.get(name)),
+                    Err(BankRefusal::Shape),
+                    "{mode:?} must refuse a {wrong}-byte inner template"
+                );
+            }
+            let mut maps = format2_object_maps(value);
+            let aya_obj::Map::Legacy(outer) = maps.get_mut("COUNTER_BANKS").unwrap() else {
+                unreachable!();
+            };
+            outer.inner_def = None;
+            assert_eq!(
+                validate_object_maps(geometry, |name| maps.get(name)),
+                Err(BankRefusal::Shape),
+                "{mode:?} must refuse a missing inner template"
+            );
+        }
+        let mut maps = format2_object_maps(40);
+        let aya_obj::Map::Legacy(stats) = maps.get_mut("STATS").unwrap() else {
+            unreachable!();
+        };
+        stats.def.value_size = 40;
+        assert_eq!(
+            validate_object_maps(
+                BankGeometry::checked(CounterMode::Timestamps, 16, 512).unwrap(),
+                |name| maps.get(name)
+            ),
+            Err(BankRefusal::Shape),
+            "a timestamps-shaped aggregate map cannot relabel the bank template"
+        );
+    }
+
+    #[test]
+    fn bank_payload_charges_mode_bytes_times_possible_cpus() {
+        for (mode, bytes) in [
+            (CounterMode::Counts, 24usize),
+            (CounterMode::Timestamps, 40usize),
+            (CounterMode::Latency, 296usize),
+        ] {
+            let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
+            for cpus in [1usize, 2, 12, 256] {
+                assert_eq!(
+                    geometry.bank_payload_bytes(cpus),
+                    Ok(512 * bytes * cpus),
+                    "{mode:?} at P={cpus}"
+                );
+            }
+            assert_eq!(
+                geometry.bank_payload_bytes(0),
+                Err(BankRefusal::Topology),
+                "{mode:?}"
+            );
+            assert_eq!(
+                geometry.bank_payload_bytes(usize::MAX),
+                Err(BankRefusal::Budget),
+                "{mode:?}"
+            );
+        }
+        // Per-bank latency bytes at P=256 stay exactly representable; the
+        // sixteen-bank growth below is what the 256 MiB envelope refuses.
+        let latency = BankGeometry::checked(CounterMode::Latency, 16, 512).unwrap();
+        assert_eq!(latency.bank_payload_bytes(256), Ok(512 * 296 * 256));
+        assert_eq!(
+            latency.bank_payload_bytes(usize::MAX / (512 * 296) + 1),
+            Err(BankRefusal::Budget)
+        );
+        // Sixteen latency banks at P=256 (~620 MiB of payload) refuse against
+        // a 256 MiB envelope before any allocation; counts and timestamps fit
+        // the same envelope, and latency fits once funded.
+        for (mode, retained, funded) in [
+            (CounterMode::Counts, 256 * 1024 * 1024, true),
+            (CounterMode::Timestamps, 256 * 1024 * 1024, true),
+            (CounterMode::Latency, 256 * 1024 * 1024, false),
+            (CounterMode::Latency, 1024 * 1024 * 1024, true),
+        ] {
+            let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
+            let mut directory = BankDirectory::growth_v2_for(mode);
+            let mut history = plan(8192);
+            let mut io = GrowthIo::new(&pool);
+            io.cpus = 256;
+            let envelope = BankReservation {
+                retained_bytes: retained,
+                transient_bytes: 256 * 1024 * 1024,
+                metadata_bytes: 16 * 1024 * 1024,
+                file_descriptors: 131_072,
+            };
+            let publication =
+                directory.stage_with(&mut io, &mut history, envelope, &pool.reserver());
+            if funded {
+                assert!(
+                    matches!(
+                        publication,
+                        BankPublication::Published { extent, .. }
+                            if extent.first == 0 && extent.end == 8192
+                    ),
+                    "{mode:?} with {retained} retained bytes: {publication:?}"
+                );
+                assert_eq!(directory.published_indices().count(), 8192, "{mode:?}");
+            } else {
+                assert_eq!(publication, BankPublication::Refused(BankRefusal::Budget));
+                assert!(
+                    io.trace.is_empty(),
+                    "budget refusal precedes native work: {:?}",
+                    io.trace
+                );
+                assert_eq!(pool.snapshot().charged_bytes, baseline);
+                assert!(directory.published_indices().next().is_none());
+                assert_eq!(directory.allocated_high_water(), 0);
+            }
         }
     }
 

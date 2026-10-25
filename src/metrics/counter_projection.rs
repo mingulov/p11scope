@@ -1167,6 +1167,46 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn projection_reports_timing_and_buckets_per_mode_with_counts_nulls() {
+        let (_file, plan, pins) = fixture();
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+            let snapshot = capture.fresh_with(
+                &plan,
+                &pins,
+                |same_plan: &AttachPlan,
+                 same_pins: &PinnedObjects,
+                 _: CounterLimits,
+                 reserve: &SemanticResourceReserver| {
+                    assert!(std::ptr::eq(same_plan, &plan));
+                    assert!(std::ptr::eq(same_pins, &pins));
+                    Ok(read(same_plan, mode, 1, 5, reserve))
+                },
+            );
+            assert!(snapshot.is_fresh());
+            let rows = snapshot.reports();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].mode, mode);
+            assert_eq!(rows[0].total_ns, if mode.has_timing() { 500 } else { 0 });
+            assert_eq!(rows[0].max_ns, if mode.has_timing() { 100 } else { 0 });
+            if mode.has_histogram() {
+                assert_eq!(
+                    rows[0].buckets[p11scope_ebpf_common::bucket_of(100) as usize],
+                    5
+                );
+                assert_eq!(rows[0].buckets.iter().sum::<u64>(), 5);
+            } else {
+                assert!(rows[0].buckets.iter().all(|&value| value == 0));
+            }
+        }
+    }
+
+    #[test]
     fn authoritative_published_rows_skip_holes_and_keep_inactive_history() {
         let (_file, first_plan, pins) = fixture();
         let slots = (0..3)

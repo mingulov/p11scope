@@ -3557,6 +3557,17 @@ pub(crate) struct BacklogOutcome {
 /// to this many leaf units per credit. Native calls stay `work = 1`.
 pub(crate) const GRAPH_STRIDE: usize = 64;
 
+/// How long a graph tolerates stay-`Pending` native polls that observe no
+/// retirement progress before it takes the finite incomplete stop (§1.9):
+/// a wedged worker never releases, while a healthy retirement always
+/// closes within seconds. Poll counts cannot bound a healthy drain (a
+/// tight driver spins thousands of polls while the worker closes), and no
+/// production constant bounds retirement-close time, so this borrows the
+/// inventory preparation window: a bounded phase that cannot complete in
+/// 30 s fails closed rather than hanging the stop. The trip outcome is
+/// the existing disclosed incomplete stop, never a silent one.
+const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Fixed accounting limit for the Engine's dedicated collected-graph pool.
 /// Measured system-scale peak is 211,743,432 bytes (~202 MiB), which sits
 /// in the 192–288 MiB band and therefore selects 384 MiB (recorded with
@@ -4140,6 +4151,7 @@ struct CollectedGraph {
     removed: Option<RetainedRetirementInput>,
     ticket: Option<CollectedRetirementTicket>,
     mutated: bool,
+    native_poll_since: Option<std::time::Instant>,
     native_cancel_owed: bool,
     deferral_done: bool,
     partial_deferred: bool,
@@ -4200,6 +4212,7 @@ impl CollectedGraph {
             removed: None,
             ticket: None,
             mutated: false,
+            native_poll_since: None,
             native_cancel_owed: false,
             deferral_done: false,
             partial_deferred: false,
@@ -25072,10 +25085,12 @@ impl Engine {
         }
     }
 
-    /// NativePoll (§1.6): one native poll credit. `Pending` stays;
-    /// `Closed` splits the input into removed rows plus storage, records
-    /// the verdict and installs. A missing ticket refuses by the mutated
-    /// flag (defensive).
+    /// NativePoll (§1.6): one native poll credit. `Pending` stays without
+    /// claiming progress; a run that observes no retirement progress for
+    /// the whole wedge deadline falls through to the finite incomplete
+    /// stop (§1.9). `Closed` splits the input into removed rows plus
+    /// storage, records the verdict and installs. A missing ticket refuses
+    /// by the mutated flag (defensive).
     fn step_graph_native_poll(
         &mut self,
         session: &mut dyn EngineSession,
@@ -25092,7 +25107,42 @@ impl Engine {
         };
         match session.poll_collected_static_retirement(q, ticket, 1) {
             Ok(progress) => match progress.state {
-                CollectedRetirementState::Pending => Self::graph_idle(true),
+                CollectedRetirementState::Pending => {
+                    // A stay-Pending poll claims no progress: the poll
+                    // result carries no batch-advancement witness (`used`
+                    // is unconditionally 1 here and the batch index never
+                    // surfaces), so no progress was observed. The bound is
+                    // wall-time: a worker that releases nothing for the
+                    // whole deadline is wedged, and the run falls through
+                    // to the existing finite incomplete stop instead of
+                    // spinning forever.
+                    let since = *graph
+                        .native_poll_since
+                        .get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= GRAPH_NATIVE_POLL_WEDGE_DEADLINE {
+                        // NativePoll is reachable only after native
+                        // mutation; the unmutated shape mirrors the Err row
+                        // below defensively.
+                        if graph.mutated {
+                            self.refuse_graph_native_retained(
+                                graph,
+                                format!(
+                                    "native poll observed no retirement progress for {}s",
+                                    GRAPH_NATIVE_POLL_WEDGE_DEADLINE.as_secs()
+                                ),
+                            );
+                        } else {
+                            let _ = session.cancel_collected_static_retirement(
+                                graph.removed.as_ref(),
+                                graph.ticket.as_ref(),
+                                1,
+                            );
+                            self.refuse_graph_native_untouched(graph);
+                        }
+                        return Self::graph_idle(true);
+                    }
+                    Self::graph_idle(false)
+                }
                 CollectedRetirementState::Closed(input) => {
                     // Closed splits the input back into rows plus storage:
                     // Reclaim step 3 drains the rows strided, so nothing of

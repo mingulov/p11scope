@@ -392,8 +392,12 @@ pub struct Engine {
     graph_inputs_epoch: u64,
     /// A collected-Finish credit requested the bounded terminal graph (§1.4).
     collected_graph_requested: bool,
-    /// The live bounded terminal graph, boxed on the shared pool (§1.5).
+    /// The live bounded terminal graph, boxed on the dedicated graph pool (§1.5).
     collected_graph: Option<Box<CollectedGraph>>,
+    /// Dedicated accounting pool for the collected graph (box, copies,
+    /// preflight, installed backing). One pool per Engine, so per capture;
+    /// the graph never charges the registry pool.
+    collected_graph_pool: SemanticResourcePool,
     /// Installed backing of the last completed graph (T4b Install step 4).
     #[allow(dead_code)] // Consumed by T4b.
     graph_backing: Option<Box<GraphBacking>>,
@@ -3533,6 +3537,12 @@ pub(crate) struct BacklogOutcome {
 /// One graph credit's leaf budget (system scale): a cursor phase spends up
 /// to this many leaf units per credit. Native calls stay `work = 1`.
 pub(crate) const GRAPH_STRIDE: usize = 64;
+
+/// Fixed accounting limit for the Engine's dedicated collected-graph pool.
+/// Measured system-scale peak is 211,743,432 bytes (~202 MiB), which sits
+/// in the 192–288 MiB band and therefore selects 384 MiB (recorded with
+/// the T4c-2 sizing numbers).
+const COLLECTED_GRAPH_POOL_BYTES: usize = 384 * 1024 * 1024;
 
 /// Lap tracker for pending leader-exit assessments at Q (R-26 N1/OD-12).
 /// `dirty` when a record queued a new assessment mid-lap, `at_q` while every
@@ -9288,6 +9298,7 @@ impl Engine {
             graph_inputs_epoch: 0,
             collected_graph_requested: false,
             collected_graph: None,
+            collected_graph_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
             graph_backing: None,
             retired_files: None,
             collected_graph_refusal: None,
@@ -9388,7 +9399,7 @@ impl Engine {
             #[cfg(test)]
             collected_intake_intents: 0,
             #[cfg(test)]
-            collected_test_pool: SemanticResourcePool::default(),
+            collected_test_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
             #[cfg(test)]
             collected_test_transport_pending: false,
             #[cfg(test)]
@@ -22477,6 +22488,13 @@ impl Engine {
         self.collected_graph_refusal
     }
 
+    /// Reservation handle on the Engine's dedicated collected-graph pool.
+    /// The coordinator pays the graph box, the graph phases and the native
+    /// preflight from this reserver; no graph lease comes from the registry.
+    pub(crate) fn collected_graph_reserver(&self) -> SemanticResourceReserver {
+        self.collected_graph_pool.reserver()
+    }
+
     /// Closes up to `max` retired graph files (§1.8); `true` when the
     /// chain is empty. The retired-file debt lives beyond the graph on
     /// the Engine chain so no synchronous close joins a graph credit.
@@ -22491,6 +22509,24 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn graph_inputs_epoch_for_test(&self) -> u64 {
         self.graph_inputs_epoch
+    }
+
+    /// Test seam: binds every plan module's object timing key to its plan
+    /// module ID, as admission would have established. Hand-built fixture
+    /// populations skip admission, but the plan cursor resolves a stable
+    /// ID for every surviving group and refuses `Identity` without one.
+    #[cfg(test)]
+    pub(crate) fn bind_plan_module_ids_for_test(&mut self) {
+        for module in &self.plan.modules {
+            let key = self
+                .pinned
+                .owned_timing_key(module.object)
+                .expect("plan modules have exact opened identity");
+            self.capture_facts.module_ids.insert(key.clone(), module.id);
+            self.capture_facts.module_keys.insert(module.id, key);
+            let next = module.id.0.saturating_add(1);
+            self.capture_facts.next_module_id = self.capture_facts.next_module_id.max(next);
+        }
     }
 
     /// Unkeyed names examined by the latest `names_view_bounded` call (names test).

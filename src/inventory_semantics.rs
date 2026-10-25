@@ -35,6 +35,7 @@ use crate::run::{STOP_QUIESCE_BUDGET, StopState, TerminalQuiescence};
 use crate::semantic_capture::{
     CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, InvalidationScope,
     PhysicalSemanticGap, SemanticCapture, TickLimits, TickOutcome, TickReport,
+    unjoined_shed_counts,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
@@ -42,6 +43,7 @@ use crate::semantics_edge::resources::{
 use crate::semantics_objects::journal::JournalAdapter;
 use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
 use p11scope_ebpf_common::ImageIdentity;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -454,6 +456,12 @@ impl SemanticBatch {
         &self.current
     }
 
+    /// Borrow the batch outcomes for drop accounting: a refused batch
+    /// sheds its unjoined calls without consuming the batch's negatives.
+    pub(crate) fn outcomes(&self) -> &[TickOutcome] {
+        &self.outcomes
+    }
+
     /// Whether the batch carries no outcomes, receipts or negatives:
     /// tests assert quiet ticks stage or commit nothing.
     #[cfg(test)]
@@ -747,6 +755,10 @@ pub(crate) struct AttestedSemanticLane {
     /// Calls shed without a route across finalizations (the aggregate
     /// unrouted gap's lifetime total), for the honest stop line.
     disclosed_calls_shed: u64,
+    /// Route-labeled shed from oversized tick reports (batch construction
+    /// refused): counted into the stop line at the drop, disclosed by the
+    /// next finalize's unrouted gap. At most one entry per route label.
+    oversized_drop_shed: BTreeMap<&'static str, u64>,
     /// Tests-only substituted H0 I/O (see [`LaneTestIo`]): installed
     /// by tests that drive the production finalize path without a
     /// live Session.
@@ -1181,6 +1193,7 @@ impl AttestedSemanticLane {
             exit_retained: false,
             staged_at: None,
             disclosed_calls_shed: 0,
+            oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -1300,6 +1313,7 @@ impl AttestedSemanticLane {
             exit_retained: false,
             staged_at: None,
             disclosed_calls_shed: 0,
+            oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -1397,6 +1411,13 @@ impl AttestedSemanticLane {
     /// finalizer counts them beside the aggregate unrouted gap).
     pub(crate) fn note_shed_calls(&mut self, shed: u64) {
         self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(shed);
+    }
+
+    /// Take stashed oversized-report shed for the next finalize's
+    /// disclosure gap. The stop-line count was already noted at the
+    /// drop; this drains the labels once.
+    pub(crate) fn take_oversized_drop_shed(&mut self) -> BTreeMap<&'static str, u64> {
+        std::mem::take(&mut self.oversized_drop_shed)
     }
 
     /// Calls shed without a route across finalizations.
@@ -1795,7 +1816,29 @@ impl AttestedSemanticLane {
         // this batch behind its own fresh evidence.
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
-        SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
+        let counted = unjoined_shed_counts(report.outcomes());
+        match SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns()) {
+            Ok(batch) => Ok(batch),
+            Err(_) => {
+                // Defensive: the report exceeded batch caps (one tick
+                // holds at most records + pending resolutions, far below
+                // the caps). Its collected calls are already counted
+                // above, so its unjoined calls shed here with the
+                // oversized label; the next finalize discloses them.
+                self.stash_oversized_shed(counted);
+                Err(SemanticRefusal::Unavailable)
+            }
+        }
+    }
+
+    /// Count a refused report's unjoined calls into shed now and stash
+    /// their route labels for the next finalize's disclosure gap.
+    fn stash_oversized_shed(&mut self, counted: BTreeMap<&'static str, u64>) {
+        for (label, count) in counted {
+            let slot = self.oversized_drop_shed.entry(label).or_default();
+            *slot = slot.saturating_add(count);
+            self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(count);
+        }
     }
 
     /// Route only the machine's original retained records. This never polls
@@ -1857,7 +1900,14 @@ impl AttestedSemanticLane {
         live.continuity_cuts = live.capture.continuity_cuts();
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
-        SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns())
+        let counted = unjoined_shed_counts(report.outcomes());
+        match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {
+            Ok(batch) => Ok(batch),
+            Err(_) => {
+                self.stash_oversized_shed(counted);
+                Err(SemanticRefusal::Unavailable)
+            }
+        }
     }
 
     /// One bounded no-call refresh for an unbound candidate pin through

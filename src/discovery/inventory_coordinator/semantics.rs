@@ -32,6 +32,7 @@ use crate::inventory_semantics::{AttestedSemanticLane, LaneNegative, SemanticRef
 use crate::process::PidPin;
 use crate::semantic_capture::{
     CurrentReceiptRefusal, Endpoint, InvalidationScope, PhysicalSemanticGap, TickOutcome,
+    unjoined_shed_counts,
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 pub(super) use finalizer::SessionFinalizerState;
@@ -2194,6 +2195,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            self.stash_drop_shed(&batch, "ended_domain");
             self.publish_refused_batch_negatives(batch);
             return;
         }
@@ -2223,6 +2225,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
             self.record_semantic_drop(&batch);
+            self.stash_drop_shed(&batch, "backpressure");
             return;
         }
         self.semantic_finalizer
@@ -2354,6 +2357,85 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if floor.is_some() || exhausted {
             state.pending_drop = Some((floor.unwrap_or(0), exhausted));
         }
+    }
+
+    /// Stash a same-domain refused batch's unjoined calls for the next
+    /// finalize's shed count and disclosure gap. Joined calls stay
+    /// joined (already counted); foreign-domain batches never stash
+    /// (their calls were never collected here, so counting them would
+    /// break collected == joined + shed).
+    fn stash_drop_shed(
+        &mut self,
+        batch: &crate::inventory_semantics::SemanticBatch,
+        drop: &'static str,
+    ) {
+        let counted = unjoined_shed_counts(batch.outcomes());
+        if counted.is_empty() {
+            return;
+        }
+        // The ended-domain arm refuses before any namespace exists; the
+        // stash retains one so the shed survives to the commit flush.
+        let state = self
+            .semantic_finalizer
+            .get_or_insert_with(|| SessionFinalizerState::new(batch.domain()));
+        if state.domain != batch.domain() {
+            return;
+        }
+        let slot = state.pending_drop_shed.entry(drop).or_default();
+        for (label, count) in counted {
+            let cell = slot.entry(label).or_default();
+            *cell = cell.saturating_add(count);
+        }
+    }
+
+    /// Disclose stashed drop shed: one unrouted gap per drop label plus
+    /// the stop-line count. Shared by stage-refused batches (stashed
+    /// without a lane) and oversized reports (stashed without a
+    /// registry): both flush at the next finalize with a lane.
+    fn flush_drop_shed(&mut self, lane: &mut crate::inventory_semantics::AttestedSemanticLane) {
+        let stashed: BTreeMap<&'static str, BTreeMap<&'static str, u64>> = self
+            .semantic_finalizer
+            .as_mut()
+            .map(|state| std::mem::take(&mut state.pending_drop_shed))
+            .unwrap_or_default();
+        for (drop, counted) in stashed {
+            self.publish_drop_shed(lane, drop, counted);
+        }
+        let oversized = lane.take_oversized_drop_shed();
+        if !oversized.is_empty() {
+            self.publish_drop_shed(lane, "oversized", oversized);
+        }
+    }
+
+    fn publish_drop_shed(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        drop: &'static str,
+        counted: BTreeMap<&'static str, u64>,
+    ) {
+        let total: u64 = counted
+            .values()
+            .fold(0, |sum, count| sum.saturating_add(*count));
+        if total == 0 {
+            return;
+        }
+        let labels = counted
+            .iter()
+            .map(|(label, count)| format!("{label}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "semantic calls unrouted".into(),
+            reason: format!(
+                "{total} calls shed from a dropped {drop} batch ({labels}) with {} bindings",
+                self.semantic_bindings.len()
+            ),
+            budget: None,
+        });
+        lane.note_shed_calls(total);
     }
 
     /// The private semantic finalizer: consumes pending semantic batches,
@@ -2630,6 +2712,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return;
         }
+        // Stashed drop shed flushes on the matching lane only: a foreign
+        // lane never collected these calls.
+        self.flush_drop_shed(lane);
         let floor = self.finalize_physical_tail(lane, None);
         if let Some(pending) = self
             .semantic_finalizer
@@ -2675,7 +2760,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            let counted = unjoined_shed_counts(batch.outcomes());
             self.publish_refused_batch_negatives(batch);
+            self.publish_drop_shed(lane, "ended_domain", counted);
             return None;
         }
         if domain != lane.domain() {

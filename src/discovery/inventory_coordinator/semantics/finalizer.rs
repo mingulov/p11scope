@@ -18,6 +18,11 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     #[cfg(test)]
     h3_takes: usize,
     pub(super) pending_drop: Option<(u64, bool)>,
+    /// Route-labeled shed from stage-refused batches, by drop label:
+    /// counted into the stop line and disclosed by the next finalize's
+    /// unrouted gap. Drained on flush; at most one entry per route label
+    /// per drop label.
+    pub(super) pending_drop_shed: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     /// The namespace's first admitted call (D9): the seal grant's
     /// association proof, set once at finalize, borrowed (never
     /// taken) by each seal mint. The grant proves the
@@ -54,6 +59,7 @@ impl SessionFinalizerState {
             #[cfg(test)]
             h3_takes: 0,
             pending_drop: None,
+            pending_drop_shed: BTreeMap::new(),
             seal_admission: None,
         }
     }

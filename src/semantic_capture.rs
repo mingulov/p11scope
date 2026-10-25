@@ -655,8 +655,19 @@ impl RoutedCall {
 /// under `pending`. Joined calls are already counted in joined and are
 /// not shed, so the stop-line identity holds across the drop.
 pub(crate) fn unjoined_shed_counts(outcomes: &[TickOutcome]) -> BTreeMap<&'static str, u64> {
-    let _ = outcomes;
-    BTreeMap::new()
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for outcome in outcomes {
+        let TickOutcome::Call(call) = outcome else {
+            continue;
+        };
+        let label = match call.route() {
+            Route::Joined(_) => continue,
+            Route::Unknown(reason) => reason.label(),
+            Route::Pending => "pending",
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    counts
 }
 
 impl fmt::Debug for RoutedCall {

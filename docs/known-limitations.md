@@ -672,6 +672,35 @@ closes after exit.
 - Future work: retained live-member identity and zombie-leader admission;
   outside this intermediate checkpoint.
 
+### Overlay xino/copy-up identity divergences (D-C7-2/D-C7-3)
+
+- What the user sees: provider files reached through an overlay merge
+  can attribute differently by lane and xino mode. Before 6.8 a copy-up
+  splits identity: the pre-copy-up anchor names the lower file while new
+  mappers name the upper file, so the legs disagree on which side proved
+  what. Two mounts over one lower join on the kernel side only (D-C7-2,
+  lanes A: a kernel edge against physical truth with a userspace named
+  mismatch) and never join on lane B. After a copy-up on lane B the
+  stable overlay inode can join the upper mapper to the stale lower
+  anchor on the userspace side while the kernel correctly refuses
+  (D-C7-3, lanes B). With xino off, equal real inode numbers on distinct
+  layers collide on the overlay device (a named mismatch, never an
+  edge); with xino off × post-copy-up the userspace edge follows
+  recorded truth because st_ino is non-persistent.
+- Kernels/conditions: overlayfs merges with xino on, off, or
+  same-filesystem layers; the tabled cells qualify 6.1/6.6 (lane A) and
+  6.8+/7.x (lane B). Same-layer layouts behave like xino on. An overlay
+  row is only claimed when the stat-based xino check agrees with the
+  requested mode (never mountinfo).
+- Disclosure: per-row `D4_OVERLAY` cell verdicts with recorded ground
+  truth, and `identity_mismatch` losses where a join is refused. A D-C7-3
+  userspace edge stands disclosed as backend-divergent until the copy-up
+  investigation lands its guard.
+- Workaround: same-filesystem layer layouts (behave like xino on);
+  avoid post-copy-up attribution windows for replaced providers.
+- Planned: v0.5.0 (guest-lane qualification, then the copy-up guard;
+  registry rows flip only after the guest cells qualify).
+
 ### Pre-admission use voids the watch (R-C51-1)
 
 - What the user sees: a `CALLER_USE` row refused as `before_admission`

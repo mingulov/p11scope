@@ -3590,8 +3590,7 @@ mod tests {
         for (rows, rv_keys) in [(2usize, 4usize), (512, 12), (8192, 65536)] {
             let pool = test_pool();
             let baseline = pool.snapshot().charged_bytes;
-            let storage =
-                ReadReservation::reserve(rows, rv_keys, &pool.reserver()).unwrap();
+            let storage = ReadReservation::reserve(rows, rv_keys, &pool.reserver()).unwrap();
             let actual = pool.snapshot().charged_bytes - baseline;
             drop(storage);
             let bound = counter_read_storage_bytes(rows, rv_keys).unwrap();
@@ -3614,13 +3613,26 @@ mod tests {
         first.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
         first.fault_bits = BANK_RV_FAULT;
         first.published = Some(snapshot);
-        let limits = CounterLimits { rows: 3, rv_keys: 12 };
+        let limits = CounterLimits {
+            rows: 3,
+            rv_keys: 12,
+        };
         let generation = NonZeroU64::new(41).unwrap();
-        assert!(first.rv_exhausted().unwrap(), "the RV fault marks a lower bound");
+        assert!(
+            first.rv_exhausted().unwrap(),
+            "the RV fault marks a lower bound"
+        );
         let read = acquire(&first, generation, &history, limits, &pool.reserver()).unwrap();
         let rows = read.view().rows.unwrap();
         assert_eq!(
-            rows.iter().map(|row| (row.view().slot, row.view().entered, row.view().returned, row.view().errors)).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| (
+                    row.view().slot,
+                    row.view().entered,
+                    row.view().returned,
+                    row.view().errors
+                ))
+                .collect::<Vec<_>>(),
             [(0, 3, 5, 1), (2, 1, 1, 0)],
             "entered/returned/errors stay exact under RV exhaustion"
         );
@@ -3641,7 +3653,10 @@ mod tests {
         let read2 = acquire(&second, generation, &history, limits, &pool.reserver()).unwrap();
         let rows2 = read2.view().rows.unwrap();
         assert_eq!(
-            rows2.iter().map(|row| (row.view().slot, row.view().entered, row.view().returned)).collect::<Vec<_>>(),
+            rows2
+                .iter()
+                .map(|row| (row.view().slot, row.view().entered, row.view().returned))
+                .collect::<Vec<_>>(),
             [(0, 8, 9), (2, 2, 2)],
             "existing keys keep counting"
         );

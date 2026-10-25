@@ -282,10 +282,7 @@ pub(crate) fn counter_fixed_map_bytes(cpus: usize) -> Result<usize, BankRefusal>
 /// Per-bank kernel map bytes for a counter mode: 512 cells times the
 /// mode value size times P possible CPUs. This reuses the same
 /// `bank_payload_bytes` the staging charge uses, never a second formula.
-pub(crate) fn counter_bank_map_bytes(
-    mode: CounterMode,
-    cpus: usize,
-) -> Result<usize, BankRefusal> {
+pub(crate) fn counter_bank_map_bytes(mode: CounterMode, cpus: usize) -> Result<usize, BankRefusal> {
     BankGeometry::checked(mode, 16, 512)?.bank_payload_bytes(cpus)
 }
 
@@ -311,7 +308,9 @@ pub(crate) fn counter_affordable_endpoints(
     mode: CounterMode,
     cpus: usize,
 ) -> Result<usize, BankRefusal> {
-    Ok(counter_affordable_banks(mode, cpus)?.checked_mul(512).ok_or(BankRefusal::Budget)?)
+    Ok(counter_affordable_banks(mode, cpus)?
+        .checked_mul(512)
+        .ok_or(BankRefusal::Budget)?)
 }
 
 /// Growth-gate check for a total bank count: fixed plus banks times
@@ -322,11 +321,7 @@ pub(crate) fn check_counter_map_memory(
     cpus: usize,
     total_banks: usize,
 ) -> Result<(), BankRefusal> {
-    check_counter_map_memory_for_geometry(
-        BankGeometry::checked(mode, 16, 512)?,
-        cpus,
-        total_banks,
-    )
+    check_counter_map_memory_for_geometry(BankGeometry::checked(mode, 16, 512)?, cpus, total_banks)
 }
 
 fn check_counter_map_memory_for_geometry(
@@ -348,8 +343,7 @@ fn check_counter_map_memory_for_geometry(
         return Err(BankRefusal::BudgetExhausted {
             resource: "counter-memory-limit",
             needed: u64::try_from(needed).map_err(|_| BankRefusal::Budget)?,
-            available: u64::try_from(COUNTER_MAP_MEMORY_LIMIT)
-                .map_err(|_| BankRefusal::Budget)?,
+            available: u64::try_from(COUNTER_MAP_MEMORY_LIMIT).map_err(|_| BankRefusal::Budget)?,
         });
     }
     Ok(())
@@ -397,7 +391,10 @@ pub(crate) fn counter_read_transient_bytes(
         .ok()
         .and_then(|value| value.checked_next_multiple_of(8))
         .ok_or(BankRefusal::Budget)?;
-    let capacity = cpus.checked_next_power_of_two().ok_or(BankRefusal::Budget)?.max(4);
+    let capacity = cpus
+        .checked_next_power_of_two()
+        .ok_or(BankRefusal::Budget)?
+        .max(4);
     let cells = cpus
         .checked_mul(2)
         .and_then(|n| n.checked_add(capacity.checked_mul(2)?))
@@ -448,9 +445,7 @@ pub(crate) fn counter_snapshot_bytes_for(
 ) -> Result<usize, BankRefusal> {
     published
         .checked_mul(size_of::<PublishedRow>() + size_of::<u32>() + size_of::<(u64, u64, u64)>())
-        .and_then(|n| {
-            n.checked_add(positions.checked_mul(size_of::<AttachKey>() + 1)?)
-        })
+        .and_then(|n| n.checked_add(positions.checked_mul(size_of::<AttachKey>() + 1)?))
         .and_then(|n| n.checked_add(size_of::<CounterBankView>() + 5 * OWNED_ALLOCATION_PADDING))
         .ok_or(BankRefusal::Budget)
 }
@@ -3156,7 +3151,11 @@ impl CounterBanks {
         let fixed = counter_fixed_map_bytes(self.cpus)?;
         let per_bank = self.geometry.bank_payload_bytes(self.cpus)?;
         let charged = fixed
-            .checked_add(allocated_banks.checked_mul(per_bank).ok_or(BankRefusal::Budget)?)
+            .checked_add(
+                allocated_banks
+                    .checked_mul(per_bank)
+                    .ok_or(BankRefusal::Budget)?,
+            )
             .ok_or(BankRefusal::Budget)?;
         Ok(CounterBudgets {
             endpoints: CounterEndpointBudgets {
@@ -3633,10 +3632,7 @@ impl Session {
         })
     }
 
-    pub(crate) fn counter_budgets(
-        &self,
-        rv_used: usize,
-    ) -> Result<CounterBudgets, BankRefusal> {
+    pub(crate) fn counter_budgets(&self, rv_used: usize) -> Result<CounterBudgets, BankRefusal> {
         self.counter_banks
             .as_ref()
             .ok_or(BankRefusal::Shape(BankShapeCause::BanksMissingForView))?
@@ -7121,7 +7117,9 @@ pub(crate) mod tests {
 
     #[test]
     fn counter_map_memory_preflight_names_mode_cpus_and_ceiling() {
-        use super::{counter_affordable_endpoints, counter_bank_map_bytes, counter_fixed_map_bytes};
+        use super::{
+            counter_affordable_endpoints, counter_bank_map_bytes, counter_fixed_map_bytes,
+        };
         for (mode, cpus) in [
             (CounterMode::Counts, 256usize),
             (CounterMode::Timestamps, 256),
@@ -7170,23 +7168,24 @@ pub(crate) mod tests {
         let mut history = plan(512);
         let mut io = GrowthIo::new(&pool);
         io.cpus = cpus;
-        let envelope_for = |all: usize, first: u32, end: u32, old_capacity: usize, new_banks: usize| {
-            let all_plan = plan(all as u32);
-            estimate_counter_stage_reservation(
-                mode,
-                16,
-                512,
-                &all_plan.slots,
-                first,
-                end,
-                old_capacity,
-                cpus,
-                new_banks,
-                0,
-                None,
-            )
-            .unwrap()
-        };
+        let envelope_for =
+            |all: usize, first: u32, end: u32, old_capacity: usize, new_banks: usize| {
+                let all_plan = plan(all as u32);
+                estimate_counter_stage_reservation(
+                    mode,
+                    16,
+                    512,
+                    &all_plan.slots,
+                    first,
+                    end,
+                    old_capacity,
+                    cpus,
+                    new_banks,
+                    0,
+                    None,
+                )
+                .unwrap()
+            };
         assert!(matches!(
             directory.stage_with(
                 &mut io,
@@ -7254,12 +7253,18 @@ pub(crate) mod tests {
 
     #[test]
     fn counter_growth_cannot_consume_terminal_reserve() {
-        use super::{counter_read_storage_bytes, counter_read_transient_bytes, counter_snapshot_bytes_for, counter_terminal_reserve_bytes};
+        use super::{
+            counter_read_storage_bytes, counter_read_transient_bytes, counter_snapshot_bytes_for,
+            counter_terminal_reserve_bytes,
+        };
         let mode = CounterMode::Counts;
         let cpus = 2usize;
         let pool = SemanticResourcePool::reference_limit(45 * 1024 * 1024);
         let terminal = counter_terminal_reserve_bytes(mode, cpus).unwrap();
-        assert!(terminal > 30 * 1024 * 1024, "the terminal hold must dominate: {terminal}");
+        assert!(
+            terminal > 30 * 1024 * 1024,
+            "the terminal hold must dominate: {terminal}"
+        );
         let _hold = pool.reserver().reserve(terminal).unwrap();
         let mut directory = BankDirectory::growth_v2_for(mode);
         let mut history = plan(512);
@@ -7267,7 +7272,17 @@ pub(crate) mod tests {
         io.cpus = cpus;
         let first_plan = plan(512);
         let first_envelope = estimate_counter_stage_reservation(
-            mode, 16, 512, &first_plan.slots, 0, 512, 0, cpus, 1, 0, None,
+            mode,
+            16,
+            512,
+            &first_plan.slots,
+            0,
+            512,
+            0,
+            cpus,
+            1,
+            0,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -7277,23 +7292,29 @@ pub(crate) mod tests {
         ));
         let second_plan = plan(1024);
         let second_need = estimate_counter_stage_reservation(
-            mode, 16, 512, &second_plan.slots, 512, 1024, 512, cpus, 1, 0, None,
+            mode,
+            16,
+            512,
+            &second_plan.slots,
+            512,
+            1024,
+            512,
+            cpus,
+            1,
+            0,
+            None,
         )
         .unwrap();
         let available = pool.snapshot().limit_bytes - pool.snapshot().charged_bytes;
-        let second_charge = second_need.retained_bytes + second_need.metadata_bytes + second_need.transient_bytes;
+        let second_charge =
+            second_need.retained_bytes + second_need.metadata_bytes + second_need.transient_bytes;
         assert!(
             second_charge > available,
             "the second stage must need the reserve: {second_charge} > {available}"
         );
         history.extend_exact(plan(1024)).unwrap();
         io.next_stage();
-        let result = directory.stage_with(
-            &mut io,
-            &mut history,
-            second_need,
-            &pool.reserver(),
-        );
+        let result = directory.stage_with(&mut io, &mut history, second_need, &pool.reserver());
         assert_eq!(
             result,
             BankPublication::Refused(BankRefusal::Budget),
@@ -7303,8 +7324,7 @@ pub(crate) mod tests {
         assert_eq!(published.len(), 512, "the published prefix stays intact");
         assert_eq!(io.routes.len(), 512, "routes keep the prefix");
         assert_eq!(directory.allocated_high_water(), 512);
-        let small_transient =
-            counter_read_transient_bytes(mode, cpus, 12, 8192, 512).unwrap();
+        let small_transient = counter_read_transient_bytes(mode, cpus, 12, 8192, 512).unwrap();
         let small_storage = counter_read_storage_bytes(512, 12).unwrap();
         let small_snapshot = counter_snapshot_bytes_for(512, 512).unwrap();
         let fresh = small_transient + small_storage + small_snapshot;
@@ -7320,7 +7340,13 @@ pub(crate) mod tests {
     fn counter_budgets_pin_each_field_against_scripted_session() {
         let owned = growth_owned_history(false);
         assert_eq!(
-            owned.banks.directory.lock().unwrap().published_indices().collect::<Vec<_>>(),
+            owned
+                .banks
+                .directory
+                .lock()
+                .unwrap()
+                .published_indices()
+                .collect::<Vec<_>>(),
             [0, 2]
         );
         let budgets = owned.banks.budgets(5).unwrap();
@@ -7331,8 +7357,14 @@ pub(crate) mod tests {
         assert_eq!(budgets.rv_keys.limit, 65536);
         assert_eq!(budgets.start.limit, 16384);
         assert_eq!(budgets.fd.projected, 6);
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
         if limit.rlim_cur == libc::RLIM_INFINITY {
             assert_eq!(budgets.fd.soft, None);
         } else {

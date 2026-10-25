@@ -13767,6 +13767,69 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn winding_fresh_begin_arms_promotion_finish_with_joint_finish_not_begun() {
+        // The item-9 gate needs no promotion conjunct: a fresh
+        // wind-down begin arms the promotion flag while the driver
+        // finish stays NotBegun (the begun state lives on the
+        // winding), and the flag disarms only when the winding
+        // retires — before any new lane seats.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let _ = install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.coordinator.promotion_finish(),
+            "A's promotion finish runs"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::NotBegun,
+            "the begun state lives on the winding, not the driver"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the winding carries the lane while the flag is armed"
+        );
+    }
+
+    #[test]
+    fn winding_transfer_keeps_promotion_finish_disarmed_and_resets_joint_finish() {
+        // An in-flight seated finish transfers into the winding
+        // without arming the promotion flag; the driver finish
+        // resets to NotBegun.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        let _ = install_promotion_for_wind_down(&mut driver);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            !driver.coordinator.promotion_finish(),
+            "a transferred finish is not A's promotion finish"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::NotBegun,
+            "the transfer resets the driver finish"
+        );
+        assert_eq!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Polling,
+            "the winding keeps the in-flight state"
+        );
+    }
+
+    #[test]
     fn joint_final_finish_tick_runs_only_driver() {
         let mut coordinator = coordinator();
         let headless = headless_display();

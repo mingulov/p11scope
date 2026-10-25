@@ -47502,6 +47502,173 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
 }
 
 #[test]
+fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
+    // The native cleanup worker is alive but wedged: the closer never
+    // releases, so the retirement batch stays Pending forever. The graph
+    // must not spin in NativePoll without bound: a stay-Pending poll
+    // claims no progress, and a bounded run of them falls through to the
+    // existing post-mutation incomplete stop with its existing disclosure.
+    let mut case = graph_case_with_exit(false);
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+    });
+    case.entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the live worker enters the blocked closer");
+    assert!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the native cursor is still held while the worker is wedged"
+    );
+    // Tight loop, no worker-settle sleep: the bound below must trip long
+    // before the closer's 5 s release deadline, so the trip cannot be the
+    // closer timing out. One yield window of slack past the bound; the
+    // spin on a boundless poll is unbounded, so any slack still reds.
+    let cap = crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT;
+    let start = std::time::Instant::now();
+    let mut polls = 0u64;
+    let mut progressed_polls = 0u64;
+    loop {
+        assert!(
+            polls <= cap + 64,
+            "NativePoll spun past its bound ({polls} stay-Pending polls)"
+        );
+        let outcome = case.service(1);
+        polls += 1;
+        if outcome.progressed {
+            progressed_polls += 1;
+        }
+        assert!(outcome.pending, "the wedged debt keeps Finish pending");
+        if case.engine.collected_graph_refused().is_some() {
+            break;
+        }
+    }
+    eprintln!(
+        "wedged-native-poll: tripped after {polls} polls in {:?}",
+        start.elapsed()
+    );
+    assert_eq!(polls, cap, "the bound trips exactly at the cap");
+    assert_eq!(
+        progressed_polls, 1,
+        "only the refusal credit claims progress"
+    );
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert_eq!(
+        case.engine.collected_graph_refused(),
+        Some("native ownership uncertain")
+    );
+    assert!(
+        graph
+            .first_error
+            .as_ref()
+            .is_some_and(|error| error.contains("consecutive pending")),
+        "the kept first error names the bound: {:?}",
+        graph.first_error
+    );
+    assert_eq!(
+        case.engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "global native retirement"
+                    && skip.reason
+                        == "original static ownership remains uncertain; replacement admission is blocked"
+            })
+            .count(),
+        1,
+        "the existing incomplete-stop disclosure ships exactly once"
+    );
+    // Still wedged at the trip: the closer never returned (sender alive),
+    // so the worker was running and the batch was Pending throughout.
+    assert_eq!(
+        case.returned.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    );
+    assert!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the native cursor is still held at the trip"
+    );
+    case.assert_original_pending();
+    // Later credits stay contained: Ok, pending, quiet, sticky refusal.
+    for _ in 0..4 {
+        let outcome = case.service(1);
+        assert!(outcome.pending && !outcome.progressed);
+    }
+    assert_eq!(
+        case.engine.collected_graph_refused(),
+        Some("native ownership uncertain")
+    );
+}
+
+#[test]
+fn collected_graph_slow_native_poll_closes_without_disclosure() {
+    // Twin: the worker is slow but progressing. It parks in the closer
+    // for a full machine-yield window of stay-Pending polls (none claims
+    // progress), then releases and the retirement closes normally with no
+    // refusal and no disclosure.
+    let mut case = graph_case_with_exit(false);
+    drive_graph_until(&mut case.engine, &mut case.session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+    });
+    case.entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the live worker enters the blocked closer");
+    for parked in 1..=64u64 {
+        assert!(
+            case.engine.collected_graph.as_ref().is_some_and(|graph| {
+                graph.phase == GraphPhase::NativePoll && graph.verdict.is_none()
+            }),
+            "still polling with no verdict at parked poll {parked}"
+        );
+        let outcome = case.service(1);
+        assert!(
+            !outcome.progressed,
+            "stay-Pending poll {parked} claims no progress"
+        );
+        assert!(outcome.pending, "the parked debt keeps Finish pending");
+    }
+    case.release();
+    case.returned
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the released worker closes the batch");
+    let credits = drive_graph_case_to_drained(&mut case);
+    eprintln!("slow-native-poll: drained in {credits} credits after 64 parked polls");
+    assert!(
+        case.engine.collected_graph_refused().is_none(),
+        "a slow worker closes with no refusal"
+    );
+    assert!(
+        !case.engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "global native retirement"
+                && skip.reason
+                    == "original static ownership remains uncertain; replacement admission is blocked"
+        }),
+        "a slow worker closes with no disclosure"
+    );
+    assert!(
+        !case.engine.pending_retirements.contains(&case.view),
+        "the retired view is consumed"
+    );
+}
+
+#[test]
 fn collected_graph_closed_never_owes_recovery_frame() {
     let mut case = graph_case_with_exit(true);
     assert!(case.engine.refresh_requested.is_empty());

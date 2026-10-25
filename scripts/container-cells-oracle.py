@@ -20,8 +20,9 @@ its post-copy-up calls are measured as missed or fully counted (old +
 new entries together), never partial. A forced-kernel run either names
 its first proof fallback or reports null (no proof attempted: the sweep
 skipped under the 256 cap, never a proof claim); the kernel and
-userspace legs of every phase must agree on every provider module key
-and edge shape. The copy-up itself is proven from facts.log (a different
+userspace legs of every phase must agree on the cell's own provider
+modules and edges (ambient host edges drift between the sequential
+legs). The copy-up itself is proven from facts.log (a different
 real inode in B's upper layer, same sha256). Fresh captures after B
 restarts attribute B exactly on lane B. The observer runs on the host in
 the initial PID namespace, so no pid_namespace cause is allowed.
@@ -52,8 +53,10 @@ PROVIDER = "libsofthsm2.so"
 # OQ4 frozen gap/loss subject allowlist for the N4 late leg, enumerated from
 # the product source. Each value cites the production push site. A gap
 # referencing the late PID with any other subject FAILs (vocabulary drift is
-# harness, never silently accepted). PENDING the controller's first N4 run,
-# which confirms the list against the built binary's actual output.
+# harness, never silently accepted). Vocabulary status: SYNTHETIC-ONLY. N4
+# has run twice (dev run 2, fedora) with zero late gaps both times, so
+# branch (a) and this list are neither confirmed nor corrected against
+# live output; the first live late gap confirms or corrects the list.
 ALLOWED_LATE_SUBJECTS = {
     "module admission changed": "src/discovery/caller_registry.rs:4885",
     "maps attribution": "src/inspect_system.rs:1854",
@@ -114,15 +117,26 @@ KERNEL_PROOF_FINDING = (
 )
 
 
-def known_late_subject(subject, late_module):
-    """A late-leg gap subject the frozen vocabulary admits."""
+DEVICE_SUBJECT_RE = re.compile(r"^device (\d+):(\d+) inode (\d+)$")
+
+
+def known_late_subject(subject, late_module, late_key, pid_l):
+    """A late-leg gap subject that names the late module (or a frozen cause).
+
+    Dynamic per-file subjects only pass when they ARE the late module: its
+    maps path, its device:ino identity (src/discovery/scan.rs:4104), or
+    L's own /proc/<pid>/mem read (src/discovery/scan.rs:4041). An
+    unrelated .so, device or mem subject for L's pid FAILs.
+    """
     if subject in ALLOWED_LATE_SUBJECTS or subject == late_module:
         return True
-    if subject.endswith(".so"):
+    if subject == f"/proc/{pid_l}/mem":
         return True
-    if subject.startswith("/proc/") and subject.endswith("/mem"):
-        return True
-    return subject.startswith("device ") and " inode " in subject
+    match = DEVICE_SUBJECT_RE.match(subject)
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2)),
+            int(match.group(3))) == late_key
 
 
 def inventory_maps(document, module_suffix=PROVIDER):
@@ -188,22 +202,33 @@ def edge_shapes_by_key(records, keys):
 
 
 def assert_backends_agree(phase, kernel_document, userspace_document,
-                          module_suffix=PROVIDER):
-    """One phase's legs agree on every provider module key and edge shape.
+                          cell_pids, module_suffix=PROVIDER):
+    """One phase's legs agree on the cell's own provider modules and edges.
 
-    Provider-scoped like every other D1 check (ambient modules churn
-    between the sequential legs); a divergence is product news, never
+    Only edges from cell pids and the provider modules they reference
+    compare. The two legs are sequential captures (pre/fresh run one
+    inventory after the other, docker-shared-layer-e2e.sh:1018-1019 and
+    :1146-1147; the span legs start one after the other, :1042-1044),
+    and inventory runs --system, so ambient host PKCS#11 users keep
+    calling across the two windows and their entries.count legitimately
+    differs. A divergence on the cell itself is product news, never
     silently accepted.
     """
-    kernel_keys = module_keys(kernel_document, module_suffix)
-    userspace_keys = module_keys(userspace_document, module_suffix)
-    assert sorted(kernel_keys.values()) == sorted(userspace_keys.values()), \
+    def cell_view(document):
+        keys = module_keys(document, module_suffix)
+        _, records = edge_records(document, module_suffix)
+        cell_records = {(pid, module): edge
+                        for (pid, module), edge in records.items()
+                        if pid in cell_pids}
+        cell_modules = sorted(keys[module]
+                              for (_, module) in cell_records)
+        return cell_modules, edge_shapes_by_key(cell_records, keys)
+
+    kernel_modules, kernel_shapes = cell_view(kernel_document)
+    userspace_modules, userspace_shapes = cell_view(userspace_document)
+    assert kernel_modules == userspace_modules, \
         (phase, "backends disagree on provider module keys",
-         sorted(kernel_keys.values()), sorted(userspace_keys.values()))
-    _, kernel_records = edge_records(kernel_document, module_suffix)
-    _, userspace_records = edge_records(userspace_document, module_suffix)
-    kernel_shapes = edge_shapes_by_key(kernel_records, kernel_keys)
-    userspace_shapes = edge_shapes_by_key(userspace_records, userspace_keys)
+         kernel_modules, userspace_modules)
     divergent = sorted(pid_key
                        for pid_key in set(kernel_shapes) | set(userspace_shapes)
                        if kernel_shapes.get(pid_key) != userspace_shapes.get(pid_key))
@@ -266,6 +291,19 @@ def measured_issue_line(pid, ledger, counted, module):
 def boundary_line(unwatched_ns, entries):
     return (f"BOUNDARY cell=N4 late-provider unwatched_ns={unwatched_ns} "
             f"entries={entries}")
+
+
+def assert_late_edge_within_ledger(record, ledger_total):
+    """L's edge count/status rule, shared by the gap and prefix branches."""
+    status = record["entries"]["coverage"]["state"]
+    count = record["entries"]["count"]
+    assert status in ("watched_no_use", "counted"), ("L late edge status", status)
+    assert count <= ledger_total, ("L entries above its ledger", count,
+                                   ledger_total)
+    if status == "watched_no_use":
+        assert count == 0, ("watched_no_use with entries", count)
+    else:
+        assert count >= 1, ("counted with zero entries", count)
 
 
 def gaps_for(document, pid_of, pid, extra_subject=None):
@@ -344,7 +382,8 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     (new edge only) apply to B-pre's own later calls when measured. A
     forced-kernel run names its first proof fallback or null (no proof
     attempted); the kernel and userspace legs of every phase must agree
-    on every provider module key and edge shape.
+    on the cell's own provider modules and edges (ambient host edges
+    are outside the cell: they drift between the sequential legs).
     """
     assert lane in ("A", "B"), lane
     assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
@@ -472,6 +511,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     known_issue = {"pid": pid_b_pre, "old_module": span_shapes["span-kernel"][0],
                    "new_module": span_shapes["span-kernel"][1]}
 
+    round2_pid = None
     if b_pre_round2_calls is None:
         assert b_pre_round2_pid is None, "round-2 pid without a measured total"
         b_pre_round2 = {"measured": False}
@@ -544,8 +584,13 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     # keeps its named failure instead of surfacing as a generic
     # disagreement. Where no kernel proof ran both legs are the same
     # userspace attribution; where proof ran it fell back to userspace
-    # decisions. Either way the legs must agree, except fresh on lane A:
-    # that leg allows edge-or-named-gap per leg, so mixed legs are legal.
+    # decisions. Either way the legs must agree on the cell's own
+    # processes and provider modules (ambient host edges drift between
+    # the sequential legs), except fresh on lane A: that leg allows
+    # edge-or-named-gap per leg, so mixed legs are legal.
+    cell_pids = {pid_a, pid_b_pre, pid_b_span, pid_b_post}
+    if round2_pid is not None:
+        cell_pids.add(round2_pid)
     for phase, kernel_document, userspace_document in (
             ("pre", pre_kernel, pre_userspace),
             ("span", span_kernel, span_userspace),
@@ -553,10 +598,12 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
         if phase == "fresh" and lane != "B":
             continue
         assert_backends_agree(phase, kernel_document, userspace_document,
-                              module_suffix)
+                              cell_pids, module_suffix)
 
     assert "copy-up-stale-caller" in dc73_note, \
         "run log without the copy-up-stale-caller disclosure"
+    assert "identity_mismatch is the correct leg" not in dc73_note, \
+        "run log repeats the disproven kernel-refusal sentence"
 
     # Fresh, after the restart: the anchor is opened from the upper copy.
     fresh_k_pid, fresh_k_edges = inventory_maps(fresh_kernel, module_suffix)
@@ -592,13 +639,14 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
                   module_suffix=PROVIDER):
     """N4: O exact and gap-free; L scanned and reported, never silently zero.
 
-    L passes when scanned and EITHER (a) a named gap from the frozen
-    vocabulary references the late module OR (b) L's edge to the late module
-    states an unwatched prefix (since_ns greater than that mapping's
-    first_seen_ns) with entries within the L ledger total and status
-    watched_no_use or counted. The L verdict stays NON-PASS/UNSUPPORTED
-    (G33): passing means the late boundary is REPORTED, never that the late
-    provider became exact.
+    L passes when scanned and EITHER (a) a named gap that names the late
+    module (its path, its device:ino identity, or a frozen cause subject)
+    OR (b) L's edge to the late module states an unwatched prefix
+    (since_ns greater than that mapping's first_seen_ns) with entries
+    within the L ledger total and status watched_no_use or counted. The
+    ledger bound and status check apply to L's edge in BOTH branches. The
+    L verdict stays NON-PASS/UNSUPPORTED (G33): passing means the late
+    boundary is REPORTED, never that the late provider became exact.
     """
     require_initial_observer(document, "n4")
     assert isinstance(iters_l, int) and iters_l >= 1, \
@@ -610,14 +658,19 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
     assert pid_l in scanned, ("L never scanned: silently zero", pid_l, sorted(scanned))
     assert pid_o in edges, ("O has no provider edge", pid_o, sorted(edges))
     assert not gaps_for(document, pid_of, pid_o), ("O is not gap-free", pid_o)
-    late_gaps = gaps_for(document, pid_of, pid_l, late_module)
-    for gap in late_gaps:
-        assert known_late_subject(gap.get("subject", ""), late_module), \
-            ("unknown late gap subject", gap)
-    named = [gap for gap in late_gaps if gap.get("reason")]
     late_ids = [m["id"] for m in document["modules"] if late_module in m["paths"]]
     assert len(late_ids) == 1, ("no single late module", late_module, late_ids)
     late_id = late_ids[0]
+    late_record = next(m for m in document["modules"] if m["id"] == late_id)
+    late_device = late_record["identity"]["device"]
+    late_key = (late_device["major"], late_device["minor"],
+                late_record["identity"]["inode"])
+    late_gaps = gaps_for(document, pid_of, pid_l, late_module)
+    for gap in late_gaps:
+        assert known_late_subject(gap.get("subject", ""), late_module,
+                                  late_key, pid_l), \
+            ("unknown late gap subject", gap)
+    named = [gap for gap in late_gaps if gap.get("reason")]
     _pid_of, records = edge_records(document, module_suffix)
     late_edges = sorted(mid for (pid, mid) in records
                         if pid == pid_l and mid == late_id)
@@ -626,6 +679,7 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
         verdict = "edge-with-gap" if pid_l in edges else "no-edge-with-gap"
         if late_edges:
             record = records[(pid_l, late_id)]
+            assert_late_edge_within_ledger(record, ledger_total)
             since_ns = record["entries"]["coverage"]["since_ns"]
             first_seen_ns = record["mapping"]["first_seen_ns"]
             if isinstance(since_ns, int) and isinstance(first_seen_ns, int):
@@ -657,14 +711,9 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
     assert since_ns > first_seen_ns, \
         ("L silently zero: no named gap and no unwatched prefix", pid_l,
          since_ns, first_seen_ns)
+    assert_late_edge_within_ledger(record, ledger_total)
     status = record["entries"]["coverage"]["state"]
     count = record["entries"]["count"]
-    assert status in ("watched_no_use", "counted"), ("L late edge status", status)
-    assert count <= ledger_total, ("L entries above its ledger", count, ledger_total)
-    if status == "watched_no_use":
-        assert count == 0, ("watched_no_use with entries", count)
-    else:
-        assert count >= 1, ("counted with zero entries", count)
     boundary = {"late_module": late_module, "module": late_id,
                 "unwatched_ns": since_ns - first_seen_ns, "entries": count,
                 "since_ns": since_ns, "first_seen_ns": first_seen_ns,

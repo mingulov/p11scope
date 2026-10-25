@@ -1041,11 +1041,13 @@ loss = causes & SCAN_LOSS_CAUSES
 if loss:
     raise SystemExit(f"scan loss refuses the leg: {sorted(loss)}")
 counted = {name: 0 for name in expected}
+ledger_errors = {name: 0 for name in expected}
 extra_calls = {}
 for row in document["functions"]:
     for name in row["names"]:
         if name in counted:
             counted[name] += row["calls"]
+            ledger_errors[name] += row["errors"]
         else:
             extra_calls[name] = extra_calls.get(name, 0) + row["calls"]
 extra_calls = {name: calls for name, calls in extra_calls.items() if calls}
@@ -1054,6 +1056,11 @@ modules = document["capture"]["modules"]
 exact = [name for name in expected if 0 < expected[name] == counted[name]]
 zero = [name for name in expected if counted[name] == 0]
 if len(exact) == len(expected):
+    # The ledger counts successful calls; a counted call that returned an
+    # error is not one of them (errors on setup rows stay recorded only).
+    errored = {name: value for name, value in ledger_errors.items() if value}
+    if errored:
+        raise SystemExit(f"scan ledger errors: {errored} on ledger functions")
     leg, disclosure = "counted-exact", []
 elif len(zero) == len(expected):
     disclosure = sorted(causes & SCAN_ZERO_DISCLOSURE)

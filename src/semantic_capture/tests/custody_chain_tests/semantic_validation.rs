@@ -195,10 +195,15 @@ struct HeldIo {
     /// ledger for the changed-file tests. Only appended, never consulted.
     scan_results: Vec<Result<(), ImageQueryRefusal>>,
     /// Scripted wall time consumed by each queued or joined-refresh scan
-    /// (`scan`, never the refresh path): production scans take real time,
-    /// so a scan-job deadline can pass mid-scan. Zero by default, so
-    /// existing tests see a constant clock within a tick.
+    /// (`scan` only): production scans take real time, so a scan-job
+    /// deadline can pass mid-scan. Zero by default, so existing tests
+    /// see a constant clock within a tick.
     scan_cost: Duration,
+    /// Scripted wall time consumed by each bind-refresh scan
+    /// (`scan_selected`): a refresh scan can overrun its slice exactly
+    /// as a queued scan can. Zero by default, so existing tests see a
+    /// constant clock across the refresh rotation.
+    refresh_cost: Duration,
 }
 
 impl HeldIo {
@@ -235,6 +240,7 @@ impl HeldIo {
             storage_null: 0,
             scan_results: Vec::new(),
             scan_cost: Duration::ZERO,
+            refresh_cost: Duration::ZERO,
         }
     }
 
@@ -432,6 +438,10 @@ impl CaptureIo for HeldIo {
         fence: u64,
         _: &dyn Fn() -> u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
+        // The scripted refresh cost elapses first, mirroring `scan`: a
+        // scripted slice can pass mid-scan exactly as a real refresh
+        // scan overruns it.
+        self.script.now += self.refresh_cost;
         // A selected refresh and a queued scan read the same failing native
         // file. Neither may publish a proof while that leaf is unavailable.
         if self.script.fail_file == Some(endpoint.file_slot) {

@@ -571,6 +571,111 @@ fn absence_then_same_base_reload_mints() {
 }
 
 #[test]
+fn refresh_scan_overrun_with_empty_breaks_continuity() {
+    // The bind-refresh twin of the absence reload: a refresh scan that
+    // proves the module unmapped breaks continuity even when the scan
+    // overruns its slice. The refusal is set aside as a deadline, but
+    // the proven absence is recorded from the already-obtained result,
+    // so the same-base reload mints instead of reviving the old ID. No
+    // burst runs during the racing pass, so no tick-job or
+    // joined-refresh scan exists — only the refresh path can record.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the absence, got {:?}",
+        instance_summary(&scene)
+    );
+    // The module vanishes mid-run; the racing pass carries no burst, so
+    // the bind rotation's refresh scan is the only scan that runs — and
+    // it overruns its slice before proving the module unmapped.
+    scene.h0.0.borrow_mut().io.absent_files.insert(0);
+    scene.h0.0.borrow_mut().io.refresh_cost = Duration::from_millis(100);
+    let scans_before_refresh = scene.h0.0.borrow().io.scan_results.len();
+    discovery_pass(&mut scene);
+    assert_eq!(
+        scene.h0.0.borrow().capture.router().counters().joined,
+        2,
+        "the racing pass joins nothing new"
+    );
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "the absence alone mints nothing, got {:?}",
+        instance_summary(&scene)
+    );
+    {
+        let held = scene.h0.0.borrow();
+        let raced = &held.io.scan_results[scans_before_refresh..];
+        assert_eq!(
+            raced,
+            &[Err(ImageQueryRefusal::Empty)],
+            "the racing pass ran exactly the overrun refresh scan, got {raced:?}"
+        );
+    }
+    // The reload lands at the same base; only the global epoch moved.
+    scene.h0.0.borrow_mut().io.absent_files.remove(&0);
+    scene.h0.0.borrow_mut().io.refresh_cost = Duration::ZERO;
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the reload after the overrun absence mints, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the pre-absence load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the reloaded mapping stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "both bursts attribute exactly once, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the retired load keeps the pre-absence burst, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-reload burst, got {rows:?}"
+    );
+}
+
+#[test]
 fn empty_scan_at_job_expiry_breaks_continuity() {
     // The tick-job twin of the absence reload: a scan that proves the
     // module unmapped breaks continuity even when the scan-job deadline

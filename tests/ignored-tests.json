@@ -39,6 +39,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach.rs",
+      "path": "attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel",
+      "reason": "live-kernel BPF lane; reports bpf_loop helper presence without asserting it",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::format2_preparation_charges_custody_and_payload_together",
       "reason": "requires the explicitly selected format2 artifact; parses only, no native load",
@@ -54,6 +60,12 @@
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
       "reason": "requires the default build with embedded counter objects; run as root in an authorized BPF lane with LP64 map/program load and uprobe_multi",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
+      "reason": "pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
       "cell": "privileged"
     },
     {
@@ -952,6 +964,42 @@
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health",
       "reason": "requires an explicitly granted native map-only BPF lane; no attach/program load",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64",
+      "reason": "requires explicitly prebuilt LP64 counter-banks fixtures, validated timestamps and latency format2 objects, and authorized native attach; runs a counts-null twin first",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated latency format2 object, functional kernel Multi attachment, and authorized native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, proven kernel Multi PID filtering, and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, validated latency format2 object, proven kernel Multi PID filtering, and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
+      "reason": "6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
       "cell": "privileged"
     },
     {

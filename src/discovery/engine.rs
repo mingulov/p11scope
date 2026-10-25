@@ -23376,7 +23376,11 @@ impl Engine {
         if !graph.facts.measured {
             // Strided measure over old counters plus cursor skips.
             let old_len = self.counters.object_skips.len();
-            let cursor_len = graph.plan.plan().map(|plan| plan.skipped.len()).unwrap_or(0);
+            let cursor_len = graph
+                .plan
+                .plan()
+                .map(|plan| plan.skipped.len())
+                .unwrap_or(0);
             let total = old_len.saturating_add(cursor_len);
             let from = graph.facts.index;
             let until = total.min(from.saturating_add(GRAPH_STRIDE));
@@ -23412,18 +23416,26 @@ impl Engine {
                 return Self::graph_idle(true);
             };
             graph.facts.storage.push(lease);
-            graph.facts.plan_skipped.reserve(old_len.saturating_add(graph.facts.skips.len()));
+            graph
+                .facts
+                .plan_skipped
+                .reserve(old_len.saturating_add(graph.facts.skips.len()));
             graph.facts.measured = true;
             graph.facts.substep = 1;
             graph.facts.index = 0;
             return Self::graph_idle(true);
         }
         if graph.facts.substep == 1 {
-            let cursor_len = graph.plan.plan().map(|plan| plan.skipped.len()).unwrap_or(0);
+            let cursor_len = graph
+                .plan
+                .plan()
+                .map(|plan| plan.skipped.len())
+                .unwrap_or(0);
             let from = graph.facts.index;
             let until = cursor_len.min(from.saturating_add(GRAPH_STRIDE));
             for position in from..until {
-                let skip = graph.plan.plan().expect("cursor checked above").skipped[position].clone();
+                let skip =
+                    graph.plan.plan().expect("cursor checked above").skipped[position].clone();
                 graph
                     .facts
                     .plan_dedup
@@ -23582,11 +23594,13 @@ impl Engine {
         while position < old_len && units < GRAPH_STRIDE {
             let (objects, _) = &self.counters.corroboration[position];
             units = units.saturating_add(1).saturating_add(objects.len());
-            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
             let keep = !objects.is_empty()
                 && objects.iter().all(|object| {
-                    graph.facts.module_objects.contains(object)
-                        && loaned.summary(*object).is_some()
+                    graph.facts.module_objects.contains(object) && loaned.summary(*object).is_some()
                 });
             if keep {
                 let entry = self.counters.corroboration[position].clone();
@@ -23626,7 +23640,10 @@ impl Engine {
         slot_index: &BTreeMap<plan::AttachKey, usize>,
     ) -> bool {
         for (left, table) in proof.tables.iter().enumerate() {
-            if proof.tables[..left].iter().any(|known| known.address == table.address) {
+            if proof.tables[..left]
+                .iter()
+                .any(|known| known.address == table.address)
+            {
                 return false;
             }
         }
@@ -23663,12 +23680,13 @@ impl Engine {
                 object: required.object,
                 file_offset: required.file_offset,
             };
-            slot_index.get(&key).and_then(|position| cursor.slots.get(*position)).is_some_and(
-                |slot| {
+            slot_index
+                .get(&key)
+                .and_then(|position| cursor.slots.get(*position))
+                .is_some_and(|slot| {
                     slot.names.iter().any(|name| name == &required.name)
                         && slot.module_ids.contains(&module.id)
-                },
-            )
+                })
         })
     }
 
@@ -23777,7 +23795,10 @@ impl Engine {
                 .saturating_add(1)
                 .saturating_add(fallback.proof.tables.len())
                 .saturating_add(fallback.proof.required_targets.len().saturating_mul(2));
-            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
             let cursor = graph.plan.plan().expect("cursor checked above");
             let keep = loaned.summary(fallback.replacement).is_some()
                 && Self::facts_proof_in_plan(
@@ -23931,7 +23952,10 @@ impl Engine {
                     .map(|(key, claim)| (key.clone(), claim.clone()))
                     .collect(),
             };
-            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
             for (key, claim) in &range {
                 let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
                     continue;
@@ -23942,10 +23966,13 @@ impl Engine {
                     && binding.context.get() == key.context
                     && binding.view == key.view
                     && binding.object == key.hook_owner
-                    && self.loader_registry.context(binding.context).is_some_and(|context| {
-                        context.spec.view == key.view
-                            && !self.loader_registry.is_tombstoned(binding.context)
-                    })
+                    && self
+                        .loader_registry
+                        .context(binding.context)
+                        .is_some_and(|context| {
+                            context.spec.view == key.view
+                                && !self.loader_registry.is_tombstoned(binding.context)
+                        })
                     && loaned
                         .owned_timing_key(binding.object)
                         .is_some_and(|provider| provider == key.provider)
@@ -23953,10 +23980,7 @@ impl Engine {
                     && claim.target.object == key.selected_object
                     && claim.target.file_offset == key.file_offset;
                 if live_view && binding_live && graph.facts.active_keys.contains(&claim.target) {
-                    graph
-                        .facts
-                        .claims
-                        .insert(key.clone(), claim.clone());
+                    graph.facts.claims.insert(key.clone(), claim.clone());
                 }
             }
             if let Some((last, _)) = range.last() {
@@ -24028,8 +24052,11 @@ impl Engine {
                     .iter()
                     .take(GRAPH_STRIDE)
                     .map(|(key, fact)| {
-                        let strings: usize =
-                            fact.targets.iter().map(|target| target.object_path.len()).sum();
+                        let strings: usize = fact
+                            .targets
+                            .iter()
+                            .map(|target| target.object_path.len())
+                            .sum();
                         (key.clone(), strings)
                     })
                     .collect(),
@@ -24038,8 +24065,11 @@ impl Engine {
                     .range((Excluded(after), Unbounded))
                     .take(GRAPH_STRIDE)
                     .map(|(key, fact)| {
-                        let strings: usize =
-                            fact.targets.iter().map(|target| target.object_path.len()).sum();
+                        let strings: usize = fact
+                            .targets
+                            .iter()
+                            .map(|target| target.object_path.len())
+                            .sum();
                         (key.clone(), strings)
                     })
                     .collect(),
@@ -24096,7 +24126,10 @@ impl Engine {
             let modules = graph.rebind.modules().expect("rebind checked above");
             let from = graph.facts.index;
             let until = modules.len().min(from.saturating_add(GRAPH_STRIDE));
-            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let loaned = graph
+                .pins
+                .loaned_output()
+                .expect("loaned pins checked above");
             for module in &modules[from..until] {
                 if let Some(provider) = loaned.owned_timing_key(module.object) {
                     graph
@@ -24161,16 +24194,11 @@ impl Engine {
                 graph.facts.index = 0;
                 return Self::graph_idle(true);
             };
-            if graph
-                .facts
-                .tables
-                .get(&key)
-                .is_some_and(|known| {
-                    known.object != table.object
-                        || known.file_offset != table.file_offset
-                        || !same_selection_target_set(&known.targets, &table.targets)
-                })
-            {
+            if graph.facts.tables.get(&key).is_some_and(|known| {
+                known.object != table.object
+                    || known.file_offset != table.file_offset
+                    || !same_selection_target_set(&known.targets, &table.targets)
+            }) {
                 graph.facts.drop_tables.insert(key);
                 return Self::graph_idle(true);
             }
@@ -24255,8 +24283,7 @@ impl Engine {
                 .drop_claims
                 .len()
                 .min(from.saturating_add(GRAPH_STRIDE));
-            let victims: Vec<SelectionClaimKey> =
-                graph.facts.drop_claims[from..until].to_vec();
+            let victims: Vec<SelectionClaimKey> = graph.facts.drop_claims[from..until].to_vec();
             for key in &victims {
                 graph.facts.claims.remove(key);
             }
@@ -24898,9 +24925,7 @@ impl Engine {
                             }) && self.retirement_intents.get(&binding.view)
                                 == Some(&RetirementCause::ExpectedRemoval)
                         });
-                    if selected
-                        && let Some(binding) = self.selection_bindings.get_mut(&id)
-                    {
+                    if selected && let Some(binding) = self.selection_bindings.get_mut(&id) {
                         binding.coverage.close_naturally();
                     }
                     leaves += 1;

@@ -48246,7 +48246,11 @@ fn facts_attach_collected_carrier(
 
 /// T5 helper: the G5 collision dance against `object`, leaving its key in
 /// `pending_rejected_keys` with live pins, plan and modules untouched.
-fn facts_queue_rejected_key(engine: &mut Engine, session: &mut ScriptedSession, object: PinnedObjectId) {
+fn facts_queue_rejected_key(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    object: PinnedObjectId,
+) {
     use crate::discovery::identity::test_fixture::real_scan_pin;
     let summary = engine.pinned.summary(object).unwrap();
     let key = summary.key;
@@ -48279,7 +48283,11 @@ fn facts_queue_rejected_key(engine: &mut Engine, session: &mut ScriptedSession, 
 /// T5 helper: selection, corroboration, fallback and skip rows for the
 /// pair-1 twin. `survivor` keeps its claims, tables, corroboration and
 /// fallback; `rejected` loses all of them through the rejected key.
-fn facts_inject_pair1_rows(engine: &mut Engine, survivor: PinnedObjectId, rejected: PinnedObjectId) {
+fn facts_inject_pair1_rows(
+    engine: &mut Engine,
+    survivor: PinnedObjectId,
+    rejected: PinnedObjectId,
+) {
     let view = engine.views[0].id();
     let generation = std::num::NonZeroU64::new(1).unwrap();
     let spec = LoaderContextSpec {
@@ -48746,20 +48754,15 @@ fn collected_graph_matches_conservative_reference() {
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
             .unwrap();
         assert!(progress.pending);
-        if session
-            .global_retirement
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .begins
-            != 0
-        {
+        if session.global_retirement.as_ref().unwrap().borrow().begins != 0 {
             submitted = true;
             break;
         }
     }
     assert!(submitted, "pair 1 reaches the native handoff");
-    entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
     for _ in 0..600 {
@@ -48829,7 +48832,9 @@ fn collected_graph_matches_conservative_reference() {
     );
     for (id, before) in &twin_bindings_before {
         assert_eq!(
-            twin.selection_bindings.get(id).map(|binding| binding.provider),
+            twin.selection_bindings
+                .get(id)
+                .map(|binding| binding.provider),
             Some(before.provider),
             "pair 1 replay leaves binding providers alone"
         );
@@ -48937,7 +48942,14 @@ fn collected_finish_lowered_original_is_consumed_without_pin_io() {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
     let outcome = engine
-        .apply_lowered_module(lowered, 0, 1_000, &mut session, &mut additions, &mut pending)
+        .apply_lowered_module(
+            lowered,
+            0,
+            1_000,
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
         .unwrap();
     assert_eq!(
         engine.pinned.revision(),

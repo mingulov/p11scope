@@ -39,17 +39,15 @@ missed, with no marker in the output; restarting such processes is the
 workaround, and the kernel identity backend does not help (full entry
 below).
 
-Only 30 minutes of bounded useful activity is claimed; longer
-continuous runs are not qualified. Startup and stop figures above are
+Continuous runs are qualified for up to 30 minutes; longer runs (4 h,
+24 h) are not qualified yet. The startup and stop figures above are
 declared per kernel, not a product guarantee.
 
 ## Planned for later versions
 
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
-- Activating the reserved measurement modes (`--counter-mode`),
-  including a per-mechanism view.
-- Finer key-operation detail (per-mechanism rows).
+- A per-mechanism counter view and per-mechanism key-operation rows.
 - A named unknown edge for the copy-up case above instead of silent
   misattribution, and for a late provider's unwatched window.
 - Tracking short-lived processes that exit before their first binding.

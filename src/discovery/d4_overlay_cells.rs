@@ -2230,9 +2230,10 @@ impl OverlayRows<'_> {
     }
 
     /// The same lower through two mounts (shared lowerdir, fresh upper
-    /// and work): D-C7-2 on lane A (equal backing keys, a kernel edge
-    /// against physical truth with a userspace named mismatch) and
-    /// parity none on lane B (distinct overlay devices).
+    /// and work): D-C7-2 on lane A (equal backing keys: the kernel
+    /// correctly reports the same underlying file while the userspace
+    /// side reports a named mismatch) and parity none on lane B
+    /// (distinct overlay devices).
     fn row_two_mounts(&mut self, work: &std::path::Path) -> Result<(), String> {
         eprintln!("D4_OVERLAY start mode={:?} row=two-mounts", self.mode);
         let fixture = OverlayFixture::mount(work, self.mode)?;

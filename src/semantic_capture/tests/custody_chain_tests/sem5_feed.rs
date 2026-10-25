@@ -618,6 +618,98 @@ fn stop_names_route_waiting_calls_in_the_final_accounting() {
 }
 
 #[test]
+fn retained_never_bound_burst_sheds_at_the_horizon_and_frees_admission() {
+    // A retained post-attach burst whose image exits before binding must
+    // not occupy the pending budget until stop: past the retention
+    // horizon it sheds mid-run as Unobserved with the existing
+    // disclosure, and a later live caller still binds and joins.
+    let mut scene = workload_scene();
+    let child = spawn_post_attach_child();
+    let pid = child.id();
+    let _caller = admit_mapped(&mut scene, pid);
+    // The image must exist for enqueueing, but no pin is ever published
+    // to the drain: the lane ticks with no pins, so the drain retains.
+    let pin = std::sync::Arc::new(
+        scene
+            .scene
+            .coordinator
+            .adapter()
+            .live_pin(pid)
+            .unwrap()
+            .1
+            .try_clone()
+            .unwrap(),
+    );
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(pid, (pin, image(7)));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    scene.h0.0.borrow_mut().io.targets.clear();
+    let batch = scene.lane.tick(&[]).unwrap();
+    scene.publish(batch);
+    assert_eq!(
+        unrouted_reasons(&scene),
+        Vec::<(String, u64)>::new(),
+        "retained calls wait inside the horizon, they do not shed yet"
+    );
+    // The image exits before binding; the horizon passes with no proof.
+    drop(child);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .advance_now(Duration::from_secs(31));
+    let batch = scene.lane.tick(&[]).unwrap();
+    scene.publish(batch);
+    let router_pending = scene.h0.0.borrow().capture.router().pending_len() as u64;
+    assert_eq!(
+        router_pending, 0,
+        "the horizon expiry frees the pending budget mid-run"
+    );
+    assert_eq!(
+        scene.lane.shed_calls_disclosed(),
+        2,
+        "the never-bound burst sheds mid-run, not at stop"
+    );
+    assert_eq!(
+        unrouted_reasons(&scene),
+        vec![(
+            "2 calls shed without a route (unobserved=2) with 0 bindings".to_string(),
+            1
+        )],
+        "the horizon shed keeps the existing disclosure"
+    );
+    // A later live caller is admitted: it binds and its burst joins.
+    let live = std::process::id();
+    let live_caller = admit_mapped(&mut scene, live);
+    production_bind(&mut scene, live_caller, live, image(9));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, live, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    assert_eq!(joined, 2, "the live burst joins after the horizon shed");
+    // Stop stays finite and the full account reconciles.
+    let finish = scene.h0.finish(scene.lane.domain());
+    scene.publish(finish);
+    let shed = scene.lane.shed_calls_disclosed();
+    assert_eq!(
+        joined + shed,
+        4,
+        "joined + shed still equals the physical calls at stop"
+    );
+}
+
+#[test]
 fn physical_calls_count_once_across_ticks_and_bindings() {
     // The test runner started long before the lane: pre-attach, R-34.
     let mut scene = workload_scene();

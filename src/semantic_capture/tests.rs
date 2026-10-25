@@ -1089,6 +1089,13 @@ impl ScriptIo {
             u64::from(file) * 0x4000 + u64::from(function_slot) * 0x100;
     }
 }
+impl ScriptIo {
+    /// Advance the scripted capture clock (retention horizons,
+    /// deadlines). Wall-clock registration stamps are unaffected.
+    pub(crate) fn advance_now(&mut self, by: Duration) {
+        self.now += by;
+    }
+}
 impl CaptureIo for ScriptIo {
     fn domain(&self) -> Option<NativeDomainId> {
         Some(self.domain)

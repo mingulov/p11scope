@@ -1609,6 +1609,108 @@ fn overlay_n4_branch_tripwire_fails_the_cell() {
     );
 }
 
+/// The N4 tripwire per no-run row shape: when `row_lower` renders
+/// overlay while a later no-run row renders backing on either side, the
+/// evaluator alone would still accept the row's no-run shape, so the
+/// row must take the identity-key branch and the top-level gate must
+/// fail the cell named. One case per row shape that feeds backing into
+/// `d4_overlay_kernel_no_run_for_pid`: upper, collision and wrong-file
+/// (parity none) plus data-only (zero demand).
+#[test]
+fn overlay_n4_tripwire_trips_when_a_later_row_renders_backing() {
+    let pid = 4244u32;
+    let truth = |line: &str, backing: bool| OverlayTruth {
+        maps_line: line.into(),
+        map_files_dev: 42,
+        map_files_ino: 7,
+        statfs_magic: p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC,
+        held_fstat: (42, 7),
+        xino_effective: true,
+        xino_auto: "N".into(),
+        map_files_backing: backing,
+        xino_off_copy_up_stable: None,
+    };
+    // row_lower renders overlay on both sides: it takes no branch.
+    let line = "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so";
+    let lower = truth(line, false);
+    assert!(
+        !takes_identity_key_branch(&lower, &lower),
+        "row_lower on overlay rendering takes no branch"
+    );
+    // The no-run driver shape under backing: no per-range key, the
+    // no-proof classification, installed slots, zero fallback and reads.
+    let evidence = KernelLegEvidence {
+        fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
+            passes: 0,
+            pids: 0,
+            keys: 0,
+            first_reason: None,
+        },
+        userspace_reads: 0,
+        slots_nonempty: true,
+        per_range_key: false,
+        no_proof_classification: Some("no kernel proof (identity key)"),
+    };
+    let none = synthetic_none();
+    // (row, target line, anchor line, target backing, anchor backing,
+    // expected shape).
+    let cases = [
+        (
+            "upper",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:03 21 /merged/lib.so",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so",
+            true,
+            false,
+            OverlayExpect::Parity(false),
+        ),
+        (
+            "collision",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:03 12 /merged/f2.so",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 12 /merged/f1.so",
+            false,
+            true,
+            OverlayExpect::Parity(false),
+        ),
+        (
+            "wrong-file",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 44 /merged/other.so",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so",
+            true,
+            true,
+            OverlayExpect::Parity(false),
+        ),
+        (
+            "data-only",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so",
+            "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so",
+            true,
+            false,
+            OverlayExpect::DataOnly,
+        ),
+    ];
+    for (row, target_line, anchor_line, target_backing, anchor_backing, expected) in cases {
+        let target = truth(target_line, target_backing);
+        let anchor = truth(anchor_line, anchor_backing);
+        assert_overlay_outcome(pid, &target, &anchor, &none, &none, &evidence, expected)
+            .unwrap_or_else(|error| {
+                panic!("{row}: the evaluator alone accepts backing rendering: {error}")
+            });
+        assert!(
+            takes_identity_key_branch(&target, &anchor),
+            "{row}: backing rendering takes the identity-key branch"
+        );
+        let mut n4_active = false;
+        if takes_identity_key_branch(&target, &anchor) {
+            n4_active = true;
+        }
+        assert_eq!(
+            n4_gate(n4_active),
+            Err("N4 active: lane cannot qualify as kernel parity".to_string()),
+            "{row}: the tripped row fails the cell named"
+        );
+    }
+}
+
 /// Every preflight miss fails with its named reason; nothing skips.
 /// Unprivileged this observes the root gate; privileged it observes
 /// the pass (or a later named probe).

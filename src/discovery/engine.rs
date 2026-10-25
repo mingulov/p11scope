@@ -19438,14 +19438,26 @@ impl Engine {
                 // inventory work that frees capacity.
                 if !pressure_quiet && self.pressure_head_pending(&queued) {
                     if self.collected_finish_actions.is_some() {
-                        // Ordinary pressure service can scan/admit/evict views.
-                        // It is not a bounded terminal graph disposition. Keep
-                        // the exact original head/suffix and requests instead
-                        // of reaching its destructive ordinary tick paths.
-                        self.pending_discovery_records
-                            .extend(std::iter::once(queued).chain(batch));
-                        self.pressure_rotation_pending = true;
-                        break;
+                        // The terminal stop takes the "rotation ruled every
+                        // entry out" route: no service pass, scan, admit,
+                        // evict or refresh runs here. The head is refused
+                        // exactly once through ordinary dispatch with
+                        // additions closed, and the suffix keeps ring order.
+                        pressure_quiet = true;
+                        *additions_allowed = false;
+                        self.dispatch_one_queued_record(
+                            queued,
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            &mut exec_refresh_views,
+                            &mut deferred_mismatches,
+                            &mut terminal_selection_handoffs,
+                            closure,
+                            &mut changed,
+                        );
+                        self.pressure_episode_clear();
+                        continue;
                     }
                     if self.frame_work_exhausted() {
                         self.note_frame_deferral();

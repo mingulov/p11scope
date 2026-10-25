@@ -3872,8 +3872,8 @@ mod promotion_lifecycle_tests {
     //! lifecycle module); the baseline agreement reuses the tested
     //! `matches_request`.
     use super::*;
-    use crate::attach::Scope;
     use crate::attach::BackendSelection;
+    use crate::attach::Scope;
     use crate::attach::capture::NativeDomainId;
     use crate::discovery::caller_registry::{
         ImageAuthority, ModuleKey, OsProcessSource, RegistryLimits,

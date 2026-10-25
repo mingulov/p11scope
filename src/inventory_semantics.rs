@@ -1738,6 +1738,7 @@ impl AttestedSemanticLane {
                     pins: Vec::new(),
                     domain,
                     stash: None,
+                    collected: &mut live.collected_calls,
                 };
                 io.finish_h0()
             }

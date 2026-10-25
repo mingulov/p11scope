@@ -3478,4 +3478,54 @@ mod tests {
             "teardown refunds every owner charge exactly once"
         );
     }
+    #[test]
+    fn raw_quantum_refusal_codes_name_every_variant() {
+        use super::RawQuantumRefusal;
+        use crate::events::EventsCutRefusal;
+        use crate::semantics_edge::resources::SemanticResourceRefusal;
+        use crate::semantics_objects::journal::{BirthCutRefusal, FaultReadError, LedgerRefusal};
+        let cases = [
+            (RawQuantumRefusal::Capacity, "Capacity"),
+            (RawQuantumRefusal::H0Active, "H0Active"),
+            (RawQuantumRefusal::ForeignDescriptors, "ForeignDescriptors"),
+            (RawQuantumRefusal::ForeignDrain, "ForeignDrain"),
+            (RawQuantumRefusal::ForeignCapture, "ForeignCapture"),
+            (RawQuantumRefusal::ForeignLedger, "ForeignLedger"),
+            (RawQuantumRefusal::DrainUnbound, "DrainUnbound"),
+            (RawQuantumRefusal::H0Undelivered, "H0Undelivered"),
+            (RawQuantumRefusal::IdentityExhausted, "IdentityExhausted"),
+            (RawQuantumRefusal::InvalidLimit, "InvalidLimit"),
+            (
+                RawQuantumRefusal::Resource(SemanticResourceRefusal {
+                    limit_bytes: 0,
+                    requested_bytes: 0,
+                }),
+                "Resource",
+            ),
+            (RawQuantumRefusal::Ledger(LedgerRefusal::Full), "Ledger"),
+            (RawQuantumRefusal::Allocation, "Allocation"),
+            (RawQuantumRefusal::Admission, "Admission"),
+            (RawQuantumRefusal::StaleFrontier, "StaleFrontier"),
+            (
+                RawQuantumRefusal::DispositionMismatch,
+                "DispositionMismatch",
+            ),
+            (RawQuantumRefusal::H3Undisposed, "H3Undisposed"),
+            (RawQuantumRefusal::ClosureStale, "ClosureStale"),
+            (RawQuantumRefusal::Stopped, "Stopped"),
+            (RawQuantumRefusal::Cut(BirthCutRefusal::Gap), "Cut"),
+            (
+                RawQuantumRefusal::Cursor(EventsCutRefusal::Untracked),
+                "Cursor",
+            ),
+            (
+                RawQuantumRefusal::Fault(FaultReadError::Unreadable),
+                "Fault",
+            ),
+        ];
+        assert_eq!(cases.len(), 22);
+        for (reason, code) in cases {
+            assert_eq!(reason.code(), code);
+        }
+    }
 }

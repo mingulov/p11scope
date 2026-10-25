@@ -1049,6 +1049,11 @@ fn joint_machine_h8_present_s1only_batch_publishes() {
     }
     scene.machine.begin_commit(true).unwrap();
     scene.published_labeled("h8-present-s1only", None);
+    assert_eq!(
+        scene.machine.staging_detail_for_test(),
+        None,
+        "successful Staging retains no refusal"
+    );
     assert!(
         scene.machine.retained_drain_grant_for_test().is_some(),
         "a grant exists: the machine took the ingest path, like live"
@@ -1108,6 +1113,11 @@ fn joint_machine_h8_absent_s1only_batch_publishes() {
     }
     scene.machine.begin_commit(true).unwrap();
     scene.published_labeled("h8-absent-s1only", None);
+    assert_eq!(
+        scene.machine.staging_detail_for_test(),
+        None,
+        "successful Staging retains no refusal"
+    );
     assert!(
         scene.machine.retained_drain_grant_for_test().is_some(),
         "a grant exists: the machine took the ingest path, like live"
@@ -1137,4 +1147,59 @@ fn joint_machine_h8_absent_s1only_batch_publishes() {
         .filter_map(|record| record.api_returns)
         .sum();
     assert_eq!(api, 8, "all eight S1-only calls stage their S1 facts");
+}
+
+/// Staging names its refusal: with journal rows present but the H8
+/// adapter stopped, the per-admission step refuses and the machine
+/// retains the exact sub-exit for the drive line.
+#[test]
+fn joint_machine_staging_refusal_names_its_sub_exit() {
+    use crate::inventory_semantics::{SemanticRefusal, StagingDetail};
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    for seq in 1..=2u64 {
+        scene.scene.push(pid, 0, "C_SignInit", seq);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.reach_phase("Staging");
+    assert_eq!(
+        scene.machine.staging_detail_for_test(),
+        None,
+        "no diagnosis before the refusal"
+    );
+    {
+        let (adapter, model) = scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .parts();
+        let _ = adapter.stop(model);
+    }
+    assert_eq!(
+        scene.service(1024).unwrap_err(),
+        SemanticRefusal::Unavailable
+    );
+    assert_eq!(phase_of(&scene), "Staging");
+    let (_, stage, _, _) = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_staging_progress(&scene.scene.real.lane)
+        .expect("the refused batch is still prepared");
+    let detail = scene
+        .machine
+        .staging_detail_for_test()
+        .expect("the Staging refusal is retained");
+    assert_eq!(
+        detail,
+        StagingDetail::StageNext {
+            reason: "Admission",
+            stage,
+        }
+    );
+    assert_eq!(detail.to_string(), format!("stage_next:Admission@{stage}"));
 }

@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::attach::SessionDrainProducers;
-use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+use crate::events::{EventDrain, EventsDomain, ScriptedRecords, record_bytes};
 use crate::semantics_objects::journal::joint_driver::{
     IngestedRaw, RawJointQuantum, RawQuantumRefusal,
 };
@@ -14,6 +14,7 @@ use crate::semantics_objects::journal::tests::{
 use crate::semantics_objects::journal::{
     AttestationRefusal, H3DispositionEvidence, JournalDomainProof, SessionDrainGrant,
 };
+use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
 use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, publish_object_descriptors};
 
 #[path = "joint_audit_handoff.rs"]
@@ -88,6 +89,71 @@ pub(super) fn claim_refusal_and_staging_regression() {
         .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
         .unwrap();
     assert_eq!(operation_edge_rows(&fixture.real.scene)[0].0, Some(2));
+}
+
+/// Ordinary rows without journal rows: the strict driver still refuses
+/// `Admission` (no H8 subject exists for the admission), but staging
+/// skips the disposition and stages S1 directly.
+#[test]
+fn joint_h8_absent_s1only_stages_without_disposition() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    let descriptors = publish_object_descriptors();
+    for sequence in 1..=2u64 {
+        let (_, end) = fixture.encoded(pid, 0, "C_SignInit", sequence);
+        let payload = match decode_journal_record(&end, &descriptors) {
+            Some(JournalRecord::End(end)) => end.payload_base(),
+            other => panic!("the shaped END decodes: {other:?}"),
+        };
+        fixture
+            .drain
+            .source_mut()
+            .push_record(record_bytes(&payload));
+    }
+    let raw = fixture.prepare(2);
+    let (mut ingested, _) = fixture.ingest(raw);
+    let coordinator = &mut fixture.real.scene.coordinator;
+    while coordinator
+        .claim_next_prepared_admission(&fixture.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    let input = {
+        let (prepared, _) = coordinator.prepared_joint_parts().unwrap();
+        assert!(
+            prepared
+                .admissions()
+                .next()
+                .unwrap()
+                .joint_resource_origin()
+                .is_none(),
+            "bare ordinary rows carry no H8 association"
+        );
+        prepared.admissions().next().unwrap().clone()
+    };
+    {
+        let (_, owner) = coordinator.prepared_joint_parts().unwrap();
+        let refusal = match ingested.disposition_s1only_original(
+            owner.adapter_mut(),
+            &fixture.producers,
+            &input,
+        ) {
+            Ok(_) => panic!("no H8 subject exists for a bare ordinary row"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal, RawQuantumRefusal::Admission);
+        assert_eq!(refusal.code(), "Admission");
+    }
+    let mut staged = 0;
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.producers, &mut ingested)
+        .unwrap()
+    {
+        staged += 1;
+    }
+    assert_eq!(staged, 2);
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
 }
 
 impl JointScene {

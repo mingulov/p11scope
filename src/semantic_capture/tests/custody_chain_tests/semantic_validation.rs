@@ -26,6 +26,8 @@ mod sem2_feed;
 mod sem3_feed;
 #[path = "sem4_feed.rs"]
 mod sem4_feed;
+#[path = "sem5_feed.rs"]
+mod sem5_feed;
 
 struct HeldProviders {
     _dir: tempfile::TempDir,

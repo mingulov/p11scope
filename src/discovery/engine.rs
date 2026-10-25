@@ -3544,6 +3544,12 @@ pub(crate) const GRAPH_STRIDE: usize = 64;
 /// the T4c-2 sizing numbers).
 const COLLECTED_GRAPH_POOL_BYTES: usize = 384 * 1024 * 1024;
 
+/// Shared floor for synthetic test PIDs: above the 64-bit PID_MAX_LIMIT
+/// (4,194,304), so no real process ID can ever collide with the fake
+/// range no matter where the host PID allocator sits.
+#[cfg(test)]
+pub(crate) const FAKE_PID_FLOOR: u32 = 5_000_000;
+
 /// Lap tracker for pending leader-exit assessments at Q (R-26 N1/OD-12).
 /// `dirty` when a record queued a new assessment mid-lap, `at_q` while every
 /// call of the lap observed transport at Q, `clean` counting consecutive

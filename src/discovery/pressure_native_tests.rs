@@ -2392,7 +2392,7 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
         "{WHAT}: the fail-control mints nothing"
     );
     for offset in 0..MAX_PENDING_REFRESH {
-        let pid = 4_000_000 + offset as u32;
+        let pid = FAKE_PID_FLOOR + offset as u32;
         assert!(
             engine.request_refresh_consumed(pid, Some(1_000 + offset as u64)),
             "{WHAT}: request {offset} consumes"
@@ -2460,7 +2460,7 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
         .pressure_select_next(&protection)
         .expect("{WHAT}: an eligible entry is selected (blocking broken)");
     assert_eq!(
-        selection.pid, 4_000_000,
+        selection.pid, FAKE_PID_FLOOR,
         "{WHAT}: selection takes the lowest eligible pid"
     );
     assert!(

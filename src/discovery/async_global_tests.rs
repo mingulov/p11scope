@@ -103,7 +103,7 @@ impl Case {
         for offset in 0..MAX_PENDING_REFRESH - 1 {
             assert!(
                 self.engine
-                    .request_refresh(4_000_000 + offset as u32, Some(20 + offset as u64))
+                    .request_refresh(FAKE_PID_FLOOR + offset as u32, Some(20 + offset as u64))
             );
         }
         assert_eq!(self.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -451,7 +451,7 @@ fn async_global_h5_handoff_keeps_selected_request_and_whole_head() {
     let _scope = case.bounded_scope();
     case.full_requests();
     let original = case.engine.refresh_requested.clone();
-    let mut records = vec![refresh_exec(9_000_000), refresh_exec(4_000_000)];
+    let mut records = vec![refresh_exec(9_000_000), refresh_exec(FAKE_PID_FLOOR)];
     let mut collect = |_: &mut dyn EngineSession| Ok((Vec::new(), 0));
     case.engine
         .process_discovery_records(

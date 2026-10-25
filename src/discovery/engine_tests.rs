@@ -1714,7 +1714,7 @@ fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
     session.dequeues = (1..=5)
         .map(|pid| {
             Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
-                4_000_000 + pid,
+                FAKE_PID_FLOOR + pid,
             ))))
         })
         .collect();
@@ -1731,7 +1731,7 @@ fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
         .iter()
         .map(|queued| (queued.record.pid_tgid >> 32) as u32)
         .collect();
-    assert_eq!(order, (4_000_001..=4_000_005).collect::<Vec<_>>());
+    assert_eq!(order, (FAKE_PID_FLOOR + 1..=FAKE_PID_FLOOR + 5).collect::<Vec<_>>());
 
     engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
     engine.drain_discovery_from(&mut session).unwrap();
@@ -1876,7 +1876,7 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
     engine.frame_work_budget_ns = 0;
     let mut session = ScriptedSession::default();
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
-        exec_record_for(4_000_020),
+        exec_record_for(FAKE_PID_FLOOR + 20),
     )))]
     .into();
 
@@ -1910,7 +1910,7 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
     engine.frame_work_budget_ns = 0;
     let mut deferred = ScriptedSession::default();
     deferred.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
-        exec_record_for(4_000_021),
+        exec_record_for(FAKE_PID_FLOOR + 21),
     )))]
     .into();
     engine.drain_discovery_from(&mut deferred).unwrap();
@@ -1940,7 +1940,7 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
     engine.frame_work_budget_ns = 0;
     let mut unfinished = ScriptedSession::default();
     unfinished.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
-        exec_record_for(4_000_022),
+        exec_record_for(FAKE_PID_FLOOR + 22),
     )))]
     .into();
     engine.drain_discovery_from(&mut unfinished).unwrap();
@@ -1973,7 +1973,7 @@ fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
     engine.set_cancel_flag(std::sync::Arc::clone(&cancel));
     let mut session = ScriptedSession::default();
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
-        exec_record_for(4_000_010),
+        exec_record_for(FAKE_PID_FLOOR + 10),
     )))]
     .into();
 
@@ -2392,7 +2392,7 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -9647,7 +9647,7 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     // occupy the queue; those short-lived generations are absent at this tick.
     let mut pending = PendingViewRetirements::new();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        let earlier_pid = 4_000_000 + offset;
+        let earlier_pid = FAKE_PID_FLOOR + offset;
         assert_ne!(earlier_pid, pid, "the owned generation is not queued yet");
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
@@ -9662,7 +9662,7 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     // is safe and the retained head is refused exactly once, as before.
     let mut overflow_batch = vec![exec_record_for(pid)];
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        overflow_batch.push(exec_record_for(4_000_000 + offset));
+        overflow_batch.push(exec_record_for(FAKE_PID_FLOOR + offset));
     }
     apply_ordinary_batch(&mut engine, &mut session, overflow_batch).unwrap();
 
@@ -9688,7 +9688,7 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -17974,7 +17974,7 @@ impl LoaderPlanningFixture {
         for offset in 0..=MAX_PENDING_REFRESH as u32 {
             engine.dispatch_lifecycle_record(
                 &mut ScriptedSession::default(),
-                &exec_record_for(4_000_000 + offset),
+                &exec_record_for(FAKE_PID_FLOOR + offset),
                 &mut pending,
             );
         }
@@ -29715,7 +29715,7 @@ fn optional_polling_defers_at_a_full_refresh_queue_without_record_loss() {
 fn optional_polling_stops_when_the_last_refresh_entry_is_taken() {
     let (_children, mut engine, pids) =
         polling_engine_with_full_exec_queue(MAX_POLLING_RESCANS + 3);
-    engine.refresh_requested.remove(&4_000_000);
+    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
     let requested = engine.refresh_requested.clone();
 
     engine.queue_polling_rescans(&pids);
@@ -29742,7 +29742,7 @@ fn optional_polling_resumes_fairly_after_refresh_capacity_reopens() {
     let (_children, mut engine, pids) = polling_engine_with_full_exec_queue(3);
     engine.queue_polling_rescans(&pids);
     assert_eq!(engine.scheduler.poll_order(&pids), pids);
-    engine.refresh_requested.remove(&4_000_000);
+    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
 
     for (index, pid) in pids.iter().copied().enumerate() {
         engine.queue_polling_rescans(&pids);
@@ -29785,7 +29785,7 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -29811,7 +29811,7 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
     );
     engine.dispatch_lifecycle_record(
         &mut ScriptedSession::default(),
-        &exec_record_for(4_000_000),
+        &exec_record_for(FAKE_PID_FLOOR),
         &mut pending,
     );
     assert_eq!(engine.discovery_truncated, 1, "already-queued EXEC is free");
@@ -29834,7 +29834,7 @@ fn polling_engine_with_full_exec_queue(
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -32128,7 +32128,7 @@ pub(crate) mod detailed_proof_driver {
         changed_loss_overrun(1, 0);
     }
     fn trace_batch(engine: &mut Engine, required_rejection: bool) -> DiscoveryBatchOutcome {
-        let mut record = exec_record_for(4_000_001);
+        let mut record = exec_record_for(FAKE_PID_FLOOR + 1);
         if required_rejection {
             record.kind = u8::MAX;
         }
@@ -33599,7 +33599,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -33624,7 +33624,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
         "owed setup cannot retire ahead of the collected record"
     );
     assert_eq!(engine.loader_records_accepted, 0);
-    engine.refresh_requested.remove(&4_000_000);
+    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
     engine.frame_work_budget_ns = u64::MAX;
     engine.drain_discovery_from(&mut session).unwrap();
     assert!(engine.pending_discovery_records.is_empty());
@@ -33707,7 +33707,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
-            &exec_record_for(4_000_000 + offset),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
     }
@@ -33855,7 +33855,7 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
 
     // Exercise the actual empty inventory path on a populated provider plan.
     let mut fixture = RefreshFairnessFixture::new();
-    fixture.engine.request_refresh_consumed(4_000_000, Some(10));
+    fixture.engine.request_refresh_consumed(FAKE_PID_FLOOR, Some(10));
     let scans = fixture.engine.deep_scans;
     let mut session = ScriptedSession::default();
     assert!(
@@ -34055,14 +34055,14 @@ fn pressure_parked_head_waits_for_unprotected_service() {
     engine.frame_work_budget_ns = u64::MAX;
     for offset in 0..255u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1_000 + u64::from(offset)))
         );
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(2_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .chain((0..255u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     let mut session = ScriptedSession::with_records([], 0);
@@ -34096,7 +34096,7 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         .expect("the original head dispatched into the freed slot");
     let mut previous = head.serial;
     for offset in 0..255u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
+        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(1_000 + u64::from(offset)),
@@ -34138,7 +34138,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     peers.sort_unstable();
     let (decoy, unprotected) = (peers[0], peers[1]);
     assert!(
-        unprotected < 4_000_000,
+        unprotected < FAKE_PID_FLOOR,
         "pid-order selection needs both live peers below the fake range"
     );
     for (index, peer) in peers.iter().enumerate() {
@@ -34153,7 +34153,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     assert!(engine.request_refresh_consumed(unprotected, Some(1_200)));
     for offset in 0..253u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -34164,7 +34164,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     // decoy first and the unprotected request second.
     let head_pid = 6_000_000u32;
     let pending: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..253u32).map(|offset| 4_000_000 + offset))
+        .chain((0..253u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     assert_eq!(pending.len(), 254);
@@ -34307,7 +34307,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
+        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -34562,7 +34562,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert!(oracle.request_refresh_consumed(oracle_peer, Some(1_200)));
     for offset in 0..254u32 {
         assert!(
-            oracle.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            oracle.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(oracle.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -34637,7 +34637,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     }
     let (decoy, unprotected) = (peers[0], peers[1]);
     assert!(
-        unprotected < 4_000_000,
+        unprotected < FAKE_PID_FLOOR,
         "pid-order selection needs both live peers below the fake range"
     );
     for (index, peer) in peers.iter().enumerate() {
@@ -34652,7 +34652,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert!(engine.request_refresh_consumed(unprotected, Some(1_200)));
     for offset in 0..253u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -34674,12 +34674,12 @@ fn pressure_services_unprotected_request_before_original_head() {
     let decoy_before = engine.refresh_requested[&decoy].clone();
     let unprotected_before = engine.refresh_requested[&unprotected].clone();
     let unrelated_before: Vec<RefreshRequest> = (0..253u32)
-        .map(|offset| engine.refresh_requested[&(4_000_000 + offset)].clone())
+        .map(|offset| engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone())
         .collect();
     let unrelated_unchanged = |engine: &Engine| {
         for (offset, before) in unrelated_before.iter().enumerate() {
             assert_eq!(
-                engine.refresh_requested.get(&(4_000_000 + offset as u32)),
+                engine.refresh_requested.get(&(FAKE_PID_FLOOR + offset as u32)),
                 Some(before),
                 "unrelated request {offset} keeps its serial and age"
             );
@@ -34885,7 +34885,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     // order with original ages kept. Renewals dispatch no scan and charge
     // no work; the head and the skipped entries are never re-dispatched.
     let mut records: Vec<QueuedDiscoveryRecord> = (0..253u32)
-        .map(|offset| refresh_exec(4_000_000 + offset))
+        .map(|offset| refresh_exec(FAKE_PID_FLOOR + offset))
         .collect();
     engine
         .process_discovery_records(
@@ -34912,7 +34912,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
+        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -34967,7 +34967,7 @@ fn pressure_service_pass_leaves_h1_fairness_accounting_untouched() {
         assert!(
             fixture
                 .engine
-                .request_refresh_consumed(4_000_000 + offset, Some(3_000 + u64::from(offset)))
+                .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(3_000 + u64::from(offset)))
         );
     }
     assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -34982,7 +34982,7 @@ fn pressure_service_pass_leaves_h1_fairness_accounting_untouched() {
     let arms_before = fixture.engine.loader_arms();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(exec_record_for(head_pid))
-        .chain((0..255u32).map(|offset| exec_record_for(4_000_000 + offset)))
+        .chain((0..255u32).map(|offset| exec_record_for(FAKE_PID_FLOOR + offset)))
         .map(|record| QueuedDiscoveryRecord {
             record,
             terminal_owner: None,
@@ -35120,7 +35120,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     assert!(engine.request_refresh_consumed(pid, Some(1_000)));
     for offset in 0..254u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
@@ -35169,13 +35169,13 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&4_000_000),
+        !engine.refresh_requested.contains_key(&FAKE_PID_FLOOR),
         "the selected stale request was serviced"
     );
     // The selected transaction completes only its selection: every other
     // unprotected request is retained with its serial and age.
     for offset in 1..254u32 {
-        let request = engine.refresh_requested.get(&(4_000_000 + offset));
+        let request = engine.refresh_requested.get(&(FAKE_PID_FLOOR + offset));
         assert_eq!(
             request.map(|request| request.first_seen_ns),
             Some(Some(2_000 + u64::from(offset))),
@@ -35258,7 +35258,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     assert!(engine.request_refresh_consumed(pid2, Some(1_500)));
     for offset in 0..253u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
@@ -35272,7 +35272,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     .into();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..253u32).map(|offset| 4_000_000 + offset))
+        .chain((0..253u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     let parked_len = records.len();
@@ -35440,7 +35440,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     assert!(engine.request_refresh_consumed(success, Some(1_400)));
     for offset in 0..251u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -35460,7 +35460,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     let arms_before = engine.loader_arms();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..251u32).map(|offset| 4_000_000 + offset))
+        .chain((0..251u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     let mut collect = Engine::collect_discovery_records;
@@ -35663,7 +35663,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
     let mut previous = 0u64;
     for offset in 0..251u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
+        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -35717,12 +35717,12 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     blocked.frame_work_budget_ns = u64::MAX;
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         assert!(
-            blocked.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+            blocked.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1_000 + u64::from(offset)))
         );
     }
     let mut records: Vec<QueuedDiscoveryRecord> = [6_000_000u32, 6_000_001u32]
         .into_iter()
-        .chain((0..MAX_PENDING_REFRESH as u32).map(|offset| 4_000_000 + offset))
+        .chain((0..MAX_PENDING_REFRESH as u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     let mut session = ScriptedSession::with_records([], 0);
@@ -35769,7 +35769,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
     let selected = fixture.spawn_peer();
     wait_peer_mapped(selected, "seed-provider.so");
     assert!(
-        selected < 4_000_000 && selected != seed_pid,
+        selected < FAKE_PID_FLOOR && selected != seed_pid,
         "pid-order selection needs the live peer below the fake range"
     );
     // Retarget the pid scope at the viewless selected pid: the selected
@@ -35795,7 +35795,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
     assert!(engine.request_refresh_consumed(selected, Some(1_200)));
     for offset in 0..255u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -35916,7 +35916,7 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     let seed_view = engine.views[0].id();
     let selected = fixture.spawn_peer();
     wait_peer_mapped(selected, "seed-provider.so");
-    assert!(selected < 4_000_000);
+    assert!(selected < FAKE_PID_FLOOR);
     engine.scope = Scope::Pid(selected);
     // The cap filler carries scan evidence (dirty), so the classifier never
     // offers it: no victim exists anywhere. Dirty-state surgery, not a
@@ -35941,7 +35941,7 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     assert!(engine.request_refresh_consumed(selected, Some(1_200)));
     for offset in 0..255u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -36018,7 +36018,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
     engine.max_scan_pids = 2;
     let selected = fixture.spawn_peer();
     wait_peer_mapped(selected, "seed-provider.so");
-    assert!(selected < 4_000_000);
+    assert!(selected < FAKE_PID_FLOOR);
     engine.scope = Scope::Pid(selected);
     // The cap filler is exploratory AND the parked head's own view: only the
     // shield stands between it and eviction.
@@ -36039,7 +36039,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
     assert!(engine.request_refresh_consumed(selected, Some(1_200)));
     for offset in 0..255u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -36276,7 +36276,7 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         assert!(
             fixture
                 .engine
-                .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+                .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
@@ -36285,7 +36285,7 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
     let ticks_before = fixture.engine.scheduler.under_cap_ticks_for_test();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .chain((0..255u32).map(|offset| FAKE_PID_FLOOR + offset))
         .map(refresh_exec)
         .collect();
     let mut session = ScriptedSession::with_records([], 0);
@@ -36360,13 +36360,13 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
     engine.frame_work_budget_ns = u64::MAX;
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1_000 + u64::from(offset)))
         );
     }
     engine.set_pause_owned_batch(true);
     let ticks_before = engine.scheduler.under_cap_ticks_for_test();
     let mut records: Vec<QueuedDiscoveryRecord> =
-        vec![refresh_exec(6_000_000u32), refresh_exec(4_000_000u32)];
+        vec![refresh_exec(6_000_000u32), refresh_exec(FAKE_PID_FLOOR)];
     let mut session = ScriptedSession::with_records([], 0);
     let mut collect = Engine::collect_discovery_records;
     engine
@@ -36397,7 +36397,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
     for offset in 0..255u32 {
         assert!(
             tick_engine
-                .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+                .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     let mut records = vec![refresh_exec(6_000_001u32)];
@@ -36432,7 +36432,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
 
     engine.frame_work_budget_ns = 0;
     let ticks_before = engine.scheduler.under_cap_ticks_for_test();
-    let mut dequeues = vec![exec_record_for(6_000_002u32), exec_record_for(4_000_001u32)];
+    let mut dequeues = vec![exec_record_for(6_000_002u32), exec_record_for(FAKE_PID_FLOOR + 1)];
     let mut session = ScriptedSession::with_records(std::mem::take(&mut dequeues), 0);
     engine
         .drain_discovery_from(&mut session)
@@ -36453,7 +36453,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
     );
     assert_eq!(
         engine.pending_discovery_records[1].record.pid_tgid >> 32,
-        4_000_001u32 as u64
+        (FAKE_PID_FLOOR + 1) as u64
     );
     assert_eq!(engine.discovery_truncated, 1, "deferral refuses nothing");
     engine.frame_work_budget_ns = u64::MAX;
@@ -36498,7 +36498,7 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
         for offset in 0..254u32 {
             assert!(
                 engine
-                    .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+                    .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
             );
         }
         if pressure {
@@ -36518,7 +36518,7 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
             loader_record,
             exec_record_for(pid),
             exec_record_for(pid),
-            exec_record_for(4_000_000u32),
+            exec_record_for(FAKE_PID_FLOOR),
         ];
         for record in records.iter_mut().filter(|record| {
             record.kind == DISCOVERY_KIND_EXEC && (record.pid_tgid >> 32) as u32 == 6_000_000u32
@@ -41138,7 +41138,7 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        assert!(engine.request_refresh_consumed(4_000_000 + offset, Some(1)));
+        assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1)));
     }
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
@@ -49178,7 +49178,7 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     assert!(engine.request_refresh_consumed(selected, Some(1_200)));
     for offset in 0..255u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);

@@ -33,11 +33,11 @@
 //! that (image, file) key, so the next scan mints even at an unchanged
 //! local epoch. A move of the witness's storage_null counter since the
 //! key's last observation also mints: an unattributed hook event may
-//! hide a real mapping change behind unchanged epochs. When the
-//! absence-flag table is full a proven absence latches an overflow
-//! instead: the next observation that would otherwise continue mints
-//! and consumes the latch, so one dropped flag costs at most one
-//! spurious split. A range that
+//! hide a real mapping change behind unchanged epochs. Absence flags
+//! record only for keys with a retained observation, so flagged keys
+//! stay a subset of the observed keys under the same cap and the flag
+//! table cannot overflow; the overflow latch stays as an unreachable
+//! backstop. A range that
 //! *appears* at an unchanged triple is impossible under hook completeness
 //! and latches a sticky coverage fault for that (process, file). Only
 //! the executable flag compares: a write-bit-only protection change
@@ -682,15 +682,15 @@ pub(crate) struct InstanceRouter {
     /// consumes the flag; retained observations stay, so late calls
     /// stamped at the old epochs still join the old ID.
     absent: BTreeSet<(ImageKey, u32)>,
-    /// Latched when a proven absence could not be recorded because the
-    /// flag table is full. The next observation that would otherwise
-    /// continue mints instead and consumes the latch — fail closed by
-    /// splitting, never joining — so one dropped flag costs at most
-    /// one spurious split and the capture never churns. Same-epoch
-    /// scans neither mint nor consume (identical stamps cannot route
-    /// calls apart). Cleared by every era reset beside `absent`:
-    /// post-era calls cannot join pre-era lifetimes, so pre-era
-    /// breaks are moot. Bounded: one bit, no allocation past the cap.
+    /// Backstop for a proven absence that could not be recorded
+    /// because the flag table was full. Unreachable while flags record
+    /// only for observed keys: flagged keys stay a subset of the
+    /// observed keys under the same cap. If ever latched, the next
+    /// observation that would otherwise continue mints instead and
+    /// consumes the latch — fail closed by splitting, never joining.
+    /// Same-epoch scans neither mint nor consume (identical stamps
+    /// cannot route calls apart). Cleared by every era reset beside
+    /// `absent`. Bounded: one bit, no allocation past the cap.
     absence_overflowed: bool,
     faulted: BTreeSet<(ImageKey, u32)>,
     /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
@@ -1146,19 +1146,18 @@ impl InstanceRouter {
     /// continuing, even over an unchanged mapping with an unchanged
     /// local epoch — except a mapped scan at unchanged epochs, which
     /// closes the window without minting (identical stamps could not
-    /// route calls apart). Retired, faulted and invalid keys are
-    /// ignored: they hold no continuity to break. When the flag table
-    /// is full the break cannot be recorded for its key; the router
-    /// latches an overflow and counts the drop instead of joining
-    /// silently: the next observation that would otherwise continue
-    /// mints and consumes the latch, so one dropped flag costs at most
-    /// one spurious split. Never allocates past the cap.
+    /// route calls apart). Retired, faulted, invalid and never-observed
+    /// keys are ignored: they hold no continuity to break. Flags record
+    /// only for observed keys under the same cap, so the flag table
+    /// cannot overflow; the full-table latch below stays as an
+    /// unreachable backstop. Never allocates past the cap.
     pub(crate) fn note_proven_absence(&mut self, image: ImageIdentity, file: u32) {
         let key = ImageKey::from(image);
         if RetirementLedger::index(key.cookie).is_none()
             || file >= instance::FILE_SLOTS
             || self.image_retired(key)
             || self.faulted.contains(&(key, file))
+            || !self.observed.contains_key(&(key, file))
         {
             return;
         }
@@ -1171,6 +1170,19 @@ impl InstanceRouter {
             self.absence_overflowed = true;
             self.counters.absence_overflows = self.counters.absence_overflows.saturating_add(1);
         }
+        self.debug_check_absent_subset();
+    }
+
+    /// Debug-only subset check: every flagged key holds a retained
+    /// observation. Both sets share the `observed_keys` cap, so the
+    /// flag table cannot overflow while this holds.
+    fn debug_check_absent_subset(&self) {
+        debug_assert!(
+            self.absent
+                .iter()
+                .all(|key| self.observed.contains_key(key)),
+            "absence flags stay a subset of observed keys"
+        );
     }
 
     /// Records the scan pass's `INSTANCE_COUNT.storage_null` counter. The
@@ -1261,9 +1273,11 @@ impl InstanceRouter {
                         self.faulted_overflowed = true;
                     }
                     self.faulted.insert(key);
+                    self.absent.remove(&key);
                     if let Some(list) = self.observed.remove(&key) {
                         self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
                     }
+                    self.debug_check_absent_subset();
                     let resolved = self.fail_pending(
                         |call| {
                             ImageKey::from(call.facts.image) == image

@@ -3187,6 +3187,81 @@ mod tests {
         }
     }
 
+    /// Assert the staged extent published. A mismatch names the actual
+    /// publication (variant, extent, refusal) instead of failing silent.
+    fn assert_growth_published(
+        publication: crate::attach::counter_banks::BankPublication,
+        first: u32,
+        end: u32,
+    ) {
+        use crate::attach::counter_banks::{BankExtent, BankPublication};
+        assert!(
+            matches!(publication, BankPublication::Published { extent, .. } if extent == BankExtent { first, end }),
+            "growth publication mismatch"
+        );
+    }
+
+    #[test]
+    fn growth_publication_mismatch_names_variant_extent_and_refusal() {
+        use crate::attach::counter_banks::{BankExtent, BankPublication, BankRefusal};
+        let mismatches: [(BankPublication, &[&str]); 3] = [
+            (
+                BankPublication::RolledBack {
+                    transaction: 7,
+                    extent: BankExtent {
+                        first: 513,
+                        end: 8192,
+                    },
+                    reason: BankRefusal::Budget,
+                },
+                &["RolledBack", "513", "8192", "Budget"],
+            ),
+            (
+                BankPublication::Refused(BankRefusal::Budget),
+                &["Refused", "Budget"],
+            ),
+            (
+                BankPublication::Published {
+                    transaction: 7,
+                    extent: BankExtent { first: 0, end: 512 },
+                },
+                &["Published", "512"],
+            ),
+        ];
+        for (publication, expected) in mismatches {
+            let message = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_growth_published(publication, 513, 8192);
+            }))
+            .expect_err("a mismatched publication must panic");
+            let text = message
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    message
+                        .downcast_ref::<&str>()
+                        .map(|text| text.to_string())
+                })
+                .expect("panic carries its message");
+            for word in expected {
+                assert!(
+                    text.contains(word),
+                    "mismatch message names {word}: {text}"
+                );
+            }
+        }
+        assert_growth_published(
+            BankPublication::Published {
+                transaction: 7,
+                extent: BankExtent {
+                    first: 513,
+                    end: 8192,
+                },
+            },
+            513,
+            8192,
+        );
+    }
+
     struct NativeGrowthRun {
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,

@@ -1284,6 +1284,8 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
     );
     // SAFETY: success above initialized it.
     let stat = unsafe { stat.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     Ok(stat.f_type as u64 == BTRFS_SUPER_MAGIC)
 }
 

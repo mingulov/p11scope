@@ -438,7 +438,11 @@ pub fn fd_is_on_overlayfs(file: &std::fs::File) -> bool {
         return false;
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`.
-    unsafe { buf.assume_init().f_type as u64 == OVERLAYFS_SUPER_MAGIC }
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    unsafe {
+        buf.assume_init().f_type as u64 == OVERLAYFS_SUPER_MAGIC
+    }
 }
 
 #[cfg(feature = "identify")]

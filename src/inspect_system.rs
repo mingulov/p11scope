@@ -6567,10 +6567,13 @@ pub(crate) mod demotion_retirement_producer_tests {
                     // the whole table; CLOEXEC (not close) keeps
                     // Rust's already-CLOEXEC spawn-error channel
                     // intact, and every marked fd vanishes at exec.
-                    if libc::close_range(
+                    // The raw syscall keeps the static musl build,
+                    // whose libc has no close_range wrapper.
+                    if libc::syscall(
+                        libc::SYS_close_range,
                         3,
                         libc::c_uint::MAX,
-                        libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+                        libc::CLOSE_RANGE_CLOEXEC,
                     ) != 0
                     {
                         // Pre-5.9 kernels: sweep a fixed cap

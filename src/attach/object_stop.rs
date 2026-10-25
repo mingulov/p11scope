@@ -153,6 +153,92 @@ mod tests {
         Ok(())
     }
 
+    /// OD-1 capture-program inventory: every `#[uprobe]` /
+    /// `#[uretprobe]` / `#[raw_tracepoint(..)]` function in the capture
+    /// source, including `#[cfg(feature = ..)]`-gated ones. Returns
+    /// `(name, body)` with the body from the `pub fn` line through its
+    /// column-zero closing brace.
+    fn scanned_capture_programs() -> Vec<(String, String)> {
+        let source = include_str!("../../crates/ebpf/src/main.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut programs = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            let is_program = line == "#[uprobe]"
+                || line == "#[uretprobe]"
+                || line.starts_with("#[raw_tracepoint");
+            if !is_program {
+                index += 1;
+                continue;
+            }
+            let head = lines[index + 1]
+                .strip_prefix("pub fn ")
+                .expect("a capture attribute is immediately followed by its fn");
+            let name = head.split('(').next().expect("a fn name").to_string();
+            let end = lines[index + 2..]
+                .iter()
+                .position(|line| *line == "}")
+                .map(|offset| index + 2 + offset)
+                .expect("a top-level fn ends at column zero");
+            programs.push((name, lines[index + 1..=end].join("\n")));
+            index = end + 1;
+        }
+        programs
+    }
+
+    #[test]
+    fn capture_source_programs_enter_stop_gate_or_carry_admission() {
+        const CARRIED: &[&str] = &["interface_list_worker", "p11_entry_template_second"];
+        let programs = scanned_capture_programs();
+        let names: Vec<&str> = programs.iter().map(|(name, _)| name.as_str()).collect();
+        eprintln!("scanned capture programs ({}): {names:?}", names.len());
+        assert_eq!(names.len(), 17, "the capture source names 17 programs");
+        for carried in CARRIED {
+            assert!(
+                names.contains(carried),
+                "carried continuation {carried} is a scanned program"
+            );
+        }
+        for (name, body) in &programs {
+            let carried = CARRIED.contains(&name.as_str());
+            let enter = body.find("stop_gate_enter()");
+            let leave = body.find("stop_gate_leave()");
+            if carried {
+                assert!(
+                    enter.is_none(),
+                    "{name} carries admission and must not re-check the gate"
+                );
+                assert!(
+                    leave.is_some(),
+                    "{name} carries admission and must release it"
+                );
+                continue;
+            }
+            let enter = enter.expect("a non-carried program enters the stop gate");
+            assert!(
+                leave.is_some(),
+                "{name} enters the stop gate and must leave it"
+            );
+            // Fail closed: before the gate line, only comments, blanks and
+            // the register/stack-discipline tail calls may run. Those calls
+            // touch no map data (out-of-range index, immediate return); any
+            // other pre-gate code — including a map data accessor — fails.
+            // Complete lines before the gate line, minus the fn signature.
+            let gate_line = body[..enter].lines().count();
+            for line in body.lines().skip(1).take(gate_line.saturating_sub(2)) {
+                let code = line.trim();
+                if code.is_empty() || code.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    code == "keep_kernel_stack(&ctx);" || code == "keep_endpoint_stack(&ctx);",
+                    "{name} runs before the stop gate: {code}"
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "privileged: frozen real OBJECT_START must not produce false scrub success"]
     fn object_stop_reports_real_scrub_failure() -> Result<()> {

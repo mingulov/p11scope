@@ -49058,8 +49058,32 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
     engine
         .pending_retirements
         .extend((0..16u32).map(ProcessViewId));
+    // The five graph-private index leases (one per split Facts row:
+    // ObjectSkips, Corroboration, Fallbacks, Claims, Tables; Lowering
+    // is all-live) stay graph-local through Install into Reclaim,
+    // while the six live leases moved to the backing at Install step 4.
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Reclaim)
+    });
+    let graph = engine.collected_graph.as_ref().expect("graph 1 boxed");
+    assert_eq!(
+        graph.facts.storage.len(),
+        5,
+        "graph 1 holds its private index leases into Reclaim"
+    );
+    assert!(
+        graph.facts.live_storage.is_empty(),
+        "graph 1 moved its live leases to the backing at Install"
+    );
     drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     assert!(engine.pending_retirements.is_empty());
+    assert!(
+        engine.collected_graph.is_none(),
+        "graph 1 drops at Done, releasing its private leases"
+    );
     assert_eq!(engine.collected_graphs_created, 1);
     assert!(engine.collected_graph_refused().is_none());
     assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
@@ -49093,7 +49117,33 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
         6,
         "graph 2's install moves graph 1's facts leases to the handoff"
     );
+    assert_eq!(
+        graph.facts.storage.len(),
+        5,
+        "graph 2 holds its private index leases into Reclaim"
+    );
+    assert!(
+        graph.facts.live_storage.is_empty(),
+        "graph 2 moved its live leases to the backing at Install"
+    );
+    // The private hold lasts through the Reclaim drain (the index sets
+    // stride off across steps 9-17); it releases with the graph at Done.
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
+        engine.collected_graph.as_ref().is_some_and(|graph| {
+            graph.phase == GraphPhase::Reclaim && graph.reclaim_step >= 17
+        })
+    });
+    let graph = engine.collected_graph.as_ref().expect("graph 2 boxed");
+    assert_eq!(
+        graph.facts.storage.len(),
+        5,
+        "graph 2 holds its private index leases through its Reclaim drain"
+    );
     drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
+    assert!(
+        engine.collected_graph.is_none(),
+        "graph 2 drops at Done, releasing its private leases"
+    );
     assert_eq!(engine.collected_graphs_created, 2);
     assert!(engine.collected_graph_refused().is_none());
     assert_eq!(engine.collected_graph_reclaim_forgotten, 0);

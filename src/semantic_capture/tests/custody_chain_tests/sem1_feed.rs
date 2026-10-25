@@ -211,10 +211,7 @@ fn fault_era_unknown_calls_are_disclosed() {
     }
     {
         let mut h0 = scene.h0.0.borrow_mut();
-        for record in h0.io.script.records.iter_mut() {
-            record.base.continuity.entry_stamp.fault = 1;
-            record.base.continuity.return_stamp.fault = 1;
-        }
+        h0.io.stain_queued_stale_era();
     }
     let batch = scene.tick();
     scene.publish(batch);

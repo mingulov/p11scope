@@ -271,6 +271,18 @@ impl HeldIo {
         record.base.continuity.entry_ip = base + endpoint.offset;
     }
 
+    /// Stale-era stain for the sem1 disclosure pin: every queued record
+    /// moves to a fault era the router has not observed, so each routes
+    /// Unknown and sheds at finalization. The private-field spelling
+    /// lives here in the allowlisted fixture; the sem1 child calls this
+    /// helper and consumes no private record fields itself.
+    fn stain_queued_stale_era(&mut self) {
+        for record in self.script.records.iter_mut() {
+            record.base.continuity.entry_stamp.fault = 1;
+            record.base.continuity.return_stamp.fault = 1;
+        }
+    }
+
     fn scan_proof(
         &mut self,
         image: ImageIdentity,

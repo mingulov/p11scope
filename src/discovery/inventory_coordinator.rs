@@ -7060,10 +7060,7 @@ pub(crate) mod tests {
         let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
         std::fs::write(shared_file.path(), vec![0x7fu8; 8192]).expect("pin bytes");
         let shared_path = shared_file.path().to_path_buf();
-        let shared_path_text = shared_path
-            .to_str()
-            .expect("a utf-8 pin path")
-            .to_string();
+        let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
         let mut pins = PinnedObjects::empty();
         let mut keys = Vec::new();
         for (slot, id) in [(0u64, view), (1, retained)] {
@@ -7145,10 +7142,8 @@ pub(crate) mod tests {
             &producers,
             Vec::<Vec<u8>>::new(),
         );
-        let drain = EventDrain::over_domain(
-            ScriptedRecords::records(Vec::<Vec<u8>>::new(), 0),
-            events,
-        );
+        let drain =
+            EventDrain::over_domain(ScriptedRecords::records(Vec::<Vec<u8>>::new(), 0), events);
         observer.request_stop();
         let q = observer
             .observe(&producers, None, &drain)
@@ -7205,15 +7200,10 @@ pub(crate) mod tests {
             "the unproven live view stays"
         );
         assert!(
-            coordinator
-                .engine
-                .counters
-                .object_skips
-                .iter()
-                .any(|skip| {
-                    skip.subject == "live discovery lifecycle"
-                        && skip.reason.starts_with("1 retirements not proven")
-                }),
+            coordinator.engine.counters.object_skips.iter().any(|skip| {
+                skip.subject == "live discovery lifecycle"
+                    && skip.reason.starts_with("1 retirements not proven")
+            }),
             "the live intent disposes as unproven"
         );
         assert_eq!(
@@ -7275,12 +7265,7 @@ pub(crate) mod tests {
         assert!(coordinator.engine.collected_graph.is_none());
         assert!(failed, "the lane reports the refusal");
         assert!(
-            coordinator
-                .engine
-                .collected_graph_pool
-                .snapshot()
-                .refused
-                >= 1,
+            coordinator.engine.collected_graph_pool.snapshot().refused >= 1,
             "the graph pool counts the refusal"
         );
         assert_eq!(

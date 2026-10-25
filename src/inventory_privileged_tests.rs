@@ -4079,11 +4079,20 @@ fn drive_until_mapped(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     pids: &[u32],
 ) -> Result<()> {
-    for _ in 0..10 {
+    for round in 0..10 {
         if pids.iter().all(|pid| has_mapped_edge(coordinator, *pid)) {
             return Ok(());
         }
         drive_native_passes_until(coordinator, &mut |passes| Ok(passes >= 4))?;
+        let mapped = pids
+            .iter()
+            .filter(|pid| has_mapped_edge(coordinator, **pid))
+            .count();
+        eprintln!(
+            "JOINT_R16 r16-map round={round} mapped={}/{}",
+            mapped,
+            pids.len()
+        );
     }
     ensure!(
         pids.iter().all(|pid| has_mapped_edge(coordinator, *pid)),
@@ -4152,7 +4161,35 @@ fn start_joint_lane(
     lane.initialize_joint(coordinator)
         .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
     ensure!(lane.has_joint_machine(), "the machine initializes live");
+    joint_drive_line(&lane, coordinator, "r16-lane", "started");
     Ok(lane)
+}
+
+/// One JOINT_R16 drive-state line: the lane gates plus the machine's
+/// retained phase/demand, before every driven step (and after a
+/// refusal, where the retained phase names the exact failing step).
+fn joint_drive_line(
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    step: &str,
+) {
+    let (live, gated, finished, ticks, phase, demand, work, base) =
+        lane.joint_drive_state_for_test();
+    let work = work.map_or_else(
+        || "-".to_string(),
+        |(attempted, pending)| format!("{attempted}/{pending}"),
+    );
+    eprintln!(
+        "JOINT_R16 {tag} step={step} live={} gated={} finished={} ticks={ticks} \
+         phase={phase} demand={demand} work={work} base={base} \
+         revision={} feeds={}",
+        u8::from(live),
+        u8::from(gated),
+        u8::from(finished),
+        coordinator.registry().published_revision(),
+        coordinator.registry().joint_feeds(),
+    );
 }
 
 /// Drive one Running transaction to publication through the real lane
@@ -4165,6 +4202,7 @@ fn service_to_published(
     tag: &str,
 ) -> Result<u64> {
     use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
+    joint_drive_line(lane, coordinator, tag, "begin");
     lane.begin_joint_commit(engine_changed).map_err(|refusal| {
         let reason = match refusal {
             crate::inventory_semantics::JointCommitRefusal::NotInitialized => "not initialized",
@@ -4185,15 +4223,23 @@ fn service_to_published(
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
+        joint_drive_line(lane, coordinator, tag, &format!("service{polls}"));
         lane.service_joint(&mut *coordinator, JointServiceMode::Running, &mut budget)
-            .map_err(|reason| anyhow::anyhow!("{tag}: service refused: {reason}"))?;
+            .map_err(|reason| {
+                joint_drive_line(lane, coordinator, tag, "service-FAILED");
+                anyhow::anyhow!("{tag}: service refused: {reason}")
+            })?;
         let mut budget = JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
+        joint_drive_line(lane, coordinator, tag, &format!("poll{polls}"));
         let commit = lane
             .poll_joint_commit(&mut *coordinator, &mut budget)
-            .map_err(|reason| anyhow::anyhow!("{tag}: commit poll refused: {reason}"))?;
+            .map_err(|reason| {
+                joint_drive_line(lane, coordinator, tag, "poll-FAILED");
+                anyhow::anyhow!("{tag}: commit poll refused: {reason}")
+            })?;
         polls += 1;
         if matches!(
             commit,
@@ -4417,6 +4463,12 @@ fn finish_stop_take_mint(
     tag: &str,
 ) -> Result<crate::inventory_promotion::lifecycle::SessionNativeCompletion> {
     use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
+    joint_drive_line(
+        driver.semantic.as_ref().expect("lane"),
+        &*driver.coordinator,
+        tag,
+        "finish-begin",
+    );
     driver.begin_final_joint_finish();
     ensure!(
         driver.joint_finish == JointFinishDriver::Polling,
@@ -4630,17 +4682,21 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // replay, no revision, no H3 movement.
     let revision_q1 = coordinator.registry().published_revision();
     let h3_q1 = coordinator.reference_h3_audit_state();
-    for _ in 0..3 {
+    for idle in 0..3 {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
+        joint_drive_line(&lane, &coordinator, "r16-q1", &format!("idle{idle}"));
         lane.service_joint(
             &mut coordinator,
             crate::inventory_semantics::JointServiceMode::Running,
             &mut budget,
         )
-        .map_err(|reason| anyhow::anyhow!("r16-q1: idle service refused: {reason}"))?;
+        .map_err(|reason| {
+            joint_drive_line(&lane, &coordinator, "r16-q1", "idle-FAILED");
+            anyhow::anyhow!("r16-q1: idle service refused: {reason}")
+        })?;
     }
     ensure!(
         coordinator.registry().published_revision() == revision_q1,
@@ -5177,17 +5233,18 @@ fn joint_edge_census(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec
     census
 }
 
-/// R1.6 cell 2: absence and S1Only siblings beside a post-attach exec. E
-/// execs after attach and its new incarnation births Joint; C maps only
-/// the SoftHSM copy (its unmapped held provider is absence-proven, never
-/// a false positive); H holds a semantic call on the held provider so
-/// that module genuinely exists in the run; S enters its held call before
-/// attach (entries genuinely shed) and returns it late, so its orphan
-/// END registers S1Only and reduces S1-direct exactly once, never
-/// upgraded to Joint. Three transactions, one revision each, then a
-/// finite stop with joined same-owner cleanup.
+/// R1.6 cell 2: absence and S1Only siblings beside an exec. E execs
+/// under native coverage and its successor incarnation is admitted (with
+/// its mapped edge) before the semantic lane attaches; then E-post births
+/// Joint; C maps only the SoftHSM copy (its unmapped held provider is
+/// absence-proven, never a false positive); H holds a semantic call on
+/// the held provider so that module genuinely exists in the run; S enters
+/// its held call before attach (entries genuinely shed) and returns it
+/// late, so its orphan END registers S1Only and reduces S1-direct exactly
+/// once, never upgraded to Joint. Three transactions, one revision each,
+/// then a finite stop with joined same-owner cleanup.
 #[test]
-#[ignore = "privileged: live Joint absence and S1Only siblings beside a post-attach exec"]
+#[ignore = "privileged: live Joint absence and S1Only siblings beside an exec"]
 fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     let cell_started = Instant::now();
     let workload = JointWorkload::build()?;
@@ -5198,10 +5255,15 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         // SAFETY: a valid NUL-terminated path.
         ensure!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0, "mkfifo");
     }
-    // S's gate opens before attach (its entries are genuinely pre-attach);
-    // every other gate opens after.
+    // S's gate opens before attach (its entries are genuinely pre-attach).
+    // E's own go/trig gates open under the native exec drive, before the
+    // semantic lane attaches; C's, H's and E-post's gates open after.
     let go = workload.path("go");
     let go_arg = go.to_str().context("go path")?.to_string();
+    let go_e = workload.path("go-e");
+    let go_e_arg = go_e.to_str().context("go-e path")?.to_string();
+    let trig_e = workload.path("trig-e");
+    let trig_e_arg = trig_e.to_str().context("trig-e path")?.to_string();
     let go_s = workload.path("go-s");
     let go_s_arg = go_s.to_str().context("go-s path")?.to_string();
     let late_e = workload.path("late-e");
@@ -5221,7 +5283,9 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             "--module",
             &soft_arg,
             "--go",
-            &go_arg,
+            &go_e_arg,
+            "--trig",
+            &trig_e_arg,
             "--late",
             &late_e_arg,
             "--iters",
@@ -5297,42 +5361,71 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         &["C_SignInit", "C_Sign"],
         "joint-r16-held.dr37.json",
     )?;
-    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
-    let attach_ns = monotonic_ns();
-
-    // The post-attach exec: gen 0 runs, execs, and gen 1 maps again. The
-    // observer admits the new incarnation before its first call.
-    std::fs::write(&go, b"")?;
-    process_e.wait_for("EXEC ", Duration::from_secs(30))?;
-    let started = Instant::now();
-    loop {
-        let text = std::fs::read_to_string(&process_e.out)?;
-        if text
+    // The exec spans one native lane: the binder mints the successor only
+    // when a single domain sees gen 0's bound image, the EXEC record and
+    // gen 1's later-image row. go_e opens on the first pass (gen 0 probes
+    // and execs); trig_e opens once gen 1 readies (its probe proves the
+    // later image). Passes take seconds next to the fixture's
+    // milliseconds, so the schedule has wide margins; the post-drive
+    // ensure checks the mint plus the successor's mapped edge.
+    let e_out = process_e.out.clone();
+    let mut go_written = false;
+    let mut trig_written = false;
+    drive_native_passes_until(&mut coordinator, &mut |passes| {
+        if !go_written {
+            std::fs::write(&go_e, b"")?;
+            go_written = true;
+        }
+        let text = std::fs::read_to_string(&e_out).unwrap_or_default();
+        let readys = text
             .lines()
             .filter(|line| line.starts_with("READY "))
-            .count()
-            >= 2
-        {
-            break;
+            .count();
+        if !trig_written && readys >= 2 {
+            std::fs::write(&trig_e, b"")?;
+            trig_written = true;
         }
-        ensure!(
-            started.elapsed() < Duration::from_secs(30),
-            "the post-exec image never readied: {:?}",
-            process_e.lines()
+        let exec = text.lines().any(|line| line.starts_with("EXEC "));
+        let gen0 = text.lines().any(|line| line.starts_with("GEN0DONE "));
+        let trig_done = text.lines().any(|line| line.starts_with("TRIGDONE "));
+        eprintln!(
+            "JOINT_R16 r16b-exec pass={passes} readys={readys} exec={} gen0={} trig={} trigdone={}",
+            u8::from(exec),
+            u8::from(gen0),
+            u8::from(trig_written),
+            u8::from(trig_done),
         );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 3))?;
+        Ok(passes >= 16)
+    })?;
     let exec_records: Vec<_> = coordinator
         .adapter()
         .records()
         .filter(|record| record.pid == process_e.pid())
         .collect();
+    eprintln!(
+        "JOINT_R16 r16b-exec admitted records={} live={:?} mapped={}",
+        exec_records.len(),
+        coordinator
+            .adapter()
+            .live_id(process_e.pid())
+            .map(|id| id.0),
+        u8::from(has_mapped_edge(&coordinator, process_e.pid())),
+    );
     ensure!(
         exec_records.len() >= 2,
         "the exec minted a new incarnation: {} records",
         exec_records.len()
     );
+    ensure!(
+        has_mapped_edge(&coordinator, process_e.pid()),
+        "the exec successor maps before attach"
+    );
+    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let attach_ns = monotonic_ns();
+
+    // E-post, C and H run under the attached lane: E-post's b script is
+    // its only observed Joint input (both probes predate the attach).
+    std::fs::write(&go, b"")?;
     std::fs::write(&late_e, b"")?;
     process_e.wait_for("DONE ", Duration::from_secs(60))?;
     process_c.wait_for("DONE ", Duration::from_secs(60))?;

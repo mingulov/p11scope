@@ -12,10 +12,14 @@
  *                   choreography needs a real admittable operation here.
  *   MODE b        SoftHSM script: READY, wait --go, run the fixed call
  *                   script, print CALLS + DONE.
- *   MODE exec     post-attach exec producer: gen 0 maps the provider, READY,
- *                   waits --go, prints EXEC and execs itself with --gen 1;
- *                   gen 1 maps again (fresh image), READY, waits --late,
- *                   runs the b script, DONE.
+ *   MODE exec     exec producer: gen 0 maps the provider, READY, waits
+ *                   --go, runs the mini probe (GEN0DONE, never CALLS),
+ *                   prints EXEC and execs itself with --gen 1; gen 1 maps
+ *                   again (fresh image), READY, waits --trig, runs the mini
+ *                   probe (TRIGDONE), waits --late, runs the b script, DONE.
+ *                   The two probes are observed pre/post-exec calls, so the
+ *                   native binder sees the ended image and its later image
+ *                   in one domain and mints the exec successor.
  *   MODE absent   absence subject: maps --module only, runs Initialize +
  *                   one GetSlotList + Finalize (so it is admitted), never
  *                   maps the subset's other provider, DONE. The observer
@@ -30,6 +34,8 @@
  *                   entries are genuinely pre-attach while its return is
  *                   post-attach.
  *   --late FILE    second gate (exec gen 1). Required by that mode.
+ *   --trig FILE    first gate (exec gen 1): the trigger probe proving the
+ *                   later image runs once it opens. Required by that mode.
  *   --release FIFO (a) the release FIFO the held call blocks on. Required.
  *                   One FIFO per held process (each opens its own).
  *   --iters N      (b/exec) digest iterations (default 2).
@@ -46,6 +52,8 @@
  *   CALLS cell pid fn n bad              n calls ENTERED (counted before the
  *                                         call), bad = calls returning rv != 0
  *   EXEC cell pid gen next               about to exec (next = gen + 1)
+ *   GEN0DONE cell pid gen status         gen 0 finished its mini probe
+ *   TRIGDONE cell pid gen status         gen 1 finished its trigger probe
  *   DONE cell pid gen exe status         finished (status ok|fail)
  * t values are CLOCK_MONOTONIC ns in the workload's time namespace, for the
  * hold-window check (same namespace as the observer on the root lane).
@@ -400,6 +408,32 @@ static int run_soft_script(void **f, int iters)
     return bad;
 }
 
+/* A three-call probe (Initialize/GetSlotList/Finalize) that never touches
+ * the CALLS ledger: gen 0 binds its native image with it before EXEC, and
+ * gen 1 proves its later image with it after READY, so one native domain
+ * sees both and the observer mints the exec successor. Prints one TAGDONE
+ * line. Returns nonzero if any call failed. */
+static int run_mini_probe(void **f, const char *tag)
+{
+    CK_RV rv;
+    CK_SLOT_ID slots[16];
+    CK_ULONG count = 16;
+    CK_INIT_ARGS args;
+    int bad = 0;
+    memset(&args, 0, sizeof(args));
+    rv = ((CK_RV(*)(void *))f[I_Initialize])(&args);
+    bad |= (rv != 0);
+    rv = ((CK_RV(*)(unsigned char, CK_SLOT_ID *, CK_ULONG *))f[I_GetSlotList])(1, slots,
+                                                                              &count);
+    bad |= (rv != 0);
+    rv = ((CK_RV(*)(void *))f[I_Finalize])(NULL);
+    bad |= (rv != 0);
+    printf("%s cell=%s pid=%d gen=%d status=%s\n", tag, cell, getpid(), gen,
+           bad ? "fail" : "ok");
+    fflush(stdout);
+    return bad;
+}
+
 static void read_self_exe(void)
 {
     ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
@@ -410,7 +444,7 @@ static void read_self_exe(void)
 
 int main(int argc, char **argv)
 {
-    const char *mode, *module = NULL, *go = "-", *late = NULL, *release = NULL;
+    const char *mode, *module = NULL, *go = "-", *late = NULL, *trig = NULL, *release = NULL;
     int iters = 2, hold = 0, i;
     void *dl;
     void **f;
@@ -432,6 +466,9 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--late") && v) {
             late = v;
+            i++;
+        } else if (!strcmp(a, "--trig") && v) {
+            trig = v;
             i++;
         } else if (!strcmp(a, "--release") && v) {
             release = v;
@@ -526,7 +563,9 @@ int main(int argc, char **argv)
     }
     if (!strcmp(mode, "exec")) {
         if (gen == 0) {
-            /* Pre-exec image: mapped and gated, never calls. */
+            /* Pre-exec image: bind its native image with the mini probe
+             * (observed calls), then EXEC. Without an observed pre-exec
+             * call the binder could never prove the image ended. */
             char gen_arg[32];
             char *child_argv[64];
             int n = 0, k;
@@ -535,6 +574,9 @@ int main(int argc, char **argv)
             printf("READY cell=%s pid=%d exe=%s\n", cell, getpid(), self_exe);
             fflush(stdout);
             wait_for_file(go, "go gate never opened");
+            f = function_table(dl);
+            if (run_mini_probe(f, "GEN0DONE"))
+                die("gen 0 probe failed");
             printf("EXEC cell=%s pid=%d gen=0 next=1\n", cell, getpid());
             fflush(stdout);
             snprintf(gen_arg, sizeof(gen_arg), "%d", 1);
@@ -551,10 +593,16 @@ int main(int argc, char **argv)
             execv(child_argv[0], child_argv);
             die("exec failed");
         }
-        /* Post-exec image: fresh mapping, gated again so the observer
-         * admits the new incarnation before its first call. */
+        /* Post-exec image: fresh mapping; the trigger probe proves the
+         * later image (the binder mints the successor), then the late
+         * gate releases the b script. The probe never touches CALLS:
+         * e_total counts the b script only. */
         if (!late) {
             fprintf(stderr, "mode exec gen 1 needs --late\n");
+            return 2;
+        }
+        if (!trig) {
+            fprintf(stderr, "mode exec gen 1 needs --trig\n");
             return 2;
         }
         dl = map_provider(module);
@@ -562,6 +610,9 @@ int main(int argc, char **argv)
         f = function_table(dl);
         printf("READY cell=%s pid=%d exe=%s\n", cell, getpid(), self_exe);
         fflush(stdout);
+        wait_for_file(trig, "trig gate never opened");
+        if (run_mini_probe(f, "TRIGDONE"))
+            die("gen 1 probe failed");
         wait_for_file(late, "late gate never opened");
         {
             int bad = run_soft_script(f, iters);

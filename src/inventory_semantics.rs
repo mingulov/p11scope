@@ -1214,6 +1214,20 @@ pub(crate) struct ScriptedStopCounts {
     pub(crate) scan_refusals: u64,
 }
 
+/// Tests-only Joint drive state: lane live/gated/finished/ticks plus the
+/// machine's retained phase/demand, in-flight work and prepared base.
+#[cfg(test)]
+type JointDriveState = (
+    bool,
+    bool,
+    bool,
+    u64,
+    &'static str,
+    &'static str,
+    Option<(usize, usize)>,
+    u64,
+);
+
 impl AttestedSemanticLane {
     pub(crate) fn with_pending_h3_continuation<R>(
         &self,
@@ -1722,6 +1736,34 @@ impl AttestedSemanticLane {
             Ok(()) => Ok(Some(live.session)),
             Err(error) => release_terminal_owner(live, Err(error)).map(|()| None),
         }
+    }
+
+    /// Tests-only Joint drive state for the live root cells'
+    /// diagnostics: the lane gates plus the machine's retained
+    /// phase/demand, read-only. After a refused service or poll the
+    /// retained phase names the exact failing step; a refusal that
+    /// advances nothing (same phase as the pre-step line) fired in
+    /// the lane wrapper or the owner check.
+    #[cfg(test)]
+    pub(crate) fn joint_drive_state_for_test(&self) -> JointDriveState {
+        let Some(live) = self.live.as_deref() else {
+            return (false, false, false, 0, "NoLane", "None", None, 0);
+        };
+        let (phase, demand, work, base) = live
+            .joint_machine
+            .as_ref()
+            .map(joint::LiveJointMachine::diagnostic_snapshot_for_test)
+            .unwrap_or(("NoMachine", "None", None, 0));
+        (
+            true,
+            live.gated,
+            live.finished,
+            live.ticks,
+            phase,
+            demand,
+            work,
+            base,
+        )
     }
 
     /// Whether this lane owns a Joint machine (§8.3).

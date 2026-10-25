@@ -13729,6 +13729,11 @@ mod promotion_driver_tests {
             "exactly one wound-down gap: {:?}",
             gaps(&mut driver)
         );
+        assert!(
+            failures[0].1.contains("Unproved"),
+            "the gap carries the detach text: {:?}",
+            failures[0].1
+        );
     }
 
     #[test]
@@ -14203,8 +14208,12 @@ mod promotion_driver_tests {
     #[test]
     fn own_domain_completion_without_live_finalizer_stays_silent() {
         // A's own late completion with no live finalizer state is
-        // not foreign: no gap fires, and the winding still holds
-        // for the next poll.
+        // not foreign: no gap fires, and the drained winding
+        // clears like the lane-less tail instead of holding: no
+        // production path can make a finalizer for A's domain
+        // live again (the slot stays empty until B installs, B
+        // waits behind the retire, and the joined winding stages
+        // nothing), so holding would block B silently forever.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
@@ -14228,8 +14237,12 @@ mod promotion_driver_tests {
         driver.on_tick();
         assert_eq!(
             driver.retiring_domain(),
-            Some(domain),
-            "A holds while its finalizer stays unproven"
+            None,
+            "A clears once drained with no live finalizer"
+        );
+        assert!(
+            !driver.coordinator.promotion_finish(),
+            "the clear releases B's gate"
         );
         assert!(
             gaps(&mut driver)
@@ -14805,6 +14818,233 @@ mod promotion_driver_tests {
             driver.joint_first_error.as_deref(),
             Some("joint finish disposition required"),
             "the first error wins across holds"
+        );
+    }
+
+    #[test]
+    fn joint_published_wound_down_failure_keeps_preset_first_error() {
+        // A pre-set first error survives a Published lane whose
+        // wound-down fails: the later cause must not overwrite it,
+        // and the failure gap still records.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        io.fail_poll = true;
+        driver.semantic = Some(joint_lane(io, true));
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.joint_first_error = Some("the earlier disposition".to_string());
+        driver.on_tick();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "a failed wound-down abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("the earlier disposition"),
+            "the pre-set first error survives the wound-down failure"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "joint wound-down failed")
+                .count(),
+            1,
+            "the failure gap still records: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn consume_gated_published_lane_escalates_on_second_signal() {
+        // The terminal consume waits for the Published detach, but
+        // a second operator signal escalates at once instead of
+        // hanging: Abandoned, held, one gap, first error kept.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (io, _gate) = WindDownIo::gated();
+        let polls = Rc::clone(&io.polls);
+        let mut lane = joint_lane(io, true);
+        lane.set_test_joint_frame(false);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.second_signal = Some(&|| true);
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = super::tests::consume_clock(&stop_now);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error: None,
+            zero_pass: None,
+            retained: None,
+        };
+        let start = Instant::now();
+        let (_stopped, _error, _zero) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the second signal returns the consume promptly"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the signal escalates the Published wait"
+        );
+        assert!(driver.semantic.is_none(), "the escalation holds its lane");
+        assert_eq!(polls.get(), 1, "one poll, then the escalation");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("second stop during joint finish"),
+            "the escalation keeps its cause"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "joint finish held for exit")
+                .count(),
+            1,
+            "the escalation discloses its hold: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn consume_gated_published_lane_holds_past_deadline() {
+        // Past the run deadline the terminal consume holds a
+        // still-Published lane for exit instead of waiting on:
+        // Abandoned, held, one gap, first error kept.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (io, _gate) = WindDownIo::gated();
+        let polls = Rc::clone(&io.polls);
+        let mut lane = joint_lane(io, true);
+        lane.set_test_joint_frame(false);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        driver.deadline = Some(Instant::now() - Duration::from_secs(1));
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = super::tests::consume_clock(&stop_now);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error: None,
+            zero_pass: None,
+            retained: None,
+        };
+        let start = Instant::now();
+        let (_stopped, _error, _zero) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the expired deadline returns the consume promptly"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the expired deadline holds the Published wait"
+        );
+        assert!(driver.semantic.is_none(), "the hold keeps its lane");
+        assert_eq!(polls.get(), 1, "one poll, then the hold");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish held for exit"),
+            "the hold keeps its cause"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "joint finish held for exit")
+                .count(),
+            1,
+            "the hold discloses once: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn consume_released_published_lane_completes_without_gap() {
+        // Control: a Published detach that joins completes through
+        // the terminal consume with no hold and no gap.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (io, gate) = WindDownIo::gated();
+        let polls = Rc::clone(&io.polls);
+        let mut lane = joint_lane(io, true);
+        lane.set_test_joint_frame(false);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Published;
+        release_gate(&gate);
+        let stop = std::cell::Cell::new(false);
+        let stop_now = || stop.get();
+        let clock = super::tests::consume_clock(&stop_now);
+        let outcome = ClassicOutcome {
+            stopped: None,
+            error: None,
+            zero_pass: None,
+            retained: None,
+        };
+        let (_stopped, _error, _zero) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(
+            driver.semantic.is_none(),
+            "the joined lane releases at the consume"
+        );
+        assert_eq!(polls.get(), 1, "one poll joins the detach");
+        assert!(
+            driver.joint_first_error.is_none(),
+            "no error on a clean join"
+        );
+        assert!(
+            gaps(&mut driver).iter().all(|(subject, _)| {
+                subject != "joint finish held for exit" && subject != "joint wound-down failed"
+            }),
+            "a quick stop gains no gap: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn repeated_stop_request_escalates_polling_finish() {
+        // A second stop request escalates a begun-but-unfinished
+        // Joint finish to the typed exit instead of re-running
+        // the stop path.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "the first stop keeps a begun finish"
+        );
+        assert!(driver.semantic.is_some(), "the first stop keeps the lane");
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second stop escalates the begun finish"
+        );
+        assert!(driver.semantic.is_none(), "the escalation holds its lane");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("second stop during joint finish"),
+            "the escalation keeps its cause"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .iter()
+                .filter(|(subject, _)| subject == "joint finish held for exit")
+                .count(),
+            1,
+            "the escalation discloses its hold: {:?}",
+            gaps(&mut driver)
         );
     }
 

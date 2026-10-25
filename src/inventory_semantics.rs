@@ -790,6 +790,15 @@ pub(crate) struct AttestedSemanticLane {
     /// exactly like a live machine past its finish.
     #[cfg(test)]
     test_joint_machine: bool,
+    /// Tests-only scripted Joint-machine init outcome: when set,
+    /// `initialize_joint` answers it without a live Session, so
+    /// the driver's D5 wiring runs unprivileged. A scripted Ok
+    /// marks the lane Joint, exactly as a live machine would.
+    #[cfg(test)]
+    scripted_joint_init: Option<Result<(), SemanticRefusal>>,
+    /// Tests-only count of `initialize_joint` calls.
+    #[cfg(test)]
+    joint_init_calls: usize,
     /// Tests-only scripted Finish begin outcome: when set, the begin
     /// answers it without a live machine, so the driver's begin-Ok
     /// arm runs unprivileged. Sticky; tests clear it explicitly.
@@ -1242,6 +1251,10 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             test_joint_machine: false,
             #[cfg(test)]
+            scripted_joint_init: None,
+            #[cfg(test)]
+            joint_init_calls: 0,
+            #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
             scripted_finish_poll: None,
@@ -1371,6 +1384,10 @@ impl AttestedSemanticLane {
             test_joint_frame: false,
             #[cfg(test)]
             test_joint_machine: false,
+            #[cfg(test)]
+            scripted_joint_init: None,
+            #[cfg(test)]
+            joint_init_calls: 0,
             #[cfg(test)]
             scripted_finish_begin: None,
             #[cfg(test)]
@@ -1687,6 +1704,23 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn set_test_joint_machine(&mut self, on: bool) {
         self.test_joint_machine = on;
+    }
+
+    /// Script the Joint-machine init outcome (or clear it with
+    /// `None`): a scripted Ok marks the lane Joint without a live
+    /// machine, so the driver's D5 wiring runs unprivileged.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_joint_init_for_test(
+        &mut self,
+        outcome: Option<Result<(), SemanticRefusal>>,
+    ) {
+        self.scripted_joint_init = outcome;
+    }
+
+    /// How many `initialize_joint` calls this lane served.
+    #[cfg(test)]
+    pub(crate) fn joint_init_calls_for_test(&self) -> usize {
+        self.joint_init_calls
     }
 
     /// Script the Finish begin outcome (or clear it with `None`):

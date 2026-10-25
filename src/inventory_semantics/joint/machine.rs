@@ -2999,6 +2999,19 @@ impl AttestedSemanticLane {
         &mut self,
         coordinator: &InventoryCoordinator<OsProcessSource>,
     ) -> Result<(), SemanticRefusal> {
+        #[cfg(test)]
+        {
+            self.joint_init_calls += 1;
+        }
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_joint_init {
+            if scripted.is_ok() {
+                // A scripted success marks the lane Joint: substituted
+                // lanes carry no live machine to install.
+                self.test_joint_machine = true;
+            }
+            return scripted;
+        }
         let live = self
             .live
             .as_deref_mut()

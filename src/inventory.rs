@@ -2486,6 +2486,12 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// D5 (§5): bind the seated lane's Joint machine before its first
+    /// tick. Scaffolding: the init call lands with the wiring.
+    fn initialize_joint_lane(&mut self) {
+        let _ = self.semantic.as_ref();
+    }
+
     /// The lane's independent terminal sequence: publish any
     /// pass-staged quantum, drain owned cursors to Q, then stop H0
     /// once. Every drained batch commits promptly during the drain,
@@ -10230,7 +10236,7 @@ mod tests {
     // collide with this module's own).
     use super::promotion_driver_tests::{
         CountingSource, WindDownIo, driver_with_display, gaps, headless_display, joint_lane,
-        queue_request,
+        queue_request, wind_down_lane,
     };
     use crate::inventory_capture::{
         BlockDisposition, ClassicCompletion, ClassicOutcome, FacadeLane, LoopClock, Publish,
@@ -12239,6 +12245,179 @@ mod tests {
             "the fallback reports the failure gap: {gaps:?}"
         );
     }
+
+    /// The D5 scene: a fresh substituted lane (no Joint seams) with a
+    /// legacy-tick spy, seated on the driver. Returns the tick spy.
+    fn seat_fresh_joint_candidate(
+        driver: &mut ClassicDriver<'_>,
+    ) -> std::rc::Rc<std::cell::Cell<usize>> {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let ticks = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.ticks = Rc::clone(&ticks);
+        driver.semantic = Some(wind_down_lane(io));
+        ticks
+    }
+
+    #[test]
+    fn joint_lane_initializes_before_first_tick_pid() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let ticks = seat_fresh_joint_candidate(&mut driver);
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_init_calls_for_test(),
+                1,
+                "D5 initializes the lane before its first tick"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "a successful init marks the lane Joint"
+            );
+        }
+        assert_eq!(ticks.get(), 0, "initialization ticks no legacy quantum");
+        // Exactly once: a second call is a no-op on a Joint lane.
+        driver.initialize_joint_lane();
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_init_calls_for_test(),
+            1,
+            "D5 initializes exactly once per lane"
+        );
+        assert_eq!(ticks.get(), 0, "still no legacy tick");
+    }
+
+    #[test]
+    fn joint_lane_initializes_before_first_tick_cgroup() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        // The D5 wiring is scope-blind: only the run scope differs.
+        driver.scope = InventoryRunScope::Cgroup;
+        let ticks = seat_fresh_joint_candidate(&mut driver);
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_init_calls_for_test(),
+                1,
+                "D5 initializes the lane before its first tick"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "a successful init marks the lane Joint"
+            );
+        }
+        assert_eq!(ticks.get(), 0, "initialization ticks no legacy quantum");
+        driver.initialize_joint_lane();
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_init_calls_for_test(),
+            1,
+            "D5 initializes exactly once per lane"
+        );
+        assert_eq!(ticks.get(), 0, "still no legacy tick");
+    }
+
+    #[test]
+    fn joint_lane_initializes_before_first_tick_system() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        // The D5 wiring is scope-blind: only the run scope differs.
+        driver.scope = InventoryRunScope::System;
+        driver.inventory_scope = Some(InventoryScope::System);
+        let ticks = seat_fresh_joint_candidate(&mut driver);
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_init_calls_for_test(),
+                1,
+                "D5 initializes the lane before its first tick"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "a successful init marks the lane Joint"
+            );
+        }
+        assert_eq!(ticks.get(), 0, "initialization ticks no legacy quantum");
+        driver.initialize_joint_lane();
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_init_calls_for_test(),
+            1,
+            "D5 initializes exactly once per lane"
+        );
+        assert_eq!(ticks.get(), 0, "still no legacy tick");
+    }
+
+    #[test]
+    fn joint_lane_after_legacy_tick_stays_legacy_and_disclosed() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let ticks = seat_fresh_joint_candidate(&mut driver);
+        // No scripted init: the natural path on a substituted lane.
+        driver.on_tick();
+        assert_eq!(ticks.get(), 1, "the first hook ticks the legacy lane");
+        driver.initialize_joint_lane();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_init_calls_for_test(),
+                1,
+                "D5 attempts the init once"
+            );
+            assert!(
+                !lane.has_joint_machine(),
+                "a refused init stays off the Joint path"
+            );
+        }
+        let joint_gaps: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "joint machine unavailable")
+            .collect();
+        assert_eq!(joint_gaps.len(), 1, "the refusal is disclosed once");
+        assert!(
+            joint_gaps[0].1.contains("semantic_unavailable"),
+            "the gap names the refusal: {:?}",
+            joint_gaps[0].1
+        );
+        // The legacy path continues: the staged gate held the second
+        // hook, so clear it (the test's own driver) and tick again.
+        driver.semantic_staged = false;
+        driver.on_tick();
+        assert_eq!(ticks.get(), 2, "a refused lane keeps legacy service");
+    }
 }
 
 #[cfg(test)]
@@ -12699,8 +12878,11 @@ mod promotion_driver_tests {
 
     /// A shell lane carrying the wind-down stub: the subset is only
     /// ever carried (empty batches stage nothing provable), so a
-    /// single-slot envelope suffices.
-    fn wind_down_lane(io: WindDownIo) -> crate::inventory_semantics::AttestedSemanticLane {
+    /// single-slot envelope suffices. Shared with the D5 init tests,
+    /// which need a fresh lane without the Joint seams.
+    pub(crate) fn wind_down_lane(
+        io: WindDownIo,
+    ) -> crate::inventory_semantics::AttestedSemanticLane {
         use crate::discovery::identity::PinnedObjectId;
         let slot = crate::plan::Slot {
             index: 0,

@@ -615,9 +615,11 @@ fn overlay_index(
 
 /// What the kernel leg observably did: the fallback ledger (zero for
 /// a real kernel proof, AnchorNotInstalled for the identity-key
-/// branch), the userspace reads it performed (zero for a real proof),
-/// and the index preconditions (a per-range key with validated slots —
-/// absent exactly on the identity-key branch).
+/// branch), the userspace reads it performed (zero for a real proof
+/// and for the identity-key fallback, whose prove set is empty), and
+/// the index preconditions (a per-range key exactly off the
+/// identity-key branch; validated slots always — anchors install for
+/// arena-mapped files on any filesystem).
 struct KernelLegEvidence {
     fallback: crate::discovery::kernel_identity::KernelFallbackTotals,
     userspace_reads: usize,
@@ -854,7 +856,8 @@ fn assert_overlay_outcome(
             }
             // Userspace decides alone through the identity path; the
             // kernel leg reaches the same edge through its
-            // AnchorNotInstalled userspace fallback, proving nothing.
+            // AnchorNotInstalled userspace fallback, proving nothing
+            // and reading nothing: the prove set is empty.
             edge(pid, row_key, userspace, "userspace")?;
             edge(pid, row_key, kernel, "kernel")?;
             if evidence.no_proof_classification != Some("no kernel proof (identity key)") {
@@ -868,11 +871,14 @@ fn assert_overlay_outcome(
                     evidence.fallback.first_reason
                 ));
             }
-            if evidence.userspace_reads == 0 {
-                return Err("overlay identity-key fallback performs userspace reads".into());
+            if evidence.userspace_reads != 0 {
+                return Err("overlay identity-key fallback reads nothing".into());
             }
-            if evidence.per_range_key || evidence.slots_nonempty {
-                return Err("overlay identity key takes no per-range proof or slots".into());
+            if evidence.per_range_key {
+                return Err("overlay identity key takes no per-range proof".into());
+            }
+            if !evidence.slots_nonempty {
+                return Err("overlay identity key still installs its anchor slots".into());
             }
             Ok(())
         }
@@ -880,15 +886,16 @@ fn assert_overlay_outcome(
 }
 
 /// The no-run evidence shape follows the rendering: a per-range key
-/// with slots exactly when not backing, the no-proof classification
-/// exactly when backing, and zero fallback plus zero reads either way
-/// (nothing ran to fall back or read).
+/// exactly when not backing, the no-proof classification exactly when
+/// backing, installed slots either way (anchors install for
+/// arena-mapped files on any filesystem), and zero fallback plus zero
+/// reads either way (nothing ran to fall back or read).
 fn check_no_run_evidence(evidence: &KernelLegEvidence, backing: bool) -> Result<(), String> {
     if evidence.per_range_key == backing {
         return Err("overlay no-run: per-range key must match non-backing rendering".into());
     }
-    if evidence.slots_nonempty == backing {
-        return Err("overlay no-run: slots must match non-backing rendering".into());
+    if !evidence.slots_nonempty {
+        return Err("overlay no-run: anchors install on any filesystem".into());
     }
     if backing && evidence.no_proof_classification != Some("no kernel proof (identity key)") {
         return Err("overlay no-run: backing rendering needs the no-proof classification".into());
@@ -1019,7 +1026,8 @@ fn d4_overlay_kernel_attribution_for_pid(
 /// Kernel leg on the N4 identity-key branch (backing rendering on ext4
 /// layers): the key takes no per-range proof, so the leg classifies "no
 /// kernel proof (identity key)" — AnchorNotInstalled with the edge, if
-/// any, from the userspace fallback. Never kernel parity.
+/// any, from the userspace fallback, which reads nothing since the
+/// prove set is empty; anchors still install. Never kernel parity.
 #[allow(clippy::too_many_arguments)]
 fn d4_overlay_kernel_identity_key_for_pid(
     pid: u32,
@@ -1065,8 +1073,8 @@ fn d4_overlay_kernel_identity_key_for_pid(
             index
                 .match_slots
                 .get(&key)
-                .is_none_or(|slots| slots.is_empty()),
-            "identity key holds no slots"
+                .is_some_and(|slots| !slots.is_empty()),
+            "anchors install for the arena-mapped file on any filesystem"
         );
         let mut budget = CaptureWorkBudget::default();
         assert!(
@@ -1090,14 +1098,14 @@ fn d4_overlay_kernel_identity_key_for_pid(
         "identity-key branch classifies AnchorNotInstalled: {fallback:?}"
     );
     let reads = trace.lock().unwrap().reads.len();
-    assert!(
-        reads > 0,
-        "the identity-key fallback proves by userspace reads"
+    assert_eq!(
+        reads, 0,
+        "the identity-key fallback reads nothing: the prove set is empty"
     );
     let evidence = KernelLegEvidence {
         fallback,
         userspace_reads: reads,
-        slots_nonempty: false,
+        slots_nonempty: true,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -1106,8 +1114,8 @@ fn d4_overlay_kernel_identity_key_for_pid(
 
 /// Kernel side for a row no confirm can run on (keys differ, or a
 /// data-only mapping): the setup asserts follow the rendering (a
-/// per-range key with slots exactly when not backing), then the empty
-/// outcome with zero fallback and zero reads.
+/// per-range key exactly when not backing; slots install either way),
+/// then the empty outcome with zero fallback and zero reads.
 #[allow(clippy::too_many_arguments)]
 fn d4_overlay_kernel_no_run_for_pid(
     pid: u32,
@@ -1151,13 +1159,12 @@ fn d4_overlay_kernel_no_run_for_pid(
         probe
             .install_expectations(&mut index)
             .expect("actual validated anchor expectations");
-        assert_eq!(
+        assert!(
             index
                 .match_slots
                 .get(&key)
                 .is_some_and(|slots| !slots.is_empty()),
-            !backing,
-            "no-run slots follow the rendering"
+            "anchors install for the arena-mapped file on any filesystem"
         );
         let mut budget = CaptureWorkBudget::default();
         assert!(
@@ -1186,7 +1193,7 @@ fn d4_overlay_kernel_no_run_for_pid(
     let evidence = KernelLegEvidence {
         fallback,
         userspace_reads: reads,
-        slots_nonempty: !backing,
+        slots_nonempty: true,
         per_range_key: !backing,
         no_proof_classification: backing.then_some("no kernel proof (identity key)"),
     };

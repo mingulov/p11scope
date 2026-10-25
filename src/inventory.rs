@@ -14502,6 +14502,87 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_first_error_keeps_first_across_holds() {
+        // Two sequential holds keep the first error, never the
+        // latest: the second hold's reason must not overwrite it.
+        use crate::inventory_semantics::SemanticRefusal;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::Unavailable);
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the first hold keeps the default reason"
+        );
+        // A later hold carries a graph refusal; the first error stays.
+        driver
+            .coordinator
+            .seed_collected_graph_refusal_for_test("terminal graph refused before native mutation");
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::Unavailable);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::NotBegun;
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second hold abandons again"
+        );
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the first error wins across holds"
+        );
+    }
+
+    #[test]
+    fn joint_abandon_commit_failure_is_kept_as_a_gap() {
+        // The abandon's best-effort terminal commit fails: the
+        // abandon reason stays the first error, and the commit
+        // failure is kept as its own gap instead of dropped.
+        use crate::inventory_semantics::SemanticRefusal;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(SemanticRefusal::Unavailable);
+        driver.semantic = Some(lane);
+        FAIL_TERMINAL_PUBLICATION.with(|fail| fail.set(true));
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the abandon proceeds past the commit failure"
+        );
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish disposition required"),
+            "the abandon reason stays the first error"
+        );
+        let commits: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint abandon commit failed")
+            .collect();
+        assert_eq!(
+            commits.len(),
+            1,
+            "the commit failure is kept: {:?}",
+            gaps(&mut driver)
+        );
+        assert!(
+            commits[0]
+                .1
+                .contains("injected terminal publication refusal"),
+            "the gap carries the commit error text: {:?}",
+            commits[0].1
+        );
+    }
+
+    #[test]
     fn stop_drains_service_without_installing() {
         use crate::attach::selected_detailed::SelectedPreparationFailure;
         let mut coordinator = coordinator();

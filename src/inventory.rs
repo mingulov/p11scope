@@ -3504,6 +3504,31 @@ impl ClassicDriver<'_> {
         self.retiring.as_ref().map(|retiring| retiring.domain)
     }
 
+    /// Disclose a promotion lane that never joined its wind-down: no
+    /// ticks follow the stop, so the lane is held for exit at drop
+    /// and this gap — recorded before the final commit — publishes
+    /// that. Callers run it once per stop path.
+    fn record_unjoined_winding_gap(&mut self) {
+        let joint = self.retiring.as_ref().and_then(|retiring| {
+            retiring
+                .winding
+                .as_ref()
+                .filter(|winding| winding.lane.is_some())
+                .map(|winding| winding.joint)
+        });
+        let Some(joint) = joint else {
+            return;
+        };
+        self.coordinator.note_scope_gap(
+            "promotion wind-down held for exit".to_string(),
+            if joint {
+                "stop during a Joint promotion finish; the lane is held for exit".to_string()
+            } else {
+                "stop during a legacy wind-down; the lane is held for exit".to_string()
+            },
+        );
+    }
+
     /// Bind the dashboard's promotion control to this run's capture
     /// (DR37 ordinary enable). Headless runs have no display and stay
     /// unbound; a bound display keeps its capture (a second enable
@@ -3681,8 +3706,18 @@ impl Drop for ClassicDriver<'_> {
     /// service for genuine disposal, and the service's own drop
     /// retains it for process lifetime. A handoff the service will
     /// not take back (unreachable: install implies outstanding)
-    /// retains its lane directly rather than stranding it.
+    /// retains its lane directly rather than stranding it. A
+    /// promotion lane still winding down is held for exit the same
+    /// way: no ticks follow the stop, so the detach would otherwise
+    /// drop unjoined mid-cleanup; the stop path already recorded its
+    /// gap before the final commit.
     fn drop(&mut self) {
+        if let Some(retiring) = self.retiring.as_mut()
+            && let Some(winding) = retiring.winding.as_mut()
+            && let Some(lane) = winding.lane.take()
+        {
+            ExitRetention::hold(lane);
+        }
         let Some(pending) = self.pending_install.take() else {
             return;
         };
@@ -4367,9 +4402,21 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     .to_string(),
             );
         }
+        // A winding of either kind never joins past the stop: hold
+        // it at drop and disclose that once, before the final
+        // commit, so the hold publishes.
+        if first_stop {
+            self.record_unjoined_winding_gap();
+        }
     }
 
     fn on_lane_stopped(&mut self) {
+        // A stop request already disclosed the unjoined winding; a
+        // bare lane stop discloses it here instead, still once and
+        // still before the final commit.
+        if !self.stop_requested {
+            self.record_unjoined_winding_gap();
+        }
         if let Some(observer) = self
             .cgroup
             .as_ref()

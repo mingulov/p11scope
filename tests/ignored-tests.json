@@ -525,7 +525,7 @@
     {
       "file": "src/discovery/d4_ext4_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
-      "reason": "root: loop ext4 mounts plus eligible BTF/task_vma identity (5.15 shutdown included)",
+      "reason": "root: loop ext4 mounts plus eligible BTF/task_vma identity (fails closed without it, including 5.15)",
       "cell": "privileged"
     },
     {

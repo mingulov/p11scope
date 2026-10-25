@@ -502,6 +502,29 @@ fn pump_until(harness: &mut Harness, target: &Target, calls: usize) -> Result<Ve
     Ok(harness.take_routed())
 }
 
+/// Bounded wait for routed outcomes without demanding joins: returns
+/// whatever the router settled (joined or unknown) once `calls`
+/// outcomes exist, or fails at the budget. For cells where the
+/// expected outcome is an unjoined call that must arrive promptly.
+fn pump_until_routed(
+    harness: &mut Harness,
+    target: &Target,
+    calls: usize,
+    budget: Duration,
+) -> Result<Vec<Routed>> {
+    let deadline = Instant::now() + budget;
+    while harness.routed.len() < calls {
+        harness.pump(target)?;
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for {calls} routed calls ({} so far)",
+            harness.routed.len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(harness.take_routed())
+}
+
 /// A compiled provider+driver and a spawned `cmd` target answering READY.
 /// The tempdir lives as long as the setup, so the target's files survive.
 struct CmdSetup {
@@ -2214,11 +2237,18 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
     Ok(())
 }
 
-/// Decision §3c: a punch-hole on the provider file from another process.
-/// The loaded image keeps executing from untouched text while the header
-/// page's VMAs are zapped through `unmap_mapping_range`, which must reach
-/// the munmap hook — a miss here is a hook-completeness finding, not a
-/// soft control. Static skip: needs punch-hole support under TMPDIR
+/// Decision §3c: a punch-hole on the provider file from another process,
+/// settled as correct fail-closed behavior (provisional R-39). The hole
+/// changes the file on disk, so the watched provider's `(ino, size,
+/// ctime)` identity pin no longer proves the instance it calibrated:
+/// `LiveImageScan::audit` refuses every later scan with Custody, and
+/// the post-hole call stays unjoined (`Unknown`, never a join to the
+/// old instance or a new one) instead of attributing calls to an
+/// instance that can no longer be proven. The loaded image keeps
+/// executing from untouched text while the header page's VMAs are
+/// zapped through `unmap_mapping_range`, which must still reach the
+/// munmap hook — a miss there stays a hook-completeness finding, not
+/// a soft control. Static skip: needs punch-hole support under TMPDIR
 /// (btrfs/ext4/xfs; tmpfs refuses); run by hand as root with a suitable
 /// TMPDIR.
 #[test]
@@ -2231,6 +2261,7 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     } = spawn_cmd_target()?;
     let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
     let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let object = plan.slots[0].object;
     let call = |harness: &mut Harness, target: &mut Target, which: &str| -> Result<InstanceId> {
         target
             .command(b'c')
@@ -2258,17 +2289,50 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
             reading.record_flags,
         ))
     };
+    // The cause proof: the watched provider's fail-closed state plus
+    // the file's own (ctime, length). Read-only while unchanged.
+    let watched_state = |harness: &Harness| -> Result<(bool, (i64, i64, u64))> {
+        let tracking = harness.session.instance_tracking();
+        let watched = tracking.watched(object).with_context(|| {
+            format!("not watched after attach: {:?}", tracking.watch_refusal(object))
+        })?;
+        let unchanged = watched.check_unchanged().map_err(anyhow::Error::msg)?;
+        let metadata = std::fs::metadata(&provider)?;
+        let stamp = (
+            std::os::unix::fs::MetadataExt::ctime(&metadata),
+            std::os::unix::fs::MetadataExt::ctime_nsec(&metadata),
+            metadata.len(),
+        );
+        Ok((unchanged, stamp))
+    };
     let a = call(&mut harness, &mut target, "a (before the hole)")?;
+    let (unchanged_before, stamp_before) = watched_state(&harness)?;
+    ensure!(
+        unchanged_before,
+        "watched provider already reports changed before the hole (stamp {stamp_before:?})"
+    );
     let before = harness.session.instance_maps().counters()?;
     let epochs_before = epochs_of(&harness, &target)?;
+    let scans_before = harness.scan.outcomes.clone();
     let holed = target.command(b'h')?;
     ensure!(holed == "PHOLE", "{holed}");
+    let (unchanged_after, stamp_after) = watched_state(&harness)?;
+    ensure!(
+        stamp_after != stamp_before,
+        "punch-hole left the provider file unchanged on disk: {stamp_before:?} vs {stamp_after:?}"
+    );
+    ensure!(
+        !unchanged_after,
+        "watched provider still reports unchanged after the hole \
+         (stamp {stamp_before:?} -> {stamp_after:?})"
+    );
     let after_hole = harness.session.instance_maps().counters()?;
     let epochs_after = epochs_of(&harness, &target)?;
     let hole_bumps = after_hole.local_bumps - before.local_bumps;
     eprintln!(
         "T3A_PHOLE_DIAG counters_before={before:?} counters_after={after_hole:?} \
          target_local={}->{} target_global={}->{} fault={}->{} sticky={}->{} flags={}->{} \
+         unchanged={unchanged_before}->{unchanged_after} stamp={stamp_before:?}->{stamp_after:?} \
          scans={:?}",
         epochs_before.0,
         epochs_after.0,
@@ -2286,13 +2350,62 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
         hole_bumps >= 1,
         "punch-hole did not reach uprobe_munmap (hook gap?)"
     );
-    let b = call(&mut harness, &mut target, "b (after the hole)")?;
-    ensure!(b != a, "punch-hole kept the instance");
+    // Call b is collected but never joined: the changed provider
+    // refuses every scan, so the call expires unjoined instead of
+    // attributing to an unprovable instance. Bounded: the unjoined
+    // outcome must arrive promptly, not after an unbounded wait.
+    target
+        .command(b'c')
+        .with_context(|| "punch-hole call b (after the hole): fixture did not answer")?;
+    let routed = pump_until_routed(&mut harness, &mut target, 1, Duration::from_secs(10))?;
+    ensure!(
+        routed.len() == 1,
+        "punch-hole call b: expected one routed outcome, got {routed:?}"
+    );
+    ensure!(
+        matches!(routed[0].route, Route::Unknown(_)),
+        "punch-hole call b joined after the provider changed (fail-open): \
+         {:?} (a={a:?} scans={:?})",
+        routed[0].route,
+        harness.scan
+    );
+    // Every scan after the hole refused Custody (at least one ran),
+    // and no New/Continued observation was sealed after the hole:
+    // every other ledger entry is frozen at its pre-hole count.
+    let custody_before = scans_before.get("Custody").copied().unwrap_or(0);
+    let custody_after = harness
+        .scan
+        .outcomes
+        .get("Custody")
+        .copied()
+        .unwrap_or(0);
+    ensure!(
+        custody_after > custody_before,
+        "no Custody scan refusal after the hole: {scans_before:?} -> {:?}",
+        harness.scan.outcomes
+    );
+    for (outcome, after) in &harness.scan.outcomes {
+        if outcome == "Custody" {
+            continue;
+        }
+        let before_count = scans_before.get(outcome).copied().unwrap_or(0);
+        ensure!(
+            *after == before_count,
+            "post-hole scan ledger entry {outcome:?} moved {before_count}->{after}; \
+             only Custody refusals are allowed after a provider change"
+        );
+    }
     let counters = harness.session.instance_maps().counters()?;
     eprintln!(
         "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} \
-         target_local={}->{} target_global={}->{} scans={:?}",
-        epochs_before.0, epochs_after.0, epochs_before.1, epochs_after.1, harness.scan
+         target_local={}->{} target_global={}->{} custody={custody_before}->{custody_after} \
+         b_route={:?} scans={:?}",
+        epochs_before.0,
+        epochs_after.0,
+        epochs_before.1,
+        epochs_after.1,
+        routed[0].route,
+        harness.scan
     );
     ensure!(harness.false_joins().is_empty());
     ensure!(counters.faults == 0 && harness.misses == 0);

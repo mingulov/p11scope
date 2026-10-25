@@ -47863,6 +47863,71 @@ fn collected_graph_reclaim_refusal_retains_and_finishes() {
 }
 
 #[test]
+fn collected_graph_install_checks_every_sink_before_swapping() {
+    // A later sink refusal must not half-swap: every sink is checked
+    // before the first swap, so the pins stay canonical.
+    let mut case = graph_case_with_exit(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut reached = false;
+    while std::time::Instant::now() < deadline {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Install && graph.install_step == 0)
+        {
+            reached = true;
+            break;
+        }
+        case.service(1);
+        std::thread::yield_now();
+    }
+    assert!(reached, "Install before its first credit");
+    let view = case.view;
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retiring view is claimed before install"
+    );
+    assert!(
+        case.engine
+            .collected_graph
+            .as_ref()
+            .expect("boxed")
+            .pins
+            .loaned_output()
+            .is_some(),
+        "the pins loan is outstanding before install"
+    );
+    let revision = case.engine.pinned.revision();
+    let modules = case.engine.modules.clone();
+    let slots = case.engine.plan.slots.clone();
+    // Test-only seam: the plan sink refuses at install.
+    case.engine
+        .collected_graph
+        .as_mut()
+        .expect("boxed")
+        .plan
+        .cancel();
+    assert!(case.service(1).pending);
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert!(!graph.installed);
+    // No half-swap: the pins loan is untouched and every canonical
+    // (pins, modules, plan) is unchanged.
+    assert!(
+        graph.pins.loaned_output().is_some(),
+        "the pins never swapped"
+    );
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retired view stays claimed"
+    );
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.modules, modules);
+    assert_eq!(case.engine.plan.slots, slots);
+}
+
+#[test]
 fn collected_graph_reclaim_drains_removed_rows_and_selection() {
     // Small case: at Closed the input splits into removed rows plus
     // storage instead of riding whole to Done; Reclaim drains the rows

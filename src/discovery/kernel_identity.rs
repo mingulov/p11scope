@@ -990,6 +990,12 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                         return self.userspace(batch, reason);
                     }
                     if let Err(reason) = work.check(budget) {
+                        // Reset before refusing: a stale target would
+                        // hijack later ordinary runs. Fail closed on a
+                        // stuck reset.
+                        if let Err(reset) = self.installed.replace_member_target(None) {
+                            return self.userspace(batch, reset);
+                        }
                         return self.userspace(batch, reason);
                     }
                     let bytes = match self
@@ -1006,6 +1012,12 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                             // only an attempted run's failure demotes
                             // later segments.
                             if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
+                                // Reset before refusing: a stale target
+                                // would hijack later ordinary runs.
+                                // Fail closed on a stuck reset.
+                                if let Err(reset) = self.installed.replace_member_target(None) {
+                                    return self.userspace(batch, reset);
+                                }
                                 return self.userspace(batch, reason);
                             }
                             self.installed.target_attempts =

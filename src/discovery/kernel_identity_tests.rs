@@ -58,6 +58,7 @@ fn fixture_session() -> IdentitySession {
             target: b"fixture target bytes".to_vec(),
             config: None,
             fail_config: false,
+            fail_config_after: 0,
             reads: Cell::new(0),
             target_steps: RefCell::new(std::collections::VecDeque::new()),
             target_trace: Arc::new(std::sync::Mutex::new(FixtureRunTrace::default())),
@@ -4248,6 +4249,10 @@ struct MemberCellSpec {
     outcomes: Vec<MemberOutcome>,
     threshold: Option<usize>,
     fail_config: bool,
+    /// Post-install config writes the fixture allows before `fail_config`
+    /// starts failing: 0 fails the first write, 1 installs a target and
+    /// fails its reset.
+    fail_config_after: usize,
     multi: bool,
 }
 
@@ -4356,8 +4361,14 @@ fn member_cell(spec: MemberCellSpec) -> MemberObservation {
     // Config failure starts after installation: the install itself
     // must succeed so the proves exercise the member path.
     if spec.fail_config {
-        if let SessionObject::Fixture { fail_config, .. } = &mut installed.session.object {
+        if let SessionObject::Fixture {
+            fail_config,
+            fail_config_after,
+            ..
+        } = &mut installed.session.object
+        {
             *fail_config = true;
+            *fail_config_after = spec.fail_config_after;
         } else {
             unreachable!()
         }
@@ -4509,6 +4520,7 @@ fn tid_run_encoding_uses_tid_only() {
         outcomes: vec![MemberOutcome::Slot],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(out.confirmations.len(), 1);
@@ -4551,6 +4563,7 @@ fn tid_run_zeroes_target_fields_on_other_runs() {
         ],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(out.confirmations.len(), 3);
@@ -4595,6 +4608,7 @@ fn zombie_request_in_batch_is_named_zombie_batch_fallback() {
         outcomes: vec![MemberOutcome::Slot, MemberOutcome::Slot],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: true,
     });
     assert_eq!(out.answers.len(), 2);
@@ -4646,6 +4660,7 @@ fn auto_single_member_run_is_below_threshold() {
         outcomes: vec![MemberOutcome::Slot],
         threshold: Some(2_400),
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     // A single member run never clears the auto gate: no run, no
@@ -4683,6 +4698,7 @@ fn forced_kernel_member_run_is_positive() {
         outcomes: vec![MemberOutcome::Slot],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(out.confirmations.len(), 1);
@@ -4711,6 +4727,7 @@ fn member_run_attempt_cap_counts_target_runs() {
         ],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(capped.confirmations.len(), 4);
@@ -4740,6 +4757,7 @@ fn member_run_attempt_cap_counts_target_runs() {
         ],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_kernel_slot(&demoted.confirmations[0], Slot(0));
@@ -4785,6 +4803,7 @@ fn failed_config_write_invalidates_binding() {
         outcomes: vec![MemberOutcome::Slot, MemberOutcome::Slot],
         threshold: None,
         fail_config: true,
+        fail_config_after: 0,
         multi: false,
     });
     // The failed target write invalidates the binding: both the member
@@ -4812,6 +4831,62 @@ fn failed_config_write_invalidates_binding() {
     );
 }
 
+/// A failed refusal reset invalidates the binding exactly like a failed
+/// target write, while the refusal still names its own site: the target
+/// installs (grace 1), the work check refuses, and the drop-guard reset
+/// fails, so the later ordinary prove finds no binding to run on.
+#[test]
+fn failed_reset_write_invalidates_binding() {
+    arm_pre_member_check_expiry();
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, false],
+        outcomes: vec![MemberOutcome::NoRead, MemberOutcome::Slot],
+        threshold: None,
+        fail_config: true,
+        fail_config_after: 1,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 2);
+    // Both prove by userspace: the first refuses at its work check,
+    // the second finds the binding already invalidated.
+    assert_userspace_mapped(&out.confirmations[0]);
+    assert_userspace_mapped(&out.confirmations[1]);
+    assert_eq!(out.attempts, 0, "no run was attempted");
+    assert!(out.failed_target.is_none(), "no demotion");
+    assert!(out.tids.is_empty(), "no run was selected");
+    assert!(
+        !out.binding_valid,
+        "the failed reset invalidated the binding"
+    );
+    assert_eq!(
+        out.fallback.first_reason,
+        Some(KernelFallbackReason::Deadline),
+        "the refusal names its site: {:?}",
+        out.fallback.first_reason
+    );
+    // The target write installed, so the failed write below is the
+    // refusal reset rather than a vacuous first write.
+    assert_eq!(
+        out.config_writes.len(),
+        3,
+        "install, member target, then the failed reset"
+    );
+    assert_eq!(
+        (
+            out.config_writes[1].target_tgid,
+            out.config_writes[1].target_tid
+        ),
+        (out.pids[0], out.pids[0]),
+        "the member write named its target"
+    );
+    let last = out.config_writes.last().expect("the install wrote");
+    assert_eq!(
+        (last.target_tgid, last.target_tid),
+        (0, 0),
+        "the failed write carried the reset bytes"
+    );
+}
+
 #[test]
 fn fd_headroom_member_refusal_resets_target_before_ordinary_run() {
     let out = member_cell(MemberCellSpec {
@@ -4822,6 +4897,7 @@ fn fd_headroom_member_refusal_resets_target_before_ordinary_run() {
         ],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(out.confirmations.len(), 2);
@@ -4966,6 +5042,7 @@ fn work_check_member_refusal_resets_target_before_ordinary_run() {
         outcomes: vec![MemberOutcome::NoRead, MemberOutcome::Slot],
         threshold: None,
         fail_config: false,
+        fail_config_after: 0,
         multi: false,
     });
     assert_eq!(out.confirmations.len(), 2);

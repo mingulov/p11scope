@@ -1675,6 +1675,8 @@ enum SessionObject {
         target: Vec<u8>,
         config: Option<crate::attach::identity_iter::IdentityConfig>,
         fail_config: bool,
+        /// Writes allowed before `fail_config` starts failing.
+        fail_config_after: usize,
         reads: std::cell::Cell<usize>,
         target_steps: std::cell::RefCell<std::collections::VecDeque<FixtureTarget>>,
         target_trace: Arc<std::sync::Mutex<FixtureRunTrace>>,
@@ -1798,6 +1800,7 @@ impl IdentitySession {
             SessionObject::Fixture {
                 config: installed,
                 fail_config,
+                fail_config_after,
                 target_trace,
                 ..
             } => {
@@ -1805,7 +1808,11 @@ impl IdentitySession {
                 // still shows the bytes it carried.
                 target_trace.lock().unwrap().config_writes.push(config);
                 if *fail_config {
-                    return Err("injected configuration failure");
+                    if *fail_config_after > 0 {
+                        *fail_config_after -= 1;
+                    } else {
+                        return Err("injected configuration failure");
+                    }
                 }
                 *installed = Some(config);
                 Ok(())

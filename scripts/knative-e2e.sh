@@ -1220,6 +1220,7 @@ unlock_step
 fact "observer-image=$OBS_IMAGE id=$(docker inspect --format '{{.Id}}' "$OBS_IMAGE" || echo unknown)"
 fact "holder-image=$KNATIVE_IMAGE id=$(docker inspect --format '{{.Id}}' "$KNATIVE_IMAGE" || echo unknown)"
 fact "base-image=$HOLDER_BASE (both stages of $KNATIVE_DOCKERFILE; apt packages float)"
+fact "observer-base-image=$(grep '^FROM ' deploy/Dockerfile.observer | head -n 1) (no apk installs there)"
 
 say "=== create kind cluster $CLUSTER (private kubeconfig) ==="
 lock_step

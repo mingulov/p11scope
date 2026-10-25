@@ -31,9 +31,10 @@ def member_is_dead(pid, starttime):
 
     A member whose exe or argv reads fail may have exited mid-snapshot. Omit
     it only when death is proven: the PID is gone, or the same-starttime
-    process is zombie/dead. An exiting member still traversing do_exit reaches
-    that state at once, so poll briefly; anything else (a live member, an
-    exec race, PID reuse, unreadable state) keeps failing closed.
+    thread group is entirely zombie/dead. An exiting member still traversing
+    do_exit reaches that state at once, so poll briefly; anything else (a live
+    member, a live thread, an exec race, PID reuse, unreadable state, any
+    task-scan error) keeps failing closed.
     """
     deadline = time.monotonic() + 0.05
     while True:
@@ -56,7 +57,23 @@ def member_is_dead(pid, starttime):
                     # PID reuse: the new owner may be live; fail closed.
                     return False
                 if current == starttime and fields[0] in (b"Z", b"X", b"x"):
-                    # Same process, provably dead: it can never run again.
+                    # Leader dead: prove the whole thread group dead. Thread
+                    # starttimes differ from the TGID's, so compare states only.
+                    try:
+                        task_stats = sorted(glob.glob(f"/proc/{pid}/task/[0-9]*/stat"))
+                    except OSError:
+                        return False
+                    if not task_stats:
+                        return False
+                    try:
+                        for task_stat in task_stats:
+                            task_raw = open(task_stat, "rb").read()
+                            _, task_sep, task_tail = task_raw.rpartition(b") ")
+                            task_fields = task_tail.split() if task_sep else []
+                            if not task_fields or task_fields[0] not in (b"Z", b"X", b"x"):
+                                return False
+                    except OSError:
+                        return False
                     return True
         if time.monotonic() >= deadline:
             return False

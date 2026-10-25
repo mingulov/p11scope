@@ -517,6 +517,12 @@ fn assert_ext4_outcome(
         if evidence.userspace_reads != 0 {
             return Err("ext4 kernel: zero targets means zero userspace reads".into());
         }
+        if evidence.bpf_calls != 0 {
+            return Err(format!(
+                "ext4 kernel: zero targets means zero bpf() calls, yet {}",
+                evidence.bpf_calls
+            ));
+        }
         Ok(())
     }
     if target.statfs_magic != 0xef53 || anchor.statfs_magic != 0xef53 {
@@ -586,6 +592,12 @@ fn assert_ext4_outcome(
             }
             if evidence.userspace_reads != 0 {
                 return Err("ext4 live-holder: the identity-key fallback reads nothing".into());
+            }
+            if evidence.bpf_calls != 0 {
+                return Err(format!(
+                    "ext4 live-holder: the edge without proof runs zero targets, yet {} bpf() calls",
+                    evidence.bpf_calls
+                ));
             }
             Ok(())
         }
@@ -684,6 +696,12 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
         .install_anchors(pass, generation, deadline)
         .expect("install actual held-file anchors");
     let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    // Zero-target measurement: every attempted run creates its link +
+    // iterator through the instrumented wrapper (counted before
+    // dispatch, failures too), and nothing else in this window does —
+    // so a zero delta is zero target runs. Exactness needs the
+    // single-test privileged process, like the 5.15 denial cell.
+    let bpf_before = crate::attach::identity_iter::test_bpf_call_count();
     let out = {
         let mut probe = KernelMemberProbe::new(
             &mut installed,
@@ -714,6 +732,12 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
             &mut budget,
         )
     };
+    let bpf_after = crate::attach::identity_iter::test_bpf_call_count();
+    let bpf_delta = bpf_after - bpf_before;
+    assert_eq!(
+        bpf_delta, 0,
+        "no-run leg issued {bpf_delta} bpf() calls: a target ran"
+    );
     assert!(out.members.is_empty(), "no candidate confirms: {out:?}");
     drop(installed);
     let fallback = session.fallback_totals();
@@ -726,7 +750,7 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
-        bpf_calls: 0,
+        bpf_calls: bpf_delta,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -775,6 +799,12 @@ fn d4_ext4_kernel_no_run_stale_key_for_pid(
         .install_anchors(pass, generation, deadline)
         .expect("install actual held-file anchors");
     let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    // Zero-target measurement: every attempted run creates its link +
+    // iterator through the instrumented wrapper (counted before
+    // dispatch, failures too), and nothing else in this window does —
+    // so a zero delta is zero target runs. Exactness needs the
+    // single-test privileged process, like the 5.15 denial cell.
+    let bpf_before = crate::attach::identity_iter::test_bpf_call_count();
     let out = {
         let mut probe = KernelMemberProbe::new(
             &mut installed,
@@ -805,6 +835,12 @@ fn d4_ext4_kernel_no_run_stale_key_for_pid(
             &mut budget,
         )
     };
+    let bpf_after = crate::attach::identity_iter::test_bpf_call_count();
+    let bpf_delta = bpf_after - bpf_before;
+    assert_eq!(
+        bpf_delta, 0,
+        "no-run leg issued {bpf_delta} bpf() calls: a target ran"
+    );
     assert!(out.members.is_empty(), "no candidate confirms: {out:?}");
     drop(installed);
     let fallback = session.fallback_totals();
@@ -817,7 +853,7 @@ fn d4_ext4_kernel_no_run_stale_key_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
-        bpf_calls: 0,
+        bpf_calls: bpf_delta,
         per_range_key: true,
         no_proof_classification: Some("no kernel proof (unusable line)"),
     };
@@ -859,6 +895,12 @@ fn d4_ext4_kernel_live_holder_for_pid(
         .install_anchors(pass, generation, deadline)
         .expect("install actual held-file anchors");
     let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    // Zero-target measurement: every attempted run creates its link +
+    // iterator through the instrumented wrapper (counted before
+    // dispatch, failures too), and nothing else in this window does —
+    // so a zero delta is zero target runs. Exactness needs the
+    // single-test privileged process, like the 5.15 denial cell.
+    let bpf_before = crate::attach::identity_iter::test_bpf_call_count();
     let out = {
         let mut probe = KernelMemberProbe::new(
             &mut installed,
@@ -889,6 +931,12 @@ fn d4_ext4_kernel_live_holder_for_pid(
             &mut budget,
         )
     };
+    let bpf_after = crate::attach::identity_iter::test_bpf_call_count();
+    let bpf_delta = bpf_after - bpf_before;
+    assert_eq!(
+        bpf_delta, 0,
+        "live-holder leg issued {bpf_delta} bpf() calls: a target ran"
+    );
     drop(installed);
     let fallback = session.fallback_totals();
     assert_eq!(
@@ -904,7 +952,7 @@ fn d4_ext4_kernel_live_holder_for_pid(
     let evidence = Ext4LegEvidence {
         fallback,
         userspace_reads: reads,
-        bpf_calls: 0,
+        bpf_calls: bpf_delta,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };

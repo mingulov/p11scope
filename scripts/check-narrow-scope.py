@@ -422,7 +422,9 @@ def check_replacement(record):
 def check_partial_walk(evidence, boundary, record, scoped_pids=()):
     """Verdict on a partial-walk cell: the walk stops at the boundary and
     the output declares PARTIAL. ``evidence`` is strace text or parsed
-    events; ``boundary`` is the forbidden path prefix."""
+    events; ``boundary`` is the forbidden path prefix. Unresolved and
+    relative opens count exactly like check_census and are returned in
+    the verdict record for the caller to judge."""
     _require(type(boundary) is str and boundary.startswith("/"),
              "boundary must be an absolute path")
     events = parse_strace(evidence) if type(evidence) is str else evidence
@@ -430,9 +432,11 @@ def check_partial_walk(evidence, boundary, record, scoped_pids=()):
     for value in scoped_pids:
         _require(type(value) is int and value > 0, "scoped pid out of range")
         scoped.add(value)
+    counts = {"unresolved-open": 0, "relative-unresolved": 0}
     for event in events:
         path = event["path"]
         if path is None or not path.startswith("/"):
+            counts[_census_pid_event(event, scoped)] += 1
             continue
         path = _normalize(path)
         kind = _proc_class(path)
@@ -456,7 +460,7 @@ def check_partial_walk(evidence, boundary, record, scoped_pids=()):
     outcome = check_coverage(record)
     _require(outcome["coverage"] == "partial",
              "partial walk without a partial coverage declaration")
-    return {"verdict": "pass", "events": len(events)}
+    return {"verdict": "pass", "events": len(events), "counts": counts}
 
 
 def main(argv=None):

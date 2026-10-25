@@ -10,6 +10,17 @@
 /* Scripted compare-exchange: the next `cas_lose` rounds are lost races. */
 static int cas_lose;
 static unsigned long long cas_calls;
+#ifdef P11SCOPE_JOURNAL_MARKER
+#include "journal_marker.h"
+/* The birth marker counts exec-ID reads through the production seam:
+ * the gap path must never read one. */
+static unsigned exec_id_reads;
+#define INST_MARKER_EXEC_ID(leader) (exec_id_reads++, (leader)->self_exec_id)
+/* A scripted scope gap landing between the birth's gen store and its
+ * publication CAS: the victim cell is dirtied, so our compare fails. */
+static int dirty_interleave_armed;
+static unsigned long long *dirty_interleave_cell;
+#endif
 #define __sync_val_compare_and_swap(cell, old, replacement) \
     test_cas((unsigned long long *)(cell), (old), (replacement))
 static unsigned long long test_cas(unsigned long long *cell, unsigned long long old,
@@ -17,6 +28,13 @@ static unsigned long long test_cas(unsigned long long *cell, unsigned long long 
 {
     unsigned long long seen = *cell;
     cas_calls++;
+#ifdef P11SCOPE_JOURNAL_MARKER
+    if (dirty_interleave_armed && cell == dirty_interleave_cell) {
+        dirty_interleave_armed = 0;
+        *cell = P11_JOURNAL_MARKER_DIRTY;
+        return old + 1;
+    }
+#endif
     if (cas_lose > 0) {
         cas_lose--;
         return seen + 1 == old ? seen + 2 : seen + 1; /* never `old` */
@@ -26,6 +44,15 @@ static unsigned long long test_cas(unsigned long long *cell, unsigned long long 
     return seen;
 }
 #include "instance_epoch.c"
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* The real marker leaves over a host control cell served by the
+ * scripted lookup below; the BPF map definition stays out. */
+#define P11SCOPE_JOURNAL_MARKER_NO_MAPS
+#include "journal_marker.c"
+unsigned char JOURNAL_MARKER_CTL;
+static struct journal_admission_control marker_ctl_cell;
+static int marker_ctl_missing;
+#endif
 
 /* The image-continuity unit's result at the authentic entry boundary.
  * The epoch unit must withhold and erase stamps when this authority refuses. */
@@ -185,6 +212,10 @@ static void *lookup(void *map, const void *key)
         return index == 0 ? &calib : 0;
     if (map == &INSTANCE_COUNT)
         return index == 0 ? &counters : 0;
+#ifdef P11SCOPE_JOURNAL_MARKER
+    if (map == &JOURNAL_MARKER_CTL)
+        return !marker_ctl_missing && index == 0 ? &marker_ctl_cell : 0;
+#endif
     if (map == &INSTANCE_START) {
         const struct instance_start_key *k = key;
         for (int i = 0; i < 4; i++)
@@ -260,6 +291,14 @@ static void reset(void)
     memset(slot_file, 0, sizeof(slot_file));
     memset(start_used, 0, sizeof(start_used));
     start_update_fail = 0;
+#ifdef P11SCOPE_JOURNAL_MARKER
+    memset(&marker_ctl_cell, 0, sizeof(marker_ctl_cell));
+    marker_ctl_missing = 0;
+    exec_id_reads = 0;
+    dirty_interleave_armed = 0;
+    dirty_interleave_cell = 0;
+    leader.self_exec_id = 0;
+#endif
     watched_slot = 5;
     watched_present = 1;
     g_epoch_missing = gen_missing = storage_fail = storage_creates = 0;
@@ -385,6 +424,172 @@ static void denied_scope_shared_mm_birth(void)
     assert(!gen[INST_GEN_FAULT] && !gen[INST_GEN_STICKY]);
     assert(stop_gate_cell == P11_STOP_GATE_STOP);
 }
+
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* This test's leader shape: the exec'ing thread is the leader. */
+static void birth_ready(void)
+{
+    current_task = &leader;
+}
+
+static void check_exec_birth(void)
+{
+    /* Closure gate: gen 0 writes nothing, charges nothing, reads no exec ID. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 0;
+    leader.self_exec_id = 5;
+    assert(p11_instance_exec_birth() == 0);
+    assert(!storage_creates && !marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(!exec_id_reads);
+    /* A missing control row cannot latch: nothing is allocated. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    marker_ctl_missing = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(!storage_creates && !record_present[0]);
+    /* A latched control refuses without spending. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    marker_ctl_cell.failed = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(!storage_creates && !marker_ctl_cell.spent);
+
+    /* No row: exactly one CREATE, spent 1, READY(exec), gen stamped. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    assert(p11_instance_exec_birth() == 1);
+    assert(storage_creates == 1 && record_present[0]);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == ((5ULL << 2) | 2ULL));
+    assert(records[0].exec_attach_gen == 7);
+    assert(exec_id_reads == 1);
+
+    /* Existing word 0: charge 1, publish. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    assert(p11_instance_exec_birth() == 1);
+    assert(!storage_creates && marker_ctl_cell.spent == 1);
+    assert(records[0].journal_bootstrap == ((5ULL << 2) | 2ULL));
+    assert(records[0].exec_attach_gen == 7);
+
+    /* READY(old): republish without charging; same exec twice is idempotent. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = ((4ULL << 2) | 2ULL);
+    assert(p11_instance_exec_birth() == 1);
+    assert(!marker_ctl_cell.spent);
+    assert(records[0].journal_bootstrap == ((5ULL << 2) | 2ULL));
+    assert(p11_instance_exec_birth() == 1);
+    assert(!marker_ctl_cell.spent);
+    assert(records[0].journal_bootstrap == ((5ULL << 2) | 2ULL));
+    assert(exec_id_reads == 2);
+
+    /* DIRTY: sticks, no latch, no charge, no exec-ID read. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = P11_JOURNAL_MARKER_DIRTY;
+    assert(p11_instance_exec_birth() == 0);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(!marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(!records[0].exec_attach_gen && !exec_id_reads);
+
+    /* Invalid words latch without charging. */
+    for (int shape = 0; shape < 2; shape++) {
+        reset();
+        birth_ready();
+        gen[INST_GEN_ATTACH] = 7;
+        leader.self_exec_id = 5;
+        record_present[0] = 1;
+        records[0].journal_bootstrap = (u64)(shape ? 4 : 3);
+        assert(p11_instance_exec_birth() == 0);
+        assert(marker_ctl_cell.failed == 1 && !marker_ctl_cell.spent);
+        assert(records[0].journal_bootstrap == (u64)(shape ? 4 : 3));
+    }
+
+    /* CREATE failure: the reservation stands, the latch trips, no fault. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    storage_fail = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
+    assert(!record_present[0] && !gen[INST_GEN_FAULT] && !counters.faults);
+
+    /* An unrepresentable exec ID latches after reserving. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 1ULL << 62;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
+    assert(!records[0].journal_bootstrap && !records[0].exec_attach_gen);
+
+    /* A non-leader exec transition latches without charging. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    assert(current_task == &thread && thread.group_leader == &leader);
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.failed == 1 && !marker_ctl_cell.spent);
+    assert(!storage_creates);
+    /* No current task, or no leader, latches the same way. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    current_task = 0;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.failed == 1);
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.group_leader = 0;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.failed == 1);
+    leader.group_leader = &leader;
+
+    /* SHARED_MM left set by a lost clear: no READY, latch. */
+    reset();
+    birth_ready();
+    record_present[0] = 1;
+    records[0].flags = INST_RECORD_SHARED_MM;
+    gen[INST_GEN_ATTACH] = 7;
+    cas_lose = INST_CAS_TRIES;
+    assert(p11_instance_exec() == 1);
+    assert(!cas_lose && (records[0].flags & INST_RECORD_SHARED_MM));
+    leader.self_exec_id = 5;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.failed == 1 && !marker_ctl_cell.spent);
+    assert(!records[0].journal_bootstrap && records[0].exec_attach_gen == 7);
+
+    /* A scope gap racing the publication: never READY, word DIRTY, no latch. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    dirty_interleave_cell = &records[0].journal_bootstrap;
+    dirty_interleave_armed = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(!dirty_interleave_armed);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(records[0].exec_attach_gen == 7);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+}
+#endif
 
 int main(void)
 {
@@ -615,6 +820,9 @@ int main(void)
     gen[INST_GEN_ATTACH] = 9;
     assert(p11_instance_exec() == 1);
     assert(records[0].flags == INST_RECORD_OVERFLOW && records[0].exec_attach_gen == 9);
+#ifdef P11SCOPE_JOURNAL_MARKER
+    check_exec_birth();
+#endif
 
     /* Stamps. */
     reset();

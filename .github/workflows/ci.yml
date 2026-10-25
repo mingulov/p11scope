@@ -121,8 +121,9 @@ jobs:
             echo "dedupe: waiting for earlier run(s) on $GITHUB_SHA:$active"
             sleep 60
           done
-  # Static gates: formatting, compilation, both clippy profiles, the
-  # diagnostic-object inventory test and script lints.
+  # Static gates: formatting, compilation (gnu plus the shipped musl and
+  # P0 configurations), both clippy profiles, the diagnostic-object
+  # inventory test and script lints.
   lint:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
@@ -136,7 +137,8 @@ jobs:
       # read inline like .coverage-floor; crate rust-version tracks its major.minor.
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 shellcheck softhsm2
       # Cache keys (see the header): the runner image, and the apt C toolchain
       # that build scripts invoke.
       - name: Cache keys
@@ -191,6 +193,15 @@ jobs:
       # The wide Detailed profile changes the embedded BPF object and the slot
       # bound; lint it so a default-only change cannot break the other profile.
       - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline -p p11scope --all-targets --features wide-detailed-2112 -- -D warnings
+      # Every shipped configuration compiles on push: the static musl
+      # observer plus the P0 feature set on both libcs. A musl-only break (a
+      # libc wrapper with no musl binding) once landed and was found only by
+      # a manual build. The musl gates stay on default targets (lib and
+      # bins) until the product source fixes its three pre-existing
+      # musl-only breaks; then they widen back to --all-targets and clippy.
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --target x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
       # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
@@ -788,11 +799,12 @@ jobs:
       # pid+system, --mode both runs metrics+profile, and the lane's own
       # oracle joins observer report + traces + workload TRUTH per cell.
       - run: scripts/system-scope-measure.sh --scope both --mode both
-  # SYSPLAN residual F-28: release preview (musl build, docker build/lint,
-  # kubeconform, SBOM, build-release.sh wired). Manual like the privileged
-  # lane: dispatch it on demand; it never blocks PRs and never implies a
-  # release ran. Hosted runners suffice (passwordless sudo covers the
-  # receipt steps); no special labels needed.
+  # SYSPLAN residual F-28: release preview (musl FULL and P0 builds,
+  # docker build/lint, kubeconform, SBOM, build-release.sh wired for both
+  # capture modes). Manual like the privileged lane: dispatch it on demand;
+  # it never blocks PRs and never implies a release ran. Hosted runners
+  # suffice (passwordless sudo covers the receipt steps); no special labels
+  # needed.
   release-preview:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_preview }}
     runs-on: ubuntu-24.04
@@ -824,6 +836,7 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
       - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --target x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
       - run: docker build -f deploy/Dockerfile.observer -t p11scope-observer:preview .
       - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
       - name: Download verified release tools
@@ -856,11 +869,14 @@ jobs:
       # Only selected public outputs below are uploaded as artifacts.
       - run: mkdir -m 700 "$RUNNER_TEMP/release-evidence"
       - run: TMPDIR="$RUNNER_TEMP/release-evidence" scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"
+      - run: TMPDIR="$RUNNER_TEMP/release-evidence" scripts/build-release.sh --capture-mode p0 "$RUNNER_TEMP/release-evidence/receipt-p0"
       - name: Release receipt summary
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          python3 -I - "$RUNNER_TEMP/release-evidence/receipt" "$GITHUB_STEP_SUMMARY" <<'PY'
+          set -euo pipefail
+          for receipt in "$RUNNER_TEMP/release-evidence/receipt" "$RUNNER_TEMP/release-evidence/receipt-p0"; do
+          python3 -I - "$receipt" "$GITHUB_STEP_SUMMARY" <<'PY'
           from pathlib import Path
           import re
           import sys
@@ -1030,6 +1046,7 @@ jobs:
               output.write("\n## Release diagnostic summary\n\n```json\n")
               output.write(json.dumps(report, sort_keys=True, indent=2) + "\n```\n")
           PY
+          done
       # Assemble public assets from the verified receipt, source and notices.
       - name: Assemble public release candidate
         shell: bash
@@ -1047,10 +1064,22 @@ jobs:
             --notices "$RUNNER_TEMP/release-evidence/notices" \
             --source "$source_archive" \
             --output "$RUNNER_TEMP/release-evidence/public"
+          python3 -I scripts/package-release.py \
+            --capture-mode p0 \
+            --receipt "$RUNNER_TEMP/release-evidence/receipt-p0" \
+            --notices "$RUNNER_TEMP/release-evidence/notices" \
+            --source "$source_archive" \
+            --output "$RUNNER_TEMP/release-evidence/public-p0"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-preview-public-assets
           path: ${{ runner.temp }}/release-evidence/public/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-preview-public-assets-p0
+          path: ${{ runner.temp }}/release-evidence/public-p0/
           if-no-files-found: error
           retention-days: 30
       # This SBOM describes the preview container image, not the official

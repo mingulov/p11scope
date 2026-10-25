@@ -48995,12 +48995,15 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let deep_scans = engine.deep_scans;
-    let truncated = engine.discovery_truncated;
     engine.collected_finish_actions = Some(64);
     session.refuse_preflights([false, false]);
-    let mut records = vec![refresh_exec(head_pid), refresh_exec(selected)];
+    // Two refused heads: the suffix advances in ring order behind the
+    // first, and the second refusal dedups against the first disclosure.
+    let second_pid = 7_000_000u32;
+    let mut records = vec![refresh_exec(head_pid), refresh_exec(second_pid)];
     let mut collect = Engine::collect_discovery_records;
+    let deep_scans = engine.deep_scans;
+    let truncated = engine.discovery_truncated;
     let mut credits = 0usize;
     for _ in 0..64 {
         // Each drive is one service call with a fresh action budget.
@@ -49046,10 +49049,15 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         !engine.refresh_requested.contains_key(&head_pid),
         "the refused head takes no slot"
     );
+    assert!(
+        !engine.refresh_requested.contains_key(&second_pid),
+        "the refused suffix takes no slot"
+    );
+
     assert_eq!(
         engine.discovery_truncated,
-        truncated.saturating_add(1),
-        "the full map refuses once"
+        truncated.saturating_add(2),
+        "the full map refuses each head"
     );
     let losses: Vec<_> = engine
         .counters
@@ -49057,10 +49065,23 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         .iter()
         .filter(|skip| skip.subject == "live discovery refresh")
         .collect();
-    assert_eq!(losses.len(), 1, "live loss once, in order");
+    // The live loss (mark_live_loss) fires exactly once, first. The
+    // retry partial behind it is ordinary EXEC dispatch behavior: the
+    // head's live view queues ExecRefresh retirement, whose retry meets
+    // the same full map. The viewless suffix dedups against both.
+    assert_eq!(
+        losses.len(),
+        2,
+        "the head loss plus the ordinary EXEC retry, in order"
+    );
     assert_eq!(
         losses[0].reason,
-        "refresh requests exceeded the bounded pending queue; excess requests were dropped"
+        "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+        "live loss once, first"
+    );
+    assert_eq!(
+        losses[1].reason,
+        "refresh retry exceeded the bounded pending queue; work remains unfinished"
     );
     assert!(
         engine.pressure_service_passes == 0,

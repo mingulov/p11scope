@@ -10,13 +10,15 @@ of three ways:
   importable package, so `-m unittest` cannot address them).
 - DRIVEN: a suite that needs a built artifact (an eBPF object, a fixture
   binary, a prepared toolchain) and is run by the named driver, which must
-  name it. The driver is a cargo integration test or a self-test the hosted
+  drive it through an invocation-shaped reference: the suite path as an
+  argument of a python/pytest/unittest call or of the runner's own suite
+  list. The driver is a cargo integration test or a self-test the hosted
   pipeline already runs.
 - EXCLUDED: a suite that cannot run anywhere today, with the reason.
 
 The registry is checked against the directory both ways before anything
 runs: a new suite nobody registered, a registered suite that is gone, or a
-driver that no longer names its suite fails the run. That is what keeps a
+driver that no longer drives its suite fails the run. That is what keeps a
 suite from silently running nowhere again.
 
 Usage:
@@ -34,6 +36,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITE_DIR = "tests/python"
+
+# Tokens of an invocation or an argument list. A quoted suite path counts
+# as driven only in argument position (after `(`, `,` or `[`) with one of
+# these within two lines: a python/pytest/unittest call, the Rust suite
+# runners, or a python argument flag. A bare mention in a comment or a
+# message has neither and fails.
+INVOCATION_MARKERS = (
+    "python", "pytest", "unittest", "run_ok", "run_native_python_suite",
+    "Command::new", ".args", ".arg(", ".join(", "vec!", "-I", "-p",
+)
 
 # (file, extra args). A file may appear more than once with different args.
 RUN = [
@@ -116,9 +128,10 @@ RUN = [
 _ARTIFACT_CONTRACTS = "tests/artifact_contracts.rs"
 _RECEIPTS = "tests/receipt_build_subjects.rs"
 
-# file -> driver path. The driver must contain the quoted repo-relative path
+# file -> driver path. The driver must pass the quoted repo-relative path
 # (`"tests/python/<file>"`) or, for a discover-by-pattern driver, the quoted
-# file name.
+# file name as an invocation argument (see INVOCATION_MARKERS); a bare
+# mention in a comment or a message does not count.
 DRIVEN = {
     "test_audit_oracle.py": _ARTIFACT_CONTRACTS,
     "test_bpf_map_defs.py": "tests/bpf_map_contracts.rs",
@@ -181,6 +194,93 @@ EXCLUDED = {
 }
 
 
+def _strip_driver_comments(text, driver):
+    """Driver text with line comments blanked (strings are kept).
+
+    Rust drivers lose `//` comments, Python and shell drivers `#` ones;
+    a marker inside a string literal never starts a comment.
+    """
+    marker = "//" if driver.endswith(".rs") else "#"
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        char = text[i]
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(text[i])
+                        i += 1
+                    continue
+                i += 1
+                if out[-1] == quote:
+                    break
+        elif marker == "//" and text.startswith("r", i) and text[i + 1:i + 2] in "#\"":
+            hashes = 0
+            j = i + 1
+            while text[j:j + 1] == "#":
+                hashes += 1
+                j += 1
+            if text[j:j + 1] != '"':
+                out.append(char)
+                i += 1
+            else:
+                close = '"' + "#" * hashes
+                end = text.find(close, j + 1)
+                end = n if end < 0 else end + len(close)
+                out.append(text[i:end])
+                i = end
+        elif text.startswith(marker, i):
+            while i < n and text[i] != "\n":
+                i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _invocation_shaped(stripped, needle):
+    """True when some occurrence is passed as an invocation argument.
+
+    An occurrence counts when it sits in argument position (after `(`, `,`
+    or `[`, closed by `,`, `)` or `]` or whitespace) with an invocation
+    marker within two lines; a bare mention has neither and fails.
+    """
+    lines = stripped.splitlines()
+    start = 0
+    while True:
+        at = stripped.find(needle, start)
+        if at < 0:
+            return False
+        start = at + len(needle)
+        before = stripped[:at].rstrip()
+        if before and before[-1] in "(,[":
+            after = stripped[at + len(needle):]
+            if after == "" or after[0] in ",)]" or after[0].isspace():
+                row = stripped.count("\n", 0, at)
+                window = lines[max(0, row - 2):row + 3]
+                if any(marker in line
+                       for marker in INVOCATION_MARKERS for line in window):
+                    return True
+    return False
+
+
+def driven_state(text, name, driver):
+    """How a driver references a suite: "driven", "named" or "missing"."""
+    stripped = _strip_driver_comments(text, driver)
+    needles = (f'"{SUITE_DIR}/{name}"', f'"{name}"')
+    if not any(needle in stripped for needle in needles):
+        return "missing"
+    if any(_invocation_shaped(stripped, needle) for needle in needles):
+        return "driven"
+    return "named"
+
+
 def registry_problems(present, run, driven, excluded, read):
     """Every way the registry and the directory disagree, as messages.
 
@@ -211,8 +311,14 @@ def registry_problems(present, run, driven, excluded, read):
         text = read(driver)
         if text is None:
             problems.append(f"{name}: driver {driver} does not exist")
-        elif f'"{SUITE_DIR}/{name}"' not in text and f'"{name}"' not in text:
-            problems.append(f"{name}: driver {driver} no longer names it")
+        else:
+            state = driven_state(text, name, driver)
+            if state == "named":
+                problems.append(
+                    f"{name}: driver {driver} names it without driving it "
+                    "(no invocation-shaped reference)")
+            elif state == "missing":
+                problems.append(f"{name}: driver {driver} no longer names it")
     for name, reason in sorted(excluded.items()):
         if not reason.strip():
             problems.append(f"{name} is excluded without a reason")

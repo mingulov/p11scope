@@ -5,14 +5,15 @@
 # Two containers A and B start from one holder image (deploy/Dockerfile.holder,
 # reused verbatim: pinned ubuntu:26.04 base, SoftHSM2, ledgered `gated` client),
 # so both map the provider through overlay lower layers. Pre-copy-up both
-# identity backends must attribute both containers exactly. Two inventory
-# captures then span a same-bytes copy-up in B only (OQ5): they pin B's
-# provider from B's first (lower) mapper, a second process in B maps the upper
-# copy, and the kernel backend must refuse that mapping with a named loss while
-# userspace still joins it (D-C7-3, disclosed). After B restarts, fresh
-# captures open their anchor from the upper copy and attribute B exactly. The
-# observer is the host release binary run through `sudo -n` in the initial PID
-# namespace.
+# identity backends collapse B onto A's module (same lower file, honest).
+# Two inventory captures then span a same-bytes copy-up in B only (OQ5):
+# a second process in B maps the upper copy, and on BOTH backends B's first
+# process keeps an ended edge to the old module plus a mapped edge to the new
+# one (the known issue copy-up-stale-caller: it still runs the lower file)
+# while the second mapper is attributed to the upper copy with no loss.
+# After B restarts, fresh captures open their anchor from the upper copy and
+# attribute B exactly. The observer is the host release binary run through
+# `sudo -n` in the initial PID namespace.
 #
 # The CONTROLLER runs every docker/dockerd/sudo command below. Workers only run
 # `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves the arg
@@ -76,8 +77,9 @@ Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 UNRUN (cell not run, see SUMMARY reason).
 Every run prints a final SUMMARY line: SUMMARY cell=D1 host=... verdict=... reason="...".
 
 CONTROLLER (run order):
-  # D1 on the dev host (from the repo root; BIN = host release binary):
-  sh scripts/docker-shared-layer-e2e.sh --host dev --observer BIN --token <TOKEN>
+  # D1 on the dev host (from the repo root; BIN = host release binary).
+  # Exact dev rerun (run-4 flags: iters 400/250, duration 30, span 60):
+  sh scripts/docker-shared-layer-e2e.sh --host dev --observer BIN --token <TOKEN> --iters-a 400 --iters-b 250 --duration 30 --span 60
   # D1 bundle for fedora (on the dev host):
   sh scripts/docker-shared-layer-e2e.sh --bundle /tmp/ctr-bundle-<TOKEN> --image p11scope-ctr-shared:<TOKEN>
   scp -r /tmp/ctr-bundle-<TOKEN> fedora:/home/user/p11scope-ctr-<TOKEN>/bundle
@@ -157,6 +159,18 @@ self_test() {
             exit 1
         }
     done
+    # The run-log note discloses copy-up-stale-caller (the disproven
+    # kernel-refusal sentence must not come back), and the oracle call
+    # proves the copy-up from facts.log. The bracketed letters keep these
+    # greps from matching their own lines.
+    grep -q 'copy-up-stale-caller.*dc73-no[t]e' "$0" \
+        || { echo "driver lost its copy-up-stale-caller note" >&2; exit 1; }
+    if grep -q "identity_mismatch is the correct le[g]" "$0"; then
+        echo "disproven kernel-refusal note is back" >&2
+        exit 1
+    fi
+    grep -q -- '--facts-log "\$FACT[S]"' "$0" \
+        || { echo "oracle call lost --facts-log" >&2; exit 1; }
     d1_help_self_test
     d1_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -167,7 +181,8 @@ self_test() {
 d1_help_self_test() {
     help=$(sh "$0" --help 2>&1 || true)
     for marker in "--host dev --observer BIN" "--host fedora-private --task-root" \
-                  "--bundle OUTDIR" "scp -r" "sudo -n true" "SUMMARY cell=D1"; do
+                  "--bundle OUTDIR" "scp -r" "sudo -n true" "SUMMARY cell=D1" \
+                  "--iters-a 400 --iters-b 250 --duration 30 --span 60"; do
         case $help in
             *"$marker"*) ;;
             *) echo "help lost its controller line: $marker" >&2; exit 1 ;;
@@ -1076,11 +1091,7 @@ awk '/^READY /{n++} n>=2' "$WORK/logs-b-post.txt" >"$WORK/logs-b-post-run.txt"
 ledger_is "$WORK/logs-b-post-run.txt" "$ITERS_B" || fail_cell "restarted B ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/logs-b-post.txt" >>"$FACTS"
 
-if [ "$LANE" = "B" ]; then
-    printf '%s\n' "D-C7-3 applies: post-copy-up userspace edge to the upper mapping is backend-divergent per docs/known-limitations.md; the kernel refusal with identity_mismatch is the correct leg." >"$WORK/dc73-note.txt"
-else
-    printf '%s\n' "D-C7-3 does not apply on lane A: neither backend joins the upper mapping (parity none, disclosed)." >"$WORK/dc73-note.txt"
-fi
+printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process is attributed to the upper copy on both identity backends (known issue, disclosed). The second mapper in B is attributed to the upper copy on both backends. No named identity loss is expected on any leg." >"$WORK/dc73-note.txt"
 fact "dc73-note=$(cat "$WORK/dc73-note.txt")"
 
 say "=== oracle ==="
@@ -1098,9 +1109,11 @@ if python3 -I "$ORACLE" copy-up --lane "$LANE" \
         --pid-b-post "$PID_B_POST" \
         --iters-a "$ITERS_A" --iters-b "$ITERS_B" \
         --dc73-note "$WORK/dc73-note.txt" \
+        --facts-log "$FACTS" \
         >"$WORK/oracle.json" 2>"$WORK/oracle.err"; then
     cat "$WORK/oracle.json" >>"$SUMMARY_JSONL"
     cat "$WORK/oracle.json" >>"$FACTS"
+    cat "$WORK/oracle.err" >>"$FACTS"
     pass_cell "D1 lane $LANE copy-up verdict recorded"
 else
     cat "$WORK/oracle.err" >&2 || true

@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* H8-D atomic birth marker leaves. Inactive: no live root wires these
- * (pinned by test). BPF-compatible: at most 3 arguments per leaf, no
- * static initializers, CAS-only mutation. */
+/* H8-D atomic birth marker leaves. Live since slice D: the exec-birth
+ * and scope-gap roots wire these (pinned by test). BPF-compatible: at
+ * most 3 arguments per leaf, no static initializers, 64-bit atomics
+ * (compare-exchange, exchange, and fetch-or reads). */
 #include "journal_marker.h"
 
 #ifndef P11SCOPE_JOURNAL_MARKER_NO_MAPS

@@ -1939,6 +1939,13 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
         p11_instance_exec()
     };
     if let Some(scope) = scope_auth() {
+        // H8-D birth marker: an in-scope exec after closure publishes
+        // READY for key-operation birth. Scope-gated: an exec outside
+        // the scope can never be born, so it is never charged.
+        #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+        unsafe {
+            p11_instance_exec_birth();
+        }
         let old_pid = _ctx.arg::<u64>(1);
         let pid_tgid = helpers::bpf_get_current_pid_tgid();
         // Replacement/invalid IDs need no kernel dumpability read. Equal
@@ -2805,6 +2812,13 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
 fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     let Some(flags) = scope_flags() else {
+        // H8-D birth marker: a watched call outside the scope dirties
+        // the leader row, so a later exec cannot claim an uncaptured
+        // prefix as born.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         return 0;
     };
     if slot >= MAX_SLOTS || flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA == 0 {
@@ -2854,6 +2868,14 @@ unsafe extern "C" {
     fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
+    /// H8-D post-attach birth marker (native instance_epoch.c, Detailed
+    /// only): the exec half publishes READY on the leader row after
+    /// closure; the gap half dirties it on an out-of-scope or refused
+    /// call. Both own their frames; failures latch the control row.
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    fn p11_instance_exec_birth() -> u32;
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    fn p11_instance_scope_gap() -> u32;
     fn p11_owner_healthy() -> u32;
     fn p11_owner_cleanup() -> u32;
     /// H7 slice B subordinate custody (native task_owner.c): the query row
@@ -3386,6 +3408,13 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         return 0;
     }
     let Some(flags) = scope_flags() else {
+        // H8-D birth marker: a watched call outside the scope dirties
+        // the leader row, so a later exec cannot claim an uncaptured
+        // prefix as born.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         return 0;
     };
     let key = StartKey {
@@ -3394,12 +3423,22 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         _pad: 0,
     };
     let Some(actual_layout) = probe_layout(&ctx) else {
+        // H8-D birth marker: a refused ABI is an uncaptured call.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         let _ = owned_start_remove(&key, false);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
     let layout = if ENTRY_ABI == ENTRY_ABI_LP64 {
         if !matches!(actual_layout, LinuxLayout::Lp64) {
+            // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(not(feature = "counter-broad"))]
+            unsafe {
+                p11_instance_scope_gap();
+            }
             let _ = owned_start_remove(&key, false);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;
@@ -3407,6 +3446,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         LinuxLayout::Lp64
     } else if ENTRY_ABI == ENTRY_ABI_ILP32 {
         if !matches!(actual_layout, LinuxLayout::Ilp32) {
+            // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(not(feature = "counter-broad"))]
+            unsafe {
+                p11_instance_scope_gap();
+            }
             let _ = owned_start_remove(&key, false);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;

@@ -1002,7 +1002,10 @@ fn object_journal_transaction_ordering_matrix() {
 }
 
 /// Slice-A custody stays inactive: no live BPF root wires the journal
-/// leaves until slice B authorizes the transactions.
+/// transaction leaves until slice B authorizes the transactions. The
+/// slice-D birth marker globals are live (wired from the exec and entry
+/// roots through names that carry none of these literals); only the
+/// transaction set below stays unwired.
 #[test]
 fn object_journal_leaves_are_inactive() {
     for program in ["main.rs", "inventory.rs", "inventory_callers.rs"] {

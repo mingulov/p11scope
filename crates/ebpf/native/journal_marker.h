@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* H8-D atomic birth marker: one READY/DIRTY word appended to PROC_EPOCH
  * (152 B total) plus a Detailed-only 16 B admission control row
- * {spent, failed}. Inactive: no live root calls these leaves until
- * slice D authorizes the transactions (pinned by test).
+ * {spent, failed}. Live since slice D: the exec-birth and scope-gap
+ * roots call publish, dirty, admit and reserve. The transaction leaves
+ * (JOURNAL_START, journal threads) stay inactive (pinned by test).
  *
  * Word encoding (low 2 bits = state, high 62 = exec generation):
  *   0                  unpublished (fresh storage)

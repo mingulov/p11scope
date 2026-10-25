@@ -6036,9 +6036,11 @@ pub(crate) mod tests {
     ///   `retained_target_copy_allocation_charge × 4` sum `NativeIo` charges;
     /// - `multi_links`: at least the session link length and capacity (Multi
     ///   attaches at most two leaves per endpoint and reserves exactly that).
+    ///
     /// Slot copies use 16, the `NativeIo` charge, which dominates the directory
     /// precheck's 4. `all_slots` must cover `first..end`. Callers add headroom
     /// on top of the returned requirement.
+    #[allow(clippy::too_many_arguments)] // Explicit mirror of stage_requirements' checked inputs plus the Multi extent.
     pub(crate) fn estimate_counter_stage_reservation(
         mode: CounterMode,
         banks: u32,

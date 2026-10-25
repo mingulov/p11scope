@@ -13643,71 +13643,88 @@ mod promotion_driver_tests {
     #[test]
     fn joint_driver_commit_error_takes_finite_stop() {
         use crate::inventory_semantics::SemanticRefusal;
-        // A non-retryable commit refusal in NotBegun abandons within
+        // Item 7 runs on the retained final lane: the winding always
+        // begins or transfers, so no winding polls a commit. A
+        // non-retryable commit refusal in NotBegun abandons within
         // one hook: the step notes the failure and takes the finite
         // stop instead of beginning.
-        let mut coordinator = coordinator();
+        let mut coord = coordinator();
         let headless = headless_display();
-        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut driver = driver_with_display(&mut coord, headless.display);
         let mut io = WindDownIo::completing();
         let drops = Rc::new(Cell::new(0));
         io.drop_spy = Some(Rc::clone(&drops));
-        driver.retiring = Some(RetiringDomain::winding(joint_lane(io, false), true));
+        driver.semantic = Some(joint_lane(io, false));
+        driver.joint_commit_pending = true;
+        driver.suspended = true;
         driver.on_tick();
         assert_eq!(driver.joint_begin_calls, 0, "a refused commit never begins");
-        let winding = driver
-            .retiring
-            .as_ref()
-            .expect("retiring")
-            .winding
-            .as_ref()
-            .expect("the abandoned finish stays winding");
-        assert!(winding.joint, "A carries a promotion finish");
         assert_eq!(
-            winding.finish,
+            driver.joint_finish,
             JointFinishDriver::Abandoned,
             "a non-retryable commit refusal abandons within one hook"
         );
-        assert!(winding.lane.is_none(), "the abandoned lane is held");
+        assert!(driver.semantic.is_none(), "the abandoned lane is held");
         assert_eq!(drops.get(), 0, "held means never dropped");
         assert!(
             driver.joint_first_error.is_some(),
             "the first error is kept"
         );
-        // B stays blocked behind the abandoned finish.
-        queue_request(driver.display.as_mut().expect("display"));
-        for _ in 0..2 {
-            driver.on_tick();
+        // B stays blocked behind an abandoned winding: a
+        // dispositioned lane winds down into a held Abandoned finish
+        // that gates B.
+        {
+            let mut coord = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coord, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.note_joint_finish_failure(SemanticRefusal::Unavailable);
+            driver.semantic = Some(lane);
+            install_promotion_for_wind_down(&mut driver);
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            let winding = driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("the abandoned finish stays winding");
+            assert!(winding.joint, "A carries a promotion finish");
+            assert_eq!(
+                winding.finish,
+                JointFinishDriver::Abandoned,
+                "the dispositioned wind-down abandons"
+            );
+            queue_request(driver.display.as_mut().expect("display"));
+            for _ in 0..2 {
+                driver.on_tick();
+            }
+            assert_eq!(
+                driver.display.as_ref().expect("display").promotion_state(),
+                PromotionState::Queued,
+                "B waits behind the abandoned finish"
+            );
+            assert!(
+                driver.lifecycle.is_idle(),
+                "B prepares nothing behind the abandoned finish"
+            );
         }
-        assert_eq!(
-            driver.display.as_ref().expect("display").promotion_state(),
-            PromotionState::Queued,
-            "B waits behind the abandoned finish"
-        );
-        assert!(
-            driver.lifecycle.is_idle(),
-            "B prepares nothing behind the abandoned finish"
-        );
         // The retryable counter: ProviderStorage stays through 100
         // hooks and fails on the 101st; anything else fails at once.
-        let lane = joint_lane(WindDownIo::completing(), false);
-        let mut retiring = RetiringDomain::winding(lane, true);
-        let winding = retiring.winding.as_mut().expect("winding");
+        let mut retries = 0u16;
         for _ in 0..100 {
             assert!(
-                winding.note_commit_refusal(SemanticRefusal::ProviderStorage),
+                note_commit_refusal_once(&mut retries, SemanticRefusal::ProviderStorage),
                 "storage refusals retry through 100 hooks"
             );
         }
         assert!(
-            !winding.note_commit_refusal(SemanticRefusal::ProviderStorage),
+            !note_commit_refusal_once(&mut retries, SemanticRefusal::ProviderStorage),
             "the 101st storage refusal fails"
         );
-        let lane = joint_lane(WindDownIo::completing(), false);
-        let mut retiring = RetiringDomain::winding(lane, true);
-        let winding = retiring.winding.as_mut().expect("winding");
+        let mut retries = 0u16;
         assert!(
-            !winding.note_commit_refusal(SemanticRefusal::Unavailable),
+            !note_commit_refusal_once(&mut retries, SemanticRefusal::Unavailable),
             "a non-retryable refusal fails at once"
         );
     }

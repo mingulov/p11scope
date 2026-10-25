@@ -3127,6 +3127,17 @@ impl AttestedSemanticLane {
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Result<(), SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_finish_begin {
+            // A scripted error latches like a pre-machine refusal on
+            // unfinished lanes; Ok runs the begun arm latch-free.
+            if let Err(reason) = &scripted
+                && !self.is_finished()
+            {
+                self.joint_finish_failure.get_or_insert(*reason);
+            }
+            return scripted;
+        }
         let mut ran = false;
         let result =
             self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {
@@ -3148,6 +3159,21 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
+        #[cfg(test)]
+        {
+            self.finish_poll_calls += 1;
+        }
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_finish_poll {
+            // A scripted error latches like a pre-machine refusal on
+            // unfinished lanes; scripted progress runs latch-free.
+            if let Err(reason) = &scripted
+                && !self.is_finished()
+            {
+                self.joint_finish_failure.get_or_insert(*reason);
+            }
+            return scripted;
+        }
         let mut ran = false;
         let result =
             self.with_machine_owner(coordinator, true, |machine, lane, coordinator, io| {

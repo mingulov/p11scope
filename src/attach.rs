@@ -8409,9 +8409,9 @@ impl Session {
         self.backend_fallback.as_deref()
     }
 
-    /// Object-attribute capture availability in this build (P0-only ship
-    /// vehicle): build scope, so every session of this binary reports the
-    /// same status. Stubbed (v0.4.0) builds disclaim attribute coverage;
+    /// Object-attribute capture availability in this build: build scope,
+    /// so every session of this binary reports the same status. Stubbed
+    /// (P0) builds disclaim attribute coverage;
     /// FULL builds report available. The consistency test pins this
     /// against the probed embedded bytes in every flavor.
     pub(crate) fn object_capture_evidence() -> crate::render::ObjectCaptureEvidence {

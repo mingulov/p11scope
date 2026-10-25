@@ -496,6 +496,40 @@ class PartialWalkCheckTests(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "pass")
         self.assertEqual(verdict["events"], 3)
 
+    def test_partial_walk_counts_relative_opens(self):
+        oracle = require_oracle(self)
+        trace = "\n".join([
+            f"{PID} openat(AT_FDCWD, \"rel/sub\", O_RDONLY|O_DIRECTORY) = 3",
+            f"{PID} getdents64(3, 0x7f00, 32768) = 120",
+        ]) + "\n"
+        verdict = oracle.check_partial_walk(
+            trace, self.BOUNDARY, self.partial_record(),
+            scoped_pids=[SCOPED])
+        self.assertEqual(verdict["verdict"], "pass")
+        self.assertEqual(verdict["events"], 2)
+        self.assertEqual(verdict["counts"],
+                         {"unresolved-open": 0, "relative-unresolved": 2})
+
+    def test_partial_walk_counts_unresolvable_open(self):
+        oracle = require_oracle(self)
+        events = [{"pid": PID, "call": "openat", "path": None, "fd": None,
+                   "result": 3, "directory_open": False, "lineno": 1}]
+        verdict = oracle.check_partial_walk(
+            events, self.BOUNDARY, self.partial_record(),
+            scoped_pids=[SCOPED])
+        self.assertEqual(verdict["verdict"], "pass")
+        self.assertEqual(verdict["counts"],
+                         {"unresolved-open": 1, "relative-unresolved": 0})
+
+    def test_partial_walk_getdents_on_unknown_fd_fails(self):
+        oracle = require_oracle(self)
+        trace = (f"{PID} getdents64(9, 0x7f00, 32768) = 120\n")
+        with self.assertRaisesRegex(oracle.EvidenceError,
+                                    "getdents64 on unresolved fd"):
+            oracle.check_partial_walk(trace, self.BOUNDARY,
+                                      self.partial_record(),
+                                      scoped_pids=[SCOPED])
+
     def test_walk_crossing_the_boundary_fails_naming_it(self):
         oracle = require_oracle(self)
         trace = (self.walk_trace() +

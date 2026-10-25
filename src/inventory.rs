@@ -5556,12 +5556,12 @@ fn final_view_guarded(
     started_ns: u64,
     ended_ns: u64,
 ) -> Presentation {
-    if driver.publication_pending() {
-        if let Some(prior) = state.last_stream_view.as_ref() {
-            let mut view = prior.clone();
-            view.semantic_capture = driver.semantic_summary();
-            return view;
-        }
+    if driver.publication_pending()
+        && let Some(prior) = state.last_stream_view.as_ref()
+    {
+        let mut view = prior.clone();
+        view.semantic_capture = driver.semantic_summary();
+        return view;
     }
     let mut presentation = Presentation::capture(
         driver.coordinator,

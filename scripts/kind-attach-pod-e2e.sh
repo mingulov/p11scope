@@ -609,6 +609,34 @@ EOF
     scan_fixture lossexact '["pid_namespace","event_loss"]' 250 "$sst_provider"
     scan_fixture losszero '["pid_namespace","event_loss"]' 0 '[]'
     scan_fixture nonumbering '["discovery"]' 0 '[]'
+    # Duplicate rows for one function sum: 100 + 150 per ledger function
+    # is exact, so a max-for-sum count would refuse it.
+    python3 -I - "$sst_stub/run3.json" "$sst_stub/dupsum.json" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = []
+for row in document["functions"]:
+    rows.append(dict(row, calls=100))
+    rows.append(dict(row, calls=150))
+document["functions"] = rows
+json.dump(document, open(sys.argv[2], "w", encoding="utf-8"))
+PY
+    # A ledger function whose counted calls all returned errors is not the
+    # ledger's successful calls; errors on setup rows stay recorded only.
+    python3 -I - "$sst_stub/run4.json" "$sst_stub/ledgererr.json" "$sst_stub/setuperr.json" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+ledger = json.loads(json.dumps(document))
+for row in ledger["functions"]:
+    if row["names"] == ["C_Digest"] and row["calls"] == 250:
+        row["errors"] = 1
+json.dump(ledger, open(sys.argv[2], "w", encoding="utf-8"))
+setup = json.loads(json.dumps(document))
+for row in setup["functions"]:
+    if row["names"] == ["C_Login"]:
+        row["errors"] = 2
+json.dump(setup, open(sys.argv[3], "w", encoding="utf-8"))
+PY
     scan_pass run4 exec250 counted-exact
     scan_pass run3 exec250 counted-exact
     scan_pass live exec250 counted-exact
@@ -617,6 +645,9 @@ EOF
     scan_pass absent exec250 absent
     scan_pass attached-zero exec250 attached-zero
     scan_pass ledger100 exec100 counted-exact
+    scan_pass dupsum exec250 counted-exact
+    scan_pass setuperr exec250 counted-exact
+    scan_fail ledgererr exec250 "scan ledger errors"
     for cause in discovery slots unprotected_live_windows skipped; do
         scan_fixture "only-$cause" "[\"pid_namespace\",\"$cause\"]" 0 '[]'
         scan_pass "only-$cause" exec250 absent

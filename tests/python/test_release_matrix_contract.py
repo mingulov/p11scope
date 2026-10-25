@@ -2418,11 +2418,16 @@ class MatrixContract(unittest.TestCase):
                 with self.subTest(obligation=obligation, lane=lane):
                     self.assertIn(lane, lanes_all)
 
-    def test_d4_ext4_inode_reuse_stays_unready(self):
+    def test_d4_ext4_inode_reuse_ready_on_qualified_lanes(self):
         ready = CHECKER_MOD["D4_READY"]
         self.assertEqual(
-            [pair for pair in ready if pair[0] == "D4:ext4-inode-reuse"], [],
-            "ext4-inode-reuse flips only when the fixed cell qualifies",
+            sorted(pair for pair in ready if pair[0] == "D4:ext4-inode-reuse"),
+            [
+                ("D4:ext4-inode-reuse", "6.1.188"),
+                ("D4:ext4-inode-reuse", "6.6.157"),
+                ("D4:ext4-inode-reuse", "host"),
+            ],
+            "ext4-inode-reuse is ready exactly on the lanes whose cell qualified",
         )
 
     def test_d4_copy_up_red_cell_is_never_a_qualifying_cell(self):

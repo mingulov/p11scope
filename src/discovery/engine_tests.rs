@@ -48968,3 +48968,104 @@ fn collected_finish_lowered_original_is_consumed_without_pin_io() {
         "a publication lowered after the terminal stop was not admitted; its objects were not pinned"
     );
 }
+
+#[test]
+fn collected_finish_pressure_head_disposes_without_refresh() {
+    let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    let selected = fixture.spawn_peer();
+    wait_peer_mapped(selected, "seed-provider.so");
+    assert!(selected < 4_000_000);
+    engine.scope = Scope::Pid(selected);
+    let mut headpeer = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn head peer");
+    let head_pid = headpeer.id();
+    assert!(head_pid != selected);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), head_pid).unwrap());
+    engine.next_view_id = 2;
+    assert!(engine.request_refresh_consumed(selected, Some(1_200)));
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let deep_scans = engine.deep_scans;
+    let truncated = engine.discovery_truncated;
+    engine.collected_finish_actions = Some(64);
+    session.refuse_preflights([false, false]);
+    let mut records = vec![refresh_exec(head_pid), refresh_exec(selected)];
+    let mut collect = Engine::collect_discovery_records;
+    let mut credits = 0usize;
+    for _ in 0..64 {
+        // Each drive is one service call with a fresh action budget.
+        engine.collected_finish_actions = Some(64);
+        engine
+            .process_discovery_records(
+                &mut session,
+                &mut records,
+                &mut PendingViewRetirements::new(),
+                &mut true,
+                &mut collect,
+                &mut PauseClosure::new(true),
+            )
+            .expect("the collected pass keeps the batch alive");
+        credits += 1;
+        if records.is_empty()
+            && engine.pending_discovery_records.is_empty()
+            && !engine.pressure_rotation_pending
+        {
+            break;
+        }
+    }
+    assert!(
+        records.is_empty() && engine.pending_discovery_records.is_empty(),
+        "the head disposes within two credits, not {credits}"
+    );
+    assert!(credits <= 2, "the head disposes within two credits");
+    assert!(
+        !engine.pressure_rotation_pending,
+        "no rotation is re-parked"
+    );
+    assert_eq!(engine.deep_scans, deep_scans, "no scan runs");
+    assert!(
+        engine.views.iter().any(|view| view.pid() == head_pid),
+        "the protected view survives"
+    );
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "no refresh slot is consumed"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&head_pid),
+        "the refused head takes no slot"
+    );
+    assert_eq!(
+        engine.discovery_truncated,
+        truncated.saturating_add(1),
+        "the full map refuses once"
+    );
+    let losses: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live discovery refresh")
+        .collect();
+    assert_eq!(losses.len(), 1, "live loss once, in order");
+    assert_eq!(
+        losses[0].reason,
+        "refresh requests exceeded the bounded pending queue; excess requests were dropped"
+    );
+    assert!(
+        engine.pressure_service_passes == 0,
+        "no service pass runs under the terminal stop"
+    );
+    headpeer.kill().unwrap();
+    headpeer.wait().unwrap();
+}

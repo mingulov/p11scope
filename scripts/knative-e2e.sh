@@ -685,6 +685,7 @@ EOF
     k3_waiter_self_test "$stub"
     k3_parser_self_test "$stub"
     k3_check_self_test "$stub"
+    k3_sequencing_self_test "$stub"
     k3_cleanup_self_test "$stub"
     rm -rf "$stub" "$work1" "$WORK"
     trap - EXIT
@@ -974,6 +975,263 @@ PY
             exit 1
         fi
     done
+    k3_wake_self_test "$stub"
+    k3_boundary_self_test "$stub"
+}
+
+k3_wake_self_test() {
+    stub=$1
+    # The wake answer is exactly "ready\n": any other body (or a ledger body,
+    # which would mean the gate moved) refuses.
+    printf 'ready\n' > "$stub/wake-good.txt"
+    response_wake_is "$stub/wake-good.txt" \
+        || { echo "good wake response refused" >&2; exit 1; }
+    printf 'nope\n' > "$stub/wake-bad.txt"
+    : > "$stub/wake-empty.txt"
+    printf 'ready' > "$stub/wake-nonl.txt"
+    printf 'ready\n\n' > "$stub/wake-extra.txt"
+    k3_ledger_fixture true 200 200 > "$stub/wake-ledger.txt"
+    for bad in bad empty nonl extra ledger; do
+        if response_wake_is "$stub/wake-$bad.txt" >/dev/null 2>&1; then
+            echo "bad wake response accepted: $bad" >&2
+            exit 1
+        fi
+    done
+    # The wake and the ledger share exactly one serving pod, or refusal.
+    cat > "$stub/wake-pods.json" <<'EOF'
+{"items": [{"metadata": {"name": "k3-00002-deployment-xyz"}, "status": {"phase": "Running"}}]}
+EOF
+    cp "$stub/wake-pods.json" "$stub/during-same.json"
+    cat > "$stub/during-other.json" <<'EOF'
+{"items": [{"metadata": {"name": "k3-00003-deployment-xyz"}, "status": {"phase": "Running"}}]}
+EOF
+    printf '{"items": []}' > "$stub/during-none.json"
+    [ "$(same_serving_pod "$stub/wake-pods.json" "$stub/during-same.json")" \
+        = k3-00002-deployment-xyz ] \
+        || { echo "stable serving pod refused" >&2; exit 1; }
+    for bad in other none; do
+        if same_serving_pod "$stub/wake-pods.json" "$stub/during-$bad.json" \
+                >/dev/null 2>&1; then
+            echo "unstable serving pod accepted: $bad" >&2
+            exit 1
+        fi
+    done
+    if same_serving_pod "$stub/during-none.json" "$stub/during-same.json" \
+            >/dev/null 2>&1; then
+        echo "missing wake pod accepted" >&2
+        exit 1
+    fi
+    # The attach window is the derived 15 s bound, slept exactly once.
+    [ "$ATTACH_WAIT_S" = 15 ] \
+        || { echo "attach wait is not the derived 15 s bound" >&2; exit 1; }
+    cat > "$stub/sleep" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_CALLS"
+EOF
+    chmod +x "$stub/sleep"
+    : > "$stub/sleep-calls.txt"
+    STUB_CALLS=$stub/sleep-calls.txt PATH="$stub:$PATH" wait_attach_window \
+        || { echo "attach wait refused" >&2; exit 1; }
+    [ "$(cat "$stub/sleep-calls.txt")" = 15 ] \
+        || { echo "attach wait did not sleep the bound" >&2; exit 1; }
+}
+
+k3_boundary_self_test() {
+    stub=$1
+    # Reported-only cold-start measurement: full (6xN) and empty (0) both
+    # report with exit 0; a partial total exits 2; an unreadable document
+    # exits 1. Every outcome prints a BOUNDARY line carrying the disclosure
+    # fields plus a record-only JSON line that never counts as a gated check.
+    python3 - "$stub/boundary-full.json" <<'PY'
+import json, sys
+names = ["C_GenerateRandom", "C_DigestInit", "C_Digest", "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"]
+json.dump({
+  "evidence": {"attached_probes": 136, "event_loss": 0, "in_flight_at_end": 0,
+    "completeness": "PARTIAL", "pid_descendant_gaps": 262, "attach_gap_ms": None,
+    "discovery_ring_loss": 0, "unprotected_live_windows": 0,
+    "gap_classes": {"observation": {"causes": ["skipped", "pid_namespace", "pid_descendant_gaps"], "status": "lossy"}},
+    "loader_discovery": {"dlopen_timing": {"unproven": 1}},
+    "scheduling": {"newcomer_queue": {"admitted": 6, "max_admitted_age_ms": 25}}},
+  "functions": [{"calls": 200, "errors": 0, "names": [n]} for n in names],
+}, open(sys.argv[1], "w"))
+PY
+    boundary_report "$stub/boundary-full.json" 200 > "$stub/bnd-full.txt" \
+        || { echo "full boundary refused" >&2; exit 1; }
+    k3_boundary_line_is "$stub/bnd-full.txt" "counted=1200 of 1200" \
+        "newcomer_admitted=6" "attach_gap_ms=null"
+    python3 - "$stub/boundary-full.json" "$stub" <<'PY'
+import copy, json, sys
+src, stub = sys.argv[1], sys.argv[2]
+good = json.load(open(src))
+def save(name, mutate):
+    bad = copy.deepcopy(good)
+    mutate(bad)
+    json.dump(bad, open(f"{stub}/boundary-{name}.json", "w"))
+save("empty", lambda d: [r.update(calls=0) for r in d["functions"]])
+save("short", lambda d: d["functions"][0].update(calls=100))
+save("over", lambda d: d["functions"][0].update(calls=201))
+save("extra", lambda d: d["functions"].append({"calls": 5, "errors": 0, "names": ["C_Login"]}))
+PY
+    boundary_report "$stub/boundary-empty.json" 200 > "$stub/bnd-empty.txt" \
+        || { echo "empty boundary refused" >&2; exit 1; }
+    k3_boundary_line_is "$stub/bnd-empty.txt" "counted=0 of 1200" \
+        "causes=pid_namespace,pid_descendant_gaps,skipped" "dlopen_unproven=1"
+    boundary_report "$stub/boundary-extra.json" 200 > "$stub/bnd-extra.txt" \
+        || { echo "boundary with ambient rows refused" >&2; exit 1; }
+    k3_boundary_line_is "$stub/bnd-extra.txt" "counted=1200 of 1200" \
+        "extra_rows=1 extra_calls=5"
+    for bad in short over; do
+        status=0
+        boundary_report "$stub/boundary-$bad.json" 200 > "$stub/bnd-$bad.txt" 2>/dev/null \
+            || status=$?
+        [ "$status" -eq 2 ] || {
+            echo "partial boundary exited $status (want 2): $bad" >&2
+            exit 1
+        }
+        # A partial total still prints its BOUNDARY line: the driver reports
+        # it before failing the cell named.
+        head -n 1 "$stub/bnd-$bad.txt" | grep -Fq "BOUNDARY k3-cold-start counted=" \
+            || { echo "partial boundary printed no BOUNDARY line: $bad" >&2; exit 1; }
+    done
+    printf '{"no": "evidence"}\n' > "$stub/boundary-broken.json"
+    status=0
+    boundary_report "$stub/boundary-broken.json" 200 >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 1 ] || {
+        echo "broken boundary exited $status (want 1)" >&2
+        exit 1
+    }
+}
+
+# The boundary output shape: line 1 is the BOUNDARY line carrying each named
+# field; line 2 is the record-only JSON, which must never carry "ok": true
+# (the gated count stays exactly 3).
+k3_boundary_line_is() {
+    bl_out=$1
+    [ "$(wc -l < "$bl_out")" = 2 ] || { echo "boundary printed no JSON line" >&2; exit 1; }
+    head -n 1 "$bl_out" | grep -Fq "BOUNDARY k3-cold-start " \
+        || { echo "boundary line lost its marker" >&2; exit 1; }
+    shift
+    for bl_want in "$@"; do
+        head -n 1 "$bl_out" | grep -Fq "$bl_want" \
+            || { echo "boundary line lost its field: $bl_want" >&2; exit 1; }
+    done
+    bl_json=$(tail -n 1 "$bl_out")
+    case $bl_json in
+        '{"check": "boundary-k3-cold-start", "record_only": true'*) ;;
+        *) echo "bad boundary JSON: $bl_json" >&2; exit 1 ;;
+    esac
+    case $bl_json in
+        *'"ok": true'*) echo "boundary JSON counts as a gated check" >&2; exit 1 ;;
+    esac
+}
+
+k3_sequencing_self_test() {
+    stub=$1
+    # The deterministic secondary's mid-capture requests in order — wake (no
+    # gate release), one pod proven, attach window waited, ledger run, same
+    # pod proven — against stub curl/kubectl/sleep. Dropping the wake, the
+    # wait, or any gate below breaks the order/wait/identity assertions.
+    seq=$stub/seq
+    mkdir -p "$seq/work"
+    printf 'ready\n' > "$seq/wake-body.txt"
+    printf 'nope\n' > "$seq/wake-bad.txt"
+    k3_ledger_fixture true 200 200 > "$seq/ledger-body.txt"
+    k3_ledger_fixture false 200 200 > "$seq/ledger-bad.txt"
+    cat > "$seq/pods-a.json" <<'EOF'
+{"items": [{"metadata": {"name": "k3-00002-deployment-xyz"}, "status": {"phase": "Running"}}]}
+EOF
+    cat > "$seq/pods-b.json" <<'EOF'
+{"items": [{"metadata": {"name": "k3-00003-deployment-xyz"}, "status": {"phase": "Running"}}]}
+EOF
+    printf '{"items": []}' > "$seq/pods-none.json"
+    cat > "$stub/curl" <<'EOF'
+#!/bin/sh
+[ -z "${STUB_CURL_FAIL-}" ] || exit 7
+out= prev= url=
+for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then out=$arg; fi
+    case $arg in http://*) url=$arg ;; esac
+    prev=$arg
+done
+case $url in
+    */ledger) printf '/ledger\n' >> "$STUB_ORDER"; cat "$STUB_LEDGER" > "$out" ;;
+    */) printf '/\n' >> "$STUB_ORDER"; cat "$STUB_WAKE" > "$out" ;;
+    *) echo "unexpected url: $url" >&2; exit 1 ;;
+esac
+EOF
+    cat > "$stub/kubectl" <<'EOF'
+#!/bin/sh
+[ -z "${STUB_KUBECTL_FAIL-}" ] || exit 1
+n=$(cat "$STUB_COUNT")
+printf '%s' "$((n + 1))" > "$STUB_COUNT"
+if [ "$n" -eq 0 ]; then cat "$STUB_PODS_1"; else cat "$STUB_PODS_2"; fi
+EOF
+    cat > "$stub/sleep" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_SLEEP"
+EOF
+    chmod +x "$stub/curl" "$stub/kubectl" "$stub/sleep"
+    k3_seq_env() {
+        printf '0' > "$stub/seq-count.txt"
+        : > "$stub/seq-order.txt"; : > "$stub/seq-sleep.txt"
+        rm -rf "$seq/work"; mkdir -p "$seq/work"
+        : > "$seq/facts.txt"
+    }
+    k3_seq_env
+    got=$(
+        FACTS=$seq/facts.txt HOST=example.invalid PF_PORT=18080 \
+        KSVC=p11scope-k3 KNS=p11scope-knative ITERS=200 WORK=$seq/work \
+        STUB_ORDER=$stub/seq-order.txt STUB_SLEEP=$stub/seq-sleep.txt \
+        STUB_WAKE=$seq/wake-body.txt STUB_LEDGER=$seq/ledger-body.txt \
+        STUB_PODS_1=$seq/pods-a.json STUB_PODS_2=$seq/pods-a.json \
+        STUB_COUNT=$stub/seq-count.txt PATH="$stub:$PATH" \
+        deterministic_requests
+    ) || { echo "deterministic requests refused" >&2; exit 1; }
+    [ "$got" = k3-00002-deployment-xyz ] \
+        || { echo "wrong stable pod: $got" >&2; exit 1; }
+    [ "$(cat "$stub/seq-order.txt")" = "/
+ /ledger" ] && [ "$(cat "$stub/seq-sleep.txt")" = 15 ] \
+        || { echo "wake/wait/ledger order lost" >&2; exit 1; }
+    grep -Fq 'wake-response=ready' "$seq/facts.txt" \
+        || { echo "wake response missing from facts" >&2; exit 1; }
+    grep -Fq 'ledger-response[response-secondary.txt]=LEDGER ' "$seq/facts.txt" \
+        || { echo "ledger response missing from facts" >&2; exit 1; }
+    # Each gate fails the run named: the wake request, the wake body, the
+    # pod listings, the pod identity, and the ledger body after the wake.
+    k3_seq_fails() {
+        # $1 = variant name, $2 = SUMMARY reason, $3 = wake body key,
+        # $4 = ledger body key, $5/$6 = pod listing keys, rest = VAR=val
+        sq_name=$1 sq_reason=$2 sq_wake=$3 sq_ledger=$4 sq_p1=$5 sq_p2=$6
+        shift 6
+        k3_seq_env
+        status=0
+        ( for sq_var in "$@"; do export "$sq_var"; done
+          FACTS=$seq/facts.txt HOST=example.invalid PF_PORT=18080 \
+          KSVC=p11scope-k3 KNS=p11scope-knative ITERS=200 WORK=$seq/work \
+          STUB_ORDER=$stub/seq-order.txt STUB_SLEEP=$stub/seq-sleep.txt \
+          STUB_WAKE=$seq/$sq_wake.txt STUB_LEDGER=$seq/$sq_ledger.txt \
+          STUB_PODS_1=$seq/pods-$sq_p1.json STUB_PODS_2=$seq/pods-$sq_p2.json \
+          STUB_COUNT=$stub/seq-count.txt PATH="$stub:$PATH" \
+          deterministic_requests ) >"$seq/fail-$sq_name.txt" 2>&1 || status=$?
+        [ "$status" -eq 1 ] || {
+            echo "sequencing accepted $sq_name (exit $status)" >&2
+            exit 1
+        }
+        grep -Fq "$sq_reason" "$seq/fail-$sq_name.txt" \
+            || { echo "$sq_name failed unnamed" >&2; exit 1; }
+    }
+    k3_seq_fails wake-request 'wake request to the service failed' \
+        wake-body ledger-body a a STUB_CURL_FAIL=1
+    k3_seq_fails wake-body 'wake response is not exactly ready' \
+        wake-bad ledger-body a a
+    k3_seq_fails pods-list 'cannot list serving pods after wake' \
+        wake-body ledger-body a a STUB_KUBECTL_FAIL=1
+    k3_seq_fails pod-stable 'wake and ledger did not share one serving pod' \
+        wake-body ledger-body a b
+    k3_seq_fails pods-none 'wake and ledger did not share one serving pod' \
+        wake-body ledger-body a none
+    k3_seq_fails ledger-body 'response is not exactly one 6x200 ledger' \
+        wake-body ledger-bad a a
 }
 
 k3_cleanup_self_test() {
@@ -1027,13 +1285,14 @@ EOF
         exit 1
     fi
     status=0
-    K3_PORT=$port K3_LEDGER=$(cat "$stub/ledger.txt") python3 - <<'PY' || status=$?
+    K3_PORT=$port K3_GATE=$stub/gate K3_LEDGER=$(cat "$stub/ledger.txt") python3 - <<'PY' || status=$?
 import os, urllib.request, urllib.error
 base = f"http://127.0.0.1:{os.environ['K3_PORT']}"
 want = os.environ["K3_LEDGER"]
 with urllib.request.urlopen(base + "/", timeout=20) as response:
     assert response.status == 200, response.status
     assert response.read() == b"ready\n"
+assert not os.path.exists(os.environ["K3_GATE"]), "the wake request touched the gate"
 with urllib.request.urlopen(base + "/ledger", timeout=20) as response:
     assert response.status == 200, response.status
     assert response.read().decode() == want + "\n", "ledger body differs"

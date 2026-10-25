@@ -134,22 +134,6 @@ fn active_and_failed_branches_share_the_root_preserving_retirement_transfer() {
     assert!(weak.upgrade().is_none());
 }
 
-// RED-only forwarders for the approved consume-self signatures. These are
-// compiled solely inside this cfg(test) child and invoke the existing owning
-// destructor, including the real RetirementJob join. No production retention
-// API exists yet. GREEN removes these forwarding implementations.
-impl RetiringCapture {
-    pub(crate) fn abandon_for_process_exit(self) {
-        drop(self);
-    }
-}
-
-impl RetiredCapture {
-    pub(crate) fn abandon_for_process_exit(self) {
-        drop(self);
-    }
-}
-
 pub(crate) struct HostCaptureExitCase {
     pub(crate) capture: RetiringCapture,
     pub(crate) gate: Arc<crate::attach::cleanup_worker::concurrency_tests::CloseGate>,

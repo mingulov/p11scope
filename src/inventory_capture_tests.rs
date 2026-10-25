@@ -35,23 +35,16 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// return at once.
 const NO_COLLECTION_TICK: Duration = Duration::from_secs(3600);
 
-#[derive(Clone, Copy)]
-enum ExitRelease {
-    Reclaimed,
-    RetainedForExit,
-}
-
-/// RED-only forwarding seam for the approved owned release hook. It calls
-/// the current production finalizer, which drops the full capture after output.
-/// The release hook is deliberately not a production API until GREEN.
+/// The owned release hook under test: the production finalizer calls it
+/// after outputs are attempted, instead of dropping the full capture.
 fn exit_finalizer_under_test<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
     outputs_attempted: &dyn Fn(),
     progress: &mut dyn FnMut(String),
-    _release: impl FnOnce(Stopped<L>) -> ExitRelease,
+    release: impl FnOnce(Stopped<L>) -> ExitRelease,
 ) -> T {
-    finish_native(stopped, write, outputs_attempted, progress)
+    finish_native(stopped, write, outputs_attempted, progress, release)
 }
 
 struct HostExitPacket {
@@ -1961,6 +1954,10 @@ fn the_report_is_written_before_the_blocking_detach() {
                 "progress:start"
             })
         },
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(code, 7);
     assert_eq!(
@@ -2028,6 +2025,10 @@ fn failed_pass_publication_retains_native_stop_for_final_sinks() {
         },
         &|| log.borrow_mut().push("armed".into()),
         &mut |_| {},
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(entries(&log), ["report", "diagnostics", "armed", "drop"]);
 }
@@ -2162,6 +2163,10 @@ fn zero_pass_prologue_failure_still_finishes_terminal_reads() {
         |_| log.borrow_mut().push("outputs".into()),
         &|| log.borrow_mut().push("armed".into()),
         &mut |_| {},
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(entries(&log), ["outputs", "armed", "drop"]);
 }
@@ -2182,6 +2187,10 @@ fn failed_output_attempt_arms_escape_before_detach() {
         },
         &|| log.borrow_mut().push("armed".into()),
         &mut |line| log.borrow_mut().push(line),
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(result, Err("sink failed"));
     let entries = entries(&log);
@@ -2306,6 +2315,10 @@ fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
         },
         &|| log.borrow_mut().push("armed".into()),
         &mut |_| {},
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(outcome.exit_code(), 1);
     assert_eq!(std::fs::read(report).unwrap(), stdout);
@@ -2340,6 +2353,10 @@ fn a_closed_retirement_reports_without_a_detach_phase() {
         |_| note("report"),
         &|| note("armed"),
         &mut |_| note("progress"),
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     assert_eq!(entries(&log), ["report", "armed", "drop"]);
 }
@@ -2529,6 +2546,10 @@ fn native_output_boundary_control(
         },
         &|| log.borrow_mut().push("armed".into()),
         &mut |_| {},
+        |s| {
+            drop(s);
+            ExitRelease::Reclaimed
+        },
     );
     let cancelled = during || before == 2;
     assert_eq!(
@@ -5564,6 +5585,10 @@ mod publication_progress_tests {
                         |_| driver.scene.note("final-sink"),
                         &|| {},
                         &mut |_| {},
+                        |s| {
+                            drop(s);
+                            ExitRelease::Reclaimed
+                        },
                     );
                     let log = entries(&log);
                     assert!(

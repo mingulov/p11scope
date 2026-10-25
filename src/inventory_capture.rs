@@ -3506,15 +3506,36 @@ impl CaptureLane<PidPin> for FacadeLane {
     }
 }
 
+/// Process-lifetime retention for the typed process-exit path: the owner
+/// is leaked, so no destructor runs and no close or join is attempted.
+pub(crate) struct ExitRetention;
+
+impl ExitRetention {
+    pub(crate) fn hold<T>(owner: T) {
+        std::mem::forget(owner)
+    }
+}
+
+/// How the run's end released the stopped native owner.
+#[derive(Clone, Copy)]
+pub(crate) enum ExitRelease {
+    #[cfg_attr(not(test), allow(dead_code))] // Production reclaims once disposal proves a close.
+    Reclaimed,
+    RetainedForExit,
+}
+
 /// The run's end after the stop (R-C51-4): `write` attempts final outputs
 /// (stream end, `-o`, stdout) first; then `outputs_attempted` arms the
 /// immediate exit on a second signal; only then does an unsettled
-/// retirement finish its blocking detach, between two progress lines.
+/// retirement reach `release`, between two progress lines. A reclaimed
+/// owner keeps the blocking detach; a retained one stays alive without
+/// the closing progress line.
 pub(crate) fn finish_native<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
     outputs_attempted: &dyn Fn(),
     progress: &mut dyn FnMut(String),
+    release: impl FnOnce(Stopped<L>) -> ExitRelease,
 ) -> T {
     let result = write(stopped.as_ref().map(|stopped| &stopped.summary));
     outputs_attempted();
@@ -3526,8 +3547,9 @@ pub(crate) fn finish_native<L, T>(
              endpoints (a second SIGINT/SIGTERM exits at once)",
             stopped.summary.attached
         ));
-        drop(stopped);
-        progress("p11scope: native probes detached".into());
+        if matches!(release(stopped), ExitRelease::Reclaimed) {
+            progress("p11scope: native probes detached".into());
+        }
     }
     result
 }

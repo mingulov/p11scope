@@ -2592,6 +2592,12 @@ impl RetiringCapture {
             },
         }
     }
+
+    /// Give up reclamation for process exit: keep every native owner
+    /// alive without joining the retirement job.
+    pub(crate) fn abandon_for_process_exit(self) {
+        crate::inventory_capture::ExitRetention::hold(self)
+    }
 }
 
 /// A retired capture: maps and pins stay readable until it drops.
@@ -2653,6 +2659,12 @@ impl RetiredCapture {
     pub(crate) fn query_cookie(&self, pin: &PidPin) -> CookieQuery {
         let ebpf = self.inner.as_ref().map(|inner| inner.state().ebpf());
         query_cookie_in(ebpf, self.book.domain, pin)
+    }
+
+    /// Give up reclamation for process exit: keep the retired owners
+    /// alive instead of dropping them.
+    pub(crate) fn abandon_for_process_exit(self) {
+        crate::inventory_capture::ExitRetention::hold(self)
     }
 }
 

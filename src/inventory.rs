@@ -29,8 +29,9 @@ use crate::discovery::native_binding::NativeIdentity;
 #[cfg(test)]
 use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
-    CgroupJobFailure, CollectJob, CollectedPass, FacadeLane, LaneSummary, LaneWindows, LoopClock,
-    NativeLane, PassDriver, Publish, SERVICE_TICK, run_classic_finalizing,
+    CgroupJobFailure, CollectJob, CollectedPass, ExitRelease, ExitRetention, FacadeLane,
+    LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
+    run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
@@ -1478,6 +1479,10 @@ fn run_with_terminal_budget(
         &mut |line| {
             let _ = crate::sink::try_stderr_line(&line);
         },
+        |s| {
+            ExitRetention::hold(s);
+            ExitRelease::RetainedForExit
+        },
     );
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
@@ -1603,6 +1608,10 @@ fn finish_failed_startup<Source: ProcessSource>(
         },
         outputs_attempted,
         &mut |line| inventory_diagnostic(&line),
+        |s| {
+            ExitRetention::hold(s);
+            ExitRelease::RetainedForExit
+        },
     )
 }
 
@@ -4289,6 +4298,10 @@ fn run_dashboard(
         },
         outputs_attempted,
         &mut |line| display_notices.borrow_mut().notice(&line),
+        |s| {
+            ExitRetention::hold(s);
+            ExitRelease::RetainedForExit
+        },
     );
     finish_caller_metadata_cleanup(&mut coordinator, second_signal);
     let cleanup = finish_semantic_native_cleanup(semantic_lane, second_signal);

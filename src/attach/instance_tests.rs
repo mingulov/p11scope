@@ -2294,7 +2294,10 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     let watched_state = |harness: &Harness| -> Result<(bool, (i64, i64, u64))> {
         let tracking = harness.session.instance_tracking();
         let watched = tracking.watched(object).with_context(|| {
-            format!("not watched after attach: {:?}", tracking.watch_refusal(object))
+            format!(
+                "not watched after attach: {:?}",
+                tracking.watch_refusal(object)
+            )
         })?;
         let unchanged = watched.check_unchanged().map_err(anyhow::Error::msg)?;
         let metadata = std::fs::metadata(&provider)?;
@@ -2373,12 +2376,7 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     // and no New/Continued observation was sealed after the hole:
     // every other ledger entry is frozen at its pre-hole count.
     let custody_before = scans_before.get("Custody").copied().unwrap_or(0);
-    let custody_after = harness
-        .scan
-        .outcomes
-        .get("Custody")
-        .copied()
-        .unwrap_or(0);
+    let custody_after = harness.scan.outcomes.get("Custody").copied().unwrap_or(0);
     ensure!(
         custody_after > custody_before,
         "no Custody scan refusal after the hole: {scans_before:?} -> {:?}",

@@ -17,9 +17,9 @@ use super::sem1_feed::{
 use super::*;
 use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::caller_registry::RegistryGap;
-use std::io::Write as _;
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, InstanceReason};
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+use std::io::Write as _;
 use std::time::Duration;
 
 /// (reason, repeats) of the `semantic calls unrouted` gaps published so far.
@@ -1034,11 +1034,7 @@ fn physical_calls_count_once_across_ticks_and_bindings() {
 fn provider_stamp(path: &str) -> (i64, i64, u64) {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = std::fs::metadata(path).unwrap();
-    (
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-        metadata.len(),
-    )
+    (metadata.ctime(), metadata.ctime_nsec(), metadata.len())
 }
 
 #[test]

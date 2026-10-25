@@ -48117,3 +48117,699 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     );
     drop(held);
 }
+
+/// T5 helper: two accepted providers on one live view (slots 0 and 1).
+/// The second provider is what pair 1 rejects while the first survives.
+fn facts_two_provider_engine() -> (SystemScopeChildGuard, Engine, Vec<ScannedModule>) {
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
+    let guard = SystemScopeChildGuard::new(child);
+    engine.scope = Scope::System;
+    let candidate = peer_candidate(&mut engine, &modules);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "the peer provider is accepted whole");
+    assert_eq!(engine.plan.slots.len(), 2);
+    (guard, engine, modules)
+}
+
+/// T5 helper: a collected native carrier over the engine's current plan
+/// and pins (the `CollectedFinishGraphCase` closer shape, over any engine).
+fn facts_attach_collected_carrier(
+    engine: &Engine,
+    fail_return: bool,
+) -> (
+    ScriptedSession,
+    std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let gate = std::sync::Arc::clone(&release);
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (returned_sender, returned) = std::sync::mpsc::channel();
+    let retirement = crate::attach::RetirementFixture::new_collected(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(move |owned, producer| {
+            if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                entered_sender.send(()).map_err(|error| error.to_string())?;
+                let (lock, changed) = &*gate;
+                let released = changed
+                    .wait_timeout_while(
+                        lock.lock().unwrap(),
+                        std::time::Duration::from_secs(5),
+                        |ready| !*ready,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !*released.0 {
+                    return Err("owned graph retirement release deadline".into());
+                }
+                returned_sender
+                    .send(())
+                    .map_err(|error| error.to_string())?;
+                if fail_return {
+                    return Err("actual graph return closer refused".into());
+                }
+            }
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let mut session = ScriptedSession::default();
+    session.global_retirement = Some(std::cell::RefCell::new(retirement));
+    (session, release, entered, returned)
+}
+
+/// T5 helper: the G5 collision dance against `object`, leaving its key in
+/// `pending_rejected_keys` with live pins, plan and modules untouched.
+fn facts_queue_rejected_key(engine: &mut Engine, session: &mut ScriptedSession, object: PinnedObjectId) {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let summary = engine.pinned.summary(object).unwrap();
+    let key = summary.key;
+    let sha256 = summary.sha256.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let peer = dir.path().join("different-kernel-file.so");
+    std::fs::copy(engine.pinned.attach_path_for(object).unwrap(), &peer).unwrap();
+    let conflicting = real_scan_pin(&peer, Some(key), 991, &sha256);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(conflicting);
+    assert!(pins.rejects(key) && !skipped.is_empty());
+    let raw = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let candidate = engine.live_candidate(pins, raw, skipped).unwrap();
+    assert!(!candidate.delta.retire.is_empty());
+    session.refuse_preflights([true]);
+    let outcome = engine
+        .apply_candidate(session, candidate, &mut false, false, &[])
+        .unwrap();
+    assert!(!outcome.accepted() && outcome.retains_intent());
+    assert!(outcome.newly_rejected_keys.contains(&key));
+    engine.queue_apply_outcome(&outcome, &mut PendingViewRetirements::new());
+    assert!(engine.pending_rejected_keys.contains(&key));
+    session.refuse_preflights([]);
+}
+
+/// T5 helper: selection, corroboration, fallback and skip rows for the
+/// pair-1 twin. `survivor` keeps its claims, tables, corroboration and
+/// fallback; `rejected` loses all of them through the rejected key.
+fn facts_inject_pair1_rows(engine: &mut Engine, survivor: PinnedObjectId, rejected: PinnedObjectId) {
+    let view = engine.views[0].id();
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    let spec = LoaderContextSpec {
+        view,
+        loader: survivor,
+        mapping: None,
+        hook: p11scope_manifest::elf::SymbolFact {
+            virtual_address: 0,
+            file_offset: 0,
+        },
+        state_address: None,
+    };
+    let context = engine.loader_registry.preflight(spec).unwrap();
+    let context = engine.loader_registry.prepare(context).unwrap();
+    engine.loader_registry.mark_attached(context).unwrap();
+    let survivor_slot = engine
+        .plan
+        .slots
+        .iter()
+        .find(|slot| slot.object == survivor)
+        .unwrap()
+        .clone();
+    let survivor_provider = engine.pinned.owned_timing_key(survivor).unwrap();
+    let survivor_module = engine
+        .plan
+        .modules
+        .iter()
+        .find(|module| module.object == survivor)
+        .unwrap()
+        .id;
+    engine.selection_bindings.insert(
+        7,
+        SelectionBindingFact {
+            id: 7,
+            context,
+            view,
+            object: survivor,
+            file_offset: 0,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: false,
+            provider: survivor_module,
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        },
+    );
+    let survivor_key = SelectionClaimKey {
+        binding_id: 7,
+        view,
+        context: context.get(),
+        hook_owner: survivor,
+        provider: survivor_provider.clone(),
+        selected_object: survivor,
+        table_file_offset: 0x20,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+        name: "C_Initialize",
+        file_offset: survivor_slot.file_offset,
+    };
+    let survivor_claim = SelectionClaim {
+        target: plan::AttachKey {
+            object: survivor,
+            file_offset: survivor_slot.file_offset,
+        },
+        object_path: survivor_slot.object_path.clone(),
+    };
+    engine
+        .selection_claims
+        .insert(survivor_key.clone(), survivor_claim.clone());
+    // The latched table is computed, never hand-shaped, so the actives
+    // loop meets its own latch exactly.
+    let mut single = BTreeMap::new();
+    single.insert(survivor_key.clone(), survivor_claim);
+    let tables = selection_tables_from_claims(&single);
+    assert_eq!(tables.len(), 1);
+    let (table_key, table_fact) = tables.into_iter().next().unwrap();
+    assert_eq!(table_key, selection_table_key(&survivor_key));
+    engine.selection_tables.insert(table_key, table_fact);
+    // Drops: a rejected-target claim with and without a binding, a
+    // retired binding's claim, an inactive target and a stale view.
+    let rejected_slot = engine
+        .plan
+        .slots
+        .iter()
+        .find(|slot| slot.object == rejected)
+        .unwrap()
+        .clone();
+    let rejected_provider = engine.pinned.owned_timing_key(rejected).unwrap();
+    let rejected_module = engine
+        .plan
+        .modules
+        .iter()
+        .find(|module| module.object == rejected)
+        .unwrap()
+        .id;
+    engine.selection_bindings.insert(
+        8,
+        SelectionBindingFact {
+            id: 8,
+            context,
+            view,
+            object: rejected,
+            file_offset: 0,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: false,
+            provider: rejected_module,
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        },
+    );
+    for (binding_id, target) in [
+        (8u64, (rejected, rejected_slot.file_offset)),
+        (999u64, (rejected, rejected_slot.file_offset)),
+    ] {
+        engine.selection_claims.insert(
+            SelectionClaimKey {
+                binding_id,
+                view,
+                context: context.get(),
+                hook_owner: rejected,
+                provider: rejected_provider.clone(),
+                selected_object: target.0,
+                table_file_offset: 0x20,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+                name: "C_Initialize",
+                file_offset: target.1,
+            },
+            SelectionClaim {
+                target: plan::AttachKey {
+                    object: target.0,
+                    file_offset: target.1,
+                },
+                object_path: rejected_slot.object_path.clone(),
+            },
+        );
+    }
+    engine.selection_bindings.insert(
+        996,
+        SelectionBindingFact {
+            id: 996,
+            context: LoaderContextId::from_case_id(9),
+            view,
+            object: survivor,
+            file_offset: 0,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: true,
+            provider: survivor_module,
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        },
+    );
+    engine.selection_claims.insert(
+        SelectionClaimKey {
+            binding_id: 996,
+            view,
+            context: context.get(),
+            hook_owner: survivor,
+            provider: survivor_provider.clone(),
+            selected_object: survivor,
+            table_file_offset: 0x20,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+            name: "C_Initialize",
+            file_offset: survivor_slot.file_offset,
+        },
+        SelectionClaim {
+            target: plan::AttachKey {
+                object: survivor,
+                file_offset: survivor_slot.file_offset,
+            },
+            object_path: survivor_slot.object_path.clone(),
+        },
+    );
+    engine.selection_claims.insert(
+        SelectionClaimKey {
+            binding_id: 7,
+            view,
+            context: context.get(),
+            hook_owner: survivor,
+            provider: survivor_provider.clone(),
+            selected_object: survivor,
+            table_file_offset: 0x20,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+            name: "C_GetFunctionList",
+            file_offset: 0xdead,
+        },
+        SelectionClaim {
+            target: plan::AttachKey {
+                object: survivor,
+                file_offset: 0xdead,
+            },
+            object_path: survivor_slot.object_path.clone(),
+        },
+    );
+    engine.selection_claims.insert(
+        SelectionClaimKey {
+            binding_id: 7,
+            view: ProcessViewId(999),
+            context: context.get(),
+            hook_owner: survivor,
+            provider: survivor_provider.clone(),
+            selected_object: survivor,
+            table_file_offset: 0x20,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+            name: "C_Initialize",
+            file_offset: survivor_slot.file_offset,
+        },
+        SelectionClaim {
+            target: plan::AttachKey {
+                object: survivor,
+                file_offset: survivor_slot.file_offset,
+            },
+            object_path: survivor_slot.object_path.clone(),
+        },
+    );
+    engine.selection_tables.insert(
+        SelectionTableKey {
+            view,
+            provider: rejected_provider,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        },
+        SelectionTableFact {
+            object: rejected,
+            file_offset: 0x20,
+            targets: Vec::new(),
+        },
+    );
+    engine
+        .counters
+        .corroboration
+        .push(([survivor].into_iter().collect(), "agreed"));
+    engine
+        .counters
+        .corroboration
+        .push(([rejected].into_iter().collect(), "agreed"));
+    engine.counters.manifest_fallbacks.push(ManifestFallback {
+        manifest: 0,
+        object: 0,
+        reason: ManifestStaleReason::IdentityMismatch,
+        replacement: survivor,
+        proof: BoundFallbackProof {
+            module: survivor,
+            tables: Vec::new(),
+            required_targets: BTreeMap::new(),
+        },
+    });
+    engine.counters.manifest_fallbacks.push(ManifestFallback {
+        manifest: 0,
+        object: 1,
+        reason: ManifestStaleReason::IdentityMismatch,
+        replacement: rejected,
+        proof: BoundFallbackProof {
+            module: rejected,
+            tables: Vec::new(),
+            required_targets: BTreeMap::new(),
+        },
+    });
+    engine.counters.object_skips.push(Skipped {
+        subject: "scan gap probe".into(),
+        reason: "not mapped in the target".into(),
+    });
+    engine.counters.object_skips.push(Skipped {
+        subject: "old loss".into(),
+        reason: "stale but kept".into(),
+    });
+}
+
+/// T5 helper: selection, corroboration, fallback and skip rows for the
+/// pair-2 twin. The only view retires, so every row drops.
+fn facts_inject_pair2_rows(engine: &mut Engine) {
+    let view = engine.views[0].id();
+    let generation = std::num::NonZeroU64::new(1).unwrap();
+    let object = engine.plan.slots[0].object;
+    let slot = engine.plan.slots[0].clone();
+    let provider = engine.pinned.owned_timing_key(object).unwrap();
+    let module = engine
+        .plan
+        .modules
+        .iter()
+        .find(|module| module.object == object)
+        .unwrap()
+        .id;
+    let spec = LoaderContextSpec {
+        view,
+        loader: object,
+        mapping: None,
+        hook: p11scope_manifest::elf::SymbolFact {
+            virtual_address: 0,
+            file_offset: 0,
+        },
+        state_address: None,
+    };
+    let context = engine.loader_registry.preflight(spec).unwrap();
+    let context = engine.loader_registry.prepare(context).unwrap();
+    engine.loader_registry.mark_attached(context).unwrap();
+    engine.selection_bindings.insert(
+        7,
+        SelectionBindingFact {
+            id: 7,
+            context,
+            view,
+            object,
+            file_offset: 0,
+            hook_id: 0,
+            abi: HookAbi::Interface,
+            attached: true,
+            retired: false,
+            provider: module,
+            observed: false,
+            coverage: SelectionCoverageState::OwnedOpen(generation),
+        },
+    );
+    for binding_id in [7u64, 999u64] {
+        engine.selection_claims.insert(
+            SelectionClaimKey {
+                binding_id,
+                view,
+                context: context.get(),
+                hook_owner: object,
+                provider: provider.clone(),
+                selected_object: object,
+                table_file_offset: 0x20,
+                version: SelectionVersionClass::V3_0,
+                flags: 0,
+                name: "C_Initialize",
+                file_offset: slot.file_offset,
+            },
+            SelectionClaim {
+                target: plan::AttachKey {
+                    object,
+                    file_offset: slot.file_offset,
+                },
+                object_path: slot.object_path.clone(),
+            },
+        );
+    }
+    engine
+        .counters
+        .corroboration
+        .push(([object].into_iter().collect(), "agreed"));
+    engine.counters.manifest_fallbacks.push(ManifestFallback {
+        manifest: 0,
+        object: 0,
+        reason: ManifestStaleReason::IdentityMismatch,
+        replacement: object,
+        proof: BoundFallbackProof {
+            module: object,
+            tables: Vec::new(),
+            required_targets: BTreeMap::new(),
+        },
+    });
+    engine.counters.object_skips.push(Skipped {
+        subject: "old loss".into(),
+        reason: "stale but kept".into(),
+    });
+}
+
+/// T5 helper: the candidate-level outputs a Facts graph must reproduce
+/// exactly against its `replay_pending_conservative` twin. Views and
+/// bindings are outside the boundary: Consume retires them while the
+/// replay never does. `ownership.pins` is outside too: the replay
+/// re-pushes pins per bind while the conservative copy prunes rejected
+/// ids, and every consumer is contains/emptiness/set-based.
+fn facts_assert_twins_match(graph: &Engine, twin: &Engine, label: &str) {
+    assert_eq!(
+        graph.selection_claims, twin.selection_claims,
+        "{label}: claims"
+    );
+    assert_eq!(
+        graph.selection_tables, twin.selection_tables,
+        "{label}: tables"
+    );
+    assert_eq!(
+        graph.counters.corroboration, twin.counters.corroboration,
+        "{label}: corroboration"
+    );
+    assert_eq!(
+        graph.counters.manifest_fallbacks, twin.counters.manifest_fallbacks,
+        "{label}: fallbacks"
+    );
+    assert_eq!(
+        graph.counters.object_skips, twin.counters.object_skips,
+        "{label}: object skips, in order"
+    );
+    assert_eq!(graph.plan, twin.plan, "{label}: plan");
+    assert_eq!(graph.modules, twin.modules, "{label}: modules");
+    assert_eq!(
+        graph.pinned.revision(),
+        twin.pinned.revision(),
+        "{label}: pins revision"
+    );
+    assert_eq!(
+        graph.pinned.has_overlay_uncertainty(),
+        twin.pinned.has_overlay_uncertainty(),
+        "{label}: overlay uncertainty"
+    );
+    for view in graph.views.iter().map(|owner| owner.id()) {
+        let left = graph.pinned.view_claims(view);
+        let right = twin.pinned.view_claims(view);
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert_eq!(left.tables, right.tables, "{label}: claim tables");
+                assert_eq!(left.targets, right.targets, "{label}: claim targets");
+            }
+            (None, None) => {}
+            _ => panic!("{label}: claim presence differs for {view:?}"),
+        }
+    }
+    let left_history = graph.capture_facts.visible_history();
+    let right_history = twin.capture_facts.visible_history();
+    assert_eq!(
+        format!("{left_history:?}"),
+        format!("{right_history:?}"),
+        "{label}: capture history"
+    );
+    assert_eq!(
+        graph.discovery.modules, twin.discovery.modules,
+        "{label}: published modules"
+    );
+    assert_eq!(
+        graph.discovery.manifest_object_fallbacks, twin.discovery.manifest_object_fallbacks,
+        "{label}: published fallbacks"
+    );
+    assert_eq!(
+        graph.discovery.modules_skipped, twin.discovery.modules_skipped,
+        "{label}: published skips"
+    );
+    assert_eq!(
+        graph.discovery.conflicts, twin.discovery.conflicts,
+        "{label}: published conflicts"
+    );
+    assert_eq!(
+        graph.discovery.uncorroborated, twin.discovery.uncorroborated,
+        "{label}: published uncorroborated"
+    );
+    assert!(
+        graph.pending_retirements.is_empty() && twin.pending_retirements.is_empty(),
+        "{label}: retirements drained"
+    );
+    assert!(
+        graph.pending_rejected_keys.is_empty() && twin.pending_rejected_keys.is_empty(),
+        "{label}: rejections drained"
+    );
+}
+
+#[test]
+fn collected_graph_matches_conservative_reference() {
+    // Pair 1: rejection-only. The peer provider's key is rejected while
+    // the first provider survives with its claims, tables, corroboration
+    // and fallback; the ambiguity skip and the invalidation disclosure
+    // land in both counters in row order.
+    let (_guard, mut engine, _) = facts_two_provider_engine();
+    let survivor = engine.plan.slots[0].object;
+    let rejected = engine.plan.slots[1].object;
+    facts_inject_pair1_rows(&mut engine, survivor, rejected);
+    let mut setup_session = ScriptedSession::default();
+    facts_queue_rejected_key(&mut engine, &mut setup_session, rejected);
+    assert!(engine.manifests.is_empty());
+    assert!(!engine.pinned.has_overlay_uncertainty());
+    let (mut session, release, entered, _returned) = facts_attach_collected_carrier(&engine, false);
+    let mut submitted = false;
+    for _ in 0..512 {
+        let progress = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        assert!(progress.pending);
+        if session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins
+            != 0
+        {
+            submitted = true;
+            break;
+        }
+    }
+    assert!(submitted, "pair 1 reaches the native handoff");
+    entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    for _ in 0..600 {
+        if !engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap()
+            .pending
+        {
+            break;
+        }
+    }
+    assert!(
+        !engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap()
+            .pending,
+        "pair 1 drains"
+    );
+    assert_eq!(
+        session.global_retirement.as_ref().unwrap().borrow().begins,
+        1
+    );
+
+    let (_twin_guard, mut twin, _) = facts_two_provider_engine();
+    let twin_survivor = twin.plan.slots[0].object;
+    let twin_rejected = twin.plan.slots[1].object;
+    facts_inject_pair1_rows(&mut twin, twin_survivor, twin_rejected);
+    let mut twin_setup = ScriptedSession::default();
+    facts_queue_rejected_key(&mut twin, &mut twin_setup, twin_rejected);
+    let twin_truncated_before = twin.capture_facts.visible_history().selection_truncated;
+    let twin_selection_losses_before: Vec<_> = twin
+        .capture_facts
+        .visible_history()
+        .losses
+        .keys()
+        .filter(|(subject, _)| subject == "live interface selection")
+        .cloned()
+        .collect();
+    let twin_bindings_before = twin.selection_bindings.clone();
+    let mut replay_session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = twin.replay_pending_conservative(
+        &mut replay_session,
+        &mut additions,
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(outcome.accepted(), "pair 1 replay commits");
+    // No prune conflict, latch conflict, admission failure or provider
+    // loss fires: the only history effects are the invalidation tombs.
+    assert_eq!(
+        twin.capture_facts.visible_history().selection_truncated,
+        twin_truncated_before,
+        "pair 1 replay raises no selection conflict"
+    );
+    let twin_selection_losses_after: Vec<_> = twin
+        .capture_facts
+        .visible_history()
+        .losses
+        .keys()
+        .filter(|(subject, _)| subject == "live interface selection")
+        .cloned()
+        .collect();
+    assert_eq!(
+        twin_selection_losses_after, twin_selection_losses_before,
+        "pair 1 replay records no selection loss"
+    );
+    for (id, before) in &twin_bindings_before {
+        assert_eq!(
+            twin.selection_bindings.get(id).map(|binding| binding.provider),
+            Some(before.provider),
+            "pair 1 replay leaves binding providers alone"
+        );
+    }
+    facts_assert_twins_match(&engine, &twin, "pair 1");
+
+    // Pair 2: retirement. The only view exits; every claim, table,
+    // corroboration and fallback drops through the exited view.
+    let mut case = CollectedFinishGraphCase::new(false);
+    facts_inject_pair2_rows(&mut case.engine);
+    case.child.reap().unwrap();
+    assert_eq!(case.engine.views[0].original_exited(), Ok(true));
+    case.engine.update_counter_snapshot(&case.session).unwrap();
+    case.engine.dispatch_lifecycle_record(
+        &mut case.session,
+        &collected_finish_leader_exit(case.child.pid()),
+        &mut PendingViewRetirements::new(),
+    );
+    case.release();
+    drive_graph_case_to_drained(&mut case);
+
+    let mut twin_case = CollectedFinishGraphCase::new(false);
+    facts_inject_pair2_rows(&mut twin_case.engine);
+    twin_case.child.reap().unwrap();
+    let retired = twin_case.view;
+    twin_case.engine.pending_retirements.insert(retired);
+    let mut replay_session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = twin_case.engine.replay_pending_conservative(
+        &mut replay_session,
+        &mut additions,
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(outcome.accepted(), "pair 2 replay commits");
+    facts_assert_twins_match(&case.engine, &twin_case.engine, "pair 2");
+}

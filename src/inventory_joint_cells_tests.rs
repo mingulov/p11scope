@@ -103,6 +103,20 @@ struct Seat {
     completes: Rc<Cell<usize>>,
 }
 
+/// The J11 graph refusal planted in the engine: the hold prefers a
+/// recorded terminal graph refusal over the default abandon reason
+/// (§6.4), so J11's first error is this text, not the default.
+const GRAPH_REFUSAL_J11: &str = "terminal graph refused before native mutation";
+
+/// The exact first error a dispositioned (J9/J11) abandon keeps:
+/// J9 the default reason, J11 its recorded graph refusal.
+fn expected_disp_first_error(state: JointState) -> &'static str {
+    match state {
+        JointState::J11 => GRAPH_REFUSAL_J11,
+        _ => "joint finish disposition required",
+    }
+}
+
 /// Seat the state-prescribed lane on a fresh driver: pre-finish
 /// lanes finished with the frame held, dispositioned lanes
 /// unfinished with the per-state latch, J10 unfinished with a
@@ -497,7 +511,7 @@ fn cancel_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(seat.drops.get(), 0, "O: held means never dropped");
     assert_eq!(
         driver.joint_first_error.as_deref(),
-        Some("joint finish disposition required"),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
     assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "no mint on abandon");
@@ -512,7 +526,8 @@ fn cancel_disp_body(scene: Scene, event: JointEvent) {
         gaps(&mut driver)
     );
     assert_eq!(
-        abandons[0].1, "joint finish disposition required",
+        abandons[0].1,
+        expected_disp_first_error(state),
         "E: the gap carries the first error"
     );
 }
@@ -543,7 +558,7 @@ fn promote_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(seat.drops.get(), 0, "O: held means never dropped");
     assert_eq!(
         driver.joint_first_error.as_deref(),
-        Some("joint finish disposition required"),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
     queue_request(driver.display.as_mut().expect("display"));
@@ -580,8 +595,9 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     );
     assert!(driver.semantic.is_none(), "U: the lane is held");
     assert_eq!(seat.drops.get(), 0, "U: held means never dropped");
-    assert!(
-        driver.joint_first_error.is_some(),
+    assert_eq!(
+        driver.joint_first_error.as_deref(),
+        Some(expected_disp_first_error(state)),
         "U: the first error is kept"
     );
     assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "U: no mint");
@@ -631,7 +647,7 @@ fn sigint2_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "T: no mint");
     assert_eq!(
         driver.joint_first_error.as_deref(),
-        Some("joint finish disposition required"),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
 }
@@ -660,7 +676,7 @@ fn stop_disp_body(scene: Scene, event: JointEvent) {
     assert_eq!(seat.drops.get(), 0, "U: held means never dropped");
     assert_eq!(
         driver.joint_first_error.as_deref(),
-        Some("joint finish disposition required"),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
     assert_eq!(mint_polls.load(Ordering::SeqCst), 0, "U: no mint");
@@ -695,8 +711,9 @@ fn deadline_disp_body(scene: Scene, event: JointEvent) {
     );
     assert!(driver.semantic.is_none(), "U: the lane is held");
     assert_eq!(seat.drops.get(), 0, "U: held means never dropped");
-    assert!(
-        driver.joint_first_error.is_some(),
+    assert_eq!(
+        driver.joint_first_error.as_deref(),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
 }
@@ -710,7 +727,7 @@ fn capture_disp_body(scene: Scene, event: JointEvent) {
     let Scene {
         mut coordinator,
         display,
-        ..
+        state,
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
     let mut lane = joint_lane(WindDownIo::completing(), false);
@@ -723,8 +740,9 @@ fn capture_disp_body(scene: Scene, event: JointEvent) {
         "U: the capture failure abandons"
     );
     assert!(driver.semantic.is_none(), "U: the lane is held");
-    assert!(
-        driver.joint_first_error.is_some(),
+    assert_eq!(
+        driver.joint_first_error.as_deref(),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
     let abandons: Vec<(String, String)> = gaps(&mut driver)
@@ -748,7 +766,7 @@ fn sink_disp_body(scene: Scene, event: JointEvent) {
     let Scene {
         mut coordinator,
         display,
-        ..
+        state,
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
     let mut lane = joint_lane(WindDownIo::completing(), false);
@@ -761,8 +779,9 @@ fn sink_disp_body(scene: Scene, event: JointEvent) {
         "U: the sink failure abandons"
     );
     assert!(driver.semantic.is_none(), "U: the lane is held");
-    assert!(
-        driver.joint_first_error.is_some(),
+    assert_eq!(
+        driver.joint_first_error.as_deref(),
+        Some(expected_disp_first_error(state)),
         "E: the first error is kept"
     );
     let abandons: Vec<(String, String)> = gaps(&mut driver)

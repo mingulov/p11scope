@@ -7,8 +7,10 @@
 # capture (healthy twin in the same JSON); at T+20s container L starts with a
 # never-scanned provider file (holder `ledger-private`: a fresh 0700 copy no
 # earlier capture could contain) and runs its ledger to completion inside the
-# window. The oracle requires O exact and gap-free and L scanned AND reported
-# (edge with a named pre-attach gap, or no edge with a named gap); silently
+# window. The oracle requires O exact and gap-free and L scanned AND reported:
+# a named gap from the frozen vocabulary referencing the late module, or L's
+# edge to the late module stating an unwatched prefix (since_ns greater than
+# the mapping's first_seen_ns) with entries within L's ledger total. Silently
 # zero FAILs. Passing N4 keeps the NON-PASS/UNSUPPORTED verdict (G33): the
 # boundary is REPORTED, never turned positive.
 #
@@ -76,7 +78,11 @@ Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 UNRUN (cell not run, see SUMMARY reason).
 Every run prints a final SUMMARY line: SUMMARY cell=N4 host=... verdict=... reason="...".
 
 CONTROLLER (run order, after R-D1):
-  # N4 on the dev host (from the repo root; BIN = host release binary):
+  # N4 on the dev host (from the repo root; BIN = host release binary).
+  # Exact dev rerun (run-1 flags: iters 400/250, duration 60, late-delay 20;
+  # run 1 built its own image, so --image is omitted):
+  sh scripts/late-provider-negative.sh --host dev --observer BIN --token <TOKEN> --iters-o 400 --iters-l 250 --duration 60 --late-delay 20
+  # Variant sharing the D1 build instead of building a second image:
   sh scripts/late-provider-negative.sh --host dev --observer BIN --image p11scope-ctr-shared:<D1-TOKEN> --token <TOKEN>
   # N4 on fedora (optional; needs the D1 bundle plus this driver there):
   scp scripts/late-provider-negative.sh scripts/container-cells-oracle.py scripts/lib.sh scripts/cleanup-traps.sh fedora:/home/user/p11scope-ctr-<TOKEN>/scripts/
@@ -134,6 +140,10 @@ self_test() {
             exit 1
         }
     done
+    # The oracle call bounds L's entries by its ledger. The bracketed
+    # letter keeps this grep from matching its own line.
+    grep -q -- '--iters-l "\$ITERS_[L]"' "$0" \
+        || { echo "oracle call lost --iters-l" >&2; exit 1; }
     n4_help_self_test
     n4_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -145,7 +155,8 @@ n4_help_self_test() {
     help=$(sh "$0" --help 2>&1 || true)
     for marker in "--host dev --observer BIN" "--host fedora-private --task-root" \
                   "inventory --system --duration" "--identity-backend" \
-                  "SUMMARY cell=N4" "p11scope-ctr-shared:<D1-TOKEN>"; do
+                  "SUMMARY cell=N4" "p11scope-ctr-shared:<D1-TOKEN>" \
+                  "--iters-o 400 --iters-l 250 --duration 60 --late-delay 20"; do
         case $help in
             *"$marker"*) ;;
             *) echo "help lost its controller line: $marker" >&2; exit 1 ;;
@@ -783,9 +794,11 @@ grep -h '^LEDGER ' "$WORK/logs-o.txt" "$WORK/logs-l.txt" >>"$FACTS"
 say "=== oracle ==="
 if python3 -I "$ORACLE" late-reported "$WORK/n4.json" \
         --pid-o "$PID_O" --pid-l "$PID_L" --late-module "$LATE_MODULE" \
+        --iters-l "$ITERS_L" \
         >"$WORK/oracle.json" 2>"$WORK/oracle.err"; then
     cat "$WORK/oracle.json" >>"$SUMMARY_JSONL"
     cat "$WORK/oracle.json" >>"$FACTS"
+    cat "$WORK/oracle.err" >>"$FACTS"
     pass_cell "N4 late boundary reported (NON-PASS retained)"
 else
     cat "$WORK/oracle.err" >&2 || true

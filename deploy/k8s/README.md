@@ -232,13 +232,14 @@ kubelet evicts the pod past it), so captures write `-o /tmp/<name>`.
 Kubelet creates that mount 0777 without the sticky bit, which the observer's
 output trust check refuses; `k8s-profile-entry.sh` restores 1777 first.
 
-Resources: requests 50m CPU / 64 Mi, limits 1 CPU / 512 Mi. The observer
+Resources: requests 50m CPU / 64 Mi, limits 1 CPU / 768 Mi. The observer
 pod's measured peak memory over a full e2e run (profile, trace, inventory and
 BPF maps included) was 55-104 MB across six runs on a one-node kind cluster
 (every run from 99 MB up held two captures at once);
 the e2e records it as `observer-memory`. A node with many processes and providers
-needs more for `inventory --system`; raise the limit rather than risk an
-OOM kill in the middle of a capture.
+needs more for `inventory --system`: the stop also builds one combined view
+of every observed process, which needs extra memory for a short time. Raise
+the limit rather than risk an OOM kill in the middle of a capture or its stop.
 
 ## End-to-end test: `scripts/kind-e2e.sh`
 

@@ -3535,6 +3535,7 @@ mod tests {
         expected: GrowthLedger,
         previous: Option<GrowthLedger>,
         case_deadline: std::time::Instant,
+        case_budget: std::time::Duration,
         mode: CounterMode,
     }
 
@@ -3700,6 +3701,7 @@ mod tests {
                 expected: GrowthLedger::empty(),
                 previous: None,
                 case_deadline,
+                case_budget: growth_case_budget(backend, final_count),
                 mode,
             };
             run.checkpoint();
@@ -4032,9 +4034,15 @@ mod tests {
                 self.pool.snapshot().charged_bytes,
                 SEMANTIC_TRANSITION_SCRATCH
             );
+            let started = self
+                .case_deadline
+                .checked_sub(self.case_budget)
+                .expect("case deadline follows its budget");
+            let elapsed = std::time::Instant::now().saturating_duration_since(started);
             assert!(
                 std::time::Instant::now() < self.case_deadline,
-                "native growth case exceeded its original deadline"
+                "native growth case exceeded its original {:?} budget after {elapsed:?}",
+                self.case_budget
             );
         }
     }
@@ -4050,19 +4058,54 @@ mod tests {
         native_growth_population_with_backend_and_mode(final_count, backend, CounterMode::Counts);
     }
 
-    fn native_growth_population_with_backend_and_mode(
-        final_count: usize,
+    /// Whole-case budget for a growth cell. Singles teardown closes every
+    /// link serially, so its budget adds a per-link close allowance to the
+    /// case budget; Multi keeps the flat case budget.
+    fn growth_case_budget(
         backend: crate::attach::AttachBackend,
-        mode: CounterMode,
-    ) {
-        let budget = match backend {
+        final_count: usize,
+    ) -> std::time::Duration {
+        match backend {
             crate::attach::AttachBackend::Singles => {
                 // Two links per endpoint plus the bank, keepalive and lifecycle links.
                 let links = u32::try_from(2 * final_count + 3).expect("growth link count fits u32");
                 GROWTH_CASE_BUDGET + GROWTH_SINGLES_CLOSE_PER_LINK * links
             }
             crate::attach::AttachBackend::Multi => GROWTH_CASE_BUDGET,
-        };
+        }
+    }
+
+    #[test]
+    fn growth_case_budget_derives_singles_deadline_from_links() {
+        use crate::attach::AttachBackend;
+        use std::time::Duration;
+        // Singles: the 60 s case budget plus 100 ms per link (two per
+        // endpoint plus the bank, keepalive and lifecycle links).
+        assert_eq!(
+            growth_case_budget(AttachBackend::Singles, 513),
+            Duration::from_secs(60) + Duration::from_millis(100) * 1029
+        );
+        assert_eq!(
+            growth_case_budget(AttachBackend::Singles, 8192),
+            Duration::from_secs(60) + Duration::from_millis(100) * 16387
+        );
+        // Multi: the flat 60 s case budget, unchanged.
+        assert_eq!(
+            growth_case_budget(AttachBackend::Multi, 513),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            growth_case_budget(AttachBackend::Multi, 8192),
+            Duration::from_secs(60)
+        );
+    }
+
+    fn native_growth_population_with_backend_and_mode(
+        final_count: usize,
+        backend: crate::attach::AttachBackend,
+        mode: CounterMode,
+    ) {
+        let budget = growth_case_budget(backend, final_count);
         let case_deadline = std::time::Instant::now() + budget;
         let mut run =
             NativeGrowthRun::new_with_backend_and_mode(final_count, case_deadline, backend, mode);

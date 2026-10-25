@@ -13,7 +13,9 @@ SAME command; the script narrows `--all-targets` to one partition:
 - `rest`: every target the gate selects except `artifact_contracts`
   (`--lib --bins --examples --benches` plus one `--test` per integration test
   target, read from `cargo metadata`, so a new test target joins `rest`
-  without anyone editing the workflow).
+  without anyone editing the workflow). `rest` proves from the combined
+  cargo output that every binary cargo ran printed a libtest summary
+  with total > 0 (the one testless bin is pinned, not proved).
 - `contracts:K/N`: shard K of N of `artifact_contracts`. The test list comes
   from the compiled binary (`-- --list --format terse`), the shards from a
   greedy longest-first assignment over the checked-in weights
@@ -28,7 +30,10 @@ listed - assigned). A shard with no tests is an error, never a silent green
 (libtest with no filter would run everything; with a filter that matches
 nothing it runs nothing and exits 0). Every shard computes the same plan
 from the same list, so the N shards together run every listed test exactly
-once; `plan` prints that partition and checks it.
+once; `plan` prints that partition and checks it. `rest` proves from the
+combined output that every binary cargo ran printed a libtest summary
+with total > 0, naming any binary that prints none or runs zero (the
+testless p11scope bin is pinned, and a nonzero pin fails as stale).
 
 Under `cargo llvm-cov` the script names the raw profiles after the partition
 (LLVM_PROFILE_FILE_NAME) so profiles from different runners never collide,
@@ -77,6 +82,14 @@ RESULT = re.compile(
     r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out;"
 )
+RUNNING_HEADER = re.compile(r"^\s*Running (\S+) (\S+) \((.*?)\)\s*$")
+BARE_RUNNING_HEADER = re.compile(r"^\s*Running (\S+)\s*$")
+# The one rest binary that legitimately holds no tests: the p11scope bin
+# is CLI dispatch only (src/main.rs), so its total-0 summary is pinned,
+# not proved. (binary stem, target source) from the Running header; a
+# nonzero pinned binary fails the pin as stale, so the exemption cannot
+# linger after a test is added.
+REST_ZERO_TEST_PIN = ("p11scope", "src/main.rs")
 
 
 class PartitionError(Exception):
@@ -226,12 +239,62 @@ def verify_summary(output, assigned, listed):
         )
 
 
-def run_capture(command, env=None):
-    """Run, echo stdout as it arrives, and return (status, stdout)."""
+def rest_binary_stem(path):
+    """Binary name minus the cargo metadata hash (`p11scope-<hash>`)."""
+    return re.sub(r"-[0-9a-f]{16}$", "", path.rsplit("/", 1)[-1])
+
+
+def verify_rest_output(output):
+    """Every binary cargo ran proved a nonzero libtest selection.
+
+    Cargo's `Running` headers (stderr) delimit one section per binary;
+    the binary's own summary is its section's last `test result:` line
+    (a nested libtest run inside a test can only print earlier).
+    """
+    sections = []  # [(src, binary, [lines])]
+    for line in output.splitlines():
+        modern = RUNNING_HEADER.match(line)
+        if modern is not None:
+            _kind, src, binary = modern.groups()
+            sections.append((src, binary, []))
+            continue
+        bare = BARE_RUNNING_HEADER.match(line)
+        if bare is not None:
+            sections.append((None, bare.group(1), []))
+            continue
+        if sections:
+            sections[-1][2].append(line)
+    if not sections:
+        raise PartitionError("no test binaries ran in the rest output")
+    for src, binary, lines in sections:
+        results = [match for match in map(RESULT.match, lines) if match]
+        if not results:
+            raise PartitionError(
+                f"rest binary {binary} printed no libtest summary")
+        passed, failed, ignored, measured, _filtered = map(
+            int, results[-1].groups())
+        total = passed + failed + ignored + measured
+        pinned = (rest_binary_stem(binary), src) == REST_ZERO_TEST_PIN
+        if total == 0 and not pinned:
+            raise PartitionError(f"rest binary {binary} ran 0 tests")
+        if total > 0 and pinned:
+            raise PartitionError(
+                f"rest binary {binary} ran {total} tests but is pinned as "
+                "testless in REST_ZERO_TEST_PIN; delete the pin")
+
+
+def run_capture(command, env=None, capture_stderr=False):
+    """Run, echo output as it arrives, and return (status, output).
+
+    With capture_stderr, cargo's stderr (the Running headers) joins the
+    captured output so rest sections delimit; otherwise stderr flows to
+    the console as before.
+    """
     print("+ " + " ".join(command), flush=True)
     with subprocess.Popen(
-        command, cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace",
+        command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if capture_stderr else None,
+        text=True, encoding="utf-8", errors="replace",
     ) as process:
         captured = []
         for line in process.stdout:
@@ -272,7 +335,13 @@ def run_partition(spec, command, runner=run_capture, metadata=cargo_metadata,
     kind, shard, shards = parse_partition(spec)
     env = coverage_env(command, spec)
     if kind == "rest":
-        status, _ = runner(narrowed(command, rest_selection(metadata(command))), env)
+        status, output = runner(
+            narrowed(command, rest_selection(metadata(command))), env,
+            capture_stderr=True,
+        )
+        if status != 0:
+            return status  # cargo or a test already failed the partition
+        verify_rest_output(output)
         return status
     names = list_tests(command, env, runner)
     assigned, loads = plan(names, shards, weights or load_weights())
@@ -462,8 +531,8 @@ class _FakeLibtest:
         self.names, self.nested, self.drop = names, nested, drop
         self.ran, self.commands = [], []
 
-    def __call__(self, command, env):
-        self.commands.append((command, env))
+    def __call__(self, command, env, capture_stderr=False):
+        self.commands.append((command, env, capture_stderr))
         args = command[command.index("--") + 1:]
         if args[:1] == ["--list"]:
             return 0, "".join(f"{name}: test\n" for name in self.names)
@@ -494,7 +563,10 @@ class _FakeRest:
         self.commands.append((command, env, capture_stderr))
         lines = []
         for binary, src, summary in self.sections:
-            lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
+            if src is None:
+                lines.append(f"     Running target/debug/deps/{binary}")
+            else:
+                lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
             lines.append("")
             if summary is None:
                 continue
@@ -585,9 +657,10 @@ def self_test():
                                    metadata=None, weights=table)
             assert status == 0
         assert sorted(fake.ran) == sorted(listed), (shards, len(fake.ran))
-        for command, env in fake.commands:
+        for command, env, capture_stderr in fake.commands:
             assert command[:7] == gate[:6] + ["--test"] and command[7] == SHARDED_TARGET, command
             assert env.get("LLVM_PROFILE_FILE_NAME") == os.environ.get("LLVM_PROFILE_FILE_NAME")
+            assert capture_stderr is False
     # A test that silently does not run makes its shard fail.
     dropped = _FakeLibtest(listed, drop="case_010")
     try:
@@ -599,16 +672,25 @@ def self_test():
         raise AssertionError("a dropped test went unnoticed")
     # rest runs the narrowed gate once; llvm-cov profiles are named per partition.
     seen = []
-    status = run_partition("rest", cov, runner=lambda c, e: (seen.append((c, e)) or (0, "")),
+
+    def rest_ok(command, env, capture_stderr=False):
+        seen.append((command, env, capture_stderr))
+        _, output = _FakeRest([
+            ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (5, 0, 0, 0)),
+        ])(command, env)
+        return 0, output
+
+    status = run_partition("rest", cov, runner=rest_ok,
                            metadata=lambda c: _fake_metadata(), weights=table)
     assert status == 0 and len(seen) == 1
     assert seen[0][0] == narrowed(cov, ["--lib", "--bins", "--examples", "--benches",
                                         "--test", "alpha", "--test", "zeta"])
     assert seen[0][1]["LLVM_PROFILE_FILE_NAME"] == "p11scope-rest-%p-%m.profraw"
+    assert seen[0][2] is True
     fake = _FakeLibtest(listed)
     run_partition("contracts:2/3", cov, runner=fake, metadata=None, weights=table)
     assert all(env["LLVM_PROFILE_FILE_NAME"] == "p11scope-contracts-2-of-3-%p-%m.profraw"
-               for _, env in fake.commands)
+               for _, env, _ in fake.commands)
 
     # rest proves a nonzero selection per binary: every binary cargo ran
     # must print a libtest summary with total > 0, else the partition fails
@@ -647,6 +729,21 @@ def self_test():
     ], status=101)
     assert run_partition("rest", gate, runner=failing,
                          metadata=lambda c: _fake_metadata()) == 101
+    bare_zero = _FakeRest([
+        ("bare-1a2b3c4d5e6f7893", None, (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=bare_zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "bare-1a2b3c4d5e6f7893" in str(error), error
+    else:
+        raise AssertionError("a bare-form zero-test binary went unnoticed")
+    bare_healthy = _FakeRest([
+        ("bare-1a2b3c4d5e6f7893", None, (2, 0, 0, 0)),
+    ])
+    assert run_partition("rest", gate, runner=bare_healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
     # The p11scope bin is CLI dispatch only (src/main.rs holds no tests),
     # so its total-0 summary is pinned, not proved: any other zero-test
     # binary still fails, and a nonzero bin fails the pin as stale.

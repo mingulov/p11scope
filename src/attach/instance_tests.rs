@@ -2238,7 +2238,7 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
 }
 
 /// Decision §3c: a punch-hole on the provider file from another process,
-/// settled as correct fail-closed behavior (provisional R-39). The hole
+/// settled as correct fail-closed behavior (R-39). The hole
 /// changes the file on disk, so the watched provider's `(ino, size,
 /// ctime)` identity pin no longer proves the instance it calibrated:
 /// `LiveImageScan::audit` refuses every later scan with Custody, and

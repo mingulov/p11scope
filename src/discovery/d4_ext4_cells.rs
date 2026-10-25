@@ -3,7 +3,9 @@
 //! the new file. The recycled row exits the original holder, deletes and
 //! re-creates the path (different bytes, same number), maps the new file
 //! in a new holder, and refuses the stale sweep on both backends; the
-//! equal-bytes twin proves identical content still refuses. A separate
+//! equal-bytes twin proves identical content still refuses. The live-copy
+//! row maps a byte-identical copy under a fresh number while the holder
+//! lives and refuses it on both backends. A separate
 //! deleted-mapping row pins the live ` (deleted)` refusal (temp+rename
 //! takes a fresh number, so that row is not inode reuse). Most ext4 rows
 //! are identity-keyed (no per-range proof) and classify "no kernel proof
@@ -364,13 +366,15 @@ struct Ext4LegEvidence {
 /// The tabled outcome for one ext4 row: the stale sweep's refusal
 /// under a recycled number, the deleted line's named refusal under a
 /// fresh number, the live holder's identity edge, the wrong-file
-/// negative or the data-only zero-demand row.
+/// negative, the live byte-identical copy's refusal under a fresh
+/// number, or the data-only zero-demand row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ext4Expect {
     RecycledRefused,
     DeletedMappingStaleKey,
     LiveHolderEdge,
     WrongFileNone,
+    LiveCopyNone,
     DataOnlyNone,
 }
 
@@ -584,6 +588,20 @@ fn assert_ext4_outcome(
         Ext4Expect::WrongFileNone => {
             if keys_equal {
                 return Err("ext4 wrong-file premise needs differing maps keys".into());
+            }
+            assert_brsv_live(target)?;
+            assert_brsv_live(anchor)?;
+            ext4_no_candidate(userspace, "userspace")?;
+            ext4_no_candidate(kernel, "kernel")?;
+            classified(evidence)?;
+            zero_run(evidence)?;
+            Ok(())
+        }
+        Ext4Expect::LiveCopyNone => {
+            if keys_equal {
+                return Err(
+                    "ext4 live-copy premise needs differing maps keys (a different inode)".into(),
+                );
             }
             assert_brsv_live(target)?;
             assert_brsv_live(anchor)?;
@@ -1090,6 +1108,90 @@ fn ext4_recycled_evaluator_refuses_the_stale_sweep() {
     );
 }
 
+/// The live-copy evaluator refuses despite identical bytes: a live pair
+/// under DIFFERING keys (the copy is a different inode) with the same
+/// size on both sides (byte-identical content) and no candidate on
+/// either backend — while an edge or equal keys fail.
+#[test]
+fn ext4_live_copy_evaluator_refuses_despite_identical_bytes() {
+    let pid = 4349u32;
+    let stat = |ino: u64| Ext4Stat {
+        dev: libc::makedev(7, 2),
+        ino,
+        size: 8192,
+        mtime_secs: 100,
+        mtime_nanos: 0,
+    };
+    // Position 0: the copy's live line (fresh inode) against the held
+    // file's live line — same size (identical bytes), differing keys.
+    let target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 14 /copy.so".into(),
+        map_files: stat(14),
+        path_stat: stat(14),
+        statfs_magic: 0xef53,
+    };
+    let anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13),
+        path_stat: stat(13),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        target.maps_key() != anchor.maps_key(),
+        "a different inode"
+    );
+    assert_eq!(
+        target.map_files.size, anchor.map_files.size,
+        "identical bytes, equal size"
+    );
+    let none = SweepAttribution::default();
+    assert_ext4_outcome(
+        pid,
+        &target,
+        &anchor,
+        &none,
+        &none,
+        &synthetic_no_run_identity_evidence(),
+        Ext4Expect::LiveCopyNone,
+    )
+    .expect("the live copy refuses on both backends");
+    // An edge for the copy's key joins and must fail.
+    let edged = synthetic_edged(pid, target.maps_key());
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::LiveCopyNone,
+        )
+        .is_err(),
+        "the byte-identical copy must never join"
+    );
+    // Equal keys are the live-holder row, not this one.
+    let same = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13),
+        path_stat: stat(13),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &same,
+            &anchor,
+            &none,
+            &none,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::LiveCopyNone,
+        )
+        .is_err(),
+        "refusal needs differing keys"
+    );
+}
+
 /// The per-row proof precondition, pinned without root: each privileged
 /// row's (key, pinned identity, filesystem) shape classifies in production
 /// exactly as its kernel driver asserts. Only the deleted-mapping row binds
@@ -1114,6 +1216,7 @@ fn ext4_row_proof_classification_matches_index_shape() {
         ("wrong-file", Ext4Expect::WrongFileNone, 13),
         ("data-only", Ext4Expect::DataOnlyNone, 13),
         ("equal-bytes", Ext4Expect::RecycledRefused, 13),
+        ("live-copy", Ext4Expect::LiveCopyNone, 13),
         ("live-holder", Ext4Expect::LiveHolderEdge, 13),
     ];
     for (row, expected, pinned_ino) in rows {
@@ -1486,6 +1589,7 @@ impl Ext4Rows<'_> {
         self.row_wrong_file(work)?;
         self.row_data_only(work)?;
         self.row_equal_bytes(work)?;
+        self.row_live_copy(work)?;
         self.row_live_holder(work)?;
         Ok(())
     }
@@ -1839,6 +1943,89 @@ impl Ext4Rows<'_> {
     /// physical identity, so the stale sweep still refuses both ways.
     fn row_equal_bytes(&mut self, work: &std::path::Path) -> Result<(), String> {
         self.row_recycled_shape("equal-bytes", vec![0xE4u8; 8192], true, work)
+    }
+
+    /// Live byte-identical copy (not inode reuse): a second file with the
+    /// same bytes under a FRESH number is mapped while the held file's
+    /// holder lives, and both legs refuse the copy — equal bytes are not
+    /// physical identity. The recycled rows refuse only because their
+    /// holder exited; this row's holder lives, so a bytes-joining mutant
+    /// would edge here.
+    fn row_live_copy(&mut self, work: &std::path::Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        eprintln!("D4_EXT4 start row=live-copy");
+        let _ = work;
+        let fs = Ext4Loop::new();
+        let held = fs.mount.join("lib.so");
+        let copy = fs.mount.join("copy.so");
+        let bytes = vec![0xE4u8; 8192];
+        std::fs::write(&held, &bytes)
+            .map_err(|error| format!("ext4 live-copy write held: {error}"))?;
+        std::fs::write(&copy, &bytes)
+            .map_err(|error| format!("ext4 live-copy write copy: {error}"))?;
+        // Premise: identical bytes, different inodes.
+        let held_bytes =
+            std::fs::read(&held).map_err(|error| format!("ext4 live-copy reread held: {error}"))?;
+        let copy_bytes =
+            std::fs::read(&copy).map_err(|error| format!("ext4 live-copy reread copy: {error}"))?;
+        if held_bytes != copy_bytes {
+            return Err("ext4 live-copy: premise needs identical bytes".into());
+        }
+        let held_ino = std::fs::metadata(&held)
+            .map_err(|error| format!("ext4 live-copy stat held: {error}"))?
+            .ino();
+        let copy_ino = std::fs::metadata(&copy)
+            .map_err(|error| format!("ext4 live-copy stat copy: {error}"))?
+            .ino();
+        if held_ino == copy_ino {
+            return Err("ext4 live-copy: premise needs a different inode".into());
+        }
+        let anchor = SwapChild::spawn(&held);
+        let target = SwapChild::spawn(&copy);
+        let a_snap = anchor.maps();
+        let t_snap = target.maps();
+        let a_line = find_line(&a_snap, child_range(&anchor), *b"r-xp")?;
+        let t_line = find_line(&t_snap, child_range(&target), *b"r-xp")?;
+        let key = ObjectKey::of(&a_line);
+        if ObjectKey::of(&t_line) == key {
+            return Err("ext4 live-copy: premise needs differing maps keys".into());
+        }
+        let (pins, object) = ext4_pin(&held, key)?;
+        let index = ext4_index(key, object, &pins);
+        let t_truth = record_ext4_truth(target.pid as u32, child_range(&target), &copy)?;
+        let a_truth = record_ext4_truth(anchor.pid as u32, child_range(&anchor), &held)?;
+        let _ = t_line;
+        assert_brsv_live(&t_truth)?;
+        assert_brsv_live(&a_truth)?;
+        let pid = target.pid as u32;
+        let userspace = d4_ext4_attribute_pid(pid, t_snap.clone(), &index);
+        ext4_no_candidate(&userspace, "userspace")?;
+        if let Some(session) = self.session.as_deref_mut() {
+            self.generation += 1;
+            let (kernel, evidence) = d4_ext4_kernel_no_run_identity_for_pid(
+                pid,
+                t_snap,
+                &pins,
+                object,
+                key,
+                session,
+                self.generation,
+            );
+            assert_ext4_outcome(
+                pid,
+                &t_truth,
+                &a_truth,
+                &userspace,
+                &kernel,
+                &evidence,
+                Ext4Expect::LiveCopyNone,
+            )?;
+        }
+        eprintln!(
+            "D4_EXT4 row=live-copy verdict=parity-none target-{}",
+            brsv_verdict(&t_truth)
+        );
+        Ok(())
     }
 }
 

@@ -18,8 +18,10 @@ pid, every burst complete, at least one successful call); the population
 counts exactly --owners (default 257) with distinct pids, both modes,
 and targets spanning old and new providers; the newcomer settles within
 its declared bound; every owner pid joins one caller, one retained
-instance and the module its TARGET names (kernel identity against kernel
-identity); every owner instance carries a key row that never over-claims
+instance and the module its TARGET names (inode plus digest; each device
+is compared only inside its own domain, since the TARGET device is
+maps-domain and the module device is fstat-domain); every owner instance
+carries a key row that never over-claims
 its ledger and never ends more operations than it started; instances
 outside the owner set carry no positive (the run excludes ambient
 provider use); the association bound holds over observed rows.
@@ -125,7 +127,8 @@ def _read_owner_lines(path):
 
 def _check_target(row):
     _require(type(row) is dict, "target row must be an object")
-    _require(set(row) == {"name", "dev", "ino", "file_offset"},
+    _require(set(row) == {"name", "dev", "ino", "file_offset"} or
+             set(row) == {"name", "dev", "ino", "file_offset", "sha256"},
              "target without identity fields")
     _require(type(row["name"]) is str and 1 <= len(row["name"]) <= 128,
              "target name invalid")
@@ -134,7 +137,11 @@ def _check_target(row):
              "target device invalid")
     _require(_integer(row["ino"], minimum=1), "target inode invalid")
     _require(_integer(row["file_offset"]), "target file offset invalid")
-    return (tuple(row["dev"]), row["ino"])
+    digest = row.get("sha256")
+    if digest is not None:
+        _require(type(digest) is str and SHA_PATTERN.match(digest),
+                 "target sha256 invalid")
+    return (tuple(row["dev"]), row["ino"], digest)
 
 
 def _check_ledger(row):
@@ -204,8 +211,10 @@ def read_owner(path):
     successful = sum(entry["successful"] for row in ledgers
                      for entry in row["functions"])
     _require(successful >= 1, "owner without a completed call")
-    return {"pid": pid, "mode": next(iter(modes)), "target": targets[0],
-            "attempts": attempts, "successful": successful}
+    dev, ino, digest = targets[0]
+    return {"pid": pid, "mode": next(iter(modes)), "target": (dev, ino),
+            "target_sha": digest, "attempts": attempts,
+            "successful": successful}
 
 
 def read_owners(directory):
@@ -451,8 +460,15 @@ def compare(population, snapshot, expect=EXPECTED_OWNERS):
                  f"owner pid {owner['pid']} not retained")
         module = modules[instance["module"]]
         key = module["key"]
-        _require((tuple(key["device"]), key["inode"]) == owner["target"],
+        # The TARGET device lives in the /proc-maps domain while the module
+        # device lives in the fstat domain (they differ on btrfs), so the
+        # join compares the inode plus the digest and never the devices.
+        _require(key["inode"] == owner["target"][1],
                  f"owner pid {owner['pid']} target disagrees with its module")
+        if owner["target_sha"] is not None:
+            _require(owner["target_sha"] == key["sha256"],
+                     f"owner pid {owner['pid']} target digest disagrees "
+                     "with its module")
         key_row = key_rows.get(instance["id"])
         _require(key_row is not None,
                  f"observed instance {instance['id']} without a key row")

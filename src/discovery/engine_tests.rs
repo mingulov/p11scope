@@ -34093,7 +34093,9 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         "the parked head was serviced, not dropped"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
+        !engine
+            .refresh_requested
+            .contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unprotected request was serviced"
     );
     let head = engine
@@ -35195,7 +35197,9 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         );
     }
     assert!(
-        engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
+        engine
+            .refresh_requested
+            .contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unselected unprotected request is retained, not cleared"
     );
     assert_eq!(
@@ -35322,7 +35326,9 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         "the diverted selection keeps its serial and age"
     );
     assert!(
-        engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
+        engine
+            .refresh_requested
+            .contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale entry waits for the next opportunity"
     );
     assert_eq!(
@@ -35384,7 +35390,9 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&(FAKE_PID_FLOOR + 255)),
+        !engine
+            .refresh_requested
+            .contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale selection freed the slot"
     );
     assert_eq!(

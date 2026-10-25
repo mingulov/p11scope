@@ -1219,7 +1219,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if batch.claim_cursor != batch.entries.len() || batch.stage_cursor >= batch.claim_cursor {
             return Ok(false);
         }
+        // No H8 association, no H8 subject: ordinary rows without
+        // journal rows stage S1 directly. Associated originals still
+        // take the strict disposition below.
         if let Some(Ok(input)) = batch.entries[batch.stage_cursor].input.as_ref()
+            && input.joint_resource_origin().is_some()
             && self.registry.admitted_feed_is_s1only(input)
             && crate::kinds::function_id(&input.s1_facts().function)
                 .and_then(crate::semantics_objects::journal::endpoint_class)

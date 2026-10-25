@@ -11042,4 +11042,172 @@ mod tests {
         assert!(cursor.plan().is_none());
         assert!(cursor.required_bytes().is_none());
     }
+
+    #[test]
+    fn plan_tree_bound_covers_std_btree_allocations() {
+        fn tight_nodes(entries: usize) -> usize {
+            if entries == 0 {
+                0
+            } else {
+                1 + (entries - 1) / 5
+            }
+        }
+        fn expected_bytes<K, V>(entries: usize) -> usize {
+            fn align8(bytes: usize) -> usize {
+                (bytes + 7) & !7
+            }
+            let node = 16
+                + align8(std::mem::size_of::<K>() * 11)
+                + align8(std::mem::size_of::<V>() * 11)
+                + 12 * 8
+                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+            tight_nodes(entries) * node
+        }
+        fn ascending(n: usize) -> Vec<u64> {
+            (0..n as u64).collect()
+        }
+        fn descending(n: usize) -> Vec<u64> {
+            (0..n as u64).rev().collect()
+        }
+        fn xorshifted(n: usize) -> Vec<u64> {
+            let mut keys: Vec<u64> = (0..n as u64).collect();
+            let mut state = 0x9E3779B97F4A7C15u64;
+            for i in (1..n).rev() {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let j = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as usize % (i + 1);
+                keys.swap(i, j);
+            }
+            keys
+        }
+        fn check_cover<K: Ord, V>(
+            entries: usize,
+            order: &[u64],
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let bound = plan_tree_bytes::<K, V>(entries).expect("tight bound fits");
+            assert_eq!(
+                bound,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in order {
+                    map.insert(key(*k), value(*k));
+                }
+                map
+            });
+            assert_eq!(map.len(), entries, "all test keys inserted");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            if entries == 0 {
+                assert_eq!(peak.live_blocks, 0, "empty map allocates nothing");
+            } else {
+                assert!(peak.live_blocks > 0, "nonempty map retains nodes");
+                assert!(peak.peak_bytes > 0, "nonempty map requests bytes");
+            }
+            let need = peak
+                .peak_bytes
+                .max(peak.live_bytes)
+                .max(peak.realloc_overlap_bytes);
+            assert!(
+                bound >= need,
+                "bound {bound} covers heap {need} for {entries} entries"
+            );
+            drop(map);
+        }
+        fn check_half_removed<K: Ord, V>(
+            entries: usize,
+            mut key: impl FnMut(u64) -> K,
+            mut value: impl FnMut(u64) -> V,
+        ) {
+            let remaining = entries / 2;
+            let full = plan_tree_bytes::<K, V>(entries).expect("tight bound fits");
+            assert_eq!(
+                full,
+                expected_bytes::<K, V>(entries),
+                "tight node count for {entries} entries"
+            );
+            let rest = plan_tree_bytes::<K, V>(remaining).expect("tight bound fits");
+            assert_eq!(
+                rest,
+                expected_bytes::<K, V>(remaining),
+                "tight node count for {remaining} entries"
+            );
+            let (map, peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut map = std::collections::BTreeMap::new();
+                for k in 0..entries as u64 {
+                    map.insert(key(k), value(k));
+                }
+                for k in (0..entries as u64).filter(|k| k % 2 == 0) {
+                    map.remove(&key(k));
+                }
+                map
+            });
+            assert_eq!(map.len(), remaining, "half the test keys removed");
+            assert!(!peak.incomplete, "allocation probe stayed complete");
+            assert_eq!(peak.failed_requests, 0, "no failed test allocations");
+            assert!(
+                full >= peak.peak_bytes.max(peak.realloc_overlap_bytes),
+                "full bound {full} covers insertion peak {}",
+                peak.peak_bytes.max(peak.realloc_overlap_bytes),
+            );
+            assert!(
+                rest >= peak.live_bytes,
+                "remaining bound {rest} covers live {}",
+                peak.live_bytes,
+            );
+            drop(map);
+        }
+        for entries in [0, 1, 5, 11, 12, 64, 4096] {
+            for order in [
+                ascending(entries),
+                descending(entries),
+                xorshifted(entries),
+            ] {
+                check_cover::<u64, u64>(entries, &order, |k| k, |k| k.wrapping_mul(3));
+                check_cover::<u64, ()>(entries, &order, |k| k, |_| ());
+                check_cover::<u64, [u64; 16]>(entries, &order, |k| k, |k| [k; 16]);
+                check_cover::<[u64; 4], [u64; 4]>(
+                    entries,
+                    &order,
+                    |k| [k, 0, 1, 2],
+                    |k| [k; 4],
+                );
+            }
+            if entries >= 2 {
+                check_half_removed::<u64, u64>(entries, |k| k, |k| k);
+                check_half_removed::<u64, ()>(entries, |k| k, |_| ());
+                check_half_removed::<u64, [u64; 16]>(entries, |k| k, |k| [k; 16]);
+                check_half_removed::<[u64; 4], [u64; 4]>(
+                    entries,
+                    |k| [k, 0, 1, 2],
+                    |k| [k; 4],
+                );
+            }
+        }
+        #[repr(align(16))]
+        struct OverAligned([u8; 16]);
+        assert!(
+            matches!(
+                plan_tree_bytes::<OverAligned, u64>(1),
+                Err(crate::discovery::identity::GraphRefusal::Overflow)
+            ),
+            "over-aligned keys refuse"
+        );
+        assert!(
+            matches!(
+                plan_tree_bytes::<u64, OverAligned>(1),
+                Err(crate::discovery::identity::GraphRefusal::Overflow)
+            ),
+            "over-aligned values refuse"
+        );
+        assert!(
+            plan_tree_bytes::<u64, u64>(usize::MAX).is_err(),
+            "huge maps refuse instead of wrapping"
+        );
+    }
 }

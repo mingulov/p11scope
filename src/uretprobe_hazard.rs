@@ -447,6 +447,10 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
 
 #[cfg(target_arch = "x86_64")]
 fn probe_kernel_inner() -> Result<KernelVerdict> {
+    // The self-probe attaches, so it holds the embedded-flavor gate itself
+    // (one cached read) instead of trusting every caller to check first; a
+    // stale or mismatched object refuses here, before any load.
+    crate::attach::checked_embedded_flavor()?;
     // Loaded exactly as a capture loads it (J-DOSSIER#28), at the default
     // ring sizes of a `--pid` capture.
     let btf = aya::Btf::from_sys_fs().context("loading required vmlinux BTF")?;

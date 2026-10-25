@@ -31,10 +31,13 @@
 //! real remap, unmap, permission change, exec or new incarnation still
 //! mints. A scan that proves the module unmapped breaks continuity for
 //! that (image, file) key, so the next scan mints even at an unchanged
-//! local epoch. A range that *appears* at an unchanged triple is
-//! impossible under hook completeness and latches a sticky coverage
-//! fault for that (process, file). Only the executable flag compares:
-//! a write-bit-only protection change continues by design.
+//! local epoch. A move of the witness's storage_null counter since the
+//! key's last observation also mints: an unattributed hook event may
+//! hide a real mapping change behind unchanged epochs. A range that
+//! *appears* at an unchanged triple is impossible under hook completeness
+//! and latches a sticky coverage fault for that (process, file). Only
+//! the executable flag compares: a write-bit-only protection change
+//! continues by design.
 //!
 //! Known limitation: the witness attributes a mapping change to a process
 //! only while that process has a single live user task and no transient
@@ -148,6 +151,14 @@ fn same_mapping(previous: &[MapRange], current: &[MapRange]) -> bool {
         out
     }
     merged(previous) == merged(current)
+}
+
+/// Q1(b): whether the witness's `INSTANCE_COUNT.storage_null` counter
+/// provably moved between the key's last observation and the current
+/// scan pass. Unknown on either side keeps the legacy rule: only a
+/// proven move fails closed toward a new instance.
+fn storage_moved_since(snapshot: Option<u64>, seen: Option<u64>) -> bool {
+    matches!((snapshot, seen), (Some(now), Some(was)) if now != was)
 }
 
 impl fmt::Debug for MapRange {
@@ -472,8 +483,9 @@ pub(crate) enum ObserveOutcome {
     /// First stable observation of these epochs: partitions were minted.
     New,
     /// Continuity: same epochs with no new range, or a new epoch triple
-    /// over the same merged mapping with the local epoch unchanged and
-    /// no proven absence since. The same instances continue.
+    /// over the same merged mapping with the local epoch unchanged, no
+    /// proven absence since, and the storage_null counter unmoved since
+    /// the key's last observation. The same instances continue.
     Continued,
     /// A range appeared at unchanged epochs: sticky coverage fault.
     CoverageFault,
@@ -1256,9 +1268,12 @@ impl InstanceRouter {
                 // its mapping, so it always mints. A scan that proved the
                 // module unmapped since (a recorded absence for this key)
                 // also mints: the mapping may have been reloaded between
-                // the scans. The merged comparison below folds split/merge
-                // artifacts; a real remap, unmap, permission change, exec or
-                // new incarnation still mints.
+                // the scans. So does a move of the witness's storage_null
+                // counter since the key's last observation: an unattributed
+                // hook event may hide a real mapping change behind the
+                // unchanged epochs. The merged comparison below folds
+                // split/merge artifacts; a real remap, unmap, permission
+                // change, exec or new incarnation still mints.
                 let broken = self.absent.remove(&key);
                 let continued = self
                     .observed
@@ -1266,6 +1281,7 @@ impl InstanceRouter {
                     .and_then(|list| list.back())
                     .filter(|current| {
                         !broken
+                            && !storage_moved_since(storage_snapshot, current.storage_seen)
                             && current.epochs.local == epochs.local
                             && same_mapping(&current.ranges, &observation.ranges)
                     })

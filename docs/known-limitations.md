@@ -698,8 +698,12 @@ closes after exit.
   investigation lands its guard.
 - Workaround: same-filesystem layer layouts (behave like xino on);
   avoid post-copy-up attribution windows for replaced providers.
-- Planned: v0.5.0 (guest-lane qualification, then the copy-up guard;
-  registry rows flip only after the guest cells qualify).
+- Planned: v0.5.0 (guest-lane qualification; registry rows flip only
+  after the guest cells qualify). Investigation verdict: no E3 userspace
+  guard fits already-captured fields (the proof boundary carries dev/ino
+  only, all stable across copy-up), and E4 layer-index tracking is
+  rejected for v0.5.0 (needs kernel/container changes). The RED copy-up
+  reproducer stays; this disclosure is final.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

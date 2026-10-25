@@ -550,6 +550,13 @@ impl PhysicalSemanticGap {
     }
 }
 
+/// How long a retained never-bound image waits for its binding proof
+/// before its records expire mid-run as Unobserved. Generous against
+/// the observed ~10 s bind delay at system scale; past it the records
+/// shed with the existing disclosure instead of occupying the pending
+/// budget until stop.
+const RETAINED_IMAGE_HORIZON: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy)]
 pub(crate) struct TickLimits {
     pub(crate) records: usize,
@@ -1219,13 +1226,14 @@ pub(crate) struct SemanticCapture {
     /// sheds immediately, exactly as before.
     retention_attach_ticks: Option<u64>,
     /// Pin-less images held for the imminent binding: first-drain
-    /// monotonic ns per image, for registration backdating. Membership
-    /// only; the records wait in `awaiting`/router-pending under the
-    /// existing pending budget. Entries leave only when their records
-    /// are gone and no binding holds the cookie, so a joined image keeps
-    /// its drain stamp for conversion; at most one entry per pending or
-    /// bound image.
-    retained: BTreeMap<(u64, u64), u64>,
+    /// monotonic ns per image, for registration backdating, plus the
+    /// capture-clock retention instant for the horizon. Membership only;
+    /// the records wait in `awaiting`/router-pending under the existing
+    /// pending budget. Entries leave when their records are gone and no
+    /// binding holds the cookie, or when the retention horizon expires
+    /// them; a joined image keeps its drain stamp for conversion. At
+    /// most one entry per pending or bound image.
+    retained: BTreeMap<(u64, u64), (u64, Instant)>,
     terminal_cursor: u64,
     /// Fairness among tick-local Joined partitions when Pending scans leave
     /// fewer scan slots than the later calls need. This carries no authority.
@@ -2634,7 +2642,7 @@ impl SemanticCapture {
     /// never reused, so a wrongly held image never joins: it waits under
     /// the pending budget until stop. Unreadable or older tasks return
     /// false and shed exactly as before.
-    fn retain_post_attach(&mut self, pid: u32, image: ImageIdentity) -> bool {
+    fn retain_post_attach(&mut self, now: Instant, pid: u32, image: ImageIdentity) -> bool {
         let Some(attach) = self.retention_attach_ticks else {
             return false;
         };
@@ -2646,7 +2654,7 @@ impl SemanticCapture {
         }
         self.retained
             .entry((image.task_cookie, image.exec_id))
-            .or_insert_with(now_ns);
+            .or_insert_with(|| (now_ns(), now));
         true
     }
 
@@ -2656,7 +2664,7 @@ impl SemanticCapture {
     pub(crate) fn retained_registration_ns(&self, image: ImageIdentity) -> Option<u64> {
         self.retained
             .get(&(image.task_cookie, image.exec_id))
-            .copied()
+            .map(|(ns, _)| *ns)
     }
 
     fn refuse_binding(&mut self, image: ImageIdentity, report: &mut TickReport) {
@@ -3067,7 +3075,7 @@ impl SemanticCapture {
                 // No binding pin yet: a task that provably started after
                 // the lane attached holds its first burst for the imminent
                 // binding; everything else sheds exactly as before (R-34).
-                if !self.retain_post_attach(pid, image) {
+                if !self.retain_post_attach(io.now(), pid, image) {
                     self.expire(image, &mut report);
                 }
                 continue;
@@ -3237,6 +3245,31 @@ impl SemanticCapture {
                     }
                 }
             }
+        }
+        // Retained images that never bind get a bounded horizon: past it
+        // their records expire mid-run as Unobserved (the existing shed
+        // disclosure) instead of occupying the pending budget until stop.
+        // Bound images are skipped: their scans resolve or refuse them.
+        let over_horizon: Vec<ImageIdentity> = self
+            .retained
+            .iter()
+            .filter(|((cookie, _), (_, at))| {
+                io.now()
+                    .checked_duration_since(*at)
+                    .is_some_and(|age| age > RETAINED_IMAGE_HORIZON)
+                    && !self
+                        .bindings
+                        .get(cookie)
+                        .is_some_and(|binding| binding.current)
+            })
+            .map(|((cookie, exec), _)| ImageIdentity {
+                task_cookie: *cookie,
+                exec_id: *exec,
+            })
+            .collect();
+        for image in over_horizon {
+            self.expire(image, &mut report);
+            self.retained.remove(&(image.task_cookie, image.exec_id));
         }
         Ok(report)
     }

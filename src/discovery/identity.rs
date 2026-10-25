@@ -1996,11 +1996,13 @@ mod conservative_copy {
         }
     }
 
-    /// Rust 1.98.1 alloc::collections::btree::node has B=6: eleven key/value
-    /// slots, twelve edges, and a 16-byte header on Linux x86-64. Account for
-    /// field padding and two full internal nodes per element, plus split/root
-    /// slack. This covers the old/new nodes of incremental insertion. These
-    /// actual private key/value types have alignment <=8; other layouts refuse.
+    /// Rust 1.99.1 alloc::collections::btree::node has B=6: eleven key/value
+    /// slots, twelve edges, and a 16-byte header on Linux x86-64. Every
+    /// non-root node keeps at least five keys after insert, remove, append
+    /// and clone (MIN_LEN), so n entries need at most 1+(n-1)/5 nodes; an
+    /// empty map allocates nothing. The node size is the full internal size,
+    /// applied to every node, so this dominates retained nodes. These actual
+    /// private key/value types have alignment <=8; other layouts refuse.
     pub(super) fn conservative_pin_tree_bytes<K, V>(entries: usize) -> Option<usize> {
         fn align8(bytes: usize) -> Option<usize> {
             bytes.checked_add(7).map(|value| value & !7)
@@ -2013,7 +2015,12 @@ mod conservative_copy {
             .checked_add(align8(std::mem::size_of::<V>().checked_mul(11)?)?)?
             .checked_add(12 * 8)?
             .checked_add(OWNED_ALLOCATION_PADDING)?;
-        entries.checked_mul(2)?.checked_add(4)?.checked_mul(node)
+        let nodes = if entries == 0 {
+            0
+        } else {
+            1 + (entries - 1) / 5
+        };
+        nodes.checked_mul(node)
     }
 
     fn bytes_for<T>(count: usize) -> Result<usize, GraphRefusal> {

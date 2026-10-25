@@ -3883,6 +3883,9 @@ fn plan_text_bytes(text: &str) -> Result<usize, GraphRefusal> {
 }
 
 // consumed by T4: used only by the cursor measure phase.
+// Rust 1.99.1 B=6 BTree keeps every non-root node at >=5 keys, so n entries
+// need at most 1+(n-1)/5 nodes; empty maps allocate nothing. Node size is the
+// full internal size applied to every node.
 #[allow(dead_code)]
 fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
     fn align8(bytes: usize) -> Option<usize> {
@@ -3905,11 +3908,12 @@ fn plan_tree_bytes<K, V>(entries: usize) -> Result<usize, GraphRefusal> {
         .and_then(|bytes| bytes.checked_add(12 * 8))
         .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
         .ok_or(GraphRefusal::Overflow)?;
-    entries
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(4))
-        .and_then(|count| count.checked_mul(node))
-        .ok_or(GraphRefusal::Overflow)
+    let nodes = if entries == 0 {
+        0
+    } else {
+        1 + (entries - 1) / 5
+    };
+    nodes.checked_mul(node).ok_or(GraphRefusal::Overflow)
 }
 
 // consumed by T4: used only by the cursor measure phase.

@@ -108,7 +108,7 @@ impl ValidatedMemberSelector<'_> {
     }
 }
 
-/// A transiently held TGID-level `map_files` directory with its own lease.
+/// A transiently held TID-addressed `map_files` directory with its own lease.
 /// Declared directory-first so it closes before its reservation returns.
 pub(crate) struct TransientMapFilesDir {
     dir: OwnedFd,

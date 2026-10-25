@@ -47,8 +47,9 @@ pub(super) fn read(
     )
 }
 
-/// Private Counts-only bank bridge. The view shares the original map handles
-/// and leases; creating a scrape opens no inner-map FD or new cursor.
+/// Private bank bridge for every prepared counter mode. The view shares the
+/// original map handles and leases; creating a scrape opens no inner-map FD
+/// or new cursor.
 #[allow(dead_code)] // Private validated bank bridge; no public/runtime reader activation.
 pub(super) fn read_banked(
     session: &Session,
@@ -85,9 +86,13 @@ pub(super) fn read_bound(
     let view = session
         .counter_bank_view(plan, objects, reserve)
         .map_err(bank_read_stage)?;
+    // Bank objects carry the legacy 24-byte aggregate template in every
+    // mode; only the bank cells vary. The read mode still comes from the
+    // prepared binding.
     let native = NativeSource::with_bounds(
         |name| session.ebpf.map(name),
         binding.mode(),
+        CounterMode::Counts,
         binding.rv_keys(),
         binding.start_rows(),
         Some(binding.possible_cpus()),
@@ -161,7 +166,7 @@ fn acquire(
     let published = source.published_snapshot(); // Borrow once; never clone a view or its lease.
     let (logical_slots, rv_limit, row_count) = match published {
         Some(snapshot) => {
-            if source.mode() != CounterMode::Counts
+            if source.mode() != snapshot.mode()
                 || source.possible_cpus() != snapshot.possible_cpus()
             {
                 return Err(ReadStage::Shape);
@@ -328,7 +333,7 @@ struct BankedSource<'a> {
 
 impl CounterSource for BankedSource<'_> {
     fn mode(&self) -> CounterMode {
-        CounterMode::Counts
+        self.native.mode
     }
     fn possible_cpus(&self) -> usize {
         self.native.cpus
@@ -375,20 +380,59 @@ impl CounterSource for BankedSource<'_> {
         } else {
             1
         };
-        shape(map, MapType::PerCpuArray, 4, 24, cells)?;
-        let stats: PerCpuArray<_, CountStats> =
-            PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
         // The original logical slot selects its retained bank and cell;
         // RV and START identities retain that original slot and full64 RV.
-        let values = stats.get(&cell, 0).map_err(|_| ReadStage::Stats)?;
-        self.native.cpu_count(values.len(), ReadStage::Stats)?;
-        Ok(CounterRow::fold(
-            slot,
-            CounterMode::Counts,
-            values.iter().map(CounterCell::Counts),
-            rvs.iter().copied(),
-            limits,
-        ))
+        // The cell width comes from the prepared mode, matching the bank.
+        let mode = self.mode();
+        shape(
+            map,
+            MapType::PerCpuArray,
+            4,
+            mode.stats_bytes() as usize,
+            cells,
+        )?;
+        let rvs = || rvs.iter().copied();
+        Ok(match mode {
+            CounterMode::Counts => {
+                let stats: PerCpuArray<_, CountStats> =
+                    PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
+                let values = stats.get(&cell, 0).map_err(|_| ReadStage::Stats)?;
+                self.native.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    mode,
+                    values.iter().map(CounterCell::Counts),
+                    rvs(),
+                    limits,
+                )
+            }
+            CounterMode::Timestamps => {
+                let stats: PerCpuArray<_, TimestampStats> =
+                    PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
+                let values = stats.get(&cell, 0).map_err(|_| ReadStage::Stats)?;
+                self.native.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    mode,
+                    values.iter().map(CounterCell::Timestamps),
+                    rvs(),
+                    limits,
+                )
+            }
+            CounterMode::Latency => {
+                let stats: PerCpuArray<_, SlotStats> =
+                    PerCpuArray::try_from(map).map_err(|_| ReadStage::Stats)?;
+                let values = stats.get(&cell, 0).map_err(|_| ReadStage::Stats)?;
+                self.native.cpu_count(values.len(), ReadStage::Stats)?;
+                CounterRow::fold(
+                    slot,
+                    mode,
+                    values.iter().map(CounterCell::Latency),
+                    rvs(),
+                    limits,
+                )
+            }
+        })
     }
     fn health(&self) -> Result<CounterHealth, ReadStage> {
         self.native.health()
@@ -429,12 +473,14 @@ fn shape(
 
 impl<'a> NativeSource<'a> {
     fn new(lookup: impl Fn(&str) -> Option<&'a Map>, mode: CounterMode) -> Result<Self, ReadStage> {
-        Self::with_bounds(lookup, mode, NATIVE_RVS, NATIVE_STARTS, None)
+        // Fixed native artifacts carry a per-mode STATS template.
+        Self::with_bounds(lookup, mode, mode, NATIVE_RVS, NATIVE_STARTS, None)
     }
 
     fn with_bounds(
         lookup: impl Fn(&str) -> Option<&'a Map>,
         mode: CounterMode,
+        stats_shape: CounterMode,
         rv_keys: usize,
         start_rows: u32,
         expected_cpus: Option<usize>,
@@ -452,7 +498,7 @@ impl<'a> NativeSource<'a> {
             stats,
             MapType::PerCpuArray,
             4,
-            mode.stats_bytes() as usize,
+            stats_shape.stats_bytes() as usize,
             NATIVE_SLOTS as u32,
         )?;
         shape(

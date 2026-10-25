@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Private Counts publication, retained native custody and charged collection.
+//! Private counter publication, retained native custody and charged collection.
 
 use super::{BpfLoopVerdict, CapturePolicy, Scope, Session};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) const BANK_CONFIG: u64 = 0x1800_0102;
 const COUNTS_GROWTH_V2_CONFIG: u64 = 0x0200_0018_0010_0200;
+const TIMESTAMPS_GROWTH_V2_CONFIG: u64 = 0x0200_0028_0010_0200;
+const LATENCY_GROWTH_V2_CONFIG: u64 = 0x0200_0128_0010_0200;
 const BANKS: usize = 2;
 const GROWTH_BANKS: usize = 16;
 pub(super) const PROGRAMS: [&str; 2] = ["p11_counter_bank_entry", "p11_counter_bank_return"];
@@ -146,30 +148,41 @@ impl BankExtent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CountsBankGeometry {
+struct BankGeometry {
+    mode: CounterMode,
     banks: u32,
     cells: u32,
     configuration: u64,
 }
 
-impl CountsBankGeometry {
+impl BankGeometry {
     fn legacy() -> Self {
         Self {
+            mode: CounterMode::Counts,
             banks: 2,
             cells: 1,
             configuration: BANK_CONFIG,
         }
     }
 
-    fn checked(banks: u32, cells: u32) -> Result<Self, BankRefusal> {
+    fn checked(mode: CounterMode, banks: u32, cells: u32) -> Result<Self, BankRefusal> {
         if (banks, cells) != (16, 512) || banks.checked_mul(cells) != Some(8192) {
             return Err(BankRefusal::Shape);
         }
         Ok(Self {
+            mode,
             banks,
             cells,
-            configuration: COUNTS_GROWTH_V2_CONFIG,
+            configuration: match mode {
+                CounterMode::Counts => COUNTS_GROWTH_V2_CONFIG,
+                CounterMode::Timestamps => TIMESTAMPS_GROWTH_V2_CONFIG,
+                CounterMode::Latency => LATENCY_GROWTH_V2_CONFIG,
+            },
         })
+    }
+
+    fn mode(self) -> CounterMode {
+        self.mode
     }
 
     fn is_legacy(self) -> bool {
@@ -177,7 +190,7 @@ impl CountsBankGeometry {
     }
 
     fn validate(self) -> Result<(), BankRefusal> {
-        if self.is_legacy() || Self::checked(self.banks, self.cells) == Ok(self) {
+        if self.is_legacy() || Self::checked(self.mode, self.banks, self.cells) == Ok(self) {
             Ok(())
         } else {
             Err(BankRefusal::Shape)
@@ -187,7 +200,9 @@ impl CountsBankGeometry {
     fn selected(profile: &str) -> Result<Self, BankRefusal> {
         match profile {
             "counts-bank-proof" => Ok(Self::legacy()),
-            "counts-bank-growth-v2" => Self::checked(16, 512),
+            "counts-bank-growth-v2" => Self::checked(CounterMode::Counts, 16, 512),
+            "timestamps-bank-growth-v2" => Self::checked(CounterMode::Timestamps, 16, 512),
+            "latency-bank-growth-v2" => Self::checked(CounterMode::Latency, 16, 512),
             _ => Err(BankRefusal::Shape),
         }
     }
@@ -221,15 +236,15 @@ impl CountsBankGeometry {
             return Err(BankRefusal::Topology);
         }
         (self.cells as usize)
-            .checked_mul(size_of::<p11scope_ebpf_common::CountStats>())
+            .checked_mul(self.mode.stats_bytes() as usize)
             .and_then(|bytes| bytes.checked_mul(cpus))
             .ok_or(BankRefusal::Budget)
     }
 }
 
-/// One private per-mode bank artifact of the opt-in proof build. Production
-/// preparation stays Counts-only; the timing rows serve the checker and load
-/// cells until a later task routes them.
+/// One private per-mode bank artifact of the default build. The load cell
+/// stages each mode's sixteen inner maps from this table; preparation
+/// selects the same embedded bytes by identity.
 #[derive(Clone, Copy, Debug)]
 #[cfg(test)]
 struct BankModeArtifact {
@@ -238,11 +253,6 @@ struct BankModeArtifact {
     value_bytes: u32,
     configuration: u64,
 }
-
-#[cfg(test)]
-const TIMESTAMPS_GROWTH_V2_CONFIG: u64 = 0x0200_0028_0010_0200;
-#[cfg(test)]
-const LATENCY_GROWTH_V2_CONFIG: u64 = 0x0200_0128_0010_0200;
 
 #[cfg(test)]
 const BANK_MODE_ARTIFACTS: [BankModeArtifact; 3] = [
@@ -275,19 +285,41 @@ fn bank_mode_artifact(token: &str) -> Result<BankModeArtifact, BankRefusal> {
         .ok_or(BankRefusal::Shape)
 }
 
-fn proof_counts_token(outputs: &str) -> Result<&str, BankRefusal> {
-    outputs
-        .split(',')
-        .find(|token| *token == "counts-bank-growth-v2")
-        .ok_or(BankRefusal::Shape)
+/// The emitted growth token for a counter mode. Preparation admits a mode
+/// only when its token is among the emitted outputs.
+fn bank_growth_token(mode: CounterMode) -> &'static str {
+    match mode {
+        CounterMode::Counts => "counts-bank-growth-v2",
+        CounterMode::Timestamps => "timestamps-bank-growth-v2",
+        CounterMode::Latency => "latency-bank-growth-v2",
+    }
 }
 
-fn production_geometry(outputs: &str) -> Result<CountsBankGeometry, BankRefusal> {
-    if outputs.contains(',') {
-        CountsBankGeometry::selected(proof_counts_token(outputs)?)
-    } else {
-        CountsBankGeometry::selected(outputs)
+fn production_geometry_for(object: &[u8], outputs: &str) -> Result<BankGeometry, BankRefusal> {
+    if outputs == "counts-bank-proof" {
+        return Ok(BankGeometry::legacy());
     }
+    let mut selected = None;
+    for mode in [
+        CounterMode::Counts,
+        CounterMode::Timestamps,
+        CounterMode::Latency,
+    ] {
+        if object == counter_object_for_mode(mode) {
+            if selected.is_some() {
+                return Err(BankRefusal::Shape);
+            }
+            selected = Some(mode);
+        }
+    }
+    let mode = selected.ok_or(BankRefusal::Shape)?;
+    if !outputs
+        .split(',')
+        .any(|token| token == bank_growth_token(mode))
+    {
+        return Err(BankRefusal::Shape);
+    }
+    BankGeometry::selected(bank_growth_token(mode))
 }
 
 /// Deterministic build gate, checked before the kernel probe: omitted
@@ -337,7 +369,7 @@ impl StagedExtent {
         bank_ids: Vec<(u32, u32)>,
     ) -> Result<Self, BankRefusal> {
         Self::checked_with(
-            CountsBankGeometry::checked(16, 512)?,
+            BankGeometry::checked(CounterMode::Counts, 16, 512)?,
             transaction,
             commit,
             routes,
@@ -346,7 +378,7 @@ impl StagedExtent {
     }
 
     fn checked_with(
-        geometry: CountsBankGeometry,
+        geometry: BankGeometry,
         transaction: NonZeroU64,
         commit: CountsBankCommit,
         routes: Vec<(u32, CountsBankRoute)>,
@@ -499,7 +531,7 @@ fn read_fd_snapshot() -> Result<FdSnapshot, BankRefusal> {
 
 #[allow(clippy::too_many_arguments)] // One checked accounting function for directory and native ownership.
 fn stage_requirements(
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     all_slots: &[Slot],
     fresh: BankExtent,
     old_capacity: usize,
@@ -509,6 +541,7 @@ fn stage_requirements(
     slot_copies: usize,
 ) -> Result<(usize, usize, usize, usize), BankRefusal> {
     geometry.validate()?;
+    let value_bytes = geometry.mode().stats_bytes() as usize;
     let payload = geometry
         .bank_payload_bytes(cpus)?
         .checked_mul(new_banks)
@@ -563,9 +596,7 @@ fn stage_requirements(
     let transient = copies
         .checked_add(table)
         .and_then(|n| n.checked_add(metadata.checked_mul(2)?))
-        .and_then(|n| {
-            n.checked_add(cpus.checked_mul(4 * size_of::<p11scope_ebpf_common::CountStats>())?)
-        })
+        .and_then(|n| n.checked_add(cpus.checked_mul(4 * value_bytes)?))
         .ok_or(BankRefusal::Budget)?;
     // NativeIo admits only OneProcess: Singles retains two BPF-link FDs
     // per endpoint, with one transient perf FD during sequential attachment.
@@ -801,7 +832,7 @@ struct BankPosition {
 }
 
 struct BankDirectory {
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     positions: Vec<BankPosition>,
     bank_ids: Vec<Option<u32>>,
     next_transaction: Option<NonZeroU64>,
@@ -812,7 +843,7 @@ struct BankDirectory {
 impl Default for BankDirectory {
     fn default() -> Self {
         Self {
-            geometry: CountsBankGeometry::legacy(),
+            geometry: BankGeometry::legacy(),
             positions: Vec::new(),
             bank_ids: Vec::new(),
             next_transaction: NonZeroU64::new(1),
@@ -1418,12 +1449,12 @@ pub(crate) struct CounterKeepalive {
 
 impl CounterKeepalive {
     pub(crate) fn precharge(reserve: &SemanticResourceReserver, bytes: usize) -> Result<Arc<Self>> {
-        Self::precharge_with_geometry(reserve, bytes, CountsBankGeometry::legacy())
+        Self::precharge_with_geometry(reserve, bytes, BankGeometry::legacy())
     }
 
     // One checked holder formula serves standalone precharge and preparation's
     // map/custody overlap. The latter already counts Self in its inline floor.
-    fn allocation_bytes(geometry: CountsBankGeometry) -> Result<usize> {
+    fn allocation_bytes(geometry: BankGeometry) -> Result<usize> {
         geometry
             .validate()
             .map_err(|_| anyhow::anyhow!("unsupported counter geometry"))?;
@@ -1440,7 +1471,7 @@ impl CounterKeepalive {
     fn precharge_with_geometry(
         reserve: &SemanticResourceReserver,
         bytes: usize,
-        geometry: CountsBankGeometry,
+        geometry: BankGeometry,
     ) -> Result<Arc<Self>> {
         let required = Self::allocation_bytes(geometry)?;
         let positions = geometry.limit() as usize;
@@ -1468,7 +1499,7 @@ pub(super) struct CounterBanks {
     directory: Arc<Mutex<BankDirectory>>,
     pub(super) keepalive: Arc<CounterKeepalive>,
     cpus: usize,
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     backend: super::AttachBackend,
     // Immutable geometry avoids reentering the Directory lock during stage.
     link_staging: Arc<AtomicU64>,
@@ -1553,17 +1584,11 @@ impl<'a> CounterPreparation<'a> {
                 anyhow::bail!("counter-mode-unavailable-on-kernel: {reason}")
             }
         }
-        let geometry = production_geometry(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"))
+        // The Session loads the embedded object for its mode: byte identity
+        // against the embedded bank objects selects the mode (growth geometry
+        // only; legacy has no embedded copy and never occurs in production).
+        let geometry = production_geometry_for(object, env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"))
             .map_err(|_| anyhow::anyhow!("unsupported private counter artifact profile"))?;
-        // The Session loads the embedded object for its mode: the selected
-        // bytes must equal the embedded bank object (growth geometry only;
-        // legacy has no embedded copy and never occurs in production).
-        if !geometry.is_legacy() {
-            ensure!(
-                object == counter_object_for_mode(CounterMode::Counts),
-                "selected counter object does not match the embedded bank object for its mode"
-            );
-        }
         let (retained, transient) = envelope
             .charges()
             .map_err(|_| anyhow::anyhow!("invalid counter reservation"))?;
@@ -1601,7 +1626,7 @@ impl<'a> CounterPreparation<'a> {
             PROGRAMS
                 .iter()
                 .all(|name| parsed.programs.contains_key(*name)),
-            "selected object lacks the exact private Counts bank roots"
+            "selected object lacks the exact private counter bank roots"
         );
         let payload = parsed
             .maps
@@ -1781,7 +1806,7 @@ fn exact_map_metadata(
     .map_err(|_| BankRefusal::Shape)
 }
 
-fn validate_maps(ebpf: &Ebpf, geometry: CountsBankGeometry) -> Result<(), BankRefusal> {
+fn validate_maps(ebpf: &Ebpf, geometry: BankGeometry) -> Result<(), BankRefusal> {
     validate_maps_for(geometry, |name| {
         let data = map_data(ebpf.map(name).ok_or(BankRefusal::Shape)?)?;
         super::read_map_metadata(name, data).map_err(|_| BankRefusal::Shape)
@@ -1792,12 +1817,10 @@ fn validate_maps(ebpf: &Ebpf, geometry: CountsBankGeometry) -> Result<(), BankRe
 fn validate_maps_with(
     metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
 ) -> Result<(), BankRefusal> {
-    validate_maps_for(CountsBankGeometry::legacy(), metadata)
+    validate_maps_for(BankGeometry::legacy(), metadata)
 }
 
-fn profile_maps(
-    geometry: CountsBankGeometry,
-) -> &'static [(&'static str, super::ExactMapMetadata)] {
+fn profile_maps(geometry: BankGeometry) -> &'static [(&'static str, super::ExactMapMetadata)] {
     if geometry.is_legacy() {
         &FORMAT1_MAPS
     } else {
@@ -1806,7 +1829,7 @@ fn profile_maps(
 }
 
 fn validate_maps_for(
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     mut metadata: impl FnMut(&str) -> Result<super::ExactMapMetadata, BankRefusal>,
 ) -> Result<(), BankRefusal> {
     geometry.validate()?;
@@ -1901,11 +1924,11 @@ const FORMAT2_MAPS: [(&str, super::ExactMapMetadata); 9] = [
 fn validate_format1_object_maps<'a>(
     map: impl FnMut(&str) -> Option<&'a aya_obj::Map>,
 ) -> Result<(), BankRefusal> {
-    validate_object_maps(CountsBankGeometry::legacy(), map)
+    validate_object_maps(BankGeometry::legacy(), map)
 }
 
 fn validate_object_maps<'a>(
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     mut map: impl FnMut(&str) -> Option<&'a aya_obj::Map>,
 ) -> Result<(), BankRefusal> {
     geometry.validate()?;
@@ -1936,8 +1959,13 @@ fn validate_object_maps<'a>(
         inner.value_size(),
         inner.max_entries(),
         inner.map_flags(),
-    ) != (6, 4, 24, geometry.cells, 0)
-        || inner.inner().is_some()
+    ) != (
+        6,
+        4,
+        geometry.mode().stats_bytes() as u32,
+        geometry.cells,
+        0,
+    ) || inner.inner().is_some()
     {
         return Err(BankRefusal::Shape);
     }
@@ -1946,11 +1974,7 @@ fn validate_object_maps<'a>(
 
 /// Map-of-maps lookup returns an ID. Borrow the retained outer FD directly;
 /// unlike HashOfMaps::get this does not open another inner FD on each scrape.
-fn outer_id(
-    ebpf: &Ebpf,
-    geometry: CountsBankGeometry,
-    key: u32,
-) -> Result<Option<u32>, BankRefusal> {
+fn outer_id(ebpf: &Ebpf, geometry: BankGeometry, key: u32) -> Result<Option<u32>, BankRefusal> {
     // Pin buffer sizes at this raw-syscall seam even if another crate-private
     // caller has replaced an Ebpf map since the original preparation.
     exact_map(
@@ -1985,7 +2009,7 @@ fn outer_id(
 
 fn observe_route(
     ebpf: &Ebpf,
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     slot: u32,
     expected: CountsBankRoute,
 ) -> Result<Option<bool>, BankRefusal> {
@@ -2011,7 +2035,7 @@ fn observe_route(
 
 fn observe_native_commit(
     ebpf: &Ebpf,
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     transaction: u64,
     expected: CountsBankCommit,
 ) -> CommitObservation {
@@ -2049,7 +2073,7 @@ struct NativeIo<'a> {
     objects: &'a PinnedObjects,
     custody: &'a mut NativeCustody,
     cpus: usize,
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
     reservation: BankReservation,
 }
 
@@ -2148,7 +2172,13 @@ impl BankIo for NativeIo<'_> {
         if self.custody.banks[index].is_some() {
             return Err(BankRefusal::Allocated);
         }
-        let object = aya_obj::Map::new_from_params(6, 4, 24, self.geometry.cells, 0);
+        let object = aya_obj::Map::new_from_params(
+            6,
+            4,
+            self.geometry.mode().stats_bytes() as u32,
+            self.geometry.cells,
+            0,
+        );
         let data =
             MapData::create(object, "p11_counter_bank", None).map_err(|_| BankRefusal::Native)?;
         let info = data.info().map_err(|_| BankRefusal::Native)?;
@@ -2323,7 +2353,7 @@ impl BankIo for NativeIo<'_> {
                     &held.map,
                     MapType::PerCpuArray,
                     4,
-                    24,
+                    self.geometry.mode().stats_bytes() as u32,
                     self.geometry.cells,
                     0,
                 )
@@ -2701,17 +2731,17 @@ pub(crate) enum BankReadStatus {
     Quarantined,
 }
 
-/// The current constructor prepares only the validated native Counts proof.
-/// This is not inferred from a caller's requested mode or a map's name.
+/// The mode comes only from the prepared bank geometry word. It is never
+/// inferred from a caller's requested mode, a map's name, or a value size.
 #[derive(Clone, Copy)]
 struct CounterReaderProfile {
     cpus: usize,
-    geometry: CountsBankGeometry,
+    geometry: BankGeometry,
 }
 
 impl CounterReaderProfile {
     fn mode(&self) -> CounterMode {
-        CounterMode::Counts
+        self.geometry.mode()
     }
     fn logical_slots(&self) -> usize {
         self.geometry.logical_slots()
@@ -2833,6 +2863,9 @@ pub(crate) struct CounterPublishedSnapshot {
 }
 
 impl CounterPublishedSnapshot {
+    pub(crate) fn mode(&self) -> CounterMode {
+        self.profile.mode()
+    }
     pub(crate) fn original_indices(&self) -> &[u32] {
         &self.indices
     }
@@ -3025,8 +3058,15 @@ impl CounterBankView {
                 return Ok(BankReadStatus::Routing);
             }
             if !checked[route.bank as usize] {
-                if exact_map_metadata(&held.map, MapType::PerCpuArray, 4, 24, geometry.cells, 0)
-                    .is_err()
+                if exact_map_metadata(
+                    &held.map,
+                    MapType::PerCpuArray,
+                    4,
+                    geometry.mode().stats_bytes() as u32,
+                    geometry.cells,
+                    0,
+                )
+                .is_err()
                     || map_data(&held.map)?
                         .info()
                         .map_err(|_| BankRefusal::Native)?
@@ -3219,7 +3259,7 @@ pub(crate) mod tests {
             if let Some(snapshot) = self.fd_stage_snapshot.take() {
                 // Replace only the readonly OS query. Consume the same actual
                 // charge calculation NativeIo uses, with this fixture's maps.
-                let geometry = CountsBankGeometry::checked(16, 512)?;
+                let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512)?;
                 let new_banks = (fresh.first / geometry.cells..=(fresh.end - 1) / geometry.cells)
                     .filter(|bank| !self.maps.contains_key(bank))
                     .count();
@@ -3239,7 +3279,7 @@ pub(crate) mod tests {
                 })?;
             }
             if let Some((links, envelope)) = &self.counter_multi_storage {
-                let geometry = CountsBankGeometry::checked(16, 512)?;
+                let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512)?;
                 let new_banks = (fresh.first / geometry.cells..=(fresh.end - 1) / geometry.cells)
                     .filter(|bank| !self.maps.contains_key(bank))
                     .count();
@@ -3513,7 +3553,7 @@ pub(crate) mod tests {
             ),
             (0, 4, 8)
         );
-        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         for (slot, wanted) in [
             (0, (0, 0)),
             (511, (0, 511)),
@@ -3534,7 +3574,7 @@ pub(crate) mod tests {
             (16, 513),
             (u32::MAX, u32::MAX),
         ] {
-            assert!(CountsBankGeometry::checked(banks, cells).is_err());
+            assert!(BankGeometry::checked(CounterMode::Counts, banks, cells).is_err());
         }
         let commit = CountsBankCommit {
             first: 511,
@@ -4563,7 +4603,7 @@ pub(crate) mod tests {
         // At1024 possible CPUs a whole bank needs12,582,912 payload bytes.
         // The one-cell amount is only24,576: metadata and FD headroom are
         // deliberately ample, so forgetting the other511 cells is causal.
-        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         assert_eq!(geometry.bank_payload_bytes(1024), Ok(12_582_912));
         for enough in [false, true] {
             let pool = SemanticResourcePool::reference_limit(128 * 1024 * 1024);
@@ -5014,7 +5054,7 @@ pub(crate) mod tests {
         // The actual Session gate must remain closed outside the transaction,
         // and a refused overlapping admission must not clear the first guard.
         let banks = CounterBanks {
-            geometry: CountsBankGeometry::legacy(),
+            geometry: BankGeometry::legacy(),
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
@@ -5474,7 +5514,7 @@ pub(crate) mod tests {
 
     fn reader_banks(pool: &SemanticResourcePool) -> CounterBanks {
         CounterBanks {
-            geometry: CountsBankGeometry::legacy(),
+            geometry: BankGeometry::legacy(),
             directory: Arc::new(Mutex::new(BankDirectory::default())),
             keepalive: CounterKeepalive::precharge(&pool.reserver(), 4096).unwrap(),
             cpus: 2,
@@ -5854,7 +5894,7 @@ pub(crate) mod tests {
                 );
                 assert_eq!(
                     stage_requirements(
-                        CountsBankGeometry::checked(16, 512).unwrap(),
+                        BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
                         &history.slots,
                         BankExtent {
                             first: 0,
@@ -5904,7 +5944,7 @@ pub(crate) mod tests {
                 selected
             })
             .collect();
-        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         let fresh = BankExtent {
             first: 512,
             end: 513,
@@ -6018,7 +6058,7 @@ pub(crate) mod tests {
             let keepalive = CounterKeepalive::precharge_with_geometry(
                 &pool.reserver(),
                 16 * 1024 * 1024,
-                CountsBankGeometry::checked(16, 512).unwrap(),
+                BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
             )
             .unwrap();
             let policy = crate::plan::AdmissionPolicy::counters(
@@ -6195,7 +6235,7 @@ pub(crate) mod tests {
             let (_fixture, pins, first, second, _) = growth_provider_fixture();
             let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
             let initial = pool.snapshot().charged_bytes;
-            let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+            let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
             let keepalive = CounterKeepalive::precharge_with_geometry(
                 &pool.reserver(),
                 16 * 1024 * 1024,
@@ -6442,7 +6482,7 @@ pub(crate) mod tests {
         assert!(selected.fallback.is_none());
         for backend in [AttachBackend::Singles, AttachBackend::Multi] {
             let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
-            let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+            let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
             let banks = CounterBanks {
                 directory: Arc::new(Mutex::new(BankDirectory::counts_growth_v2())),
                 keepalive: CounterKeepalive::precharge_with_geometry(
@@ -6519,7 +6559,7 @@ pub(crate) mod tests {
     fn format2_charge_holders_cover_8192_nonempty_extents() {
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let charged = pool.snapshot().charged_bytes;
-        let geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         assert!(
             CounterKeepalive::precharge_with_geometry(&pool.reserver(), 32 * 1024, geometry)
                 .is_err(),
@@ -6561,7 +6601,7 @@ pub(crate) mod tests {
         let owner = CounterKeepalive::precharge_with_geometry(
             &pool.reserver(),
             16 * 1024 * 1024,
-            CountsBankGeometry::checked(16, 512).unwrap(),
+            BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
         )
         .unwrap();
         let policy = crate::plan::AdmissionPolicy::counters(
@@ -7539,7 +7579,7 @@ pub(crate) mod tests {
     fn format2_link_stage_requires_exact_extent() {
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);
         let mut banks = reader_banks(&pool);
-        banks.geometry = CountsBankGeometry::checked(16, 512).unwrap();
+        banks.geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         *banks.directory.lock().unwrap() = BankDirectory::counts_growth_v2();
         let slots = vec![slot(511, 1), slot(512, 2)];
         // The existing atomic is an exact (first,end) guard, not a slot mask.

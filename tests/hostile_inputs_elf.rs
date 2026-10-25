@@ -9,6 +9,7 @@ use p11scope_manifest::elf::{
     ElfAbi, ElfSnapshot, classified_object, entry_file_offset, exports_matching, read_export_facts,
     read_export_facts_bounded, symbol_file_offset,
 };
+use p11scope_manifest::identity::inspect_file_with_reader_exporting;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -462,7 +463,10 @@ fn seeded_byte_mutations_never_panic_or_over_attribute() {
         }
         // The classifier is intentionally lenient (header basics
         // only); the snapshot is the strict oracle, so the verdict
-        // split is counted at the snapshot level.
+        // split is counted at the snapshot level. A snapshot segment
+        // refusal is retained so the inspect path below must refuse
+        // byte-identically.
+        let mut snapshot_segment_err: Option<String> = None;
         match classified_object(&bytes) {
             Ok(_) => match snapshot_of(&dir, &bytes) {
                 Ok(snapshot) => {
@@ -471,7 +475,12 @@ fn seeded_byte_mutations_never_panic_or_over_attribute() {
                 }
                 // The snapshot's own range checks refuse where the
                 // classifier passed; both are bounded refusals.
-                Err(_) => refused += 1,
+                Err(error) => {
+                    if error.starts_with("segment ") {
+                        snapshot_segment_err = Some(error);
+                    }
+                    refused += 1;
+                }
             },
             Err(_) => refused += 1,
         }
@@ -492,6 +501,46 @@ fn seeded_byte_mutations_never_panic_or_over_attribute() {
                 assert!(
                     *offset < bytes.len() as u64,
                     "mutation {iteration} attributed offset {offset} past EOF {}",
+                    bytes.len()
+                );
+            }
+        }
+        // The inspect path shares the same segment-range validation, so it
+        // must refuse byte-identically on segment-corrupt images and yield
+        // only in-range facts otherwise. Interpreter-divergent mutants are
+        // out of scope here for the same reason as above.
+        let file = open_of(&dir, &bytes);
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            std::os::unix::fs::FileExt::read_at,
+            &[ANSWER],
+        );
+        if let Some(expected) = snapshot_segment_err {
+            match inspected {
+                Err(actual) => assert_eq!(
+                    actual, expected,
+                    "mutation {iteration} inspect refusal must match the snapshot oracle"
+                ),
+                Ok(answered) => panic!(
+                    "mutation {iteration} snapshot refused {expected:?} but inspect answered: \
+                     exports {:?}, ranges {:?} (len {})",
+                    answered.exports,
+                    answered.executable_ranges,
+                    bytes.len(),
+                ),
+            }
+        } else if let Ok(answered) = inspected {
+            for (_, offset) in &answered.exports {
+                assert!(
+                    *offset < bytes.len() as u64,
+                    "mutation {iteration} inspect export offset {offset} past EOF {}",
+                    bytes.len()
+                );
+            }
+            for (start, end) in &answered.executable_ranges {
+                assert!(
+                    *end <= bytes.len() as u64,
+                    "mutation {iteration} inspect range {start}..{end} past EOF {}",
                     bytes.len()
                 );
             }

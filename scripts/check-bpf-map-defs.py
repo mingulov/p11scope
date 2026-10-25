@@ -395,6 +395,12 @@ OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
     "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell",
 })
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
+# H8-D post-attach birth marker (Detailed only): the exec half publishes
+# READY after closure, the gap half dirties on refused calls. Counter and
+# inventory objects carry neither these globals nor the control map.
+REQUIRED_GLOBAL_MARKER_HELPERS = frozenset({
+    "p11_instance_exec_birth", "p11_instance_scope_gap",
+})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
     "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove", "p11_owner_discovery_get",
@@ -669,6 +675,47 @@ def validate_exec_helpers(elf, inventory=False):
             calls.add(imm)
     if calls != {113, 158}:
         raise RuntimeError("EXEC predicate requires both checked kernel helper boundaries")
+
+
+def validate_marker_helpers(elf, inventory=False):
+    """Keep the H8-D birth marker behind its two Detailed-only globals.
+
+    Generic fixtures carry no marker and skip this check, the same way
+    owner/exec validators skip objects that lack their subsystem. A
+    Detailed object that defines one global must define both, as GLOBAL
+    DEFAULT FUNCs in .text whose bodies only look up maps (1), fetch
+    task storage (156) and read the current task (158): the marker paths
+    read no user memory, argument, path or name. Inventory objects must
+    not define either global.
+    """
+    selected = [symbol for symbol in elf.symbols
+                if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS]
+    if not selected:
+        return
+    if inventory:
+        raise RuntimeError("Inventory contains birth marker globals")
+    if {symbol[0] for symbol in selected} != REQUIRED_GLOBAL_MARKER_HELPERS:
+        raise RuntimeError("birth marker requires the complete unique set of globals")
+    text = elf.indices.get(".text")
+    for name, info, other, section, value, size in selected:
+        if info != 0x12 or other != 0 or section != text:
+            raise RuntimeError(f"birth marker {name} must be GLOBAL DEFAULT FUNC in .text")
+        if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+            raise RuntimeError(f"birth marker {name} has invalid/empty body")
+    for name, _, _, _, value, size in selected:
+        body = checked_slice(elf.sections[".text"][1], value, size, "marker body")
+        helpers = set()
+        for pos in range(0, len(body), 8):
+            op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+            # A BPF-to-BPF pseudo-call (source register 1) is a local
+            # leaf call, not a kernel helper boundary.
+            if op == 0x85 and reg >> 4 == 0:
+                helpers.add(imm)
+        if helpers != {1, 156, 158}:
+            raise RuntimeError(
+                f"birth marker {name} permits only map lookup, task storage and "
+                f"current-task helpers, saw {sorted(helpers)}"
+            )
 
 
 def validate_diagnostic_helper_linkage(elf):
@@ -1745,6 +1792,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_object_capture_globals(elf, inventory)
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
+    validate_marker_helpers(elf, inventory)
     if not inventory:
         validate_selected_leaf(elf)
         validate_root_helpers(elf)
@@ -1761,7 +1809,8 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     if global_data:
         raise RuntimeError(f"object carries global-data sections {global_data}")
     image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
-                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
+                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+                     | REQUIRED_GLOBAL_MARKER_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                           | REQUIRED_GLOBAL_EXEC_HELPERS
@@ -1808,6 +1857,7 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
                     | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
                     | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+                    | REQUIRED_GLOBAL_MARKER_HELPERS
                     | OBJECT_CAPTURE_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
@@ -1893,6 +1943,9 @@ SAFE_MAPS = {
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
+        # H8-D post-attach birth marker: Detailed-only admission control
+        # row {spent, failed}, frozen before links attach.
+        "JOURNAL_MARKER_CTL": (2, 4, 16, 1),
     }.items()
 }
 UNSAFE_MAPS = SAFE_MAPS | {
@@ -1961,6 +2014,7 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
     "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
+    "JOURNAL_MARKER_CTL",
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
     "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
     "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
@@ -2043,7 +2097,8 @@ def validate_inventory(variant, maps, programs, symbols):
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
+                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+                        | REQUIRED_GLOBAL_MARKER_HELPERS)
     required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
     if callers:
         required_helpers |= {"p11_link_current_identity"}
@@ -2086,6 +2141,8 @@ def self_test():
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
+    assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1)
+    assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
     assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
     assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
@@ -2093,15 +2150,16 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 42
-    assert len(UNSAFE_MAPS) == 44
-    assert len(WIDE_MAPS) == 42
-    assert len(WIDE_UNSAFE_MAPS) == 44
+    assert len(SAFE_MAPS) == 43
+    assert len(UNSAFE_MAPS) == 45
+    assert len(WIDE_MAPS) == 43
+    assert len(WIDE_UNSAFE_MAPS) == 45
     assert len(SAFE_PROGRAMS) == 20
     assert len(UNSAFE_PROGRAMS) == 25
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
+            | REQUIRED_GLOBAL_MARKER_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -2115,7 +2173,8 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
+        | REQUIRED_GLOBAL_MARKER_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -2124,7 +2183,8 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
+                         | REQUIRED_GLOBAL_MARKER_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):

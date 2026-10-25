@@ -22941,17 +22941,63 @@ impl Engine {
         }
     }
 
-    /// Selection (§1.6): one key per credit, retirements first, then
-    /// rejected keys, through the after-cursors. An empty selection
-    /// finishes at Done with no copy and no publish; otherwise the sets
-    /// seal into a `ConservativePinSelection` (the Engine sets stay the
-    /// owners). A refusal keeps the takes for Reclaim.
+    /// Selection (§1.6): count through the after-cursors, reserve,
+    /// then insert — one key per credit, retirements first, then rejected
+    /// keys. An empty selection finishes at Done with no copy and no
+    /// publish; otherwise the sets seal into a `ConservativePinSelection`
+    /// (the Engine sets stay the owners). A refused reservation inserts
+    /// nothing; a seal refusal keeps the takes for Reclaim.
     fn step_graph_selection(
         &mut self,
         graph: &mut CollectedGraph,
         reserve: &SemanticResourceReserver,
     ) -> GraphService {
         use std::ops::Bound::{Excluded, Unbounded};
+        if graph.sel_storage.is_none() {
+            // Count pass: walk both sets without inserting.
+            if let Some(next) = match graph.sel_after_view {
+                None => self.pending_retirements.first().copied(),
+                Some(after) => self
+                    .pending_retirements
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied(),
+            } {
+                graph.sel_after_view = Some(next);
+                graph.sel_count.0 = graph.sel_count.0.saturating_add(1);
+                return Self::graph_idle(true);
+            }
+            if let Some(next) = match graph.sel_after_key {
+                None => self.pending_rejected_keys.first().copied(),
+                Some(after) => self
+                    .pending_rejected_keys
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied(),
+            } {
+                graph.sel_after_key = Some(next);
+                graph.sel_count.1 = graph.sel_count.1.saturating_add(1);
+                return Self::graph_idle(true);
+            }
+            if graph.sel_count == (0, 0) {
+                graph.phase = GraphPhase::Done;
+                return Self::graph_idle(true);
+            }
+            let storage = ConservativePinSelection::storage_bound(
+                graph.sel_count.0,
+                graph.sel_count.1,
+            )
+            .and_then(|bytes| reserve.reserve(bytes).ok());
+            let Some(storage) = storage else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            graph.sel_storage = Some(storage);
+            graph.sel_after_view = None;
+            graph.sel_after_key = None;
+            return Self::graph_idle(true);
+        }
+        // Insert pass: the reservation precedes every insert.
         if let Some(next) = match graph.sel_after_view {
             None => self.pending_retirements.first().copied(),
             Some(after) => self
@@ -22962,7 +23008,6 @@ impl Engine {
         } {
             graph.sel_after_view = Some(next);
             graph.sel_retired.insert(next);
-            graph.sel_count.0 = graph.sel_retired.len();
             return Self::graph_idle(true);
         }
         if let Some(next) = match graph.sel_after_key {
@@ -22975,22 +23020,9 @@ impl Engine {
         } {
             graph.sel_after_key = Some(next);
             graph.sel_rejected.insert(next);
-            graph.sel_count.1 = graph.sel_rejected.len();
             return Self::graph_idle(true);
         }
-        if graph.sel_retired.is_empty() && graph.sel_rejected.is_empty() {
-            graph.phase = GraphPhase::Done;
-            return Self::graph_idle(true);
-        }
-        let storage = ConservativePinSelection::storage_bound(
-            graph.sel_retired.len(),
-            graph.sel_rejected.len(),
-        )
-        .and_then(|bytes| reserve.reserve(bytes).ok());
-        let Some(storage) = storage else {
-            self.refuse_graph_before_native(graph);
-            return Self::graph_idle(true);
-        };
+        let storage = graph.sel_storage.take().expect("reserved above");
         let retired = std::mem::take(&mut graph.sel_retired);
         let rejected = std::mem::take(&mut graph.sel_rejected);
         match ConservativePinSelection::from_reserved_originals(retired, rejected, storage, reserve)

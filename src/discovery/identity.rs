@@ -359,6 +359,8 @@ fn on_overlayfs(fd: RawFd) -> Result<bool, String> {
         ));
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     Ok(unsafe {
         buf.assume_init().f_type as u64 == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC
     })
@@ -398,6 +400,7 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`. `f_type` is
     // signed on some ABIs; the magic numbers are 32-bit values.
+    #[allow(clippy::unnecessary_cast)]
     let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
     Ok(nonunique_inode_kind(f_type))
 }
@@ -676,7 +679,9 @@ fn map_files_entry_file(entry: &str) -> std::io::Result<MappedFile> {
         (unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) } == 0).then(|| {
             // SAFETY: initialized by the successful `statfs`. `f_type` is
             // signed on some ABIs; the magic numbers are 32-bit values.
-            (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff
+            #[allow(clippy::unnecessary_cast)]
+            let magic = (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff;
+            magic
         })
     });
     Ok(MappedFile { identity, fs_magic })
@@ -9274,6 +9279,8 @@ mod tests {
                     0
                 );
                 // SAFETY: initialized by the successful `fstatfs`.
+                // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+                #[allow(clippy::unnecessary_cast)]
                 let magic = (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff;
                 assert_eq!(self_mapped_file(&held).unwrap().fs_magic, Some(magic));
             }

@@ -1341,6 +1341,11 @@ fn create_subvolume(parent: &std::path::Path, name: &str) {
         fd: i64,
         name: [u8; 4088],
     }
+    // musl `ioctl` takes a c_int request, glibc a c_ulong one; the
+    // number fits both.
+    #[cfg(target_env = "musl")]
+    const BTRFS_IOC_SUBVOL_CREATE: libc::c_int = 0x5000_940e;
+    #[cfg(not(target_env = "musl"))]
     const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
     let dir = std::fs::File::open(parent).unwrap();
     let mut args = VolArgs {
@@ -2009,6 +2014,8 @@ fn privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file(
         0
     );
     // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
     create_subvolume(parent, "s");
@@ -3163,6 +3170,8 @@ fn privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge() {
         0
     );
     // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
     create_subvolume(parent, "s");
@@ -3342,6 +3351,8 @@ fn privileged_d4_btrfs_subvolume_collision_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     create_subvolume(parent, "a");
@@ -3584,6 +3595,8 @@ fn privileged_d4_btrfs_same_line_remap_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     create_subvolume(parent, "a");
@@ -3822,6 +3835,8 @@ fn privileged_d4_btrfs_deleted_mapping_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     let path = dir.path().join("libdeleted.so");
@@ -4073,6 +4088,8 @@ fn privileged_d4_btrfs_hardlink_alias_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     let original_path = dir.path().join("liboriginal.so");
@@ -4301,6 +4318,8 @@ fn privileged_d4_btrfs_bind_alias_backend_parity() {
         0
     );
     // SAFETY: initialized by successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     let original_path = dir.path().join("liboriginal.so");

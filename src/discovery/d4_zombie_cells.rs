@@ -758,6 +758,8 @@ fn privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     create_subvolume(parent, "a");

@@ -196,6 +196,8 @@ fn statfs_magic(path: &str) -> Result<u64, String> {
         ));
     }
     // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     Ok(unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff)
 }
 

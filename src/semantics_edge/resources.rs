@@ -327,7 +327,8 @@ impl ResourceLease {
 
 impl Drop for ResourceLease {
     fn drop(&mut self) {
-        #[cfg(test)]
+        // The refund observer serves the gnu-only allocation tests alone.
+        #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
         REFUND_OBSERVER.with(|observer| {
             if let Some(observe) = observer.get() {
                 observe(self.bytes);
@@ -344,12 +345,12 @@ impl Drop for ResourceLease {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
 thread_local! {
     static REFUND_OBSERVER: std::cell::Cell<Option<fn(usize)>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
 pub(super) fn observe_refunds(run: impl FnOnce(), observe: fn(usize)) {
     struct Guard;
     impl Drop for Guard {

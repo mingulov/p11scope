@@ -297,11 +297,17 @@ def _ledger_keys(rows):
 
 
 def compare_abi(rows, counts):
-    """Join ledger rows to counts rows. Both must have been validated."""
+    """Join ledger rows to counts rows. Both must have been validated.
+
+    The comparison needs populations on both sides: at least one ledger
+    call/entry row and at least one counts row, else it refuses."""
     ledger = _ledger_keys(rows)
     observed = {}
     for row in counts:
         observed[(row["cell"], row["entry"])] = row
+    # An empty counts side already refuses below ("counts missing for
+    # cell ..."), so only the empty ledger side needs its own floor.
+    _require(ledger, "comparison without ledger populations")
     for key in sorted(ledger):
         _require(len(ledger[key]["fns"]) == 1,
                  f"fn disagrees within cell {key[0]} entry {key[1]}")

@@ -426,7 +426,9 @@ static int set_cpu(int cpu) {
 }
 
 static int run_migration(void) {
-    if (set_cpu(0) != 0) {
+    /* A cpuset without CPU 0 fails like a missing CPU 1 below: tolerate
+     * EINVAL and record the CPUs the calls actually ran on. */
+    if (set_cpu(0) != 0 && errno != EINVAL) {
         return -1;
     }
     emit_call(5, "migration", "cond-migration");
@@ -783,8 +785,11 @@ int main(int argc, char **argv) {
         if (symbol != table->functions[i]) {
             /* Slot 68 shares its name with the stub-family marker: the
              * production provider binds a function there, test-only stubs
-             * bind the marker variable. A mismatch at 68 alone skips the
-             * slot for naming; anything else is refused. */
+             * bind the marker variable. A mismatch at 68 alone skips only
+             * the immediate per-slot refusal below; the aggregate gate
+             * still refuses unless all 104 names resolve (or none do, for
+             * test-only stubs), so a 103-match provider with the marker
+             * at 68 is refused as a mixed-identity build. */
             if (i == 68) {
                 continue;
             }

@@ -416,6 +416,362 @@ fn counter_bank_timing_objects_have_exact_maps_and_clocks() {
     }
 }
 
+fn counter_objects_enabled() -> bool {
+    match env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") {
+        "0" => false,
+        "1" => true,
+        other => panic!("invalid counter objects selection {other:?}"),
+    }
+}
+
+fn counter_object_bytes(token: &str) -> &'static [u8] {
+    match token {
+        "counts-bank-growth-v2" => p11scope::EBPF_COUNTER_COUNTS_OBJECT,
+        "timestamps-bank-growth-v2" => p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+        "latency-bank-growth-v2" => p11scope::EBPF_COUNTER_LATENCY_OBJECT,
+        other => panic!("unknown counter bank token {other:?}"),
+    }
+}
+
+fn write_counter_object(token: &str, directory: &Path) -> PathBuf {
+    let path = directory.join(format!("p11scope-ebpf-{token}"));
+    std::fs::write(&path, counter_object_bytes(token)).expect("write embedded counter object");
+    path
+}
+
+fn counter_bank_mode_check_mutants(mode: &str, profile: &str, path: &Path) -> std::process::Output {
+    Command::new("python3")
+        .args([
+            "-I",
+            "scripts/check-counter-object.py",
+            "--mode",
+            mode,
+            "--profile",
+            profile,
+            "--self-test-mutants",
+        ])
+        .arg(path)
+        .output()
+        .expect("run bank mutants checker")
+}
+
+const COUNTER_BANK_TOKENS: [&str; 3] = [
+    "counts-bank-growth-v2",
+    "timestamps-bank-growth-v2",
+    "latency-bank-growth-v2",
+];
+
+const COUNTER_BANK_MODES: [(&str, &str, u64, u64); 3] = [
+    (
+        "counts",
+        "counts-bank-growth-v2",
+        24,
+        0x0200_0018_0010_0200,
+    ),
+    (
+        "timestamps",
+        "timestamps-bank-growth-v2",
+        40,
+        0x0200_0028_0010_0200,
+    ),
+    (
+        "latency",
+        "latency-bank-growth-v2",
+        296,
+        0x0200_0128_0010_0200,
+    ),
+];
+
+/// The ordinary FULL build embeds all three bank objects. `=0`, SMALL and
+/// WIDE omit them (empty outputs); anything else fails the build before work.
+#[test]
+fn counter_objects_switch_matches_emitted_contract() {
+    let requested = match option_env!("P11SCOPE_COUNTER_OBJECTS") {
+        None | Some("1") => true,
+        Some("0") => false,
+        other => panic!("malformed counter objects request {other:?}"),
+    };
+    let small = matches!(option_env!("P11SCOPE_SMALL_RING"), Some("1" | "true"))
+        || matches!(
+            option_env!("P11SCOPE_SMALL_STATE_MAPS"),
+            Some("1" | "true")
+        )
+        || matches!(
+            option_env!("P11SCOPE_SMALL_DISCOVERY_RING"),
+            Some("1" | "true")
+        );
+    let wide = cfg!(feature = "wide-detailed-2112");
+    // An explicit `=1` with SMALL/WIDE never builds (build.rs panics); only
+    // unset omits silently, and `=0` omits explicitly.
+    if small || wide {
+        assert_ne!(
+            option_env!("P11SCOPE_COUNTER_OBJECTS"),
+            Some("1"),
+            "explicit counter objects with SMALL/WIDE must fail the build"
+        );
+    }
+    let enabled = requested && !small && !wide;
+    assert_eq!(counter_objects_enabled(), enabled);
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        if enabled {
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        } else {
+            ""
+        },
+        "the emitted set must follow this compilation, not stale files"
+    );
+    if enabled {
+        let mut bodies = Vec::new();
+        for token in COUNTER_BANK_TOKENS {
+            let body = counter_object_bytes(token);
+            assert!(!body.is_empty(), "{token} embedded object is empty");
+            assert_ne!(
+                body,
+                p11scope::EBPF_OBJECT,
+                "{token} selected Detailed bytes"
+            );
+            assert!(
+                !bodies.contains(&body),
+                "two counter modes share their object"
+            );
+            bodies.push(body);
+        }
+    } else {
+        for token in COUNTER_BANK_TOKENS {
+            assert!(
+                counter_object_bytes(token).is_empty(),
+                "{token} must be omitted when disabled"
+            );
+        }
+        // Disabled builds refuse each mode at the checker too: Detailed is
+        // not a bank object under any profile.
+        let directory = tempfile::tempdir().unwrap();
+        let ordinary = embedded_object(directory.path());
+        for (mode, profile, _, _) in COUNTER_BANK_MODES {
+            let result = counter_bank_mode_check(mode, profile, &ordinary);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "Detailed passed as {mode}"
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("counter object refused:")
+            );
+        }
+    }
+}
+
+/// Every embedded bank object carries the exact format2 maps, the exact
+/// config word, and the mode's clock/histogram reachability. The checker's
+/// acceptance is the proof for access bounds (counts: no STATS or inner
+/// access at offset >= 24; timestamps: CAS writes at 24/32, none >= 40;
+/// latency: buckets only from the return root), both health dispositions,
+/// and the absence of semantic/event helpers or maps; the report fields
+/// below pin the shape that acceptance was computed on.
+#[test]
+fn counter_bank_modes_have_exact_maps_clock_and_histogram_reachability() {
+    if !counter_objects_enabled() {
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        for token in COUNTER_BANK_TOKENS {
+            assert!(
+                counter_object_bytes(token).is_empty(),
+                "{token} must be omitted when disabled"
+            );
+        }
+        return;
+    }
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    for (mode, profile, value_bytes, configuration) in COUNTER_BANK_MODES {
+        let path = write_counter_object(profile, directory.path());
+        let output = counter_bank_mode_check(mode, profile, &path);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["schema"], "p11scope-counter-bank-object/v2",
+            "{mode}"
+        );
+        assert_eq!(report["configuration"], configuration, "{mode}");
+        assert_eq!(report["native_owner_slot_bound"], 8_192, "{mode}");
+        for (name, kind, key, value, entries, flags) in [
+            ("STATS", 6, 4, 24, 512, 0),
+            ("COUNTER_BANKS", 13, 4, 4, 16, 128),
+            ("COUNTER_BANK_META", 1, 4, 32, 8_192, 128),
+            ("COUNTER_BANK_COMMIT", 1, 8, 16, 8_192, 128),
+            ("COUNTER_BANK_FAULT", 6, 4, 8, 1, 0),
+            ("COUNTER_HEALTH", 6, 4, 8, 2, 0),
+            ("START", 1, 16, 288, 16_384, 0),
+            ("RV_COUNTS", 5, 16, 8, 65_536, 0),
+            ("SLOT_FILE", 2, 4, 4, 8_192, 128),
+        ] {
+            for (field, expected) in [
+                ("type", kind),
+                ("key_size", key),
+                ("value_size", value),
+                ("max_entries", entries),
+                ("flags", flags),
+            ] {
+                assert_eq!(
+                    report["maps"][name][field], expected,
+                    "{mode} {name}.{field}"
+                );
+            }
+        }
+        assert_eq!(report["inner_template"]["type"], 6, "{mode}");
+        assert_eq!(report["inner_template"]["key_size"], 4, "{mode}");
+        assert_eq!(
+            report["inner_template"]["value_size"], value_bytes,
+            "{mode}"
+        );
+        assert_eq!(report["inner_template"]["max_entries"], 512, "{mode}");
+        assert_eq!(report["inner_template"]["flags"], 0, "{mode}");
+        assert_eq!(report["ordinary_counter_profile"], "refused", "{mode}");
+        for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+            assert!(
+                report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512,
+                "{mode} {root}"
+            );
+            if mode == "counts" {
+                assert_eq!(
+                    report["roots"][root]["clocks"], 0,
+                    "{mode} {root} must not read the clock"
+                );
+            } else {
+                assert!(
+                    report["roots"][root]["clocks"].as_u64().unwrap() >= 1,
+                    "{mode} {root} must read the clock"
+                );
+            }
+            assert_eq!(
+                report["roots"][root]["semantic_or_event_work"], false,
+                "{mode} {root}"
+            );
+        }
+        let controls = report["controls"].as_object().unwrap();
+        assert!(!controls.is_empty(), "{mode}");
+        for (name, verdict) in controls {
+            assert_eq!(verdict, "accepted", "{mode} {name}");
+        }
+    }
+    // The three configuration words are pairwise distinct, so every
+    // cross-profile check below is also a wrong-config control.
+    assert_ne!(
+        COUNTER_BANK_MODES[0].3, COUNTER_BANK_MODES[1].3,
+        "counts and timestamps configurations must differ"
+    );
+    assert_ne!(
+        COUNTER_BANK_MODES[0].3, COUNTER_BANK_MODES[2].3,
+        "counts and latency configurations must differ"
+    );
+    assert_ne!(
+        COUNTER_BANK_MODES[1].3, COUNTER_BANK_MODES[2].3,
+        "timestamps and latency configurations must differ"
+    );
+}
+
+/// Causal mutants for the embedded bank objects: the counts self-test
+/// mutants (including an injected clock and a missing START removal) plus
+/// every swapped mode token (including a 40-byte template under the counts
+/// token, histogram bytes as timestamps, and wrong configs) refuse with a
+/// named cause.
+#[test]
+fn counter_bank_mode_mutations_are_causally_rejected() {
+    if !counter_objects_enabled() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_counter_object("counts-bank-growth-v2", directory.path());
+    let output = counter_bank_mode_check_mutants("counts", "counts-bank-growth-v2", &path);
+    assert!(
+        output.status.success(),
+        "counts mutants: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mutants = report["mutants"].as_object().unwrap();
+    for name in [
+        "inner_value_width",
+        "inner_cell_count",
+        "outer_bank_count",
+        "outer_type",
+        "route_value_width",
+        "route_max_entries",
+        "commit_max_entries",
+        "rv_max_entries",
+        "slot_file_max_entries",
+        "slot_file_flags",
+        "native_owner_slot_bound",
+        "missing_native_owner_slot_bound",
+        "legacy_native_owner_slot_bound",
+        "logical_index",
+        "inner_index",
+        "bank_global_linkage",
+        "bank_global_abi",
+        "commit_gate",
+        "commit_first",
+        "commit_end",
+        "route_first",
+        "route_end",
+        "route_bank",
+        "route_cell",
+        "route_inner_id_zero",
+        "route_reserved",
+        "configuration",
+        "configuration_version",
+        "transaction_width",
+        "optional_start_get",
+        "required_start_remove",
+        "missing_start_get",
+        "missing_start_remove",
+        "route_fault",
+        "legacy_stats_write",
+        "endpoint_clock",
+        "semantic_helper",
+        "unknown_call",
+    ] {
+        assert_eq!(
+            mutants.get(name),
+            Some(&serde_json::json!("refused")),
+            "{name}"
+        );
+    }
+    // Every swapped mode token refuses with a named cause: a 40-byte
+    // template under the counts token, histogram bytes as timestamps, a
+    // missing clock as timing, and wrong configs in every direction.
+    for (mode, profile, _, _) in COUNTER_BANK_MODES {
+        let path = write_counter_object(profile, directory.path());
+        for (wrong_mode, wrong_profile, _, _) in COUNTER_BANK_MODES {
+            if wrong_profile == profile {
+                continue;
+            }
+            let wrong = counter_bank_mode_check(wrong_mode, wrong_profile, &path);
+            assert_eq!(
+                wrong.status.code(),
+                Some(2),
+                "{mode} accepted as {wrong_mode}"
+            );
+            let stderr = String::from_utf8_lossy(&wrong.stderr);
+            assert!(
+                stderr.contains("counter object refused:"),
+                "{mode} refused without a cause as {wrong_mode}"
+            );
+            let cause = stderr.split("counter object refused:").nth(1).unwrap_or("");
+            assert!(
+                !cause.trim().is_empty(),
+                "{mode} refusal has an empty cause as {wrong_mode}"
+            );
+        }
+    }
+}
+
 /// Creates owned anonymous maps and loads both proof and exec/exit roots. Aya may run
 /// feature probes; no attachment, commit publication or workload runs here.
 #[test]

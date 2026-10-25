@@ -6934,6 +6934,77 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn counter_build_gate_refuses_disabled_and_wide() {
+        for disabled in ["0", "", "2", "yes"] {
+            let refusal = super::check_counter_build(disabled, "", false).unwrap_err();
+            assert!(
+                refusal.contains("counter-mode-unavailable-in-build"),
+                "{disabled:?}: {refusal}"
+            );
+        }
+        let wide = super::check_counter_build(
+            "1",
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            wide.contains("counter-mode-unavailable-in-build"),
+            "wide: {wide}"
+        );
+        assert!(
+            super::check_counter_build(
+                "1",
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn counter_preparation_refuses_when_objects_disabled() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1" {
+            assert_eq!(
+                env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+            );
+            return;
+        }
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let envelope = BankReservation {
+            retained_bytes: 1024 * 1024,
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 64 * 1024,
+            file_descriptors: 1024,
+        };
+        // The build gate refuses before the kernel probe: even a kernel that
+        // would allow counters gets the build token, and a kernel refusal
+        // never masks it (deterministic checks run first).
+        for verdict in [
+            BpfLoopVerdict::Available,
+            BpfLoopVerdict::Unavailable("needs Linux 5.17+".into()),
+        ] {
+            let Err(refusal) = CounterPreparation::new_with_backend_and_probe(
+                b"not an object",
+                envelope,
+                &pool.reserver(),
+                AttachBackend::Singles,
+                || verdict.clone(),
+            ) else {
+                panic!("disabled build must refuse preparation");
+            };
+            let message = format!("{refusal:#}");
+            assert!(
+                message.contains("counter-mode-unavailable-in-build"),
+                "{message}"
+            );
+        }
+    }
+
     /// Loads every bank mode object: sixteen per-mode inner maps are staged
     /// into the outer map, then the two bank roots and the two lifecycle
     /// roots load against them. No attachment, commit publication or

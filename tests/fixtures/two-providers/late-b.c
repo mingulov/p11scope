@@ -21,8 +21,12 @@
  * Each burst iteration ledgers six real calls: two C_GetSlotList steps,
  * C_GetTokenInfo, C_OpenSession (public read-only), C_GetSessionInfo and
  * C_CloseSession. Setup calls (Initialize, token discovery, Finalize) are
- * not ledgered. The ledger carries feed labels ("A"/"B"), a global
- * contiguous seq, two ready rows (B stamped at its late load), and one cut
+ * not ledgered. Part B live comparison accounts for the unledgered B
+ * setup calls, which execute after the GO gate and are visible to any
+ * observer, by starting the comparison window after the B ready row and
+ * comparing per function label. The ledger carries feed labels ("A"/"B"),
+ * a global contiguous seq, two ready rows (B stamped at its late load),
+ * and one cut
  * row naming the last pre-cut B seq. Exit 0 when every ledgered call
  * returned CKR_OK, 1 when the ledger is complete but some call did not, 2
  * on usage/setup/refusal failure. Providers whose function-list major
@@ -531,8 +535,10 @@ int main(int argc, char **argv) {
     }
     int gated = argc == 6;
     if (gated && !ledger.failed) {
+        /* Poll the stop flag: pause() would lose a signal that arrives
+         * between the flag test and the sleep. */
         while (!stop) {
-            pause();
+            usleep(10000);
         }
     }
     unload_provider(&prov_b);

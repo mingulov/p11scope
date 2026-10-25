@@ -158,13 +158,15 @@ establish hosted online/network qualification, which still needs real CI
 evidence.
 
 Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
-`release_preview` selected). The job rebuilds the musl observer, builds the
-observer/holder container images (with hadolint and kubeconform checks over
-`deploy/`), runs the official builder receipt, and assembles the notices,
-source export and public candidate. The `release-preview-public-assets`
-artifact has 30-day retention. The separately labeled container SBOM
-(`sbom-observer-container-preview`) describes the preview container image,
-not the official release bytes. Keep the local builder receipt while packaging,
+`release_preview` selected). The job rebuilds the FULL and P0 musl observers,
+builds the observer/holder container images (the observer image holds the FULL
+binary; hadolint and kubeconform checks cover `deploy/`), runs the official
+builder receipt for each capture mode, and assembles the notices, source export
+and one public candidate per mode. The `release-preview-public-assets` and
+`release-preview-public-assets-p0` artifacts have 30-day retention. The
+separately labeled container SBOM (`sbom-observer-container-preview`) describes
+the preview container image, not the official release bytes. Keep the local
+builder receipt while packaging,
 verification or active debugging needs it; this does not require a permanent
 private archive. The full hosted receipt remains on the runner only during
 verification. Actions logs contain a small status, source identity, tree and

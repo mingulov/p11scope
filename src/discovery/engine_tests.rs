@@ -48118,12 +48118,54 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     drop(held);
 }
 
+/// T5 helper: the deterministic (exe, libc) provider pair for one
+/// view. Index-picked peers race the child's exec; path-picked ones do
+/// not, and twin engines must agree on the peer below.
+fn facts_provider_pair(view: &ProcessView) -> Vec<ScannedModule> {
+    let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
+    let maps = parse_maps(&bytes).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
+    let mut keys = BTreeSet::new();
+    let mut found: BTreeMap<String, ScannedModule> = BTreeMap::new();
+    for mapping in maps
+        .iter()
+        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+    {
+        let Resolved::File {
+            path: MappedPath::Usable(path),
+            ..
+        } = map_index.resolve(mapping.start)
+        else {
+            continue;
+        };
+        if !keys.insert(ObjectKey::of(mapping)) {
+            continue;
+        }
+        let path_string = path.to_string_lossy().into_owned();
+        if path_string.contains("libc.so") || !path_string.contains(".so") {
+            found.insert(path_string, provider_module(view, mapping, &path, 0x1000));
+        }
+    }
+    let exe = found
+        .iter()
+        .find(|(path, _)| !path.contains(".so"))
+        .map(|(_, module)| module.clone())
+        .unwrap();
+    let libc = found
+        .iter()
+        .find(|(path, _)| path.contains("libc.so"))
+        .map(|(_, module)| module.clone())
+        .unwrap();
+    vec![exe, libc]
+}
+
 /// T5 helper: two accepted providers on one live view (slots 0 and 1).
 /// The second provider is what pair 1 rejects while the first survives.
 fn facts_two_provider_engine() -> (SystemScopeChildGuard, Engine, Vec<ScannedModule>) {
-    let (child, mut engine, modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
     let guard = SystemScopeChildGuard::new(child);
     engine.scope = Scope::System;
+    let modules = facts_provider_pair(&engine.views[0]);
     let candidate = peer_candidate(&mut engine, &modules);
     let mut session = ScriptedSession::default();
     let mut additions = true;
@@ -48133,6 +48175,25 @@ fn facts_two_provider_engine() -> (SystemScopeChildGuard, Engine, Vec<ScannedMod
     assert!(outcome.accepted(), "the peer provider is accepted whole");
     assert_eq!(engine.plan.slots.len(), 2);
     (guard, engine, modules)
+}
+
+/// T5 helper: admit the injected selection rows into the plan before Q,
+/// so the replay's re-admission is the idempotent fixpoint it is in
+/// production (claims are always older than the last tick there).
+fn facts_admit_selection_rows(engine: &mut Engine) {
+    let pins = engine.pinned.clone();
+    let raw = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let candidate = engine.live_candidate(pins, raw, Vec::new()).unwrap();
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "the selection rows admit cleanly");
 }
 
 /// T5 helper: a collected native carrier over the engine's current plan
@@ -48510,24 +48571,14 @@ fn facts_inject_pair2_rows(engine: &mut Engine) {
         .find(|module| module.object == object)
         .unwrap()
         .id;
-    let spec = LoaderContextSpec {
-        view,
-        loader: object,
-        mapping: None,
-        hook: p11scope_manifest::elf::SymbolFact {
-            virtual_address: 0,
-            file_offset: 0,
-        },
-        state_address: None,
-    };
-    let context = engine.loader_registry.preflight(spec).unwrap();
-    let context = engine.loader_registry.prepare(context).unwrap();
-    engine.loader_registry.mark_attached(context).unwrap();
+    // No registry context: the exited view drops every claim before the
+    // binding half is read, and an attached context would make the twin
+    // select conservative retirement instead of committing.
     engine.selection_bindings.insert(
         7,
         SelectionBindingFact {
             id: 7,
-            context,
+            context: LoaderContextId::from_case_id(7),
             view,
             object,
             file_offset: 0,
@@ -48545,7 +48596,7 @@ fn facts_inject_pair2_rows(engine: &mut Engine) {
             SelectionClaimKey {
                 binding_id,
                 view,
-                context: context.get(),
+                context: LoaderContextId::from_case_id(7).get(),
                 hook_owner: object,
                 provider: provider.clone(),
                 selected_object: object,
@@ -48683,6 +48734,7 @@ fn collected_graph_matches_conservative_reference() {
     let survivor = engine.plan.slots[0].object;
     let rejected = engine.plan.slots[1].object;
     facts_inject_pair1_rows(&mut engine, survivor, rejected);
+    facts_admit_selection_rows(&mut engine);
     let mut setup_session = ScriptedSession::default();
     facts_queue_rejected_key(&mut engine, &mut setup_session, rejected);
     assert!(engine.manifests.is_empty());
@@ -48735,6 +48787,7 @@ fn collected_graph_matches_conservative_reference() {
     let twin_survivor = twin.plan.slots[0].object;
     let twin_rejected = twin.plan.slots[1].object;
     facts_inject_pair1_rows(&mut twin, twin_survivor, twin_rejected);
+    facts_admit_selection_rows(&mut twin);
     let mut twin_setup = ScriptedSession::default();
     facts_queue_rejected_key(&mut twin, &mut twin_setup, twin_rejected);
     let twin_truncated_before = twin.capture_facts.visible_history().selection_truncated;

@@ -353,6 +353,25 @@ LEDGER good" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
             exit 1
         fi
     done
+    # Gate release: from the node through /proc/<pid>/root, never exec
+    # into a captured pod; a failed release fails the run.
+    : > "$cst_stub/calls.txt"
+    STUB_CID="containerd://$cst_cid" STUB_NODE_PID=4321 NODE=node-stub \
+        STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" release_pod ledger-b \
+        || { echo "gate release refused" >&2; exit 1; }
+    grep -q "touch /proc/4321/root/tmp/gate" "$cst_stub/calls.txt" \
+        || { echo "gate release missed the node path" >&2; exit 1; }
+    if grep "kubectl " "$cst_stub/calls.txt" | grep -q "touch"; then
+        echo "gate release touched through the pod" >&2
+        exit 1
+    fi
+    if STUB_CID="containerd://$cst_cid" STUB_NODE_PID=4321 NODE=node-stub \
+            STUB_FAIL="touch" STUB_CALLS=$cst_stub/calls.txt \
+            PATH="$cst_stub:$PATH" release_pod ledger-b >/dev/null 2>&1; then
+        echo "failed gate release accepted" >&2
+        exit 1
+    fi
+    STUB_FAIL=
     cst_uid=0123abcd-4567-89ef-0123-456789abcdef
     got=$(STUB_UID="$cst_uid" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
         pod_uid ledger-b) || { echo "pod uid refused" >&2; exit 1; }

@@ -5340,16 +5340,6 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     process_s.wait_for("HELD ", Duration::from_secs(30))?;
     let mut coordinator =
         system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
-    drive_until_mapped(
-        &mut coordinator,
-        &[
-            process_e.pid(),
-            process_c.pid(),
-            process_s.pid(),
-            process_h.pid(),
-        ],
-    )?;
-    let caller_s = caller_of(&coordinator, process_s.pid())?;
     let manifest_soft = provider_joint_manifest(
         workload.workload.dir.path(),
         &workload.soft_copy,
@@ -5362,18 +5352,21 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         &["C_SignInit", "C_Sign"],
         "joint-r16-held.dr37.json",
     )?;
-    // The exec spans one native lane: the binder mints the successor only
-    // when a single domain sees gen 0's bound image, the EXEC record and
-    // gen 1's later-image row. go_e opens on the first pass (gen 0 probes
-    // and execs); trig_e opens once gen 1 readies (its probe proves the
-    // later image). Passes take seconds next to the fixture's
-    // milliseconds, so the schedule has wide margins; the post-drive
-    // ensure checks the mint plus the successor's mapped edge.
+    // One native drive spans mapping and the exec: run_classic gates the
+    // coordinator when the drive ends, so a second drive's passes would
+    // refuse while its counter never advances. The binder mints the
+    // successor only when a single domain sees gen 0's bound image, the
+    // EXEC record and gen 1's later-image row. go_e opens once mapping
+    // has had its passes (witness rows bind against admitted callers);
+    // trig_e opens once gen 1 readies (its probe proves the later
+    // image). Passes take seconds next to the fixture's milliseconds,
+    // so the schedule has wide margins; the post-drive ensures check
+    // the mapping, the mint and the successor's mapped edge.
     let e_out = process_e.out.clone();
     let mut go_written = false;
     let mut trig_written = false;
     drive_native_passes_until(&mut coordinator, &mut |passes| {
-        if !go_written {
+        if !go_written && passes >= 5 {
             std::fs::write(&go_e, b"")?;
             go_written = true;
         }
@@ -5398,6 +5391,18 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         );
         Ok(passes >= 16)
     })?;
+    for (name, pid) in [
+        ("E", process_e.pid()),
+        ("C", process_c.pid()),
+        ("S", process_s.pid()),
+        ("H", process_h.pid()),
+    ] {
+        ensure!(
+            has_mapped_edge(&coordinator, pid),
+            "the {name} sibling maps in the spanning drive"
+        );
+    }
+    let caller_s = caller_of(&coordinator, process_s.pid())?;
     let exec_records: Vec<_> = coordinator
         .adapter()
         .records()

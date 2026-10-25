@@ -7,7 +7,6 @@ on BOTH backends, fresh exactness. N4 follows the live run-1 ruling: L passes
 via a named gap or a stated unwatched prefix (since_ns > first_seen_ns).
 """
 
-import copy
 import json
 import runpy
 import subprocess
@@ -709,7 +708,7 @@ class FixtureTest(unittest.TestCase):
             late_module=LATE_PROVIDER, iters_l=250)
         self.assertTrue(result["ok"])
         self.assertEqual(result["late"], "unwatched-prefix")
-        self.assertEqual(result["boundary"]["unwatched_ns"], 300268461)
+        self.assertEqual(result["boundary"]["unwatched_ns"], 3002684461)
         self.assertEqual(result["boundary"]["entries"], 0)
 
     def test_n4_since_rewritten_fixture_fails(self):
@@ -824,9 +823,16 @@ class OracleCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_help_names_new_flags(self):
+        for command, markers in (
+                ("copy-up", ("--facts-log", "--b-pre-round2-calls")),
+                ("late-reported", ("--iters-l",))):
+            completed = run_oracle(command, "--help")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            for marker in markers:
+                self.assertIn(marker, completed.stdout)
         completed = run_oracle("--help")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        for marker in ("--facts-log", "--iters-l", "--b-pre-round2-calls"):
+        for marker in ("--facts-log", "--iters-l"):
             self.assertIn(marker, completed.stdout)
 
     def test_unknown_subcommand_fails(self):

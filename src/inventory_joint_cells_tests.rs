@@ -142,7 +142,15 @@ fn seat_state_lane(driver: &mut ClassicDriver<'_>, state: JointState) -> Seat {
             lane.set_scripted_finish_begin_for_test(Some(Ok(())));
             lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
         }
-        JointState::J11 => lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage),
+        JointState::J11 => {
+            lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+            // J11 is a real engine graph refusal, not just a latch:
+            // the machine latched from its failed progress, and the
+            // hold prefers the recorded refusal text (§6.4).
+            driver
+                .coordinator
+                .seed_collected_graph_refusal_for_test(GRAPH_REFUSAL_J11);
+        }
         _ => {}
     }
     let domain = lane.domain();
@@ -689,9 +697,10 @@ fn stop_disp_body(scene: Scene, event: JointEvent) {
     );
 }
 
-/// J9/J11 × deadline (U E): like stop; the Deadline cause-once is
-/// driver-recorded (pinned by the J12 × deadline cell), so the
-/// driver twins stop.
+/// J9/J11 × deadline (U E): the expired deadline is really
+/// applied — the loop samples it as the retention cause through
+/// the real helper — then the suspended tick abandons the
+/// dispositioned finish with the first error kept.
 fn deadline_disp_body(scene: Scene, event: JointEvent) {
     assert!(matches!(event, JointEvent::Deadline));
     assert!(matches!(scene.state, JointState::J9 | JointState::J11));
@@ -702,12 +711,17 @@ fn deadline_disp_body(scene: Scene, event: JointEvent) {
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
     let seat = seat_state_lane(&mut driver, state);
-    driver.deadline = Some(Instant::now() - Duration::from_secs(1));
-    driver.on_stop_requested();
+    let (run, _) = retain_publication(&mut driver, state, event, false);
+    assert_eq!(
+        run.stop_cause,
+        Some(ZeroPassCause::Deadline),
+        "the run records the deadline cause"
+    );
+    driver.on_tick();
     assert_eq!(
         driver.joint_finish,
         JointFinishDriver::Abandoned,
-        "U: the expired deadline abandons"
+        "U: the dispositioned finish abandons under the deadline"
     );
     assert!(driver.semantic.is_none(), "U: the lane is held");
     assert_eq!(seat.drops.get(), 0, "U: held means never dropped");
@@ -718,8 +732,9 @@ fn deadline_disp_body(scene: Scene, event: JointEvent) {
     );
 }
 
-/// J9/J11 × capture_error (U E): the capture failure is the first
-/// error the finite stop keeps.
+/// J9/J11 × capture_error (U E): the capture failure is really
+/// applied — the begin refuses with the attachment error and
+/// latches it — then the stop abandons with the first error kept.
 fn capture_disp_body(scene: Scene, event: JointEvent) {
     use crate::inventory_semantics::SemanticRefusal;
     assert!(matches!(event, JointEvent::CaptureError));
@@ -730,8 +745,13 @@ fn capture_disp_body(scene: Scene, event: JointEvent) {
         state,
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
+    if state == JointState::J11 {
+        driver
+            .coordinator
+            .seed_collected_graph_refusal_for_test(GRAPH_REFUSAL_J11);
+    }
     let mut lane = joint_lane(WindDownIo::completing(), false);
-    lane.note_joint_finish_failure(SemanticRefusal::Attachment);
+    lane.set_scripted_finish_begin_for_test(Some(Err(SemanticRefusal::Attachment)));
     driver.semantic = Some(lane);
     driver.on_stop_requested();
     assert_eq!(
@@ -757,8 +777,9 @@ fn capture_disp_body(scene: Scene, event: JointEvent) {
     );
 }
 
-/// J9/J11 × sink_failure (U E): the sink failure is the first
-/// error the finite stop keeps.
+/// J9/J11 × sink_failure (U E): the sink failure is really
+/// applied — the begin refuses with the storage error and latches
+/// it — then the stop abandons with the first error kept.
 fn sink_disp_body(scene: Scene, event: JointEvent) {
     use crate::inventory_semantics::SemanticRefusal;
     assert!(matches!(event, JointEvent::SinkFailure));
@@ -769,8 +790,13 @@ fn sink_disp_body(scene: Scene, event: JointEvent) {
         state,
     } = scene;
     let mut driver = driver_with_display(&mut coordinator, display);
+    if state == JointState::J11 {
+        driver
+            .coordinator
+            .seed_collected_graph_refusal_for_test(GRAPH_REFUSAL_J11);
+    }
     let mut lane = joint_lane(WindDownIo::completing(), false);
-    lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+    lane.set_scripted_finish_begin_for_test(Some(Err(SemanticRefusal::ProviderStorage)));
     driver.semantic = Some(lane);
     driver.on_stop_requested();
     assert_eq!(

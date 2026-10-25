@@ -367,7 +367,11 @@ fn check_fd_headroom_with(
         .checked_add(required)
         .ok_or(BankRefusal::Budget)?;
     match snapshot.soft_limit {
-        FdLimit::Finite(limit) if total > limit => Err(BankRefusal::Budget),
+        FdLimit::Finite(limit) if total > limit => Err(BankRefusal::BudgetExhausted {
+            resource: "file descriptors",
+            needed: total,
+            available: limit,
+        }),
         _ => Ok(()),
     }
 }
@@ -5519,7 +5523,11 @@ pub(crate) mod tests {
                     soft_limit: FdLimit::Finite(123),
                     observed_open: 100,
                 }),
-                Some(BankRefusal::Budget),
+                Some(BankRefusal::BudgetExhausted {
+                    resource: "file descriptors",
+                    needed: 124,
+                    available: 123,
+                }),
             ),
             (
                 "unreadable",
@@ -5829,7 +5837,11 @@ pub(crate) mod tests {
                     soft_limit: FdLimit::Finite(102),
                     observed_open: 100,
                 }),
-                Some(BankRefusal::Budget),
+                Some(BankRefusal::BudgetExhausted {
+                    resource: "file descriptors",
+                    needed: 103,
+                    available: 102,
+                }),
             ),
             (
                 "unreadable",

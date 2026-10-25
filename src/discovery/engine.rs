@@ -4,10 +4,10 @@
 #[cfg(feature = "h6-reexec-diagnostic")]
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
-    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementTicket, CounterSnapshot,
-    DetachOutcome, DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration,
-    ReplacementOutcome, RetainedInputMeasure, RetainedRetirementInput, RetirementPoll,
-    RetirementProgress, RetirementTicket, Scope, Session,
+    BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementState,
+    CollectedRetirementTicket, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
+    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, RetainedInputMeasure,
+    RetainedRetirementInput, RetirementPoll, RetirementProgress, RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -3796,42 +3796,89 @@ fn exact_owned_string(source: &str) -> String {
     owned
 }
 
-/// Removed-slot copy cursor (§1.6). Inert skeleton: T4b fills the
-/// stepped exact copy; steps report no progress until then.
-struct SlotCopy;
+/// Removed-slot copy cursor (§1.6): exact-capacity clone of one plan
+/// [`Slot`](plan::Slot) per stepped pass. Scalars, the object path and
+/// both id vectors are copied first (vectors sized exact, module ids
+/// extended whole — `Copy` scalars the measure charges as one array);
+/// then one name per step. The cursor resets between slots.
+struct SlotCopy {
+    item: usize,
+    stage: u8,
+}
 
-#[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
 impl SlotCopy {
     fn new() -> Self {
-        Self
+        Self { item: 0, stage: 0 }
     }
 
-    /// One copy leaf; inert until T4b lands (never completes).
-    fn step(&mut self, _source: &plan::Slot, _rows: &mut Vec<plan::Slot>) -> bool {
-        false
+    /// Copies one leaf unit of `source` into `rows`, appending the
+    /// destination shell row on the first step. Returns true when the
+    /// slot is fully copied, resetting for the next slot.
+    fn step(&mut self, source: &plan::Slot, rows: &mut Vec<plan::Slot>) -> bool {
+        match self.stage {
+            // Shell: scalars plus exact vectors, module ids whole.
+            0 => {
+                let mut module_ids = Vec::with_capacity(source.module_ids.len());
+                module_ids.extend_from_slice(&source.module_ids);
+                rows.push(plan::Slot {
+                    index: source.index,
+                    descriptor_index: source.descriptor_index,
+                    object: source.object,
+                    object_path: exact_owned_string(&source.object_path),
+                    file_offset: source.file_offset,
+                    names: Vec::with_capacity(source.names.len()),
+                    aliased: source.aliased,
+                    semantics: source.semantics,
+                    semantic_authorized: source.semantic_authorized,
+                    semantic_ambiguous: source.semantic_ambiguous,
+                    fork_safe: source.fork_safe,
+                    module_ids,
+                });
+                self.item = 0;
+                self.stage = 1;
+                false
+            }
+            // Names, one per step.
+            _ => {
+                if let Some(name) = source.names.get(self.item) {
+                    rows.last_mut()
+                        .expect("the shell row is pushed at stage 0")
+                        .names
+                        .push(exact_owned_string(name));
+                    self.item += 1;
+                    false
+                } else {
+                    self.item = 0;
+                    self.stage = 0;
+                    true
+                }
+            }
+        }
     }
 }
 
 /// Corroboration facts staged across the Facts phase (§1.8). Shaped by T5.
 struct CollectedFacts;
 
-/// View/batch retirement cursor for Consume (§1.7). Consumed by T4b.
-#[allow(dead_code)] // Consumed by T4b.
+/// View/batch retirement cursor for Consume (§1.7). `row` stays reserved
+/// (the retire loop repeats across credits until its row completes).
 struct ConsumeCursor {
     step: u8,
     after_view: Option<ProcessViewId>,
     after_binding: Option<u64>,
+    after_key: Option<ObjectKey>,
+    #[allow(dead_code)] // Reserved: the retire loop repeats across credits.
     row: u8,
     pending_views: PendingViewRetirements,
 }
 
-#[allow(dead_code)] // Consumed by T4b.
 impl ConsumeCursor {
     fn new() -> Self {
         Self {
             step: 0,
             after_view: None,
             after_binding: None,
+            after_key: None,
             row: 0,
             pending_views: PendingViewRetirements::new(),
         }
@@ -3871,6 +3918,7 @@ struct CollectedGraph {
     handoff: Option<Box<RetiredFileHandoff>>,
     backing_storage: Option<ResourceLease>,
     removed_index: usize,
+    removed_included: usize,
     removed_measure: Option<RetainedInputMeasure>,
     removed_copy: Option<SlotCopy>,
     removed_rows: Vec<plan::Slot>,
@@ -3878,6 +3926,7 @@ struct CollectedGraph {
     removed: Option<RetainedRetirementInput>,
     ticket: Option<CollectedRetirementTicket>,
     mutated: bool,
+    native_cancel_owed: bool,
     installed: bool,
     install_step: u8,
     install_index: usize,
@@ -3886,6 +3935,7 @@ struct CollectedGraph {
     old_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
     consume: ConsumeCursor,
     reclaim_step: u8,
+    reclaim_forgotten: bool,
     verdict: Option<Verdict>,
     first_error: Option<String>,
     partial_noted: bool,
@@ -3923,6 +3973,7 @@ impl CollectedGraph {
             handoff: None,
             backing_storage: None,
             removed_index: 0,
+            removed_included: 0,
             removed_measure: None,
             removed_copy: None,
             removed_rows: Vec::new(),
@@ -3930,6 +3981,7 @@ impl CollectedGraph {
             removed: None,
             ticket: None,
             mutated: false,
+            native_cancel_owed: false,
             installed: false,
             install_step: 0,
             install_index: 0,
@@ -3938,6 +3990,7 @@ impl CollectedGraph {
             old_tables: BTreeMap::new(),
             consume: ConsumeCursor::new(),
             reclaim_step: 0,
+            reclaim_forgotten: false,
             verdict: None,
             first_error: None,
             partial_noted: false,
@@ -22230,11 +22283,14 @@ impl Engine {
         self.collected_graph_refusal
     }
 
-    /// Inert skeleton: T4b closes up to `max` retired graph files and
-    /// reports when the chain is empty.
-    #[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
-    pub(crate) fn close_retired_files(&mut self, _max: usize) -> bool {
-        false
+    /// Closes up to `max` retired graph files (§1.8); `true` when the
+    /// chain is empty. The retired-file debt lives beyond the graph on
+    /// the Engine chain so no synchronous close joins a graph credit.
+    pub(crate) fn close_retired_files(&mut self, max: usize) -> bool {
+        match self.retired_files.as_mut() {
+            Some(handoff) => handoff.close_some(max),
+            None => true,
+        }
     }
 
     /// Test read of the graph-input generation counter (§1.3).
@@ -22355,17 +22411,35 @@ impl Engine {
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         reserve: &SemanticResourceReserver,
-        _collect: &mut DiscoveryCollector<'_>,
+        collect: &mut DiscoveryCollector<'_>,
     ) -> GraphService {
         let mut graph = self
             .collected_graph
             .take()
             .expect("a collected graph is stepped only while boxed");
-        if graph.verdict.is_some() {
+        // A refused graph stays boxed at its phase; later credits report
+        // no work while the debt keeps Finish pending. Closed is a
+        // progress verdict: the graph continues through Install.
+        if matches!(
+            graph.verdict,
+            Some(Verdict::RefusedUntouched | Verdict::RefusedRetained)
+        ) {
             self.collected_graph = Some(graph);
             return GraphService::default();
         }
-        let service = self.step_graph_inner(session, q, reserve, &mut graph);
+        let service = self.step_graph_inner(session, q, reserve, collect, &mut graph);
+        if graph.reclaim_forgotten {
+            // Reclaim refusal (§1.9): the handoff already moved to the
+            // Engine chain; the unprovable graph stays process-lifetime
+            // (never dropped) while Finish continues with its install.
+            let installed = graph.installed;
+            std::mem::forget(graph);
+            return GraphService {
+                changed: installed,
+                progressed: true,
+                named_generation_lost: false,
+            };
+        }
         if matches!(graph.phase, GraphPhase::Done) {
             // Done (item 13): chain the handoff without allocating, drop the
             // graph, and report `changed` only after Install.
@@ -22426,14 +22500,15 @@ impl Engine {
         })
     }
 
-    /// One phase step. T4 owns Intake and the I1 error rows of the native
-    /// phases; T4a fills Freeze..Plan below, T4b fills Handoff..Done and
-    /// maps native success.
+    /// One phase step: T4's Intake, T4a's Freeze..Plan, T4b's
+    /// Handoff..Done with native success mapping. Facts content and
+    /// Install steps 6-8 are T5's stubs.
     fn step_graph_inner(
         &mut self,
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         reserve: &SemanticResourceReserver,
+        collect: &mut DiscoveryCollector<'_>,
         graph: &mut CollectedGraph,
     ) -> GraphService {
         // Epoch rule (finding 2): from Freeze through NativePoll, every
@@ -22479,33 +22554,15 @@ impl Engine {
             GraphPhase::RawCopy => self.step_graph_raw_copy(graph, reserve),
             GraphPhase::Rebind => self.step_graph_rebind(graph, reserve),
             GraphPhase::Plan => self.step_graph_plan(graph, reserve),
-            GraphPhase::Facts => {
-                graph.phase = GraphPhase::Handoff;
-                Self::graph_idle(true)
-            }
-            GraphPhase::Handoff => {
-                graph.phase = GraphPhase::RemovedCopy;
-                Self::graph_idle(true)
-            }
-            GraphPhase::RemovedCopy => {
-                graph.phase = GraphPhase::NativePrepare;
-                Self::graph_idle(true)
-            }
-            GraphPhase::NativePrepare => self.probe_native_prepare(session, q, reserve, graph),
-            GraphPhase::NativeBegin => self.probe_native_begin(session, q, graph),
-            GraphPhase::NativePoll => self.probe_native_poll(session, q, graph),
-            GraphPhase::Install => {
-                graph.phase = GraphPhase::Consume;
-                Self::graph_idle(true)
-            }
-            GraphPhase::Consume => {
-                graph.phase = GraphPhase::Reclaim;
-                Self::graph_idle(true)
-            }
-            GraphPhase::Reclaim => {
-                graph.phase = GraphPhase::Done;
-                Self::graph_idle(true)
-            }
+            GraphPhase::Facts => Self::step_graph_facts_pending_t5(graph),
+            GraphPhase::Handoff => self.step_graph_handoff(graph, reserve),
+            GraphPhase::RemovedCopy => self.step_graph_removed_copy(session, graph, reserve),
+            GraphPhase::NativePrepare => self.step_graph_native_prepare(session, q, reserve, graph),
+            GraphPhase::NativeBegin => self.step_graph_native_begin(session, q, graph),
+            GraphPhase::NativePoll => self.step_graph_native_poll(session, q, graph),
+            GraphPhase::Install => self.step_graph_install(graph),
+            GraphPhase::Consume => self.step_graph_consume(session, collect, graph),
+            GraphPhase::Reclaim => self.step_graph_reclaim(graph, reserve),
             GraphPhase::Done => GraphService::default(),
         }
     }
@@ -22632,7 +22689,7 @@ impl Engine {
                 .pending_retirements
                 .range((Excluded(after), Unbounded))
                 .next()
-                .map(|view| *view),
+                .copied(),
         } {
             graph.sel_after_view = Some(next);
             graph.sel_retired.insert(next);
@@ -22645,7 +22702,7 @@ impl Engine {
                 .pending_rejected_keys
                 .range((Excluded(after), Unbounded))
                 .next()
-                .map(|key| *key),
+                .copied(),
         } {
             graph.sel_after_key = Some(next);
             graph.sel_rejected.insert(next);
@@ -22901,161 +22958,910 @@ impl Engine {
         }
     }
 
-    /// NativePrepare, T4 error probe (I1 skeleton): without a removal input
-    /// (T4b's RemovedCopy builds it) the phase is vacuous and advances
-    /// without calling. An `Err` before the take cancels once and refuses
-    /// untouched; a taken input refuses retained until T4b's G9 dance
-    /// refines it. Success mapping (ticket store, advance) is T4b's body.
-    fn probe_native_prepare(
+    /// Records a pre-mutation native refusal (§1.9): the input is back
+    /// with the graph, the reason is named once, the disclosure ships once.
+    fn refuse_graph_native_untouched(&mut self, graph: &mut CollectedGraph) {
+        graph.verdict = Some(Verdict::RefusedUntouched);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph refused before native mutation");
+        self.mark_partial(
+            "collected native retirement",
+            "the original removal was refused before native mutation; originals remain owned",
+        );
+    }
+
+    /// Records a post-mutation native refusal (§1.9): the first error
+    /// text is kept, the G4 disclosure ships, replacement stays blocked.
+    fn refuse_graph_native_retained(&mut self, graph: &mut CollectedGraph, error: String) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error);
+        }
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("native ownership uncertain");
+        self.mark_partial(
+            "global native retirement",
+            "original static ownership remains uncertain; replacement admission is blocked",
+        );
+    }
+
+    /// Defensive post-Closed refusal (§1.9 row 7 shape): no Install, no
+    /// restart, no refund, no extra disclosure. Unreachable by phase
+    /// order: every sink is Ready and every buffer is reserved.
+    fn refuse_graph_after_closed(&mut self, graph: &mut CollectedGraph) {
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("native ownership uncertain");
+    }
+
+    /// Facts (§1.8), T5 stub: T5 fills the row machine that builds
+    /// claims/tables/corroboration plus Install steps 6-8 over it. Until
+    /// then the phase advances with no facts content; Install step 5
+    /// swaps the (empty) stub maps that T5's
+    /// `facts_maps_for_install_t5_stub` fills.
+    fn step_graph_facts_pending_t5(graph: &mut CollectedGraph) -> GraphService {
+        graph.phase = GraphPhase::Handoff;
+        Self::graph_idle(true)
+    }
+
+    /// Handoff (§1.6): reserves the retired-file handoff and the installed
+    /// backing-lease storage. No files arrive from anywhere else; on a
+    /// backing refusal the empty handoff drops as a lease refund.
+    fn step_graph_handoff(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(files) = graph.pins.retired_entry_count() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        let handoff = match RetiredFileHandoff::reserve(files, reserve) {
+            Ok(handoff) => handoff,
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+        };
+        match reserve.reserve(std::mem::size_of::<GraphBacking>() + OWNED_ALLOCATION_PADDING) {
+            Ok(storage) => {
+                graph.handoff = Some(handoff);
+                graph.backing_storage = Some(storage);
+                graph.phase = GraphPhase::RemovedCopy;
+            }
+            Err(_) => {
+                drop(handoff);
+                self.refuse_graph_before_native(graph);
+            }
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Whether the plan slot at `position` is removed by the graph: its
+    /// index is in the plan cursor's ascending removed list.
+    fn graph_slot_removed(graph: &CollectedGraph, position: usize, slots: &[plan::Slot]) -> bool {
+        match (graph.plan.removed(), slots.get(position)) {
+            (Some(removed), Some(slot)) => removed.binary_search(&slot.index).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// RemovedCopy (§1.6): removed plan slots are measured with
+    /// `RetainedInputMeasure`, reserved, cloned exact by `SlotCopy` into
+    /// an exactly preallocated `removed_rows`, and sealed into
+    /// `RetainedRetirementInput`. An empty removal list, or a logical
+    /// (Singles) leaf, closes without any copy or native call.
+    fn step_graph_removed_copy(
+        &mut self,
+        session: &mut dyn EngineSession,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        let Some(removed) = graph.plan.removed() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
+        if removed.is_empty() {
+            graph.verdict = Some(Verdict::Closed);
+            graph.phase = GraphPhase::Install;
+            return Self::graph_idle(true);
+        }
+        if !session.collected_retirement_is_physical() {
+            graph.verdict = Some(Verdict::Closed);
+            graph.phase = GraphPhase::Install;
+            self.mark_partial(
+                "global native retirement",
+                "retired links on this kernel are closed by the Session's terminal detach",
+            );
+            return Self::graph_idle(true);
+        }
+        if graph.removed_measure.is_none() {
+            match RetainedInputMeasure::new(self.plan.slots.len()) {
+                Ok(measure) => {
+                    graph.removed_measure = Some(measure);
+                    graph.removed_index = 0;
+                    graph.removed_included = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                    return Self::graph_idle(true);
+                }
+            }
+        }
+        if graph.removed_storage.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.plan.slots.get(graph.removed_index) else {
+                    break;
+                };
+                if Self::graph_slot_removed(graph, graph.removed_index, &self.plan.slots) {
+                    let done = match graph
+                        .removed_measure
+                        .as_mut()
+                        .expect("the measure is seeded above")
+                        .step(source)
+                    {
+                        Ok(done) => done,
+                        Err(_) => {
+                            self.refuse_graph_before_native(graph);
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    if done {
+                        graph.removed_included += 1;
+                        graph.removed_index += 1;
+                    }
+                } else {
+                    graph.removed_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.removed_index < self.plan.slots.len() {
+                return Self::graph_idle(true);
+            }
+            let bytes = graph
+                .removed_measure
+                .as_ref()
+                .expect("the measure is seeded above")
+                .bytes();
+            match reserve.reserve(bytes) {
+                Ok(storage) => {
+                    graph.removed_storage = Some(storage);
+                    graph.removed_rows = Vec::with_capacity(graph.removed_included);
+                    graph.removed_copy = Some(SlotCopy::new());
+                    graph.removed_index = 0;
+                }
+                Err(_) => {
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.removed.is_none() {
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let Some(source) = self.plan.slots.get(graph.removed_index) else {
+                    break;
+                };
+                if Self::graph_slot_removed(graph, graph.removed_index, &self.plan.slots) {
+                    let cursor = graph.removed_copy.as_mut().expect("the copy opens at seal");
+                    if cursor.step(source, &mut graph.removed_rows) {
+                        graph.removed_index += 1;
+                    }
+                } else {
+                    graph.removed_index += 1;
+                }
+                leaves += 1;
+            }
+            if graph.removed_index < self.plan.slots.len() {
+                return Self::graph_idle(true);
+            }
+            let rows = std::mem::take(&mut graph.removed_rows);
+            let storage = graph
+                .removed_storage
+                .take()
+                .expect("the storage is reserved above");
+            debug_assert_eq!(
+                rows.capacity(),
+                rows.len(),
+                "removed rows are preallocated exact"
+            );
+            match RetainedRetirementInput::from_reserved_removed(rows, storage) {
+                Ok(removed) => {
+                    graph.removed = Some(removed);
+                    graph.phase = GraphPhase::NativePrepare;
+                }
+                Err(refusal) => {
+                    let (rows, storage) = refusal.into_removed();
+                    graph.removed_rows = rows;
+                    graph.removed_storage = Some(storage);
+                    self.refuse_graph_before_native(graph);
+                }
+            }
+            return Self::graph_idle(true);
+        }
+        graph.phase = GraphPhase::NativePrepare;
+        Self::graph_idle(true)
+    }
+
+    /// NativePrepare (§1.6): one native prepare credit. Any progress with
+    /// a ticket stores it; `Prepared` advances to NativeBegin. Before the
+    /// take, an `Err` cancels once and refuses untouched; after the take,
+    /// the ticket cancel runs one credit at a time until it returns the
+    /// input (untouched) or retains it.
+    fn step_graph_native_prepare(
         &mut self,
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         reserve: &SemanticResourceReserver,
         graph: &mut CollectedGraph,
     ) -> GraphService {
-        if graph.removed.is_none() {
-            graph.phase = GraphPhase::NativeBegin;
-            return GraphService {
-                changed: false,
-                progressed: true,
-                named_generation_lost: false,
-            };
+        // Owed cancel after a post-take prepare error: one cancel credit
+        // at a time until the release answers.
+        if graph.native_cancel_owed {
+            match session.cancel_collected_static_retirement(None, graph.ticket.as_ref(), 1) {
+                Ok(progress) => match progress.state {
+                    CollectedRetirementState::RefusedUntouched(input) => {
+                        graph.removed = Some(input);
+                        graph.native_cancel_owed = false;
+                        self.refuse_graph_native_untouched(graph);
+                    }
+                    CollectedRetirementState::RefusedRetained => {
+                        graph.native_cancel_owed = false;
+                        self.refuse_graph_native_retained(
+                            graph,
+                            "the post-take cancel retained native ownership".into(),
+                        );
+                    }
+                    // Preparing or any other interim state: stay owed.
+                    _ => {}
+                },
+                Err(error) => {
+                    graph.native_cancel_owed = false;
+                    self.refuse_graph_native_retained(graph, error.to_string());
+                }
+            }
+            return Self::graph_idle(true);
         }
         match session.prepare_collected_static_retirement(q, &mut graph.removed, reserve, 1) {
-            Ok(_) => GraphService::default(),
-            Err(_) => {
-                if graph.removed.is_none() {
-                    // Taken, then failed: ownership is uncertain.
-                    graph.verdict = Some(Verdict::RefusedRetained);
-                    self.collected_graph_refusal
-                        .get_or_insert("native ownership uncertain");
-                    self.mark_partial(
-                        "global native retirement",
-                        "original static ownership remains uncertain; replacement admission is blocked",
-                    );
-                } else {
-                    // Before the take: cancel once (the row names no error
-                    // propagation), refuse untouched, disclose once.
+            Ok(progress) => {
+                if let Some(ticket) = progress.ticket {
+                    graph.ticket = Some(ticket);
+                }
+                match progress.state {
+                    CollectedRetirementState::Prepared(_) => {
+                        graph.phase = GraphPhase::NativeBegin;
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::RefusedUntouched(input) => {
+                        graph.removed = Some(input);
+                        self.refuse_graph_native_untouched(graph);
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::RefusedRetained => {
+                        self.refuse_graph_native_retained(
+                            graph,
+                            "native prepare retained the taken input".into(),
+                        );
+                        Self::graph_idle(true)
+                    }
+                    CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                    // Preparing or any other interim state: stay.
+                    _ => Self::graph_idle(true),
+                }
+            }
+            Err(error) => {
+                if graph.removed.is_some() {
+                    // Before the take: cancel once (result ignored),
+                    // refuse untouched, disclose once.
                     let _ =
                         session.cancel_collected_static_retirement(graph.removed.as_ref(), None, 1);
-                    graph.verdict = Some(Verdict::RefusedUntouched);
-                    self.collected_graph_refusal
-                        .get_or_insert("terminal graph refused before native mutation");
-                    self.mark_partial(
-                        "collected native retirement",
-                        "the original removal was refused before native mutation; originals remain owned",
-                    );
+                    self.refuse_graph_native_untouched(graph);
+                } else if graph.ticket.is_some() {
+                    // After the take: the ticket cancel starts next
+                    // credit (one native call per credit).
+                    graph.native_cancel_owed = true;
+                } else {
+                    // Defensive: taken but unticketed cannot cancel.
+                    self.refuse_graph_native_retained(graph, error.to_string());
                 }
-                GraphService {
-                    changed: false,
-                    progressed: true,
-                    named_generation_lost: false,
-                }
+                Self::graph_idle(true)
             }
         }
     }
 
-    /// NativeBegin, T4 error probe (I1 skeleton): without a ticket (T4b
-    /// stores it) the phase is vacuous and advances without calling. A
-    /// post-mutation `Err` refuses retained; a pre-mutation `Err` cannot
-    /// have mutated, so it cancels and refuses untouched. Success mapping
-    /// is T4b's §1.6 body.
-    fn probe_native_begin(
+    /// NativeBegin (§1.6): one native begin credit. `Transferring`
+    /// sets mutated and stays; `Pending` advances to NativePoll. A
+    /// missing ticket refuses by the mutated flag (defensive: Begin is
+    /// only reachable through Prepared).
+    fn step_graph_native_begin(
         &mut self,
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         graph: &mut CollectedGraph,
     ) -> GraphService {
         let Some(ticket) = graph.ticket.as_ref() else {
-            graph.phase = GraphPhase::NativePoll;
-            return GraphService {
-                changed: false,
-                progressed: true,
-                named_generation_lost: false,
-            };
+            if graph.mutated {
+                self.refuse_graph_native_retained(graph, "native begin without a ticket".into());
+            } else {
+                self.refuse_graph_native_untouched(graph);
+            }
+            return Self::graph_idle(true);
         };
         match session.begin_collected_static_retirement(q, ticket, 1) {
-            Ok(_) => GraphService::default(),
-            Err(_) => {
-                if graph.mutated {
-                    graph.verdict = Some(Verdict::RefusedRetained);
-                    self.collected_graph_refusal
-                        .get_or_insert("native ownership uncertain");
-                    self.mark_partial(
-                        "global native retirement",
-                        "original static ownership remains uncertain; replacement admission is blocked",
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::Transferring => {
+                    graph.mutated = true;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Pending => {
+                    graph.phase = GraphPhase::NativePoll;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "native begin retained the taken input".into(),
                     );
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                // Preparing/Prepared or any other interim state: stay.
+                _ => Self::graph_idle(true),
+            },
+            Err(error) => {
+                if graph.mutated {
+                    self.refuse_graph_native_retained(graph, error.to_string());
                 } else {
                     let _ = session.cancel_collected_static_retirement(
                         graph.removed.as_ref(),
                         graph.ticket.as_ref(),
                         1,
                     );
-                    graph.verdict = Some(Verdict::RefusedUntouched);
-                    self.collected_graph_refusal
-                        .get_or_insert("terminal graph refused before native mutation");
-                    self.mark_partial(
-                        "collected native retirement",
-                        "the original removal was refused before native mutation; originals remain owned",
-                    );
+                    self.refuse_graph_native_untouched(graph);
                 }
-                GraphService {
-                    changed: false,
-                    progressed: true,
-                    named_generation_lost: false,
-                }
+                Self::graph_idle(true)
             }
         }
     }
 
-    /// NativePoll, T4 error probe (I1 skeleton): same shape as the begin
-    /// probe. Success mapping (Pending stays, Closed installs) is T4b's.
-    fn probe_native_poll(
+    /// T5 stub: the Facts maps Install step 5 swaps in. T5 returns the
+    /// built claims/tables; until then the swap installs empty maps.
+    fn facts_maps_for_install_t5_stub() -> (
+        BTreeMap<SelectionClaimKey, SelectionClaim>,
+        BTreeMap<SelectionTableKey, SelectionTableFact>,
+    ) {
+        (BTreeMap::new(), BTreeMap::new())
+    }
+
+    /// Install (§1.8): the first credit revalidates epoch plus Freeze
+    /// scalars (a mismatch after Closed retains, never restarts), then
+    /// sinks pins/modules/plan (steps 1-3), chains the old backing
+    /// (step 4) and swaps the Facts maps (step 5). A later credit runs
+    /// the T5 row stubs (steps 7-8) and the epoch bump (step 9).
+    fn step_graph_install(&mut self, graph: &mut CollectedGraph) -> GraphService {
+        if graph.install_step == 0 {
+            if self.graph_inputs_epoch != graph.epoch
+                || self.pinned.revision() != graph.pins_revision
+                || self.plan.slots.len() != graph.plan_slots
+            {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            }
+            let pins_backing = match graph.pins.install_ready(&mut self.pinned) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let modules_backing = match graph.rebind.install_ready(&mut self.modules) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let plan_backing = match graph.plan.swap_ready(&mut self.plan) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    self.refuse_graph_after_closed(graph);
+                    return Self::graph_idle(true);
+                }
+            };
+            let Some(backing_storage) = graph.backing_storage.take() else {
+                self.refuse_graph_after_closed(graph);
+                return Self::graph_idle(true);
+            };
+            graph.retired_backing = self.graph_backing.replace(Box::new(GraphBacking {
+                pins: pins_backing,
+                modules: modules_backing,
+                plan: plan_backing,
+                storage: Some(backing_storage),
+            }));
+            let (mut claims, mut tables) = Self::facts_maps_for_install_t5_stub();
+            std::mem::swap(&mut claims, &mut self.selection_claims);
+            std::mem::swap(&mut tables, &mut self.selection_tables);
+            graph.old_claims = claims;
+            graph.old_tables = tables;
+            graph.installed = true;
+            graph.install_step = 1;
+            return Self::graph_idle(true);
+        }
+        // Steps 7-8 (T5: skips and invalidations over the Facts rows)
+        // are vacuous until T5 fills them; step 9 bumps the epoch.
+        self.note_graph_inputs_mutated();
+        graph.phase = GraphPhase::Consume;
+        Self::graph_idle(true)
+    }
+
+    /// NativePoll (§1.6): one native poll credit. `Pending` stays;
+    /// `Closed` stores the input, records the verdict and installs. A
+    /// missing ticket refuses by the mutated flag (defensive).
+    fn step_graph_native_poll(
         &mut self,
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         graph: &mut CollectedGraph,
     ) -> GraphService {
         let Some(ticket) = graph.ticket.as_ref() else {
-            graph.phase = GraphPhase::Install;
-            return GraphService {
-                changed: false,
-                progressed: true,
-                named_generation_lost: false,
-            };
+            if graph.mutated {
+                self.refuse_graph_native_retained(graph, "native poll without a ticket".into());
+            } else {
+                self.refuse_graph_native_untouched(graph);
+            }
+            return Self::graph_idle(true);
         };
         match session.poll_collected_static_retirement(q, ticket, 1) {
-            Ok(_) => GraphService::default(),
-            Err(_) => {
-                if graph.mutated {
-                    graph.verdict = Some(Verdict::RefusedRetained);
-                    self.collected_graph_refusal
-                        .get_or_insert("native ownership uncertain");
-                    self.mark_partial(
-                        "global native retirement",
-                        "original static ownership remains uncertain; replacement admission is blocked",
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::Pending => Self::graph_idle(true),
+                CollectedRetirementState::Closed(input) => {
+                    graph.removed = Some(input);
+                    graph.verdict = Some(Verdict::Closed);
+                    graph.phase = GraphPhase::Install;
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    self.refuse_graph_native_untouched(graph);
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "native poll retained the taken input".into(),
                     );
+                    Self::graph_idle(true)
+                }
+                CollectedRetirementState::Yielded => Self::graph_idle(progress.used != 0),
+                // Preparing/Prepared/Transferring or any other interim
+                // state: stay.
+                _ => Self::graph_idle(true),
+            },
+            Err(error) => {
+                if graph.mutated {
+                    self.refuse_graph_native_retained(graph, error.to_string());
                 } else {
                     let _ = session.cancel_collected_static_retirement(
                         graph.removed.as_ref(),
                         graph.ticket.as_ref(),
                         1,
                     );
-                    graph.verdict = Some(Verdict::RefusedUntouched);
-                    self.collected_graph_refusal
-                        .get_or_insert("terminal graph refused before native mutation");
-                    self.mark_partial(
-                        "collected native retirement",
-                        "the original removal was refused before native mutation; originals remain owned",
-                    );
+                    self.refuse_graph_native_untouched(graph);
                 }
-                GraphService {
-                    changed: false,
-                    progressed: true,
-                    named_generation_lost: false,
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Consume (§1.7): retires the selected views and rejected keys
+    /// through the legacy effects. Step 0 closes ExpectedRemoval
+    /// binding coverage (strided); step 1 retires one view row per
+    /// credit; step 2 drops the rejected keys (strided); step 3
+    /// finalizes, then Reclaim. Publication stays quiet until Done.
+    fn step_graph_consume(
+        &mut self,
+        session: &mut dyn EngineSession,
+        collect: &mut DiscoveryCollector<'_>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        match graph.consume.step {
+            // Bindings: close ExpectedRemoval coverage, strided.
+            0 => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let mut leaves = 0;
+                while leaves < GRAPH_STRIDE {
+                    let next = match graph.consume.after_binding {
+                        None => self.selection_bindings.first_key_value().map(|(id, _)| *id),
+                        Some(after) => self
+                            .selection_bindings
+                            .range((Excluded(after), Unbounded))
+                            .next()
+                            .map(|(id, _)| *id),
+                    };
+                    let Some(id) = next else { break };
+                    graph.consume.after_binding = Some(id);
+                    let selected =
+                        self.selection_bindings.get(&id).is_some_and(|binding| {
+                            graph.selection.as_ref().is_some_and(|selection| {
+                                selection.retired().contains(&binding.view)
+                            }) && self.retirement_intents.get(&binding.view)
+                                == Some(&RetirementCause::ExpectedRemoval)
+                        });
+                    if selected
+                        && let Some(binding) = self.selection_bindings.get_mut(&id)
+                    {
+                        binding.coverage.close_naturally();
+                    }
+                    leaves += 1;
+                }
+                let done = match graph.consume.after_binding {
+                    None => true,
+                    Some(after) => self
+                        .selection_bindings
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                        .is_none(),
+                };
+                if done {
+                    graph.consume.step = 1;
+                    graph.consume.after_view = None;
+                }
+                Self::graph_idle(true)
+            }
+            // Views: one row per credit.
+            1 => self.step_graph_consume_view(session, collect, graph),
+            // Rejected keys: drop, strided.
+            2 => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let mut leaves = 0;
+                while leaves < GRAPH_STRIDE {
+                    let next = match graph.consume.after_key {
+                        None => graph
+                            .selection
+                            .as_ref()
+                            .and_then(|selection| selection.rejected().first().copied()),
+                        Some(after) => graph.selection.as_ref().and_then(|selection| {
+                            selection
+                                .rejected()
+                                .range((Excluded(after), Unbounded))
+                                .next()
+                                .copied()
+                        }),
+                    };
+                    let Some(key) = next else { break };
+                    graph.consume.after_key = Some(key);
+                    self.pending_rejected_keys.remove(&key);
+                    leaves += 1;
+                }
+                let done = match graph.consume.after_key {
+                    None => true,
+                    Some(after) => graph.selection.as_ref().is_some_and(|selection| {
+                        selection
+                            .rejected()
+                            .range((Excluded(after), Unbounded))
+                            .next()
+                            .is_none()
+                    }),
+                };
+                if done {
+                    graph.consume.step = 3;
+                }
+                Self::graph_idle(true)
+            }
+            // Finalize, then Reclaim.
+            _ => {
+                self.finalize_expected_target_exit();
+                graph.phase = GraphPhase::Reclaim;
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// One Consume view row (§1.7): a causeless view drops from pending
+    /// retirements; a caused view runs one loader-retire call (the row
+    /// repeats across credits until the view's contexts complete — one
+    /// Finish action cannot clear two terminal journals in one credit)
+    /// and then the legacy removal effects. A row error restores the
+    /// graph at its Consume position (§1.9).
+    fn step_graph_consume_view(
+        &mut self,
+        session: &mut dyn EngineSession,
+        collect: &mut DiscoveryCollector<'_>,
+        graph: &mut CollectedGraph,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match graph.consume.after_view {
+            None => graph
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.retired().first().copied()),
+            Some(after) => graph.selection.as_ref().and_then(|selection| {
+                selection
+                    .retired()
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            }),
+        };
+        let Some(view) = next else {
+            // Views exhausted: reject leftover handoffs once (always
+            // empty at Q — no record dispatch fills them), then drop
+            // the rejected keys.
+            let mut closure = PauseClosure::new(false);
+            self.reject_terminal_selection_handoffs(Vec::new(), &mut closure);
+            graph.consume.step = 2;
+            graph.consume.after_key = None;
+            return Self::graph_idle(true);
+        };
+        let Some(cause) = self.retirement_intents.get(&view).copied() else {
+            // No intent (pending before Q): only the pending entry drops.
+            self.pending_retirements.remove(&view);
+            graph.consume.after_view = Some(view);
+            return Self::graph_idle(true);
+        };
+        let mut handoffs = TerminalSelectionHandoffs::new();
+        let mut additions = false;
+        let mut closure = PauseClosure::new(false);
+        let retired = self.retire_loader_contexts(
+            view,
+            &mut handoffs,
+            session,
+            &mut additions,
+            &mut graph.consume.pending_views,
+            collect,
+            &mut closure,
+        );
+        // Findings merge back into the persistent intents, as legacy does.
+        for (found, found_cause) in std::mem::take(&mut graph.consume.pending_views) {
+            self.retirement_intents
+                .entry(found)
+                .and_modify(|current| {
+                    current.merge(found_cause);
+                })
+                .or_insert(found_cause);
+        }
+        let complete = match retired {
+            Ok((_, complete)) => complete,
+            Err(error) => {
+                self.fail_graph_consume_row(graph, error);
+                return Self::graph_idle(true);
+            }
+        };
+        if !complete {
+            return Self::graph_idle(true);
+        }
+        let mut service = Self::graph_idle(true);
+        if cause == RetirementCause::GenerationLost && matches!(self.scope, Scope::Pid(_)) {
+            service.named_generation_lost = true;
+        }
+        self.retirement_intents.remove(&view);
+        self.ready_expected_removals.remove(&view);
+        if cause == RetirementCause::ExpectedRemoval {
+            self.close_cgroup_admission_at_removal(view);
+            self.settle_leader_exits_at_removal([view]);
+            if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
+                // Never at Q: no ended-PID proof is taken here.
+                self.views.remove(index);
+            }
+            self.release_view_id(view);
+            self.scan_inputs.remove(&view);
+            self.arm_expected_target_exit(view);
+        }
+        // Last: the pending entry drops only after every effect lands.
+        self.pending_retirements.remove(&view);
+        graph.consume.after_view = Some(view);
+        service
+    }
+
+    /// A Consume row error (§1.9): the graph stays at its Consume
+    /// position with intents and pending retirements kept; the first
+    /// error text is recorded with the post-install reason. A deferred
+    /// batch is re-installed first (defensive: the collected collector
+    /// never produces one); when that refuses, the boxed error is kept
+    /// with the graph instead of dropped.
+    fn fail_graph_consume_row(&mut self, graph: &mut CollectedGraph, error: anyhow::Error) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error.to_string());
+        }
+        if let Ok(mut deferred) = error.downcast::<DeferredDiscoveryItem>()
+            && let Some(batch) = deferred.terminal_batch.take()
+            && self.install_terminal_batch(batch, []).is_err()
+        {
+            graph.retained_error = Some(deferred.into());
+        }
+        graph.verdict = Some(Verdict::RefusedRetained);
+        self.collected_graph_refusal
+            .get_or_insert("terminal graph disposition failed after install");
+    }
+
+    /// Reclaim (§1.6): one sub-stage per credit, each up to `GRAPH_STRIDE`
+    /// leaves: the plan cursor, the rebind cursor against the installed
+    /// pins, the pins cursor, the removed/claim/table/raw leftovers, and
+    /// finally the retired backing — then Done. A cursor refusal forgets
+    /// the unprovable graph (§1.9) while Finish continues.
+    fn step_graph_reclaim(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        loop {
+            match graph.reclaim_step {
+                0 => match graph.plan.reclaim(GRAPH_STRIDE) {
+                    Ok(GraphStep::Ready) => {
+                        graph.reclaim_step = 1;
+                        return Self::graph_idle(true);
+                    }
+                    Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                    Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                    Err(error) => {
+                        self.forget_graph_reclaim(graph, format!("{error:?}"));
+                        return Self::graph_idle(true);
+                    }
+                },
+                1 => {
+                    let handoff = match graph.handoff.as_mut() {
+                        Some(handoff) => handoff,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a retired-file handoff".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    match graph.rebind.reclaim_installed(
+                        &mut graph.pins,
+                        &self.pinned,
+                        handoff,
+                        reserve,
+                        GRAPH_STRIDE,
+                    ) {
+                        Ok(GraphStep::Ready) => {
+                            graph.reclaim_step = 2;
+                            return Self::graph_idle(true);
+                        }
+                        Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                        Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                        Err(error) => {
+                            self.forget_graph_reclaim(graph, format!("{error:?}"));
+                            return Self::graph_idle(true);
+                        }
+                    }
+                }
+                2 => {
+                    let handoff = match graph.handoff.as_mut() {
+                        Some(handoff) => handoff,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a retired-file handoff".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    let selection = match graph.selection.as_ref() {
+                        Some(selection) => selection,
+                        None => {
+                            self.forget_graph_reclaim(
+                                graph,
+                                "reclaim without a sealed selection".into(),
+                            );
+                            return Self::graph_idle(true);
+                        }
+                    };
+                    match graph.pins.reclaim_installed(
+                        &self.pinned,
+                        selection,
+                        handoff,
+                        reserve,
+                        GRAPH_STRIDE,
+                    ) {
+                        Ok(GraphStep::Ready) => {
+                            graph.reclaim_step = 3;
+                            return Self::graph_idle(true);
+                        }
+                        Ok(GraphStep::Advanced) => return Self::graph_idle(true),
+                        Ok(GraphStep::Yielded) => return Self::graph_idle(false),
+                        Err(error) => {
+                            self.forget_graph_reclaim(graph, format!("{error:?}"));
+                            return Self::graph_idle(true);
+                        }
+                    }
+                }
+                3 => {
+                    if graph.removed_rows.is_empty() {
+                        graph.reclaim_step = 4;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.removed_rows.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.removed_rows.is_empty() {
+                        graph.reclaim_step = 4;
+                    }
+                    return Self::graph_idle(true);
+                }
+                4 => {
+                    if graph.old_claims.is_empty() {
+                        graph.reclaim_step = 5;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_claims.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_claims.is_empty() {
+                        graph.reclaim_step = 5;
+                    }
+                    return Self::graph_idle(true);
+                }
+                5 => {
+                    if graph.old_tables.is_empty() {
+                        graph.reclaim_step = 6;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_tables.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_tables.is_empty() {
+                        graph.reclaim_step = 6;
+                    }
+                    return Self::graph_idle(true);
+                }
+                6 => {
+                    if graph.raw_rows.is_empty() {
+                        graph.reclaim_step = 7;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.raw_rows.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.raw_rows.is_empty() {
+                        graph.reclaim_step = 7;
+                    }
+                    return Self::graph_idle(true);
+                }
+                _ => {
+                    drop(graph.retired_backing.take());
+                    graph.phase = GraphPhase::Done;
+                    return Self::graph_idle(true);
                 }
             }
         }
+    }
+
+    /// A Reclaim refusal (§1.9): the first error text is kept, the
+    /// disclosure ships once per Engine, the handoff moves to the Engine
+    /// chain, the forgotten counter bumps, and the graph is marked for
+    /// process-lifetime retention while Finish continues (not a refusal).
+    fn forget_graph_reclaim(&mut self, graph: &mut CollectedGraph, error: String) {
+        if graph.first_error.is_none() {
+            graph.first_error = Some(error);
+        }
+        self.mark_partial(
+            "collected graph reclamation",
+            "a retired graph buffer could not be proven reclaimable; it is retained until process exit",
+        );
+        if let Some(mut handoff) = graph.handoff.take() {
+            handoff.prev = self.retired_files.take();
+            self.retired_files = Some(handoff);
+        }
+        self.collected_graph_reclaim_forgotten =
+            self.collected_graph_reclaim_forgotten.saturating_add(1);
+        graph.reclaim_forgotten = true;
     }
 
     /// One bounded service of originals already transferred from the actual
@@ -23157,7 +23963,14 @@ impl Engine {
             if create {
                 match reserve.reserve(size_of::<CollectedGraph>() + OWNED_ALLOCATION_PADDING) {
                     Ok(storage) => {
-                        self.collected_graph = Some(Box::new(CollectedGraph::new(storage)));
+                        // A fresh graph starts at the current input
+                        // generation: the constructor zero would
+                        // false-mismatch the Freeze epoch check after any
+                        // earlier graph mutated the inputs (Install step 9),
+                        // refusing and stalling every later graph at Freeze.
+                        let mut graph = Box::new(CollectedGraph::new(storage));
+                        graph.epoch = self.graph_inputs_epoch;
+                        self.collected_graph = Some(graph);
                         self.collected_graph_requested = false;
                         #[cfg(test)]
                         {

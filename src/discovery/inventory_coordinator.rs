@@ -1044,10 +1044,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.tail_stats()
     }
 
-    /// Inert skeleton: T4b delegates to the Engine's retired-file chain.
-    #[allow(dead_code)] // Skeleton: the T4b implementation commit drops this.
-    pub(crate) fn close_retired_graph_files(&mut self, _max: usize) -> bool {
-        false
+    /// Closes up to `max` retired graph files (§1.8); `true` when the
+    /// chain is empty. The lane calls this while opening the next graph
+    /// batch so no synchronous close joins a graph credit.
+    // consumed by T12a: called when the next graph batch opens.
+    #[allow(dead_code)]
+    pub(crate) fn close_retired_graph_files(&mut self, max: usize) -> bool {
+        self.engine.close_retired_files(max)
     }
 
     /// Fixture transport replacement only: processing still uses this
@@ -1204,7 +1207,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 || progress.pending
                 || staged.len() != 0
                 || after.consumer != q.discovery_stop(),
-            failed: false,
+            failed: self.engine.collected_graph_refused().is_some(),
         })
     }
 
@@ -1346,7 +1349,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 || progress.pending
                 || session.staged_discovery_len() != 0
                 || after.consumer != q.discovery_stop(),
-            failed: false,
+            failed: self.engine.collected_graph_refused().is_some(),
         })
     }
 

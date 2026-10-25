@@ -39,6 +39,24 @@ missed, with no marker in the output; restarting such processes is the
 workaround, and the kernel identity backend does not help (full entry
 below).
 
+A `profile` or `trace` output has no per-run marker for calls made
+before a provider's probes landed, so a missed early burst reads the
+same as no calls. Inside a nested PID namespace (a kind node, a
+hostPID pod) a newly started process waits for the full discovery
+sweep, up to about 7 s, before its provider is attached. A late
+provider whose calls finished before its watch began shows that
+unwatched window in the JSON (`first_seen_ns` earlier than
+`since_ns`).
+
+Container checks run for v0.5.0, each counted against an independent
+call ledger: Docker shared image layers and copy-up (Linux 7.0, and
+Fedora on Linux 7.2.9 with a private Docker daemon), the kind
+DaemonSet, `attach-pod` into a kind pod from the node, a pre-attached
+provider in a newly created pod, a Knative pod scaled from zero, and a
+node-wide late provider that stays a reported boundary. They use one
+kind node; multi-node clusters, CRI-O and the cgroupfs driver are
+still not exercised.
+
 Continuous runs are qualified for up to 30 minutes; longer runs (4 h,
 24 h) are not qualified yet. The startup and stop figures above are
 declared per kernel, not a product guarantee.

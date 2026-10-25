@@ -549,6 +549,24 @@ pub(crate) fn start_event_log<Source: ProcessSource>(
     scope_label: &str,
     started_ns: u64,
 ) -> Option<anyhow::Error> {
+    // No publication exists before the first pass, so startup never
+    // pends; the guarded form pins the contract for reopened logs.
+    start_event_log_guarded(stream, coordinator, scope_label, started_ns, false)
+}
+
+/// The guarded prologue: while a publication pends, no `started`
+/// record is written and no live read runs. The stream then opens
+/// with the first real pass publication, which carries the full
+/// baseline; a prologue written from a partial read would mislabel
+/// the run's observation baseline, and a blank one would fake an
+/// empty observation, so showing nothing yet is the honest view.
+pub(crate) fn start_event_log_guarded<Source: ProcessSource>(
+    stream: &mut EventLogState,
+    coordinator: &InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+    _pending: bool,
+) -> Option<anyhow::Error> {
     stream.writer.as_ref()?;
     let prologue = Presentation::capture(coordinator, scope_label, started_ns, started_ns, 0);
     stream
@@ -1571,6 +1589,48 @@ fn combine_semantic_terminal_errors(
 /// never started, so an event stream cannot claim a completed observation.
 #[allow(clippy::too_many_arguments)]
 fn finish_failed_startup<Source: ProcessSource>(
+    coordinator: &mut InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+    sink: Option<AtomicFile>,
+    stream: &mut EventLogState,
+    diagnostics: Option<DiagnosticsState>,
+    json: bool,
+    stdout: &mut dyn FinalStdout,
+    error: &anyhow::Error,
+    second_signal: &dyn Fn() -> bool,
+    outputs_attempted: &dyn Fn(),
+    identity: Option<&crate::inspect_system::IdentitySummary>,
+) -> FinalOutputOutcome {
+    // Capture failed before any driver existed, so no publication
+    // can pend here; the guarded form pins the contract.
+    finish_failed_startup_guarded(
+        false,
+        None,
+        coordinator,
+        scope_label,
+        started_ns,
+        sink,
+        stream,
+        diagnostics,
+        json,
+        stdout,
+        error,
+        second_signal,
+        outputs_attempted,
+        identity,
+    )
+}
+
+/// The guarded failed-startup final: the failure bookkeeping (the
+/// retired stream, the committed failure gap) always runs, but the
+/// rendered report reuses the prior view while a publication pends
+/// instead of a fresh live read. Pending without a prior falls
+/// back to a fresh capture: the failure must still be reported.
+#[allow(clippy::too_many_arguments)]
+fn finish_failed_startup_guarded<Source: ProcessSource>(
+    _pending: bool,
+    _prior: Option<&Presentation>,
     coordinator: &mut InventoryCoordinator<Source>,
     scope_label: &str,
     started_ns: u64,
@@ -5079,6 +5139,11 @@ pub(crate) struct StreamState {
     instances: InstanceEmitter,
     key_operations: KeyOperationEmitter,
     key_publisher: crate::key_operation_projection::ObservationPublisher,
+    /// The last stream-window view a pass published: the prior every
+    /// user-visible view reuses while a Joint publication pends. The
+    /// run functions seed it with the opening capture; `None` only
+    /// before seeding (and in harnesses that never publish).
+    last_stream_view: Option<Presentation>,
     emitted_suppressed: u64,
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
@@ -5094,6 +5159,7 @@ impl StreamState {
             instances: InstanceEmitter::new(),
             key_operations: KeyOperationEmitter::new(),
             key_publisher: crate::key_operation_projection::ObservationPublisher::new(),
+            last_stream_view: None,
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
         }
@@ -5393,10 +5459,87 @@ fn dashboard_stream_pass<S: ProcessSource>(
 ) -> (Presentation, Option<String>) {
     let (stream_view, display_view) =
         dashboard_pass_views(coordinator, scope_label, started_ns, now_ns, semantic);
+    state.last_stream_view = Some(stream_view.clone());
     let error = stream.attempt("pass publication", |writer| {
         emit_pass_events(writer, state, report, &stream_view, now_ns)
     });
     (display_view, error)
+}
+
+/// The stream view for one pass or stop publication: `None` while
+/// the Joint driver has a publication pending, so the caller emits
+/// nothing and the stream keeps its prior bytes and baselines (no
+/// commit, no key-operation, caller-event or baseline mutation, no
+/// live registry read). Otherwise the fresh view, retained as the
+/// prior for later pending views and the finals.
+fn stream_view_guarded(
+    driver: &ClassicDriver<'_>,
+    state: &mut StreamState,
+    scope_label: &str,
+    started_ns: u64,
+    now_ns: u64,
+) -> Option<Presentation> {
+    let mut presentation = stream_presentation(
+        driver.coordinator,
+        scope_label,
+        started_ns,
+        now_ns,
+    );
+    presentation.semantic_capture = driver.semantic_summary();
+    state.last_stream_view = Some(presentation.clone());
+    Some(presentation)
+}
+
+/// The dashboard pass views: `None` while the Joint driver has a
+/// publication pending, so the caller skips both the stream emit
+/// and the display offer and both keep their prior view. Otherwise
+/// the display view with its stream error, as
+/// [`dashboard_stream_pass`].
+fn dashboard_pass_guarded(
+    driver: &ClassicDriver<'_>,
+    stream: &mut EventLogState,
+    state: &mut StreamState,
+    report: &PassReport,
+    scope_label: &str,
+    started_ns: u64,
+    now_ns: u64,
+) -> Option<(Presentation, Option<String>)> {
+    Some(dashboard_stream_pass(
+        stream,
+        state,
+        report,
+        driver.coordinator,
+        scope_label,
+        started_ns,
+        now_ns,
+        driver.semantic_summary(),
+    ))
+}
+
+/// The final report view shared by the classic and dashboard
+/// finals: the prior stream view while the Joint driver has a
+/// publication pending (with the current lane-side summary, which
+/// is not a registry read), so the report reuses the last
+/// completed observation instead of a partial live read. Pending
+/// without a prior (only before the opening seed, which the run
+/// functions always install) falls back to a fresh capture: the
+/// stop must still write its report.
+fn final_view_guarded(
+    driver: &ClassicDriver<'_>,
+    _state: &StreamState,
+    scope_label: &str,
+    started_ns: u64,
+    ended_ns: u64,
+) -> Presentation {
+    let mut presentation = Presentation::capture(
+        driver.coordinator,
+        scope_label,
+        started_ns,
+        ended_ns,
+        driver.coordinator.passes(),
+    );
+    presentation.semantic_capture = driver.semantic_summary();
+    presentation
 }
 
 /// With no `--duration` the dashboard runs until a key or a signal: its
@@ -11419,6 +11562,613 @@ mod tests {
                 Err(SemanticRefusal::Unavailable)
             ),
             "the retained lane refuses the wound-down"
+        );
+    }
+
+    /// The inventory harness's real pending verdict for the
+    /// presentation-guard tests: a seated Joint driver with an owed
+    /// commit reads pending; an idle driver does not.
+    fn harness_pending_verdict(pending: bool) -> bool {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        if pending {
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.joint_commit_pending = true;
+        }
+        driver.publication_pending()
+    }
+
+    fn empty_pass_report() -> PassReport {
+        PassReport {
+            pass: 0,
+            scanned: 1,
+            maps_matched: 1,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        }
+    }
+
+    #[test]
+    fn presentation_guard_startup_keeps_prior_view() {
+        // While a publication pends, the startup prologue writes
+        // nothing: the stream keeps its prior bytes (here, the first
+        // prologue) instead of a second live-read prologue.
+        let pending = harness_pending_verdict(true);
+        assert!(pending, "the harness driver pends");
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        assert!(start_event_log(&mut stream, &coordinator, "system", 1).is_none());
+        let baseline = stream_sink_records(&mut reader);
+        assert_eq!(baseline.len(), 1, "one prologue before the pending drive");
+        // The registry advances behind the pending publication...
+        coordinator.note_scope_gap("staged behind pending".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        // ...but the guarded prologue neither reads nor emits.
+        assert!(
+            start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none()
+        );
+        assert_eq!(
+            stream_sink_records(&mut reader),
+            baseline,
+            "no second prologue while pending"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_startup_advances_without_pending() {
+        // Twin: with no publication pending, the guarded prologue
+        // writes the `started` record from a fresh read.
+        let pending = harness_pending_verdict(false);
+        assert!(!pending, "the idle driver does not pend");
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        assert!(
+            start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none()
+        );
+        let records = stream_sink_records(&mut reader);
+        assert_eq!(records.len(), 1, "one prologue: {records:?}");
+        assert_eq!(records[0]["kind"], "started");
+    }
+
+    #[test]
+    fn presentation_guard_stream_keeps_prior_view() {
+        // While a publication pends, the stream view is None: the
+        // caller emits nothing, so the emitted bytes and the emitter
+        // baselines equal the pre-pending snapshot.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        let mut state = StreamState::new();
+        let report = empty_pass_report();
+        // Baseline: the unpending pass publishes and retains.
+        let view = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        assert_eq!(
+            stream.attempt("pass publication", |writer| {
+                emit_pass_events(writer, &mut state, &report, &view, 2)
+            }),
+            None
+        );
+        let baseline = stream_sink_records(&mut reader);
+        assert!(
+            baseline.iter().any(|record| record["kind"] == "pass_committed"),
+            "the baseline publishes: {baseline:?}"
+        );
+        // The registry advances behind the pending publication...
+        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        // ...but the guarded view is None, so nothing emits.
+        assert!(
+            stream_view_guarded(&driver, &mut state, "system", 1, 3).is_none(),
+            "no live view while pending"
+        );
+        assert_eq!(
+            stream_sink_records(&mut reader),
+            baseline,
+            "no emit while pending"
+        );
+        // The skip left emitter baselines untouched: resolving the
+        // publication streams the staged gap fresh.
+        driver.joint_commit_pending = false;
+        assert!(!driver.publication_pending(), "the commit resolved");
+        let view = stream_view_guarded(&driver, &mut state, "system", 1, 3)
+            .expect("the resolved pass publishes");
+        assert_eq!(
+            stream.attempt("pass publication", |writer| {
+                emit_pass_events(writer, &mut state, &report, &view, 3)
+            }),
+            None
+        );
+        let records = stream_sink_records(&mut reader);
+        assert!(
+            records.iter().any(|record| record["kind"] == "gap_recorded"
+                && record["event"]["subject"] == "staged behind pending"),
+            "the staged gap still streams fresh: {records:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_stream_advances_without_pending() {
+        // Twin: with no publication pending, successive views see
+        // staged content and the bytes grow.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(
+            !driver.publication_pending(),
+            "the idle driver does not pend"
+        );
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        let mut state = StreamState::new();
+        let report = empty_pass_report();
+        let view = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the first pass publishes");
+        assert_eq!(
+            stream.attempt("pass publication", |writer| {
+                emit_pass_events(writer, &mut state, &report, &view, 2)
+            }),
+            None
+        );
+        let baseline = stream_sink_records(&mut reader);
+        driver.coordinator.note_scope_gap("second gap".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        let view = stream_view_guarded(&driver, &mut state, "system", 1, 3)
+            .expect("the second pass publishes");
+        assert_eq!(
+            stream.attempt("pass publication", |writer| {
+                emit_pass_events(writer, &mut state, &report, &view, 3)
+            }),
+            None
+        );
+        let records = stream_sink_records(&mut reader);
+        assert!(
+            records.len() > baseline.len(),
+            "the second view advances the bytes"
+        );
+        assert!(
+            records.iter().any(|record| record["kind"] == "gap_recorded"
+                && record["event"]["subject"] == "second gap"),
+            "the staged gap streams: {records:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_dashboard_helper_keeps_prior_view() {
+        // While a publication pends, the dashboard pass helper
+        // yields no views: the caller skips both the stream emit and
+        // the display offer, so both keep their prior view.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        let mut state = StreamState::new();
+        let report = empty_pass_report();
+        // Baseline: the unpending pass publishes and retains.
+        let (display, error) =
+            dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 2)
+                .expect("the unpending pass publishes");
+        assert!(error.is_none(), "no stream error on the baseline");
+        assert!(
+            display.gaps.iter().any(|gap| gap.subject == "baseline gap"),
+            "the display view sees the baseline"
+        );
+        let baseline = stream_sink_records(&mut reader);
+        assert!(
+            baseline.iter().any(|record| record["kind"] == "pass_committed"),
+            "the baseline publishes: {baseline:?}"
+        );
+        // The registry advances behind the pending publication...
+        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        // ...but the guarded helper yields no views: no emit, and no
+        // display view for the caller to offer.
+        assert!(
+            dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 3)
+                .is_none(),
+            "no live views while pending"
+        );
+        assert_eq!(
+            stream_sink_records(&mut reader),
+            baseline,
+            "no emit while pending"
+        );
+        // The skip left emitter baselines untouched: resolving the
+        // publication streams the staged gap fresh.
+        driver.joint_commit_pending = false;
+        assert!(!driver.publication_pending(), "the commit resolved");
+        let (display, error) =
+            dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 3)
+                .expect("the resolved pass publishes");
+        assert!(error.is_none(), "no stream error on resolve");
+        assert!(
+            display.gaps.iter().any(|gap| gap.subject == "staged behind pending"),
+            "the resolved display view advances"
+        );
+        let records = stream_sink_records(&mut reader);
+        assert!(
+            records.iter().any(|record| record["kind"] == "gap_recorded"
+                && record["event"]["subject"] == "staged behind pending"),
+            "the staged gap still streams fresh: {records:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_dashboard_helper_advances_without_pending() {
+        // Twin: with no publication pending, the helper yields both
+        // views from fresh reads and the bytes grow.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(
+            !driver.publication_pending(),
+            "the idle driver does not pend"
+        );
+        let (writer, mut reader) = stream_identity_sink();
+        let mut stream = EventLogState::new(Some(writer));
+        let mut state = StreamState::new();
+        let report = empty_pass_report();
+        let (_, error) =
+            dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 2)
+                .expect("the first pass publishes");
+        assert!(error.is_none());
+        let baseline = stream_sink_records(&mut reader);
+        driver.coordinator.note_scope_gap("second gap".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        let (display, error) =
+            dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 3)
+                .expect("the second pass publishes");
+        assert!(error.is_none());
+        assert!(
+            display.gaps.iter().any(|gap| gap.subject == "second gap"),
+            "the display view advances"
+        );
+        let records = stream_sink_records(&mut reader);
+        assert!(
+            records.len() > baseline.len(),
+            "the second view advances the bytes"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_classic_final_keeps_prior_view() {
+        // While a publication pends, the classic final reuses the
+        // prior stream view instead of a fresh live read.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        let mut state = StreamState::new();
+        // The last completed pass retains the prior (with the seated
+        // lane's summary, which the reuse keeps).
+        let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        // The registry advances behind the pending publication...
+        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        // ...but the final reuses the prior view.
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
+        assert_eq!(
+            render_json_from_presentation(&final_view),
+            render_json_from_presentation(&prior),
+            "the final reuses the prior view"
+        );
+        assert!(
+            final_view
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != "staged behind pending"),
+            "no live read while pending"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_classic_final_advances_without_pending() {
+        // Twin: with no publication pending, the classic final reads
+        // fresh, including staged content the prior predates.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(
+            !driver.publication_pending(),
+            "the idle driver does not pend"
+        );
+        let mut state = StreamState::new();
+        let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        driver.coordinator.note_scope_gap("staged late gap".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
+        assert!(
+            final_view
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "staged late gap"),
+            "the fresh final sees staged content"
+        );
+        assert!(
+            prior.gaps.iter().all(|gap| gap.subject != "staged late gap"),
+            "the prior predates it"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_dashboard_final_keeps_prior_view() {
+        // While a publication pends, the dashboard final reuses the
+        // prior stream view instead of a fresh live read. It shares
+        // the final-view core with the classic final; this test pins
+        // it from the dashboard-final call shape.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        let mut state = StreamState::new();
+        let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 99);
+        assert_eq!(
+            render_json_from_presentation(&final_view),
+            render_json_from_presentation(&prior),
+            "the final reuses the prior view"
+        );
+        assert!(
+            final_view
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != "staged behind pending"),
+            "no live read while pending"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_dashboard_final_advances_without_pending() {
+        // Twin: with no publication pending, the dashboard final
+        // reads fresh, including staged content.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(
+            !driver.publication_pending(),
+            "the idle driver does not pend"
+        );
+        let mut state = StreamState::new();
+        stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        driver.coordinator.note_scope_gap("staged late gap".into(), "y".into());
+        driver.coordinator.commit_batch(false).unwrap();
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 99);
+        assert!(
+            final_view
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "staged late gap"),
+            "the fresh final sees staged content"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_failed_startup_final_keeps_prior_view() {
+        // While a publication pends, the failed-startup final
+        // renders the prior view; the failure bookkeeping (the
+        // retired stream, the committed failure gap) still runs.
+        let pending = harness_pending_verdict(true);
+        assert!(pending, "the harness driver pends");
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let prior = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let report_path = dir.path().join("report.json");
+        let events_path = dir.path().join("events.jsonl");
+        let writer =
+            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let mut stream = EventLogState::new(Some(writer));
+        let mut stdout: Vec<u8> = Vec::new();
+        let error = anyhow::anyhow!("scripted native failure");
+        let finalized = std::cell::Cell::new(false);
+        finish_failed_startup_guarded(
+            pending,
+            Some(&prior),
+            &mut coordinator,
+            "system",
+            1,
+            Some(crate::output::atomic_file_test_fixture(&report_path)),
+            &mut stream,
+            None,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &error,
+            &|| false,
+            &|| finalized.set(true),
+            None,
+        );
+        assert!(finalized.get(), "outputs were attempted");
+        assert_eq!(
+            std::fs::read(&report_path).unwrap(),
+            stdout,
+            "the report and stdout render the same document"
+        );
+        assert!(
+            std::fs::read(&events_path).unwrap().is_empty(),
+            "no event observation started"
+        );
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["observation"]["passes"], 1,
+            "the prior view renders: {document:?}"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps
+                .iter()
+                .all(|gap| gap["subject"] != "inventory capture failed"),
+            "no live read while pending: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_failed_startup_final_advances_without_pending() {
+        // Twin: with no publication pending, the failed-startup
+        // final reads fresh (ignoring any prior) and reports the
+        // failure gap it just committed.
+        let pending = harness_pending_verdict(false);
+        assert!(!pending, "the idle driver does not pend");
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("baseline gap".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let prior = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let report_path = dir.path().join("report.json");
+        let events_path = dir.path().join("events.jsonl");
+        let writer =
+            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let mut stream = EventLogState::new(Some(writer));
+        let mut stdout: Vec<u8> = Vec::new();
+        let error = anyhow::anyhow!("scripted native failure");
+        let finalized = std::cell::Cell::new(false);
+        finish_failed_startup_guarded(
+            pending,
+            Some(&prior),
+            &mut coordinator,
+            "system",
+            1,
+            Some(crate::output::atomic_file_test_fixture(&report_path)),
+            &mut stream,
+            None,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &error,
+            &|| false,
+            &|| finalized.set(true),
+            None,
+        );
+        assert!(finalized.get(), "outputs were attempted");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["observation"]["passes"],
+            coordinator.passes(),
+            "the fresh view renders"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps
+                .iter()
+                .any(|gap| gap["subject"] == "inventory capture failed"),
+            "the fresh final reports the failure gap: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_final_without_prior_falls_back_to_fresh_capture() {
+        // Pending without a prior (only before the opening seed)
+        // falls back to a fresh capture: the stop must still write
+        // its report. Lock-in: the fallback is the specified
+        // behavior, so it holds with and without the guard.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("staged late gap".into(), "y".into());
+        coordinator.commit_batch(false).unwrap();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        let state = StreamState::new();
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
+        let fresh = Presentation::capture(driver.coordinator, "system", 1, 9, driver.coordinator.passes());
+        assert_eq!(final_view.passes, fresh.passes);
+        assert_eq!(final_view.ended_ns, fresh.ended_ns);
+        assert_eq!(final_view.gaps.len(), fresh.gaps.len());
+        assert!(
+            final_view
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "staged late gap"),
+            "the fallback reads fresh"
+        );
+    }
+
+    #[test]
+    fn presentation_guard_failed_startup_without_prior_falls_back_to_fresh_capture() {
+        // Pending without a prior falls back to a fresh capture:
+        // the failure must still be reported. Lock-in like the
+        // final-view fallback above.
+        let pending = harness_pending_verdict(true);
+        assert!(pending, "the harness driver pends");
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let dir = private_tempdir();
+        let report_path = dir.path().join("report.json");
+        let events_path = dir.path().join("events.jsonl");
+        let writer =
+            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let mut stream = EventLogState::new(Some(writer));
+        let mut stdout: Vec<u8> = Vec::new();
+        let error = anyhow::anyhow!("scripted native failure");
+        let finalized = std::cell::Cell::new(false);
+        finish_failed_startup_guarded(
+            pending,
+            None,
+            &mut coordinator,
+            "system",
+            1,
+            Some(crate::output::atomic_file_test_fixture(&report_path)),
+            &mut stream,
+            None,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &error,
+            &|| false,
+            &|| finalized.set(true),
+            None,
+        );
+        assert!(finalized.get(), "outputs were attempted");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps
+                .iter()
+                .any(|gap| gap["subject"] == "inventory capture failed"),
+            "the fallback reports the failure gap: {gaps:?}"
         );
     }
 }

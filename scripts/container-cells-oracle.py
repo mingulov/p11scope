@@ -8,11 +8,15 @@ see --self-test and tests/python/test_container_cells_oracle.py.
 
 D1 expectations follow the R4 per-lane overlay outcome table
 (plans/2026-10-24-v050-r4-identity.md, "Per-lane overlay outcome table"):
-pre-copy-up both backends attribute both containers (parity); post-copy-up on
-lane B the kernel refuses the upper mapping with a named identity loss while
-userspace still joins it (D-C7-3, disclosed in docs/known-limitations.md
-"Overlay xino/copy-up identity divergences (D-C7-2/D-C7-3)"), and on lane A
-neither backend joins it (parity none, disclosed). The observer runs on the
+pre-copy-up both backends attribute both containers (parity). The row "upper
+mapper after copy-up, anchor opened before" needs captures that span the
+copy-up: they pin B's provider from B's first (lower) mapper, then a second
+process in B maps the upper copy. On lane B the kernel refuses that mapping
+with a named identity loss while userspace still joins it (D-C7-3, disclosed
+in docs/known-limitations.md "Overlay xino/copy-up identity divergences
+(D-C7-2/D-C7-3)"); on lane A neither backend joins it (parity none,
+disclosed). Fresh captures after B restarts open their anchor from the upper
+copy, so on lane B both backends attribute B exactly. The observer runs on the
 host in the initial PID namespace, so no pid_namespace cause is allowed.
 """
 import argparse
@@ -135,24 +139,30 @@ def has_identity_loss(gaps):
     return [g for g in gaps if "identity_mismatch" in g.get("reason", "")]
 
 
-def copy_up(pre_kernel, pre_userspace, post_kernel, post_userspace,
-            pre_profile_a, pre_profile_b, post_profile_b,
-            pid_a, pid_b_pre, pid_b_post, iters_a, iters_b, lane, dc73_note,
+def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
+            fresh_kernel, fresh_userspace, pre_profile_a, pre_profile_b, post_profile_b,
+            pid_a, pid_b_pre, pid_b_span, pid_b_post, iters_a, iters_b, lane, dc73_note,
             module_suffix=PROVIDER):
-    """D1: pre parity on both backends, post per the R4 row for `lane`.
+    """D1: pre parity on both backends, the spanning row per `lane`, fresh exactness.
 
-    Post runs only three captures (the plan's d1-post-*): both inventory
-    backends plus the restarted B profile. A is the unchanged control: its
-    ledger ran once pre-copy-up, and post it is pinned by both inventories.
+    pid_b_pre is B's first process (lower mapper, alive through the span);
+    pid_b_span is the second process in B that maps the upper copy inside the
+    span; pid_b_post is B's main process after the restart. A is the
+    unchanged control: its ledger ran once pre-copy-up, and later it is pinned
+    by every inventory.
     """
     assert lane in ("A", "B"), lane
-    for label, document in (("pre-kernel", pre_kernel), ("pre-userspace", pre_userspace),
-                            ("post-kernel", post_kernel), ("post-userspace", post_userspace)):
+    documents = (("pre-kernel", pre_kernel), ("pre-userspace", pre_userspace),
+                 ("span-kernel", span_kernel), ("span-userspace", span_userspace),
+                 ("fresh-kernel", fresh_kernel), ("fresh-userspace", fresh_userspace))
+    for label, document in documents:
         require_initial_observer(document, label)
     pre_k_pid, pre_k_edges = inventory_maps(pre_kernel, module_suffix)
     pre_u_pid, pre_u_edges = inventory_maps(pre_userspace, module_suffix)
-    post_k_pid, post_k_edges = inventory_maps(post_kernel, module_suffix)
-    post_u_pid, post_u_edges = inventory_maps(post_userspace, module_suffix)
+    span_k_pid, span_k_edges = inventory_maps(span_kernel, module_suffix)
+    span_u_pid, span_u_edges = inventory_maps(span_userspace, module_suffix)
+    fresh_k_pid, fresh_k_edges = inventory_maps(fresh_kernel, module_suffix)
+    fresh_u_pid, fresh_u_edges = inventory_maps(fresh_userspace, module_suffix)
 
     # Pre: both backends show edges for A and B to the provider, with no
     # named identity loss (exact parity, non-vacuous).
@@ -166,42 +176,65 @@ def copy_up(pre_kernel, pre_userspace, post_kernel, post_userspace,
     require_profile_exact(pre_profile_b, iters_b, "pre-profile-b", module_suffix)
 
     # Vacuity guard: the kernel backend results must differ across the
-    # copy-up (pre edge, post no-edge plus named loss). Identical results
+    # copy-up (pre edge, span no-edge plus named loss). Identical results
     # mean the copy-up never happened or was never observed.
     pre_fingerprint = (pid_b_pre in pre_k_edges,
                        bool(has_identity_loss(gaps_for(pre_kernel, pre_k_pid, pid_b_pre))))
-    post_fingerprint = (pid_b_post in post_k_edges,
-                        bool(has_identity_loss(gaps_for(post_kernel, post_k_pid, pid_b_post))))
+    span_fingerprint = (pid_b_span in span_k_edges,
+                        bool(has_identity_loss(gaps_for(span_kernel, span_k_pid, pid_b_span))))
     assert pre_fingerprint == (True, False), ("pre-kernel", pre_fingerprint)
-    assert pre_fingerprint != post_fingerprint, ("vacuity: pre/post kernel results identical",
-                                                 pre_fingerprint, post_fingerprint)
+    assert pre_fingerprint != span_fingerprint, ("vacuity: pre/span kernel results identical",
+                                                 pre_fingerprint, span_fingerprint)
 
-    # Post, both lanes: A stays exact; B's new mapping is scanned (in
-    # callers) so "no edge" cannot mean "never seen".
-    assert pid_a in post_k_edges, ("post-kernel", pid_a, sorted(post_k_edges))
-    assert pid_a in post_u_edges, ("post-userspace", pid_a, sorted(post_u_edges))
-    assert pid_b_post in post_k_pid.values(), ("post-kernel unscanned", pid_b_post)
-    assert pid_b_post in post_u_pid.values(), ("post-userspace unscanned", pid_b_post)
-    # Post kernel, both lanes: NO edge for B's new mapping plus a named loss.
-    assert pid_b_post not in post_k_edges, ("post-kernel claims exact attribution "
-                                            "across the copy-up", pid_b_post)
-    assert has_identity_loss(gaps_for(post_kernel, post_k_pid, pid_b_post)), \
-        ("post-kernel names no loss for B", pid_b_post)
+    # Span, both lanes: A and B's lower mapper stay exact; the upper mapper
+    # is scanned (in callers) so "no edge" cannot mean "never seen".
+    for label, pid_of, edges, document in (
+            ("span-kernel", span_k_pid, span_k_edges, span_kernel),
+            ("span-userspace", span_u_pid, span_u_edges, span_userspace)):
+        assert pid_a in edges, (label, pid_a, sorted(edges))
+        assert pid_b_pre in edges, (label, "B's lower mapper", pid_b_pre, sorted(edges))
+        assert not has_identity_loss(gaps_for(document, pid_of, pid_b_pre)), \
+            (label, "identity loss for B's lower mapper", pid_b_pre)
+        assert pid_b_span in pid_of.values(), (label, "upper mapper unscanned", pid_b_span)
+    # Span kernel, both lanes: NO edge for the upper mapper plus a named loss.
+    assert pid_b_span not in span_k_edges, ("span-kernel claims exact attribution "
+                                            "across the copy-up", pid_b_span)
+    assert has_identity_loss(gaps_for(span_kernel, span_k_pid, pid_b_span)), \
+        ("span-kernel names no loss for the upper mapper", pid_b_span)
     if lane == "B":
         # R4 lane-B row: userspace still joins the upper mapping to the stale
         # lower anchor (D-C7-3); the run log must record the disclosure.
-        assert pid_b_post in post_u_edges, ("post-userspace lost the D-C7-3 edge", pid_b_post)
-        assert "D-C7-3 applies" in dc73_note, "post-userspace edge without the D-C7-3 note"
+        assert pid_b_span in span_u_edges, ("span-userspace lost the D-C7-3 edge", pid_b_span)
+        assert "D-C7-3 applies" in dc73_note, "span-userspace edge without the D-C7-3 note"
     else:
         # R4 lane-A row: neither backend joins (parity none, disclosed).
-        assert pid_b_post not in post_u_edges, ("post-userspace joins on lane A", pid_b_post)
-        assert has_identity_loss(gaps_for(post_userspace, post_u_pid, pid_b_post)), \
-            ("post-userspace names no loss for B on lane A", pid_b_post)
+        assert pid_b_span not in span_u_edges, ("span-userspace joins on lane A", pid_b_span)
+        assert has_identity_loss(gaps_for(span_userspace, span_u_pid, pid_b_span)), \
+            ("span-userspace names no loss for the upper mapper on lane A", pid_b_span)
         assert "D-C7-3 applies" not in dc73_note, "D-C7-3 is lane-B-only"
+
+    # Fresh, after the restart: the anchor is opened from the upper copy.
+    for label, pid_of, edges, document in (
+            ("fresh-kernel", fresh_k_pid, fresh_k_edges, fresh_kernel),
+            ("fresh-userspace", fresh_u_pid, fresh_u_edges, fresh_userspace)):
+        assert pid_a in edges, (label, pid_a, sorted(edges))
+        assert pid_b_post in pid_of.values(), (label, "restarted B unscanned", pid_b_post)
+        gaps = gaps_for(document, pid_of, pid_b_post)
+        if lane == "B":
+            # Lane B keys maps by the overlay inode and the anchor names the
+            # same upper file: exact on both backends.
+            assert pid_b_post in edges, (label, "restarted B lost its edge", pid_b_post)
+            assert not has_identity_loss(gaps), (label, "identity loss for restarted B")
+        else:
+            # Lane A has no recorded row for a fresh anchor: never silent.
+            assert pid_b_post in edges or any(g.get("reason") for g in gaps), \
+                (label, "restarted B silently zero", pid_b_post)
     require_profile_exact(post_profile_b, iters_b, "post-profile-b", module_suffix)
     return {"check": "copy-up", "ok": True, "lane": lane,
             "pre": {"kernel_edges": sorted(pre_k_edges), "userspace_edges": sorted(pre_u_edges)},
-            "post": {"kernel_edges": sorted(post_k_edges), "userspace_edges": sorted(post_u_edges)}}
+            "span": {"kernel_edges": sorted(span_k_edges), "userspace_edges": sorted(span_u_edges)},
+            "fresh": {"kernel_edges": sorted(fresh_k_edges),
+                      "userspace_edges": sorted(fresh_u_edges)}}
 
 
 def late_reported(document, pid_o, pid_l, late_module, module_suffix=PROVIDER):
@@ -236,7 +269,7 @@ def late_reported(document, pid_o, pid_l, late_module, module_suffix=PROVIDER):
 
 
 def good_inventory(edges, gaps=(), observer="initial"):
-    pids = [101, 102, 103, 201, 202]
+    pids = [101, 102, 103, 104, 201, 202]
     callers = [{"id": f"c{i}", "pid": pid} for i, pid in enumerate(pids)]
     by_pid = {pid: f"c{i}" for i, pid in enumerate(pids)}
     path = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
@@ -272,25 +305,28 @@ def good_profile(iters=400):
 
 
 def good_copy_up(lane="B"):
-    gap = ("x", "identity_mismatch: mapping (0:42, 5) != opened (0:42, 6)", 103)
+    gap = ("x", "identity_mismatch: mapping (0:42, 5) != opened (0:42, 6)", 104)
     if lane == "B":
-        post_kernel = good_inventory({101: True, 102: False, 103: False}, [gap])
-        post_userspace = good_inventory({101: True, 102: False, 103: True})
+        span_kernel = good_inventory({101: True, 102: True, 104: False}, [gap])
+        span_userspace = good_inventory({101: True, 102: True, 104: True})
         note = "run log: D-C7-3 applies to the post-copy-up userspace edge"
     else:
-        post_kernel = good_inventory({101: True, 102: False, 103: False}, [gap])
-        post_userspace = good_inventory({101: True, 102: False, 103: False}, [gap])
+        span_kernel = good_inventory({101: True, 102: True, 104: False}, [gap])
+        span_userspace = good_inventory({101: True, 102: True, 104: False}, [gap])
         note = "run log: D-C7-3 does not apply on lane A"
     return {
         "pre_kernel": good_inventory({101: True, 102: True}),
         "pre_userspace": good_inventory({101: True, 102: True}),
-        "post_kernel": post_kernel,
-        "post_userspace": post_userspace,
+        "span_kernel": span_kernel,
+        "span_userspace": span_userspace,
+        "fresh_kernel": good_inventory({101: True, 103: True}),
+        "fresh_userspace": good_inventory({101: True, 103: True}),
         "pre_profile_a": good_profile(400),
         "pre_profile_b": good_profile(250),
         "post_profile_b": good_profile(250),
         "pid_a": 101,
         "pid_b_pre": 102,
+        "pid_b_span": 104,
         "pid_b_post": 103,
         "iters_a": 400,
         "iters_b": 250,
@@ -329,27 +365,43 @@ def self_test():
                             [("pid namespace", "nested", None)], observer="nested")
     mutate_copy("pre pid_namespace cause", pre_kernel=nested)
     mutate_copy("exact attribution across the copy-up",
-                post_kernel=good_inventory({101: True, 103: True}))
-    mutate_copy("post-kernel no edge without named loss",
-                post_kernel=good_inventory({101: True, 103: False}))
-    unscanned = good_inventory({101: True, 103: False},
-                               [("x", "identity_mismatch", 103)])
-    unscanned["callers"] = [c for c in unscanned["callers"] if c["pid"] != 103]
-    mutate_copy("post-kernel B unscanned", post_kernel=unscanned)
+                span_kernel=good_inventory({101: True, 102: True, 104: True}))
+    mutate_copy("span-kernel no edge without named loss",
+                span_kernel=good_inventory({101: True, 102: True, 104: False}))
+    unscanned = good_inventory({101: True, 102: True, 104: False},
+                               [("x", "identity_mismatch", 104)])
+    unscanned["callers"] = [c for c in unscanned["callers"] if c["pid"] != 104]
+    mutate_copy("span-kernel upper mapper unscanned", span_kernel=unscanned)
+    mutate_copy("span lower mapper lost its edge",
+                span_userspace=good_inventory({101: True, 102: False, 104: True}))
+    mutate_copy("span lower mapper with identity loss",
+                span_userspace=good_inventory({101: True, 102: True, 104: True},
+                                              [("x", "identity_mismatch", 102)]))
     mutate_copy("lane-B userspace lost the D-C7-3 edge",
-                post_userspace=good_inventory(
-                    {101: True, 103: False}, [("x", "identity_mismatch", 103)]))
+                span_userspace=good_inventory(
+                    {101: True, 102: True, 104: False}, [("x", "identity_mismatch", 104)]))
     mutate_copy("lane-B userspace edge without the D-C7-3 note", dc73_note="nothing recorded")
     mutate_copy("lane-A userspace joins", lane="A",
-                post_userspace=good_inventory({101: True, 103: True}))
+                span_userspace=good_inventory({101: True, 102: True, 104: True}))
     mutate_copy("lane-A claims D-C7-3", lane="A", dc73_note="D-C7-3 applies here")
     identical = good_copy_up("B")
-    mutate_copy("vacuous identical pre/post",
-                post_kernel=copy.deepcopy(identical["pre_kernel"]))
+    mutate_copy("vacuous identical pre/span",
+                span_kernel=copy.deepcopy(identical["pre_kernel"]))
     mutate_copy("post profile wrong count", post_profile_b=good_profile(249))
-    mutate_copy("A inexact post",
-                post_kernel=good_inventory({101: False, 103: False},
-                                           [("x", "identity_mismatch", 103)]))
+    mutate_copy("A inexact in the span",
+                span_kernel=good_inventory({101: False, 102: True, 104: False},
+                                           [("x", "identity_mismatch", 104)]))
+    mutate_copy("lane-B fresh kernel lost restarted B",
+                fresh_kernel=good_inventory({101: True, 103: False}))
+    mutate_copy("lane-B fresh userspace identity loss",
+                fresh_userspace=good_inventory({101: True, 103: True},
+                                               [("x", "identity_mismatch", 103)]))
+    fresh_unscanned = good_inventory({101: True})
+    fresh_unscanned["callers"] = [c for c in fresh_unscanned["callers"] if c["pid"] != 103]
+    mutate_copy("fresh restarted B unscanned", fresh_kernel=fresh_unscanned)
+    mutate_copy("lane-A fresh restarted B silently zero", lane="A",
+                fresh_userspace=good_inventory({101: True, 103: False}))
+    mutate_copy("fresh A inexact", fresh_userspace=good_inventory({101: False, 103: True}))
     refuses("unknown lane", lambda: copy_up(**{**good_copy_up("B"), "lane": "C"}))
 
     late_module = "/tmp/private/libsofthsm2.so"
@@ -403,13 +455,16 @@ def main(argv):
     copy_parser = sub.add_parser("copy-up")
     copy_parser.add_argument("--pre-kernel", required=True)
     copy_parser.add_argument("--pre-userspace", required=True)
-    copy_parser.add_argument("--post-kernel", required=True)
-    copy_parser.add_argument("--post-userspace", required=True)
+    copy_parser.add_argument("--span-kernel", required=True)
+    copy_parser.add_argument("--span-userspace", required=True)
+    copy_parser.add_argument("--fresh-kernel", required=True)
+    copy_parser.add_argument("--fresh-userspace", required=True)
     copy_parser.add_argument("--pre-profile-a", required=True)
     copy_parser.add_argument("--pre-profile-b", required=True)
     copy_parser.add_argument("--post-profile-b", required=True)
     copy_parser.add_argument("--pid-a", type=int, required=True)
     copy_parser.add_argument("--pid-b-pre", type=int, required=True)
+    copy_parser.add_argument("--pid-b-span", type=int, required=True)
     copy_parser.add_argument("--pid-b-post", type=int, required=True)
     copy_parser.add_argument("--iters-a", type=int, required=True)
     copy_parser.add_argument("--iters-b", type=int, required=True)
@@ -436,11 +491,12 @@ def main(argv):
             with open(options.dc73_note, encoding="utf-8") as handle:
                 note = handle.read()
         result = copy_up(load(options.pre_kernel), load(options.pre_userspace),
-                         load(options.post_kernel), load(options.post_userspace),
+                         load(options.span_kernel), load(options.span_userspace),
+                         load(options.fresh_kernel), load(options.fresh_userspace),
                          load(options.pre_profile_a), load(options.pre_profile_b),
                          load(options.post_profile_b), options.pid_a, options.pid_b_pre,
-                         options.pid_b_post, options.iters_a, options.iters_b,
-                         options.lane, note, options.module_suffix)
+                         options.pid_b_span, options.pid_b_post, options.iters_a,
+                         options.iters_b, options.lane, note, options.module_suffix)
         print(json.dumps(result, sort_keys=True))
     elif options.command == "late-reported":
         with open(options.file, encoding="utf-8") as handle:

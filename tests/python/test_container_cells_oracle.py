@@ -18,19 +18,19 @@ NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
          "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal")
 PROVIDER = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
 LATE_PROVIDER = "/tmp/private/libsofthsm2.so"
-PID_A, PID_B_PRE, PID_B_POST = 101, 102, 103
+PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN = 101, 102, 103, 104
 PID_O, PID_L = 201, 202
 ITERS_A, ITERS_B = 400, 250
 DC73_NOTE = "D-C7-3 applies: post-copy-up userspace edge is backend-divergent per docs/known-limitations.md"
 
 
 def inventory(edges, gaps=(), observer="initial"):
-    """One inventory v1 document over callers A/B-pre/B-post (D1) or O/L (N4).
+    """One inventory v1 document over callers A/B-pre/B-post/B-span (D1) or O/L (N4).
 
     `edges` maps pid -> bool (edge to the provider present). Callers always
     carries every pid the legs need; gaps are (subject, reason, pid|None).
     """
-    pids = [PID_A, PID_B_PRE, PID_B_POST, PID_O, PID_L]
+    pids = [PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN, PID_O, PID_L]
     callers = [{"id": f"c{i}", "pid": pid} for i, pid in enumerate(pids)]
     by_pid = {pid: f"c{i}" for i, pid in enumerate(pids)}
     return {
@@ -66,28 +66,31 @@ def profile(iters, event_loss=0, observer="initial", causes=()):
 
 
 def good_copy_up_inputs(lane="B"):
-    """Healthy D1 legs: pre parity on both backends, post per the R4 lane row."""
+    """Healthy D1 legs: pre parity, the spanning R4 lane row, fresh exactness."""
     pre_kernel = inventory({PID_A: True, PID_B_PRE: True})
     pre_userspace = inventory({PID_A: True, PID_B_PRE: True})
-    gap = ("LATE", "identity_mismatch: mapping (0:42, 5) != opened (0:42, 6)", PID_B_POST)
+    gap = ("LATE", "identity_mismatch: mapping (0:42, 5) != opened (0:42, 6)", PID_B_SPAN)
     if lane == "B":
-        post_kernel = inventory({PID_A: True, PID_B_POST: False}, [gap])
-        post_userspace = inventory({PID_A: True, PID_B_POST: True})
+        span_kernel = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False}, [gap])
+        span_userspace = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: True})
         note = DC73_NOTE
     else:
-        post_kernel = inventory({PID_A: True, PID_B_POST: False}, [gap])
-        post_userspace = inventory({PID_A: True, PID_B_POST: False}, [gap])
+        span_kernel = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False}, [gap])
+        span_userspace = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False}, [gap])
         note = "D-C7-3 does not apply on lane A (parity none, disclosed)"
     return {
         "pre_kernel": pre_kernel,
         "pre_userspace": pre_userspace,
-        "post_kernel": post_kernel,
-        "post_userspace": post_userspace,
+        "span_kernel": span_kernel,
+        "span_userspace": span_userspace,
+        "fresh_kernel": inventory({PID_A: True, PID_B_POST: True}),
+        "fresh_userspace": inventory({PID_A: True, PID_B_POST: True}),
         "pre_profile_a": profile(ITERS_A),
         "pre_profile_b": profile(ITERS_B),
         "post_profile_b": profile(ITERS_B),
         "pid_a": PID_A,
         "pid_b_pre": PID_B_PRE,
+        "pid_b_span": PID_B_SPAN,
         "pid_b_post": PID_B_POST,
         "iters_a": ITERS_A,
         "iters_b": ITERS_B,
@@ -174,46 +177,89 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(pre_kernel=pre)
 
-    def test_post_kernel_exact_across_copy_up_fails(self):
-        """The control: a naive exact-oracle over post data must FAIL."""
-        post = inventory({PID_A: True, PID_B_POST: True})
+    def test_span_kernel_exact_across_copy_up_fails(self):
+        """The control: a naive exact-oracle over the spanning data must FAIL."""
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: True})
         with self.assertRaises(AssertionError):
-            check_copy_up(post_kernel=post)
+            check_copy_up(span_kernel=span)
 
-    def test_post_kernel_missing_edge_without_gap_fails(self):
-        post = inventory({PID_A: True, PID_B_POST: False})
+    def test_span_kernel_missing_edge_without_gap_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False})
         with self.assertRaises(AssertionError):
-            check_copy_up(post_kernel=post)
+            check_copy_up(span_kernel=span)
 
-    def test_post_kernel_b_unscanned_fails(self):
-        post = inventory({PID_A: True, PID_B_POST: False})
-        post["callers"] = [c for c in post["callers"] if c["pid"] != PID_B_POST]
+    def test_span_kernel_upper_mapper_unscanned_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False},
+                         [("x", "identity_mismatch: stale", PID_B_SPAN)])
+        span["callers"] = [c for c in span["callers"] if c["pid"] != PID_B_SPAN]
         with self.assertRaises(AssertionError):
-            check_copy_up(post_kernel=post)
+            check_copy_up(span_kernel=span)
 
-    def test_post_userspace_lane_b_missing_b_edge_fails(self):
-        post = inventory({PID_A: True, PID_B_POST: False},
-                         [("x", "identity_mismatch: stale", PID_B_POST)])
+    def test_span_lower_mapper_without_edge_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: False, PID_B_SPAN: True})
         with self.assertRaises(AssertionError):
-            check_copy_up(post_userspace=post)
+            check_copy_up(span_userspace=span)
 
-    def test_post_userspace_lane_b_without_dc73_note_fails(self):
+    def test_span_lower_mapper_with_identity_loss_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: True},
+                         [("x", "identity_mismatch: stale", PID_B_PRE)])
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_userspace=span)
+
+    def test_span_userspace_lane_b_missing_upper_edge_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: False},
+                         [("x", "identity_mismatch: stale", PID_B_SPAN)])
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_userspace=span)
+
+    def test_span_userspace_lane_b_without_dc73_note_fails(self):
         with self.assertRaises(AssertionError):
             check_copy_up(dc73_note="no disclosure recorded")
 
-    def test_lane_a_post_userspace_with_b_edge_fails(self):
-        post = inventory({PID_A: True, PID_B_POST: True})
+    def test_lane_a_span_userspace_with_upper_edge_fails(self):
+        span = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: True})
         with self.assertRaises(AssertionError):
-            check_copy_up(lane="A", post_userspace=post)
+            check_copy_up(lane="A", span_userspace=span)
 
     def test_lane_a_with_dc73_note_fails(self):
         with self.assertRaises(AssertionError):
             check_copy_up(lane="A", dc73_note=DC73_NOTE)
 
-    def test_vacuous_identical_pre_post_fails(self):
+    def test_vacuous_identical_pre_span_fails(self):
         inputs = good_copy_up_inputs()
         with self.assertRaises(AssertionError):
-            check_copy_up(post_kernel=copy.deepcopy(inputs["pre_kernel"]))
+            check_copy_up(span_kernel=copy.deepcopy(inputs["pre_kernel"]))
+
+    def test_fresh_after_restart_is_the_old_post_shape_and_passes(self):
+        """The first D1 runs' post captures (fresh anchors) edge on both backends."""
+        result = check_copy_up()
+        self.assertIn(PID_B_POST, result["fresh"]["kernel_edges"])
+        self.assertIn(PID_B_POST, result["fresh"]["userspace_edges"])
+
+    def test_fresh_lane_b_restarted_b_without_edge_fails(self):
+        with self.assertRaises(AssertionError):
+            check_copy_up(fresh_kernel=inventory({PID_A: True, PID_B_POST: False}))
+
+    def test_fresh_lane_b_identity_loss_fails(self):
+        fresh = inventory({PID_A: True, PID_B_POST: True},
+                          [("x", "identity_mismatch: stale", PID_B_POST)])
+        with self.assertRaises(AssertionError):
+            check_copy_up(fresh_userspace=fresh)
+
+    def test_fresh_restarted_b_unscanned_fails(self):
+        fresh = inventory({PID_A: True})
+        fresh["callers"] = [c for c in fresh["callers"] if c["pid"] != PID_B_POST]
+        with self.assertRaises(AssertionError):
+            check_copy_up(fresh_kernel=fresh)
+
+    def test_fresh_lane_a_silent_restarted_b_fails(self):
+        with self.assertRaises(AssertionError):
+            check_copy_up(lane="A", fresh_userspace=inventory({PID_A: True, PID_B_POST: False}))
+
+    def test_fresh_lane_a_named_loss_passes(self):
+        fresh = inventory({PID_A: True, PID_B_POST: False},
+                          [("x", "identity_mismatch: stale", PID_B_POST)])
+        self.assertTrue(check_copy_up(lane="A", fresh_userspace=fresh)["ok"])
 
     def test_post_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):
@@ -223,11 +269,15 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(post_profile_b=profile(ITERS_B, event_loss=1))
 
-    def test_post_kernel_missing_a_edge_fails(self):
-        post = inventory({PID_A: False, PID_B_POST: False},
-                         [("x", "identity_mismatch: stale", PID_B_POST)])
+    def test_post_profile_b_descendant_gaps_fail(self):
         with self.assertRaises(AssertionError):
-            check_copy_up(post_kernel=post)
+            check_copy_up(post_profile_b=profile(ITERS_B, causes=("pid_descendant_gaps",)))
+
+    def test_span_kernel_missing_a_edge_fails(self):
+        span = inventory({PID_A: False, PID_B_PRE: True, PID_B_SPAN: False},
+                         [("x", "identity_mismatch: stale", PID_B_SPAN)])
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
 
     def test_unknown_lane_fails(self):
         with self.assertRaises(AssertionError):
@@ -325,6 +375,7 @@ class OracleCliTest(unittest.TestCase):
             args = ["copy-up", "--lane", inputs.pop("lane"),
                     "--pid-a", str(inputs.pop("pid_a")),
                     "--pid-b-pre", str(inputs.pop("pid_b_pre")),
+                    "--pid-b-span", str(inputs.pop("pid_b_span")),
                     "--pid-b-post", str(inputs.pop("pid_b_post")),
                     "--iters-a", str(inputs.pop("iters_a")),
                     "--iters-b", str(inputs.pop("iters_b")),
@@ -338,13 +389,14 @@ class OracleCliTest(unittest.TestCase):
 
     def test_copy_up_cli_refuses_mutation(self):
         inputs = good_copy_up_inputs()
-        inputs["post_kernel"] = inventory({PID_A: True, PID_B_POST: True})
+        inputs["span_kernel"] = inventory({PID_A: True, PID_B_PRE: True, PID_B_SPAN: True})
         with tempfile.TemporaryDirectory() as work:
             note = Path(work) / "dc73.txt"
             note.write_text(inputs.pop("dc73_note"))
             args = ["copy-up", "--lane", inputs.pop("lane"),
                     "--pid-a", str(inputs.pop("pid_a")),
                     "--pid-b-pre", str(inputs.pop("pid_b_pre")),
+                    "--pid-b-span", str(inputs.pop("pid_b_span")),
                     "--pid-b-post", str(inputs.pop("pid_b_post")),
                     "--iters-a", str(inputs.pop("iters_a")),
                     "--iters-b", str(inputs.pop("iters_b")),

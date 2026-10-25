@@ -5,10 +5,14 @@
 # Two containers A and B start from one holder image (deploy/Dockerfile.holder,
 # reused verbatim: pinned ubuntu:26.04 base, SoftHSM2, ledgered `gated` client),
 # so both map the provider through overlay lower layers. Pre-copy-up both
-# identity backends must attribute both containers exactly; after a same-bytes
-# copy-up in B only (OQ5), the kernel backend must refuse B's new mapping with
-# a named loss while userspace still joins it (D-C7-3, disclosed). The observer
-# is the host release binary run through `sudo -n` in the initial PID namespace.
+# identity backends must attribute both containers exactly. Two inventory
+# captures then span a same-bytes copy-up in B only (OQ5): they pin B's
+# provider from B's first (lower) mapper, a second process in B maps the upper
+# copy, and the kernel backend must refuse that mapping with a named loss while
+# userspace still joins it (D-C7-3, disclosed). After B restarts, fresh
+# captures open their anchor from the upper copy and attribute B exactly. The
+# observer is the host release binary run through `sudo -n` in the initial PID
+# namespace.
 #
 # The CONTROLLER runs every docker/dockerd/sudo command below. Workers only run
 # `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves the arg
@@ -25,6 +29,11 @@ PROVIDER_PATH=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 ITERS_A_DEFAULT=400
 ITERS_B_DEFAULT=250
 DURATION_DEFAULT=30
+SPAN_DEFAULT=60
+# The second mapper in B: the ledgered client on the image's own token, held
+# at a gate nobody releases (it only has to map the upper copy).
+GATED=/usr/local/bin/p11scope-ledger-gated
+B2_GATE=/tmp/gate-b2
 
 usage() {
     cat >&2 <<'EOF'
@@ -33,9 +42,10 @@ usage: scripts/docker-shared-layer-e2e.sh --host dev|fedora-private --observer B
        scripts/docker-shared-layer-e2e.sh --self-test | --help
 
   Cell D1 driver. Run modes share one flow: build (or load) the holder image,
-  start containers A and B, capture pre-copy-up evidence, copy B's provider
-  upper with identical bytes, restart B, capture post evidence, and check it
-  with scripts/container-cells-oracle.py copy-up.
+  start containers A and B, capture pre-copy-up evidence, start two
+  inventory captures that span B's same-bytes copy-up and a second mapper of
+  the upper copy, restart B, capture fresh evidence, and check it with
+  scripts/container-cells-oracle.py copy-up.
 
   --host dev            use the local docker daemon (dev host)
   --host fedora-private run ON fedora as user against a task-owned private
@@ -47,6 +57,9 @@ usage: scripts/docker-shared-layer-e2e.sh --host dev|fedora-private --observer B
   --iters-a N           ledger iterations for A (default 400)
   --iters-b N           ledger iterations for B (default 250)
   --duration S          profile capture seconds (default 30)
+  --span S              spanning inventory seconds (default 60; pass 0 takes
+                        5-10 s on a busy host and the oracle needs two passes
+                        after the second mapper is ready)
   --task-root DIR       fedora-private only: existing task root directory
   --bundle-dir DIR      fedora-private only: bundle from --bundle mode
   --work DIR            evidence directory (must not exist; default fresh 0700
@@ -131,6 +144,7 @@ self_test() {
                "--host dev --observer /bin/true --iters-a 0" \
                "--host dev --observer /bin/true --iters-b 01" \
                "--host dev --observer /bin/true --duration x" \
+               "--host dev --observer /bin/true --span 0" \
                "--host fedora-private --observer /bin/true" \
                "--host fedora-private --observer /bin/true --task-root /tmp" \
                "--host fedora-private --observer /bin/true --task-root /tmp --bundle-dir /tmp --bundle-dir /tmp" \
@@ -339,6 +353,19 @@ LEDGER one" PRIVATE=0 PATH="$stub:$PATH" wait_docker_log_count c '^LEDGER ' 2 1 
             exit 1
         fi
     done
+    # Timed-inventory passes: pass summary lines only, never progress lines.
+    WORK=$stub
+    printf '%s\n' 'p11scope: sweeping 440 process maps (cap 256)...' \
+        'p11scope: pass 0: 256 scanned (1 maps-matched; 0 native, 256 scan-pinned)' \
+        'p11scope: pass 0: 24 gaps (0 budget refusals, 0 suppressed)' \
+        'p11scope: pass 1: 254 scanned (1 maps-matched; 0 native, 254 scan-pinned)' > "$stub/span.err"
+    [ "$(pass_count span)" -eq 2 ] || { echo "pass count $(pass_count span), want 2" >&2; exit 1; }
+    [ "$(pass_count absent)" -eq 0 ] || { echo "a missing capture counted passes" >&2; exit 1; }
+    wait_passes span 999999 2 || { echo "two completed passes missed" >&2; exit 1; }
+    if wait_passes span 999999 3 >/dev/null 2>&1; then
+        echo "an exited capture waited for a third pass" >&2
+        exit 1
+    fi
     rm -rf "$stub"
     trap - EXIT
 }
@@ -579,6 +606,13 @@ prov_sha() {
     sudo -n sha256sum "/proc/$1/root$PROVIDER_PATH" | awk '{print $1}'
 }
 
+# Create a container's gate file from the host through its own root: a
+# `docker exec touch` would add short-lived processes to the captured
+# cgroup, which the capture rightly counts as pid_descendant_gaps.
+release_gate() {
+    sudo -n touch "/proc/$1/root/tmp/gate"
+}
+
 wait_docker_log() {
     i=0
     while [ "$i" -lt "$(($3 * 2))" ]; do
@@ -638,6 +672,68 @@ wait_ready() {
     return 1
 }
 
+start_inventory() {
+    obs inventory --system --identity-backend "$2" --duration "$3" --caller-metadata none \
+        -o "$4" >"$WORK/$1.out" 2>"$WORK/$1.err" &
+    CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
+    STARTED_PID=$!
+}
+
+# Completed passes of a timed inventory. It prints no capture readiness
+# line; pass 0's summary line means its anchors are held.
+pass_count() {
+    n=$(grep -c '^p11scope: pass [0-9]*: [0-9]* scanned' "$WORK/$1.err" 2>/dev/null) || true
+    printf '%s\n' "${n:-0}"
+}
+
+wait_passes() {
+    i=0
+    while [ "$i" -lt 360 ]; do
+        [ "$(pass_count "$1")" -lt "$3" ] || return 0
+        kill -0 "$2" 2>/dev/null || break
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "capture $1 completed $(pass_count "$1") passes, want $3" >&2
+    grep -v 'deep-scanning' "$WORK/$1.err" | tail -20 >&2
+    return 1
+}
+
+wait_file_line() {
+    i=0
+    while [ "$i" -lt "$(($3 * 2))" ]; do
+        grep -q "$2" "$1" 2>/dev/null && return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "$1 never printed $2" >&2
+    return 1
+}
+
+# A second process in B maps the provider after the copy-up, so it maps the
+# upper copy while B's first process keeps the lower one.
+start_second_mapper() {
+    dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH 1 200 $B2_GATE" \
+        >"$WORK/b2.log" 2>&1 &
+    CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
+}
+
+# Host PID of the process in cgroup $1 whose command line contains $2.
+pid_in_cgroup_with() {
+    for p in $(cat "$1/cgroup.procs"); do
+        if sudo -n cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ' | grep -Fq -- "$2"; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    echo "no process in $1 runs $2" >&2
+    return 1
+}
+
+maps_provider() {
+    sudo -n grep -Fq "$PROVIDER_PATH" "/proc/$1/maps"
+}
+
 build_image() {
     [ "$(grep -c "FROM $HOLDER_BASE" "$HOLDER_DOCKERFILE")" -eq 2 ] \
         || { echo "holder base pin drifted" >&2; return 1; }
@@ -690,6 +786,7 @@ TOKEN=
 ITERS_A=$ITERS_A_DEFAULT
 ITERS_B=$ITERS_B_DEFAULT
 DURATION=$DURATION_DEFAULT
+SPAN=$SPAN_DEFAULT
 TASK_ROOT=
 BUNDLE_DIR=
 WORK_OPT=
@@ -707,6 +804,7 @@ while [ "$#" -gt 0 ]; do
         --iters-a) [ "$#" -ge 2 ] || usage; ITERS_A=$2; shift 2 ;;
         --iters-b) [ "$#" -ge 2 ] || usage; ITERS_B=$2; shift 2 ;;
         --duration) [ "$#" -ge 2 ] || usage; DURATION=$2; shift 2 ;;
+        --span) [ "$#" -ge 2 ] || usage; SPAN=$2; shift 2 ;;
         --task-root) [ "$#" -ge 2 ] || usage; [ -z "$TASK_ROOT" ] || usage; TASK_ROOT=$2; shift 2 ;;
         --bundle-dir) [ "$#" -ge 2 ] || usage; [ -z "$BUNDLE_DIR" ] || usage; BUNDLE_DIR=$2; shift 2 ;;
         --work) [ "$#" -ge 2 ] || usage; [ -z "$WORK_OPT" ] || usage; WORK_OPT=$2; shift 2 ;;
@@ -751,6 +849,7 @@ valid_token "$TOKEN" || usage
 valid_count "$ITERS_A" || usage
 valid_count "$ITERS_B" || usage
 valid_count "$DURATION" || usage
+valid_count "$SPAN" || usage
 if [ "$PRIVATE" -eq 1 ]; then
     [ -n "$TASK_ROOT" ] && [ -n "$BUNDLE_DIR" ] || usage
     [ -d "$TASK_ROOT" ] || { echo "task root $TASK_ROOT is not a directory" >&2; exit 2; }
@@ -800,7 +899,7 @@ CAPTURE_PIDS=
 
 fact "cell=D1 host=$HOST token=$TOKEN date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fact "observer=$OBSERVER sha256=$(sha256sum "$OBSERVER" | awk '{print $1}')"
-fact "image=$D1_IMAGE containers=$D1_A,$D1_B iters=$ITERS_A,$ITERS_B duration=$DURATION"
+fact "image=$D1_IMAGE containers=$D1_A,$D1_B iters=$ITERS_A,$ITERS_B duration=$DURATION span=$SPAN"
 fact "kernel=$(uname -sr) $(uname -m)"
 LANE=$(lane_for_kernel "$(uname -r)") || unrun "kernel $(uname -r) has no R4 lane row"
 fact "lane=$LANE"
@@ -875,8 +974,8 @@ start_profile pre-b "$CG_B" "$DURATION" "$WORK/d1-pre-b.json"
 PID_CAP_B=$STARTED_PID
 wait_ready pre-a "$PID_CAP_A" || fail_cell "pre profile A never became ready"
 wait_ready pre-b "$PID_CAP_B" || fail_cell "pre profile B never became ready"
-dcli exec "$D1_A" touch /tmp/gate || fail_cell "gate release failed for $D1_A"
-dcli exec "$D1_B" touch /tmp/gate || fail_cell "gate release failed for $D1_B"
+release_gate "$PID_A" || fail_cell "gate release failed for $D1_A"
+release_gate "$PID_B_PRE" || fail_cell "gate release failed for $D1_B"
 wait_docker_log "$D1_A" '^LEDGER ' "$DURATION" || fail_cell "A ledger never completed"
 kill -0 "$PID_CAP_A" 2>/dev/null || fail_cell "A ledger completed outside the capture window"
 wait_docker_log "$D1_B" '^LEDGER ' "$DURATION" || fail_cell "B ledger never completed"
@@ -889,6 +988,14 @@ save_logs "$D1_B" "$WORK/logs-b-pre.txt" || fail_cell "cannot read $D1_B logs"
 ledger_is "$WORK/logs-a-pre.txt" "$ITERS_A" || fail_cell "A ledger is not 6x$ITERS_A"
 ledger_is "$WORK/logs-b-pre.txt" "$ITERS_B" || fail_cell "B ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/logs-a-pre.txt" "$WORK/logs-b-pre.txt" >>"$FACTS"
+
+say "=== spanning captures: anchors opened before the copy-up ==="
+start_inventory span-kernel kernel "$SPAN" "$WORK/d1-span-kernel.json"
+PID_SPAN_K=$STARTED_PID
+start_inventory span-userspace userspace "$SPAN" "$WORK/d1-span-userspace.json"
+PID_SPAN_U=$STARTED_PID
+wait_passes span-kernel "$PID_SPAN_K" 1 || fail_cell "spanning kernel capture never completed pass 0"
+wait_passes span-userspace "$PID_SPAN_U" 1 || fail_cell "spanning userspace capture never completed pass 0"
 
 say "=== same-bytes copy-up in B only (OQ5) ==="
 STAT_B_COPY_PRE=$(prov_stat "$PID_B_PRE") || fail_cell "cannot re-stat B provider"
@@ -906,6 +1013,32 @@ fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
 [ "$UPPER_SHA_B" = "$SHA_B_PRE" ] || fail_cell "B upper provider bytes differ (not same-bytes)"
 [ "$SHA_B_POST" = "$SHA_B_PRE" ] || fail_cell "copy-up changed bytes (not same-bytes)"
 [ "$STAT_A_CHECK" = "$STAT_A_PRE" ] || fail_cell "A provider moved during B copy-up"
+
+say "=== second mapper in B maps the upper copy ==="
+start_second_mapper
+wait_file_line "$WORK/b2.log" '^READY ' 60 || fail_cell "second mapper in $D1_B never became ready"
+PID_B2=$(pid_in_cgroup_with "$CG_B" "$B2_GATE") || fail_cell "no host pid for the second mapper"
+maps_provider "$PID_B2" || fail_cell "second mapper does not map the provider"
+maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the provider"
+STAT_B2=$(prov_stat "$PID_B2") || fail_cell "cannot stat the second mapper's provider"
+SPAN_K0=$(pass_count span-kernel)
+SPAN_U0=$(pass_count span-userspace)
+fact "pid-b2=$PID_B2 stat-b2=$STAT_B2 span-passes-at-b2-ready=$SPAN_K0,$SPAN_U0"
+wait_passes span-kernel "$PID_SPAN_K" "$((SPAN_K0 + 2))" \
+    || fail_cell "spanning kernel capture ran fewer than two passes after the second mapper"
+wait_passes span-userspace "$PID_SPAN_U" "$((SPAN_U0 + 2))" \
+    || fail_cell "spanning userspace capture ran fewer than two passes after the second mapper"
+if ! maps_provider "$PID_B2" || ! maps_provider "$PID_B_PRE"; then
+    fail_cell "a B mapper stopped mapping the provider inside the span"
+fi
+wait "$PID_SPAN_K" || fail_cell "spanning kernel capture failed"
+wait "$PID_SPAN_U" || fail_cell "spanning userspace capture failed"
+for span in d1-span-kernel d1-span-userspace; do
+    reclaim_root_output "$WORK/$span.json" || fail_cell "cannot reclaim $span"
+    python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/$span.json" \
+        || fail_cell "$span is not valid JSON"
+done
+fact "span-passes-total=$(pass_count span-kernel),$(pass_count span-userspace)"
 
 say "=== restart B so it maps the upper copy ==="
 dcli restart "$D1_B" >/dev/null || fail_cell "restart failed for $D1_B"
@@ -927,13 +1060,13 @@ fact "pid-b-post=$PID_B_POST cgroup-b-post=$CG_B_POST stat-b-restart=$STAT_B_RES
 [ "$UPPER_STAT_B_RESTART" = "$UPPER_STAT_B" ] || fail_cell "restarted B upper provider is $UPPER_STAT_B_RESTART, want $UPPER_STAT_B"
 [ "$SHA_B_RESTART" = "$SHA_B_PRE" ] || fail_cell "restarted B bytes differ"
 
-say "=== post-copy-up captures ==="
-run_inventory kernel "$WORK/d1-post-kernel.json" || fail_cell "post kernel inventory failed"
-run_inventory userspace "$WORK/d1-post-userspace.json" || fail_cell "post userspace inventory failed"
+say "=== fresh captures after the restart ==="
+run_inventory kernel "$WORK/d1-fresh-kernel.json" || fail_cell "fresh kernel inventory failed"
+run_inventory userspace "$WORK/d1-fresh-userspace.json" || fail_cell "fresh userspace inventory failed"
 start_profile post-b "$CG_B_POST" "$DURATION" "$WORK/d1-post-b.json"
 PID_CAP_BP=$STARTED_PID
 wait_ready post-b "$PID_CAP_BP" || fail_cell "post profile B never became ready"
-dcli exec "$D1_B" touch /tmp/gate || fail_cell "gate release failed for restarted $D1_B"
+release_gate "$PID_B_POST" || fail_cell "gate release failed for restarted $D1_B"
 wait_docker_log_count "$D1_B" '^LEDGER ' 2 "$DURATION" || fail_cell "restarted B ledger never completed"
 kill -0 "$PID_CAP_BP" 2>/dev/null || fail_cell "restarted B ledger completed outside the capture window"
 wait "$PID_CAP_BP" || fail_cell "post profile B failed"
@@ -954,12 +1087,15 @@ say "=== oracle ==="
 if python3 -I "$ORACLE" copy-up --lane "$LANE" \
         --pre-kernel "$WORK/d1-pre-kernel.json" \
         --pre-userspace "$WORK/d1-pre-userspace.json" \
-        --post-kernel "$WORK/d1-post-kernel.json" \
-        --post-userspace "$WORK/d1-post-userspace.json" \
+        --span-kernel "$WORK/d1-span-kernel.json" \
+        --span-userspace "$WORK/d1-span-userspace.json" \
+        --fresh-kernel "$WORK/d1-fresh-kernel.json" \
+        --fresh-userspace "$WORK/d1-fresh-userspace.json" \
         --pre-profile-a "$WORK/d1-pre-a.json" \
         --pre-profile-b "$WORK/d1-pre-b.json" \
         --post-profile-b "$WORK/d1-post-b.json" \
-        --pid-a "$PID_A" --pid-b-pre "$PID_B_PRE" --pid-b-post "$PID_B_POST" \
+        --pid-a "$PID_A" --pid-b-pre "$PID_B_PRE" --pid-b-span "$PID_B2" \
+        --pid-b-post "$PID_B_POST" \
         --iters-a "$ITERS_A" --iters-b "$ITERS_B" \
         --dc73-note "$WORK/dc73-note.txt" \
         >"$WORK/oracle.json" 2>"$WORK/oracle.err"; then

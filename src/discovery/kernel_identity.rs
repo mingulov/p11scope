@@ -776,6 +776,31 @@ impl TargetWorkDeadline {
     }
 }
 
+/// Resets an installed member-run target unless disarmed. The guard
+/// holds the pass mutably, so every post-write return through `&mut
+/// self` must drop it first — and dropping resets, including future
+/// refusal paths. A failed reset already invalidated the binding
+/// inside `replace_member_target`, so the drop ignores its result
+/// fail-closed.
+struct MemberTargetGuard<'a, 's, 'p> {
+    installed: &'a mut InstalledAnchorPass<'s, 'p>,
+    armed: bool,
+}
+
+impl MemberTargetGuard<'_, '_, '_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MemberTargetGuard<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.installed.replace_member_target(None);
+        }
+    }
+}
+
 fn bounded_target_deadline(
     budget: &mut CaptureWorkBudget,
     outer: std::time::Instant,
@@ -989,24 +1014,27 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     {
                         return self.userspace(batch, reason);
                     }
+                    // From here every refusal resets the installed
+                    // target: the guard holds the pass, so returning
+                    // through `&mut self` must drop it first, and
+                    // dropping resets.
+                    let guard = MemberTargetGuard {
+                        installed: &mut self.installed,
+                        armed: true,
+                    };
                     #[cfg(test)]
                     tests::maybe_expire_pre_member_check(&mut work);
                     if let Err(reason) = work.check(budget) {
-                        // Reset before refusing: a stale target would
-                        // hijack later ordinary runs. Fail closed on a
-                        // stuck reset.
-                        if let Err(reset) = self.installed.replace_member_target(None) {
-                            return self.userspace(batch, reset);
-                        }
+                        drop(guard);
                         return self.userspace(batch, reason);
                     }
-                    let bytes = match self
+                    let bytes = match guard
                         .installed
                         .read_member_typed(selector, deadline, max_bytes)
                     {
                         Ok(bytes) => {
-                            self.installed.target_attempts =
-                                self.installed.target_attempts.saturating_add(1);
+                            guard.installed.target_attempts =
+                                guard.installed.target_attempts.saturating_add(1);
                             bytes
                         }
                         Err(reason) => {
@@ -1014,16 +1042,12 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                             // only an attempted run's failure demotes
                             // later segments.
                             if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
-                                // Reset before refusing: a stale target
-                                // would hijack later ordinary runs.
-                                // Fail closed on a stuck reset.
-                                if let Err(reset) = self.installed.replace_member_target(None) {
-                                    return self.userspace(batch, reset);
-                                }
+                                drop(guard);
                                 return self.userspace(batch, reason);
                             }
-                            self.installed.target_attempts =
-                                self.installed.target_attempts.saturating_add(1);
+                            guard.installed.target_attempts =
+                                guard.installed.target_attempts.saturating_add(1);
+                            drop(guard);
                             self.note_attempted_outcome(reason);
                             self.installed.failed_target = Some(reason);
                             return self.userspace(batch, reason);
@@ -1031,7 +1055,9 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     };
                     // Reset before consuming: a stuck target would hijack
                     // later ordinary runs. Fail closed on a stuck reset.
-                    if let Err(reason) = self.installed.replace_member_target(None) {
+                    let reset = guard.installed.replace_member_target(None);
+                    guard.disarm();
+                    if let Err(reason) = reset {
                         return self.userspace(batch, reason);
                     }
                     ran_as_member = true;

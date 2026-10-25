@@ -9259,6 +9259,7 @@ mod capture_policy {
                 false,
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
             );
             assert!(refused.is_err(), "{policy:?} must not take bank roots");
         }
@@ -9273,8 +9274,42 @@ mod capture_policy {
                 false,
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
+                Some(mode),
             );
             assert!(accepted.is_ok(), "{mode:?} takes bank roots");
+            for other in [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ] {
+                if other == mode {
+                    continue;
+                }
+                let refused = group_static_slots_with_roots(
+                    &[],
+                    CapturePolicy::Counter(mode),
+                    false,
+                    &std::collections::BTreeMap::new(),
+                    StaticRoots::CounterBanks,
+                    Some(other),
+                );
+                assert!(
+                    refused.is_err(),
+                    "{mode:?} policy must not take {other:?} bank roots"
+                );
+            }
+            let unprepared = group_static_slots_with_roots(
+                &[],
+                CapturePolicy::Counter(mode),
+                false,
+                &std::collections::BTreeMap::new(),
+                StaticRoots::CounterBanks,
+                None,
+            );
+            assert!(
+                unprepared.is_err(),
+                "{mode:?} bank roots require a prepared mode"
+            );
         }
     }
 }
@@ -12973,6 +13008,7 @@ mod tests {
             false,
             &targets,
             StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
         )
         .unwrap();
         assert_eq!(groups.len(), 2);
@@ -13060,6 +13096,7 @@ mod tests {
                 unsafe_object,
                 &target_facts,
                 StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
             );
             assert!(refused.is_err());
         }
@@ -13109,6 +13146,7 @@ mod tests {
                 false,
                 &all_targets,
                 StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
             )
             .unwrap();
             let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
@@ -13117,6 +13155,7 @@ mod tests {
                 false,
                 &all_targets,
                 StaticRoots::CounterBanks,
+                Some(CounterMode::Counts),
             )
             .unwrap();
             assert_eq!(old_groups.len(), 1);

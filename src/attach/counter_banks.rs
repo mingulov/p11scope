@@ -4733,6 +4733,7 @@ pub(crate) mod tests {
             CapturePolicy::Counter(CounterMode::Counts),
             false,
             StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
             |slot| {
                 calls.borrow_mut().push(("abi", slot.index));
                 Ok(ElfAbi::Lp64)
@@ -4766,6 +4767,7 @@ pub(crate) mod tests {
             CapturePolicy::AggregateOnly,
             false,
             StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
             |_| Ok(ElfAbi::Ilp32),
             |_, _, _| {
                 attached = true;
@@ -4784,6 +4786,7 @@ pub(crate) mod tests {
             CapturePolicy::AggregateOnly,
             false,
             StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
             |_| Ok(ElfAbi::Lp64),
             |_, _, _| {
                 legacy_attached = true;
@@ -4799,6 +4802,28 @@ pub(crate) mod tests {
             "legacy aggregate policy must not take bank roots"
         );
         assert!(!legacy_attached, "policy refusal precedes the first link");
+        let mut mismatched_attached = false;
+        let mismatched = attach_targets_observed_with_roots(
+            &slots,
+            CapturePolicy::Counter(CounterMode::Timestamps),
+            false,
+            StaticRoots::CounterBanks,
+            Some(CounterMode::Counts),
+            |_| Ok(ElfAbi::Lp64),
+            |_, _, _| {
+                mismatched_attached = true;
+                pid_continuity::NativeAttempt {
+                    started_ns: None,
+                    result: Ok(()),
+                }
+            },
+            |_| None,
+        );
+        assert!(
+            mismatched.is_err(),
+            "a timestamps policy must not take counts bank roots"
+        );
+        assert!(!mismatched_attached, "mode refusal precedes the first link");
     }
 
     #[derive(Default)]

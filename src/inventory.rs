@@ -2847,10 +2847,10 @@ impl ClassicDriver<'_> {
 
     /// Step a begun Joint finish once within the 10 ms /
     /// 1024-action budget (§8.3): Polling polls the finish (a
-    /// disposition abandons through the finite stop, anything else
-    /// stays for the latch to bound); Published polls only the
-    /// wound-down (a refusal skips the abandon per §6.4 and holds);
-    /// Abandoned does nothing.
+    /// disposition abandons through the finite stop, a finished lane
+    /// resumes at Published, anything else stays for the latch to
+    /// bound); Published polls only the wound-down (a refusal skips
+    /// the abandon per §6.4 and holds); Abandoned does nothing.
     fn step_begun_joint_finish(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
@@ -2877,6 +2877,14 @@ impl ClassicDriver<'_> {
                     }
                     *finish = JointFinishDriver::Abandoned;
                     return JointStepOutcome::Abandoned;
+                }
+                // A finished lane has nothing left to poll: the
+                // finish it began already published, so resume at
+                // the wound-down phase instead of spinning on a
+                // refusal the latch can never bound.
+                if lane.as_ref().is_some_and(|lane| lane.is_finished()) {
+                    *finish = JointFinishDriver::Published;
+                    return JointStepOutcome::Stayed;
                 }
                 let Some(lane) = lane.as_mut() else {
                     return JointStepOutcome::Stayed;
@@ -10078,7 +10086,11 @@ mod tests {
             let mut io = WindDownIo::completing();
             let ticks = Rc::new(Cell::new(0));
             io.ticks = Rc::clone(&ticks);
-            driver.semantic = Some(joint_lane(io, true));
+            // In-flight through the scripted poll: the finish polls
+            // on without latching while suspended.
+            let mut lane = joint_lane(io, false);
+            lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+            driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             driver.suspended = true;
             queue_request(driver.display.as_mut().expect("display"));
@@ -10128,7 +10140,7 @@ mod tests {
             assert_eq!(
                 driver.joint_finish,
                 JointFinishDriver::Polling,
-                "a finished lane polls without latching"
+                "an in-flight lane polls without latching"
             );
             assert!(driver.semantic.is_some(), "the polling lane is kept");
             assert_eq!(
@@ -10383,7 +10395,11 @@ mod tests {
             let mut coord = coordinator();
             let headless = headless_display();
             let mut driver = driver_with_display(&mut coord, headless.display);
-            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            // In-flight through the scripted poll: the finish polls
+            // on without latching.
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+            driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
             let (mut run, _) = retained_run_of(outcome);
@@ -10404,7 +10420,7 @@ mod tests {
             assert_eq!(
                 driver.joint_finish,
                 JointFinishDriver::Polling,
-                "a finished lane polls without latching"
+                "an in-flight lane polls without latching"
             );
             assert!(driver.semantic.is_some(), "the polling lane is kept");
             assert_eq!(driver.joint_begin_calls, 0, "polling never re-begins");
@@ -13682,7 +13698,11 @@ mod promotion_driver_tests {
         let mut driver = driver_with_display(&mut coordinator, headless.display);
         let io = WindDownIo::completing();
         let lane_ticks = Rc::clone(&io.ticks);
-        driver.semantic = Some(joint_lane(io, true));
+        // In-flight through the scripted poll: the finish polls on
+        // without latching while the item-9 gate holds.
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        driver.semantic = Some(lane);
         driver.joint_finish = JointFinishDriver::Polling;
         assert!(
             !driver.coordinator.promotion_finish(),
@@ -13703,7 +13723,7 @@ mod promotion_driver_tests {
         assert_eq!(
             driver.joint_finish,
             JointFinishDriver::Polling,
-            "a finished lane polls without latching"
+            "an in-flight lane polls without latching"
         );
         assert_eq!(driver.joint_step_calls, 8, "every hook stepped the driver");
         assert_eq!(

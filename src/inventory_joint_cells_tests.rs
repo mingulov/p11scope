@@ -105,10 +105,11 @@ struct Seat {
 
 /// Seat the state-prescribed lane on a fresh driver: pre-finish
 /// lanes finished with the frame held, dispositioned lanes
-/// unfinished with the per-state latch, J10 finished for its
-/// in-flight finish, J16 finished with the frame held. Every
-/// namespace is quiesced retire-ready through the real path. Cells
-/// needing another detach script build their lane by hand.
+/// unfinished with the per-state latch, J10 unfinished with a
+/// scripted in-flight finish (begin Ok, polls Pending), J16
+/// finished with the frame held. Every namespace is quiesced
+/// retire-ready through the real path. Cells needing another
+/// detach script build their lane by hand.
 fn seat_state_lane(driver: &mut ClassicDriver<'_>, state: JointState) -> Seat {
     use crate::inventory_semantics::SemanticRefusal;
     let mut io = WindDownIo::completing();
@@ -116,10 +117,17 @@ fn seat_state_lane(driver: &mut ClassicDriver<'_>, state: JointState) -> Seat {
     io.drop_spy = Some(Rc::clone(&drops));
     let polls = Rc::clone(&io.polls);
     let completes = Rc::clone(&io.completes);
-    let finished = !matches!(state, JointState::J9 | JointState::J11);
+    let finished = !matches!(
+        state,
+        JointState::J9 | JointState::J10 | JointState::J11
+    );
     let mut lane = joint_lane(io, finished);
     match state {
         JointState::J9 => lane.note_joint_finish_failure(SemanticRefusal::Unavailable),
+        JointState::J10 => {
+            lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+            lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        }
         JointState::J11 => lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage),
         _ => {}
     }
@@ -791,15 +799,19 @@ fn cancel_graph_body(scene: Scene, event: JointEvent) {
         driver.coordinator.promotion_finish(),
         "A's promotion finish holds its flag"
     );
-    // In-flight (live-machine behavior the substituted begin skips).
-    driver
-        .retiring
-        .as_mut()
-        .expect("retiring")
-        .winding
-        .as_mut()
-        .expect("winding")
-        .finish = JointFinishDriver::Polling;
+    // In-flight through the scripted begin: the finish polls on.
+    assert_eq!(
+        driver
+            .retiring
+            .as_ref()
+            .expect("retiring")
+            .winding
+            .as_ref()
+            .expect("winding")
+            .finish,
+        JointFinishDriver::Polling,
+        "the scripted begin reaches Polling"
+    );
     let (source, mint_polls, _) = CountingSource::scripted(None);
     driver.completion_source = Some(Box::new(source));
     assert_eq!(
@@ -884,14 +896,19 @@ fn promote_graph_body(scene: Scene, event: JointEvent) {
     install_promotion_for_wind_down(&mut driver);
     driver.on_tick();
     assert_eq!(driver.joint_begin_calls, 1, "A's finish begins once");
-    driver
-        .retiring
-        .as_mut()
-        .expect("retiring")
-        .winding
-        .as_mut()
-        .expect("winding")
-        .finish = JointFinishDriver::Polling;
+    // In-flight through the scripted begin: the finish polls on.
+    assert_eq!(
+        driver
+            .retiring
+            .as_ref()
+            .expect("retiring")
+            .winding
+            .as_ref()
+            .expect("winding")
+            .finish,
+        JointFinishDriver::Polling,
+        "the scripted begin reaches Polling"
+    );
     queue_request(driver.display.as_mut().expect("display"));
     for _ in 0..3 {
         driver.on_tick();
@@ -1381,7 +1398,11 @@ fn cancel_pub_body(scene: Scene, event: JointEvent) {
     let mut io = WindDownIo::completing();
     let drops = Rc::new(Cell::new(0));
     io.drop_spy = Some(Rc::clone(&drops));
-    driver.semantic = Some(joint_lane(io, true));
+    // In-flight through the scripted poll: the finish polls on
+    // without latching while the cancel waits.
+    let mut lane = joint_lane(io, false);
+    lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+    driver.semantic = Some(lane);
     let (_, error) = retain_publication(&mut driver, state, event, false);
     install_promotion_for_wind_down(&mut driver);
     for _ in 0..8 {
@@ -1433,7 +1454,11 @@ fn promote_pub_body(scene: Scene, event: JointEvent) {
     let mut io = WindDownIo::completing();
     let drops = Rc::new(Cell::new(0));
     io.drop_spy = Some(Rc::clone(&drops));
-    driver.semantic = Some(joint_lane(io, true));
+    // In-flight through the scripted poll: the finish polls on
+    // without latching while B waits.
+    let mut lane = joint_lane(io, false);
+    lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+    driver.semantic = Some(lane);
     let (_, error) = retain_publication(&mut driver, state, event, false);
     queue_request(driver.display.as_mut().expect("display"));
     for _ in 0..8 {

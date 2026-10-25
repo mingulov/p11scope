@@ -1382,6 +1382,10 @@ fn overlay_backing_render_is_identity_key_no_proof() {
     let target = backing("7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so");
     let anchor = backing("7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /merged/lib.so");
     let edged = synthetic_edged(pid, target.maps_key());
+    // The measured identity-key mechanism: anchors install for the
+    // arena-mapped file on any filesystem (slots nonempty) and the
+    // AnchorNotInstalled fallback reads nothing (the prove set is
+    // empty) — never kernel parity.
     let evidence = KernelLegEvidence {
         fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
             passes: 1,
@@ -1391,8 +1395,8 @@ fn overlay_backing_render_is_identity_key_no_proof() {
                 crate::discovery::kernel_identity::KernelFallbackReason::AnchorNotInstalled,
             ),
         },
-        userspace_reads: 2,
-        slots_nonempty: false,
+        userspace_reads: 0,
+        slots_nonempty: true,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -1406,6 +1410,42 @@ fn overlay_backing_render_is_identity_key_no_proof() {
         OverlayExpect::IdentityKeyNoProof,
     )
     .expect("backing rendering classifies as identity-key no-proof");
+    // Fail-closed: the branch refuses evidence that misrecords the
+    // mechanism — empty slots, or reads the empty prove set never
+    // performs.
+    let misrecorded = |reads: usize, slots: bool| KernelLegEvidence {
+        fallback: evidence.fallback.clone(),
+        userspace_reads: reads,
+        slots_nonempty: slots,
+        per_range_key: evidence.per_range_key,
+        no_proof_classification: evidence.no_proof_classification,
+    };
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &misrecorded(0, false),
+            OverlayExpect::IdentityKeyNoProof,
+        )
+        .is_err(),
+        "the branch refuses empty slots: anchors install on any filesystem"
+    );
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &misrecorded(1, true),
+            OverlayExpect::IdentityKeyNoProof,
+        )
+        .is_err(),
+        "the branch refuses phantom reads: the prove set is empty"
+    );
     // A real kernel proof is not an identity-key no-proof.
     assert!(
         assert_overlay_outcome(
@@ -1455,7 +1495,7 @@ fn overlay_backing_render_is_identity_key_no_proof() {
             first_reason: None,
         },
         userspace_reads: 0,
-        slots_nonempty: false,
+        slots_nonempty: true,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
     };
@@ -1482,6 +1522,32 @@ fn overlay_backing_render_is_identity_key_no_proof() {
         )
         .is_err(),
         "parity none must match evidence to rendering"
+    );
+    // And slots stay installed when backing: empty slots fail closed.
+    let no_run_empty_slots = KernelLegEvidence {
+        fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
+            passes: 0,
+            pids: 0,
+            keys: 0,
+            first_reason: None,
+        },
+        userspace_reads: 0,
+        slots_nonempty: false,
+        per_range_key: false,
+        no_proof_classification: Some("no kernel proof (identity key)"),
+    };
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &upper,
+            &anchor,
+            &synthetic_none(),
+            &synthetic_none(),
+            &no_run_empty_slots,
+            OverlayExpect::Parity(false),
+        )
+        .is_err(),
+        "a backing no-run row refuses empty slots"
     );
 }
 

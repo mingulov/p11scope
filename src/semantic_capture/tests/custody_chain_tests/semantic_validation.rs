@@ -194,6 +194,11 @@ struct HeldIo {
     /// for a sealed proof, `Err` for the refusal): the seam's scan
     /// ledger for the changed-file tests. Only appended, never consulted.
     scan_results: Vec<Result<(), ImageQueryRefusal>>,
+    /// Scripted wall time consumed by each queued or joined-refresh scan
+    /// (`scan`, never the refresh path): production scans take real time,
+    /// so a scan-job deadline can pass mid-scan. Zero by default, so
+    /// existing tests see a constant clock within a tick.
+    scan_cost: Duration,
 }
 
 impl HeldIo {
@@ -229,6 +234,7 @@ impl HeldIo {
             absent_files: BTreeSet::new(),
             storage_null: 0,
             scan_results: Vec::new(),
+            scan_cost: Duration::ZERO,
         }
     }
 
@@ -408,6 +414,9 @@ impl CaptureIo for HeldIo {
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
         // Substitute only the native scan leaf, as ScriptIo does. The
         // router, original pending job and collected H0 origin remain real.
+        // The scripted scan cost elapses first: a scripted deadline can
+        // pass mid-scan exactly as a real scan overruns it.
+        self.script.now += self.scan_cost;
         if self.script.fail_cookie == Some(job.image.task_cookie)
             || self.script.fail_file == Some(job.endpoint.file_slot)
         {

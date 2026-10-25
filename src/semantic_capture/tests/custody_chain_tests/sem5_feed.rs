@@ -571,6 +571,252 @@ fn absence_then_same_base_reload_mints() {
 }
 
 #[test]
+fn empty_scan_at_job_expiry_breaks_continuity() {
+    // The tick-job twin of the absence reload: a scan that proves the
+    // module unmapped breaks continuity even when the scan-job deadline
+    // passes mid-scan. The expiry sheds the waiting burst, but the proven
+    // absence is recorded from the already-obtained result, so the
+    // same-base reload mints instead of reviving the old ID.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the absence, got {:?}",
+        instance_summary(&scene)
+    );
+    // The next burst needs a fresh observation; its first scan refuses
+    // without proving anything, so the job waits with the burst pending.
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    scene.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    let batch = scene.tick();
+    scene.publish(batch);
+    scene.h0.0.borrow_mut().io.script.fail_file = None;
+    assert_eq!(
+        scene.h0.0.borrow().capture.router().counters().joined,
+        2,
+        "the waiting burst joins nothing before its observation"
+    );
+    assert_eq!(
+        scene.lane.shed_calls_disclosed(),
+        0,
+        "route-waiting calls shed at the deadline, not before"
+    );
+    // The deadline passes mid-scan: the job is live when popped, the
+    // scan proves the module unmapped, and the expiry sheds the burst.
+    scene.h0.0.borrow_mut().io.absent_files.insert(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .advance_now(Duration::from_millis(1950));
+    scene.h0.0.borrow_mut().io.scan_cost = Duration::from_millis(100);
+    let scans_before_expiry = scene.h0.0.borrow().io.scan_results.len();
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        scene.h0.0.borrow().capture.router().counters().joined,
+        2,
+        "the expired burst joins nothing"
+    );
+    assert_eq!(
+        scene.lane.shed_calls_disclosed(),
+        2,
+        "the expiry sheds the waiting burst"
+    );
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "the expiry alone mints nothing, got {:?}",
+        instance_summary(&scene)
+    );
+    {
+        let held = scene.h0.0.borrow();
+        let raced = &held.io.scan_results[scans_before_expiry..];
+        assert_eq!(
+            raced,
+            &[Err(ImageQueryRefusal::Empty)],
+            "the expiry tick ran exactly the unmapped scan, got {raced:?}"
+        );
+    }
+    // The reload lands at the same base; only the global epoch moved.
+    scene.h0.0.borrow_mut().io.absent_files.remove(&0);
+    scene.h0.0.borrow_mut().io.scan_cost = Duration::ZERO;
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the reload after expiry-raced absence mints, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the pre-absence load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the reloaded mapping stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "both joined bursts attribute exactly once, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the retired load keeps its own burst, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-reload burst, got {rows:?}"
+    );
+}
+
+#[test]
+fn empty_scan_at_joined_refresh_slice_end_breaks_continuity() {
+    // The joined-refresh twin: a joined call's refresh scan that proves
+    // the module unmapped breaks continuity even when the scan slice
+    // elapses mid-scan. The refusal is set aside as a deadline, but the
+    // proven absence is recorded from the already-obtained result, so
+    // the same-base reload mints instead of reviving the old ID.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the absence, got {:?}",
+        instance_summary(&scene)
+    );
+    // The module vanishes mid-run: the live burst still joins the
+    // current observation, but its refresh scan proves it unmapped —
+    // after the scan slice already elapsed.
+    scene.h0.0.borrow_mut().io.absent_files.insert(0);
+    scene.h0.0.borrow_mut().io.scan_cost = Duration::from_millis(100);
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let scans_before_refresh = scene.h0.0.borrow().io.scan_results.len();
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        scene.h0.0.borrow().capture.router().counters().joined,
+        4,
+        "the live burst joins the current observation"
+    );
+    assert_eq!(
+        scene.lane.shed_calls_disclosed(),
+        0,
+        "nothing sheds on the joined path"
+    );
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "the absence alone mints nothing, got {:?}",
+        instance_summary(&scene)
+    );
+    {
+        let held = scene.h0.0.borrow();
+        let raced = &held.io.scan_results[scans_before_refresh..];
+        assert_eq!(
+            raced,
+            &[Err(ImageQueryRefusal::Empty)],
+            "the refresh tick ran exactly the unmapped scan, got {raced:?}"
+        );
+    }
+    // The reload lands at the same base; only the global epoch moved.
+    scene.h0.0.borrow_mut().io.absent_files.remove(&0);
+    scene.h0.0.borrow_mut().io.scan_cost = Duration::ZERO;
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        2,
+        "the reload after slice-raced absence mints, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            InstanceLifecycle::Retired.label(),
+            InstanceReason::InstanceRetired.label(),
+        ),
+        "the pre-absence load retires stating instance_retired, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[1].2.as_str(), instances[1].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the reloaded mapping stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        6,
+        "all three bursts attribute exactly once, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(4),
+        "the retired load keeps both pre-reload bursts, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1,
+        Some(2),
+        "the successor joins only the post-reload burst, got {rows:?}"
+    );
+}
+
+#[test]
 fn remap_mints_new_instance_and_retires_prior_with_reason() {
     let mut scene = workload_scene();
     let pid = std::process::id();

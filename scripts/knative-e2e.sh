@@ -157,6 +157,18 @@ refuse_existing_cluster() {
     fi
 }
 
+# One step holds the host lock at a time; fd 9 is never held across steps.
+lock_step() {
+    [ -z "${LOCK-}" ] || { exec 9>>"$LOCK" && flock 9; }
+}
+unlock_step() {
+    [ -z "${LOCK-}" ] || { flock -u 9; exec 9>&-; }
+}
+
+kc() {
+    timeout --signal=TERM --kill-after=10s 300s kubectl "$@"
+}
+
 # Download one Knative release file over strict https and verify its sha256
 # before the caller hands it to kubectl. Refuses on any mismatch.
 download_release() {
@@ -210,7 +222,7 @@ render_ksvc() {
 wait_scale_zero() {
     wz_i=0
     while [ "$wz_i" -lt "$(($3 * 2))" ]; do
-        wz_pods=$(kubectl get pods -l "serving.knative.dev/service=$1" -n "$2" -o name 2>/dev/null) || return 1
+        wz_pods=$(kc get pods -l "serving.knative.dev/service=$1" -n "$2" -o name 2>/dev/null) || return 1
         [ -z "$wz_pods" ] && return 0
         sleep 0.5
         wz_i=$((wz_i + 1))
@@ -1037,5 +1049,309 @@ TOKEN=${TOKEN:-$(date +%s)-$$}
 valid_token "$TOKEN" || usage
 valid_count "$ITERS" || usage
 
-echo "run path not implemented" >&2
-exit 3
+. scripts/lib.sh
+require_non_root_caller || unrun "run as a non-root user with passwordless sudo"
+[ "$(uname -m)" = x86_64 ] || unrun "the images are x86-64 only"
+for command in docker kind kubectl python3 timeout curl sha256sum awk grep stat; do
+    command -v "$command" >/dev/null || unrun "$command required"
+done
+
+CLUSTER=${P11SCOPE_KNATIVE_CLUSTER:-p11scope-k3-$TOKEN}
+case $CLUSTER in
+    ''|*[!a-z0-9-]*|-*|*-) echo "cluster name must be a DNS label: $CLUSTER" >&2; exit 2 ;;
+esac
+# The kind node is "$CLUSTER-control-plane" (14 more chars), still a DNS label.
+[ "${#CLUSTER}" -le 49 ] || { echo "cluster name too long: $CLUSTER" >&2; exit 2; }
+NODE=$CLUSTER-control-plane
+TOOLCHAIN=${P11SCOPE_KNATIVE_TOOLCHAIN:-$(cat .release-rust-version)}
+OBSERVER_BIN=${P11SCOPE_KNATIVE_OBSERVER_BIN:-}
+LOCK=${P11SCOPE_KNATIVE_LOCK:-}
+[ -z "$LOCK" ] || command -v flock >/dev/null || { echo "flock required for P11SCOPE_KNATIVE_LOCK" >&2; exit 2; }
+OBS_IMAGE=p11scope-observer:k3-$TOKEN
+KNATIVE_IMAGE=p11scope-knative-holder:k3-$TOKEN
+prepare_work || exit 2
+FACTS=$WORK/facts.log
+SUMMARY_JSONL=$WORK/summary.jsonl
+: >"$FACTS"
+: >"$SUMMARY_JSONL"
+CLUSTER_CREATED=
+IMAGES_BUILT=
+CAPTURE_PIDS=
+PF_PID=
+
+cleanup() {
+    CLEANUP_STATUS=$?
+    trap - EXIT INT TERM
+    set +e
+    for capture_pid in ${CAPTURE_PIDS-}; do
+        kill "$capture_pid" 2>/dev/null
+    done
+    unlock_step 2>/dev/null
+    if [ -n "$CLUSTER_CREATED" ] && [ "$KEEP" -eq 1 ]; then
+        echo "kept cluster $CLUSTER (--keep): KUBECONFIG=$KUBECONFIG" >&2
+        echo "the KService and Knative die with the cluster; to remove them alone:" >&2
+        echo "kubectl delete -f $WORK/releases/kourier.yaml -f $WORK/releases/serving-core.yaml -f $WORK/releases/serving-crds.yaml" >&2
+        echo "delete with: kind delete cluster --name $CLUSTER --kubeconfig $KUBECONFIG" >&2
+        echo "delete with: docker image rm -f $OBS_IMAGE $KNATIVE_IMAGE" >&2
+    elif [ -n "$CLUSTER_CREATED" ]; then
+        lock_step
+        cleanup_step timeout --signal=TERM --kill-after=10s 300s \
+            kind delete cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
+        unlock_step
+    fi
+    if [ -n "$IMAGES_BUILT" ] && [ "$KEEP" -eq 0 ]; then
+        cleanup_step docker image rm -f "$OBS_IMAGE" "$KNATIVE_IMAGE" >/dev/null
+    fi
+    echo "evidence directory: $WORK" >&2
+    exit "$CLEANUP_STATUS"
+}
+. scripts/cleanup-traps.sh
+
+observe() {
+    kc -n "$OBS_NS" exec "$OBS" -- "$@"
+}
+
+# wait_ready NAME PID: the capture's stderr must name readiness while the
+# local kubectl exec still lives.
+wait_ready() {
+    wr_i=0
+    while [ "$wr_i" -lt 360 ]; do
+        grep -q 'p11scope: capturing:' "$WORK/$1.err" 2>/dev/null && return 0
+        kill -0 "$2" 2>/dev/null || break
+        sleep 0.5
+        wr_i=$((wr_i + 1))
+    done
+    echo "capture $1 never became ready" >&2
+    cat "$WORK/$1.err" >&2
+    return 1
+}
+
+start_port_forward() {
+    PF_PORT=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    case $PF_PORT in ''|*[!0-9]*) fail_cell "no free port for the port-forward" ;; esac
+    # Plain kubectl, not the timeout-wrapped kc: the forward outlives the 300 s
+    # call budget (primary, scale-to-zero waits, secondary) and dies by explicit
+    # kill plus the cleanup trap.
+    kubectl port-forward -n kourier-system svc/kourier-internal "$PF_PORT:80" >"$WORK/pf.log" 2>&1 &
+    PF_PID=$!
+    CAPTURE_PIDS="$CAPTURE_PIDS $PF_PID"
+    wait_pf_ready "$PF_PORT" 60 || fail_cell "port-forward never became ready"
+    fact "port-forward=127.0.0.1:$PF_PORT -> kourier-internal:80"
+}
+
+# ONE request; the response must carry exactly one complete 6xN ledger.
+request_ledger() {
+    curl --fail --silent --show-error -H "Host: $HOST" \
+        "http://127.0.0.1:$PF_PORT/ledger" --max-time 120 -o "$1" \
+        || fail_cell "request to the service failed"
+    response_ledger_is "$1" "$ITERS" || fail_cell "response is not exactly one 6x$ITERS ledger"
+    fact "ledger-response[$(basename "$1")]=$(cat "$1")"
+}
+
+# Resolve the live serving pod and its node PIDs. No capture may be running:
+# crictl runs through docker exec in the node.
+resolve_serving() {
+    kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-pods.json" \
+        || fail_cell "cannot list serving pods"
+    SERVING_POD=$(serving_pod "$WORK/serving-pods.json") || fail_cell "no single serving pod"
+    kc get pod "$SERVING_POD" -n "$KNS" -o json > "$WORK/serving-pod.json" \
+        || fail_cell "cannot describe $SERVING_POD"
+    cids=$(serving_cids "$WORK/serving-pod.json") || fail_cell "cannot select serving containers"
+    SERVING_CID=$(printf '%s\n' "$cids" | sed -n '1p')
+    PROXY_CID=$(printf '%s\n' "$cids" | sed -n '2p')
+    SERVING_PID=$(crictl_pid "$NODE" "$SERVING_CID") || fail_cell "no node pid for the serving container"
+    PROXY_PID=$(crictl_pid "$NODE" "$PROXY_CID") || fail_cell "no node pid for queue-proxy"
+    fact "serving-pod=$SERVING_POD serving-pid=$SERVING_PID proxy-pid=$PROXY_PID"
+}
+
+refuse_existing_cluster "$CLUSTER" || unrun "cluster $CLUSTER already exists"
+
+fact "cell=K3 token=$TOKEN date=$(date -u +%Y-%m-%dT%H:%M:%SZ) iters=$ITERS"
+fact "knative=$KNATIVE_VERSION"
+fact "kernel=$(uname -sr) $(uname -m)"
+# {{.ServerVersion}}: the nested {{.Server.Version}} form is wrong on Docker
+# 29.8.1 (first D1 runs).
+docker_info=$(docker info --format '{{.Driver}} {{.ServerVersion}}' 2>/dev/null) \
+    || unrun "docker info failed"
+fact "docker-info=$docker_info"
+fact "cgroup-driver=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo unknown)"
+docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) \
+    || unrun "docker info failed"
+fact "docker-root=$docker_root backing-fs=$(stat -f -c '%T' "$docker_root" 2>/dev/null || echo unknown)"
+fact "kind-version=$(kind version 2>/dev/null || echo unknown)"
+fact "kubectl-version=$(kubectl version --client 2>/dev/null | head -n 1 || echo unknown)"
+
+if [ -z "$OBSERVER_BIN" ]; then
+    say "=== build the static observer (cargo +$TOOLCHAIN, x86_64-unknown-linux-musl) ==="
+    command -v musl-gcc >/dev/null || unrun "musl-gcc required (musl-tools)"
+    SYSROOT=$(rustc "+$TOOLCHAIN" --print sysroot 2>/dev/null) \
+        || unrun "toolchain $TOOLCHAIN is not installed"
+    [ -d "$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl" ] \
+        || unrun "toolchain $TOOLCHAIN has no x86_64-unknown-linux-musl target"
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+        timeout --signal=TERM --kill-after=10s 3600s scripts/cargo.sh "+$TOOLCHAIN" build \
+        --locked --release --no-default-features \
+        --target x86_64-unknown-linux-musl --bin p11scope \
+        || fail_cell "static observer build failed"
+    OBSERVER_BIN=target/x86_64-unknown-linux-musl/release/p11scope
+fi
+[ -x "$OBSERVER_BIN" ] || unrun "observer $OBSERVER_BIN is not an executable"
+
+say "=== stage minimal build contexts ==="
+OCTX=$WORK/context-observer
+HCTX=$WORK/context-knative
+mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts" \
+    "$HCTX/tests/fixtures/public-cli"
+cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
+sha256sum "$OBSERVER_BIN" | tee "$WORK/observer.sha256"
+
+say "=== build images $OBS_IMAGE $KNATIVE_IMAGE ==="
+lock_step
+IMAGES_BUILT=1
+timeout --signal=TERM --kill-after=10s 1200s \
+    docker build -q -f deploy/Dockerfile.observer -t "$OBS_IMAGE" "$OCTX" \
+    || fail_cell "observer image build failed"
+timeout --signal=TERM --kill-after=10s 1200s \
+    docker build -q -f "$KNATIVE_DOCKERFILE" -t "$KNATIVE_IMAGE" "$HCTX" \
+    || fail_cell "knative holder image build failed"
+unlock_step
+fact "observer-image=$OBS_IMAGE id=$(docker inspect --format '{{.Id}}' "$OBS_IMAGE" || echo unknown)"
+fact "holder-image=$KNATIVE_IMAGE id=$(docker inspect --format '{{.Id}}' "$KNATIVE_IMAGE" || echo unknown)"
+fact "base-image=$HOLDER_BASE (both stages of $KNATIVE_DOCKERFILE; apt packages float)"
+
+say "=== create kind cluster $CLUSTER (private kubeconfig) ==="
+lock_step
+# Set before create: a create killed half-way must still be deleted. The name
+# was proven unused above and carries this run's token by default.
+CLUSTER_CREATED=1
+timeout --signal=TERM --kill-after=10s 900s kind create cluster --name "$CLUSTER" \
+    --kubeconfig "$KUBECONFIG" --wait 180s \
+    ${P11SCOPE_KNATIVE_NODE_IMAGE:+--image "$P11SCOPE_KNATIVE_NODE_IMAGE"} \
+    || fail_cell "kind cluster creation failed"
+unlock_step
+fact "node-image-ref=$(docker inspect --format '{{.Config.Image}}' "$NODE" || echo unknown)"
+fact "node-image-id=$(docker inspect --format '{{.Image}}' "$NODE" || echo unknown)"
+lock_step
+timeout --signal=TERM --kill-after=10s 1200s \
+    kind load docker-image --name "$CLUSTER" "$OBS_IMAGE" "$KNATIVE_IMAGE" \
+    || fail_cell "kind load failed"
+unlock_step
+
+say "=== install Knative $KNATIVE_VERSION (sha256-verified) ==="
+mkdir -p "$WORK/releases"
+for yaml in serving-crds.yaml serving-core.yaml kourier.yaml; do
+    download_release "$(knative_url "$yaml")" "$yaml" "$WORK/releases/$yaml" \
+        || fail_cell "$yaml download or sha256 verification failed"
+    fact "release=$yaml url=$(knative_url "$yaml") sha256=$(knative_pin "$yaml")"
+done
+kc apply -f "$WORK/releases/serving-crds.yaml" >"$WORK/apply-crds.log" 2>&1 \
+    || fail_cell "serving-crds apply failed"
+kc apply -f "$WORK/releases/serving-core.yaml" >"$WORK/apply-core.log" 2>&1 \
+    || fail_cell "serving-core apply failed"
+kc apply -f "$WORK/releases/kourier.yaml" >"$WORK/apply-kourier.log" 2>&1 \
+    || fail_cell "kourier apply failed"
+kc patch configmap/config-network -n knative-serving --type merge \
+    -p '{"data":{"ingress-class":"kourier.ingress.networking.knative.dev"}}' \
+    || fail_cell "config-network ingress patch failed"
+kc wait --for=condition=Available deployment --all -n knative-serving --timeout=180s \
+    || fail_cell "knative-serving never became Available"
+kc wait --for=condition=Available deployment --all -n kourier-system --timeout=180s \
+    || fail_cell "kourier-system never became Available"
+
+say "=== record every image the install references ==="
+kc get pods -A -o json > "$WORK/pods-all.json" || fail_cell "cannot list cluster pods"
+dump_pod_images "$WORK/pods-all.json" || fail_cell "cannot dump pod images"
+fact "downloads: 3 Knative YAMLs (release lines above) + kind node image (node-image lines above) + every image-download line above + base $HOLDER_BASE"
+
+say "=== apply the KService at its node-resolved digest ==="
+docker exec "$NODE" crictl images -o json > "$WORK/node-images.json" \
+    || fail_cell "cannot list node images"
+HOLDER_DIGEST=$(resolve_holder_digest "$WORK/node-images.json" "$KNATIVE_IMAGE") \
+    || fail_cell "no single node digest for $KNATIVE_IMAGE"
+fact "holder-node-digest=$HOLDER_DIGEST"
+docker exec "$NODE" crictl inspecti "$HOLDER_DIGEST" >/dev/null \
+    || fail_cell "node does not resolve $HOLDER_DIGEST"
+render_ksvc "$KNATIVE_KSVC" "$WORK/knative-service.yaml" "$HOLDER_DIGEST" \
+    || fail_cell "kservice render failed"
+kc apply -f "$WORK/knative-service.yaml" || fail_cell "kservice apply failed"
+kc wait --for=condition=Ready "ksvc/$KSVC" -n "$KNS" --timeout=180s \
+    || fail_cell "kservice never became Ready"
+HOST=$(kc get "ksvc/$KSVC" -n "$KNS" -o jsonpath='{.status.url}' | sed 's#http://##') \
+    || fail_cell "cannot read kservice url"
+case $HOST in ''|*[!a-zA-Z0-9.:-]*) fail_cell "bad kservice host: $HOST" ;; esac
+fact "kservice-host=$HOST"
+say "=== prove the service scaled to zero ==="
+wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled to zero"
+
+say "=== apply deploy/k8s as documented (directory apply; image names rendered) ==="
+render_daemonset deploy/k8s "$WORK/manifests" "$OBS_IMAGE" || fail_cell "daemonset render failed"
+kc apply -f "$WORK/manifests/" || fail_cell "daemonset apply failed"
+kc -n "$OBS_NS" rollout status daemonset/p11scope-observer --timeout=240s \
+    || fail_cell "observer rollout failed"
+OBS=$(kc -n "$OBS_NS" get pod -l app.kubernetes.io/component=observer -o jsonpath='{.items[0].metadata.name}')
+[ -n "$OBS" ] || fail_cell "no observer pod"
+fact "observer-pod=$OBS"
+
+say "=== primary: one request, inventory while the pod lives ==="
+lock_step
+start_port_forward
+request_ledger "$WORK/response-primary.txt"
+resolve_serving
+observe p11scope inventory --system --caller-metadata none -o /tmp/k3-primary.json \
+    >"$WORK/primary.out" 2>"$WORK/primary.err" \
+    || { cat "$WORK/primary.err" >&2; fail_cell "primary inventory failed"; }
+kc -n "$OBS_NS" cp "$OBS:/tmp/k3-primary.json" "$WORK/k3-primary.json" >/dev/null \
+    || fail_cell "cannot fetch the primary inventory"
+unlock_step
+kc get pod "$SERVING_POD" -n "$KNS" -o jsonpath='{.status.phase}' 2>/dev/null | grep -qx Running \
+    || fail_cell "serving pod $SERVING_POD died during the primary inventory"
+RESULT=$(python3 -I "$ORACLE" --expect-observer nested inventory "$WORK/k3-primary.json" \
+    --caller "$SERVING_PID" --non-caller "$PROXY_PID") || fail_cell "primary oracle refused"
+record "$RESULT"
+PRIMARY_PID=$SERVING_PID
+
+say "=== scale back to zero ==="
+wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled back to zero"
+
+say "=== secondary: system profile spanning one request ==="
+lock_step
+kc -n "$OBS_NS" exec "$OBS" -- p11scope profile --system --duration "$PROFILE_SECONDS" \
+    -o /tmp/k3-system.json >"$WORK/system.out" 2>"$WORK/system.err" &
+SEC_PID=$!
+CAPTURE_PIDS="$CAPTURE_PIDS $SEC_PID"
+wait_ready system "$SEC_PID" || fail_cell "system profile never became ready"
+# The request and the API read below are the only mid-capture contact: the
+# curl runs on the host (invisible to the node observer) and no exec enters
+# any container while the capture runs.
+request_ledger "$WORK/response-secondary.txt"
+kc get pods -l "serving.knative.dev/service=$KSVC" -n "$KNS" -o json > "$WORK/serving-during.json" \
+    || fail_cell "cannot list serving pods mid-capture"
+fact "serving-during=$(python3 -I -c 'import json,sys; print(sorted(i["metadata"]["name"] for i in json.load(open(sys.argv[1]))["items"]))' "$WORK/serving-during.json")"
+wait "$SEC_PID" || fail_cell "system profile failed"
+kc -n "$OBS_NS" cp "$OBS:/tmp/k3-system.json" "$WORK/k3-system.json" >/dev/null \
+    || fail_cell "cannot fetch the system profile"
+unlock_step
+RESULT=$(profile_system_is "$WORK/k3-system.json" "$ITERS") || fail_cell "secondary oracle refused"
+record "$RESULT"
+
+say "=== scale back to zero ==="
+wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled to zero after the secondary"
+
+say "=== failure twin: no stale edge after scale-to-zero ==="
+lock_step
+observe p11scope inventory --system --caller-metadata none -o /tmp/k3-twin.json \
+    >"$WORK/twin.out" 2>"$WORK/twin.err" \
+    || { cat "$WORK/twin.err" >&2; fail_cell "twin inventory failed"; }
+kc -n "$OBS_NS" cp "$OBS:/tmp/k3-twin.json" "$WORK/k3-twin.json" >/dev/null \
+    || fail_cell "cannot fetch the twin inventory"
+unlock_step
+RESULT=$(inventory_absent "$WORK/k3-twin.json" "$PRIMARY_PID") || fail_cell "twin oracle refused"
+record "$RESULT"
+
+kill "$PF_PID" 2>/dev/null || true
+GATED=$(grep -c '"ok": true' "$SUMMARY_JSONL")
+[ "$GATED" -eq 3 ] || fail_cell "want 3 gated checks, got $GATED"
+say "=== knative e2e: ALL OK ($GATED gated checks passed; summary $SUMMARY_JSONL) ==="
+pass_cell "K3 Knative scale-from-zero attributed while serving"

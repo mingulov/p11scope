@@ -23699,19 +23699,21 @@ impl Engine {
             return Self::graph_idle(true);
         }
         if graph.facts.substep == 2 {
-            // Cursor-plan module objects: the twin's rebuilt set.
-            let modules: Vec<PinnedObjectId> = graph
+            // Cursor-plan module objects, sliced directly: the twin's
+            // rebuilt set with no whole-plan Vec per credit.
+            let modules_len = graph
                 .plan
                 .plan()
-                .map(|plan| plan.modules.iter().map(|module| module.object).collect())
-                .unwrap_or_default();
+                .map(|plan| plan.modules.len())
+                .unwrap_or(0);
             let from = graph.facts.index;
-            let until = modules.len().min(from.saturating_add(GRAPH_STRIDE));
-            for object in &modules[from..until] {
-                graph.facts.module_objects.insert(*object);
+            let until = modules_len.min(from.saturating_add(GRAPH_STRIDE));
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            for module in &cursor.modules[from..until] {
+                graph.facts.module_objects.insert(module.object);
             }
             graph.facts.index = until;
-            if until >= modules.len() {
+            if until >= modules_len {
                 graph.facts.substep = 3;
                 graph.facts.index = 0;
             }
@@ -23888,33 +23890,27 @@ impl Engine {
             return Self::graph_idle(true);
         }
         if graph.facts.substep == 1 {
-            // Cursor-plan slot index for proof target lookups.
-            let slots: Vec<(plan::AttachKey, usize)> = graph
+            // Cursor-plan slot index for proof target lookups, sliced
+            // directly off the cursor plan: no whole-plan Vec per credit.
+            let slots_len = graph
                 .plan
                 .plan()
-                .map(|plan| {
-                    plan.slots
-                        .iter()
-                        .enumerate()
-                        .map(|(position, slot)| {
-                            (
-                                plan::AttachKey {
-                                    object: slot.object,
-                                    file_offset: slot.file_offset,
-                                },
-                                position,
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map(|plan| plan.slots.len())
+                .unwrap_or(0);
             let from = graph.facts.index;
-            let until = slots.len().min(from.saturating_add(GRAPH_STRIDE));
-            for (key, position) in &slots[from..until] {
-                graph.facts.slot_index.insert(*key, *position);
+            let until = slots_len.min(from.saturating_add(GRAPH_STRIDE));
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            for (offset, slot) in cursor.slots[from..until].iter().enumerate() {
+                graph.facts.slot_index.insert(
+                    plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    from + offset,
+                );
             }
             graph.facts.index = until;
-            if until >= slots.len() {
+            if until >= slots_len {
                 graph.facts.substep = 2;
                 graph.facts.index = 0;
             }

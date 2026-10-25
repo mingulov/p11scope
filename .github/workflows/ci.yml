@@ -836,7 +836,9 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
       - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --target x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
+      # The P0 pre-build keeps its own target dir: it is a compile gate only,
+      # and the docker build below consumes the FULL binary above.
+      - run: cargo +"$(cat .release-rust-version)" build --locked --offline --release --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl --target-dir target/p0-preview
       - run: docker build -f deploy/Dockerfile.observer -t p11scope-observer:preview .
       - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
       - name: Download verified release tools

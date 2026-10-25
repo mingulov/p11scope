@@ -329,6 +329,13 @@ fn counter_bank_modes_have_exact_maps_clock_and_histogram_reachability() {
 #[test]
 fn counter_bank_mode_mutations_are_causally_rejected() {
     if !counter_objects_enabled() {
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        for token in COUNTER_BANK_TOKENS {
+            assert!(
+                counter_object_bytes(token).is_empty(),
+                "{token} must be omitted when disabled"
+            );
+        }
         return;
     }
     let directory = tempfile::tempdir().unwrap();

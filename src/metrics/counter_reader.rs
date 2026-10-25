@@ -2435,6 +2435,11 @@ mod tests {
     // ledger and child exit. Producer close shares the original case budget.
     const GROWTH_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     const GROWTH_CASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    // Singles teardown closes every link serially (about 50 ms each on the
+    // 6.6 guest and the 7.0 host): correct and finite, not fast. Its case
+    // budget adds a per-link close allowance at twice that rate.
+    const GROWTH_SINGLES_CLOSE_PER_LINK: std::time::Duration =
+        std::time::Duration::from_millis(100);
 
     fn growth_reap_until(
         child: &mut std::process::Child,
@@ -3146,7 +3151,7 @@ mod tests {
                 )
                 .unwrap_or_else(|error| {
                     panic!(
-                        "producer close failed or exceeded the original 60s case deadline; cleanup unproved: {error:#}\ncleanup progress:\n{}",
+                        "producer close failed or exceeded the original case deadline; cleanup unproved: {error:#}\ncleanup progress:\n{}",
                         String::from_utf8_lossy(&progress)
                     )
                 });
@@ -3177,7 +3182,7 @@ mod tests {
             );
             assert!(
                 std::time::Instant::now() < self.case_deadline,
-                "native growth case exceeded its original 60s deadline"
+                "native growth case exceeded its original deadline"
             );
         }
     }
@@ -3190,7 +3195,15 @@ mod tests {
         final_count: usize,
         backend: crate::attach::AttachBackend,
     ) {
-        let case_deadline = std::time::Instant::now() + GROWTH_CASE_BUDGET;
+        let budget = match backend {
+            crate::attach::AttachBackend::Singles => {
+                // Two links per endpoint plus the bank, keepalive and lifecycle links.
+                let links = u32::try_from(2 * final_count + 3).expect("growth link count fits u32");
+                GROWTH_CASE_BUDGET + GROWTH_SINGLES_CLOSE_PER_LINK * links
+            }
+            crate::attach::AttachBackend::Multi => GROWTH_CASE_BUDGET,
+        };
+        let case_deadline = std::time::Instant::now() + budget;
         let mut run = match backend {
             crate::attach::AttachBackend::Singles => {
                 NativeGrowthRun::new(final_count, case_deadline)

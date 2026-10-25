@@ -232,15 +232,20 @@ def has_identity_loss(gaps):
 def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             fresh_kernel, fresh_userspace, pre_profile_a, pre_profile_b, post_profile_b,
             pid_a, pid_b_pre, pid_b_span, pid_b_post, iters_a, iters_b, lane, dc73_note,
-            facts_text, b_pre_round2_calls=None, module_suffix=PROVIDER):
+            facts_text, b_pre_round2_calls=None, b_pre_round2_pid=None,
+            module_suffix=PROVIDER):
     """D1: pre collapse, the run-4 span shape on both backends, fresh exactness.
 
     pid_b_pre is B's first process (lower mapper, alive through the span);
     pid_b_span is the second process in B that maps the upper copy inside the
     span; pid_b_post is B's main process after the restart. facts_text is
     facts.log, which proves the copy-up (a different real inode in B's upper
-    layer, same sha256). b_pre_round2_calls is B-pre's measured post-copy-up
-    LEDGER total when the driver ran that round, else None (unmeasured).
+    layer, same sha256). b_pre_round2_calls is the measured post-copy-up
+    LEDGER total of the round-2 caller b_pre_round2_pid (default pid_b_pre)
+    when the driver ran that round, else None (unmeasured). The driver runs
+    round 2 on a second pre-copy-up mapper (gated.c runs one round per
+    process); the oracle asserts only that the new edge claims none of those
+    calls.
     """
     assert lane in ("A", "B"), lane
     assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
@@ -365,24 +370,36 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                    "new_module": span_shapes["span-kernel"][1]}
 
     if b_pre_round2_calls is None:
+        assert b_pre_round2_pid is None, "round-2 pid without a measured total"
         b_pre_round2 = {"measured": False}
     else:
         assert isinstance(b_pre_round2_calls, int) and b_pre_round2_calls >= 1, \
             ("bad B-pre round-2 total", b_pre_round2_calls)
+        if b_pre_round2_pid is None:
+            round2_pid = pid_b_pre
+        else:
+            assert isinstance(b_pre_round2_pid, int) and b_pre_round2_pid >= 1, \
+                ("bad round-2 pid", b_pre_round2_pid)
+            round2_pid = b_pre_round2_pid
         legs = {}
         for label, records in (("span_kernel", span_k_records),
                                ("span_userspace", span_u_records)):
             old_id, new_id = span_shapes[label.replace("_", "-")]
-            m7_entries = records[(pid_b_pre, old_id)]["entries"]["count"]
-            m8_record = records[(pid_b_pre, new_id)]
+            assert (round2_pid, new_id) in records, \
+                (label, "no new-module edge for the round-2 caller", round2_pid)
+            assert (round2_pid, old_id) in records, \
+                (label, "no old-module edge for the round-2 caller", round2_pid)
+            m7_entries = records[(round2_pid, old_id)]["entries"]["count"]
+            m8_record = records[(round2_pid, new_id)]
             m8_entries = m8_record["entries"]["count"]
             m8_status = m8_record["entries"]["coverage"]["state"]
             assert m8_entries == 0, \
-                (label, "the new edge claims B-pre's post-copy-up calls",
-                 m8_entries)
+                (label, "the new edge claims the round-2 caller's post-copy-up calls",
+                 round2_pid, m8_entries)
             legs[label] = {"m7_entries": m7_entries, "m8_entries": m8_entries,
                            "m8_status": m8_status}
-        b_pre_round2 = {"measured": True, "calls": b_pre_round2_calls, **legs}
+        b_pre_round2 = {"measured": True, "calls": b_pre_round2_calls,
+                        "pid": round2_pid, **legs}
 
     assert "copy-up-stale-caller" in dc73_note, \
         "run log without the copy-up-stale-caller disclosure"
@@ -506,7 +523,7 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
 # ---------------------------------------------------------------- self-test
 
 
-ST_PIDS = [101, 102, 103, 104, 201, 202]
+ST_PIDS = [101, 102, 103, 104, 105, 201, 202]
 ST_KEY_A = (0, 138, 100)
 ST_KEY_B = (0, 140, 100)
 ST_PROVIDER = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
@@ -593,7 +610,10 @@ def st_span_edges():
             st_edge(102, "m8", cov="watched_no_use", since=3000,
                     first_seen=2000),
             st_edge(104, "m8", evidence="maps_match", cov="watched_no_use",
-                    since=3000, first_seen=2000)]
+                    since=3000, first_seen=2000),
+            st_edge(105, "m7", state="ended"),
+            st_edge(105, "m8", cov="watched_no_use", since=3000,
+                    first_seen=2000)]
 
 
 def good_copy_up(lane="B"):
@@ -782,6 +802,38 @@ def self_test():
                                                modules=ST_MODULES_SPAN)
     refuses("round-2 calls claimed by the new edge",
             lambda: copy_up(**round2_bad))
+    round2_twin = good_copy_up("B")
+    round2_twin["b_pre_round2_calls"] = 1500
+    round2_twin["b_pre_round2_pid"] = 105
+    assert copy_up(**round2_twin)["b_pre_round2"]["pid"] == 105
+    twin_claimed = [st_edge(101, "m7"),
+                    st_edge(102, "m7", state="ended"),
+                    st_edge(102, "m8", cov="watched_no_use", since=3000,
+                           first_seen=2000),
+                    st_edge(104, "m8", evidence="maps_match"),
+                    st_edge(105, "m7", state="ended"),
+                    st_edge(105, "m8", cov="counted", count=9, since=3000,
+                           first_seen=2000)]
+    round2_twin_bad = good_copy_up("B")
+    round2_twin_bad["b_pre_round2_calls"] = 1500
+    round2_twin_bad["b_pre_round2_pid"] = 105
+    round2_twin_bad["span_kernel"] = good_inventory(twin_claimed, [st_collapse()],
+                                                    backend="kernel",
+                                                    modules=ST_MODULES_SPAN)
+    refuses("round-2 twin calls claimed by the new edge",
+            lambda: copy_up(**round2_twin_bad))
+    twin_missing = good_copy_up("B")
+    twin_missing["b_pre_round2_calls"] = 1500
+    twin_missing["b_pre_round2_pid"] = 105
+    twin_missing["span_kernel"] = good_inventory(
+        [item for item in st_span_edges() if item["pid"] != 105],
+        [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN)
+    refuses("round-2 twin without a new edge",
+            lambda: copy_up(**twin_missing))
+    twin_nocalls = good_copy_up("B")
+    twin_nocalls["b_pre_round2_pid"] = 105
+    refuses("round-2 pid without a measured total",
+            lambda: copy_up(**twin_nocalls))
     mutate_copy("post profile wrong count", post_profile_b=good_profile(249))
     mutate_copy("A inexact in the span",
                 span_kernel=good_inventory(
@@ -941,6 +993,7 @@ def main(argv):
     copy_parser.add_argument("--dc73-note")
     copy_parser.add_argument("--facts-log", required=True)
     copy_parser.add_argument("--b-pre-round2-calls", type=int, default=None)
+    copy_parser.add_argument("--b-pre-round2-pid", type=int, default=None)
     copy_parser.add_argument("--module-suffix", default=PROVIDER)
     late_parser = sub.add_parser("late-reported")
     late_parser.add_argument("file")
@@ -970,7 +1023,8 @@ def main(argv):
                          load(options.post_profile_b), options.pid_a, options.pid_b_pre,
                          options.pid_b_span, options.pid_b_post, options.iters_a,
                          options.iters_b, options.lane, note, facts,
-                         options.b_pre_round2_calls, options.module_suffix)
+                         options.b_pre_round2_calls, options.b_pre_round2_pid,
+                         options.module_suffix)
         print(json.dumps(result, sort_keys=True))
         known = result["known_issue"]
         print(known_issue_line(known["pid"], known["old_module"],

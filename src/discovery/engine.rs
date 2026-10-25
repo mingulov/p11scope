@@ -26868,6 +26868,9 @@ pub(crate) mod session_fixture {
         /// T4b seam: fail every `prepare_collected_static_retirement` call
         /// (the G9 trigger for pre/post-take prepare errors).
         pub(crate) fail_collected_prepare: Cell<bool>,
+        /// Test seam: fail every `begin_collected_static_retirement` call
+        /// (the trigger for a begin error before native mutation).
+        pub(crate) fail_collected_begin: Cell<bool>,
         /// T4b seam: report a logical retirement leaf (the G24 Singles
         /// twin takes no native path).
         pub(crate) logical_retirement: Cell<bool>,
@@ -27322,6 +27325,9 @@ pub(crate) mod session_fixture {
             work: usize,
         ) -> Result<RetirementProgress> {
             anyhow::ensure!(q.is_none(), "scripted leaf refuses a production Q");
+            if self.fail_collected_begin.get() {
+                bail!("scripted collected begin refused");
+            }
             let Some(fixture) = self.global_retirement.as_ref() else {
                 bail!("scripted leaf has no collected carrier");
             };

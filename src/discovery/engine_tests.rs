@@ -47368,6 +47368,69 @@ fn collected_graph_prepare_error_cancels_preflight_and_returns_input() {
 }
 
 #[test]
+fn collected_graph_begin_error_before_mutation_returns_input() {
+    // A NativeBegin error before the first transfer owes a ticket cancel:
+    // the cancel runs one credit at a time until the input comes back
+    // untouched and the native cursor drains.
+    let mut case = graph_case_with_exit(true);
+    let mut reached = false;
+    for _ in 0..512 {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativeBegin && !graph.mutated)
+        {
+            reached = true;
+            break;
+        }
+        case.service(1);
+    }
+    assert!(reached, "NativeBegin before the first begin credit");
+    case.session.fail_collected_begin.set(true);
+    assert!(case.service(1).pending);
+    case.session.fail_collected_begin.set(false);
+    // The owed cancel settles the batch within bounded credits; the wall
+    // guard covers the async worker, not the credit count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut credits = 0u32;
+    let mut verdict = None;
+    while verdict.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owed begin cancel did not settle"
+        );
+        assert!(case.service(1).pending);
+        credits += 1;
+        verdict = case
+            .engine
+            .collected_graph
+            .as_ref()
+            .and_then(|graph| graph.verdict);
+    }
+    assert_eq!(verdict, Some(Verdict::RefusedUntouched));
+    assert!(
+        credits <= 4096,
+        "the owed cancel settles within bounded credits ({credits})"
+    );
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert!(
+        graph.removed.is_some(),
+        "the owed cancel returns the input"
+    );
+    assert!(
+        !case
+            .session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .blocking(),
+        "the owed cancel drains the native cursor"
+    );
+}
+
+#[test]
 fn collected_graph_closed_never_owes_recovery_frame() {
     let mut case = graph_case_with_exit(true);
     assert!(case.engine.refresh_requested.is_empty());

@@ -603,6 +603,36 @@ pub(crate) enum RawQuantumRefusal {
     Fault(FaultReadError),
 }
 
+impl RawQuantumRefusal {
+    /// Stable variant name for diagnosis (the Staging line).
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Capacity => "Capacity",
+            Self::H0Active => "H0Active",
+            Self::ForeignDescriptors => "ForeignDescriptors",
+            Self::ForeignDrain => "ForeignDrain",
+            Self::ForeignCapture => "ForeignCapture",
+            Self::ForeignLedger => "ForeignLedger",
+            Self::DrainUnbound => "DrainUnbound",
+            Self::H0Undelivered => "H0Undelivered",
+            Self::IdentityExhausted => "IdentityExhausted",
+            Self::InvalidLimit => "InvalidLimit",
+            Self::Resource(_) => "Resource",
+            Self::Ledger(_) => "Ledger",
+            Self::Allocation => "Allocation",
+            Self::Admission => "Admission",
+            Self::StaleFrontier => "StaleFrontier",
+            Self::DispositionMismatch => "DispositionMismatch",
+            Self::H3Undisposed => "H3Undisposed",
+            Self::ClosureStale => "ClosureStale",
+            Self::Stopped => "Stopped",
+            Self::Cut(_) => "Cut",
+            Self::Cursor(_) => "Cursor",
+            Self::Fault(_) => "Fault",
+        }
+    }
+}
+
 impl RawJointQuantum {
     pub(crate) fn birth_cut(&self) -> Option<&super::JournalBirthCut> {
         self.cuts.as_ref().map(|cuts| &cuts.birth)

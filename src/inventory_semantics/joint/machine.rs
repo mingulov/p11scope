@@ -610,6 +610,38 @@ impl CollectedReports {
     }
 }
 
+/// Which Staging sub-exit refused, retained for diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagingDetail {
+    /// The per-admission staging step refused with its exact variant,
+    /// at this stage cursor.
+    StageNext { reason: &'static str, stage: usize },
+    /// The batch completion check found this cursor state.
+    Finish {
+        claim: usize,
+        stage: usize,
+        len: usize,
+        domain: bool,
+    },
+}
+
+impl std::fmt::Display for StagingDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StageNext { reason, stage } => write!(f, "stage_next:{reason}@{stage}"),
+            Self::Finish {
+                claim,
+                stage,
+                len,
+                domain,
+            } => write!(
+                f,
+                "finish:claim={claim},stage={stage},len={len},domain={domain}"
+            ),
+        }
+    }
+}
+
 /// Scheduling state over the original owner, not an alternate capture/model.
 pub(crate) struct LiveJointMachine {
     producers: SessionDrainProducers,
@@ -617,6 +649,11 @@ pub(crate) struct LiveJointMachine {
     phase: Option<Phase>,
     state: RunState,
     grant: Option<SessionDrainGrant>,
+    /// Staging diagnosis. Set only on the cold refusal path; a
+    /// refused machine retains Staging, so no later success can make
+    /// it stale. Read by tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    staging_detail: Option<StagingDetail>,
     births: RetainedJointBirths,
     // Index-only idle selection; no copied image/candidate table. Every
     // inspected pair/query spends an action before collection can begin.
@@ -686,6 +723,7 @@ impl LiveJointMachine {
             phase: Some(Phase::Idle),
             state: RunState::Runnable,
             grant: None,
+            staging_detail: None,
             births: RetainedJointBirths::new(),
             absence_binding: 0,
             absence_after: None,
@@ -1467,6 +1505,12 @@ impl LiveJointMachine {
             original.map(|value| (value.attempted, value.raw.pending_h0_records())),
             self.prepared_base,
         )
+    }
+
+    /// Staging diagnosis, if Staging refused.
+    #[cfg(test)]
+    pub(crate) fn staging_detail_for_test(&self) -> Option<StagingDetail> {
+        self.staging_detail
     }
 
     #[cfg(test)]
@@ -2308,17 +2352,28 @@ impl LiveJointMachine {
                 base,
             } => {
                 budget.spend(1);
-                let more = retain_on_refusal!(
-                    Phase::Staging {
-                        original,
-                        identity,
-                        base
-                    },
-                    coordinator.stage_next_prepared_admission_with_disposition(
-                        &self.producers,
-                        &mut original
-                    )
-                );
+                let staged = coordinator
+                    .stage_next_prepared_admission_with_disposition(&self.producers, &mut original);
+                let more = match staged {
+                    Ok(more) => more,
+                    Err(reason) => {
+                        let stage = coordinator
+                            .prepared_staging_progress(lane)
+                            .map_or(0, |(_, stage, _, _)| stage);
+                        self.staging_detail = Some(StagingDetail::StageNext {
+                            reason: reason.code(),
+                            stage,
+                        });
+                        return (
+                            Phase::Staging {
+                                original,
+                                identity,
+                                base,
+                            },
+                            Err(SemanticRefusal::Unavailable),
+                        );
+                    }
+                };
                 if more {
                     return (
                         Phase::Staging {
@@ -2330,6 +2385,15 @@ impl LiveJointMachine {
                     );
                 }
                 if !coordinator.finish_prepared_semantic_batch(lane) {
+                    let (claim, stage, len, domain) = coordinator
+                        .prepared_staging_progress(lane)
+                        .unwrap_or((0, 0, 0, false));
+                    self.staging_detail = Some(StagingDetail::Finish {
+                        claim,
+                        stage,
+                        len,
+                        domain,
+                    });
                     return (
                         Phase::Staging {
                             original,

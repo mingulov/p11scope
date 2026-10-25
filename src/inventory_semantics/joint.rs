@@ -25,6 +25,7 @@ mod machine;
 pub(crate) use machine::JointMachineIo;
 pub(crate) use machine::{
     JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
+    StagingDetail,
 };
 
 /// One original negative or completed witness in the SAME paid allocation.

@@ -1215,7 +1215,8 @@ pub(crate) struct ScriptedStopCounts {
 }
 
 /// Tests-only Joint drive state: lane live/gated/finished/ticks plus the
-/// machine's retained phase/demand, in-flight work and prepared base.
+/// machine's retained phase/demand, in-flight work, prepared base and
+/// last Staging diagnosis.
 #[cfg(test)]
 type JointDriveState = (
     bool,
@@ -1226,6 +1227,7 @@ type JointDriveState = (
     &'static str,
     Option<(usize, usize)>,
     u64,
+    Option<joint::StagingDetail>,
 );
 
 impl AttestedSemanticLane {
@@ -1747,13 +1749,17 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn joint_drive_state_for_test(&self) -> JointDriveState {
         let Some(live) = self.live.as_deref() else {
-            return (false, false, false, 0, "NoLane", "None", None, 0);
+            return (false, false, false, 0, "NoLane", "None", None, 0, None);
         };
         let (phase, demand, work, base) = live
             .joint_machine
             .as_ref()
             .map(joint::LiveJointMachine::diagnostic_snapshot_for_test)
             .unwrap_or(("NoMachine", "None", None, 0));
+        let staging = live
+            .joint_machine
+            .as_ref()
+            .and_then(joint::LiveJointMachine::staging_detail_for_test);
         (
             true,
             live.gated,
@@ -1763,6 +1769,7 @@ impl AttestedSemanticLane {
             demand,
             work,
             base,
+            staging,
         )
     }
 

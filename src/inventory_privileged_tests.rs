@@ -4174,15 +4174,16 @@ fn joint_drive_line(
     tag: &str,
     step: &str,
 ) {
-    let (live, gated, finished, ticks, phase, demand, work, base) =
+    let (live, gated, finished, ticks, phase, demand, work, base, staging) =
         lane.joint_drive_state_for_test();
     let work = work.map_or_else(
         || "-".to_string(),
         |(attempted, pending)| format!("{attempted}/{pending}"),
     );
+    let staging = staging.map_or_else(|| "-".to_string(), |detail| detail.to_string());
     eprintln!(
         "JOINT_R16 {tag} step={step} live={} gated={} finished={} ticks={ticks} \
-         phase={phase} demand={demand} work={work} base={base} \
+         phase={phase} demand={demand} work={work} base={base} staging={staging} \
          revision={} feeds={}",
         u8::from(live),
         u8::from(gated),

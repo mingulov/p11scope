@@ -849,6 +849,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Staging progress for diagnosis: claim cursor, stage cursor, entry
+    /// count, and whether the batch domain matches the lane.
+    pub(crate) fn prepared_staging_progress(
+        &self,
+        lane: &AttestedSemanticLane,
+    ) -> Option<(usize, usize, usize, bool)> {
+        let batch = self.prepared_semantic_batch()?;
+        Some((
+            batch.claim_cursor,
+            batch.stage_cursor,
+            batch.entries.len(),
+            batch.domain == lane.domain(),
+        ))
+    }
+
     /// Borrow the actual prepared originals beside the canonical capture
     /// owner for initial key binding and ingestion.
     pub(crate) fn prepared_joint_parts(

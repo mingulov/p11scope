@@ -525,52 +525,130 @@ k2_oracle_self_test() {
     fi
 }
 
-# The scan-limit rule: a late provider is never silently zero. Each accepted
-# shape passes, each silent shape fails -- including the exec-artifact-only
-# shape, which proves the pid_descendant_gaps exclusion is load-bearing.
+# The scan-limit rule: the scan leg's report is judged against its own
+# LEDGER line. Each ledger function must count exactly its LEDGER
+# successful value (leg counted-exact, whatever the disclosure causes) or
+# zero with a named disclosure for the miss (legs absent/attached-zero);
+# loss, partial counts and silent zeros fail. The run3/run4 fixtures copy
+# the live shapes (single vs doubled function tables, setup calls,
+# causes); unknown causes are recorded, never gated.
 k2_scan_self_test() {
     sst_stub=$1
+    # The scan exec log the check reads the LEDGER line from: READY plus
+    # one LEDGER line with the six gated.c functions at $2 successful each
+    # ($2 = missing writes no LEDGER line; $3 = complete flag).
+    scan_exec() {
+        printf 'READY pid=14\n' >"$sst_stub/$1.log"
+        if [ "$2" = "missing" ]; then
+            return 0
+        fi
+        se_fns=""
+        for name in C_GenerateRandom C_DigestInit C_Digest C_FindObjectsInit C_FindObjects C_FindObjectsFinal; do
+            se_fns="$se_fns{\"name\":\"$name\",\"attempts\":$2,\"successful\":$2},"
+        done
+        se_fns=${se_fns%,}
+        printf 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":14,"complete":%s,"functions":[%s]}\n' \
+            "${3-true}" "$se_fns" >>"$sst_stub/$1.log"
+    }
+    # $1 base, $2 causes JSON, $3 calls in every ledger row, $4 modules JSON.
     scan_fixture() {
         cat > "$sst_stub/$1.json" <<EOF
 {"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"},"evidence":{"verdict_detail":"concrete_gap","gap_classes":{"observation":{"causes":$2,"status":"lossy"}}},"capture":{"scope":"cgroup","modules":$4},"functions":[{"calls":$3,"errors":0,"names":["C_GenerateRandom"]},{"calls":$3,"errors":0,"names":["C_DigestInit"]},{"calls":$3,"errors":0,"names":["C_Digest"]},{"calls":$3,"errors":0,"names":["C_FindObjectsInit"]},{"calls":$3,"errors":0,"names":["C_FindObjects"]},{"calls":$3,"errors":0,"names":["C_FindObjectsFinal"]}]}
 EOF
     }
-    sst_provider='[{"path":"/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"}]'
-    scan_fixture absent '["pid_namespace","pid_descendant_gaps","discovery","slots"]' 0 '[]'
-    scan_fixture live '["pid_namespace","unprotected_live_windows"]' 100 "$sst_provider"
-    scan_fixture silent '["pid_namespace"]' 0 '[]'
-    scan_fixture exec-only '["pid_namespace","pid_descendant_gaps"]' 0 '[]'
-    scan_fixture exact '["pid_namespace"]' 250 "$sst_provider"
-    scan_fixture partial '["pid_namespace"]' 100 "$sst_provider"
-    PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/absent.json" >/dev/null \
-        || { echo "absent-with-disclosure refused" >&2; exit 1; }
-    PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/live.json" >/dev/null \
-        || { echo "discovered-live refused" >&2; exit 1; }
-    for bad in silent exec-only exact partial; do
-        if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/$bad.json" >/dev/null 2>&1; then
-            echo "silent scan shape accepted: $bad" >&2
+    # scan_pass BASE EXEC WANT_LEG: the shape must pass with that leg.
+    scan_pass() {
+        sp_out=$(PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/$1.json" "$sst_stub/$2.log" 2>"$sst_stub/$1.err") \
+            || { echo "scan shape refused: $1 ($(cat "$sst_stub/$1.err"))" >&2; exit 1; }
+        sp_leg=$(printf '%s' "$sp_out" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["leg"])')
+        if [ "$sp_leg" != "$3" ]; then
+            echo "scan leg is $sp_leg, want $3: $1" >&2
             exit 1
         fi
-    done
-    # The disclosure vocabulary is frozen, not open-ended: an unknown cause
-    # is refused even with exact 6x250 counts, and every frozen cause
-    # passes on its own.
+    }
+    # scan_fail BASE EXEC WANT_REASON: the shape must fail naming that reason.
+    scan_fail() {
+        if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/$1.json" "$sst_stub/$2.log" >/dev/null 2>"$sst_stub/$1.err"; then
+            echo "scan shape accepted: $1" >&2
+            exit 1
+        fi
+        if ! grep -q -F "$3" "$sst_stub/$1.err"; then
+            echo "scan failure misnamed (want [$3]): $1 ($(cat "$sst_stub/$1.err"))" >&2
+            exit 1
+        fi
+    }
+    sst_provider='[{"path":"/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"}]'
+    scan_exec exec250 250
+    scan_exec exec100 100
+    scan_exec execmissing missing
+    scan_exec execincomplete 250 false
+    # Live run 3: single table, 250 each, nested discovery skip + exec gaps.
+    scan_fixture run3 '["skipped","pid_namespace","pid_descendant_gaps"]' 250 "$sst_provider"
+    # Live run 4: doubled tables (setup calls plus zero ledger rows, then
+    # 250 ledger rows), six causes. Counts must sum across the duplicate
+    # rows; the 16 setup calls are reported, never subtracted.
+    cat > "$sst_stub/run4.json" <<'EOF'
+{"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"},"evidence":{"verdict_detail":"concrete_gap","gap_classes":{"observation":{"causes":["skipped","pid_namespace","unprotected_live_windows","discovery_truncated","loader_discovery","pid_descendant_gaps"],"status":"lossy"}}},"capture":{"scope":"cgroup","modules":[{"path":"/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"}]},"functions":[{"calls":2,"errors":0,"names":["C_Initialize"]},{"calls":2,"errors":0,"names":["C_Finalize"]},{"calls":1,"errors":0,"names":["C_GetFunctionList"]},{"calls":3,"errors":0,"names":["C_GetSlotList"]},{"calls":3,"errors":0,"names":["C_GetTokenInfo"]},{"calls":1,"errors":0,"names":["C_InitPIN"]},{"calls":2,"errors":0,"names":["C_OpenSession"]},{"calls":2,"errors":0,"names":["C_Login"]},{"calls":0,"errors":0,"names":["C_GenerateRandom"]},{"calls":0,"errors":0,"names":["C_DigestInit"]},{"calls":0,"errors":0,"names":["C_Digest"]},{"calls":0,"errors":0,"names":["C_FindObjectsInit"]},{"calls":0,"errors":0,"names":["C_FindObjects"]},{"calls":0,"errors":0,"names":["C_FindObjectsFinal"]},{"calls":250,"errors":0,"names":["C_GenerateRandom"]},{"calls":250,"errors":0,"names":["C_DigestInit"]},{"calls":250,"errors":0,"names":["C_Digest"]},{"calls":250,"errors":0,"names":["C_FindObjectsInit"]},{"calls":250,"errors":0,"names":["C_FindObjects"]},{"calls":250,"errors":0,"names":["C_FindObjectsFinal"]}]}
+EOF
+    # A burst split across the attach: three functions exact, three zero.
+    cat > "$sst_stub/split.json" <<'EOF'
+{"pid_namespace":{"observer":"nested","kernel_pids":"initial","proc_pids":"observer"},"evidence":{"verdict_detail":"concrete_gap","gap_classes":{"observation":{"causes":["pid_namespace","unprotected_live_windows"],"status":"lossy"}}},"capture":{"scope":"cgroup","modules":[{"path":"/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"}]},"functions":[{"calls":250,"errors":0,"names":["C_GenerateRandom"]},{"calls":250,"errors":0,"names":["C_DigestInit"]},{"calls":250,"errors":0,"names":["C_Digest"]},{"calls":0,"errors":0,"names":["C_FindObjectsInit"]},{"calls":0,"errors":0,"names":["C_FindObjects"]},{"calls":0,"errors":0,"names":["C_FindObjectsFinal"]}]}
+EOF
+    scan_fixture live '["pid_namespace","unprotected_live_windows"]' 250 "$sst_provider"
+    scan_fixture absent '["pid_namespace","pid_descendant_gaps","discovery","slots"]' 0 '[]'
+    scan_fixture silent '["pid_namespace"]' 0 '[]'
+    scan_fixture exec-only '["pid_namespace","pid_descendant_gaps"]' 0 '[]'
+    scan_fixture silent-attached '["pid_namespace","pid_descendant_gaps"]' 0 "$sst_provider"
+    scan_fixture attached-zero '["pid_namespace","unprotected_live_windows","skipped"]' 0 "$sst_provider"
+    scan_fixture exact '["pid_namespace"]' 250 "$sst_provider"
     scan_fixture bogus '["pid_namespace","totally_bogus_future_cause"]' 250 "$sst_provider"
-    if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/bogus.json" >/dev/null 2>&1; then
-        echo "unknown scan cause accepted: bogus" >&2
-        exit 1
-    fi
+    scan_fixture partial '["pid_namespace"]' 100 "$sst_provider"
+    scan_fixture ledgermismatch '["skipped","pid_namespace","pid_descendant_gaps"]' 250 "$sst_provider"
+    scan_fixture ledger100 '["pid_namespace","skipped"]' 100 "$sst_provider"
+    scan_fixture lossexact '["pid_namespace","event_loss"]' 250 "$sst_provider"
+    scan_fixture losszero '["pid_namespace","event_loss"]' 0 '[]'
+    scan_fixture nonumbering '["discovery"]' 0 '[]'
+    scan_pass run4 exec250 counted-exact
+    scan_pass run3 exec250 counted-exact
+    scan_pass live exec250 counted-exact
+    scan_pass exact exec250 counted-exact
+    scan_pass bogus exec250 counted-exact
+    scan_pass absent exec250 absent
+    scan_pass attached-zero exec250 attached-zero
+    scan_pass ledger100 exec100 counted-exact
     for cause in discovery slots unprotected_live_windows skipped; do
         scan_fixture "only-$cause" "[\"pid_namespace\",\"$cause\"]" 0 '[]'
-        PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/only-$cause.json" >/dev/null \
-            || { echo "frozen scan cause refused: $cause" >&2; exit 1; }
+        scan_pass "only-$cause" exec250 absent
     done
+    for bad in silent exec-only silent-attached; do
+        scan_fail "$bad" exec250 "late provider silently zero"
+    done
+    scan_fail partial exec250 "partial scan count"
+    scan_fail split exec250 "partial scan count"
+    scan_fail ledgermismatch exec100 "partial scan count"
+    scan_fail lossexact exec250 "scan loss"
+    scan_fail losszero exec250 "scan loss"
     # A nested capture without its pid_namespace cause is not this cell.
-    scan_fixture nonumbering '["discovery"]' 0 '[]'
-    if PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/nonumbering.json" >/dev/null 2>&1; then
-        echo "scan shape without numbering accepted" >&2
-        exit 1
-    fi
+    scan_fail nonumbering exec250 "nested capture without its pid_namespace cause"
+    # Without the scan leg's LEDGER line there is nothing to compare with.
+    scan_fail run3 execmissing "scan ledger"
+    scan_fail run3 execincomplete "scan ledger incomplete"
+    # The run 4 verdict reports the ledger total plus the setup calls, never
+    # subtracted: 1500 counted, 16 extra.
+    rv4_out=$(PATH="$sst_stub:$PATH" scan_limit_check "$sst_stub/run4.json" "$sst_stub/exec250.log") \
+        || { echo "run4 verdict refused" >&2; exit 1; }
+    printf '%s' "$rv4_out" | python3 -I -c '
+import json, sys
+verdict = json.load(sys.stdin)
+assert verdict["leg"] == "counted-exact", verdict
+assert verdict["counted_calls"] == 1500, verdict
+assert sum(verdict["extra_calls"].values()) == 16, verdict
+assert verdict["extra_calls"]["C_Login"] == 2, verdict
+assert verdict["errors"] == 0, verdict
+assert verdict["modules"] == 1, verdict
+assert set(verdict["ledger"]) == {"C_GenerateRandom", "C_DigestInit", "C_Digest", "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"}, verdict
+assert set(verdict["ledger"].values()) == {250}, verdict
+' || { echo "run4 verdict content wrong: $rv4_out" >&2; exit 1; }
 }
 
 # Cleanup deletes its own cluster and image, keeps nothing by default, and

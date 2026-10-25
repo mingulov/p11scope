@@ -1241,10 +1241,10 @@ impl InstanceRouter {
                 // The scan re-observed these epochs now: refresh the
                 // entry's storage reference, so only a LATER counter
                 // move breaks continuity.
-                if let Some(list) = self.observed.get_mut(&key) {
-                    if let Some(found) = list.iter_mut().find(|o| o.epochs == epochs) {
-                        found.storage_seen = storage_snapshot;
-                    }
+                if let Some(list) = self.observed.get_mut(&key)
+                    && let Some(found) = list.iter_mut().find(|o| o.epochs == epochs)
+                {
+                    found.storage_seen = storage_snapshot;
                 }
                 self.counters.continued += 1;
                 ObserveOutcome::Continued

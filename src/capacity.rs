@@ -323,8 +323,13 @@ impl InventoryBudget {
             .checked_mul(INVENTORY_ENDPOINT_BYTES)
             .ok_or_else(|| "inventory payload requirement overflowed".to_string())?;
         if endpoints > self.endpoint_limit || payload > self.payload_bytes {
+            let hint = if self.endpoint_limit < MAX_INVENTORY_ENDPOINT_LIMIT {
+                format!("; raise --max-endpoints (up to {MAX_INVENTORY_ENDPOINT_LIMIT})")
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "inventory plan requires {endpoints} endpoints ({payload} payload bytes) but only {} endpoints ({} payload bytes) are available",
+                "inventory plan requires {endpoints} endpoints ({payload} payload bytes) but only {} endpoints ({} payload bytes) are available{hint}",
                 self.endpoint_limit, self.payload_bytes
             ));
         }
@@ -2592,6 +2597,22 @@ mod tests {
         for endpoints in [0, 8_193, u64::from(u32::MAX) + 1, u64::MAX] {
             assert!(CounterBudget::new(endpoints).is_err());
         }
+    }
+
+    #[test]
+    fn inventory_plan_refusal_names_the_endpoint_option_below_the_maximum() {
+        let default = inventory_endpoint_budget(None).unwrap();
+        let refusal = default.validate_count(4097).unwrap_err();
+        assert!(refusal.contains("requires 4097 endpoints"), "{refusal}");
+        assert!(
+            refusal.contains("raise --max-endpoints (up to 8192)"),
+            "{refusal}"
+        );
+        let maximum = inventory_endpoint_budget(Some(MAX_INVENTORY_ENDPOINT_LIMIT)).unwrap();
+        let refusal = maximum.validate_count(8193).unwrap_err();
+        assert!(refusal.contains("requires 8193 endpoints"), "{refusal}");
+        assert!(!refusal.contains("--max-endpoints"), "{refusal}");
+        assert!(default.validate_count(4096).is_ok());
     }
 
     #[test]

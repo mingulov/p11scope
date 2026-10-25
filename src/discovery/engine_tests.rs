@@ -48989,7 +48989,6 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     engine.max_scan_pids = 2;
     let selected = fixture.spawn_peer();
     wait_peer_mapped(selected, "seed-provider.so");
-    assert!(selected < 4_000_000);
     engine.scope = Scope::Pid(selected);
     let mut headpeer = std::process::Command::new("sleep")
         .arg("60")

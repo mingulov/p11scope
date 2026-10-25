@@ -1,0 +1,123 @@
+{
+ "callers": [
+  {
+   "id": "c251",
+   "pid": 1452406
+  },
+  {
+   "id": "c255",
+   "pid": 1456333
+  }
+ ],
+ "edges": [
+  {
+   "caller": "c251",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": null,
+     "state": "unknown"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80290198992139,
+    "state": "mapped"
+   },
+   "module": "m7"
+  },
+  {
+   "caller": "c255",
+   "entries": {
+    "count": 0,
+    "coverage": {
+     "lossy": null,
+     "since_ns": null,
+     "state": "unknown"
+    }
+   },
+   "mapping": {
+    "evidence": "deep_scan",
+    "first_seen_ns": 80290198992139,
+    "state": "mapped"
+   },
+   "module": "m8"
+  }
+ ],
+ "gaps": [
+  {
+   "caller": null,
+   "module": null,
+   "pid": null,
+   "reason": "493 processes in scope; 256 deep-scanned by provider rarity (limit 256); 1 attributed to pinned provider objects by exact maps identity; 1 processes map 2 shared objects no deep scan examined and may use undiscovered providers",
+   "subject": "discovery capped"
+  }
+ ],
+ "modules": [
+  {
+   "id": "m4",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 35
+    },
+    "inode": 356176
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m5",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 307
+    },
+    "inode": 3161916
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m7",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 138
+    },
+    "inode": 29662859
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  },
+  {
+   "id": "m8",
+   "identity": {
+    "device": {
+     "major": 0,
+     "minor": 140
+    },
+    "inode": 29662859
+   },
+   "paths": [
+    "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+   ]
+  }
+ ],
+ "observation": {
+  "identity": {
+   "backend": "kernel",
+   "fallback": "anchor_not_installed"
+  }
+ },
+ "pid_namespace": {
+  "kernel_pids": "initial",
+  "observer": "initial",
+  "proc_pids": "observer"
+ },
+ "schema": "p11scope/inventory/v1"
+}

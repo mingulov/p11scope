@@ -802,6 +802,10 @@ pub(crate) struct AttestedSemanticLane {
     /// pins zero polls past Published.
     #[cfg(test)]
     finish_poll_calls: usize,
+    /// The last wound-down poll's detach error text, if it failed:
+    /// the legacy cleanup gap carries it instead of the mapped
+    /// refusal code. Fresh each poll.
+    wound_down_error: Option<String>,
     #[cfg(test)]
     recorded_gaps: Vec<PhysicalSemanticGap>,
     #[cfg(test)]
@@ -1228,9 +1232,13 @@ impl AttestedSemanticLane {
             test_finished: false,
             #[cfg(test)]
             test_joint_frame: false,
+            #[cfg(test)]
             scripted_finish_begin: None,
+            #[cfg(test)]
             scripted_finish_poll: None,
+            #[cfg(test)]
             finish_poll_calls: 0,
+            wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1352,9 +1360,13 @@ impl AttestedSemanticLane {
             test_finished: false,
             #[cfg(test)]
             test_joint_frame: false,
+            #[cfg(test)]
             scripted_finish_begin: None,
+            #[cfg(test)]
             scripted_finish_poll: None,
+            #[cfg(test)]
             finish_poll_calls: 0,
+            wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1687,6 +1699,12 @@ impl AttestedSemanticLane {
         self.finish_poll_calls
     }
 
+    /// Take the last wound-down poll's detach error text, if it
+    /// failed: the legacy cleanup gap carries it.
+    pub(crate) fn take_wound_down_error_text(&mut self) -> Option<String> {
+        self.wound_down_error.take()
+    }
+
     /// Non-consuming wound-down poll for the Joint driver (§8.3):
     /// requires a finished, non-retained lane; begins owned terminal
     /// cleanup (idempotent); reaps the owned detach without joining.
@@ -1699,19 +1717,26 @@ impl AttestedSemanticLane {
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Result<bool, SemanticRefusal> {
+        self.wound_down_error = None;
         if self.exit_retained {
             return Err(SemanticRefusal::Unavailable);
         }
         if !self.is_finished() {
             return Err(SemanticRefusal::Unavailable);
         }
-        self.begin_owned_terminal_cleanup()
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+        if let Err(error) = self.begin_owned_terminal_cleanup() {
+            self.wound_down_error = Some(format!("{error:#}"));
+            return Err(SemanticRefusal::Unavailable);
+        }
         #[cfg(test)]
         if let Some(io) = self.test_io.as_mut() {
-            let progress = io
-                .poll_terminal_detach(&mut std::io::sink())
-                .map_err(|_| SemanticRefusal::Unavailable)?;
+            let progress = match io.poll_terminal_detach(&mut std::io::sink()) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    self.wound_down_error = Some(format!("{error:#}"));
+                    return Err(SemanticRefusal::Unavailable);
+                }
+            };
             return match progress {
                 ProducerDetachProgress::Pending => Ok(false),
                 ProducerDetachProgress::Complete => {
@@ -1744,7 +1769,10 @@ impl AttestedSemanticLane {
                 }
                 Ok(drained)
             }
-            Err(_) => Err(SemanticRefusal::Unavailable),
+            Err(error) => {
+                self.wound_down_error = Some(format!("{error:#}"));
+                Err(SemanticRefusal::Unavailable)
+            }
         }
     }
 

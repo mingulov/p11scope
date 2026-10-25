@@ -1345,6 +1345,7 @@ fn run_with_terminal_budget(
         display: None,
         semantic,
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -1902,6 +1903,12 @@ struct ClassicDriver<'a> {
     /// one ordinary collection quantum is owned at a time, so later
     /// ticks in the same pass stay quiet instead of backpressuring.
     semantic_staged: bool,
+    /// The seated lane's summary at its last hold or completion: a
+    /// held or completed final lane leaves no seat, but the run
+    /// still serves what was seated instead of the default. Each
+    /// hold or completion overwrites it with its own lane; a seated
+    /// lane always reads live.
+    seated_summary: Option<crate::inventory_semantics::SemanticCaptureSummary>,
     /// DR37 selected-lane lifecycle: the single-flight preparation
     /// worker service, polled every tick. Idle without promotion.
     lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService,
@@ -2002,6 +2009,7 @@ pub(crate) fn classic_semantic_tick_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2060,6 +2068,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2156,6 +2165,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         display: None,
         semantic: Some(lane),
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -2247,6 +2257,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         display: Some(display),
         semantic: None,
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: Some(Box::new(crate::attach::NativeCompletionMinter::new())),
         pending_install: None,
@@ -2377,10 +2388,21 @@ impl ClassicDriver<'_> {
     /// The lane's sanitized summary for this pass's presentation:
     /// disabled without manifests, never permission-bearing.
     fn semantic_summary(&self) -> crate::inventory_semantics::SemanticCaptureSummary {
-        self.semantic.as_ref().map_or(
-            crate::inventory_semantics::SemanticCaptureSummary::default(),
-            |lane| lane.semantic_summary(),
-        )
+        self.semantic
+            .as_ref()
+            .map(|lane| lane.semantic_summary())
+            .or(self.seated_summary)
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the seated lane's summary before a hold or
+    /// completion removes it: the run serves the snapshot past the
+    /// handoff instead of the default. Each removal overwrites it
+    /// with its own lane.
+    fn snapshot_seated_summary(&mut self) {
+        if let Some(lane) = self.semantic.as_ref() {
+            self.seated_summary = Some(lane.semantic_summary());
+        }
     }
 
     /// The lane's independent terminal sequence: publish any
@@ -2925,6 +2947,7 @@ impl ClassicDriver<'_> {
     /// Begin the live lane's Joint finish once; an abandoned begin
     /// holds the lane immediately.
     fn begin_final_joint_finish(&mut self) {
+        self.snapshot_seated_summary();
         let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
         let Some(lane) = semantic.as_mut() else {
             return;
@@ -2959,6 +2982,7 @@ impl ClassicDriver<'_> {
         if matches!(self.joint_finish, JointFinishDriver::Abandoned) {
             return;
         }
+        self.snapshot_seated_summary();
         let Some(lane) = self.semantic.take() else {
             return;
         };
@@ -2983,6 +3007,7 @@ impl ClassicDriver<'_> {
     /// the lane shell. A take refusal keeps the lane for the next
     /// hook, whose wound-down poll re-verifies it.
     fn complete_final_joint_lane(&mut self) {
+        self.snapshot_seated_summary();
         let Some(lane) = self.semantic.as_mut() else {
             return;
         };
@@ -3010,7 +3035,15 @@ impl ClassicDriver<'_> {
             match lane.poll_wound_down(&mut *self.coordinator) {
                 Ok(false) => Outcome::Pending,
                 Ok(true) => Outcome::Joined,
-                Err(error) => Outcome::Failed(format!("{error:#}")),
+                Err(error) => {
+                    // The gap carries the detach error text; the
+                    // mapped refusal code is only the fallback when
+                    // no detach ran (exit-retained or unfinished).
+                    let cause = lane
+                        .take_wound_down_error_text()
+                        .unwrap_or_else(|| format!("{error:#}"));
+                    Outcome::Failed(cause)
+                }
             }
         };
         match outcome {
@@ -3360,6 +3393,7 @@ impl ClassicDriver<'_> {
         {
             self.joint_step_calls += 1;
         }
+        self.snapshot_seated_summary();
         let outcome = Self::step_begun_joint_finish(
             &mut self.semantic,
             &mut self.joint_finish,
@@ -3381,8 +3415,10 @@ impl ClassicDriver<'_> {
     /// genuine end. Until publication
     /// completes the validating lane and its staged evidence stay:
     /// removing them would orphan pending work that no later
-    /// publication could discharge. Manifest lanes are not
-    /// promotion-managed and never wind down here.
+    /// publication could discharge. Joint lanes skip that gate and
+    /// begin their Finish at once (the retire gate holds pending
+    /// work instead). Manifest lanes are not promotion-managed and
+    /// never wind down here.
     fn wind_down_installed_promotion(&mut self, end: crate::inventory_promotion::PromotionEnd) {
         use crate::inventory_promotion::{PromotionOutcome, PromotionStatusUpdate};
         let Some(installed) = self.installed_promotion else {
@@ -3416,8 +3452,16 @@ impl ClassicDriver<'_> {
             }
         }
         let domain = self.semantic.as_ref().map(|lane| lane.domain());
-        let published = !self.semantic_staged
-            && domain.is_none_or(|domain| !self.coordinator.joint_domain_has_pending_work(domain));
+        let joint = self.semantic.as_ref().is_some_and(Self::is_joint_lane);
+        // Joint lanes skip the legacy staged-work gate and begin the
+        // Finish at once: staged evidence cannot drain through a
+        // gated lane, so holding here would wedge the wind-down
+        // behind B forever. Pending work is handled by the retire
+        // gate instead.
+        let published = joint
+            || (!self.semantic_staged
+                && domain
+                    .is_none_or(|domain| !self.coordinator.joint_domain_has_pending_work(domain)));
         if !published {
             // Terminal publication is incomplete: keep the validating
             // lane and its staged evidence; the next tick retries.
@@ -3425,7 +3469,6 @@ impl ClassicDriver<'_> {
             return;
         }
         self.installed_promotion = None;
-        let joint = self.semantic.as_ref().is_some_and(Self::is_joint_lane);
         let Some(lane) = self.semantic.take() else {
             let update = PromotionStatusUpdate::new(
                 installed.capture,
@@ -4255,6 +4298,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             {
                 self.joint_step_calls += 1;
             }
+            self.snapshot_seated_summary();
             let outcome = Self::step_begun_joint_finish(
                 &mut self.semantic,
                 &mut self.joint_finish,
@@ -4447,6 +4491,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 {
                     self.joint_step_calls += 1;
                 }
+                self.snapshot_seated_summary();
                 let outcome = Self::step_begun_joint_finish(
                     &mut self.semantic,
                     &mut self.joint_finish,
@@ -5400,6 +5445,7 @@ fn run_dashboard(
         display: Some(display),
         semantic,
         semantic_staged: false,
+        seated_summary: None,
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -9777,6 +9823,7 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 semantic_staged: false,
+                seated_summary: None,
                 lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
                 completion_source: None,
                 pending_install: None,
@@ -9886,6 +9933,7 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 semantic_staged: true,
+                seated_summary: None,
                 lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
                 completion_source: None,
                 pending_install: None,
@@ -11431,6 +11479,7 @@ mod promotion_driver_tests {
             display: Some(display),
             semantic: None,
             semantic_staged: false,
+            seated_summary: None,
             lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
             completion_source: None,
             pending_install: None,
@@ -14382,6 +14431,7 @@ mod promotion_driver_tests {
             display: None,
             semantic: None,
             semantic_staged: false,
+            seated_summary: None,
             lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
             completion_source: None,
             pending_install: None,

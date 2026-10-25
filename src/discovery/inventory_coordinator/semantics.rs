@@ -2478,6 +2478,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         budget: None,
                     });
                     self.record_semantic_drop(&dropped);
+                    // The staged batch is same-domain: its calls were
+                    // collected by this lane, so their shed waits for the
+                    // next finalize with a lane (collected == joined + shed).
+                    self.stash_drop_shed(&dropped, "no_lane");
                 }
             }
             Some(lane) => self.finalize_with_lane(lane),

@@ -331,6 +331,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         raise ValueError("public output must be outside the source checkout")
     head, tree, version = source_identity(root)
     facts = receipt_facts(receipt, head, tree)
+    if facts.get("capture_mode") != capture_mode:
+        raise ValueError("receipt capture mode does not match --capture-mode")
     hashes, binaries = artifacts(receipt, facts["release_artifacts_sha256"])
     notices_files, notices_hash = notices_payload(root, notices, head, tree)
     source_data = source_archive(root, source, head)

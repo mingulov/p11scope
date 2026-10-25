@@ -3857,8 +3857,179 @@ impl SlotCopy {
     }
 }
 
-/// Corroboration facts staged across the Facts phase (§1.8). Shaped by T5.
-struct CollectedFacts;
+/// Generous per-entry B-tree node share for Facts map/set buffers, in
+/// bytes on top of the entry's own size. It covers the amortized node
+/// header plus allocation padding; actual nodes hold about eleven
+/// entries each.
+const FACTS_TREE_ENTRY_OVERHEAD: usize = 128;
+
+/// Generous byte bound for one lowering refusal reason. Reasons are
+/// produced at lowering time, so only their count is measured; every
+/// `add_selection_table` refusal in plan.rs is well under this.
+const FACTS_REFUSAL_REASON_BOUND: usize = 512;
+
+/// One `live_candidate_with_pending` row per step (§1.8). Each row
+/// writes only graph buffers, preallocated from a measured bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactsStep {
+    Overlay,
+    BindingSkips,
+    SelectionLowering,
+    ObjectSkips,
+    Corroboration,
+    Fallbacks,
+    Claims,
+    Tables,
+    Done,
+}
+
+/// Corroboration facts staged across the Facts phase (§1.8). Every
+/// buffer is measured, reserved and filled strided; `storage` holds one
+/// lease per reservation. Index buffers (`module_by_object`,
+/// `module_objects`, `live_views`, `module_provider_objects`,
+/// `slot_index`) keep per-entry work logarithmic.
+struct CollectedFacts {
+    step: FactsStep,
+    substep: u8,
+    index: usize,
+    measured: bool,
+    measure_bytes: usize,
+    skips: VecDeque<Skipped>,
+    table_skips: VecDeque<Skipped>,
+    plan_skipped: VecDeque<Skipped>,
+    corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
+    fallbacks: Vec<ManifestFallback>,
+    invalidated_modules: BTreeSet<plan::ModuleId>,
+    invalidated_fallbacks: BTreeSet<(u32, u32)>,
+    claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    drop_tables: BTreeSet<SelectionTableKey>,
+    active_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    drop_claims: Vec<SelectionClaimKey>,
+    drop_cursor: Option<SelectionClaimKey>,
+    claims_cursor: Option<SelectionClaimKey>,
+    tables_cursor: Option<SelectionTableKey>,
+    dedup: BTreeSet<(String, String)>,
+    plan_dedup: BTreeSet<(String, String)>,
+    module_by_object: BTreeMap<PinnedObjectId, (usize, u8)>,
+    module_objects: BTreeSet<PinnedObjectId>,
+    live_views: BTreeSet<ProcessViewId>,
+    module_provider_objects: BTreeMap<(ProcessViewId, PinnedTimingKey), PinnedObjectId>,
+    slot_index: BTreeMap<plan::AttachKey, usize>,
+    active_keys: BTreeSet<plan::AttachKey>,
+    scratch: Option<plan::AttachPlan>,
+    scratch_manifest: usize,
+    scratch_table: usize,
+    scratch_storage: Option<ResourceLease>,
+    storage: Vec<ResourceLease>,
+}
+
+impl CollectedFacts {
+    fn new() -> Self {
+        Self {
+            step: FactsStep::Overlay,
+            substep: 0,
+            index: 0,
+            measured: false,
+            measure_bytes: 0,
+            skips: VecDeque::new(),
+            table_skips: VecDeque::new(),
+            plan_skipped: VecDeque::new(),
+            corroboration: Vec::new(),
+            fallbacks: Vec::new(),
+            invalidated_modules: BTreeSet::new(),
+            invalidated_fallbacks: BTreeSet::new(),
+            claims: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            drop_tables: BTreeSet::new(),
+            active_tables: BTreeMap::new(),
+            drop_claims: Vec::new(),
+            drop_cursor: None,
+            claims_cursor: None,
+            tables_cursor: None,
+            dedup: BTreeSet::new(),
+            plan_dedup: BTreeSet::new(),
+            module_by_object: BTreeMap::new(),
+            module_objects: BTreeSet::new(),
+            live_views: BTreeSet::new(),
+            module_provider_objects: BTreeMap::new(),
+            slot_index: BTreeMap::new(),
+            active_keys: BTreeSet::new(),
+            scratch: None,
+            scratch_manifest: 0,
+            scratch_table: 0,
+            scratch_storage: None,
+            storage: Vec::new(),
+        }
+    }
+
+    /// Advance to the next row with a fresh measure/fill cursor.
+    fn advance(&mut self, step: FactsStep) {
+        self.step = step;
+        self.substep = 0;
+        self.index = 0;
+        self.measured = false;
+        self.measure_bytes = 0;
+        self.drop_cursor = None;
+        self.claims_cursor = None;
+        self.tables_cursor = None;
+    }
+}
+
+/// Byte bound for one skip record with already-measured strings.
+fn facts_skip_bound(subject_len: usize, reason_len: usize) -> Option<usize> {
+    std::mem::size_of::<Skipped>()
+        .checked_add(subject_len)?
+        .checked_add(reason_len)?
+        .checked_add(OWNED_ALLOCATION_PADDING)
+}
+
+/// Byte bound for one corroboration entry over `objects` object ids.
+fn facts_corroboration_entry_bound(objects: usize) -> Option<usize> {
+    let set = objects.checked_mul(
+        std::mem::size_of::<PinnedObjectId>().checked_add(FACTS_TREE_ENTRY_OVERHEAD * 2)?,
+    )?;
+    std::mem::size_of::<(BTreeSet<PinnedObjectId>, &'static str)>()
+        .checked_add(OWNED_ALLOCATION_PADDING)?
+        .checked_add(set)
+}
+
+/// Byte bound for one fallback entry with measured proof parts.
+fn facts_fallback_entry_bound(tables: usize, targets: usize) -> Option<usize> {
+    let tables = tables.checked_mul(std::mem::size_of::<BoundTableProof>())?;
+    let targets = targets.checked_mul(
+        std::mem::size_of::<RequiredTarget>()
+            .checked_add(std::mem::size_of::<usize>())?
+            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+    )?;
+    std::mem::size_of::<ManifestFallback>()
+        .checked_add(OWNED_ALLOCATION_PADDING)?
+        .checked_add(tables)?
+        .checked_add(targets)
+}
+
+/// Fixed allowance for one timing key's heap strings. The key's sha
+/// field is private to identity.rs; a hex sha is 64 bytes, so 256 is a
+/// generous bound, documented here instead of measured.
+const FACTS_TIMING_KEY_STRINGS: usize = 256;
+
+/// Byte bound for one claim entry with a measured path.
+fn facts_claim_entry_bound(path_len: usize) -> Option<usize> {
+    std::mem::size_of::<SelectionClaimKey>()
+        .checked_add(std::mem::size_of::<SelectionClaim>())?
+        .checked_add(FACTS_TIMING_KEY_STRINGS)?
+        .checked_add(path_len)?
+        .checked_add(FACTS_TREE_ENTRY_OVERHEAD)
+}
+
+/// Byte bound for one table entry with measured target strings.
+fn facts_table_entry_bound(targets_bytes: usize) -> Option<usize> {
+    std::mem::size_of::<SelectionTableKey>()
+        .checked_add(std::mem::size_of::<SelectionTableFact>())?
+        .checked_add(FACTS_TIMING_KEY_STRINGS)?
+        .checked_add(targets_bytes)?
+        .checked_add(FACTS_TREE_ENTRY_OVERHEAD)
+}
 
 /// View/batch retirement cursor for Consume (§1.7). `row` stays reserved
 /// (the retire loop repeats across credits until its row completes).
@@ -3930,9 +4101,12 @@ struct CollectedGraph {
     installed: bool,
     install_step: u8,
     install_index: usize,
+    install_invalidated: bool,
     retired_backing: Option<Box<GraphBacking>>,
     old_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     old_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    old_corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
+    old_fallbacks: Vec<ManifestFallback>,
     consume: ConsumeCursor,
     reclaim_step: u8,
     reclaim_forgotten: bool,
@@ -3969,7 +4143,7 @@ impl CollectedGraph {
             raw: None,
             rebind: ScannedRebindCursor::new(),
             plan: plan::ConservativePlanCursor::new(),
-            facts: CollectedFacts,
+            facts: CollectedFacts::new(),
             handoff: None,
             backing_storage: None,
             removed_index: 0,
@@ -3985,9 +4159,12 @@ impl CollectedGraph {
             installed: false,
             install_step: 0,
             install_index: 0,
+            install_invalidated: false,
             retired_backing: None,
             old_claims: BTreeMap::new(),
             old_tables: BTreeMap::new(),
+            old_corroboration: Vec::new(),
+            old_fallbacks: Vec::new(),
             consume: ConsumeCursor::new(),
             reclaim_step: 0,
             reclaim_forgotten: false,
@@ -22554,7 +22731,7 @@ impl Engine {
             GraphPhase::RawCopy => self.step_graph_raw_copy(graph, reserve),
             GraphPhase::Rebind => self.step_graph_rebind(graph, reserve),
             GraphPhase::Plan => self.step_graph_plan(graph, reserve),
-            GraphPhase::Facts => Self::step_graph_facts_pending_t5(graph),
+            GraphPhase::Facts => self.step_graph_facts(graph, reserve),
             GraphPhase::Handoff => self.step_graph_handoff(graph, reserve),
             GraphPhase::RemovedCopy => self.step_graph_removed_copy(session, graph, reserve),
             GraphPhase::NativePrepare => self.step_graph_native_prepare(session, q, reserve, graph),
@@ -22994,14 +23171,1090 @@ impl Engine {
             .get_or_insert("native ownership uncertain");
     }
 
-    /// Facts (§1.8), T5 stub: T5 fills the row machine that builds
-    /// claims/tables/corroboration plus Install steps 6-8 over it. Until
-    /// then the phase advances with no facts content; Install step 5
-    /// swaps the (empty) stub maps that T5's
-    /// `facts_maps_for_install_t5_stub` fills.
-    fn step_graph_facts_pending_t5(graph: &mut CollectedGraph) -> GraphService {
-        graph.phase = GraphPhase::Handoff;
+    /// Facts (§1.8): one `live_candidate_with_pending` row per step.
+    /// Each row writes only graph buffers, preallocated from a measured
+    /// bound, up to one stride of entries per credit.
+    fn step_graph_facts(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        match graph.facts.step {
+            FactsStep::Overlay => {
+                // Overlay merges cannot be detected here: the scan-only
+                // alias map is private to identity.rs. Live pins are
+                // canonical at Freeze on the manifest-free path (every
+                // install canonicalizes), and the uncertainty flag rides
+                // the copy; a T2b followup must surface a merge detector
+                // before manifest captures can rely on this row.
+                graph.facts.advance(FactsStep::BindingSkips);
+                Self::graph_idle(true)
+            }
+            FactsStep::BindingSkips => {
+                // No bind failures exist below: the rebind cursor binds
+                // losslessly (T2b H2a), and ambiguity records are always
+                // pre-published before a key reaches the pending set, so
+                // the replay's republish is a dedup hit the graph matches
+                // by holding no copy. G11 proves both sides empty.
+                graph.facts.advance(FactsStep::SelectionLowering);
+                Self::graph_idle(true)
+            }
+            FactsStep::SelectionLowering => self.step_facts_lowering(graph, reserve),
+            FactsStep::ObjectSkips => self.step_facts_object_skips(graph, reserve),
+            FactsStep::Corroboration => self.step_facts_corroboration(graph, reserve),
+            FactsStep::Fallbacks => self.step_facts_fallbacks(graph, reserve),
+            FactsStep::Claims => self.step_facts_claims(graph, reserve),
+            FactsStep::Tables => self.step_facts_tables(graph, reserve),
+            FactsStep::Done => {
+                graph.phase = GraphPhase::Handoff;
+                Self::graph_idle(true)
+            }
+        }
+    }
+
+    /// Reserve `bytes` for a Facts buffer, refusing untouched on a short
+    /// pool or an overflowed measure. Facts runs before native mutation.
+    fn facts_reserve(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+        bytes: Option<usize>,
+    ) -> Option<ResourceLease> {
+        let bytes = bytes?;
+        match reserve.reserve(bytes) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                self.refuse_graph_before_native(graph);
+                None
+            }
+        }
+    }
+
+    /// SelectionLowering (§1.8): manifest selection tables over a
+    /// graph-owned scratch clone of the cursor plan. Admissions are
+    /// discarded — the cursor plan already carries the admitted state,
+    /// so none are installed at Q — and refusals become skips with the
+    /// legacy subject. Outcomes match the twin exactly: they depend
+    /// only on policy, present modules, object match and key sets, all
+    /// equal across twins; the scratch mutations are dropped. One table
+    /// per credit: `add_selection_table` scans the slot keys.
+    fn step_facts_lowering(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if !graph.facts.measured {
+            let mut tables = 0usize;
+            let mut overflow = false;
+            for manifest in &self.manifests {
+                match tables.checked_add(manifest.selection_evidence.tables.len()) {
+                    Some(total) => tables = total,
+                    None => overflow = true,
+                }
+            }
+            let per = std::mem::size_of::<Skipped>()
+                .checked_add(FACTS_REFUSAL_REASON_BOUND)
+                .and_then(|per| per.checked_add(OWNED_ALLOCATION_PADDING));
+            let bound = per
+                .and_then(|per| tables.checked_mul(per))
+                .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING));
+            if overflow || bound.is_none() {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            let Some(lease) = self.facts_reserve(graph, reserve, bound) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.skips.reserve(tables);
+            graph.facts.measured = true;
+        }
+        if self.manifests.is_empty() {
+            graph.facts.advance(FactsStep::ObjectSkips);
+            return Self::graph_idle(true);
+        }
+        if graph.facts.scratch.is_none() {
+            let ready = graph.plan.plan().is_some() && graph.plan.required_bytes().is_some();
+            if !ready {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            let required = graph.plan.required_bytes();
+            let Some(lease) = self.facts_reserve(graph, reserve, required) else {
+                return Self::graph_idle(true);
+            };
+            let clone = graph.plan.plan().map(|cursor| cursor.clone());
+            let Some(clone) = clone else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            graph.facts.scratch_storage = Some(lease);
+            graph.facts.scratch = Some(clone);
+        }
+        if graph.pins.loaned_output().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        // One table per credit; manifests without a provider or module
+        // are skipped exactly like `lower_manifest_selection_tables`.
+        loop {
+            let at = (graph.facts.scratch_manifest, graph.facts.scratch_table);
+            if at.0 >= self.manifests.len() {
+                graph.facts.advance(FactsStep::ObjectSkips);
+                return Self::graph_idle(true);
+            }
+            let manifest = &self.manifests[at.0];
+            let g = &mut *graph;
+            let (pins, facts) = (&g.pins, &mut g.facts);
+            let loaned = pins.loaned_output().expect("loaned pins checked above");
+            let scratch = facts.scratch.as_mut().expect("scratch cloned above");
+            let Some(provider) = manifest_module_object(manifest, loaned) else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            let Some(module) = scratch
+                .modules
+                .iter()
+                .find(|module| module.object == provider)
+                .map(|module| module.id)
+            else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            let mut targets = manifest_selection_targets(manifest, loaned).skip(at.1);
+            let Some((_, targets)) = targets.next() else {
+                facts.scratch_manifest += 1;
+                facts.scratch_table = 0;
+                continue;
+            };
+            facts.scratch_table += 1;
+            if let Err(reason) = scratch.add_selection_table(&self.plan, module, targets) {
+                facts.skips.push_back(Skipped {
+                    subject: "offline interface selection".into(),
+                    reason,
+                });
+            }
+            return Self::graph_idle(true);
+        }
+    }
+
+    /// ObjectSkips (§1.8): the `record_object_skips` append delta over
+    /// the cursor plan, in twin order. The retain half is vacuous at Q:
+    /// the cursor plan carries only fresh-broad skips (manifest orphans,
+    /// never scan gaps), and removal cannot newly attach a gap. The delta
+    /// also seeds the counters and plan dedup sets Install steps 7-8 use.
+    fn step_facts_object_skips(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            // Strided measure over old counters plus cursor skips.
+            let old_len = self.counters.object_skips.len();
+            let cursor_len = graph.plan.plan().map(|plan| plan.skipped.len()).unwrap_or(0);
+            let total = old_len.saturating_add(cursor_len);
+            let from = graph.facts.index;
+            let until = total.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for position in from..until {
+                let skip = if position < old_len {
+                    &self.counters.object_skips[position]
+                } else {
+                    &graph.plan.plan().expect("cursor checked above").skipped[position - old_len]
+                };
+                match facts_skip_bound(skip.subject.len(), skip.reason.len())
+                    .and_then(|bound| bytes.checked_add(bound))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < total {
+                return Self::graph_idle(true);
+            }
+            let extra = total
+                .checked_add(graph.facts.skips.len())
+                .and_then(|n| n.checked_mul(FACTS_TREE_ENTRY_OVERHEAD * 2 + 1))
+                .and_then(|extra| bytes.checked_add(extra));
+            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.plan_skipped.reserve(old_len.saturating_add(graph.facts.skips.len()));
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            let cursor_len = graph.plan.plan().map(|plan| plan.skipped.len()).unwrap_or(0);
+            let from = graph.facts.index;
+            let until = cursor_len.min(from.saturating_add(GRAPH_STRIDE));
+            for position in from..until {
+                let skip = graph.plan.plan().expect("cursor checked above").skipped[position].clone();
+                graph
+                    .facts
+                    .plan_dedup
+                    .insert((skip.subject.clone(), skip.reason.clone()));
+            }
+            graph.facts.index = until;
+            if until >= cursor_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            let old_len = self.counters.object_skips.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            for position in from..until {
+                let skip = self.counters.object_skips[position].clone();
+                let pair = (skip.subject.clone(), skip.reason.clone());
+                graph.facts.dedup.insert(pair.clone());
+                if graph.facts.plan_dedup.insert(pair) {
+                    graph.facts.plan_skipped.push_back(skip);
+                }
+            }
+            graph.facts.index = until;
+            if until >= old_len {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let skips_len = graph.facts.skips.len();
+        let from = graph.facts.index;
+        let until = skips_len.min(from.saturating_add(GRAPH_STRIDE));
+        for position in from..until {
+            let skip = graph.facts.skips[position].clone();
+            let pair = (skip.subject.clone(), skip.reason.clone());
+            if graph.facts.plan_dedup.insert(pair) {
+                graph.facts.plan_skipped.push_back(skip);
+            }
+        }
+        graph.facts.index = until;
+        if until >= skips_len {
+            graph.facts.advance(FactsStep::Corroboration);
+        }
         Self::graph_idle(true)
+    }
+
+    /// Corroboration (§1.8): retain the entries whose objects all survive
+    /// in the cursor plan modules with loaned summaries; the rest name
+    /// invalidated old-plan modules. Mirrors the retain row exactly.
+    fn step_facts_corroboration(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.pins.loaned_output().is_none() || graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let old_len = self.counters.corroboration.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for entry in &self.counters.corroboration[from..until] {
+                match facts_corroboration_entry_bound(entry.0.len())
+                    .and_then(|per| bytes.checked_add(per))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < old_len {
+                return Self::graph_idle(true);
+            }
+            let extra = self
+                .plan
+                .modules
+                .len()
+                .checked_add(
+                    graph
+                        .plan
+                        .plan()
+                        .map(|plan| plan.modules.len())
+                        .unwrap_or(0),
+                )
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<PinnedObjectId>()
+                            .checked_add(std::mem::size_of::<(usize, u8)>())?
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+                    )
+                })
+                .and_then(|extra| bytes.checked_add(extra));
+            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.corroboration.reserve(old_len);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Old-plan object index for invalidation lookups.
+            let modules_len = self.plan.modules.len();
+            let from = graph.facts.index;
+            let until = modules_len.min(from.saturating_add(GRAPH_STRIDE));
+            for (position, module) in self.plan.modules[from..until].iter().enumerate() {
+                graph
+                    .facts
+                    .module_by_object
+                    .entry(module.object)
+                    .and_modify(|slot| slot.1 = slot.1.saturating_add(1).min(2))
+                    .or_insert((from + position, 1));
+            }
+            graph.facts.index = until;
+            if until >= modules_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            // Cursor-plan module objects: the twin's rebuilt set.
+            let modules: Vec<PinnedObjectId> = graph
+                .plan
+                .plan()
+                .map(|plan| plan.modules.iter().map(|module| module.object).collect())
+                .unwrap_or_default();
+            let from = graph.facts.index;
+            let until = modules.len().min(from.saturating_add(GRAPH_STRIDE));
+            for object in &modules[from..until] {
+                graph.facts.module_objects.insert(*object);
+            }
+            graph.facts.index = until;
+            if until >= modules.len() {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let old_len = self.counters.corroboration.len();
+        let from = graph.facts.index;
+        let mut units = 0usize;
+        let mut position = from;
+        while position < old_len && units < GRAPH_STRIDE {
+            let (objects, _) = &self.counters.corroboration[position];
+            units = units.saturating_add(1).saturating_add(objects.len());
+            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let keep = !objects.is_empty()
+                && objects.iter().all(|object| {
+                    graph.facts.module_objects.contains(object)
+                        && loaned.summary(*object).is_some()
+                });
+            if keep {
+                let entry = self.counters.corroboration[position].clone();
+                graph.facts.corroboration.push(entry);
+            } else {
+                let mut invalidated = Vec::new();
+                for object in objects {
+                    if let Some((index, _)) = graph.facts.module_by_object.get(object) {
+                        invalidated.push(self.plan.modules[*index].id);
+                    }
+                }
+                for module in invalidated {
+                    graph.facts.invalidated_modules.insert(module);
+                }
+            }
+            position += 1;
+        }
+        graph.facts.index = position;
+        if position >= old_len {
+            graph.facts.advance(FactsStep::Fallbacks);
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Fallback proof check over indexed plan state, replicating
+    /// `fallback_proof_in_plan` without its linear scans: module
+    /// uniqueness from the object index, required targets from the slot
+    /// index, table counts by nested scan (no allocation per entry).
+    /// Module tables come from the old plan: surviving modules keep the
+    /// same derived tables across the removal-only rebuild (G11 guards
+    /// the equivalence against the twin's rebuilt read).
+    fn facts_proof_in_plan(
+        proof: &BoundFallbackProof,
+        old_modules: &[plan::ModuleSummary],
+        cursor: &plan::AttachPlan,
+        module_by_object: &BTreeMap<PinnedObjectId, (usize, u8)>,
+        slot_index: &BTreeMap<plan::AttachKey, usize>,
+    ) -> bool {
+        for (left, table) in proof.tables.iter().enumerate() {
+            if proof.tables[..left].iter().any(|known| known.address == table.address) {
+                return false;
+            }
+        }
+        let Some((index, count)) = module_by_object.get(&proof.module) else {
+            return false;
+        };
+        if *count != 1 {
+            return false;
+        }
+        let Some(module) = old_modules.get(*index) else {
+            return false;
+        };
+        if module.object != proof.module {
+            return false;
+        }
+        for table in &proof.tables {
+            let required = proof
+                .tables
+                .iter()
+                .filter(|known| known.version == table.version && known.entries == table.entries)
+                .count();
+            let available = module
+                .tables
+                .iter()
+                .filter(|known| known.source == "scan")
+                .filter(|known| known.version == table.version && known.entries == table.entries)
+                .count();
+            if available < required {
+                return false;
+            }
+        }
+        proof.required_targets.keys().all(|required| {
+            let key = plan::AttachKey {
+                object: required.object,
+                file_offset: required.file_offset,
+            };
+            slot_index.get(&key).and_then(|position| cursor.slots.get(*position)).is_some_and(
+                |slot| {
+                    slot.names.iter().any(|name| name == &required.name)
+                        && slot.module_ids.contains(&module.id)
+                },
+            )
+        })
+    }
+
+    /// Fallbacks (§1.8): retain the fallbacks whose replacement keeps a
+    /// loaned summary with its proof in the cursor plan; the rest name
+    /// invalidated manifest objects. Unit-counted: one entry minimum per
+    /// credit so a large proof still makes progress.
+    fn step_facts_fallbacks(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        if graph.pins.loaned_output().is_none() || graph.plan.plan().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let old_len = self.counters.manifest_fallbacks.len();
+            let from = graph.facts.index;
+            let until = old_len.min(from.saturating_add(GRAPH_STRIDE));
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for fallback in &self.counters.manifest_fallbacks[from..until] {
+                match facts_fallback_entry_bound(
+                    fallback.proof.tables.len(),
+                    fallback.proof.required_targets.len(),
+                )
+                .and_then(|per| bytes.checked_add(per))
+                {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.index = until;
+            graph.facts.measure_bytes = bytes;
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if until < old_len {
+                return Self::graph_idle(true);
+            }
+            let per = std::mem::size_of::<plan::AttachKey>()
+                .checked_add(std::mem::size_of::<usize>())
+                .and_then(|per| per.checked_add(FACTS_TREE_ENTRY_OVERHEAD));
+            let extra = per
+                .and_then(|per| {
+                    graph
+                        .plan
+                        .plan()
+                        .map(|plan| plan.slots.len())
+                        .unwrap_or(0)
+                        .checked_mul(per)
+                })
+                .and_then(|extra| bytes.checked_add(extra));
+            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.fallbacks.reserve(old_len);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Cursor-plan slot index for proof target lookups.
+            let slots: Vec<(plan::AttachKey, usize)> = graph
+                .plan
+                .plan()
+                .map(|plan| {
+                    plan.slots
+                        .iter()
+                        .enumerate()
+                        .map(|(position, slot)| {
+                            (
+                                plan::AttachKey {
+                                    object: slot.object,
+                                    file_offset: slot.file_offset,
+                                },
+                                position,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let from = graph.facts.index;
+            let until = slots.len().min(from.saturating_add(GRAPH_STRIDE));
+            for (key, position) in &slots[from..until] {
+                graph.facts.slot_index.insert(*key, *position);
+            }
+            graph.facts.index = until;
+            if until >= slots.len() {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        let old_len = self.counters.manifest_fallbacks.len();
+        let from = graph.facts.index;
+        let mut units = 0usize;
+        let mut position = from;
+        while position < old_len && (units < GRAPH_STRIDE || position == from) {
+            let fallback = &self.counters.manifest_fallbacks[position];
+            units = units
+                .saturating_add(1)
+                .saturating_add(fallback.proof.tables.len())
+                .saturating_add(fallback.proof.required_targets.len().saturating_mul(2));
+            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            let cursor = graph.plan.plan().expect("cursor checked above");
+            let keep = loaned.summary(fallback.replacement).is_some()
+                && Self::facts_proof_in_plan(
+                    &fallback.proof,
+                    &self.plan.modules,
+                    cursor,
+                    &graph.facts.module_by_object,
+                    &graph.facts.slot_index,
+                );
+            if keep {
+                let entry = self.counters.manifest_fallbacks[position].clone();
+                graph.facts.fallbacks.push(entry);
+            } else {
+                graph
+                    .facts
+                    .invalidated_fallbacks
+                    .insert((fallback.manifest, fallback.object));
+            }
+            position += 1;
+        }
+        graph.facts.index = position;
+        if position >= old_len {
+            graph.facts.advance(FactsStep::Claims);
+        }
+        Self::graph_idle(true)
+    }
+
+    /// Claims (§1.8): retain the claims over live views with live
+    /// bindings, replicating the retain predicate condition by
+    /// condition (`declined` is empty and `pending_selection` is `None`
+    /// on the conservative path), then prune table conflicts exactly
+    /// like the twin. Prune conflicts have no graph refuse row (their
+    /// refuse touches history and coverage, outside Install 6-8); the
+    /// fixture raises none and G11 guards the history equality.
+    fn step_facts_claims(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.pins.loaned_output().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let after = graph.facts.claims_cursor.clone();
+            let range: Vec<(SelectionClaimKey, usize)> = match after {
+                None => self
+                    .selection_claims
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.object_path.len()))
+                    .collect(),
+                Some(after) => self
+                    .selection_claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.object_path.len()))
+                    .collect(),
+            };
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for (_, path_len) in &range {
+                match facts_claim_entry_bound(*path_len).and_then(|per| bytes.checked_add(per)) {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.measure_bytes = bytes;
+            if let Some((last, _)) = range.last() {
+                graph.facts.claims_cursor = Some(last.clone());
+            }
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            let extra = self
+                .views
+                .len()
+                .checked_add(self.plan.slots.len())
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<plan::AttachKey>()
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?,
+                    )
+                })
+                .and_then(|extra| bytes.checked_add(extra));
+            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            graph.facts.claims_cursor = None;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Live views, read once instead of per claim per view.
+            let views_len = self.views.len();
+            let from = graph.facts.index;
+            let until = views_len.min(from.saturating_add(GRAPH_STRIDE));
+            for view in &self.views[from..until] {
+                if view.still_the_same() {
+                    graph.facts.live_views.insert(view.id());
+                }
+            }
+            graph.facts.index = until;
+            if until >= views_len {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            // Active old-plan slot keys: the twin reads the old plan.
+            let slots_len = self.plan.slots.len();
+            let from = graph.facts.index;
+            let until = slots_len.min(from.saturating_add(GRAPH_STRIDE));
+            for slot in &self.plan.slots[from..until] {
+                if self.plan.is_active(slot.index) {
+                    graph.facts.active_keys.insert(plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    });
+                }
+            }
+            graph.facts.index = until;
+            if until >= slots_len {
+                graph.facts.substep = 3;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 3 {
+            let after = graph.facts.claims_cursor.clone();
+            let range: Vec<(SelectionClaimKey, SelectionClaim)> = match after {
+                None => self
+                    .selection_claims
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.clone()))
+                    .collect(),
+                Some(after) => self
+                    .selection_claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, claim)| (key.clone(), claim.clone()))
+                    .collect(),
+            };
+            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            for (key, claim) in &range {
+                let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
+                    continue;
+                };
+                let live_view = graph.facts.live_views.contains(&key.view);
+                let binding_live = binding.attached
+                    && !binding.retired
+                    && binding.context.get() == key.context
+                    && binding.view == key.view
+                    && binding.object == key.hook_owner
+                    && self.loader_registry.context(binding.context).is_some_and(|context| {
+                        context.spec.view == key.view
+                            && !self.loader_registry.is_tombstoned(binding.context)
+                    })
+                    && loaned
+                        .owned_timing_key(binding.object)
+                        .is_some_and(|provider| provider == key.provider)
+                    && loaned.summary(claim.target.object).is_some()
+                    && claim.target.object == key.selected_object
+                    && claim.target.file_offset == key.file_offset;
+                if live_view && binding_live && graph.facts.active_keys.contains(&claim.target) {
+                    graph
+                        .facts
+                        .claims
+                        .insert(key.clone(), claim.clone());
+                }
+            }
+            if let Some((last, _)) = range.last() {
+                graph.facts.claims_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 4;
+            return Self::graph_idle(true);
+        }
+        // Whole prune, like the twin: conflicts are absent below.
+        let _conflicts = prune_selection_table_conflicts(&mut graph.facts.claims);
+        graph.facts.advance(FactsStep::Tables);
+        Self::graph_idle(true)
+    }
+
+    /// Clone the cursor plan into the lowering scratch if absent,
+    /// reserving the cursor's measured derivation bound for it.
+    fn facts_ensure_scratch(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> bool {
+        if graph.facts.scratch.is_some() {
+            return true;
+        }
+        if graph.plan.plan().is_none() || graph.plan.required_bytes().is_none() {
+            self.refuse_graph_before_native(graph);
+            return false;
+        }
+        let required = graph.plan.required_bytes();
+        let Some(lease) = self.facts_reserve(graph, reserve, required) else {
+            return false;
+        };
+        let clone = graph.plan.plan().map(|cursor| cursor.clone());
+        let Some(clone) = clone else {
+            self.refuse_graph_before_native(graph);
+            return false;
+        };
+        graph.facts.scratch_storage = Some(lease);
+        graph.facts.scratch = Some(clone);
+        true
+    }
+
+    /// Tables (§1.8): retain the tables whose view lives with a provider
+    /// module in the rebound set, then admit the active claim tables
+    /// over the lowering scratch. Latch mismatches, missing modules and
+    /// admission failures drop their claims; admission failures also
+    /// queue skips with the legacy subject. The refuse half of those
+    /// paths touches history and coverage, outside Install 6-8; the
+    /// fixture raises none and G11 guards the history equality. One
+    /// active table per credit: admission scans the slot keys.
+    fn step_facts_tables(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.pins.loaned_output().is_none() || graph.rebind.modules().is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if !graph.facts.measured {
+            let after = graph.facts.tables_cursor.clone();
+            let range: Vec<(SelectionTableKey, usize)> = match after {
+                None => self
+                    .selection_tables
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| {
+                        let strings: usize =
+                            fact.targets.iter().map(|target| target.object_path.len()).sum();
+                        (key.clone(), strings)
+                    })
+                    .collect(),
+                Some(after) => self
+                    .selection_tables
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| {
+                        let strings: usize =
+                            fact.targets.iter().map(|target| target.object_path.len()).sum();
+                        (key.clone(), strings)
+                    })
+                    .collect(),
+            };
+            let mut bytes = graph.facts.measure_bytes;
+            let mut overflow = false;
+            for (_, strings) in &range {
+                match facts_table_entry_bound(*strings).and_then(|per| bytes.checked_add(per)) {
+                    Some(total) => bytes = total,
+                    None => overflow = true,
+                }
+            }
+            graph.facts.measure_bytes = bytes;
+            if let Some((last, _)) = range.last() {
+                graph.facts.tables_cursor = Some(last.clone());
+            }
+            if overflow {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            let extra = graph
+                .rebind
+                .modules()
+                .map(|modules| modules.len())
+                .unwrap_or(0)
+                .checked_add(graph.facts.claims.len())
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<(ProcessViewId, PinnedTimingKey)>()
+                            .checked_add(std::mem::size_of::<PinnedObjectId>())?
+                            .checked_add(FACTS_TREE_ENTRY_OVERHEAD)?
+                            .checked_add(FACTS_TIMING_KEY_STRINGS)?,
+                    )
+                })
+                .and_then(|extra| bytes.checked_add(extra));
+            let Some(lease) = self.facts_reserve(graph, reserve, extra) else {
+                return Self::graph_idle(true);
+            };
+            graph.facts.storage.push(lease);
+            graph.facts.table_skips.reserve(graph.facts.claims.len());
+            graph.facts.drop_claims.reserve(graph.facts.claims.len());
+            graph.facts.measured = true;
+            graph.facts.substep = 1;
+            graph.facts.index = 0;
+            graph.facts.tables_cursor = None;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 1 {
+            // Rebound provider objects by (view, timing key). Providers
+            // are unique per object, so first-match order is irrelevant.
+            let modules = graph.rebind.modules().expect("rebind checked above");
+            let from = graph.facts.index;
+            let until = modules.len().min(from.saturating_add(GRAPH_STRIDE));
+            let loaned = graph.pins.loaned_output().expect("loaned pins checked above");
+            for module in &modules[from..until] {
+                if let Some(provider) = loaned.owned_timing_key(module.object) {
+                    graph
+                        .facts
+                        .module_provider_objects
+                        .entry((module.scanned.view, provider))
+                        .or_insert(module.object);
+                }
+            }
+            graph.facts.index = until;
+            if until >= modules.len() {
+                graph.facts.substep = 2;
+                graph.facts.index = 0;
+            }
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 2 {
+            let after = graph.facts.tables_cursor.clone();
+            let range: Vec<(SelectionTableKey, SelectionTableFact)> = match after {
+                None => self
+                    .selection_tables
+                    .iter()
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| (key.clone(), fact.clone()))
+                    .collect(),
+                Some(after) => self
+                    .selection_tables
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, fact)| (key.clone(), fact.clone()))
+                    .collect(),
+            };
+            for (key, fact) in &range {
+                let live = graph.facts.live_views.contains(&key.view)
+                    && graph
+                        .facts
+                        .module_provider_objects
+                        .contains_key(&(key.view, key.provider.clone()));
+                if live {
+                    graph.facts.tables.insert(key.clone(), fact.clone());
+                }
+            }
+            if let Some((last, _)) = range.last() {
+                graph.facts.tables_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 3;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 3 {
+            // Whole actives build, like the twin; the loop strides below.
+            let active = selection_tables_from_claims(&graph.facts.claims);
+            graph.facts.active_tables = active;
+            graph.facts.substep = 4;
+            return Self::graph_idle(true);
+        }
+        if graph.facts.substep == 4 {
+            let Some((key, table)) = graph.facts.active_tables.pop_first() else {
+                graph.facts.substep = 5;
+                graph.facts.index = 0;
+                return Self::graph_idle(true);
+            };
+            if graph
+                .facts
+                .tables
+                .get(&key)
+                .is_some_and(|known| {
+                    known.object != table.object
+                        || known.file_offset != table.file_offset
+                        || !same_selection_target_set(&known.targets, &table.targets)
+                })
+            {
+                graph.facts.drop_tables.insert(key);
+                return Self::graph_idle(true);
+            }
+            graph
+                .facts
+                .tables
+                .entry(key.clone())
+                .or_insert_with(|| table.clone());
+            let object = graph
+                .facts
+                .module_provider_objects
+                .get(&(key.view, key.provider.clone()))
+                .copied();
+            let module = object.and_then(|object| {
+                graph
+                    .facts
+                    .module_by_object
+                    .get(&object)
+                    .and_then(|(index, count)| (*count == 1).then_some(*index))
+            });
+            let Some(module) = module else {
+                graph.facts.drop_tables.insert(key);
+                return Self::graph_idle(true);
+            };
+            if !self.facts_ensure_scratch(graph, reserve) {
+                // The popped table is requeued so the refusal path and a
+                // later retry keep it. Refusal already recorded above.
+                graph.facts.active_tables.insert(key, table);
+                return Self::graph_idle(true);
+            }
+            let module_id = self.plan.modules[module].id;
+            let g = &mut *graph;
+            let facts = &mut g.facts;
+            let scratch = facts.scratch.as_mut().expect("scratch ensured above");
+            if let Err(reason) =
+                scratch.add_selection_table(&self.plan, module_id, table.targets.clone())
+            {
+                facts.table_skips.push_back(Skipped {
+                    subject: "live interface selection".into(),
+                    reason,
+                });
+                facts.drop_tables.insert(key);
+            }
+            Self::graph_idle(true)
+        } else if graph.facts.substep == 5 {
+            // Collect the claims whose table key was dropped.
+            let after = graph.facts.drop_cursor.clone();
+            let range: Vec<SelectionClaimKey> = match after {
+                None => graph
+                    .facts
+                    .claims
+                    .keys()
+                    .take(GRAPH_STRIDE)
+                    .cloned()
+                    .collect(),
+                Some(after) => graph
+                    .facts
+                    .claims
+                    .range((Excluded(after), Unbounded))
+                    .take(GRAPH_STRIDE)
+                    .map(|(key, _)| key.clone())
+                    .collect(),
+            };
+            for key in &range {
+                if graph.facts.drop_tables.contains(&selection_table_key(key)) {
+                    graph.facts.drop_claims.push(key.clone());
+                }
+            }
+            if let Some(last) = range.last() {
+                graph.facts.drop_cursor = Some(last.clone());
+            }
+            if range.len() >= GRAPH_STRIDE {
+                return Self::graph_idle(true);
+            }
+            graph.facts.substep = 6;
+            graph.facts.index = 0;
+            Self::graph_idle(true)
+        } else if graph.facts.substep == 6 {
+            let from = graph.facts.index;
+            let until = graph
+                .facts
+                .drop_claims
+                .len()
+                .min(from.saturating_add(GRAPH_STRIDE));
+            let victims: Vec<SelectionClaimKey> =
+                graph.facts.drop_claims[from..until].to_vec();
+            for key in &victims {
+                graph.facts.claims.remove(key);
+            }
+            graph.facts.index = until;
+            if until >= graph.facts.drop_claims.len() {
+                graph.facts.substep = 7;
+            }
+            Self::graph_idle(true)
+        } else {
+            // The scratch plan has no strided drain: its maps are private
+            // to plan.rs. Dropping it whole matches the twin's rebuilt
+            // drop; a plan.rs drain is the followup for strict striding.
+            graph.facts.scratch = None;
+            graph.facts.scratch_storage = None;
+            graph.facts.advance(FactsStep::Done);
+            Self::graph_idle(true)
+        }
     }
 
     /// Handoff (§1.6): reserves the retired-file handoff and the installed
@@ -23330,20 +24583,14 @@ impl Engine {
         }
     }
 
-    /// T5 stub: the Facts maps Install step 5 swaps in. T5 returns the
-    /// built claims/tables; until then the swap installs empty maps.
-    fn facts_maps_for_install_t5_stub() -> (
-        BTreeMap<SelectionClaimKey, SelectionClaim>,
-        BTreeMap<SelectionTableKey, SelectionTableFact>,
-    ) {
-        (BTreeMap::new(), BTreeMap::new())
-    }
-
     /// Install (§1.8): the first credit revalidates epoch plus Freeze
     /// scalars (a mismatch after Closed retains, never restarts), then
     /// sinks pins/modules/plan (steps 1-3), chains the old backing
-    /// (step 4) and swaps the Facts maps (step 5). A later credit runs
-    /// the T5 row stubs (steps 7-8) and the epoch bump (step 9).
+    /// (step 4) and swaps the Facts maps (steps 5-6). Later credits run
+    /// skips into counters (step 7, in live row order around the
+    /// invalidation disclosure), invalidated modules/fallbacks with the
+    /// legacy handling (step 8), the ObjectSkips plan append and the
+    /// epoch bump (step 9).
     fn step_graph_install(&mut self, graph: &mut CollectedGraph) -> GraphService {
         if graph.install_step == 0 {
             if self.graph_inputs_epoch != graph.epoch
@@ -23384,20 +24631,159 @@ impl Engine {
                 plan: plan_backing,
                 storage: Some(backing_storage),
             }));
-            let (mut claims, mut tables) = Self::facts_maps_for_install_t5_stub();
-            std::mem::swap(&mut claims, &mut self.selection_claims);
-            std::mem::swap(&mut tables, &mut self.selection_tables);
-            graph.old_claims = claims;
-            graph.old_tables = tables;
+            std::mem::swap(&mut graph.facts.claims, &mut self.selection_claims);
+            std::mem::swap(&mut graph.facts.tables, &mut self.selection_tables);
+            graph.old_claims = std::mem::take(&mut graph.facts.claims);
+            graph.old_tables = std::mem::take(&mut graph.facts.tables);
+            std::mem::swap(
+                &mut graph.facts.corroboration,
+                &mut self.counters.corroboration,
+            );
+            std::mem::swap(
+                &mut graph.facts.fallbacks,
+                &mut self.counters.manifest_fallbacks,
+            );
+            graph.old_corroboration = std::mem::take(&mut graph.facts.corroboration);
+            graph.old_fallbacks = std::mem::take(&mut graph.facts.fallbacks);
+            graph.install_invalidated = !graph.facts.invalidated_modules.is_empty()
+                || !graph.facts.invalidated_fallbacks.is_empty();
             graph.installed = true;
             graph.install_step = 1;
+            graph.install_index = 0;
             return Self::graph_idle(true);
         }
-        // Steps 7-8 (T5: skips and invalidations over the Facts rows)
-        // are vacuous until T5 fills them; step 9 bumps the epoch.
-        self.note_graph_inputs_mutated();
-        graph.phase = GraphPhase::Consume;
-        Self::graph_idle(true)
+        match graph.install_step {
+            // Step 7, early rows: skip entries into counters with the
+            // legacy contains-dedup, in live row order.
+            1 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.skips.pop_front() else {
+                        break;
+                    };
+                    attribution::note(&skip);
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.dedup.insert(pair) {
+                        self.counters.object_skips.push(skip);
+                    }
+                    units += 1;
+                }
+                if graph.facts.skips.is_empty() {
+                    graph.install_step = 2;
+                }
+                Self::graph_idle(true)
+            }
+            // Step 8: invalidated modules/fallbacks with the legacy
+            // handling after the retain rows: invalidate, project when
+            // nothing is staged, then the evidence disclosure. One
+            // credit, like the twin's single call sequence.
+            2 => {
+                if graph.install_invalidated {
+                    let modules = std::mem::take(&mut graph.facts.invalidated_modules);
+                    let fallbacks = std::mem::take(&mut graph.facts.invalidated_fallbacks);
+                    self.capture_facts
+                        .invalidate_discovery_proofs(modules, fallbacks);
+                    if self.capture_facts.staged.is_none() {
+                        self.project_capture_facts();
+                    }
+                    self.mark_partial(
+                        "live discovery evidence",
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence",
+                    );
+                    graph.facts.dedup.insert((
+                        "live discovery evidence".to_string(),
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .to_string(),
+                    ));
+                }
+                graph.install_step = 3;
+                graph.install_index = 0;
+                Self::graph_idle(true)
+            }
+            // Step 7, Tables row: queued after the invalidation
+            // disclosure, in live row order. Borrows here; the plan
+            // append drains the buffer next.
+            3 => {
+                let len = graph.facts.table_skips.len();
+                let from = graph.install_index;
+                let until = len.min(from.saturating_add(GRAPH_STRIDE));
+                for position in from..until {
+                    let skip = graph.facts.table_skips[position].clone();
+                    attribution::note(&skip);
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.dedup.insert(pair) {
+                        self.counters.object_skips.push(skip);
+                    }
+                }
+                graph.install_index = until;
+                if until >= len {
+                    graph.install_step = 4;
+                    graph.install_index = 0;
+                }
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, first segment: the pre-deduped
+            // Facts delta. No contains check: Facts deduped it against
+            // the cursor plan the swap just installed.
+            4 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.plan_skipped.pop_front() else {
+                        break;
+                    };
+                    self.plan.skipped.push(skip);
+                    units += 1;
+                }
+                if graph.facts.plan_skipped.is_empty() {
+                    graph.install_step = 5;
+                }
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, second segment: the invalidation
+            // disclosure, in live row order.
+            5 => {
+                if graph.install_invalidated
+                    && graph.facts.plan_dedup.insert((
+                        "live discovery evidence".to_string(),
+                        "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .to_string(),
+                    ))
+                {
+                    self.plan.skipped.push(Skipped {
+                        subject: "live discovery evidence".into(),
+                        reason: "a late identity collision invalidated prior exact fallback or corroboration evidence"
+                            .into(),
+                    });
+                }
+                graph.install_step = 6;
+                Self::graph_idle(true)
+            }
+            // ObjectSkips plan append, last segment: the Tables-row
+            // skips, in live row order.
+            6 => {
+                let mut units = 0usize;
+                while units < GRAPH_STRIDE {
+                    let Some(skip) = graph.facts.table_skips.pop_front() else {
+                        break;
+                    };
+                    let pair = (skip.subject.clone(), skip.reason.clone());
+                    if graph.facts.plan_dedup.insert(pair) {
+                        self.plan.skipped.push(skip);
+                    }
+                    units += 1;
+                }
+                if graph.facts.table_skips.is_empty() {
+                    graph.install_step = 7;
+                }
+                Self::graph_idle(true)
+            }
+            // Step 9: the epoch bump, then Consume.
+            _ => {
+                self.note_graph_inputs_mutated();
+                graph.phase = GraphPhase::Consume;
+                Self::graph_idle(true)
+            }
+        }
     }
 
     /// NativePoll (§1.6): one native poll credit. `Pending` stays;
@@ -23831,6 +25217,173 @@ impl Engine {
                     }
                     if graph.raw_rows.is_empty() {
                         graph.reclaim_step = 7;
+                    }
+                    return Self::graph_idle(true);
+                }
+                // T5 leaves: swapped-out corroboration/fallbacks plus the
+                // Facts index and dedup sets, one stride per credit.
+                7 => {
+                    if graph.old_corroboration.is_empty() {
+                        graph.reclaim_step = 8;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_corroboration.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_corroboration.is_empty() {
+                        graph.reclaim_step = 8;
+                    }
+                    return Self::graph_idle(true);
+                }
+                8 => {
+                    if graph.old_fallbacks.is_empty() {
+                        graph.reclaim_step = 9;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.old_fallbacks.pop().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.old_fallbacks.is_empty() {
+                        graph.reclaim_step = 9;
+                    }
+                    return Self::graph_idle(true);
+                }
+                9 => {
+                    if graph.facts.dedup.is_empty() {
+                        graph.reclaim_step = 10;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.dedup.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.dedup.is_empty() {
+                        graph.reclaim_step = 10;
+                    }
+                    return Self::graph_idle(true);
+                }
+                10 => {
+                    if graph.facts.plan_dedup.is_empty() {
+                        graph.reclaim_step = 11;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.plan_dedup.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.plan_dedup.is_empty() {
+                        graph.reclaim_step = 11;
+                    }
+                    return Self::graph_idle(true);
+                }
+                11 => {
+                    if graph.facts.module_by_object.is_empty() {
+                        graph.reclaim_step = 12;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_by_object.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_by_object.is_empty() {
+                        graph.reclaim_step = 12;
+                    }
+                    return Self::graph_idle(true);
+                }
+                12 => {
+                    if graph.facts.module_objects.is_empty() {
+                        graph.reclaim_step = 13;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_objects.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_objects.is_empty() {
+                        graph.reclaim_step = 13;
+                    }
+                    return Self::graph_idle(true);
+                }
+                13 => {
+                    if graph.facts.live_views.is_empty() {
+                        graph.reclaim_step = 14;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.live_views.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.live_views.is_empty() {
+                        graph.reclaim_step = 14;
+                    }
+                    return Self::graph_idle(true);
+                }
+                14 => {
+                    if graph.facts.module_provider_objects.is_empty() {
+                        graph.reclaim_step = 15;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.module_provider_objects.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.module_provider_objects.is_empty() {
+                        graph.reclaim_step = 15;
+                    }
+                    return Self::graph_idle(true);
+                }
+                15 => {
+                    if graph.facts.slot_index.is_empty() {
+                        graph.reclaim_step = 16;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.slot_index.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.slot_index.is_empty() {
+                        graph.reclaim_step = 16;
+                    }
+                    return Self::graph_idle(true);
+                }
+                16 => {
+                    if graph.facts.active_keys.is_empty() {
+                        graph.reclaim_step = 17;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.active_keys.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.active_keys.is_empty() {
+                        graph.reclaim_step = 17;
+                    }
+                    return Self::graph_idle(true);
+                }
+                17 => {
+                    if graph.facts.drop_tables.is_empty() {
+                        graph.reclaim_step = 18;
+                        continue;
+                    }
+                    for _ in 0..GRAPH_STRIDE {
+                        if graph.facts.drop_tables.pop_first().is_none() {
+                            break;
+                        }
+                    }
+                    if graph.facts.drop_tables.is_empty() {
+                        graph.reclaim_step = 18;
                     }
                     return Self::graph_idle(true);
                 }

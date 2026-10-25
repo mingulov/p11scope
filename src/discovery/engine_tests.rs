@@ -47402,6 +47402,16 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
         );
         assert!(case.service(1).pending);
         credits += 1;
+        // The release half waits on the async worker: yield while the
+        // cancel is owed instead of spinning against it.
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.native_cancel_owed)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         verdict = case
             .engine
             .collected_graph
@@ -47409,6 +47419,7 @@ fn collected_graph_begin_error_before_mutation_returns_input() {
             .and_then(|graph| graph.verdict);
     }
     assert_eq!(verdict, Some(Verdict::RefusedUntouched));
+    eprintln!("begin-owed-cancel: settled in {credits} credits");
     assert!(
         credits <= 4096,
         "the owed cancel settles within bounded credits ({credits})"

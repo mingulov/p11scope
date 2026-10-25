@@ -24546,6 +24546,39 @@ impl Engine {
         Self::graph_idle(true)
     }
 
+    /// Owed ticket cancel (§1.9 Prepare/Begin row): one cancel credit
+    /// per service credit until the release answers untouched (the input
+    /// comes back) or retained. Shared by NativePrepare and NativeBegin;
+    /// the caller stays in its phase while the cancel is owed.
+    fn step_native_cancel_owed(
+        &mut self,
+        session: &mut dyn EngineSession,
+        graph: &mut CollectedGraph,
+    ) {
+        match session.cancel_collected_static_retirement(None, graph.ticket.as_ref(), 1) {
+            Ok(progress) => match progress.state {
+                CollectedRetirementState::RefusedUntouched(input) => {
+                    graph.removed = Some(input);
+                    graph.native_cancel_owed = false;
+                    self.refuse_graph_native_untouched(graph);
+                }
+                CollectedRetirementState::RefusedRetained => {
+                    graph.native_cancel_owed = false;
+                    self.refuse_graph_native_retained(
+                        graph,
+                        "the post-take cancel retained native ownership".into(),
+                    );
+                }
+                // Preparing or any other interim state: stay owed.
+                _ => {}
+            },
+            Err(error) => {
+                graph.native_cancel_owed = false;
+                self.refuse_graph_native_retained(graph, error.to_string());
+            }
+        }
+    }
+
     /// NativePrepare (§1.6): one native prepare credit. Any progress with
     /// a ticket stores it; `Prepared` advances to NativeBegin. Before the
     /// take, an `Err` cancels once and refuses untouched; after the take,
@@ -24610,28 +24643,7 @@ impl Engine {
         // Owed cancel after a post-take prepare error: one cancel credit
         // at a time until the release answers.
         if graph.native_cancel_owed {
-            match session.cancel_collected_static_retirement(None, graph.ticket.as_ref(), 1) {
-                Ok(progress) => match progress.state {
-                    CollectedRetirementState::RefusedUntouched(input) => {
-                        graph.removed = Some(input);
-                        graph.native_cancel_owed = false;
-                        self.refuse_graph_native_untouched(graph);
-                    }
-                    CollectedRetirementState::RefusedRetained => {
-                        graph.native_cancel_owed = false;
-                        self.refuse_graph_native_retained(
-                            graph,
-                            "the post-take cancel retained native ownership".into(),
-                        );
-                    }
-                    // Preparing or any other interim state: stay owed.
-                    _ => {}
-                },
-                Err(error) => {
-                    graph.native_cancel_owed = false;
-                    self.refuse_graph_native_retained(graph, error.to_string());
-                }
-            }
+            self.step_native_cancel_owed(session, graph);
             return Self::graph_idle(true);
         }
         match session.prepare_collected_static_retirement(q, &mut graph.removed, reserve, 1) {
@@ -24684,13 +24696,18 @@ impl Engine {
     /// NativeBegin (§1.6): one native begin credit. `Transferring`
     /// sets mutated and stays; `Pending` advances to NativePoll. A
     /// missing ticket refuses by the mutated flag (defensive: Begin is
-    /// only reachable through Prepared).
+    /// only reachable through Prepared). An `Err` before mutation owes
+    /// the ticket cancel (§1.9 Begin row), shared with NativePrepare.
     fn step_graph_native_begin(
         &mut self,
         session: &mut dyn EngineSession,
         q: Option<&CollectedFinishQ>,
         graph: &mut CollectedGraph,
     ) -> GraphService {
+        if graph.native_cancel_owed {
+            self.step_native_cancel_owed(session, graph);
+            return Self::graph_idle(true);
+        }
         let Some(ticket) = graph.ticket.as_ref() else {
             if graph.mutated {
                 self.refuse_graph_native_retained(graph, "native begin without a ticket".into());
@@ -24728,6 +24745,11 @@ impl Engine {
             Err(error) => {
                 if graph.mutated {
                     self.refuse_graph_native_retained(graph, error.to_string());
+                } else if graph.ticket.is_some() {
+                    // Before mutation with a ticket: owe the cancel (§1.9
+                    // Begin row). The input comes back untouched credit by
+                    // credit instead of stranding the native cursor.
+                    graph.native_cancel_owed = true;
                 } else {
                     let _ = session.cancel_collected_static_retirement(
                         graph.removed.as_ref(),

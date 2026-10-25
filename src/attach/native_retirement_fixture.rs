@@ -694,6 +694,10 @@ impl CollectedRetirementFixture {
     pub(super) fn join(&mut self) -> super::super::cleanup_worker::CleanupReceipt {
         self.native.worker.join()
     }
+
+    pub(super) fn try_join(&mut self) -> Option<super::super::cleanup_worker::CleanupReceipt> {
+        self.native.worker.try_join()
+    }
 }
 
 fn collected_reads<'a>(

@@ -1375,6 +1375,132 @@ fn collected_retirement_failed_handoff_keeps_files_and_charge() {
 }
 
 #[test]
+fn collected_retirement_batch_released_while_worker_alive_then_joined_receipt() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    // The graph verdict follows its exact batch ticket: poll returned Closed
+    // with no join, so the worker still runs.
+    assert!(native.worker().running());
+    // Whole-Session completion stays gated on the joined receipt: a later
+    // try_join reaps one receipt whose closed count includes that batch once.
+    let mut receipt = None;
+    wait_for(|| {
+        receipt = native.try_join();
+        receipt.is_some()
+    });
+    let receipt = receipt.expect("a live worker joins after shutdown");
+    assert!(receipt.completed);
+    assert_eq!(
+        (receipt.total, receipt.released, receipt.uncertain),
+        (4, 4, 0)
+    );
+    assert!(!native.worker().running());
+    let again = native
+        .try_join()
+        .expect("a settled worker reaps its receipt again");
+    assert!(again.completed);
+    assert_eq!(
+        (again.total, again.released, again.uncertain),
+        (4, 4, 0),
+        "the closed batch is counted exactly once"
+    );
+}
+
+#[test]
+fn collected_retirement_failed_batch_keeps_custody_and_unproved_completion() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|owned, producer| {
+            drop(owned);
+            if producer == ProducerProgram::UProbe("p11_return") {
+                Err("real collected closer failure".into())
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let file = native.original_file();
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        slots,
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut input, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    let charged = pool.snapshot().charged_bytes;
+    let links = native.original_links();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut refused = false;
+    for _ in 0..COLLECTED_CREDITS {
+        assert!(
+            Instant::now() < deadline,
+            "a failed original batch must refuse, not hang"
+        );
+        let progress = native.poll(&q, &ticket, 1).unwrap();
+        assert_eq!(progress.used, 1);
+        match progress.state {
+            CollectedRetirementState::Pending => std::thread::yield_now(),
+            CollectedRetirementState::RefusedRetained => {
+                refused = true;
+                break;
+            }
+            _ => panic!("a failed original batch keeps custody, never closure"),
+        }
+    }
+    assert!(refused, "a failed batch refuses retained");
+    // The cursor, files and leases are kept: the fence still holds, the
+    // cursor still answers, and nothing was refunded or released.
+    assert!(native.blocking());
+    assert!(matches!(
+        native.poll(&q, &ticket, 1).unwrap().state,
+        CollectedRetirementState::RefusedRetained
+    ));
+    assert_eq!(native.original_links(), links);
+    assert_eq!(native.native_counts().0, 4);
+    assert!(file.upgrade().is_some());
+    assert_eq!(pool.snapshot().charged_bytes, charged);
+    // The Session's later mint is Unproved: the joined receipt is incomplete,
+    // and the Session's own detach adjudication refuses it as uncertain —
+    // the exact evidence its terminal detach settles as Unproved, which the
+    // mint join gates refuse. No consuming drive, resubmission, or
+    // deadline-as-completion anywhere on this path.
+    let receipt = native.join();
+    assert!(!receipt.completed);
+    assert!(!receipt.failures.is_empty());
+    let joined = super::super::cleanup_worker::settle_cleanup_exit(
+        super::super::cleanup_worker::CleanupExit::Completed(receipt),
+    )
+    .unwrap();
+    let mut detached = true;
+    let verdict = super::super::finish_producer_detach(&mut detached, &joined, Ok(()));
+    assert!(!detached);
+    assert!(
+        verdict
+            .unwrap_err()
+            .to_string()
+            .contains("remains uncertain"),
+        "an incomplete joined receipt cannot settle the Session detach"
+    );
+}
+
+#[test]
 fn collected_retirement_rank_and_partial_multi_are_exact() {
     use super::super::cleanup_worker::concurrency_tests::{CloseGate, ReleaseGuard};
     let gate = Arc::new(CloseGate::default());

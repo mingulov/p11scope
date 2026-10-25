@@ -259,6 +259,13 @@ mod current_receipts_tests {
         );
         io.now = now;
         io.local = 1; // Actual epoch I/O changes before any subsequent observation.
+        // The bump is a real remap (an extra load alongside the old one):
+        // identical ranges would continue the one instance instead.
+        io.scan_ranges = Some(vec![
+            MapRange::new(0x1000, 0x2000, 0, false),
+            MapRange::new(0x2000, 0x3000, 0x1000, true),
+            MapRange::new(0x3000, 0x4000, 0x2000, false),
+        ]);
         assert_eq!(
             capture.validate_current_with(&mut io, &receipt, &mut report),
             Err(CurrentReceiptRefusal::Epoch)
@@ -281,6 +288,7 @@ mod current_receipts_tests {
                 TickOutcome::Invalidation(value) if matches!(value.scope(), InvalidationScope::InstancesRetired { ids, .. } if ids == receipt.instances()))));
 
         io.local = 0;
+        io.scan_ranges = None;
         let original_pin = io.pin.clone();
         let historical = capture.refresh_with(&mut io, original_pin, 0).unwrap();
         assert_eq!(historical.observations, vec![ObserveOutcome::Continued]);
@@ -1999,6 +2007,12 @@ pub(super) fn actual_absence_birth_fixture() {
             .quiet_sighting_at(harness.io.current_image, &negative.cut)
     );
     harness.io.local = 3;
+    // The new appearance is a real remap (an extra load alongside the old
+    // one): identical ranges would continue the one instance instead.
+    harness.io.scan_ranges = Some(vec![
+        MapRange::new(0x7000_0000, 0x7000_6000, 0, true),
+        MapRange::new(0x7000_6000, 0x7000_7000, 0x6000, false),
+    ]);
     harness.push_create(1);
     let mut raw = harness.collect();
     let (report, admitted) = harness.route(&mut raw);
@@ -3866,6 +3880,13 @@ mod authority_controls {
             unreachable!()
         };
         io.local = 1;
+        // The accepted change is a real remap (an extra load alongside the
+        // old one): identical ranges would continue the one instance.
+        io.scan_ranges = Some(vec![
+            MapRange::new(0x1000, 0x2000, 0, false),
+            MapRange::new(0x2000, 0x3000, 0x1000, true),
+            MapRange::new(0x3000, 0x4000, 0x2000, false),
+        ]);
         io.call(1, 0);
         let report = capture.tick_with(&mut io).unwrap();
         let Route::Joined(new) = report.calls().next().unwrap().route() else {
@@ -3901,6 +3922,7 @@ mod authority_controls {
         // Delivery after the boundary can still be a historical native call;
         // the explicit ended ID prevents consumers treating it as current.
         io.local = 0;
+        io.scan_ranges = None;
         io.call(1, 0);
         assert_eq!(
             capture

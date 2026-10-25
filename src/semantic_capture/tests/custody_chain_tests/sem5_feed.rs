@@ -169,10 +169,7 @@ fn still_mapped_caller_keeps_one_instance_across_three_passes() {
     let (_, _, state, reason, first, last) = &instance_summary(&scene)[0];
     assert_eq!(
         (state.as_str(), reason.as_str()),
-        (
-            InstanceLifecycle::Observed.label(),
-            "-",
-        ),
+        (InstanceLifecycle::Observed.label(), "-",),
         "the surviving instance stays observed, never retired"
     );
     assert!(
@@ -270,7 +267,13 @@ fn remap_mints_new_instance_and_retires_prior_with_reason() {
     );
     // Unmap + map again: a new load base at a new epoch, the real remap
     // shape. Later calls carry the new stamps; the next pass re-proves.
-    scene.h0.0.borrow_mut().io.scan_inputs.insert(0, (0x2000_0000, 1));
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (0x2000_0000, 1));
     for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
         enqueue_live_like(&mut scene, pid, name, *mechanism);
     }
@@ -338,7 +341,11 @@ fn replaced_task_mints_new_instance_without_cross_join() {
     scene.publish(batch);
     let instances = instance_summary(&scene);
     assert_eq!(
-        (instances.len(), instances[0].2.as_str(), instances[0].3.as_str()),
+        (
+            instances.len(),
+            instances[0].2.as_str(),
+            instances[0].3.as_str()
+        ),
         (
             1,
             InstanceLifecycle::Retired.label(),

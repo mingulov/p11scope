@@ -567,35 +567,49 @@ fn same_epochs_under_unrelated_churn_keep_one_instance() {
 }
 
 #[test]
-fn any_epoch_move_mints_a_new_instance_and_keeps_the_old_join() {
+fn epoch_move_over_unchanged_mapping_continues_and_remap_mints() {
+    // Continuity is the identity of the mapping, not of the epoch triple:
+    // a local or global bump over identical ranges (a kernel VMA
+    // adjustment or spurious hook fire) keeps the one instance, while a
+    // real remap at a new base mints a successor and keeps the old join.
     for moved in [(3, 0, 0), (2, 1, 0)] {
         let mut r = router();
         r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
         let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
         r.observe_legacy(observation(moved.0, moved.1, moved.2, load(BASE_A)));
-        let new = joined(r.route(call(
+        let same = joined(r.route(call(
             2,
             stamp(moved.0 as u32, moved.1 as u32, moved.2 as u32),
             ip_in(BASE_A),
         )));
-        assert_ne!(old, new, "{moved:?}");
-        // A late completion stamped at the old epochs still names the old
+        assert_eq!(old, same, "{moved:?}");
+        // A late completion stamped at the old epochs still names the one
         // incarnation: it ran while that mapping existed.
         assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+        assert_eq!(r.instances_minted(), 1);
     }
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.observe_legacy(observation(3, 0, 0, load(BASE_B)));
+    let new = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_B))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
 }
 
 #[test]
-fn same_address_reload_never_revives_the_old_instance() {
+fn same_address_reload_continues_the_unchanged_mapping() {
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let before = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     // dlclose (unmap: +k bumps) and dlopen at the same address (map: +m):
-    // identical ranges, different epochs.
+    // identical ranges, different epochs. Indistinguishable from a VMA
+    // merge here, so the unchanged mapping continues; a file replacement
+    // between still mints through the module key. IDs stay monotonic.
     r.observe_legacy(observation(9, 0, 0, load(BASE_A)));
     let after = joined(r.route(call(2, stamp(9, 0, 0), ip_in(BASE_A))));
-    assert_ne!(before, after);
-    assert!(after > before, "IDs are monotonic, never reused");
+    assert_eq!(before, after);
+    assert_eq!(r.instances_minted(), 1);
 }
 
 #[test]
@@ -905,8 +919,10 @@ fn instance_ceiling_refuses_at_n_plus_one_and_never_reuses_ids() {
     );
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    r.observe_legacy(observation(3, 0, 0, load(BASE_A)));
-    let second = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))));
+    // Each ceiling step is a real remap at a new base: identical ranges
+    // would continue the one instance instead of minting.
+    r.observe_legacy(observation(3, 0, 0, load(BASE_B)));
+    let second = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_B))));
     assert_eq!(r.instances_minted(), 2);
     r.observe_legacy(observation(4, 0, 0, load(BASE_A)));
     assert_eq!(

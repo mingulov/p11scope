@@ -19,12 +19,18 @@
 //!   attached file offset. Every other case is an explicit
 //!   [`UnknownReason`], never a guess.
 //!
-//! Continuity is the identity of the epoch triple: under unrelated mapping
-//! churn the triple does not move, so the ID stays; any change of a watched
-//! file's VMAs moves it, so an unload/reload at the same address always gets
-//! a new ID. A range that *appears* at an unchanged triple is impossible
-//! under hook completeness and latches a sticky coverage fault for that
-//! (process, file).
+//! Continuity is the identity of the mapping: one instance per (caller
+//! incarnation, module mapping) for as long as the mapped file, addresses,
+//! offsets and permissions are unchanged. Kernel VMA adjustments
+//! (split/merge, compaction) and spurious hook fires advance the epoch
+//! triple without changing the mapping, so a new triple over the same
+//! merged coverage continues the current partitions instead of minting.
+//! A real remap, unmap, permission change, exec or new incarnation still
+//! mints a new ID. An unload/reload at the same address is
+//! indistinguishable from a merge here, so it continues too; a file
+//! replacement between still mints through the module key. A range that
+//! *appears* at an unchanged triple is impossible under hook completeness
+//! and latches a sticky coverage fault for that (process, file).
 //!
 //! Privacy (proposed allowlist-v3): entry IPs and map ranges are private,
 //! generation-local routing inputs. Their `Debug` output is redacted, they
@@ -94,6 +100,42 @@ impl MapRange {
     fn contains(&self, ip: u64) -> bool {
         self.start <= ip && ip < self.end
     }
+}
+
+/// Whether two scans show the same mapping: the same file bytes at the
+/// same addresses with the same permissions, after folding VMA
+/// split/merge artifacts. Adjacent congruent runs merge; anything else
+/// (rebased, resized, unmapped, remapped, repermissioned, overlapping
+/// or reordered-beyond-sorting ranges) compares unequal, failing closed
+/// toward a new instance. Stays inside the router: only the equality
+/// bit leaves, never the addresses.
+fn same_mapping(previous: &[MapRange], current: &[MapRange]) -> bool {
+    fn merged(ranges: &[MapRange]) -> Vec<MapRange> {
+        let mut sorted = ranges.to_vec();
+        sorted.sort();
+        let mut out: Vec<MapRange> = Vec::with_capacity(sorted.len());
+        for range in sorted {
+            let mergeable = out.last().is_some_and(|last: &MapRange| {
+                last.end == range.start
+                    && range.start > last.start
+                    && last
+                        .end
+                        .checked_sub(last.start)
+                        .and_then(|len| last.file_offset.checked_add(len))
+                        == Some(range.file_offset)
+                    && last.executable == range.executable
+            });
+            if mergeable {
+                if let Some(last) = out.last_mut() {
+                    last.end = range.end;
+                }
+            } else {
+                out.push(range);
+            }
+        }
+        out
+    }
+    merged(previous) == merged(current)
 }
 
 impl fmt::Debug for MapRange {
@@ -1121,50 +1163,82 @@ impl InstanceRouter {
                     );
                     return (ObserveOutcome::RangeCapacity, resolved);
                 }
-                let partitions = observation
-                    .ranges
-                    .iter()
-                    .filter(|range| range.file_offset == 0)
-                    .map(|range| (Base(range.start), self.mint()))
-                    .collect();
-                self.ranges += observation.ranges.len();
-                while self.observed.len() >= self.limits.observed_keys
-                    && !self.observed.contains_key(&key)
-                {
-                    let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
-                        break;
-                    };
-                    let ids: Vec<_> = evicted
-                        .back()
-                        .into_iter()
-                        .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
+                // A new epoch triple for an unchanged mapping continues the
+                // current partitions instead of minting: kernel VMA
+                // adjustments (split/merge, compaction) and spurious hook
+                // fires advance the triple without changing the mapped
+                // file, addresses, offsets or permissions. The merged
+                // comparison below folds split/merge artifacts; a real
+                // remap, unmap, permission change, exec or new incarnation
+                // still mints. An unload/reload at the same address is
+                // indistinguishable from a merge here, so it continues too.
+                let continued = self
+                    .observed
+                    .get(&key)
+                    .and_then(|list| list.back())
+                    .filter(|current| same_mapping(&current.ranges, &observation.ranges))
+                    .map(|current| current.partitions.clone());
+                if let Some(partitions) = continued {
+                    self.counters.continued += 1;
+                    self.ranges += observation.ranges.len();
+                    let list = self.observed.entry(key).or_default();
+                    list.push_back(Observed {
+                        epochs,
+                        ranges: observation.ranges,
+                        partitions,
+                    });
+                    while list.len() > KEYS_PER_PROCESS_FILE {
+                        if let Some(old) = list.pop_front() {
+                            self.ranges -= old.ranges.len();
+                        }
+                    }
+                    ObserveOutcome::Continued
+                } else {
+                    let partitions = observation
+                        .ranges
+                        .iter()
+                        .filter(|range| range.file_offset == 0)
+                        .map(|range| (Base(range.start), self.mint()))
                         .collect();
-                    if !ids.is_empty() {
-                        self.observation_losses.push(ObservationLoss {
-                            image: ImageIdentity {
-                                task_cookie: owner.cookie,
-                                exec_id: owner.exec,
-                            },
-                            file_slot,
-                            ids,
-                        });
+                    self.ranges += observation.ranges.len();
+                    while self.observed.len() >= self.limits.observed_keys
+                        && !self.observed.contains_key(&key)
+                    {
+                        let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
+                            break;
+                        };
+                        let ids: Vec<_> = evicted
+                            .back()
+                            .into_iter()
+                            .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
+                            .collect();
+                        if !ids.is_empty() {
+                            self.observation_losses.push(ObservationLoss {
+                                image: ImageIdentity {
+                                    task_cookie: owner.cookie,
+                                    exec_id: owner.exec,
+                                },
+                                file_slot,
+                                ids,
+                            });
+                        }
+                        self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
+                        self.counters.observed_evictions =
+                            self.counters.observed_evictions.saturating_add(1);
                     }
-                    self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
-                    self.counters.observed_evictions =
-                        self.counters.observed_evictions.saturating_add(1);
-                }
-                let list = self.observed.entry(key).or_default();
-                list.push_back(Observed {
-                    epochs,
-                    ranges: observation.ranges,
-                    partitions,
-                });
-                while list.len() > KEYS_PER_PROCESS_FILE {
-                    if let Some(old) = list.pop_front() {
-                        self.ranges -= old.ranges.len();
+                    let list = self.observed.entry(key).or_default();
+                    list.push_back(Observed {
+                        epochs,
+                        ranges: observation.ranges,
+                        partitions,
+                    });
+                    while list.len() > KEYS_PER_PROCESS_FILE {
+                        if let Some(old) = list.pop_front() {
+                            self.ranges -= old.ranges.len();
+                        }
                     }
+                    ObserveOutcome::New
                 }
-                ObserveOutcome::New
             }
         };
         let resolved = self.resolve_pending(image, file);

@@ -289,6 +289,24 @@ EOF
     for gone in docker-data docker-exec docker.sock dockerd.pid; do
         [ ! -e "$stub/task/$gone" ] || { echo "daemon state survived: $gone" >&2; exit 1; }
     done
+    # Counting log waiter: the restarted container must print its 2nd LEDGER.
+    cat > "$stub/docker" <<'EOF'
+#!/bin/sh
+if [ "$1" = "logs" ]; then printf '%s\n' "$STUB_LOGS"; exit 0; fi
+echo "unexpected docker call: $*" >&2; exit 1
+EOF
+    chmod +x "$stub/docker"
+    STUB_LOGS="READY pid=1
+LEDGER one
+READY pid=1
+LEDGER two" PRIVATE=0 PATH="$stub:$PATH" wait_docker_log_count c '^LEDGER ' 2 1 \
+        || { echo "two LEDGER lines missed" >&2; exit 1; }
+    if STUB_LOGS="READY pid=1
+LEDGER one" PRIVATE=0 PATH="$stub:$PATH" wait_docker_log_count c '^LEDGER ' 2 1 \
+            >/dev/null 2>&1; then
+        echo "one LEDGER line counted as two" >&2
+        exit 1
+    fi
     # Cgroup resolution: v2 path only, verified as a directory.
     mkdir -p "$stub/cg/system.slice/docker-abc.scope"
     printf '0::/system.slice/docker-abc.scope\n' > "$stub/cgroup"
@@ -514,6 +532,20 @@ wait_docker_log() {
         i=$((i + 1))
     done
     echo "container $1 never printed $2" >&2
+    return 1
+}
+
+wait_docker_log_count() {
+    i=0
+    while [ "$i" -lt "$(($4 * 2))" ]; do
+        n=$(dcli logs "$1" 2>&1 | grep -c "$2" || true)
+        if [ "${n:-0}" -ge "$3" ]; then
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "container $1 never printed $3 x $2" >&2
     return 1
 }
 
@@ -782,6 +814,10 @@ wait_ready pre-a "$PID_CAP_A" || fail_cell "pre profile A never became ready"
 wait_ready pre-b "$PID_CAP_B" || fail_cell "pre profile B never became ready"
 dcli exec "$D1_A" touch /tmp/gate || fail_cell "gate release failed for $D1_A"
 dcli exec "$D1_B" touch /tmp/gate || fail_cell "gate release failed for $D1_B"
+wait_docker_log "$D1_A" '^LEDGER ' "$DURATION" || fail_cell "A ledger never completed"
+kill -0 "$PID_CAP_A" 2>/dev/null || fail_cell "A ledger completed outside the capture window"
+wait_docker_log "$D1_B" '^LEDGER ' "$DURATION" || fail_cell "B ledger never completed"
+kill -0 "$PID_CAP_B" 2>/dev/null || fail_cell "B ledger completed outside the capture window"
 wait "$PID_CAP_A" || fail_cell "pre profile A failed"
 wait "$PID_CAP_B" || fail_cell "pre profile B failed"
 reclaim_root_output "$WORK/d1-pre-a.json" "$WORK/d1-pre-b.json" || fail_cell "cannot reclaim pre profiles"
@@ -827,6 +863,8 @@ start_profile post-b "$CG_B_POST" "$DURATION" "$WORK/d1-post-b.json"
 PID_CAP_BP=$STARTED_PID
 wait_ready post-b "$PID_CAP_BP" || fail_cell "post profile B never became ready"
 dcli exec "$D1_B" touch /tmp/gate || fail_cell "gate release failed for restarted $D1_B"
+wait_docker_log_count "$D1_B" '^LEDGER ' 2 "$DURATION" || fail_cell "restarted B ledger never completed"
+kill -0 "$PID_CAP_BP" 2>/dev/null || fail_cell "restarted B ledger completed outside the capture window"
 wait "$PID_CAP_BP" || fail_cell "post profile B failed"
 reclaim_root_output "$WORK/d1-post-b.json" || fail_cell "cannot reclaim post profile B"
 save_logs "$D1_B" "$WORK/logs-b-post.txt" || fail_cell "cannot read restarted $D1_B logs"

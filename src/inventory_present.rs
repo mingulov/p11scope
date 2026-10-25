@@ -710,6 +710,14 @@ impl Presentation {
             .map(|edge| (edge.caller, edge.module))
             .collect();
         edge_keys.sort();
+        // Edges whose per-edge feed never materialized but whose instance
+        // children hold mechanism/operation claims: their label must not
+        // deny the observed feed (see semantics_view).
+        let claimed_children: std::collections::BTreeSet<(CallerId, ModuleId)> = registry
+            .instance_semantic_edges()
+            .filter(|row| row.semantics.as_ref().is_some_and(EdgeSemantics::has_claims))
+            .map(|row| (row.caller, row.module))
+            .collect();
         let mut edges = Vec::with_capacity(edge_keys.len());
         for (caller_id, module_id) in &edge_keys {
             let edge = registry
@@ -735,7 +743,10 @@ impl Presentation {
                         registry.entry_recent_within(edge, now_ns, window_ns)
                     }
                 };
-            let semantics = semantics_view(edge.semantics.as_ref());
+            let semantics = semantics_view(
+                edge.semantics.as_ref(),
+                claimed_children.contains(&(*caller_id, *module_id)),
+            );
             let op_active = edge
                 .semantics
                 .as_ref()
@@ -783,7 +794,7 @@ impl Presentation {
         let semantic_edges: Vec<InstanceSemanticView> = registry
             .instance_semantic_edges()
             .map(|r| {
-                let mut semantics = semantics_view(r.semantics.as_ref());
+                let mut semantics = semantics_view(r.semantics.as_ref(), false);
                 if r.semantics.is_none() {
                     semantics.label = if r.api_returns.is_none() {
                         "unknown (no calls observed)"
@@ -916,13 +927,25 @@ impl Presentation {
     }
 }
 
+/// What an edge's semantic column reads while its per-edge feed stays
+/// withheld but its instance children hold claims: the per-edge summary
+/// is unknown, never the observed feed. Wording only; the S1 shape and
+/// the childless withheld rendering are unchanged.
+const SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN: &str =
+    "unknown (per-edge summary withheld; see semantic children)";
+
 /// Project one edge's semantic state into its owned view: the label
 /// always, the mechanism rows and operation aggregates iff the edge
-/// holds claims. Withheld edges keep the exact U0 unknown rendering.
-fn semantics_view(state: Option<&EdgeSemantics>) -> EdgeSemanticsView {
+/// holds claims. Withheld edges keep the exact U0 unknown rendering,
+/// except an edge with claimed instance children, which names them.
+fn semantics_view(state: Option<&EdgeSemantics>, claimed_children: bool) -> EdgeSemanticsView {
     let Some(state) = state else {
         return EdgeSemanticsView {
-            label: SEMANTIC_UNKNOWN,
+            label: if claimed_children {
+                SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN
+            } else {
+                SEMANTIC_UNKNOWN
+            },
             mechanisms: Vec::new(),
             operations: None,
         };

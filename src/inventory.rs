@@ -1482,7 +1482,8 @@ fn run_with_terminal_budget(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
-    let presentation = final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
+    let presentation =
+        final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     // Both owners stay alive through the final commit, the immutable
     // presentation and every sink attempt; the lane releases after
     // output, beside the native capture it never certified.
@@ -5505,12 +5506,7 @@ fn stream_view_guarded(
     if driver.publication_pending() {
         return None;
     }
-    let mut presentation = stream_presentation(
-        driver.coordinator,
-        scope_label,
-        started_ns,
-        now_ns,
-    );
+    let mut presentation = stream_presentation(driver.coordinator, scope_label, started_ns, now_ns);
     presentation.semantic_capture = driver.semantic_summary();
     state.last_stream_view = Some(presentation.clone());
     Some(presentation)
@@ -5800,7 +5796,8 @@ fn run_dashboard(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
-    let presentation = final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
+    let presentation =
+        final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
@@ -11660,9 +11657,7 @@ mod tests {
         coordinator.note_scope_gap("staged behind pending".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
         // ...but the guarded prologue neither reads nor emits.
-        assert!(
-            start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none()
-        );
+        assert!(start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none());
         assert_eq!(
             stream_sink_records(&mut reader),
             baseline,
@@ -11680,9 +11675,7 @@ mod tests {
         coordinator.commit_batch(false).unwrap();
         let (writer, mut reader) = stream_identity_sink();
         let mut stream = EventLogState::new(Some(writer));
-        assert!(
-            start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none()
-        );
+        assert!(start_event_log_guarded(&mut stream, &coordinator, "system", 1, pending).is_none());
         let records = stream_sink_records(&mut reader);
         assert_eq!(records.len(), 1, "one prologue: {records:?}");
         assert_eq!(records[0]["kind"], "started");
@@ -11713,11 +11706,15 @@ mod tests {
         );
         let baseline = stream_sink_records(&mut reader);
         assert!(
-            baseline.iter().any(|record| record["kind"] == "pass_committed"),
+            baseline
+                .iter()
+                .any(|record| record["kind"] == "pass_committed"),
             "the baseline publishes: {baseline:?}"
         );
         // The registry advances behind the pending publication...
-        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged behind pending".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
         driver.joint_commit_pending = true;
@@ -11778,7 +11775,9 @@ mod tests {
             None
         );
         let baseline = stream_sink_records(&mut reader);
-        driver.coordinator.note_scope_gap("second gap".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("second gap".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         let view = stream_view_guarded(&driver, &mut state, "system", 1, 3)
             .expect("the second pass publishes");
@@ -11825,11 +11824,15 @@ mod tests {
         );
         let baseline = stream_sink_records(&mut reader);
         assert!(
-            baseline.iter().any(|record| record["kind"] == "pass_committed"),
+            baseline
+                .iter()
+                .any(|record| record["kind"] == "pass_committed"),
             "the baseline publishes: {baseline:?}"
         );
         // The registry advances behind the pending publication...
-        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged behind pending".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
         driver.joint_commit_pending = true;
@@ -11855,7 +11858,10 @@ mod tests {
                 .expect("the resolved pass publishes");
         assert!(error.is_none(), "no stream error on resolve");
         assert!(
-            display.gaps.iter().any(|gap| gap.subject == "staged behind pending"),
+            display
+                .gaps
+                .iter()
+                .any(|gap| gap.subject == "staged behind pending"),
             "the resolved display view advances"
         );
         let records = stream_sink_records(&mut reader);
@@ -11888,7 +11894,9 @@ mod tests {
                 .expect("the first pass publishes");
         assert!(error.is_none());
         let baseline = stream_sink_records(&mut reader);
-        driver.coordinator.note_scope_gap("second gap".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("second gap".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         let (display, error) =
             dashboard_pass_guarded(&driver, &mut stream, &mut state, &report, "system", 1, 3)
@@ -11921,7 +11929,9 @@ mod tests {
         let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
             .expect("the unpending pass publishes");
         // The registry advances behind the pending publication...
-        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged behind pending".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         driver.joint_commit_pending = true;
         assert!(driver.publication_pending(), "the harness driver pends");
@@ -11957,7 +11967,9 @@ mod tests {
         let mut state = StreamState::new();
         let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
             .expect("the unpending pass publishes");
-        driver.coordinator.note_scope_gap("staged late gap".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged late gap".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
         assert!(
@@ -11968,7 +11980,10 @@ mod tests {
             "the fresh final sees staged content"
         );
         assert!(
-            prior.gaps.iter().all(|gap| gap.subject != "staged late gap"),
+            prior
+                .gaps
+                .iter()
+                .all(|gap| gap.subject != "staged late gap"),
             "the prior predates it"
         );
     }
@@ -11988,7 +12003,9 @@ mod tests {
         let mut state = StreamState::new();
         let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
             .expect("the unpending pass publishes");
-        driver.coordinator.note_scope_gap("staged behind pending".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged behind pending".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         driver.joint_commit_pending = true;
         assert!(driver.publication_pending(), "the harness driver pends");
@@ -12023,7 +12040,9 @@ mod tests {
         let mut state = StreamState::new();
         stream_view_guarded(&driver, &mut state, "system", 1, 2)
             .expect("the unpending pass publishes");
-        driver.coordinator.note_scope_gap("staged late gap".into(), "y".into());
+        driver
+            .coordinator
+            .note_scope_gap("staged late gap".into(), "y".into());
         driver.coordinator.commit_batch(false).unwrap();
         let final_view = final_view_guarded(&driver, &state, "system", 1, 99);
         assert!(
@@ -12049,8 +12068,7 @@ mod tests {
         let dir = private_tempdir();
         let report_path = dir.path().join("report.json");
         let events_path = dir.path().join("events.jsonl");
-        let writer =
-            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let writer = EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
         let mut stream = EventLogState::new(Some(writer));
         let mut stdout: Vec<u8> = Vec::new();
         let error = anyhow::anyhow!("scripted native failure");
@@ -12088,8 +12106,7 @@ mod tests {
         );
         let gaps = document["gaps"].as_array().unwrap();
         assert!(
-            gaps
-                .iter()
+            gaps.iter()
                 .all(|gap| gap["subject"] != "inventory capture failed"),
             "no live read while pending: {gaps:?}"
         );
@@ -12109,8 +12126,7 @@ mod tests {
         let dir = private_tempdir();
         let report_path = dir.path().join("report.json");
         let events_path = dir.path().join("events.jsonl");
-        let writer =
-            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let writer = EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
         let mut stream = EventLogState::new(Some(writer));
         let mut stdout: Vec<u8> = Vec::new();
         let error = anyhow::anyhow!("scripted native failure");
@@ -12140,8 +12156,7 @@ mod tests {
         );
         let gaps = document["gaps"].as_array().unwrap();
         assert!(
-            gaps
-                .iter()
+            gaps.iter()
                 .any(|gap| gap["subject"] == "inventory capture failed"),
             "the fresh final reports the failure gap: {gaps:?}"
         );
@@ -12163,7 +12178,13 @@ mod tests {
         assert!(driver.publication_pending(), "the harness driver pends");
         let state = StreamState::new();
         let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
-        let fresh = Presentation::capture(driver.coordinator, "system", 1, 9, driver.coordinator.passes());
+        let fresh = Presentation::capture(
+            driver.coordinator,
+            "system",
+            1,
+            9,
+            driver.coordinator.passes(),
+        );
         assert_eq!(final_view.passes, fresh.passes);
         assert_eq!(final_view.ended_ns, fresh.ended_ns);
         assert_eq!(final_view.gaps.len(), fresh.gaps.len());
@@ -12188,8 +12209,7 @@ mod tests {
         let dir = private_tempdir();
         let report_path = dir.path().join("report.json");
         let events_path = dir.path().join("events.jsonl");
-        let writer =
-            EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let writer = EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
         let mut stream = EventLogState::new(Some(writer));
         let mut stdout: Vec<u8> = Vec::new();
         let error = anyhow::anyhow!("scripted native failure");
@@ -12214,8 +12234,7 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         let gaps = document["gaps"].as_array().unwrap();
         assert!(
-            gaps
-                .iter()
+            gaps.iter()
                 .any(|gap| gap["subject"] == "inventory capture failed"),
             "the fallback reports the failure gap: {gaps:?}"
         );

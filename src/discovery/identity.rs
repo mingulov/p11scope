@@ -12622,4 +12622,333 @@ mod tests {
             "huge maps refuse instead of wrapping"
         );
     }
+
+    #[test]
+    fn conservative_installed_reclaim_releases_session_shared_exports() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        // A Session-held clone of retired exports is released by dropping our
+        // share; reclaim completes and the holder keeps its data.
+        {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let id_for = |provider: &str| {
+                source
+                    .by_id
+                    .iter()
+                    .find(|(_, entry)| entry.path.contains(provider))
+                    .map(|(id, _)| *id)
+                    .unwrap()
+            };
+            let id_r1 = id_for("provider-1");
+            let id_r2 = id_for("provider-2");
+            source.by_id.get_mut(&id_r1).unwrap().exports = Arc::from(vec![
+                ("session-shared-r1-first".repeat(8), 11),
+                ("session-shared-r1-second".repeat(8), 22),
+            ]);
+            source.by_id.get_mut(&id_r2).unwrap().exports =
+                Arc::from(vec![("session-shared-r2-only".repeat(16), 33)]);
+            let outside_r1 = source.by_id.get(&id_r1).unwrap().exports.clone();
+            let outside_r2 = source.by_id.get(&id_r2).unwrap().exports.clone();
+            assert_eq!(
+                Arc::strong_count(&outside_r1),
+                2,
+                "old entry plus the Session holder"
+            );
+            assert_eq!(
+                Arc::strong_count(&outside_r2),
+                2,
+                "old entry plus the Session holder"
+            );
+            let mut cursor = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+            let count = cursor.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let backing = cursor.install_ready(&mut canonical).unwrap();
+            let outcome = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "shared exports release: {outcome:?}");
+            assert_eq!(
+                handoff.len_for_test(),
+                2,
+                "files hand off, exports do not"
+            );
+            assert_eq!(Arc::strong_count(&outside_r1), 1);
+            assert_eq!(Arc::strong_count(&outside_r2), 1);
+            assert_eq!(outside_r1.len(), 2);
+            assert!(outside_r1.iter().all(|(text, _)| !text.is_empty()));
+            assert!(outside_r1[0].0.starts_with("session-shared-r1-first"));
+            assert_eq!(outside_r2.len(), 1);
+            assert!(outside_r2[0].0.starts_with("session-shared-r2-only"));
+            drop(canonical);
+            drop(backing);
+            drop(handoff);
+        }
+        // An unknown Weak still refuses; dropping it lets the exclusive drain
+        // finish.
+        {
+            let (_dir, mut source, _) = conservative_cursor_fixture();
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let id_r1 = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-1"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r1).unwrap().exports =
+                Arc::from(vec![("weak-guarded-export".repeat(8), 1)]);
+            let mut cursor = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut cursor, &selection, &reserve);
+            let count = cursor.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let backing = cursor.install_ready(&mut canonical).unwrap();
+            let weak = Arc::downgrade(
+                &cursor
+                    .installed_output_for_test()
+                    .unwrap()
+                    .by_id
+                    .get(&id_r1)
+                    .unwrap()
+                    .exports,
+            );
+            let refused = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(matches!(refused, Err(GraphRefusal::Identity)));
+            assert_eq!(handoff.len_for_test(), 1);
+            assert!(weak.upgrade().is_some(), "refused exports keep their data");
+            drop(weak);
+            let outcome = drive_pins_installed_reclaim(
+                &mut cursor,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(
+                outcome.is_ok(),
+                "drain finishes after Weak drops: {outcome:?}"
+            );
+            assert_eq!(handoff.len_for_test(), 2);
+            drop(canonical);
+            drop(backing);
+            drop(handoff);
+        }
+    }
+
+    #[test]
+    fn scanned_installed_reclaim_releases_session_shared_exports() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        // A Session-held clone of a retired module's exports is released by
+        // dropping our share; reclaim completes and the holder keeps its data.
+        {
+            let (_dir, mut source, modules) = conservative_cursor_fixture();
+            let id_r = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-2"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+                ("session-shared-module-first".repeat(8), 11),
+                ("session-shared-module-second".repeat(16), 22),
+                ("session-shared-module-third".repeat(32), 33),
+            ]);
+            let mut old_pins = source.clone();
+            old_pins.reset_derived_claims();
+            let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+            drop(old_pins);
+            assert!(old_modules.iter().any(|module| module.object == id_r));
+            source.by_id.get_mut(&id_r).unwrap().exports =
+                Arc::from(vec![("live-successor-export".into(), 44)]);
+            let outside = old_modules
+                .iter()
+                .find(|module| module.object == id_r)
+                .unwrap()
+                .exports
+                .clone();
+            assert_eq!(
+                Arc::strong_count(&outside),
+                2,
+                "old module plus the Session holder"
+            );
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            assert!(!pins.pinned().unwrap().by_id.contains_key(&id_r));
+            let rows: Vec<ScannedModule> = modules
+                .iter()
+                .filter(|module| module.view != ProcessViewId(3))
+                .cloned()
+                .collect();
+            assert_eq!(rows.len(), 3);
+            let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+            let mut rebind = ScannedRebindCursor::new();
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+            assert!(input.is_none());
+            let count = pins.retired_entry_count();
+            assert_eq!(count, Some(1), "one retired claim bounds the handoff");
+            let mut handoff = RetiredFileHandoff::reserve(count.unwrap(), &reserve).unwrap();
+            let mut canonical = source;
+            let mut canonical_modules = old_modules;
+            let pins_backing = pins.install_ready(&mut canonical).unwrap();
+            let modules_backing = rebind.install_ready(&mut canonical_modules).unwrap();
+            let outcome = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "shared module exports release: {outcome:?}");
+            assert_eq!(
+                handoff.len_for_test(),
+                0,
+                "module exports never enter the file handoff"
+            );
+            assert_eq!(pins.installed_state_for_test(), (true, true));
+            assert_eq!(Arc::strong_count(&outside), 1);
+            assert_eq!(outside.len(), 3);
+            assert!(outside.iter().all(|(text, _)| !text.is_empty()));
+            assert!(outside[0].0.starts_with("session-shared-module-first"));
+            let outcome = drive_pins_installed_reclaim(
+                &mut pins,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "retired file still hands off: {outcome:?}");
+            assert_eq!(handoff.len_for_test(), 1);
+            drop(canonical);
+            drop(canonical_modules);
+            drop(pins_backing);
+            drop(modules_backing);
+            drop(handoff);
+        }
+        // An unknown Weak still refuses; dropping it lets the exclusive drain
+        // finish.
+        {
+            let (_dir, mut source, modules) = conservative_cursor_fixture();
+            let id_r = source
+                .by_id
+                .iter()
+                .find(|(_, entry)| entry.path.contains("provider-2"))
+                .map(|(id, _)| *id)
+                .unwrap();
+            source.by_id.get_mut(&id_r).unwrap().exports = Arc::from(vec![
+                ("weak-guarded-module-first".repeat(8), 11),
+                ("weak-guarded-module-second".repeat(8), 22),
+            ]);
+            let mut old_pins = source.clone();
+            old_pins.reset_derived_claims();
+            let (old_modules, _) = bind_scanned_modules(&modules, &mut old_pins);
+            drop(old_pins);
+            source.by_id.get_mut(&id_r).unwrap().exports =
+                Arc::from(vec![("live-successor-export".into(), 44)]);
+            let probe = old_modules
+                .iter()
+                .find(|module| module.object == id_r)
+                .unwrap()
+                .exports
+                .clone();
+            assert_eq!(Arc::strong_count(&probe), 2);
+            drop(probe);
+            let weak = Arc::downgrade(
+                &old_modules
+                    .iter()
+                    .find(|module| module.object == id_r)
+                    .unwrap()
+                    .exports,
+            );
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let selection = conservative_selection(
+                &pool,
+                BTreeSet::from([ProcessViewId(3)]),
+                BTreeSet::new(),
+            );
+            let mut pins = PinnedConservativeCursor::new();
+            finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+            let rows: Vec<ScannedModule> = modules
+                .iter()
+                .filter(|module| module.view != ProcessViewId(3))
+                .cloned()
+                .collect();
+            let (mut input, _) = retained_rebind_inputs(&pool, &rows, false);
+            let mut rebind = ScannedRebindCursor::new();
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+            let count = pins.retired_entry_count().unwrap();
+            let mut handoff = RetiredFileHandoff::reserve(count, &reserve).unwrap();
+            let mut canonical = source;
+            let mut canonical_modules = old_modules;
+            let pins_backing = pins.install_ready(&mut canonical).unwrap();
+            let modules_backing = rebind.install_ready(&mut canonical_modules).unwrap();
+            let refused = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(matches!(refused, Err(GraphRefusal::Identity)));
+            assert_eq!(handoff.len_for_test(), 0);
+            assert!(weak.upgrade().is_some(), "refused exports keep their data");
+            drop(weak);
+            let outcome = drive_rebind_installed_reclaim(
+                &mut rebind,
+                &mut pins,
+                &canonical,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(
+                outcome.is_ok(),
+                "drain finishes after Weak drops: {outcome:?}"
+            );
+            assert_eq!(handoff.len_for_test(), 0);
+            let outcome = drive_pins_installed_reclaim(
+                &mut pins,
+                &canonical,
+                &selection,
+                &mut handoff,
+                &reserve,
+            );
+            assert!(outcome.is_ok(), "retired file still hands off: {outcome:?}");
+            assert_eq!(handoff.len_for_test(), 1);
+            drop(canonical);
+            drop(canonical_modules);
+            drop(pins_backing);
+            drop(modules_backing);
+            drop(handoff);
+        }
+    }
 }

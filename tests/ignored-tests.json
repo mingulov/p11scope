@@ -728,8 +728,26 @@
     },
     {
       "file": "src/inventory_privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64",
+      "reason": "privileged: live Joint absence and S1Only siblings beside a post-attach exec",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory_privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64",
       "reason": "root-owned live BPF lane; live joint machine begin to Published to WoundDown through the finish driver",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory_privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64",
+      "reason": "privileged: live Joint first birth through a held q1 to q2 and stop",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory_privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64",
+      "reason": "privileged: live Joint promotion retires A before B is admitted",
       "cell": "privileged"
     },
     {

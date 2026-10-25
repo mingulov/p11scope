@@ -3829,3 +3829,1759 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
     eprintln!("JOINT_LIVE wound_down_after={wound_polls} take=some");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// R1.6 live Joint root cells: the production classic Session with Joint on,
+// over the owned live-joint provider workload. System scope with private
+// provider copies (a SoftHSM copy plus the fixture's held provider), so
+// exactly the owned processes are observed and every population is exact.
+// Each cell drives native discovery passes first (adapter records and
+// mapped edges, the machine's binding input), then starts the semantic
+// lane, initializes the Joint machine, and drives service/commit/finish
+// through the real lane APIs directly; the production on-tick wiring that
+// will call the same APIs is a separate pending task. Diagnostics print
+// as JOINT_R16 lines.
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+fn live_joint_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/object-journal/live-joint.c")
+}
+
+/// The R1.6 workload: the standard token setup plus the live-joint fixture
+/// workload, its held provider and a private SoftHSM copy. Nothing else on
+/// the host maps the copies, so System scope observes exactly these owners.
+struct JointWorkload {
+    workload: Workload,
+    joint: PathBuf,
+    held: PathBuf,
+    soft_copy: PathBuf,
+}
+
+impl JointWorkload {
+    fn build() -> Result<Self> {
+        let workload = Workload::build()?;
+        let joint = workload.path("live-joint");
+        let held = workload.path("live-joint-held.so");
+        let gcc = |args: &[&str], out: &Path| -> Result<()> {
+            let status = Command::new("gcc")
+                .args(args)
+                .arg("-o")
+                .arg(out)
+                .arg(live_joint_source())
+                .arg("-ldl")
+                .status()
+                .context("running gcc")?;
+            ensure!(status.success(), "gcc {args:?} failed");
+            Ok(())
+        };
+        gcc(&["-O1", "-Wall", "-Wextra", "-Werror"], &joint)?;
+        gcc(
+            &[
+                "-O1",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-shared",
+                "-fPIC",
+                "-DLIVE_JOINT_HELD_PROVIDER",
+            ],
+            &held,
+        )?;
+        let soft_copy = workload.path("soft-copy.so");
+        std::fs::copy(SOFTHSM, &soft_copy).context("copying SoftHSM2")?;
+        Ok(Self {
+            workload,
+            joint,
+            held,
+            soft_copy,
+        })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.workload.path(name)
+    }
+
+    /// One live-joint process; its stdout is the ledger file `<cell>.out`.
+    /// Reuses the owned-child/deadline helper shape (`LedgerProcess`).
+    fn spawn(
+        &self,
+        cell: &str,
+        args: &[&str],
+        extra_env: &[(&str, &Path)],
+    ) -> Result<LedgerProcess> {
+        let out = self.path(&format!("{cell}.out"));
+        let mut command = Command::new(&self.joint);
+        command
+            .args(args)
+            .env("SOFTHSM2_CONF", &self.workload.conf)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&out)?)
+            .stderr(std::fs::File::create(self.path(&format!("{cell}.err")))?);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().context("spawning live-joint")?;
+        let process = LedgerProcess { child, out };
+        process.wait_for("READY ", Duration::from_secs(30))?;
+        Ok(process)
+    }
+}
+
+/// The fixed SoftHSM call script's functions (every call the b/exec
+/// modes make is observed; the CALLS ledger carries the adaptive counts).
+const JOINT_SOFT_FUNCTIONS: &[&str] = &[
+    "C_Initialize",
+    "C_Finalize",
+    "C_GetSlotList",
+    "C_GetTokenInfo",
+    "C_OpenSession",
+    "C_CloseSession",
+    "C_Login",
+    "C_Logout",
+    "C_DigestInit",
+    "C_Digest",
+    "C_SignInit",
+    "C_Sign",
+    "C_GenerateKey",
+];
+
+/// A Joint manifest for any owned provider: the live joint-finish cell's
+/// recipe (file identity + mapping key + ELF offsets for the named
+/// functions), parameterized by provider. That cell's helper is untouched.
+fn provider_joint_manifest(
+    dir: &Path,
+    provider: &Path,
+    functions: &[&str],
+    file_name: &str,
+) -> Result<PathBuf> {
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+    use p11scope_manifest::manifest::*;
+    ensure!(
+        provider.exists(),
+        "provider {} is missing",
+        provider.display()
+    );
+    let file = open_object(provider).map_err(anyhow::Error::msg)?;
+    let inspected = inspect_file(&file).map_err(anyhow::Error::msg)?;
+    let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+    let elf = std::fs::File::open(provider)?;
+    let snapshot = p11scope_manifest::elf::ElfSnapshot::read(&elf).map_err(anyhow::Error::msg)?;
+    let mut offsets = Vec::new();
+    for name in functions {
+        let fact = snapshot
+            .defined_symbol(name)
+            .map_err(anyhow::Error::msg)?
+            .with_context(|| format!("{} exports no {name}", provider.display()))?;
+        offsets.push(fact.file_offset);
+    }
+    let functions = match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        },
+    }) {
+        pkcs11_module::TableSet::Walk(spans) => spans
+            .iter()
+            .flat_map(|span| span.fields())
+            .map(|field| {
+                let resolution = functions
+                    .iter()
+                    .position(|name| *name == field.name)
+                    .map_or(Resolution::NullPointer, |at| Resolution::Resolved {
+                        object: 0,
+                        file_offset: offsets[at],
+                    });
+                FunctionRecord {
+                    name: field.name.into(),
+                    resolution,
+                }
+            })
+            .collect(),
+        _ => anyhow::bail!("2.40 is a full standard table"),
+    };
+    let path = provider.to_str().context("provider path")?.to_string();
+    let manifest = Manifest {
+        schema: SCHEMA.into(),
+        module_path: path.clone(),
+        objects: vec![ObjectRecord {
+            id: 0,
+            path: path.clone(),
+            identity: inspected.identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path,
+            device_major: mapping.device_major,
+            device_minor: mapping.device_minor,
+            inode: mapping.inode,
+            identity: inspected.identity,
+        }],
+        interface_list: Acquisition::Absent,
+        surfaces: vec![SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Ok,
+            version: Some(Version {
+                major: 2,
+                minor: 40,
+            }),
+            walk: WalkOutcome::Full,
+            functions,
+        }],
+        vendor_interfaces: Vec::new(),
+        alias_groups: Vec::new(),
+        selection_evidence: Default::default(),
+    };
+    ensure!(
+        crate::manifest_input::validate_structure(&manifest).is_empty(),
+        "the {} manifest is well-formed",
+        provider.display()
+    );
+    let manifest_path = dir.join(file_name);
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    Ok(manifest_path)
+}
+
+fn system_joint_coordinator(modules: &[PathBuf]) -> Result<InventoryCoordinator<OsProcessSource>> {
+    InventoryCoordinator::new(
+        Scope::System,
+        HookRegistry::builtin(),
+        modules.to_vec(),
+        OsProcessSource,
+        RegistryLimits::default_limits(),
+    )
+}
+
+/// Native discovery passes until `done` says stop (adapter records and
+/// mapped edges for the owned processes, the Joint machine's binding
+/// input). The native lane stops afterwards; its records persist in the
+/// coordinator.
+fn drive_native_passes_until(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    done: &mut dyn FnMut(u64) -> Result<bool>,
+) -> Result<()> {
+    let probe = Probe::new(FacadeLane::prepare(
+        crate::attach::capture::CaptureScope::System,
+        coordinator.attach_set().budget(),
+        crate::attach::BackendSelection::Auto,
+    )?);
+    let lane = NativeLane::start(probe, coordinator, LaneWindows::PROVISIONAL, None)
+        .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
+    drive(coordinator, InspectScope::System, lane, done)?;
+    Ok(())
+}
+
+/// Native discovery until every listed pid has a mapped edge (bounded:
+/// at most ten short drives; each drive stops its own lane while the
+/// coordinator's records accumulate).
+fn drive_until_mapped(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    pids: &[u32],
+) -> Result<()> {
+    for _ in 0..10 {
+        if pids.iter().all(|pid| has_mapped_edge(coordinator, *pid)) {
+            return Ok(());
+        }
+        drive_native_passes_until(coordinator, &mut |passes| Ok(passes >= 4))?;
+    }
+    ensure!(
+        pids.iter().all(|pid| has_mapped_edge(coordinator, *pid)),
+        "every owner maps before attach"
+    );
+    Ok(())
+}
+
+fn caller_of(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    pid: u32,
+) -> Result<crate::discovery::caller_registry::CallerId> {
+    coordinator
+        .adapter()
+        .live_id(pid)
+        .with_context(|| format!("pid {pid} was never admitted"))
+}
+
+fn module_of(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    substr: &str,
+) -> Result<crate::discovery::caller_registry::ModuleId> {
+    coordinator
+        .registry()
+        .modules()
+        .find(|module| module.paths.iter().any(|path| path.contains(substr)))
+        .map(|module| module.id)
+        .with_context(|| format!("no module matching {substr:?}"))
+}
+
+fn has_mapped_edge(coordinator: &InventoryCoordinator<OsProcessSource>, pid: u32) -> bool {
+    let Some(id) = coordinator.adapter().live_id(pid) else {
+        return false;
+    };
+    coordinator
+        .registry()
+        .edges_of(id)
+        .any(|edge| edge.mapping == crate::discovery::caller_registry::MappingState::Mapped)
+}
+
+/// Start the production semantic lane over the manifests and initialize
+/// its Joint machine, before any lane tick (initialization refuses once
+/// ticks or stashed refresh exist).
+fn start_joint_lane(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+    )
+    .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    lane.initialize_joint(coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    Ok(lane)
+}
+
+/// Drive one Running transaction to publication through the real lane
+/// APIs (the future on-tick path, called directly): one begin, bounded
+/// service/poll slices, exactly one published revision.
+fn service_to_published(
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    engine_changed: bool,
+    tag: &str,
+) -> Result<u64> {
+    use crate::inventory_semantics::{JointServiceMode, JointWorkBudget};
+    lane.begin_joint_commit(engine_changed).map_err(|refusal| {
+        let reason = match refusal {
+            crate::inventory_semantics::JointCommitRefusal::NotInitialized => "not initialized",
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest => {
+                "outstanding request"
+            }
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired => {
+                "disposition required"
+            }
+        };
+        anyhow::anyhow!("{tag}: begin refused: {reason}")
+    })?;
+    let revision_before = coordinator.registry().published_revision();
+    let started = Instant::now();
+    let mut polls = 0u64;
+    loop {
+        let mut budget = JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        lane.service_joint(&mut *coordinator, JointServiceMode::Running, &mut budget)
+            .map_err(|reason| anyhow::anyhow!("{tag}: service refused: {reason}"))?;
+        let mut budget = JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let commit = lane
+            .poll_joint_commit(&mut *coordinator, &mut budget)
+            .map_err(|reason| anyhow::anyhow!("{tag}: commit poll refused: {reason}"))?;
+        polls += 1;
+        if matches!(
+            commit,
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
+        ) {
+            let revision_after = coordinator.registry().published_revision();
+            ensure!(
+                revision_after == revision_before + 1,
+                "{tag}: one published revision per transaction: \
+                 {revision_before} -> {revision_after}"
+            );
+            return Ok(polls);
+        }
+        ensure!(
+            polls < 600,
+            "{tag}: unpublished after 600 polls ({} ms)",
+            started.elapsed().as_millis()
+        );
+        ensure!(
+            started.elapsed() < Duration::from_secs(120),
+            "{tag}: unpublished after 120 s"
+        );
+    }
+}
+
+/// The fixture's CALLS ledger: per-function entered counts, total entered,
+/// total failed. The observer's exact populations are checked against
+/// these, never against hardcoded counts.
+fn ledger_calls(out: &Path) -> Result<(BTreeMap<String, u64>, u64, u64)> {
+    let text = std::fs::read_to_string(out)?;
+    let mut per_function = BTreeMap::new();
+    let mut total = 0u64;
+    let mut bad = 0u64;
+    for line in text.lines().filter(|line| line.starts_with("CALLS ")) {
+        let mut function = None;
+        let mut entered = None;
+        let mut failed = None;
+        for token in line.split_whitespace() {
+            if let Some(name) = token.strip_prefix("fn=") {
+                function = Some(name.to_string());
+            } else if let Some(count) = token.strip_prefix("n=") {
+                entered = Some(count.parse::<u64>()?);
+            } else if let Some(count) = token.strip_prefix("bad=") {
+                failed = Some(count.parse::<u64>()?);
+            }
+        }
+        let (Some(function), Some(entered), Some(failed)) = (function, entered, failed) else {
+            anyhow::bail!("unparsable CALLS line: {line:?}")
+        };
+        *per_function.entry(function).or_insert(0) += entered;
+        total += entered;
+        bad += failed;
+    }
+    Ok((per_function, total, bad))
+}
+
+/// The first `t=` stamp on a ledger line with the given prefix.
+fn ledger_stamp(out: &Path, prefix: &str) -> Result<u64> {
+    let text = std::fs::read_to_string(out)?;
+    for line in text.lines().filter(|line| line.starts_with(prefix)) {
+        for token in line.split_whitespace() {
+            if let Some(stamp) = token.strip_prefix("t=") {
+                return Ok(stamp.parse::<u64>()?);
+            }
+        }
+    }
+    anyhow::bail!("no {prefix:?} stamp in {}", out.display())
+}
+
+/// One semantic edge's observable populations.
+struct JointEdgeSnapshot {
+    api_returns: Option<u64>,
+    reduced: u64,
+    joint: bool,
+    started: Option<u64>,
+    completed: Option<u64>,
+    orphans: Option<u64>,
+}
+
+fn joint_edge_snapshot(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    pid: u32,
+    module_substr: &str,
+) -> Result<JointEdgeSnapshot> {
+    let caller = caller_of(coordinator, pid)?;
+    let module = module_of(coordinator, module_substr)?;
+    let record = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|record| record.caller == caller && record.module == module)
+        .with_context(|| format!("no semantic edge for pid {pid} on {module_substr:?}"))?;
+    Ok(JointEdgeSnapshot {
+        api_returns: record.api_returns,
+        reduced: record.feed.reduced(),
+        joint: record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
+        started: record.semantics.as_ref().map(|edge| edge.started()),
+        completed: record.semantics.as_ref().map(|edge| edge.completed()),
+        orphans: record.semantics.as_ref().map(|edge| edge.orphans()),
+    })
+}
+
+/// The quiet-path loss twins: no loss-ish gap, no lossy edge, no
+/// loss-ish reason on any edge, no H3 pending. Prints the H3 takes.
+fn assert_quiet_twins(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+) -> Result<()> {
+    for gap in coordinator.registry().gaps() {
+        let subject = gap.subject.to_lowercase();
+        let reason = gap.reason.to_lowercase();
+        ensure!(
+            !subject.contains("loss")
+                && !subject.contains("lost")
+                && !subject.contains("refused")
+                && !subject.contains("shed")
+                && !subject.contains("unsettled")
+                && !reason.contains("loss"),
+            "{tag}: unexpected gap {}: {}",
+            gap.subject,
+            gap.reason
+        );
+    }
+    for record in coordinator.registry().instance_semantic_edges() {
+        ensure!(
+            !record.lossy,
+            "{tag}: edge {:?}/{:?} is lossy",
+            record.caller,
+            record.module
+        );
+        for reason in &record.reasons {
+            let text = format!("{reason:?}");
+            ensure!(
+                ![
+                    "SemanticLoss",
+                    "OutOfOrderReturn",
+                    "AuthorityExhausted",
+                    "InstanceCapacity",
+                    "SemanticStateCapacity",
+                    "NegativeStateCapacity",
+                    "SemanticResourceCapacity",
+                    "BeforeSemanticBoundary",
+                    "CountOnly",
+                    "Unauthorized",
+                    "AmbiguousDescriptor",
+                    "CallerUnbound",
+                    "InstanceUnproven",
+                    "ProviderInstanceUnproven",
+                ]
+                .contains(&text.as_str()),
+                "{tag}: edge {:?}/{:?} carries {text}",
+                record.caller,
+                record.module
+            );
+        }
+    }
+    let (takes, pending) = coordinator.reference_h3_audit_state();
+    ensure!(!pending, "{tag}: H3 pending after publication");
+    eprintln!("JOINT_R16 {tag} h3_takes={takes}");
+    Ok(())
+}
+
+/// A ClassicDriver seating the Joint lane, for the production finish
+/// path (mirrors the live joint-finish cell's driver over System scope).
+fn joint_finish_driver<'a>(
+    coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+) -> ClassicDriver<'a> {
+    ClassicDriver {
+        coordinator,
+        inventory_scope: Some(InventoryScope::System),
+        scope: InspectScope::System.into(),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+        seated_summary: None,
+        second_signal: None,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
+        identity: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_commit_retries: 0,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
+    }
+}
+
+/// Stop the seated Joint lane through the production finish driver and
+/// hand its session over with joined same-owner cleanup: begin to
+/// Published, H0 stop, wound-down, take, and a genuine mint from the
+/// production completion minter. Every loop is bounded (finite stop).
+fn finish_stop_take_mint(
+    driver: &mut ClassicDriver<'_>,
+    tag: &str,
+) -> Result<crate::inventory_promotion::lifecycle::SessionNativeCompletion> {
+    use crate::inventory_promotion::lifecycle::NativeCompletionSource as _;
+    driver.begin_final_joint_finish();
+    ensure!(
+        driver.joint_finish == JointFinishDriver::Polling,
+        "{tag}: the live begin returns Ok and polls, got {:?}",
+        driver.joint_finish
+    );
+    ensure!(
+        !driver
+            .semantic
+            .as_ref()
+            .expect("lane")
+            .joint_finish_disposition_required(),
+        "{tag}: the Ok begin latches nothing"
+    );
+    let mut polls = 0u64;
+    loop {
+        let outcome = {
+            let (coordinator, semantic, finish, first_error) = (
+                &mut *driver.coordinator,
+                &mut driver.semantic,
+                &mut driver.joint_finish,
+                &mut driver.joint_first_error,
+            );
+            ClassicDriver::step_begun_joint_finish(semantic, finish, coordinator, first_error)
+        };
+        polls += 1;
+        if driver.joint_finish == JointFinishDriver::Published {
+            break;
+        }
+        ensure!(
+            !matches!(outcome, JointStepOutcome::Abandoned),
+            "{tag}: the live poll never abandons"
+        );
+        ensure!(
+            polls < 200,
+            "{tag}: the live poll reaches Published within 200 polls"
+        );
+    }
+    eprintln!("JOINT_R16 {tag} published_after={polls}");
+    let domain = driver.semantic.as_ref().expect("lane").domain();
+    {
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        if let Some(finish) = lane.finish_semantic_stop() {
+            coordinator.stage_semantic_batch(finish);
+            lane.note_semantic_staged();
+            commit_semantic_finish(coordinator, lane)?;
+            lane.note_semantic_published();
+        }
+        ensure!(lane.is_finished(), "{tag}: H0 stops");
+    }
+    let mut wound_polls = 0u64;
+    loop {
+        let (coordinator, semantic) = (&mut *driver.coordinator, &mut driver.semantic);
+        let lane = semantic.as_mut().expect("lane");
+        match lane.poll_wound_down(coordinator) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(refusal) => anyhow::bail!("{tag}: the live wound-down never refuses: {refusal}"),
+        }
+        wound_polls += 1;
+        ensure!(
+            wound_polls < 600,
+            "{tag}: the live detach joins within 600 polls"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let session = driver
+        .semantic
+        .as_mut()
+        .expect("lane")
+        .take_joined_session()
+        .map_err(|refusal| {
+            anyhow::anyhow!("{tag}: the wound-down lane hands its session: {refusal}")
+        })?
+        .with_context(|| format!("{tag}: the live take hands the session"))?;
+    eprintln!("JOINT_R16 {tag} wound_down_after={wound_polls} take=some");
+    let mut minter = crate::attach::NativeCompletionMinter::new();
+    minter.note_wound_down(domain, session);
+    let started = Instant::now();
+    loop {
+        if let Some(completion) = minter.poll_completion(domain) {
+            ensure!(
+                completion.domain() == domain,
+                "{tag}: the genuine mint names the wound-down domain"
+            );
+            ensure!(
+                minter.take_first_failure().is_none(),
+                "{tag}: the genuine mint never fails"
+            );
+            eprintln!(
+                "JOINT_R16 {tag} minted after {} ms",
+                started.elapsed().as_millis()
+            );
+            return Ok(completion);
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(30),
+            "{tag}: the genuine mint completes within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// R1.6 cell 1: the first birth through a held q1 to q2 and stop. Process
+/// A runs C_SignInit (returns at once) and enters a held C_Sign (its
+/// return is genuinely absent until the harness releases the FIFO); the
+/// held call is semantic on purpose, since a COUNT_ONLY slot can never
+/// birth Joint. Process B completes its whole SoftHSM script meanwhile.
+/// q1 publishes with A retained (no replay through the missing END, no
+/// fabricated return); the release lands A's return in q2; q2 publishes
+/// everything exactly once; the lane stops finite with joined same-owner
+/// cleanup.
+#[test]
+#[ignore = "privileged: live Joint first birth through a held q1 to q2 and stop"]
+fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
+    let cell_started = Instant::now();
+    let workload = JointWorkload::build()?;
+    let release = workload.path("release");
+    let fifo = std::ffi::CString::new(release.to_str().context("release path")?)?;
+    // SAFETY: a valid NUL-terminated path.
+    ensure!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0, "mkfifo");
+    let go = workload.path("go");
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let held_arg = workload.held.to_str().context("held path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process_a = workload.spawn(
+        "a",
+        &[
+            "a",
+            "--cell",
+            "A",
+            "--module",
+            &held_arg,
+            "--go",
+            &go_arg,
+            "--release",
+            release.to_str().context("release path")?,
+            "--hold",
+        ],
+        &[],
+    )?;
+    let process_b = workload.spawn(
+        "b",
+        &[
+            "b", "--cell", "B", "--module", &soft_arg, "--go", &go_arg, "--iters", "2", "--hold",
+        ],
+        &[],
+    )?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "joint-r16-held.dr37.json",
+    )?;
+    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let revision_before = coordinator.registry().published_revision();
+    std::fs::write(&go, b"")?;
+    process_a.wait_for("HELD ", Duration::from_secs(30))?;
+    process_b.wait_for("DONE ", Duration::from_secs(60))?;
+    ensure!(
+        !process_a.has("RETURNED "),
+        "A's held call returned before release"
+    );
+    let (_, b_total, b_bad) = ledger_calls(&process_b.out)?;
+    ensure!(
+        b_bad == 0,
+        "B's script never fails: {:?}",
+        process_b.lines()
+    );
+    ensure!(b_total > 0, "B completed its script");
+
+    // q1: B completed, A's return genuinely absent. The publication keeps
+    // A retained without replaying anything through the missing END.
+    let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16-q1")?;
+    let q1_end_ns = monotonic_ns();
+    let edge_a_q1 = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so");
+    let edge_b_q1 = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so");
+    let reduced_q1: u64 = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| record.feed.reduced())
+        .sum();
+    ensure!(
+        reduced_q1 == 0,
+        "r16-q1: no replay through the missing END(A): reduced {reduced_q1}"
+    );
+    if let Ok(edge) = &edge_a_q1 {
+        // A's SignInit return may route at q1, but the held Sign return
+        // is genuinely absent: anything below 2 proves no fabrication.
+        ensure!(
+            edge.api_returns.is_none_or(|count| count <= 1),
+            "r16-q1: A's held return is genuinely absent while held: {:?}",
+            edge.api_returns
+        );
+    }
+    // Without A's END, further service changes nothing observable: no
+    // replay, no revision, no H3 movement.
+    let revision_q1 = coordinator.registry().published_revision();
+    let h3_q1 = coordinator.reference_h3_audit_state();
+    for _ in 0..3 {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        lane.service_joint(
+            &mut coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| anyhow::anyhow!("r16-q1: idle service refused: {reason}"))?;
+    }
+    ensure!(
+        coordinator.registry().published_revision() == revision_q1,
+        "r16-q1: idle service publishes nothing"
+    );
+    ensure!(
+        coordinator.reference_h3_audit_state() == h3_q1,
+        "r16-q1: idle service moves no H3 audit"
+    );
+    let reduced_idle: u64 = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| record.feed.reduced())
+        .sum();
+    ensure!(reduced_idle == 0, "r16-q1: idle service replays nothing");
+    eprintln!(
+        "JOINT_R16 r16-q1 polls={q1_polls} revision={revision_before}->{revision_q1} \
+         reduced={reduced_q1} b_edge={} a_edge={}",
+        edge_b_q1.is_ok(),
+        edge_a_q1.is_ok(),
+    );
+
+    // Release A's return into q2.
+    std::fs::OpenOptions::new().write(true).open(&release)?;
+    process_a.wait_for("RETURNED ", Duration::from_secs(30))?;
+    let t_enter = ledger_stamp(&process_a.out, "HELD ")?;
+    let t_exit = ledger_stamp(&process_a.out, "RETURNED ")?;
+    ensure!(
+        t_enter < q1_end_ns && q1_end_ns < t_exit,
+        "the hold genuinely spans q1: enter {t_enter} q1-end {q1_end_ns} exit {t_exit}"
+    );
+    let (_, a_total, a_bad) = ledger_calls(&process_a.out)?;
+    ensure!(
+        a_bad == 0 && a_total == 2,
+        "A made exactly SignInit plus its held Sign"
+    );
+
+    // q2: A's genuine END lands; everything completes exactly once.
+    let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+    let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")?;
+    let edge_b = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so")?;
+    ensure!(
+        edge_a.api_returns == Some(a_total),
+        "A's API returns are exact: {:?} vs ledger {a_total}",
+        edge_a.api_returns
+    );
+    ensure!(
+        edge_b.api_returns == Some(b_total),
+        "B's API returns are exact: {:?} vs ledger {b_total}",
+        edge_b.api_returns
+    );
+    ensure!(
+        edge_a.reduced == a_total,
+        "A reduces exactly once: {} vs {a_total}",
+        edge_a.reduced
+    );
+    ensure!(
+        edge_b.reduced == b_total,
+        "B reduces exactly once: {} vs {b_total}",
+        edge_b.reduced
+    );
+    ensure!(edge_a.joint && edge_b.joint, "both feeds are Joint");
+    // B's script starts 2 digests + 1 sign + 1 direct keygen (unit-pinned
+    // 1/1 each); session/query calls start nothing.
+    ensure!(
+        edge_b.started == Some(4) && edge_b.completed == Some(4),
+        "B's completions are exact: {:?}/{:?}",
+        edge_b.started,
+        edge_b.completed
+    );
+    ensure!(
+        edge_a.started == Some(1) && edge_a.completed == Some(1),
+        "A's sign operation completes exactly: {:?}/{:?}",
+        edge_a.started,
+        edge_a.completed
+    );
+    let receipts = coordinator.registry().pending_joint_receipts_for_test();
+    ensure!(
+        receipts.len() >= 2,
+        "nonzero observed Joint receipts: {}",
+        receipts.len()
+    );
+    ensure!(
+        coordinator.registry().joint_feeds() >= 2,
+        "both owners hold Joint feeds"
+    );
+    let aggregates = coordinator.registry().keyuse_for_test().aggregates();
+    ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
+    let revision = coordinator.registry().published_revision();
+    let observations = coordinator.registry().joint_observations(revision);
+    ensure!(
+        observations.status == crate::key_operation_projection::ObsStatus::Populated,
+        "the guarded H9 section populates: {:?} ({})",
+        observations.status,
+        observations.reason
+    );
+    ensure!(
+        !observations.key_operations.is_empty(),
+        "the populated section carries key-operation rows"
+    );
+    ensure!(
+        observations.revision == revision,
+        "the section tags the published revision"
+    );
+    assert_quiet_twins(&coordinator, "r16-q2")?;
+    eprintln!(
+        "JOINT_R16 r16-q2 polls={q2_polls} revision={revision} feeds={} receipts={} key_aggs={} \
+         key_rows={} a_api={:?} b_api={:?}",
+        coordinator.registry().joint_feeds(),
+        receipts.len(),
+        aggregates.len(),
+        observations.key_operations.len(),
+        edge_a.api_returns,
+        edge_b.api_returns,
+    );
+
+    // Finite stop with joined same-owner cleanup (the stop helper
+    // checks the genuine mint names the wound-down domain).
+    let mut driver = joint_finish_driver(&mut coordinator, lane);
+    let _completion = finish_stop_take_mint(&mut driver, "r16-stop")?;
+    drop(driver);
+    drop(process_a);
+    drop(process_b);
+    eprintln!(
+        "JOINT_R16 r16-stop elapsed_s={} q1_polls={q1_polls} q2_polls={q2_polls}",
+        cell_started.elapsed().as_secs(),
+    );
+    ensure!(
+        cell_started.elapsed() < Duration::from_secs(300),
+        "the cell stops finite"
+    );
+    Ok(())
+}
+
+/// R1.6 cell 3: Joint promotion from A to B. A publishes its useful
+/// calls, then winds down through the production §8.6 driver: while A
+/// winds, B's queued promotion request is held (no preparation, no
+/// admission); A's finish publishes, its detach joins, the genuine
+/// minter mints, and the seal-drained gate retires A's namespace; only
+/// then is B's request taken, B seated on the same coordinator, and B's
+/// useful calls published. A retires before B is admitted.
+#[test]
+#[ignore = "privileged: live Joint promotion retires A before B is admitted"]
+fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
+    let cell_started = Instant::now();
+    let workload = JointWorkload::build()?;
+    let go_a = workload.path("go-a");
+    let go_a_arg = go_a.to_str().context("go-a path")?.to_string();
+    let go_b = workload.path("go-b");
+    let go_b_arg = go_b.to_str().context("go-b path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process_a = workload.spawn(
+        "pa",
+        &[
+            "b", "--cell", "PA", "--module", &soft_arg, "--go", &go_a_arg, "--iters", "1", "--hold",
+        ],
+        &[],
+    )?;
+    let process_b = workload.spawn(
+        "pb",
+        &[
+            "b", "--cell", "PB", "--module", &soft_arg, "--go", &go_b_arg, "--iters", "1", "--hold",
+        ],
+        &[],
+    )?;
+    let mut coordinator = system_joint_coordinator(std::slice::from_ref(&workload.soft_copy))?;
+    drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft.dr37.json",
+    )?;
+    let mut lane_a = start_joint_lane(&mut coordinator, vec![manifest_soft.clone()])?;
+    let domain_a = lane_a.domain();
+    std::fs::write(&go_a, b"")?;
+    process_a.wait_for("DONE ", Duration::from_secs(60))?;
+    let (_, a_total, a_bad) = ledger_calls(&process_a.out)?;
+    ensure!(a_bad == 0 && a_total > 0, "A ran its script");
+    let qa_polls = service_to_published(&mut lane_a, &mut coordinator, true, "r16c-qa")?;
+    let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "soft-copy.so")?;
+    ensure!(
+        edge_a.api_returns == Some(a_total) && edge_a.reduced == a_total,
+        "A is exact: {:?}/{} vs {a_total}",
+        edge_a.api_returns,
+        edge_a.reduced
+    );
+    ensure!(
+        edge_a.started == Some(3) && edge_a.completed == Some(3),
+        "A completions are exact: {:?}/{:?}",
+        edge_a.started,
+        edge_a.completed
+    );
+    ensure!(edge_a.joint, "A is Joint");
+    eprintln!(
+        "JOINT_R16 r16c-qa polls={qa_polls} a_api={:?}",
+        edge_a.api_returns
+    );
+
+    // Seat A's lane in the production promotion driver with a posed
+    // install record (A's real caller/module ids): the selected-install
+    // chain that would have produced it is interactive-only and covered
+    // by unit scenes; everything from the wind-down entry on is live.
+    // B's promotion request queues with B's real ids; its viewed frame
+    // is scripted, which the assertions never depend on: the §8.6 hold
+    // fires before any view read, and the post-retire take is proven by
+    // queue consumption plus the refusal record, never by preparation.
+    let held_display = super::promotion_driver_tests::headless_display();
+    let mut driver =
+        super::promotion_driver_tests::driver_with_display(&mut coordinator, held_display.display);
+    driver.semantic = Some(lane_a);
+    driver.completion_source = Some(Box::new(crate::attach::NativeCompletionMinter::new()));
+    let caller_a = caller_of(driver.coordinator, process_a.pid())?;
+    let module_a = module_of(driver.coordinator, "soft-copy.so")?;
+    driver.installed_promotion = Some(InstalledPromotion {
+        capture: CaptureId::new(41),
+        request: RequestId::new(7),
+        pair: PromotionPair::new(caller_a.0, module_a.0),
+    });
+    let display = driver.display.as_mut().expect("headless display");
+    ensure!(
+        display.promotion_enable(CaptureId::new(41)),
+        "the promotion control enables"
+    );
+    let caller_b = caller_of(driver.coordinator, process_b.pid())?;
+    let module_b = module_of(driver.coordinator, "soft-copy.so")?;
+    display
+        .queue_promotion_request_for_test(
+            crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test(),
+            caller_b,
+            module_b,
+        )
+        .map_err(|_| anyhow::anyhow!("B's promotion request queues"))?;
+    eprintln!("JOINT_R16 r16c-queued b_request=ok");
+
+    // The wind-down entry retires nothing yet: A's whole lane winds in
+    // its domain with the promotion flag armed.
+    driver.wind_down_installed_promotion(PromotionEnd::LaneClosed);
+    ensure!(
+        driver.installed_promotion.is_none(),
+        "the wind-down consumes the install"
+    );
+    ensure!(
+        driver
+            .retiring
+            .as_ref()
+            .is_some_and(|retiring| retiring.winding.is_some()),
+        "A's whole lane winds in its retiring domain"
+    );
+    ensure!(
+        driver.coordinator.promotion_finish(),
+        "A's promotion finish arms"
+    );
+    ensure!(
+        has_gap(driver.coordinator, "selected promotion ended"),
+        "the wind-down discloses its end"
+    );
+    ensure!(
+        driver
+            .retiring
+            .as_ref()
+            .and_then(|retiring| retiring.winding.as_ref())
+            .is_some_and(|winding| winding.finish == JointFinishDriver::Polling),
+        "A's promotion finish begins polling"
+    );
+
+    // While A winds, B is held: the take runs (its call counts) but
+    // takes nothing — no worker, no install, no refusal record.
+    driver.take_promotion_work();
+    ensure!(
+        driver.take_promotion_work_calls == 1,
+        "the held take runs once"
+    );
+    ensure!(driver.lifecycle.is_idle(), "no preparation starts for B");
+    ensure!(driver.pending_install.is_none(), "no install pends for B");
+    ensure!(
+        driver
+            .retiring
+            .as_ref()
+            .is_some_and(|retiring| retiring.winding.is_some()),
+        "A still winds"
+    );
+    ensure!(
+        !has_gap(driver.coordinator, "selected promotion refused"),
+        "a held B is not refused either"
+    );
+    ensure!(
+        driver
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.caller != caller_b),
+        "B is admitted nowhere while A winds"
+    );
+    eprintln!("JOINT_R16 r16c-hold b_held=ok");
+
+    // Retire A through the production winding poll: finish, joined
+    // detach, genuine mint, seal-drained retire.
+    let retire_started = Instant::now();
+    let mut retire_polls = 0u64;
+    while !driver.poll_joint_winding() {
+        retire_polls += 1;
+        ensure!(retire_polls < 1200, "A retires within 1200 winding polls");
+        ensure!(
+            retire_started.elapsed() < Duration::from_secs(120),
+            "A retires within 120 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    ensure!(driver.retiring.is_none(), "A's domain retires");
+    ensure!(
+        !driver.coordinator.promotion_finish(),
+        "the promotion flag clears on retire"
+    );
+    eprintln!("JOINT_R16 r16c-retire polls={retire_polls}");
+    // Twin: A's namespace is gone — the same domain retires no more.
+    let twin = driver.coordinator.retire_joint_domain(
+        crate::inventory_promotion::lifecycle::SessionNativeCompletion::scripted(domain_a),
+    );
+    let Err((_, refusal)) = twin else {
+        anyhow::bail!("A's retired namespace refuses a second retire as foreign")
+    };
+    ensure!(
+        matches!(
+            refusal,
+            crate::discovery::engine::inventory_coordinator::semantics::JointRetireRefusal::NotLiveDomain
+        ),
+        "the second retire refuses as foreign"
+    );
+
+    // The hold releases: B's request is taken (the queue drains and the
+    // scripted view refuses through the bounded refusal path — the §8.6
+    // content is take-vs-hold, not preparation, which unit scenes own).
+    // A worker starting from a scripted view would be a finding, not a
+    // pass: fail loudly so it is investigated, never silently absorbed.
+    driver.take_promotion_work();
+    ensure!(
+        driver.take_promotion_work_calls == 2,
+        "the released take runs"
+    );
+    ensure!(
+        driver
+            .display
+            .as_mut()
+            .expect("headless display")
+            .take_promotion_request()
+            .is_none(),
+        "the released take consumes B's request"
+    );
+    ensure!(
+        has_gap(driver.coordinator, "selected promotion refused"),
+        "the scripted view refuses through the bounded path"
+    );
+    ensure!(
+        driver.lifecycle.is_idle(),
+        "no worker starts from a scripted view"
+    );
+    eprintln!("JOINT_R16 r16c-take b_taken=ok");
+
+    // B seats on the same coordinator that outlived A, and B's useful
+    // calls publish exactly. B had no edge before this seat: A retired
+    // before B was admitted.
+    ensure!(
+        driver
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.caller != caller_b),
+        "B still has no edge before its seat"
+    );
+    let manifest_soft_b = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft-b.dr37.json",
+    )?;
+    // The promotion driver drops here; the coordinator outlives it for B.
+    let coordinator = &mut *driver.coordinator;
+    let mut lane_b = start_joint_lane(&mut *coordinator, vec![manifest_soft_b])?;
+    std::fs::write(&go_b, b"")?;
+    process_b.wait_for("DONE ", Duration::from_secs(60))?;
+    let (_, b_total, b_bad) = ledger_calls(&process_b.out)?;
+    ensure!(b_bad == 0 && b_total > 0, "B ran its script");
+    let qb_polls = service_to_published(&mut lane_b, &mut *coordinator, false, "r16c-qb")?;
+    let edge_b = joint_edge_snapshot(coordinator, process_b.pid(), "soft-copy.so")?;
+    ensure!(
+        edge_b.api_returns == Some(b_total) && edge_b.reduced == b_total,
+        "B is exact: {:?}/{} vs {b_total}",
+        edge_b.api_returns,
+        edge_b.reduced
+    );
+    ensure!(
+        edge_b.started == Some(3) && edge_b.completed == Some(3),
+        "B completions are exact: {:?}/{:?}",
+        edge_b.started,
+        edge_b.completed
+    );
+    ensure!(edge_b.joint, "B is Joint");
+    ensure!(
+        !coordinator
+            .registry()
+            .pending_joint_receipts_for_test()
+            .is_empty(),
+        "nonzero observed Joint receipts"
+    );
+    ensure!(
+        !coordinator
+            .registry()
+            .keyuse_for_test()
+            .aggregates()
+            .is_empty(),
+        "nonzero observed key receipts"
+    );
+    let revision = coordinator.registry().published_revision();
+    let observations = coordinator.registry().joint_observations(revision);
+    ensure!(
+        observations.status == crate::key_operation_projection::ObsStatus::Populated,
+        "the guarded H9 section populates after promotion: {:?} ({})",
+        observations.status,
+        observations.reason
+    );
+    assert_quiet_twins(coordinator, "r16c-qb")?;
+    eprintln!(
+        "JOINT_R16 r16c-qb polls={qb_polls} revision={revision} b_api={:?}",
+        edge_b.api_returns
+    );
+
+    // Finite stop with joined same-owner cleanup for B's lane.
+    let mut stop_driver = joint_finish_driver(&mut *coordinator, lane_b);
+    let _completion = finish_stop_take_mint(&mut stop_driver, "r16c-stop")?;
+    drop(stop_driver);
+    drop(driver);
+    drop(process_a);
+    drop(process_b);
+    eprintln!(
+        "JOINT_R16 r16c-stop elapsed_s={}",
+        cell_started.elapsed().as_secs()
+    );
+    ensure!(
+        cell_started.elapsed() < Duration::from_secs(300),
+        "the cell stops finite"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod joint_ledger_parse_tests {
+    //! Unit tests for the R1.6 ledger parsers (pure, no root): the exact
+    //! population assertions rest on these, so their parsing is pinned
+    //! here rather than trusted implicitly.
+    use super::{ledger_calls, ledger_stamp};
+
+    #[test]
+    fn calls_ledger_sums_per_function_and_totals() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("b.out");
+        std::fs::write(
+            &out,
+            "MAPPED cell=B pid=11 module=/tmp/soft-copy.so ino=7\n\
+             READY cell=B pid=11 exe=/tmp/live-joint\n\
+             CALLS cell=B pid=11 fn=C_Initialize n=1 bad=0\n\
+             CALLS cell=B pid=11 fn=C_GetTokenInfo n=2 bad=0\n\
+             CALLS cell=B pid=11 fn=C_Digest n=2 bad=1\n\
+             DONE cell=B pid=11 gen=0 exe=/tmp/live-joint status=fail\n",
+        )?;
+        let (per_function, total, bad) = ledger_calls(&out)?;
+        assert_eq!(per_function.get("C_Initialize"), Some(&1));
+        assert_eq!(per_function.get("C_GetTokenInfo"), Some(&2));
+        assert_eq!(per_function.get("C_Digest"), Some(&2));
+        assert_eq!(total, 5);
+        assert_eq!(bad, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn calls_ledger_rejects_garbled_lines() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let out = dir.path().join("g.out");
+        std::fs::write(&out, "CALLS cell=B pid=11 fn=C_Digest n=many bad=0\n").expect("write");
+        assert!(ledger_calls(&out).is_err());
+    }
+
+    #[test]
+    fn stamps_read_the_first_prefix_match() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("a.out");
+        std::fs::write(
+            &out,
+            "READY cell=A pid=12 exe=/tmp/live-joint\n\
+             HELD cell=A pid=12 fn=C_WaitForSlotEvent t=100\n\
+             RETURNED cell=A pid=12 fn=C_WaitForSlotEvent t=200 rv=0\n",
+        )?;
+        assert_eq!(ledger_stamp(&out, "HELD ")?, 100);
+        assert_eq!(ledger_stamp(&out, "RETURNED ")?, 200);
+        assert!(ledger_stamp(&out, "MISSING ").is_err());
+        Ok(())
+    }
+}
+
+use crate::inventory_promotion::{CaptureId, PromotionEnd, PromotionPair, RequestId};
+
+fn has_gap(coordinator: &InventoryCoordinator<OsProcessSource>, subject: &str) -> bool {
+    coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .any(|gap| gap.subject == subject)
+}
+
+/// The semantic-edge census: (pid, module path) pairs. Owner pids resolve
+/// through the adapter records (live and retired); unknown callers print
+/// numerically.
+fn joint_edge_census(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<(u32, String)> {
+    let mut census = Vec::new();
+    for record in coordinator.registry().instance_semantic_edges() {
+        let pid = coordinator
+            .adapter()
+            .records()
+            .find(|caller| caller.id == record.caller)
+            .map(|caller| caller.pid)
+            .unwrap_or(u32::MAX);
+        let path = coordinator
+            .registry()
+            .module(record.module)
+            .map(|module| module.paths.iter().next().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        census.push((pid, path));
+    }
+    census.sort();
+    census
+}
+
+/// R1.6 cell 2: absence and S1Only siblings beside a post-attach exec. E
+/// execs after attach and its new incarnation births Joint; C maps only
+/// the SoftHSM copy (its unmapped held provider is absence-proven, never
+/// a false positive); H holds a semantic call on the held provider so
+/// that module genuinely exists in the run; S enters its held call before
+/// attach (entries genuinely shed) and returns it late, so its orphan
+/// END registers S1Only and reduces S1-direct exactly once, never
+/// upgraded to Joint. Three transactions, one revision each, then a
+/// finite stop with joined same-owner cleanup.
+#[test]
+#[ignore = "privileged: live Joint absence and S1Only siblings beside a post-attach exec"]
+fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
+    let cell_started = Instant::now();
+    let workload = JointWorkload::build()?;
+    let release_h = workload.path("release-h");
+    let release_s = workload.path("release-s");
+    for release in [&release_h, &release_s] {
+        let fifo = std::ffi::CString::new(release.to_str().context("release path")?)?;
+        // SAFETY: a valid NUL-terminated path.
+        ensure!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0, "mkfifo");
+    }
+    // S's gate opens before attach (its entries are genuinely pre-attach);
+    // every other gate opens after.
+    let go = workload.path("go");
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let go_s = workload.path("go-s");
+    let go_s_arg = go_s.to_str().context("go-s path")?.to_string();
+    let late_e = workload.path("late-e");
+    let late_e_arg = late_e.to_str().context("late-e path")?.to_string();
+    let held_arg = workload.held.to_str().context("held path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process_e = workload.spawn(
+        "e",
+        &[
+            "exec",
+            "--cell",
+            "E",
+            "--module",
+            &soft_arg,
+            "--go",
+            &go_arg,
+            "--late",
+            &late_e_arg,
+            "--iters",
+            "1",
+            "--hold",
+        ],
+        &[],
+    )?;
+    let process_c = workload.spawn(
+        "c",
+        &[
+            "absent", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--hold",
+        ],
+        &[],
+    )?;
+    let process_s = workload.spawn(
+        "s",
+        &[
+            "a",
+            "--cell",
+            "S",
+            "--module",
+            &held_arg,
+            "--go",
+            &go_s_arg,
+            "--release",
+            release_s.to_str().context("release-s path")?,
+            "--hold",
+        ],
+        &[],
+    )?;
+    let process_h = workload.spawn(
+        "h",
+        &[
+            "a",
+            "--cell",
+            "H",
+            "--module",
+            &held_arg,
+            "--go",
+            &go_arg,
+            "--release",
+            release_h.to_str().context("release-h path")?,
+            "--hold",
+        ],
+        &[],
+    )?;
+    // S enters its held call before attach; the HELD line plus the
+    // post-hoc stamp check prove both entries predate the lane.
+    std::fs::write(&go_s, b"")?;
+    process_s.wait_for("HELD ", Duration::from_secs(30))?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    drive_until_mapped(
+        &mut coordinator,
+        &[
+            process_e.pid(),
+            process_c.pid(),
+            process_s.pid(),
+            process_h.pid(),
+        ],
+    )?;
+    let caller_s = caller_of(&coordinator, process_s.pid())?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "joint-r16-held.dr37.json",
+    )?;
+    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let attach_ns = monotonic_ns();
+
+    // The post-attach exec: gen 0 runs, execs, and gen 1 maps again. The
+    // observer admits the new incarnation before its first call.
+    std::fs::write(&go, b"")?;
+    process_e.wait_for("EXEC ", Duration::from_secs(30))?;
+    let started = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(&process_e.out)?;
+        if text
+            .lines()
+            .filter(|line| line.starts_with("READY "))
+            .count()
+            >= 2
+        {
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(30),
+            "the post-exec image never readied: {:?}",
+            process_e.lines()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drive_native_passes_until(&mut coordinator, &mut |passes| Ok(passes >= 3))?;
+    let exec_records: Vec<_> = coordinator
+        .adapter()
+        .records()
+        .filter(|record| record.pid == process_e.pid())
+        .collect();
+    ensure!(
+        exec_records.len() >= 2,
+        "the exec minted a new incarnation: {} records",
+        exec_records.len()
+    );
+    std::fs::write(&late_e, b"")?;
+    process_e.wait_for("DONE ", Duration::from_secs(60))?;
+    process_c.wait_for("DONE ", Duration::from_secs(60))?;
+    process_h.wait_for("HELD ", Duration::from_secs(30))?;
+    ensure!(
+        !process_h.has("RETURNED "),
+        "H's held call returned before release"
+    );
+    let (_, e_total, e_bad) = ledger_calls(&process_e.out)?;
+    let (_, c_total, c_bad) = ledger_calls(&process_c.out)?;
+    ensure!(e_bad == 0 && c_bad == 0, "E and C never fail");
+    ensure!(e_total > 0 && c_total == 3, "E and C ran their scripts");
+
+    // q1: E-post and C completed, H held, S held pre-attach (its
+    // entries shed, contributing nothing). Nothing replays through the
+    // missing END(H), not even H's own completed SignInit: the frame
+    // gates replay as a whole. S is admitted (bound) but registers
+    // nothing: records come only from observed calls.
+    let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16b-q1")?;
+    let q1_end_ns = monotonic_ns();
+    let reduced_q1: u64 = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| record.feed.reduced())
+        .sum();
+    ensure!(reduced_q1 == 0, "r16b-q1: nothing replays while H is held");
+    ensure!(
+        coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.caller != caller_s),
+        "r16b-q1: the pre-attach sibling registers nothing without observed calls"
+    );
+    ensure!(
+        coordinator.semantic_bindings().get(caller_s).is_some(),
+        "r16b-q1: the pre-attach sibling is admitted"
+    );
+    let feeds_q1 = coordinator.registry().joint_feeds();
+    let receipts_q1 = coordinator
+        .registry()
+        .pending_joint_receipts_for_test()
+        .len();
+    eprintln!(
+        "JOINT_R16 r16b-q1 polls={q1_polls} feeds={feeds_q1} receipts={receipts_q1} \
+         census={:?}",
+        joint_edge_census(&coordinator),
+    );
+
+    // Release H into q2; S stays held on its own FIFO.
+    std::fs::OpenOptions::new().write(true).open(&release_h)?;
+    process_h.wait_for("RETURNED ", Duration::from_secs(30))?;
+    let h_enter = ledger_stamp(&process_h.out, "HELD ")?;
+    let h_exit = ledger_stamp(&process_h.out, "RETURNED ")?;
+    ensure!(
+        h_enter < q1_end_ns && q1_end_ns < h_exit,
+        "H's hold genuinely spans q1"
+    );
+    let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q2")?;
+    let edge_e = joint_edge_snapshot(&coordinator, process_e.pid(), "soft-copy.so")?;
+    let edge_c = joint_edge_snapshot(&coordinator, process_c.pid(), "soft-copy.so")?;
+    let edge_h = joint_edge_snapshot(&coordinator, process_h.pid(), "live-joint-held.so")?;
+    ensure!(
+        edge_e.joint && edge_c.joint && edge_h.joint,
+        "E, C and H are Joint"
+    );
+    ensure!(
+        edge_e.api_returns == Some(e_total) && edge_e.reduced == e_total,
+        "E-post is exact: {:?}/{} vs {e_total}",
+        edge_e.api_returns,
+        edge_e.reduced
+    );
+    ensure!(
+        edge_c.api_returns == Some(c_total) && edge_c.reduced == c_total,
+        "C is exact: {:?}/{} vs {c_total}",
+        edge_c.api_returns,
+        edge_c.reduced
+    );
+    ensure!(
+        edge_h.api_returns == Some(2) && edge_h.reduced == 2,
+        "H is exact: {:?}/{}",
+        edge_h.api_returns,
+        edge_h.reduced
+    );
+    ensure!(
+        edge_e.started == Some(3) && edge_e.completed == Some(3),
+        "E-post completions are exact: {:?}/{:?}",
+        edge_e.started,
+        edge_e.completed
+    );
+    ensure!(
+        edge_c.started == Some(0) && edge_c.completed == Some(0),
+        "C starts no operation: {:?}/{:?}",
+        edge_c.started,
+        edge_c.completed
+    );
+    ensure!(
+        edge_h.started == Some(1) && edge_h.completed == Some(1),
+        "H's sign operation completes exactly: {:?}/{:?}",
+        edge_h.started,
+        edge_h.completed
+    );
+    ensure!(
+        coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.caller != caller_s),
+        "r16b-q2: the still-held sibling registers nothing"
+    );
+    // No unmapped object ever gains a positive: every edge pairs its
+    // owner with a provider it genuinely mapped.
+    let census = joint_edge_census(&coordinator);
+    for (pid, path) in &census {
+        let held = path.contains("live-joint-held.so");
+        let soft = path.contains("soft-copy.so");
+        ensure!(
+            (*pid == process_h.pid() && held)
+                || (*pid != process_h.pid() && *pid != u32::MAX && soft),
+            "r16b-q2: no false unmapped positive: {census:?}"
+        );
+    }
+    for (pid, want) in [
+        (process_e.pid(), "soft-copy.so"),
+        (process_c.pid(), "soft-copy.so"),
+        (process_h.pid(), "live-joint-held.so"),
+    ] {
+        ensure!(
+            census
+                .iter()
+                .any(|(edge_pid, path)| *edge_pid == pid && path.contains(want)),
+            "r16b-q2: owner {pid} pairs with {want}: {census:?}"
+        );
+    }
+    eprintln!("JOINT_R16 r16b-q2 polls={q2_polls} census={census:?}");
+    let feeds_q2 = coordinator.registry().joint_feeds();
+    let receipts_q2 = coordinator
+        .registry()
+        .pending_joint_receipts_for_test()
+        .len();
+
+    // q3: S's late return lands as an orphan END (both entries shed
+    // pre-attach). Without a birth receipt it registers S1Only and
+    // reduces S1-direct exactly once, never upgraded to Joint.
+    let unknown_before = coordinator
+        .registry()
+        .keyuse_for_test()
+        .evidence()
+        .unknown_key_rows;
+    std::fs::OpenOptions::new().write(true).open(&release_s)?;
+    process_s.wait_for("RETURNED ", Duration::from_secs(30))?;
+    let s_enter = ledger_stamp(&process_s.out, "HELD ")?;
+    let s_exit = ledger_stamp(&process_s.out, "RETURNED ")?;
+    ensure!(
+        s_enter < attach_ns && attach_ns < s_exit,
+        "S's entries predate attach and its return postdates it: {s_enter} {attach_ns} {s_exit}"
+    );
+    let (_, s_total, s_bad) = ledger_calls(&process_s.out)?;
+    ensure!(
+        s_bad == 0 && s_total == 2,
+        "S entered exactly its held pair"
+    );
+    let q3_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q3")?;
+    let edge_s = joint_edge_snapshot(&coordinator, process_s.pid(), "live-joint-held.so")?;
+    ensure!(!edge_s.joint, "S never upgrades to Joint");
+    ensure!(
+        edge_s.api_returns == Some(1) && edge_s.reduced == 1,
+        "S observes only its orphan END: {:?}/{} (ledger entered {s_total})",
+        edge_s.api_returns,
+        edge_s.reduced
+    );
+    ensure!(
+        edge_s.started == Some(0) && edge_s.completed == Some(0),
+        "the orphan END starts no operation: {:?}/{:?}",
+        edge_s.started,
+        edge_s.completed
+    );
+    ensure!(
+        edge_s.orphans == Some(1),
+        "the orphan END counts exactly once: {:?}",
+        edge_s.orphans
+    );
+    ensure!(
+        coordinator.registry().joint_feeds() == feeds_q2,
+        "S adds no Joint feed: {} vs {feeds_q2}",
+        coordinator.registry().joint_feeds()
+    );
+    ensure!(
+        coordinator
+            .registry()
+            .pending_joint_receipts_for_test()
+            .len()
+            == receipts_q2,
+        "S installs no Joint receipt"
+    );
+    let census_q3 = joint_edge_census(&coordinator);
+    ensure!(
+        census_q3
+            .iter()
+            .any(|(edge_pid, path)| *edge_pid == process_s.pid()
+                && path.contains("live-joint-held.so")),
+        "r16b-q3: S pairs with its mapped provider: {census_q3:?}"
+    );
+    let unknown_after = coordinator
+        .registry()
+        .keyuse_for_test()
+        .evidence()
+        .unknown_key_rows;
+    ensure!(
+        unknown_after > unknown_before,
+        "S contributes unknown-key S1 facts: {unknown_before} -> {unknown_after}"
+    );
+    let receipts = coordinator.registry().pending_joint_receipts_for_test();
+    ensure!(!receipts.is_empty(), "nonzero observed Joint receipts");
+    let aggregates = coordinator.registry().keyuse_for_test().aggregates();
+    ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
+    let revision = coordinator.registry().published_revision();
+    let observations = coordinator.registry().joint_observations(revision);
+    ensure!(
+        observations.status == crate::key_operation_projection::ObsStatus::Populated,
+        "the guarded H9 section populates: {:?} ({})",
+        observations.status,
+        observations.reason
+    );
+    ensure!(
+        !observations.key_operations.is_empty(),
+        "the populated section carries key-operation rows"
+    );
+    assert_quiet_twins(&coordinator, "r16b-q3")?;
+    eprintln!(
+        "JOINT_R16 r16b-q3 polls={q3_polls} revision={revision} feeds={} receipts={} \
+         unknown_key={unknown_before}->{unknown_after}",
+        coordinator.registry().joint_feeds(),
+        receipts.len(),
+    );
+
+    // Finite stop with joined same-owner cleanup.
+    let mut driver = joint_finish_driver(&mut coordinator, lane);
+    let _completion = finish_stop_take_mint(&mut driver, "r16b-stop")?;
+    drop(driver);
+    drop(process_e);
+    drop(process_c);
+    drop(process_s);
+    drop(process_h);
+    eprintln!(
+        "JOINT_R16 r16b-stop elapsed_s={}",
+        cell_started.elapsed().as_secs()
+    );
+    ensure!(
+        cell_started.elapsed() < Duration::from_secs(300),
+        "the cell stops finite"
+    );
+    Ok(())
+}

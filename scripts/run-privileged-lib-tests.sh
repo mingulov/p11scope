@@ -252,6 +252,15 @@ inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 # (the M1/M3 arms unit tests cannot build a live machine for). Prints
 # JOINT_LIVE lines.
 inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64
+# R1.6 live Joint root cells: the production classic Session with Joint on
+# over the owned live-joint provider workload (needs gcc, softhsm2-util and
+# SoftHSM2; each runs its own System-scope capture, a few minutes). First
+# birth through a held q1 to q2 and stop; absence and S1Only siblings
+# beside a post-attach exec; promotion retiring A before B is admitted.
+# Print JOINT_R16 lines.
+inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64
+inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64
+inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

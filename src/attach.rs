@@ -3324,6 +3324,7 @@ fn group_static_slots(
         object_has_unsafe,
         attach_targets,
         StaticRoots::Detailed,
+        None,
     )
     .expect("every selected Detailed target has retained pinned facts")
 }
@@ -3348,10 +3349,13 @@ fn group_static_slots_with_roots(
     object_has_unsafe: bool,
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
     roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
 ) -> Result<Vec<StaticGroup>> {
     if roots == StaticRoots::CounterBanks {
-        if !matches!(policy, CapturePolicy::Counter(_)) || object_has_unsafe {
-            bail!("private Counts grouping requires its fixed aggregate-only roots");
+        if policy.counter_mode() != expected_counter_mode || object_has_unsafe {
+            bail!(
+                "private counter grouping requires the prepared mode's fixed aggregate-only roots"
+            );
         }
         for slot in slots {
             let (path, abi) = attach_targets
@@ -4147,6 +4151,7 @@ fn attach_targets_observed_with(
         policy,
         object_has_unsafe,
         StaticRoots::Detailed,
+        None,
         abi_for,
         attach,
         completed_at,
@@ -4158,6 +4163,7 @@ fn attach_targets_observed_with_roots(
     policy: CapturePolicy,
     object_has_unsafe: bool,
     roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
     mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(
         &'static str,
@@ -4173,11 +4179,11 @@ fn attach_targets_observed_with_roots(
         .map(|slot| abi_for(slot).map(|abi| (slot, abi)))
         .collect::<Result<Vec<_>>>()?;
     if roots == StaticRoots::CounterBanks
-        && (!matches!(policy, CapturePolicy::Counter(_))
+        && (policy.counter_mode() != expected_counter_mode
             || object_has_unsafe
             || targets.iter().any(|(_, abi)| *abi != ElfAbi::Lp64))
     {
-        bail!("private Counts bank attachment requires the LP64 aggregate-only fixed pair");
+        bail!("private counter bank attachment requires the LP64 aggregate-only fixed pair");
     }
     let return_program = if roots == StaticRoots::CounterBanks {
         "p11_counter_bank_return"
@@ -7081,6 +7087,10 @@ impl Session {
         };
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic = self.reexec_diagnostic();
+        let counter_mode = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| banks.geometry_mode());
         let outcome = if self.backend == AttachBackend::Multi {
             self.attach_targets_multi(targets, &attach_targets, roots)?
         } else {
@@ -7092,6 +7102,7 @@ impl Session {
                 self.policy,
                 self.embedded_flavor.unsafe_present,
                 roots,
+                counter_mode,
                 |slot| {
                     Ok(attach_targets
                         .get(&slot.index)
@@ -7244,12 +7255,17 @@ impl Session {
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
         roots: StaticRoots,
     ) -> Result<AttachOutcome> {
+        let counter_mode = self
+            .counter_banks
+            .as_ref()
+            .map(|banks| banks.geometry_mode());
         let groups = group_static_slots_with_roots(
             targets,
             self.policy,
             self.embedded_flavor.unsafe_present,
             attach_targets,
             roots,
+            counter_mode,
         )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();

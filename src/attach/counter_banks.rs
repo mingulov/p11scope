@@ -2540,9 +2540,10 @@ impl Session {
                     .banks
                     .validate_backend(selected.backend)
                     .map_err(|_| anyhow::anyhow!("private counter preparation backend mismatch"))?;
+                let counter_mode = preparation.banks.geometry_mode();
                 let (mut session, prepared_instance) = Self::prepare_inner_unlinked_with_object(
                     scope,
-                    CapturePolicy::Counter(CounterMode::Counts),
+                    CapturePolicy::Counter(counter_mode),
                     None,
                     None,
                     None,
@@ -2590,9 +2591,10 @@ impl Session {
             "private bank proof requires one PID scope"
         );
         let preparation = CounterPreparation::new(object, reservation, reserve)?;
+        let counter_mode = preparation.banks.geometry_mode();
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked_with_object(
             scope,
-            CapturePolicy::Counter(CounterMode::Counts),
+            CapturePolicy::Counter(counter_mode),
             None,
             None,
             None,
@@ -2653,6 +2655,10 @@ impl Session {
 }
 
 impl CounterBanks {
+    pub(super) fn geometry_mode(&self) -> CounterMode {
+        self.geometry.mode()
+    }
+
     pub(super) fn validate_backend(
         &self,
         backend: super::AttachBackend,

@@ -4752,6 +4752,30 @@ fn member_run_attempt_cap_counts_target_runs() {
         demoted.fallback.first_reason,
         Some(KernelFallbackReason::TargetUnavailable)
     );
+    // The failed attempt named its target, so the reset below pins a
+    // real installed target rather than a vacuous zero. The demoted
+    // run writes nothing: it refuses before any target write.
+    assert_eq!(
+        demoted.config_writes.len(),
+        5,
+        "install, member target, success reset, failed target, failure reset"
+    );
+    assert_eq!(
+        (
+            demoted.config_writes[3].target_tgid,
+            demoted.config_writes[3].target_tid
+        ),
+        (demoted.pids[1], demoted.pids[1]),
+        "the failed write named its target"
+    );
+    // The attempted-run failure exit resets the target: the trailing
+    // write zeroes it, so the stale target cannot hijack a later run.
+    let last = demoted.config_writes.last().expect("the install wrote");
+    assert_eq!(
+        (last.target_tgid, last.target_tid),
+        (0, 0),
+        "the trailing config write zeroes the member target"
+    );
 }
 
 #[test]

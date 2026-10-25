@@ -1,0 +1,128 @@
+# Test-only Knative holder image for cell K3 (scripts/knative-e2e.sh):
+# SoftHSM2 plus the ledgered `gated` client from tests/fixtures/public-cli as
+# PID 1 and an embedded minimal HTTP handler on $PORT, so a Knative
+# scale-from-zero pod makes an exactly known number of PKCS#11 calls per
+# request: one GET on /ledger releases gated's single ledger run and returns
+# its LEDGER line. Any other path answers 200 without touching the gate, so
+# readiness probes never consume the one shot; a second /ledger GET fails.
+#   docker build -f p11scope/deploy/Dockerfile.knative-holder -t p11scope-knative-holder:1 p11scope
+# Base and layout mirror deploy/Dockerfile.holder: the same pinned
+# ubuntu:26.04 digest in both stages (apt packages still float with the
+# archive, so the image is repeatable, not bit-reproducible). python3 is
+# installed explicitly: the minimal base is not relied upon to ship it, and
+# the handler needs the http.server stdlib (full python3, not python3-minimal,
+# so every stdlib import the handler uses is present). No other new package.
+FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e AS build
+# hadolint ignore=DL3008 # Test holder tracks the pinned Ubuntu 26.04 repository; package versions vary by architecture.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/fixtures/public-cli/gated.c /src/gated.c
+RUN gcc -O1 -o /src/gated /src/gated.c -ldl
+
+FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e
+# hadolint ignore=DL3008 # Test holder tracks the pinned Ubuntu 26.04 repository; package versions vary by architecture.
+RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+COPY --from=build /src/gated /usr/local/bin/p11scope-ledger-gated
+# The HTTP handler (one GET on /ledger = one ledger run, LEDGER line back).
+# K3_GATE/K3_LEDGER_LOG/K3_RAN/K3_LEDGER_TIMEOUT_S are self-test hooks; the
+# image defaults are the /tmp paths the entry script prepares.
+RUN cat > /server.py <<'PYEOF'
+# K3-SERVER-BEGIN
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""K3 holder HTTP handler: one GET on /ledger releases the gated SoftHSM2
+ledger run and returns its LEDGER line. Any other path answers 200 without
+touching the gate (readiness probes must not consume the one shot)."""
+import http.server
+import os
+import time
+
+PORT = int(os.environ.get("PORT", "8080"))
+GATE = os.environ.get("K3_GATE", "/tmp/gate")
+LEDGER_LOG = os.environ.get("K3_LEDGER_LOG", "/tmp/gated.log")
+LEDGER_TIMEOUT_S = float(os.environ.get("K3_LEDGER_TIMEOUT_S", "50"))
+RAN_MARKER = os.environ.get("K3_RAN", "/tmp/ledger-ran")
+
+
+def wait_ledger():
+    deadline = time.monotonic() + LEDGER_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            with open(LEDGER_LOG, encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("LEDGER "):
+                        return line.strip()
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return None
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path != "/ledger":
+            self._send(200, "ready\n")
+            return
+        try:
+            fd = os.open(RAN_MARKER, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            self._send(500, "ledger already ran\n")
+            return
+        os.close(fd)
+        try:
+            with open(GATE, "w", encoding="utf-8") as handle:
+                handle.write("run\n")
+        except OSError as exc:
+            self._send(500, f"gate failed: {exc}\n")
+            return
+        line = wait_ledger()
+        if line is None:
+            self._send(500, "ledger timed out\n")
+            return
+        self._send(200, line + "\n")
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+if __name__ == "__main__":
+    http.server.HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+# K3-SERVER-END
+PYEOF
+# The entry script: init a private SoftHSM2 token, start the handler in the
+# background, then become the gated ledger client (PID 1 maps the provider
+# from pod start; one GET releases its single ledger run).
+RUN cat > /usr/local/bin/knative-holder-entry <<'SHEOF'
+# K3-ENTRY-BEGIN
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Test-only entry for the K3 Knative holder image.
+set -eu
+MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+ITERS=${LEDGER_ITERS:-200}
+SLEEP_US=${LEDGER_SLEEP_US:-200}
+export SOFTHSM2_CONF=/tmp/softhsm2.conf
+rm -rf /tmp/tokens /tmp/gate /tmp/gated.log /tmp/ledger-ran
+mkdir -p /tmp/tokens
+printf 'directories.tokendir = /tmp/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' \
+    > "$SOFTHSM2_CONF"
+softhsm2-util --init-token --free --label k3-knative --so-pin 5678 --pin 1234 >/dev/null
+python3 /server.py &
+exec /usr/local/bin/p11scope-ledger-gated "$MODULE" "$ITERS" "$SLEEP_US" /tmp/gate >>/tmp/gated.log 2>&1
+# K3-ENTRY-END
+SHEOF
+RUN chmod 0755 /usr/local/bin/knative-holder-entry /usr/local/bin/p11scope-ledger-gated \
+    && python3 -m py_compile /server.py \
+    && sh -n /usr/local/bin/knative-holder-entry
+ENV LEDGER_ITERS=200 LEDGER_SLEEP_US=200 PORT=8080
+ENTRYPOINT ["/usr/local/bin/knative-holder-entry"]

@@ -15,7 +15,10 @@ use super::sem1_feed::{
     WORKLOAD_MAIN, admit_mapped, enqueue_live_like, production_bind, workload_scene,
 };
 use super::*;
+use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::caller_registry::RegistryGap;
+use crate::inventory_semantics::image_query_refusal_index;
+use std::io::Write as _;
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, InstanceReason};
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use std::time::Duration;
@@ -1024,5 +1027,204 @@ fn physical_calls_count_once_across_ticks_and_bindings() {
         boundary_gaps(&scene).len(),
         1,
         "the R-34 shed keeps its boundary disclosure"
+    );
+}
+
+/// (ctime seconds, ctime nanoseconds, length) of a held provider file:
+/// the corruption check for the changed-file tests below.
+fn provider_stamp(path: &str) -> (i64, i64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(path).unwrap();
+    (
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.len(),
+    )
+}
+
+#[test]
+fn changed_provider_file_refuses_scans_and_sheds_the_pending_burst() {
+    // The punch-hole rule at the fake scan seam: once the watched
+    // provider file reports changed, every later scan refuses Custody —
+    // the `LiveImageScan::audit` guard — so a global-advanced burst
+    // can never observe and sheds as Unobserved with the existing
+    // disclosure. The pre-change instance stays observed; nothing
+    // mints, nothing joins, no other refusal appears.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "one instance before the change, got {:?}",
+        instance_summary(&scene)
+    );
+    // The hole: the provider file changes on disk after pinning.
+    let provider = scene.modules[0].1.clone();
+    let before = provider_stamp(&provider);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&provider)
+        .unwrap()
+        .write_all(b"sem-8-hole")
+        .unwrap();
+    let after = provider_stamp(&provider);
+    assert_ne!(
+        before, after,
+        "the test setup must actually change the file"
+    );
+    assert_eq!(
+        scene.h0.0.borrow().io.watched[0].check_unchanged(),
+        Ok(false),
+        "the watched file reports changed after the on-disk write"
+    );
+    // The hole's epoch shape: the global epoch advanced while the
+    // mapping and the process's own epoch stayed identical, so the
+    // next burst needs a fresh observation instead of a cached join.
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    assert_eq!(
+        joined, 2,
+        "the post-change burst waits for its observation, got {joined} joined"
+    );
+    assert_eq!(
+        scene.lane.shed_calls_disclosed(),
+        0,
+        "route-waiting calls shed at the deadline, not before"
+    );
+    // Past the 2 s scan-job deadline the burst expires unobserved.
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .advance_now(Duration::from_secs(3));
+    let batch = scene.tick();
+    scene.publish(batch);
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    let shed = scene.lane.shed_calls_disclosed();
+    assert_eq!((joined, shed), (2, 2), "only the pre-change burst joins");
+    assert_eq!(joined + shed, 4, "joined + shed equals the physical calls");
+    assert_eq!(
+        unrouted_reasons(&scene),
+        vec![(
+            "2 calls shed without a route (unobserved=2) with 1 bindings".to_string(),
+            1
+        )],
+        "the expired burst keeps the unobserved disclosure"
+    );
+    let counts = scene.lane.scan_refusal_counts();
+    let custody = image_query_refusal_index(ImageQueryRefusal::Custody);
+    assert_eq!(
+        counts[custody], 2,
+        "the refresh scan and the tick scan both refuse Custody, got {counts:?}"
+    );
+    for (index, count) in counts.iter().enumerate() {
+        assert_eq!(
+            *count,
+            u64::from(index == custody) * 2,
+            "no refusal but Custody appears, got {counts:?}"
+        );
+    }
+    let instances = instance_summary(&scene);
+    assert_eq!(
+        instances.len(),
+        1,
+        "the change mints nothing, got {instances:?}"
+    );
+    assert_eq!(
+        (instances[0].2.as_str(), instances[0].3.as_str()),
+        (InstanceLifecycle::Observed.label(), "-"),
+        "the pre-change instance stays observed, got {instances:?}"
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        2,
+        "only the pre-change burst attributes, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some(2),
+        "the surviving instance keeps exactly its own burst, got {rows:?}"
+    );
+}
+
+#[test]
+fn unchanged_provider_file_joins_across_a_global_advance() {
+    // The healthy twin: the same global advance with an unchanged
+    // watched file observes (Continued) and joins. No scan refuses.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        scene.h0.0.borrow().io.watched[0].check_unchanged(),
+        Ok(true),
+        "the untouched watched file reports unchanged"
+    );
+    let (base, local, global) = scene.h0.0.borrow().io.scan_input(0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .scan_inputs
+        .insert(0, (base, local, global + 1));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    discovery_pass(&mut scene);
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    let shed = scene.lane.shed_calls_disclosed();
+    assert_eq!((joined, shed), (4, 0), "both bursts join, nothing sheds");
+    assert_eq!(
+        scene.lane.scan_refusal_counts(),
+        [0; 12],
+        "an unchanged file refuses no scan"
+    );
+    assert!(
+        unrouted_reasons(&scene).is_empty(),
+        "nothing sheds on the joined path: {:?}",
+        unrouted_reasons(&scene)
+    );
+    assert_eq!(
+        instance_summary(&scene).len(),
+        1,
+        "the advance continues the one instance, got {:?}",
+        instance_summary(&scene)
+    );
+    let rows = semantic_rows(&scene);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, returns, _, _)| returns.unwrap_or(0))
+            .sum::<u64>(),
+        4,
+        "both bursts attribute to the one instance, got {rows:?}"
     );
 }

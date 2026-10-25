@@ -10706,6 +10706,205 @@ mod tests {
         assert!(!detached && matches!(job, OwnedProducerDetach::Unproved));
     }
 
+    /// A gated detach job over `singles` single links with a scripted
+    /// worker clock: polls stay Pending until one release per link.
+    fn gated_detach_job(
+        singles: usize,
+    ) -> (
+        OwnedProducerDetach,
+        Arc<std::sync::Mutex<std::time::Duration>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let now = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+        let worker_now = Arc::clone(&now);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                released
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("one release per link");
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(move || *worker_now.lock().unwrap()),
+        );
+        worker.submit(
+            (0..singles)
+                .map(|_| (OwnedLink::TestSingle, ProducerProgram::UProbe("p11_entry")))
+                .collect(),
+            Arc::default(),
+            DetachOrder,
+        );
+        let job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        (job, now, release)
+    }
+
+    #[test]
+    fn owned_detach_poll_writes_stop_estimate_once_and_progress_on_cadence() {
+        let (mut job, now, release) = gated_detach_job(40);
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall_ms = 0;
+        let mut out = Vec::new();
+        // The first pending poll prints only the one-shot estimate.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("progress lines are UTF-8"),
+            "p11scope: closing 40 probe links one at a time (no batched uprobe detach on this kernel); about 2 s, progress follows\n",
+            "the first pending poll prints only the one-shot estimate"
+        );
+        // Half a second in: still no progress line.
+        *now.lock().unwrap() = std::time::Duration::from_millis(500);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            !text.contains("cleanup "),
+            "no progress before the 1 s cadence: {text:?}"
+        );
+        // Past one second: the progress line follows, the estimate
+        // stays one-shot.
+        *now.lock().unwrap() = std::time::Duration::from_secs(2);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            text.contains("p11scope: cleanup 0/40 links released, 2 s\n"),
+            "progress follows on cadence: {text:?}"
+        );
+        assert_eq!(
+            text.matches("probe links one at a time").count(),
+            1,
+            "the estimate stays one-shot"
+        );
+        // Same second: no duplicate progress.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert_eq!(
+            text.matches("cleanup ").count(),
+            1,
+            "no duplicate within the cadence"
+        );
+        // Release every link and drain to completion (bounded).
+        for _ in 0..40 {
+            release.send(()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert_eq!(
+            text.matches("probe links one at a time").count(),
+            1,
+            "one estimate per stop"
+        );
+        assert_eq!(
+            text.matches("cleanup ").count(),
+            1,
+            "the drain prints no further progress at the same clock"
+        );
+    }
+
+    #[test]
+    fn owned_detach_poll_writes_no_estimate_below_two_second_floor() {
+        let (mut job, now, release) = gated_detach_job(1);
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall_ms = 0;
+        let mut out = Vec::new();
+        // Below the floor and the cadence: silent.
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(text.is_empty(), "a quick stop stays silent: {text:?}");
+        // Past one second: progress follows, still no estimate.
+        *now.lock().unwrap() = std::time::Duration::from_secs(2);
+        let progress = job
+            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .unwrap();
+        assert!(
+            matches!(progress, ProducerDetachProgress::Pending),
+            "a gated close stays pending"
+        );
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            text.contains("p11scope: cleanup 0/1 links released, 2 s\n"),
+            "progress follows on cadence: {text:?}"
+        );
+        assert!(
+            !text.contains("probe links one at a time"),
+            "no estimate below the 2 s floor: {text:?}"
+        );
+        // Release the link and drain to completion (bounded).
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            !text.contains("probe links one at a time"),
+            "no estimate below the 2 s floor: {text:?}"
+        );
+    }
+
     #[test]
     fn owner_terminal_interrupted_job_cannot_turn_empty_into_success() {
         let (release, released) = std::sync::mpsc::channel();

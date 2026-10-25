@@ -1823,19 +1823,6 @@ struct WindingLane {
     /// gone, so reaping again would fail closed — and retry the
     /// completion/retire tail with the retained proof.
     joined: bool,
-    /// ProviderStorage commit refusals retried so far (item 7).
-    commit_retries: u16,
-}
-
-impl WindingLane {
-    /// Item 7's commit-refusal handler: `ProviderStorage` retries
-    /// through 100 hooks, anything else (or the 101st) fails. True
-    /// stays `NotBegun`; false notes the failure and takes the
-    /// finite stop.
-    #[cfg_attr(not(test), allow(dead_code))] // Production retries through the shared NotBegun step; tests pin the per-lane discipline here.
-    fn note_commit_refusal(&mut self, reason: crate::inventory_semantics::SemanticRefusal) -> bool {
-        note_commit_refusal_once(&mut self.commit_retries, reason)
-    }
 }
 
 /// A wound-down domain whose coordinator namespace still retires. The
@@ -1872,7 +1859,6 @@ impl RetiringDomain {
                 finish: JointFinishDriver::NotBegun,
                 joint,
                 joined: false,
-                commit_retries: 0,
             }),
         }
     }
@@ -3109,14 +3095,10 @@ impl ClassicDriver<'_> {
         {
             self.joint_step_calls += 1;
         }
-        if self.retiring.as_ref().is_some_and(|retiring| {
-            retiring
-                .winding
-                .as_ref()
-                .is_some_and(|winding| matches!(winding.finish, JointFinishDriver::NotBegun))
-        }) {
-            return self.step_not_begun_winding();
-        }
+        // No NotBegun arm: the wind-down always begins or transfers
+        // (§8.3), so a production winding is never NotBegun here; a
+        // directly posed one stays through the begun step below. Item
+        // 7's commit polls run on the retained final lane.
         let joined = self
             .retiring
             .as_ref()
@@ -3316,35 +3298,6 @@ impl ClassicDriver<'_> {
                 NotBegunStep::Stepped
             }
         }
-    }
-
-    fn step_not_begun_winding(&mut self) -> bool {
-        let retiring = self.retiring.as_mut().expect("a winding lane retires");
-        let winding = retiring.winding.as_mut().expect("a winding lane retires");
-        let stepped = Self::step_not_begun_joint_finish(
-            &mut winding.lane,
-            &mut winding.finish,
-            &mut *self.coordinator,
-            &mut self.joint_first_error,
-            &mut winding.commit_retries,
-        );
-        match stepped {
-            NotBegunStep::Began => {
-                #[cfg(test)]
-                {
-                    self.joint_commit_polls += 1;
-                    self.joint_begin_calls += 1;
-                }
-            }
-            NotBegunStep::Stepped => {
-                #[cfg(test)]
-                {
-                    self.joint_commit_polls += 1;
-                }
-            }
-            NotBegunStep::Idle => {}
-        }
-        false
     }
 
     /// One retained §8.3 step for the final Joint lane (§6.1, §6.3),

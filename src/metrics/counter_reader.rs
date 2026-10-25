@@ -568,6 +568,12 @@ fn shape(
     Ok(())
 }
 
+/// Selects the stats template for the typed stats view from the read mode
+/// and the aggregate template shape.
+fn stats_view_shape(mode: CounterMode, _stats_shape: CounterMode) -> CounterMode {
+    mode
+}
+
 impl<'a> NativeSource<'a> {
     fn new(lookup: impl Fn(&str) -> Option<&'a Map>, mode: CounterMode) -> Result<Self, ReadStage> {
         // Fixed native artifacts carry a per-mode STATS template.
@@ -667,7 +673,7 @@ impl<'a> NativeSource<'a> {
         Ok(Self {
             mode,
             cpus,
-            stats: match mode {
+            stats: match stats_view_shape(mode, stats_shape) {
                 CounterMode::Counts => NativeStats::Counts(
                     PerCpuArray::try_from(stats)
                         .map_err(|_| ReadStage::Shape(ReaderShapeCause::StatsViewCounts))?,
@@ -893,6 +899,34 @@ mod tests {
             36,
             "every new cause variant must join ALL"
         );
+    }
+
+    #[test]
+    fn banked_stats_view_follows_the_aggregate_template() {
+        // Fixed native artifacts carry a per-mode STATS template, so the
+        // view shape equals the mode there.
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert_eq!(stats_view_shape(mode, mode), mode, "{mode:?}");
+        }
+        // Bank objects carry the legacy 24-byte aggregate template in every
+        // mode; only the bank cells vary. The typed view must follow the
+        // aggregate template, never the cell mode: a timestamps/latency view
+        // over the 24-byte map refuses with a shape error.
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert_eq!(
+                stats_view_shape(mode, CounterMode::Counts),
+                CounterMode::Counts,
+                "{mode:?} banked read over the legacy aggregate"
+            );
+        }
     }
 
     fn key(slot: u32, rv: u64) -> RvKey {
@@ -2213,6 +2247,39 @@ mod tests {
             );
             maps.insert(name, previous);
         }
+        // Banked timing reads share the legacy 24-byte aggregate template
+        // (the fixture above): the typed view must accept it in every mode.
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert!(
+                NativeSource::with_bounds(
+                    |name| maps.get(name),
+                    mode,
+                    CounterMode::Counts,
+                    4096,
+                    16384,
+                    None,
+                )
+                .is_ok(),
+                "{mode:?} banked read over the legacy aggregate"
+            );
+        }
+        // The aggregate shape check follows the template, not the mode.
+        assert_eq!(
+            NativeSource::with_bounds(
+                |name| maps.get(name),
+                CounterMode::Timestamps,
+                CounterMode::Timestamps,
+                4096,
+                16384,
+                None,
+            )
+            .err(),
+            Some(ReadStage::Shape(ReaderShapeCause::StatsShape))
+        );
         for (index, issue) in [
             (0, CounterIssue::ProducerSaturated),
             (1, CounterIssue::Contended),

@@ -3720,6 +3720,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn embedded_bank_objects_match_reader_expectations() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            for mode in [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ] {
+                assert!(
+                    counter_object_for_mode(mode).is_empty(),
+                    "{mode:?} must be omitted when disabled"
+                );
+            }
+            return;
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let embedded = counter_object_for_mode(mode);
+            assert!(!embedded.is_empty(), "{mode:?} embedded object is empty");
+            // The privileged cells read the staged OUT_DIR bytes; they must
+            // equal the bytes the build embeds.
+            let staged = std::fs::read(std::path::Path::new(env!("OUT_DIR")).join(format!(
+                "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
+                mode.name()
+            )))
+            .unwrap();
+            assert_eq!(embedded, &staged[..], "{mode:?} staged bytes differ");
+            let object = aya_obj::Object::parse(embedded).unwrap();
+            let geometry = BankGeometry::checked(mode, 16, 512).unwrap();
+            validate_object_maps(geometry, |name| object.maps.get(name)).unwrap();
+            // The aggregate template stays 24 bytes in every mode; only the
+            // bank cells vary.
+            let stats = object.maps.get("STATS").unwrap();
+            assert_eq!(stats.value_size(), 24, "{mode:?} aggregate template");
+            let expected = match mode {
+                CounterMode::Counts => 0x0200_0018_0010_0200u64,
+                CounterMode::Timestamps => 0x0200_0028_0010_0200u64,
+                CounterMode::Latency => 0x0200_0128_0010_0200u64,
+            };
+            assert_eq!(geometry.configuration, expected, "{mode:?} config word");
+        }
+    }
+
+    #[test]
+    fn embedded_bank_objects_refuse_wrong_reader_expectations() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        let counts = aya_obj::Object::parse(counter_object_for_mode(CounterMode::Counts)).unwrap();
+        let timestamps =
+            aya_obj::Object::parse(counter_object_for_mode(CounterMode::Timestamps)).unwrap();
+        // Cross-mode geometry: the inner template width names the mismatch.
+        assert_eq!(
+            validate_object_maps(
+                BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
+                |name| timestamps.maps.get(name),
+            ),
+            Err(BankRefusal::Shape(BankShapeCause::InnerTemplateShape)),
+            "counts geometry over timestamps bytes"
+        );
+        assert_eq!(
+            validate_object_maps(
+                BankGeometry::checked(CounterMode::Latency, 16, 512).unwrap(),
+                |name| counts.maps.get(name),
+            ),
+            Err(BankRefusal::Shape(BankShapeCause::InnerTemplateShape)),
+            "latency geometry over counts bytes"
+        );
+        // A timestamps-wide aggregate cannot relabel the bank template.
+        let mut tampered = timestamps.maps.clone();
+        let aya_obj::Map::Legacy(stats) = tampered.get_mut("STATS").unwrap() else {
+            unreachable!();
+        };
+        stats.def.value_size = 40;
+        assert_eq!(
+            validate_object_maps(
+                BankGeometry::checked(CounterMode::Timestamps, 16, 512).unwrap(),
+                |name| tampered.get(name),
+            ),
+            Err(BankRefusal::Shape(BankShapeCause::StatsShape)),
+            "timestamps geometry over a relabeled aggregate"
+        );
+    }
+
+    #[test]
     fn scaled_counts_geometry_and_record_layouts_are_checked() {
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<CountsBankRoute>(), 32);

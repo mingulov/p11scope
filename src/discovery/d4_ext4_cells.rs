@@ -5,10 +5,13 @@
 //! in a new holder, and refuses the stale sweep on both backends; the
 //! equal-bytes twin proves identical content still refuses. A separate
 //! deleted-mapping row pins the live ` (deleted)` refusal (temp+rename
-//! takes a fresh number, so that row is not inode reuse). ext4 keys are
-//! identity keys (no per-range proof), so every kernel leg classifies
-//! "no kernel proof (identity key)" with zero target runs — never kernel
-//! parity. Each privileged row also records its BRSV (stat-vs-map_files
+//! takes a fresh number, so that row is not inode reuse). Most ext4 rows
+//! are identity-keyed (no per-range proof) and classify "no kernel proof
+//! (identity key)"; the deleted-mapping row binds the replacement under
+//! the stale key, so its key stays per-range and the leg classifies "no
+//! kernel proof (unusable line)" — the unusable line refuses before any
+//! proof runs. Every leg runs zero targets — never kernel parity. Each
+//! privileged row also records its BRSV (stat-vs-map_files
 //! pair) and fails closed when the rendering changes; the 5.15 shutdown
 //! leg is included.
 
@@ -363,9 +366,10 @@ fn ext4_index(
 }
 
 /// What the kernel leg observably did: the fallback ledger, the
-/// userspace reads it performed, and the index preconditions. ext4
-/// keys are identity keys, so every leg carries the no-proof
-/// classification with no per-range key. (Installed anchor slots are
+/// userspace reads it performed, and the index preconditions. Identity
+/// rows carry the no-proof classification with no per-range key; the
+/// stale-key row carries its unusable-line classification with the key in
+/// the prove set (refused before proof). (Installed anchor slots are
 /// asserted on the index directly by the drivers: anchors install for
 /// arena-mapped files on any filesystem.)
 struct Ext4LegEvidence {
@@ -396,8 +400,7 @@ enum Ext4Expect {
 /// refuses first). The stale-key driver asserts this; the ordinary
 /// precondition test pins it per row shape without root.
 fn ext4_row_takes_per_range_proof(expected: Ext4Expect) -> bool {
-    let _ = expected;
-    false
+    matches!(expected, Ext4Expect::DeletedMappingStaleKey)
 }
 
 fn ext4_edge(pid: u32, key: ObjectKey, out: &SweepAttribution, side: &str) -> Result<(), String> {
@@ -474,7 +477,7 @@ fn ext4_no_candidate(out: &SweepAttribution, side: &str) -> Result<(), String> {
 /// Assert one ext4 row: the maps-key premise from both sides'
 /// recorded lines first (a violated premise fails the row, never
 /// passes by luck), then the statfs-magic and BRSV premises, then the
-/// per-backend outcomes, then the kernel-leg evidence — always the
+/// per-backend outcomes, then the kernel-leg evidence — always a
 /// no-proof classification, never kernel parity.
 #[allow(clippy::too_many_arguments)]
 fn assert_ext4_outcome(
@@ -496,6 +499,19 @@ fn assert_ext4_outcome(
         // the installed slots directly.
         if evidence.per_range_key {
             return Err("ext4 kernel: an identity key takes no per-range proof".into());
+        }
+        Ok(())
+    }
+    fn classified_stale(evidence: &Ext4LegEvidence) -> Result<(), String> {
+        if evidence.no_proof_classification != Some("no kernel proof (unusable line)") {
+            return Err("ext4 kernel: the stale-key leg needs its no-proof classification".into());
+        }
+        // The stale key names the deleted file while the pinned object is
+        // its replacement, so the key stays a per-range key: the
+        // unusable-line early return refuses before any proof runs (zero
+        // fallback, zero reads), never because the key is identity.
+        if !evidence.per_range_key {
+            return Err("ext4 kernel: a stale key stays a per-range key".into());
         }
         Ok(())
     }
@@ -557,6 +573,9 @@ fn assert_ext4_outcome(
             zero_run(evidence)?;
             Ok(())
         }
+        // Legacy: keeps the uniform identity assumption it was pinned
+        // with; no privileged row uses it (the deleted-mapping row
+        // expects DeletedMappingStaleKey). Cleanup needs a ruling.
         Ext4Expect::DeletedMappingRefused => {
             if !target.maps_line.contains("(deleted)") {
                 return Err("ext4 deleted-mapping premise needs the (deleted) line".into());
@@ -589,7 +608,7 @@ fn assert_ext4_outcome(
             assert_brsv_live(anchor)?;
             ext4_deleted(userspace, "userspace")?;
             ext4_deleted(kernel, "kernel")?;
-            classified(evidence)?;
+            classified_stale(evidence)?;
             zero_run(evidence)?;
             Ok(())
         }
@@ -746,6 +765,96 @@ fn d4_ext4_kernel_no_run_identity_for_pid(
         userspace_reads: reads,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
+    };
+    (out, evidence)
+}
+
+/// Kernel leg for a row whose key is stale: the deleted file's number
+/// bound to its replacement object, so the key stays a per-range key even
+/// though the unusable-line early return refuses before any proof runs —
+/// zero fallback and zero reads, with the named refusal as the outcome, so
+/// a vacuous kernel leg cannot pass.
+#[allow(clippy::too_many_arguments)]
+fn d4_ext4_kernel_no_run_stale_key_for_pid(
+    pid: u32,
+    snapshot: Vec<MapEntry>,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: crate::discovery::identity::PinnedObjectId,
+    key: ObjectKey,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+    expected: Ext4Expect,
+) -> (SweepAttribution, Ext4LegEvidence) {
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelMemberProbe};
+    use std::sync::{Arc, Mutex};
+    assert!(
+        ext4_row_takes_per_range_proof(expected),
+        "ext4 {expected:?} is not a stale-key row"
+    );
+    let mut index = ext4_index(key, object, pins);
+    assert!(
+        index.map_files_keys().contains(&key),
+        "ext4 stale key stays a per-range key: the pinned object is its replacement"
+    );
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+    custody
+        .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+        .expect("shared physical reservation owner");
+    let pass = AnchorPass::prepare(pins, [(key, object)], custody);
+    assert!(pass.fallback.is_empty(), "{:?}", pass.fallback);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, generation, deadline)
+        .expect("install actual held-file anchors");
+    let trace = Arc::new(Mutex::new(ProofTrace::default()));
+    let out = {
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            OsConfirmIo::with_pool(None).observing(trace.clone()),
+            deadline,
+        );
+        probe
+            .install_expectations(&mut index)
+            .expect("actual validated anchor expectations");
+        assert!(
+            index
+                .match_slots
+                .get(&key)
+                .is_some_and(|slots| !slots.is_empty()),
+            "anchors install for the arena-mapped file on any filesystem"
+        );
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.has_collection_work(),
+            "exercise actual kernel proof, not scoped fallback"
+        );
+        attribute_unselected(
+            &[(pid, snapshot)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut probe,
+            &mut budget,
+        )
+    };
+    assert!(out.members.is_empty(), "no candidate confirms: {out:?}");
+    drop(installed);
+    let fallback = session.fallback_totals();
+    assert_eq!(fallback.passes, 0, "no-run leg falls back nowhere");
+    assert_eq!(fallback.pids, 0, "no-run leg falls back nowhere");
+    assert_eq!(fallback.keys, 0, "no-run leg falls back nowhere");
+    assert_eq!(fallback.first_reason, None, "no-run leg falls back nowhere");
+    let reads = trace.lock().unwrap().reads.len();
+    assert_eq!(reads, 0, "no-run leg reads nothing");
+    let evidence = Ext4LegEvidence {
+        fallback,
+        userspace_reads: reads,
+        per_range_key: true,
+        no_proof_classification: Some("no kernel proof (unusable line)"),
     };
     (out, evidence)
 }
@@ -1555,9 +1664,11 @@ fn synthetic_no_run_stale_evidence() -> Ext4LegEvidence {
 /// live recycled key — and both legs refuse it while a live holder
 /// still edges. The deleted-mapping row pins the live ` (deleted)`
 /// refusal separately (temp+rename takes a fresh number). Every kernel
-/// leg classifies "no kernel proof (identity key)" with zero target
-/// runs (never kernel parity); every row records its BRSV and fails
-/// closed when the rendering changes. On pre-6 kernels the BPF denial
+/// leg classifies its no-proof evidence with zero target runs (never
+/// kernel parity): identity rows "no kernel proof (identity key)", the
+/// deleted-mapping row "no kernel proof (unusable line)"; every row
+/// records its BRSV and fails closed when the rendering changes. On
+/// pre-6 kernels the BPF denial
 /// is asserted (shutdown included) with userspace-only legs plus BRSVs.
 #[test]
 #[ignore = "root: loop ext4 mounts plus eligible BTF/task_vma identity (5.15 shutdown included)"]
@@ -1729,7 +1840,9 @@ impl Ext4Rows<'_> {
     /// Deleted mapping (not inode reuse): the live holder keeps a
     /// ` (deleted)` line under the old number while temp+rename takes a
     /// fresh one, and both legs refuse the unusable line with the named
-    /// loss. The kernel leg proves nothing (identity key, zero runs).
+    /// loss. The stale key stays per-range (the pinned object is the
+    /// replacement), but the kernel leg still proves nothing: the
+    /// unusable line refuses before proof (zero runs).
     fn row_deleted_mapping(&mut self, work: &std::path::Path) -> Result<(), String> {
         eprintln!("D4_EXT4 start row=deleted-mapping");
         let _ = work;
@@ -1765,7 +1878,7 @@ impl Ext4Rows<'_> {
         ext4_deleted(&userspace, "userspace")?;
         if let Some(session) = self.session.as_deref_mut() {
             self.generation += 1;
-            let (kernel, evidence) = d4_ext4_kernel_no_run_identity_for_pid(
+            let (kernel, evidence) = d4_ext4_kernel_no_run_stale_key_for_pid(
                 pid,
                 target.maps(),
                 &pins,
@@ -1773,6 +1886,7 @@ impl Ext4Rows<'_> {
                 key,
                 session,
                 self.generation,
+                Ext4Expect::DeletedMappingStaleKey,
             );
             assert_ext4_outcome(
                 pid,
@@ -1781,7 +1895,7 @@ impl Ext4Rows<'_> {
                 &userspace,
                 &kernel,
                 &evidence,
-                Ext4Expect::DeletedMappingRefused,
+                Ext4Expect::DeletedMappingStaleKey,
             )?;
         }
         eprintln!(

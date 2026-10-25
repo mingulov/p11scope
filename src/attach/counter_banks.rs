@@ -8090,7 +8090,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires the explicitly selected format2 artifact; parses only, no native load"]
     fn format2_preparation_rejects_mixed_profiles_before_lifecycle() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(

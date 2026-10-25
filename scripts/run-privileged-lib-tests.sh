@@ -359,8 +359,6 @@ semantics_edge::resource_tests::native_semantic_resource_probe
 discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity
-attach::counter_banks::tests::format2_preparation_rejects_mixed_profiles_before_lifecycle
-attach::counter_banks::tests::format2_preparation_charges_custody_and_payload_together
 metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64
 metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
 discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity
@@ -417,8 +415,6 @@ SKIP_REASONS=(
 "known-failing repro (doc Known limit 2026-10-19: lane-A runtime does not converge, the rotation stalls); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "known-failing repro (doc Known limit: same lane-A view-capacity stall, post-settle refusal asserts unreachable until the runtime fix); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; actual before-unlink positive and deleted-mapping negative; no compiler/provider fixture; run exact ignored test in an authorized BPF lane"
-"pure constructor test needs the default build with the embedded V2 artifact; no native syscall or root needed; run exact --ignored from that libtest"
-"pure constructor accounting test needs the default build with the embedded V2 artifact; no native syscall or root needed; run exact --ignored from that libtest"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 513-endpoint native admission after resource preflight"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
 "needs root Btrfs disk TMPDIR and eligible task_vma/BTF for required actual hardlink alias kernel/userspace parity; run exact selector with --ignored --test-threads=1 on a matching prebuilt binary"

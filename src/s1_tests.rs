@@ -3265,11 +3265,7 @@ fn instance_s1_does_not_change_physical_totals() {
     // summary, which claimed children withhold by design (the F1 ruling).
     let before_edges = before.as_array().expect("edges array");
     let after_edges = after.as_array().expect("edges array");
-    assert_eq!(
-        before_edges.len(),
-        after_edges.len(),
-        "claims add no edges"
-    );
+    assert_eq!(before_edges.len(), after_edges.len(), "claims add no edges");
     for (position, (lhs, rhs)) in before_edges.iter().zip(after_edges.iter()).enumerate() {
         let lhs_object = lhs.as_object().expect("edge object");
         let rhs_object = rhs.as_object().expect("edge object");

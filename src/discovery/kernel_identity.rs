@@ -525,7 +525,7 @@ impl KernelFallbackReason {
             Self::TargetUnavailable => "target_unavailable",
             Self::Unvisited => "unvisited",
             Self::ConflictingDuplicate => "conflicting_duplicate",
-            Self::ZombieBatch => "zombie-batch",
+            Self::ZombieBatch => "zombie_batch",
         }
     }
 

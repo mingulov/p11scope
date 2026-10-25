@@ -626,6 +626,67 @@ latch:
     marker_latch(ctl);
     return 0;
 }
+
+/* H8-D scope gap (Detailed only): a watched call refused for scope or
+ * ABI dirties the leader's marker, so a later exec cannot claim the
+ * uncaptured prefix as born. Reads no argument, user memory, path,
+ * name, or exec ID. Returns 1 when the row is DIRTY at return
+ * (marked, or already), 0 when gated, latched, or failed. Gap
+ * failures latch and fault; later gaps no-op on the latch without
+ * faulting again. */
+__attribute__((noinline)) u32 p11_instance_scope_gap(void)
+{
+    struct task_struct___p11inst *current = inst_current_task();
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+    struct journal_admission_control *ctl;
+    u32 key = INST_GEN_ATTACH;
+    u32 ctl_key = 0;
+    u64 *attach;
+    u64 gen;
+    u64 word;
+
+    attach = inst_map_lookup(&INSTANCE_GEN, &key);
+    if (!attach)
+        return 0;
+    gen = *(volatile u64 *)attach;
+    if (!gen)
+        return 0;
+    ctl = inst_map_lookup(&JOURNAL_MARKER_CTL, &ctl_key);
+    if (!ctl)
+        return 0;
+    if (*(volatile u64 *)&ctl->failed != 0)
+        return 0;
+    if (!current)
+        goto latch_fault;
+    leader = current->group_leader;
+    if (!leader)
+        goto latch_fault;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (rec) {
+        word = *(volatile u64 *)&rec->journal_bootstrap;
+        if (word == P11_JOURNAL_MARKER_DIRTY)
+            return 1;
+        if (word == P11_JOURNAL_MARKER_UNPUBLISHED && !p11_journal_marker_reserve(ctl)) {
+            /* The latch is set; the gap below still marks. */
+        }
+        p11_journal_marker_dirty(rec);
+        return 1;
+    }
+    if (!p11_journal_marker_reserve(ctl)) {
+        inst_fault(inst_counters());
+        return 0;
+    }
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 1);
+    if (!rec)
+        goto latch_fault;
+    p11_journal_marker_dirty(rec);
+    return 1;
+latch_fault:
+    marker_latch(ctl);
+    inst_fault(inst_counters());
+    return 0;
+}
 #endif
 
 /* The continuity stamp for the caller of endpoint `endpoint_slot`; reads

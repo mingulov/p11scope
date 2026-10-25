@@ -13404,6 +13404,15 @@ mod promotion_driver_tests {
             driver.lifecycle.is_idle(),
             "the finite stop never triggered"
         );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .finish_poll_calls_for_test(),
+            0,
+            "5a: no hook polled the finish past Published"
+        );
         release_gate(&gate);
         driver.on_tick();
         assert!(
@@ -13458,6 +13467,73 @@ mod promotion_driver_tests {
                 gaps(&mut driver)
             );
         }
+    }
+
+    #[test]
+    fn joint_begin_ok_reaches_polling_without_latch() {
+        // The begin-Ok arm runs unprivileged through the scripted
+        // begin: a begun finish polls, latches nothing and keeps
+        // its lane. A begin that never reaches Polling fails here.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(driver.joint_begin_calls, 1, "the finish begins once");
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "begin Ok reaches Polling"
+        );
+        assert!(driver.semantic.is_some(), "the begun lane is kept");
+        assert!(
+            !driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .joint_finish_disposition_required(),
+            "begin Ok latches nothing"
+        );
+    }
+
+    #[test]
+    fn joint_poll_published_reaches_published_and_counts_once() {
+        // The Polling-to-Published arm runs unprivileged through the
+        // scripted poll: one poll publishes, and the lane counts
+        // exactly that call. A poll that never publishes fails here.
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Published(
+            BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            },
+        ))));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.on_tick();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "poll Published reaches Published"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .finish_poll_calls_for_test(),
+            1,
+            "the poll ran once through the lane"
+        );
     }
 
     #[test]
@@ -14022,8 +14098,7 @@ mod promotion_driver_tests {
                 gaps(&mut driver)
             );
             assert_eq!(
-                holds[0].1,
-                "stop during a Joint promotion finish; the lane is held for exit",
+                holds[0].1, "stop during a Joint promotion finish; the lane is held for exit",
                 "the gap names the unjoined Joint winding"
             );
             // The driver drops here with the winding still held.

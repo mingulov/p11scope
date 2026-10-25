@@ -783,6 +783,25 @@ pub(crate) struct AttestedSemanticLane {
     /// `has_joint_frame` (mirrors `test_finished`).
     #[cfg(test)]
     test_joint_frame: bool,
+    /// Tests-only scripted Finish begin outcome: when set, the begin
+    /// answers it without a live machine, so the driver's begin-Ok
+    /// arm runs unprivileged. Sticky; tests clear it explicitly.
+    #[cfg(test)]
+    scripted_finish_begin: Option<Result<(), SemanticRefusal>>,
+    /// Tests-only scripted Finish poll outcome: when set, each poll
+    /// answers it without a live machine. Pending stays sticky
+    /// across ticks; a Published answer moves the driver on.
+    #[cfg(test)]
+    scripted_finish_poll: Option<
+        Result<
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress,
+            SemanticRefusal,
+        >,
+    >,
+    /// Tests-only count of `poll_joint_finish` calls: contract 5a
+    /// pins zero polls past Published.
+    #[cfg(test)]
+    finish_poll_calls: usize,
     #[cfg(test)]
     recorded_gaps: Vec<PhysicalSemanticGap>,
     #[cfg(test)]
@@ -1209,6 +1228,9 @@ impl AttestedSemanticLane {
             test_finished: false,
             #[cfg(test)]
             test_joint_frame: false,
+            scripted_finish_begin: None,
+            scripted_finish_poll: None,
+            finish_poll_calls: 0,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1330,6 +1352,9 @@ impl AttestedSemanticLane {
             test_finished: false,
             #[cfg(test)]
             test_joint_frame: false,
+            scripted_finish_begin: None,
+            scripted_finish_poll: None,
+            finish_poll_calls: 0,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1628,6 +1653,38 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn set_test_joint_frame(&mut self, on: bool) {
         self.test_joint_frame = on;
+    }
+
+    /// Script the Finish begin outcome (or clear it with `None`):
+    /// the begin-Ok arm runs without a live machine. A scripted
+    /// error latches like a pre-machine refusal on unfinished lanes.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_finish_begin_for_test(
+        &mut self,
+        outcome: Option<Result<(), SemanticRefusal>>,
+    ) {
+        self.scripted_finish_begin = outcome;
+    }
+
+    /// Script the Finish poll outcome (or clear it with `None`):
+    /// each poll answers it without a live machine.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_finish_poll_for_test(
+        &mut self,
+        outcome: Option<
+            Result<
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress,
+                SemanticRefusal,
+            >,
+        >,
+    ) {
+        self.scripted_finish_poll = outcome;
+    }
+
+    /// How many `poll_joint_finish` calls this lane served.
+    #[cfg(test)]
+    pub(crate) fn finish_poll_calls_for_test(&self) -> usize {
+        self.finish_poll_calls
     }
 
     /// Non-consuming wound-down poll for the Joint driver (§8.3):

@@ -2,9 +2,9 @@
 //! Private authority carried from retained Inventory inputs to a Detailed lane.
 
 mod joint;
-pub(crate) mod selected;
 #[cfg(test)]
 mod joint_cells;
+pub(crate) mod selected;
 
 pub(crate) use joint::{
     JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
@@ -21,7 +21,9 @@ pub(crate) use joint::{
 };
 
 use crate::attach::capture::NativeDomainId;
-use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};
+use crate::attach::{
+    AttachedSemanticSet, BackendSelection, ProducerDetachProgress, Scope, Session,
+};
 use crate::discovery::caller_registry::ModuleKey;
 use crate::discovery::caller_registry::{OsProcessSource, now_ns};
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
@@ -485,6 +487,16 @@ pub(crate) trait LaneTestIo {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Substitute owned-detach reap beneath the wound-down poll:
+    /// scripted progress for lanes without a live Session. Pending
+    /// keeps every original; only Complete advances to retired-file
+    /// closing. An Unproved detach is an error the owner keeps.
+    fn poll_terminal_detach(
+        &mut self,
+        _out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<ProducerDetachProgress> {
+        Ok(ProducerDetachProgress::Pending)
+    }
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
     /// Substitute Session attachment I/O, retaining the production subset
@@ -621,6 +633,10 @@ pub(crate) struct AttestedSemanticLane {
     /// the lane wrapper, or a driver-noted terminal refusal. The machine
     /// holds its own latch; the lane query reports either.
     joint_finish_failure: Option<SemanticRefusal>,
+    /// Set by the I2 abandon: the lane finished without a published
+    /// Finish and stays retained for process exit. Wound-down and take
+    /// refuse forever; the Session never begins owned detach.
+    exit_retained: bool,
     /// When the lane's latest batch was staged for commit: the driver
     /// stamps it on stage and clears it on publish, bounding the wait
     /// for receipt-free evidence and backing off failed commits.
@@ -641,6 +657,10 @@ pub(crate) struct AttestedSemanticLane {
     inject_pre_machine: bool,
     #[cfg(test)]
     test_finished: bool,
+    /// Tests-only retained-frame answer, checked first by
+    /// `has_joint_frame` (mirrors `test_finished`).
+    #[cfg(test)]
+    test_joint_frame: bool,
     #[cfg(test)]
     recorded_gaps: Vec<PhysicalSemanticGap>,
     #[cfg(test)]
@@ -960,6 +980,7 @@ impl AttestedSemanticLane {
             startup_failed: false,
             collected_finish_requested: false,
             joint_finish_failure: None,
+            exit_retained: false,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
@@ -969,6 +990,8 @@ impl AttestedSemanticLane {
             inject_pre_machine: false,
             #[cfg(test)]
             test_finished: false,
+            #[cfg(test)]
+            test_joint_frame: false,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1059,6 +1082,7 @@ impl AttestedSemanticLane {
             startup_failed: false,
             collected_finish_requested: false,
             joint_finish_failure: None,
+            exit_retained: false,
             staged_at: None,
             #[cfg(test)]
             test_io: None,
@@ -1068,6 +1092,8 @@ impl AttestedSemanticLane {
             inject_pre_machine: false,
             #[cfg(test)]
             test_finished: false,
+            #[cfg(test)]
+            test_joint_frame: false,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
@@ -1296,6 +1322,169 @@ impl AttestedSemanticLane {
             Ok(()) => Ok(Some(live.session)),
             Err(error) => release_terminal_owner(live, Err(error)).map(|()| None),
         }
+    }
+
+    /// Whether this lane owns a Joint machine (§8.3).
+    pub(crate) fn has_joint_machine(&self) -> bool {
+        self.live
+            .as_deref()
+            .is_some_and(|live| live.joint_machine.is_some())
+    }
+
+    /// Whether the lane retains a Joint frame (§8.3): the test seam,
+    /// checked first, or a live machine on an unfinished lane. The
+    /// machine phase itself is joint-module state; until Finish
+    /// publication marks the lane finished, any lane with a machine
+    /// may still hold its frame. Conservative while unfinished, exact
+    /// once published; lanes without a machine read false.
+    pub(crate) fn has_joint_frame(&self) -> bool {
+        #[cfg(test)]
+        if self.test_joint_frame {
+            return true;
+        }
+        self.has_joint_machine() && !self.is_finished()
+    }
+
+    /// Force the retained-frame answer for the retire-gate tests.
+    #[cfg(test)]
+    pub(crate) fn set_test_joint_frame(&mut self, on: bool) {
+        self.test_joint_frame = on;
+    }
+
+    /// Non-consuming wound-down poll for the Joint driver (§8.3):
+    /// requires a finished, non-retained lane; begins owned terminal
+    /// cleanup (idempotent); reaps the owned detach without joining.
+    /// `Pending` keeps the worker and reports false; `Complete`
+    /// closes retired graph files (256 per call) and reports true
+    /// only once the chain drains. An Unproved detach or an
+    /// exit-retained lane refuses; the first error stays owned.
+    pub(crate) fn poll_wound_down(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    ) -> Result<bool, SemanticRefusal> {
+        if self.exit_retained {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if !self.is_finished() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        self.begin_owned_terminal_cleanup()
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        #[cfg(test)]
+        if let Some(io) = self.test_io.as_mut() {
+            let progress = io
+                .poll_terminal_detach(&mut std::io::sink())
+                .map_err(|_| SemanticRefusal::Unavailable)?;
+            return match progress {
+                ProducerDetachProgress::Pending => Ok(false),
+                ProducerDetachProgress::Complete => Ok(coordinator.close_retired_graph_files(256)),
+            };
+        }
+        let Some(live) = self.live.as_mut() else {
+            // No native session: nothing to detach; still drain the
+            // shared retired-file chain the Engine may hold.
+            return Ok(coordinator.close_retired_graph_files(256));
+        };
+        match live
+            .session
+            .poll_owned_producer_detach(&mut std::io::sink())
+        {
+            Ok(ProducerDetachProgress::Pending) => Ok(false),
+            Ok(ProducerDetachProgress::Complete) => Ok(coordinator.close_retired_graph_files(256)),
+            Err(_) => Err(SemanticRefusal::Unavailable),
+        }
+    }
+
+    /// Take the wound-down Session for completion-polled retire
+    /// (§8.3): `Some` only after the owned detach joined, Finish
+    /// published and no Joint frame retained. Memory-only lane state
+    /// drops with the handoff, like the promotion wind-down; anything
+    /// earlier or an exit-retained lane yields `None` or refuses.
+    pub(crate) fn take_joined_session(&mut self) -> Result<Option<Session>, SemanticRefusal> {
+        if self.exit_retained {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if !self.is_finished() || self.has_joint_frame() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.test_io.is_some() {
+            // Substituted lanes never ran a native session.
+            return Ok(None);
+        }
+        let Some(live) = self.live.as_mut() else {
+            return Ok(None);
+        };
+        // A Pending poll keeps the worker; only Complete hands over.
+        match live
+            .session
+            .poll_owned_producer_detach(&mut std::io::sink())
+        {
+            Ok(ProducerDetachProgress::Complete) => {
+                let live = self.live.take().expect("session observed above");
+                Ok(Some(live.session))
+            }
+            Ok(ProducerDetachProgress::Pending) | Err(_) => Ok(None),
+        }
+    }
+
+    /// Finite stop on the lane (I2, §8.4): admitted only on a latched
+    /// Finish disposition. A refused graph also latches that
+    /// disposition first (its finish progress reports failed), so no
+    /// reachable refusal bypasses this gate. Builds the terminal
+    /// batch through the H0 stop — unresolved routes expire into
+    /// terminal negatives — justifies the abandon with `reason`,
+    /// marks the lane finished and exit-retained, and drops nothing:
+    /// later wound-down and take refuse forever and the Session never
+    /// begins owned detach.
+    pub(crate) fn abandon_finish_for_exit(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        reason: &'static str,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        if !self.joint_finish_disposition_required() {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let domain = self.domain;
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            let batch = test.finish(domain);
+            self.finish_for_exit();
+            coordinator.note_scope_gap("joint finish abandoned for exit".into(), reason.into());
+            return Ok(batch);
+        }
+        let batch = match self.live.as_mut() {
+            Some(live) => {
+                let live = &mut **live;
+                let mut io = LiveStopIo {
+                    session: &mut live.session,
+                    capture: &mut live.capture,
+                    pins: Vec::new(),
+                    domain,
+                    stash: None,
+                };
+                io.finish_h0()
+            }
+            None => {
+                SemanticBatch::from_tick_report(domain, TickReport::default(), Vec::new(), now_ns())
+                    .map_err(|_| SemanticRefusal::Unavailable)?
+            }
+        };
+        self.finish_for_exit();
+        coordinator.note_scope_gap("joint finish abandoned for exit".into(), reason.into());
+        Ok(batch)
+    }
+
+    /// Mark the lane finished and exit-retained: nothing else moves.
+    fn finish_for_exit(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.finished = true;
+        }
+        #[cfg(test)]
+        {
+            self.test_finished = true;
+        }
+        self.exit_retained = true;
     }
 
     /// One H0 collect→audit→route quantum over the bound callers' stable
@@ -3477,10 +3666,9 @@ mod joint_terminal_tests {
             match state.detach {
                 DetachScript::Pending => Ok(ProducerDetachProgress::Pending),
                 DetachScript::Complete => Ok(ProducerDetachProgress::Complete),
-                DetachScript::Unproved => anyhow::bail!(
-                    "terminal detach unproved: {}",
-                    state.failures.join("; ")
-                ),
+                DetachScript::Unproved => {
+                    anyhow::bail!("terminal detach unproved: {}", state.failures.join("; "))
+                }
             }
         }
 
@@ -3558,8 +3746,12 @@ mod joint_terminal_tests {
         };
         let plan = crate::plan::AttachPlan::from_slots(vec![slot]);
         let subset = AttestedSubset::scripted(plan, PinnedObjects::empty(), BTreeMap::new());
-        AttestedSemanticLane::start(subset, &Scope::Pid(std::process::id()), BackendSelection::Auto)
-            .expect("one scripted slot forms a shell lane")
+        AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            BackendSelection::Auto,
+        )
+        .expect("one scripted slot forms a shell lane")
     }
 
     fn coordinator_for_test() -> InventoryCoordinator<OsProcessSource> {
@@ -3632,9 +3824,8 @@ mod joint_terminal_tests {
             Err(SemanticRefusal::Unavailable)
         );
         assert_eq!(shared.borrow().detach_polls, 0);
-        // An exit-retained lane refuses even when finished, still
-        // without touching the detach.
-        lane.test_finished = true;
+        // An exit-retained lane refuses before any other gate, still
+        // without touching the detach — even unfinished.
         lane.exit_retained = true;
         assert_eq!(
             lane.poll_wound_down(&mut coordinator),
@@ -3720,34 +3911,34 @@ mod joint_terminal_tests {
         lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
         lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain")
             .expect("disposition-required admits abandon");
-        assert_eq!(
+        assert!(matches!(
             lane.take_joined_session(),
             Err(SemanticRefusal::Unavailable)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             lane.take_joined_session(),
             Err(SemanticRefusal::Unavailable)
-        );
+        ));
     }
 
     #[test]
     fn abandon_when_not_admitted_refuses() {
         let mut coordinator = coordinator_for_test();
         let mut lane = shell_lane_for_test();
-        assert_eq!(
+        assert!(matches!(
             lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain"),
             Err(SemanticRefusal::Unavailable)
-        );
+        ));
         assert!(!lane.is_finished());
         assert!(!lane.exit_retained);
         assert!(coordinator.registry().gaps().is_empty());
         // A refused abandon drops nothing: the substituted I/O stays
         // installed and answers afterwards.
         let (mut lane, shared, dropped) = io_lane_for_test(DetachScript::Pending);
-        assert_eq!(
+        assert!(matches!(
             lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain"),
             Err(SemanticRefusal::Unavailable)
-        );
+        ));
         assert!(!dropped.get());
         assert_eq!(shared.borrow().finish_calls, 0);
         assert_eq!(lane.stash_pending_floor(), Some(STUB_STASH_FLOOR));
@@ -3768,6 +3959,10 @@ mod joint_terminal_tests {
         assert_eq!(shared.borrow().finish_calls, 1);
         assert_eq!(batch.domain(), domain);
         assert!(batch.is_empty());
+        // Scope gaps stage until publication; commit, then read back.
+        coordinator
+            .commit_batch(false)
+            .expect("a fresh coordinator commits");
         let gaps = coordinator.registry().gaps();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].subject, "joint finish abandoned for exit");
@@ -3777,7 +3972,7 @@ mod joint_terminal_tests {
         assert!(!dropped.get());
         assert_eq!(shared.borrow().detach_polls, 0);
         assert_eq!(shared.borrow().begin_calls, 0);
-        assert!(!lane.is_live());
+        assert!(lane.is_live());
         assert_eq!(lane.stash_pending_floor(), Some(STUB_STASH_FLOOR));
         assert!(!dropped.get());
         drop(lane);
@@ -3799,10 +3994,10 @@ mod joint_terminal_tests {
                 lane.poll_wound_down(&mut coordinator),
                 Err(SemanticRefusal::Unavailable)
             );
-            assert_eq!(
+            assert!(matches!(
                 lane.take_joined_session(),
                 Err(SemanticRefusal::Unavailable)
-            );
+            ));
         }
         assert_eq!(
             shared.borrow().detach_polls,

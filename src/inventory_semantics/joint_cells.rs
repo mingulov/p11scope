@@ -54,12 +54,10 @@ pub(crate) enum CellHome {
 
 use CellHome::{Deferred, Driver, Machine, Native, Unconstructible};
 use JointEvent::{
-    Cancel, CaptureError, Deadline, HeldInstall, Promote, ReplaceForeign, RetireOwn, SinkFailure,
-    Sigint2, Stop,
+    Cancel, CaptureError, Deadline, HeldInstall, Promote, ReplaceForeign, RetireOwn, Sigint2,
+    SinkFailure, Stop,
 };
-use JointState::{
-    J0, J1, J10, J11, J12, J13, J14, J15, J16, J2, J3, J4, J5, J6, J7, J8, J9,
-};
+use JointState::{J0, J1, J2, J3, J4, J5, J6, J7, J8, J9, J10, J11, J12, J13, J14, J15, J16};
 
 /// Every constructible cell exactly once: 40 Machine + 27 Native +
 /// 69 Driver + 18 Deferred(R1.5) = 154. The 16 retire_own pairs on
@@ -275,8 +273,7 @@ fn joint_cells_cover_every_pair_once() {
                 .iter()
                 .filter(|(s, e, _)| *s == state && *e == event)
                 .count();
-            let retired_before_completion =
-                matches!(event, RetireOwn) && !matches!(state, J16);
+            let retired_before_completion = matches!(event, RetireOwn) && !matches!(state, J16);
             if retired_before_completion {
                 let home = CellHome::Unconstructible("a completion exists only after Complete");
                 assert_eq!(

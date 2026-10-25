@@ -3,6 +3,8 @@
 
 mod joint;
 pub(crate) mod selected;
+#[cfg(test)]
+mod joint_cells;
 
 pub(crate) use joint::{
     JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
@@ -3403,5 +3405,409 @@ mod terminal_drain_tests {
         assert_eq!(io.finish_calls, 0, "drain phases never stop H0");
         assert!(summary.quiesced);
         assert!(summary.final_drain);
+    }
+}
+
+#[cfg(test)]
+mod joint_terminal_tests {
+    use super::*;
+    use crate::attach::ProducerDetachProgress;
+    use crate::discovery::caller_registry::RegistryLimits;
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+    use p11scope_ebpf_common::SlotSemantics;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    /// Scripted owned-detach progress for lanes without a live Session.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DetachScript {
+        Pending,
+        Complete,
+        Unproved,
+    }
+
+    /// Scripted stash floor proving calls still route to this stub:
+    /// a lane without substituted I/O answers `None`.
+    const STUB_STASH_FLOOR: u64 = 77;
+
+    /// Shared stub state: the lane owns the stub, the test owns this.
+    struct WoundDownState {
+        detach: DetachScript,
+        failures: Vec<String>,
+        detach_polls: usize,
+        begin_calls: usize,
+        finish_calls: usize,
+    }
+
+    /// Drop spy: proves the lane retains (or releases) its substituted I/O.
+    struct DropWatch(Rc<Cell<bool>>);
+
+    impl Drop for DropWatch {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    /// Substituted terminal I/O beneath the wound-down path: scripted
+    /// detach progress with kept failures, an H0 stop batch, and call
+    /// counts. Every other method is inert.
+    struct WoundDownStub {
+        state: Rc<RefCell<WoundDownState>>,
+        _watch: DropWatch,
+    }
+
+    impl LaneTestIo for WoundDownStub {
+        fn stash_pending_floor(&self) -> Option<u64> {
+            Some(STUB_STASH_FLOOR)
+        }
+
+        fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+            self.state.borrow_mut().begin_calls += 1;
+            Ok(())
+        }
+
+        fn poll_terminal_detach(
+            &mut self,
+            _out: &mut dyn std::io::Write,
+        ) -> anyhow::Result<ProducerDetachProgress> {
+            let mut state = self.state.borrow_mut();
+            state.detach_polls += 1;
+            match state.detach {
+                DetachScript::Pending => Ok(ProducerDetachProgress::Pending),
+                DetachScript::Complete => Ok(ProducerDetachProgress::Complete),
+                DetachScript::Unproved => anyhow::bail!(
+                    "terminal detach unproved: {}",
+                    state.failures.join("; ")
+                ),
+            }
+        }
+
+        fn validate_current(
+            &mut self,
+            _receipt: &CurrentPartitionReceipt,
+            _report: &mut TickReport,
+        ) -> Result<(), CurrentReceiptRefusal> {
+            Err(CurrentReceiptRefusal::Stopped)
+        }
+
+        fn tick(&mut self, _domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+            Err(SemanticRefusal::Unavailable)
+        }
+
+        fn refresh(
+            &mut self,
+            _pin: Arc<PidPin>,
+            _slot: u32,
+        ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+            Err(SemanticRefusal::Unavailable)
+        }
+
+        fn has_pending_evidence(&self) -> bool {
+            false
+        }
+
+        fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
+            self.state.borrow_mut().finish_calls += 1;
+            SemanticBatch::scripted(domain, Vec::new(), 0)
+        }
+
+        fn quiescent(&mut self) -> bool {
+            true
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            None
+        }
+
+        fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome {
+                records: 0,
+                post_q: false,
+                backlog: false,
+                failed: false,
+            }
+        }
+
+        fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome {
+                records: 0,
+                post_q: false,
+                backlog: false,
+                failed: false,
+            }
+        }
+    }
+
+    /// One scripted slot forms a shell lane: no Session, maps or cursor.
+    fn shell_lane_for_test() -> AttestedSemanticLane {
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: 0,
+            object: PinnedObjectId(7),
+            object_path: "joint-terminal-test".into(),
+            file_offset: 0x1000,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: Vec::new(),
+        };
+        let plan = crate::plan::AttachPlan::from_slots(vec![slot]);
+        let subset = AttestedSubset::scripted(plan, PinnedObjects::empty(), BTreeMap::new());
+        AttestedSemanticLane::start(subset, &Scope::Pid(std::process::id()), BackendSelection::Auto)
+            .expect("one scripted slot forms a shell lane")
+    }
+
+    fn coordinator_for_test() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .expect("a test coordinator builds")
+    }
+
+    fn io_lane_for_test(
+        detach: DetachScript,
+    ) -> (
+        AttestedSemanticLane,
+        Rc<RefCell<WoundDownState>>,
+        Rc<Cell<bool>>,
+    ) {
+        let mut lane = shell_lane_for_test();
+        let state = Rc::new(RefCell::new(WoundDownState {
+            detach,
+            failures: Vec::new(),
+            detach_polls: 0,
+            begin_calls: 0,
+            finish_calls: 0,
+        }));
+        let dropped = Rc::new(Cell::new(false));
+        lane.install_test_io(Box::new(WoundDownStub {
+            state: Rc::clone(&state),
+            _watch: DropWatch(Rc::clone(&dropped)),
+        }));
+        (lane, state, dropped)
+    }
+
+    #[test]
+    fn joint_lane_without_machine_has_no_machine_or_frame() {
+        let lane = shell_lane_for_test();
+        assert!(!lane.has_joint_machine());
+        assert!(!lane.has_joint_frame());
+    }
+
+    #[test]
+    fn joint_lane_test_frame_seam_reports_first() {
+        let mut lane = shell_lane_for_test();
+        assert!(!lane.has_joint_frame());
+        lane.set_test_joint_frame(true);
+        assert!(lane.has_joint_frame());
+        // The seam wins even over a finished lane: it is checked first.
+        lane.test_finished = true;
+        assert!(lane.has_joint_frame());
+        lane.set_test_joint_frame(false);
+        assert!(!lane.has_joint_frame());
+    }
+
+    #[test]
+    fn wound_down_before_finished_refuses() {
+        let mut coordinator = coordinator_for_test();
+        let mut lane = shell_lane_for_test();
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator),
+            Err(SemanticRefusal::Unavailable)
+        );
+        // Substituted I/O does not waive the gate, and the detach is
+        // never polled before Finish.
+        let (mut lane, shared, _) = io_lane_for_test(DetachScript::Complete);
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(shared.borrow().detach_polls, 0);
+        // An exit-retained lane refuses even when finished, still
+        // without touching the detach.
+        lane.test_finished = true;
+        lane.exit_retained = true;
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(shared.borrow().detach_polls, 0);
+    }
+
+    #[test]
+    fn wound_down_pending_detach_returns_false() {
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, shared, _) = io_lane_for_test(DetachScript::Pending);
+        lane.test_finished = true;
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(false));
+        assert_eq!(shared.borrow().detach_polls, 1);
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(false));
+        assert_eq!(shared.borrow().detach_polls, 2);
+    }
+
+    #[test]
+    fn wound_down_complete_detach_reports_drained_true() {
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, shared, _) = io_lane_for_test(DetachScript::Complete);
+        lane.test_finished = true;
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        assert_eq!(shared.borrow().detach_polls, 2);
+        // A finished shell lane has nothing to detach; the shared
+        // retired-file chain is already empty.
+        let mut lane = shell_lane_for_test();
+        lane.test_finished = true;
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+    }
+
+    #[test]
+    fn wound_down_unproved_detach_errors_and_keeps_first_failure() {
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, shared, _) = io_lane_for_test(DetachScript::Unproved);
+        lane.test_finished = true;
+        shared.borrow_mut().failures = vec![
+            "joined producer cleanup did not prove complete settlement".into(),
+            "a later poll failure".into(),
+        ];
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(
+            shared.borrow().failures,
+            vec![
+                "joined producer cleanup did not prove complete settlement".to_string(),
+                "a later poll failure".to_string(),
+            ],
+            "the first error is kept, nothing consumed or overwritten"
+        );
+        assert_eq!(
+            lane.poll_wound_down(&mut coordinator),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(shared.borrow().detach_polls, 2);
+    }
+
+    #[test]
+    fn take_before_wound_down_returns_none() {
+        let mut lane = shell_lane_for_test();
+        assert!(lane.take_joined_session().unwrap().is_none());
+        lane.test_finished = true;
+        assert!(lane.take_joined_session().unwrap().is_none());
+        // A retained frame blocks the take even when finished.
+        lane.set_test_joint_frame(true);
+        assert!(lane.take_joined_session().unwrap().is_none());
+        lane.set_test_joint_frame(false);
+        // Substituted lanes never ran a native session.
+        let (mut lane, _, _) = io_lane_for_test(DetachScript::Complete);
+        lane.test_finished = true;
+        assert!(lane.take_joined_session().unwrap().is_none());
+    }
+
+    #[test]
+    fn take_after_abandon_refuses() {
+        let mut coordinator = coordinator_for_test();
+        let mut lane = shell_lane_for_test();
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain")
+            .expect("disposition-required admits abandon");
+        assert_eq!(
+            lane.take_joined_session(),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(
+            lane.take_joined_session(),
+            Err(SemanticRefusal::Unavailable)
+        );
+    }
+
+    #[test]
+    fn abandon_when_not_admitted_refuses() {
+        let mut coordinator = coordinator_for_test();
+        let mut lane = shell_lane_for_test();
+        assert_eq!(
+            lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain"),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert!(!lane.is_finished());
+        assert!(!lane.exit_retained);
+        assert!(coordinator.registry().gaps().is_empty());
+        // A refused abandon drops nothing: the substituted I/O stays
+        // installed and answers afterwards.
+        let (mut lane, shared, dropped) = io_lane_for_test(DetachScript::Pending);
+        assert_eq!(
+            lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain"),
+            Err(SemanticRefusal::Unavailable)
+        );
+        assert!(!dropped.get());
+        assert_eq!(shared.borrow().finish_calls, 0);
+        assert_eq!(lane.stash_pending_floor(), Some(STUB_STASH_FLOOR));
+        assert!(!dropped.get());
+    }
+
+    #[test]
+    fn abandon_on_disposition_builds_terminal_batch_and_retains() {
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, shared, dropped) = io_lane_for_test(DetachScript::Pending);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        let domain = lane.domain();
+        let batch = lane
+            .abandon_finish_for_exit(&mut coordinator, "native ownership uncertain")
+            .expect("disposition-required admits abandon");
+        assert!(lane.is_finished());
+        assert!(lane.exit_retained);
+        assert_eq!(shared.borrow().finish_calls, 1);
+        assert_eq!(batch.domain(), domain);
+        assert!(batch.is_empty());
+        let gaps = coordinator.registry().gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].subject, "joint finish abandoned for exit");
+        assert_eq!(gaps[0].reason, "native ownership uncertain");
+        // Nothing is dropped and no detach begins: the substituted I/O
+        // stays installed, unpolled, and answers afterwards.
+        assert!(!dropped.get());
+        assert_eq!(shared.borrow().detach_polls, 0);
+        assert_eq!(shared.borrow().begin_calls, 0);
+        assert!(!lane.is_live());
+        assert_eq!(lane.stash_pending_floor(), Some(STUB_STASH_FLOOR));
+        assert!(!dropped.get());
+        drop(lane);
+        assert!(
+            dropped.get(),
+            "the drop watch fires: retention was real, not a dead spy"
+        );
+    }
+
+    #[test]
+    fn abandon_then_poll_and_take_refuse_forever() {
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, shared, _) = io_lane_for_test(DetachScript::Complete);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        lane.abandon_finish_for_exit(&mut coordinator, "native ownership uncertain")
+            .expect("disposition-required admits abandon");
+        for _ in 0..2 {
+            assert_eq!(
+                lane.poll_wound_down(&mut coordinator),
+                Err(SemanticRefusal::Unavailable)
+            );
+            assert_eq!(
+                lane.take_joined_session(),
+                Err(SemanticRefusal::Unavailable)
+            );
+        }
+        assert_eq!(
+            shared.borrow().detach_polls,
+            0,
+            "refused polls never touch the detach"
+        );
     }
 }

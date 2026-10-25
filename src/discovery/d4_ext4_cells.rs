@@ -14,8 +14,9 @@
 //! kernel proof (unusable line)" — the unusable line refuses before any
 //! proof runs. Every leg runs zero targets — never kernel parity. Each
 //! privileged row also records its BRSV (stat-vs-map_files
-//! pair) and fails closed when the rendering changes; the 5.15 shutdown
-//! leg is included.
+//! pair) and fails closed when the rendering changes. Where the BTF
+//! gate refuses (5.15 included) the cell fails closed at that check;
+//! no shutdown leg runs there.
 
 use super::*;
 use std::time::{Duration, Instant};
@@ -82,8 +83,9 @@ fn probe_map_files_capability() -> Result<(), String> {
     ))
 }
 
-/// Whether the running kernel predates 6.x (the shutdown leg: a BPF
-/// denial is asserted there instead of qualifying the cell).
+/// Whether the running kernel predates 6.x (the denial path asserts
+/// a probe failure there instead of qualifying the cell; the BTF gate
+/// still refuses first where BTF is ineligible).
 fn ext4_pre_6() -> Result<bool, String> {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map_err(|error| format!("EXT4-PREFLIGHT kernel-release: {error}"))?;
@@ -1136,10 +1138,7 @@ fn ext4_live_copy_evaluator_refuses_despite_identical_bytes() {
         path_stat: stat(13),
         statfs_magic: 0xef53,
     };
-    assert!(
-        target.maps_key() != anchor.maps_key(),
-        "a different inode"
-    );
+    assert!(target.maps_key() != anchor.maps_key(), "a different inode");
     assert_eq!(
         target.map_files.size, anchor.map_files.size,
         "identical bytes, equal size"
@@ -1533,11 +1532,12 @@ fn synthetic_no_run_stale_evidence() -> Ext4LegEvidence {
 /// leg classifies its no-proof evidence with zero target runs (never
 /// kernel parity): identity rows "no kernel proof (identity key)", the
 /// deleted-mapping row "no kernel proof (unusable line)"; every row
-/// records its BRSV and fails closed when the rendering changes. On
-/// pre-6 kernels the BPF denial
-/// is asserted (shutdown included) with userspace-only legs plus BRSVs.
+/// records its BRSV and fails closed when the rendering changes. Where
+/// the BTF gate refuses (5.15 included) the cell fails closed at that
+/// check; the denial path below only runs if BTF passes but the probe
+/// fails, with userspace-only legs plus BRSVs.
 #[test]
-#[ignore = "root: loop ext4 mounts plus eligible BTF/task_vma identity (5.15 shutdown included)"]
+#[ignore = "root: loop ext4 mounts plus eligible BTF/task_vma identity (fails closed without it, including 5.15)"]
 fn privileged_d4_ext4_inode_reuse_confirmation_parity() {
     ext4_preflight().expect("ext4 preconditions hold");
     let pre_6 = ext4_pre_6().expect("kernel release parses");
@@ -1571,8 +1571,8 @@ fn privileged_d4_ext4_inode_reuse_confirmation_parity() {
     eprintln!("D4_EXT4 shutdown={} verdict=table", rows.shutdown,);
 }
 
-/// One ignored run's shared kernel session (None on the 5.15 shutdown
-/// leg), generation counter and shutdown flag.
+/// One ignored run's shared kernel session (None only on the pre-6
+/// denial path), generation counter and shutdown flag.
 struct Ext4Rows<'s> {
     session: Option<&'s mut crate::discovery::kernel_identity::IdentitySession>,
     generation: u64,

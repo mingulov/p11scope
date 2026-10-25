@@ -2766,7 +2766,7 @@ mod tests {
             assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
             assert_eq!(
                 env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-                "counts-bank-growth-v2"
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
             );
             ensure_growth_fd_budget(final_count);
             let provider = PathBuf::from(
@@ -3390,7 +3390,7 @@ mod tests {
         assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let provider = PathBuf::from(
             std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")

@@ -75,12 +75,55 @@ valid_cluster() {
     esac
 }
 
+# Exactly one complete gated JSON ledger with 6xN successes (gated.c prints
+# `READY pid=` once and one `LEDGER {...}` line with complete/attempts/
+# successful), the same rule as the container-cell drivers.
+ledger_check() {
+    python3 -I - "$1" "$2" <<'PY'
+import json, sys
+path, iters = sys.argv[1], int(sys.argv[2])
+ledgers = []
+ready = 0
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        if line.startswith("READY "):
+            ready += 1
+        elif line.startswith("LEDGER "):
+            ledgers.append(json.loads(line[len("LEDGER "):]))
+if ready < 1 or len(ledgers) != 1:
+    raise SystemExit(f"want >=1 READY and 1 LEDGER, got {ready} and {len(ledgers)}")
+ledger = ledgers[0]
+if ledger.get("schema") != "p11scope/public-cli-ledger/v1":
+    raise SystemExit("bad ledger schema")
+if ledger.get("complete") is not True:
+    raise SystemExit("ledger incomplete")
+functions = ledger.get("functions")
+if not isinstance(functions, list) or len(functions) != 6:
+    raise SystemExit("want 6 ledger functions")
+names = set()
+for row in functions:
+    if row.get("attempts") != iters or row.get("successful") != iters:
+        raise SystemExit(f"ledger row is not 6x{iters}: {row}")
+    names.add(row.get("name"))
+if len(names) != 6:
+    raise SystemExit("ledger function names are not distinct")
+PY
+}
+
 ledger_is() {
-    kc -n "$WL_NS" logs "$1" | grep -qx "LEDGER iterations=$2 nonzero_rv=0" || {
-        echo "$1 did not ledger $2 clean iterations" >&2
-        kc -n "$WL_NS" logs "$1" >&2
+    ledger_tmp=$(mktemp "${TMPDIR:-/tmp}/p11scope-kind-ledger-XXXXXX") || return 1
+    kc -n "$WL_NS" logs "$1" > "$ledger_tmp" || {
+        echo "cannot read logs for $1" >&2
+        rm -f "$ledger_tmp"
         return 1
     }
+    ledger_check "$ledger_tmp" "$2" || {
+        echo "$1 did not ledger $2 clean iterations" >&2
+        cat "$ledger_tmp" >&2
+        rm -f "$ledger_tmp"
+        return 1
+    }
+    rm -f "$ledger_tmp"
 }
 
 self_test() {

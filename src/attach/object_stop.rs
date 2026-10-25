@@ -189,20 +189,20 @@ mod tests {
     impl ClassifiedKind {
         fn matches_section(self, section: &aya_obj::ProgramSection) -> bool {
             use aya_obj::ProgramSection as Section;
-            match (self, section) {
-                (Self::TpBtf, Section::BtfTracePoint) => true,
-                (Self::FEntry, Section::FEntry { sleepable: false }) => true,
-                (Self::FExit, Section::FExit { sleepable: false }) => true,
-                (Self::Iter, Section::Iter { sleepable: false }) => true,
-                (
-                    Self::UProbe,
-                    Section::UProbe {
-                        sleepable: false,
-                        multi: false,
-                    },
-                ) => true,
-                _ => false,
-            }
+            matches!(
+                (self, section),
+                (Self::TpBtf, Section::BtfTracePoint)
+                    | (Self::FEntry, Section::FEntry { sleepable: false })
+                    | (Self::FExit, Section::FExit { sleepable: false })
+                    | (Self::Iter, Section::Iter { sleepable: false })
+                    | (
+                        Self::UProbe,
+                        Section::UProbe {
+                            sleepable: false,
+                            multi: false,
+                        }
+                    )
+            )
         }
     }
 
@@ -531,8 +531,8 @@ mod tests {
             if code.is_empty() || code == "{" {
                 continue;
             }
-            if code.starts_with("/*") {
-                if code[2..].find("*/").is_none() {
+            if let Some(rest) = code.strip_prefix("/*") {
+                if rest.find("*/").is_none() {
                     in_block = true;
                 }
                 continue;

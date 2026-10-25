@@ -5813,6 +5813,390 @@ mod tests {
         );
     }
 
+    /// Fixture maps for the mislabelled-table tests: an executable
+    /// provider mapping for valid slots, a file-backed data mapping for
+    /// unrelated tail words, and a readable mapping holding the snapshot.
+    fn mislabelled_fixture_maps() -> Vec<MapEntry> {
+        parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap()
+    }
+
+    /// A table image with `head` valid executable slots followed by `tail`
+    /// file-backed data words under the given version word.
+    fn mislabelled_snapshot(word: u64, head: usize, tail: usize) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + (head + tail) * 8];
+        snapshot[..8].copy_from_slice(&word.to_le_bytes());
+        for slot in 0..head {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 0..tail {
+            let at = 8 + (head + slot) * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn genuine_tables_decode_their_declared_slot_count() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (word, version, slots) in [
+            (0x2802u64, (2u8, 40u8), 68usize),
+            (0x0003, (3, 0), 92),
+            (0x0103, (3, 1), 92),
+            (0x0203, (3, 2), 104),
+        ] {
+            let snapshot = mislabelled_snapshot(word, slots, 0);
+            let table = decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the table")
+            .unwrap_or_else(|| panic!("{version:?} must decode"));
+            assert_eq!(table.version, version);
+            assert_eq!(table.walk, "full");
+            assert_eq!(table.entries.len(), slots, "{version:?}");
+            assert!(table.null_entries.is_empty(), "{version:?}");
+        }
+    }
+
+    /// Fedora's stock SoftHSM labels its 68-slot 2.x table {3,2}. The scan
+    /// accepts the complete 68-slot prefix instead of rejecting the table
+    /// for its unusable 3.x tail.
+    #[test]
+    fn mislabelled_3x_table_with_complete_68_prefix_decodes_as_68() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (word, version, tail) in [
+            (0x0203u64, (3u8, 2u8), 36usize),
+            (0x0003, (3, 0), 24),
+            (0x0103, (3, 1), 24),
+        ] {
+            let snapshot = mislabelled_snapshot(word, 68, tail);
+            let table = decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the table")
+            .unwrap_or_else(|| panic!("{version:?} with a complete 68 prefix must decode"));
+            assert_eq!(table.version, version, "the declared version stays visible");
+            assert_eq!(table.walk, "known_prefix", "{version:?}");
+            assert_eq!(table.entries.len(), 68, "{version:?}");
+            assert!(table.null_entries.is_empty(), "{version:?}");
+            assert!(
+                table.entries.iter().all(|entry| entry.file_offset < 0x2000),
+                "{version:?}: every entry resolves into the executable mapping"
+            );
+        }
+        // The Fedora tail starts with an executable word (the personality
+        // routine) before the unrelated data: the prefix decision waits
+        // for the first unusable slot instead of stopping at slot 68.
+        let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        for slot in 68..71 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the table")
+        .expect("an executable-led tail still decodes the 68 prefix");
+        assert_eq!((table.version, table.walk), ((3, 2), "known_prefix"));
+        assert_eq!(table.entries.len(), 68);
+    }
+
+    #[test]
+    fn mislabelled_3x_table_with_incomplete_68_prefix_is_rejected() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        // 67 of the first 68 slots valid, one data word inside the prefix.
+        for broken in [0usize, 67] {
+            let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+            let at = 8 + broken * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+            assert!(
+                decode_exact_table(
+                    &snapshot,
+                    0x7000,
+                    LinuxLayout::Lp64,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    None,
+                )
+                .expect("budget must admit the attempt")
+                .is_none(),
+                "slot {broken} breaks the 68 prefix"
+            );
+        }
+        // An all-NULL 68 prefix is data, not a table.
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an all-NULL 68 prefix is not a table"
+        );
+        // The full 3.2 extent must be present: 68 valid slots with the
+        // tail cut off stay refused, never a short accept.
+        let snapshot = mislabelled_snapshot(0x0203, 68, 0);
+        assert!(
+            decode_exact_table(
+                &snapshot,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "a truncated 3.2 extent is not a table"
+        );
+    }
+
+    #[test]
+    fn mislabelled_3x_table_sweep_finds_single_68_slot_table() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        let (tables, skipped) = detect_tables(
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "the sweep finds the mislabelled table");
+        assert_eq!(tables[0].version, (3, 2));
+        assert_eq!(tables[0].walk, "known_prefix");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].entries.len(), 68);
+        // The decoded extent is the 68-slot prefix: overlap handling
+        // must not swallow the 36 tail bytes as table.
+        let (_, len) = decode_candidate(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the table")
+        .expect("offset 0 must decode");
+        assert_eq!(len, 8 + 68 * 8);
+    }
+
+    /// A decoded mislabelled table: version {3,2}, walk `known_prefix`,
+    /// 68 entries at the fixture snapshot base.
+    fn short_prefix_table() -> ScannedTable {
+        let device = Device { major: 8, minor: 1 };
+        ScannedTable {
+            version: (3, 2),
+            walk: "known_prefix",
+            entries: (0..68)
+                .map(|_| ScannedEntry {
+                    name: "C_Initialize",
+                    object: ObjectKey { device, inode: 7 },
+                    object_path: "/lib/provider.so".to_string(),
+                    file_offset: 0x500,
+                })
+                .collect(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0x2000),
+            live_return: false,
+            manifest_supported: false,
+        }
+    }
+
+    #[test]
+    fn interface_identity_charges_a_short_prefix_under_its_decoded_count() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let device = Device { major: 8, minor: 1 };
+        let table = short_prefix_table();
+        let identity = interface_identity(&table, "null", &None, 0, &map_index, None)
+            .expect("a file-backed table always has an identity");
+        assert_eq!(
+            identity.table,
+            InterfaceTableKey::File(TableIdentity {
+                device,
+                inode: 7,
+                file_offset: 0x2000,
+                version_word: 0x0203,
+                usable: 68,
+            }),
+            "the repeat key charges what the decode admitted"
+        );
+    }
+
+    #[test]
+    fn retain_tables_ignores_unmapped_tail_words_beyond_the_decoded_prefix() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = short_prefix_table();
+        let mut snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&(0x100u64 + slot as u64).to_le_bytes());
+        }
+        let mut dependencies = ScanDependencies::default();
+        dependencies.retain_tables(
+            std::slice::from_ref(&table),
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(
+            !dependencies.invalid_span,
+            "unmapped tail words are outside the decoded span"
+        );
+        assert_eq!(
+            dependencies.targets.keys().collect::<Vec<_>>(),
+            [&0x1000],
+            "only the executable mapping is a dependency target"
+        );
+    }
+
+    #[test]
+    fn retain_tables_ignores_mapped_data_tail_words_beyond_the_decoded_prefix() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = short_prefix_table();
+        // Mapped-data tail words (the Fedora typeinfo shape): still no
+        // data dependency, still a valid span.
+        let snapshot = mislabelled_snapshot(0x0203, 68, 36);
+        let mut dependencies = ScanDependencies::default();
+        dependencies.retain_tables(
+            std::slice::from_ref(&table),
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(!dependencies.invalid_span);
+        assert_eq!(
+            dependencies.targets.keys().collect::<Vec<_>>(),
+            [&0x1000],
+            "data tail words are never dependency targets"
+        );
+    }
+
+    /// The scan-1 controller copy of Fedora 44's stock SoftHSM, read
+    /// read-only and never executed: it must carry the mislabelled {3,2}
+    /// 68-slot table this fix accepts. Skips cleanly where the copy is
+    /// absent; the synthetic tests above stay the positive. File bytes
+    /// hold unrelocated addends rather than runtime pointers, so this
+    /// locks the synthetic premise (version word, missing export), while
+    /// decoding is covered synthetically.
+    #[test]
+    fn fedora_softhsm_copy_carries_a_mislabelled_68_slot_table() {
+        use p11scope_manifest::identity::{inspect_file_with_reader_exporting, open_object};
+        use std::os::unix::fs::FileExt as _;
+        const LANE_COPY: &str = "/var/tmp/p11scope-ws-tmp/scan-1/libsofthsm2-fc44.so";
+        const FEDORA_STOCK: &str = "/usr/lib64/pkcs11/libsofthsm2.so";
+        const TABLE_OFFSET: usize = 0xe7000;
+        const TABLE_END: usize = 0xe7000 + 8 + 104 * 8;
+        let path = match std::env::var("P11SCOPE_SCAN1_SOFTHSM") {
+            Ok(path) if !path.is_empty() => {
+                let path = PathBuf::from(path);
+                assert!(
+                    path.is_file(),
+                    "P11SCOPE_SCAN1_SOFTHSM requires {} to exist",
+                    path.display()
+                );
+                path
+            }
+            _ => {
+                let found = [LANE_COPY, FEDORA_STOCK]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.is_file());
+                let Some(path) = found else {
+                    eprintln!(
+                        "SKIP fedora_softhsm_copy_carries_a_mislabelled_68_slot_table: \
+                         reason=fedora-softhsm-copy-absent \
+                         (set P11SCOPE_SCAN1_SOFTHSM to require it)"
+                    );
+                    return;
+                };
+                path
+            }
+        };
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert!(
+            bytes.len() > TABLE_END,
+            "{} is {} bytes; the Fedora table ends at {TABLE_END:#x}",
+            path.display(),
+            bytes.len()
+        );
+        let word = u64::from_le_bytes(
+            bytes[TABLE_OFFSET..TABLE_OFFSET + 8]
+                .try_into()
+                .expect("eight version bytes"),
+        );
+        assert_eq!(word, 0x0203, "the Fedora table declares version 3.2");
+        let file =
+            open_object(&path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &["C_GetFunctionList", "C_GetInterface"],
+        )
+        .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()));
+        let exported: Vec<&str> = inspected
+            .exports
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            exported.contains(&"C_GetFunctionList"),
+            "{} must export C_GetFunctionList: {exported:?}",
+            path.display()
+        );
+        assert!(
+            !exported.contains(&"C_GetInterface"),
+            "{} must not export C_GetInterface: {exported:?}",
+            path.display()
+        );
+    }
+
     #[test]
     fn dense_candidates_and_interfaces_stop_at_capture_caps() {
         let maps = parse_maps(

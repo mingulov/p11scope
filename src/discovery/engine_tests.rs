@@ -51947,3 +51947,67 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     headpeer.kill().unwrap();
     headpeer.wait().unwrap();
 }
+
+/// The exact-address reader behind live publication, selection and
+/// broad-pool validation accepts a mislabelled {3,2} 68-slot table and
+/// brackets only its decoded prefix. The table is fabricated in a
+/// static (never moves under parallel tests); slots point at this
+/// binary's own text, tail words mix mapped data with unmapped words
+/// so any use of slot 69+ refuses.
+#[test]
+fn exact_read_accepts_a_mislabelled_68_slot_prefix() {
+    static TABLE: std::sync::Mutex<[u64; 105]> = std::sync::Mutex::new([0; 105]);
+    static TAIL_DATA: u64 = 0x9e3779b97f4a7c15;
+    fn scan1_anchor() {}
+    let anchor = scan1_anchor as *const () as usize as u64;
+    let data = &TAIL_DATA as *const u64 as usize as u64;
+    assert_ne!(anchor, 0);
+    assert_ne!(data, 0);
+    let address = {
+        let mut table = TABLE.lock().unwrap();
+        table[0] = 0x0203;
+        for slot in table[1..69].iter_mut() {
+            *slot = anchor;
+        }
+        // Fedora tail shape: an executable word first (the personality
+        // routine), then mapped data words (typeinfo), then unmapped
+        // words, which fail any slot-69+ use.
+        table[69] = anchor;
+        for slot in table[70..80].iter_mut() {
+            *slot = data;
+        }
+        for (index, slot) in table[80..].iter_mut().enumerate() {
+            *slot = 0x100 + index as u64;
+        }
+        &table[0] as *const u64 as u64
+    };
+    let view = ProcessView::open(ProcessViewId(4242), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
+    let mut budget = CaptureWorkBudget::default();
+    let (_, table, bytes) = Engine::read_exact_table_bracketed(
+        &view,
+        address,
+        LinuxLayout::Lp64,
+        &map_index,
+        &mut budget,
+        false,
+    )
+    .expect("the mislabelled prefix must validate");
+    assert_eq!(table.version, (3, 2));
+    assert_eq!(table.walk, "known_prefix");
+    assert_eq!(table.entries.len(), 68);
+    assert!(table.null_entries.is_empty());
+    assert_eq!(
+        bytes.len(),
+        8 + 104 * 8,
+        "the full extent is read, the prefix decoded"
+    );
+    assert!(
+        table
+            .entries
+            .iter()
+            .all(|entry| entry.object_path == table.entries[0].object_path),
+        "every entry resolves into one executable object"
+    );
+}

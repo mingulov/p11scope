@@ -102,10 +102,10 @@ impl ZombieLeaderGroup {
                     | libc::CLONE_SIGHAND
                     | libc::CLONE_THREAD
                     | libc::CLONE_SYSVSEM;
-                for index in 0..count {
+                for top in tops.iter().take(count) {
                     let cloned = libc::clone(
                         clone_survivor_main,
-                        tops[index],
+                        *top,
                         FLAGS,
                         pipes[1] as isize as *mut std::ffi::c_void,
                     );

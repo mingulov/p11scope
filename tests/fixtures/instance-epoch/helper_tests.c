@@ -589,6 +589,126 @@ static void check_exec_birth(void)
     assert(records[0].exec_attach_gen == 7);
     assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
 }
+
+static void check_scope_gap(void)
+{
+    /* Closure gate: gen 0 writes nothing, charges nothing, faults nothing. */
+    reset();
+    gen[INST_GEN_ATTACH] = 0;
+    assert(p11_instance_scope_gap() == 0);
+    assert(!storage_creates && !marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(!gen[INST_GEN_FAULT] && !exec_id_reads);
+    /* A missing control row cannot latch: nothing is allocated. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    marker_ctl_missing = 1;
+    assert(p11_instance_scope_gap() == 0);
+    assert(!storage_creates);
+    /* A latched control refuses without spending or faulting again. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    marker_ctl_cell.failed = 1;
+    assert(p11_instance_scope_gap() == 0);
+    assert(!storage_creates && !marker_ctl_cell.spent);
+    assert(!gen[INST_GEN_FAULT] && !counters.faults);
+    /* No current task, or no leader: latch plus one fault. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    current_task = 0;
+    assert(p11_instance_scope_gap() == 0);
+    assert(marker_ctl_cell.failed == 1);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    thread.group_leader = 0;
+    assert(p11_instance_scope_gap() == 0);
+    assert(marker_ctl_cell.failed == 1);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+    thread.group_leader = &leader;
+
+    /* Absent row: one CREATE, spent 1, DIRTY, no exec-ID read. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    assert(p11_instance_scope_gap() == 1);
+    assert(storage_creates == 1 && record_present[0]);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(!gen[INST_GEN_FAULT] && !exec_id_reads);
+
+    /* Existing word 0: charge, DIRTY. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    record_present[0] = 1;
+    assert(p11_instance_scope_gap() == 1);
+    assert(!storage_creates && marker_ctl_cell.spent == 1);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+
+    /* Existing READY: DIRTY, no charge. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = ((9ULL << 2) | 2ULL);
+    assert(p11_instance_scope_gap() == 1);
+    assert(!marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+
+    /* Already DIRTY: no charge, no latch. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = P11_JOURNAL_MARKER_DIRTY;
+    assert(p11_instance_scope_gap() == 1);
+    assert(!marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+
+    /* Exhausted budget on an absent row: latch plus one fault, no row. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    marker_ctl_cell.spent = P11_JOURNAL_MARKER_ADMIT_CAP;
+    assert(p11_instance_scope_gap() == 0);
+    assert(marker_ctl_cell.failed == 1);
+    assert(marker_ctl_cell.spent == P11_JOURNAL_MARKER_ADMIT_CAP);
+    assert(!record_present[0] && !storage_creates);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+    /* Exhausted budget on word 0: latch set, still marked, no fault. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    record_present[0] = 1;
+    marker_ctl_cell.spent = P11_JOURNAL_MARKER_ADMIT_CAP;
+    assert(p11_instance_scope_gap() == 1);
+    assert(marker_ctl_cell.failed == 1);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(!gen[INST_GEN_FAULT] && !counters.faults);
+
+    /* CREATE failure: the reservation stands, latch plus one fault. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    storage_fail = 1;
+    assert(p11_instance_scope_gap() == 0);
+    assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
+    assert(!record_present[0]);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+
+    /* After the latch: no-op with no further fault. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    record_present[0] = 1;
+    marker_ctl_cell.failed = 1;
+    assert(p11_instance_scope_gap() == 0);
+    assert(!marker_ctl_cell.spent && !storage_creates);
+    assert(!gen[INST_GEN_FAULT] && !counters.faults);
+    assert(!records[0].journal_bootstrap);
+
+    /* The gap path never reads the exec ID. */
+    reset();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 0xdeadbeef;
+    assert(p11_instance_scope_gap() == 1);
+    record_present[0] = 1;
+    records[0].journal_bootstrap = ((9ULL << 2) | 2ULL);
+    assert(p11_instance_scope_gap() == 1);
+    assert(!exec_id_reads);
+}
 #endif
 
 int main(void)
@@ -822,6 +942,7 @@ int main(void)
     assert(records[0].flags == INST_RECORD_OVERFLOW && records[0].exec_attach_gen == 9);
 #ifdef P11SCOPE_JOURNAL_MARKER
     check_exec_birth();
+    check_scope_gap();
 #endif
 
     /* Stamps. */

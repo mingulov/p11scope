@@ -3845,6 +3845,7 @@ mod promotion_lifecycle_tests {
     //! `matches_request`.
     use super::*;
     use crate::attach::Scope;
+    use crate::attach::BackendSelection;
     use crate::attach::capture::NativeDomainId;
     use crate::discovery::caller_registry::{
         ImageAuthority, ModuleKey, OsProcessSource, RegistryLimits,
@@ -3852,9 +3853,10 @@ mod promotion_lifecycle_tests {
     use crate::discovery::hooks::HookRegistry;
     use crate::inventory_promotion::lifecycle::SessionNativeCompletion;
     use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
+    use crate::inventory_semantics::AttestedSemanticLane;
     use crate::inventory_semantics::SemanticBatch;
     use p11scope_ebpf_common::ImageIdentity;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn image() -> ImageIdentity {
         ImageIdentity {
@@ -4184,6 +4186,159 @@ mod promotion_lifecycle_tests {
                 .is_some_and(|state| state.domain == b && state.pending_semantic.is_some()),
             "B stages into a fresh namespace"
         );
+    }
+
+    /// One scripted slot forms a shell lane: no Session, maps or
+    /// cursor, and no joint frame until the test seam sets one.
+    fn shell_lane() -> AttestedSemanticLane {
+        use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+        use crate::plan::{AttachPlan, Slot};
+        use p11scope_ebpf_common::SlotSemantics;
+        let slot = Slot {
+            index: 0,
+            descriptor_index: 0,
+            object: PinnedObjectId(7),
+            object_path: "joint-retire-test".into(),
+            file_offset: 0x1000,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: Vec::new(),
+        };
+        let plan = AttachPlan::from_slots(vec![slot]);
+        let subset = AttestedSubset::scripted(plan, PinnedObjects::empty(), BTreeMap::new());
+        AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            BackendSelection::Auto,
+        )
+        .expect("one scripted slot forms a shell lane")
+    }
+
+    #[test]
+    fn retire_joint_domain_with_lane_refuses_h3_pending_and_returns_completion() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let mut coordinator = coordinator();
+        let a = domain();
+        let lane = shell_lane();
+        assert!(!lane.has_joint_frame(), "a shell lane starts frameless");
+        let mut finalizer = SessionFinalizerState::new(a);
+        finalizer.h3_pending = Some(H3DispositionEvidence::genesis());
+        coordinator.semantic_finalizer = Some(finalizer);
+        assert!(
+            coordinator.joint_domain_has_pending_work(a),
+            "h3 evidence needs its lane"
+        );
+        let (completion, err) = coordinator
+            .retire_joint_domain_with_lane(&lane, SessionNativeCompletion::scripted(a))
+            .expect_err("h3 evidence stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        assert_eq!(completion.domain(), a, "the refusal hands the proof back");
+        assert!(
+            coordinator
+                .semantic_finalizer
+                .as_ref()
+                .is_some_and(|state| state.h3_pending.is_some()),
+            "the evidence stays staged"
+        );
+        assert!(coordinator.refused_semantic_domains.is_empty());
+        // Drain the evidence; the retained proof retires on retry.
+        coordinator
+            .semantic_finalizer
+            .as_mut()
+            .expect("kept")
+            .h3_pending = None;
+        coordinator
+            .retire_joint_domain_with_lane(&lane, completion)
+            .expect("drained evidence retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
+    }
+
+    #[test]
+    fn retire_joint_domain_with_lane_refuses_staged_h9() {
+        let mut coordinator = coordinator();
+        let a = domain();
+        let lane = shell_lane();
+        assert!(!lane.has_joint_frame(), "a shell lane starts frameless");
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
+        coordinator
+            .joint_capture
+            .ledger_mut()
+            .charge(7, 64)
+            .expect("one h9 entry stages");
+        assert_eq!(coordinator.joint_capture.ledger().staged(), 1);
+        assert!(
+            coordinator.joint_domain_has_pending_work(a),
+            "a staged h9 entry needs its lane"
+        );
+        let (completion, err) = coordinator
+            .retire_joint_domain_with_lane(&lane, SessionNativeCompletion::scripted(a))
+            .expect_err("staged h9 stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        assert_eq!(completion.domain(), a, "the refusal hands the proof back");
+        assert_eq!(
+            coordinator.joint_capture.ledger().staged(),
+            1,
+            "the staged entry survives the refusal"
+        );
+        assert!(coordinator.semantic_finalizer.is_some(), "namespace kept");
+        assert!(coordinator.refused_semantic_domains.is_empty());
+        // Drain the ledger; the retained proof retires on retry.
+        coordinator.joint_capture.ledger_mut().release(7, 64);
+        assert_eq!(coordinator.joint_capture.ledger().staged(), 0);
+        coordinator
+            .retire_joint_domain_with_lane(&lane, completion)
+            .expect("a drained ledger retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
+    }
+
+    #[test]
+    fn retire_joint_domain_with_lane_refuses_retained_joint_frame() {
+        let mut coordinator = coordinator();
+        let a = domain();
+        let mut lane = shell_lane();
+        lane.set_test_joint_frame(true);
+        assert!(lane.has_joint_frame(), "the seam retains a frame");
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
+        assert!(
+            !coordinator.joint_domain_has_pending_work(a),
+            "the frame lives on the lane, not the coordinator"
+        );
+        let (completion, err) = coordinator
+            .retire_joint_domain_with_lane(&lane, SessionNativeCompletion::scripted(a))
+            .expect_err("a retained frame stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        assert_eq!(completion.domain(), a, "the refusal hands the proof back");
+        assert!(coordinator.semantic_finalizer.is_some(), "namespace kept");
+        assert!(coordinator.refused_semantic_domains.is_empty());
+        // Drop the frame; the retained proof retires on retry.
+        lane.set_test_joint_frame(false);
+        coordinator
+            .retire_joint_domain_with_lane(&lane, completion)
+            .expect("a frameless lane retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
+    }
+
+    #[test]
+    fn retire_joint_domain_with_lane_retires_when_drained() {
+        let mut coordinator = coordinator();
+        let a = domain();
+        let lane = shell_lane();
+        assert!(!lane.has_joint_frame(), "a shell lane starts frameless");
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
+        assert_eq!(coordinator.joint_capture.ledger().staged(), 0);
+        assert!(!coordinator.joint_domain_has_pending_work(a));
+        coordinator
+            .retire_joint_domain_with_lane(&lane, SessionNativeCompletion::scripted(a))
+            .expect("a drained domain retires");
+        assert!(coordinator.semantic_finalizer.is_none());
+        assert!(coordinator.refused_semantic_domains.contains(&a));
     }
 
     /// Admit the test process itself through the real adapter path

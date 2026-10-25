@@ -377,6 +377,12 @@ discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
 # D4 copy-up RED reproducer: fails by design (the post-copy-up D-C7-3
 # re-edge stands), investigation target, never qualifies.
 discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
+# TID-scoped nonleader anchor run (installs nothing live; strict BPF
+# load): needs root with a live nonleader thread, run by hand.
+attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
+# Zombie survivor collision parity: needs root Btrfs disk TMPDIR and
+# eligible BTF/task_vma identity, run by hand.
+discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -418,6 +424,8 @@ SKIP_REASONS=(
 "needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
 "RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
+"needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
+"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; zombie survivor collision parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -436,6 +444,26 @@ attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049
 attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit
 attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec
 attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
+)
+
+# Counter-build curation (checker-enforced, never executed by this
+# script): the ignored integration tests that exist only in dedicated
+# counter builds. COUNTER_BANK_PROOF_TESTS members run with
+# P11SCOPE_COUNTER_BANK_PROOF=1, COUNTER_ARTIFACTS_TESTS members with
+# P11SCOPE_COUNTER_ARTIFACTS=1, each in its own build with --ignored
+# --exact (the BTF/map/program-load cell needs root; the checker cells
+# are static object analysis). Selectors are `file:path` like
+# INTEGRATION_TESTS.
+# shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
+COUNTER_BANK_PROOF_TESTS=(
+tests/object_producer_activation.rs:counter_bank_proof_has_exact_routes_and_start_ownership
+tests/object_producer_activation.rs:counter_bank_proof_mutations_are_causally_rejected
+tests/object_producer_activation.rs:counter_bank_proof_btf_maps_and_programs_load
+)
+# shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
+COUNTER_ARTIFACTS_TESTS=(
+tests/object_producer_activation.rs:counter_artifact_modes_have_exact_maps_and_root_work
+tests/object_producer_activation.rs:counter_artifact_mutations_are_causally_rejected
 )
 
 # Integration-test curation: `tests/<target>.rs:<exact test path>` entries

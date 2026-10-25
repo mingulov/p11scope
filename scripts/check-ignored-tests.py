@@ -10,23 +10,25 @@ compares them both ways against tests/ignored-tests.json:
 - an inventory entry with no matching site fails;
 - a `feature` entry without a non-empty `owner` fails: the owner names
   the lane that runs the test (a runner list or a dedicated build).
-  The owner must be one of ALLOWED_OWNERS; a new lane extends that
-  tuple (and gains its own curation rule when it runs tests);
-- a `privileged` entry whose test is not curated in
-  scripts/run-privileged-lib-tests.sh fails. Macro-defined sites
-  (path ending in `!`) expand to their `name!(test, ...)` invocations in
-  the same file; every default-build expansion must be curated in the
-  default lists, while expansions gated on a cargo feature exist in no
-  default binary, so they must be curated in WIDE_DETAILED_2112_TESTS
-  instead (the runner's own drift check cannot see them);
-- a `feature` entry owned by the wide-detailed-2112 runner, and every
-  member of WIDE_DETAILED_2112_TESTS, must resolve both ways: an owned
-  entry missing from the list fails, and a list member that is neither
-  a wide-owned entry nor a feature-gated expansion fails;
+  The owner must be one of ALLOWED_OWNERS, and every allowed owner has
+  a curation list in OWNER_LISTS; a new lane extends that map. An owned
+  entry missing from its owner's list fails, and a list member that
+  resolves to no owned entry fails;
+- a `privileged` or `live-kernel` entry outside tests/ whose test is
+  not curated in scripts/run-privileged-lib-tests.sh fails. Macro-defined
+  sites (path ending in `!`) expand to their `name!(test, ...)`
+  invocations in the same file; every default-build expansion must be
+  curated in the default lists, while expansions gated on a cargo
+  feature exist in no default binary, so they must be curated in
+  WIDE_DETAILED_2112_TESTS instead (the runner's own drift check cannot
+  see them);
 - a `live-kernel` or `privileged` entry under tests/ (an ignored
   integration test) must be curated as `file:path` in the runner's
   INTEGRATION_TESTS list, and every list member must resolve back to
   such an entry.
+
+Every run prints the exact size of each curation list, so the relation
+between the privileged selection and the inventory stays explicit.
 
 Usage:
   python3 -I scripts/check-ignored-tests.py [--root DIR]
@@ -51,13 +53,28 @@ RUNNER_LISTS = (
 )
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
-ALLOWED_OWNERS = (
-    WIDE_OWNER,
-    "counter-bank-proof build",
-    "counter-artifacts build",
+COUNTER_PROOF_LIST = "COUNTER_BANK_PROOF_TESTS"
+COUNTER_PROOF_OWNER = "counter-bank-proof build"
+COUNTER_ARTIFACTS_LIST = "COUNTER_ARTIFACTS_TESTS"
+COUNTER_ARTIFACTS_OWNER = "counter-artifacts build"
+# Every allowed feature owner and the curation list that proves it. The
+# form tells how an entry resolves to a member: the wide runner curates
+# plain lib paths, the counter builds curate `file:path` selectors
+# (their tests are integration targets).
+OWNER_LISTS = (
+    (WIDE_OWNER, WIDE_LIST, "path"),
+    (COUNTER_PROOF_OWNER, COUNTER_PROOF_LIST, "file:path"),
+    (COUNTER_ARTIFACTS_OWNER, COUNTER_ARTIFACTS_LIST, "file:path"),
 )
+ALLOWED_OWNERS = tuple(owner for owner, _, _ in OWNER_LISTS)
 INTEGRATION_LIST = "INTEGRATION_TESTS"
 INTEGRATION_CELLS = ("live-kernel", "privileged")
+COUNT_LISTS = (
+    *RUNNER_LISTS,
+    *(name for _, name, _ in OWNER_LISTS),
+    INTEGRATION_LIST,
+)
+LIB_CELLS = ("privileged", "live-kernel")
 
 MOD_RE = re.compile(
     r"((?:#\s*\[[^\]]*\]\s*)*)"
@@ -377,7 +394,7 @@ def runner_lists(runner_path):
     """{list name: set of curated items} for every runner curation list."""
     text = Path(runner_path).read_text(encoding="utf-8")
     lists = {}
-    for name in (*RUNNER_LISTS, WIDE_LIST, INTEGRATION_LIST):
+    for name in COUNT_LISTS:
         match = re.search(rf"^{name}=\(\n(.*?)\n\)", text, re.M | re.S)
         if match is None:
             raise ValueError(f"{runner_path} has no {name} list")
@@ -494,6 +511,8 @@ def check(root=ROOT, inventory=None, runner=None):
         registered |= lists.get(name, set())
     wide = lists.get(WIDE_LIST, set())
     integration = lists.get(INTEGRATION_LIST, set())
+    owned = {owner: (name, lists.get(name, set()), form)
+             for owner, name, form in OWNER_LISTS}
 
     sites, scan_errors = scan_sources(root)
     failures.extend(f"FAIL scan: {e}" for e in scan_errors)
@@ -543,10 +562,13 @@ def check(root=ROOT, inventory=None, runner=None):
                     f"owner {owner!r} (expected one of "
                     f"{', '.join(ALLOWED_OWNERS)})")
                 continue
-            if owner == WIDE_OWNER and entry["path"] not in wide:
+            owned_name, members, form = owned[owner]
+            key = entry["path"] if form == "path" else (
+                f"{entry['file']}:{entry['path']}")
+            if key not in members:
                 failures.append(
                     f"FAIL {where}: feature {entry['path']} is owned by "
-                    f"{WIDE_OWNER} but not curated in {WIDE_LIST}")
+                    f"{owner} but not curated in {owned_name}")
             continue
         if (isinstance(entry.get("file"), str)
                 and entry["file"].startswith("tests/")):
@@ -558,13 +580,13 @@ def check(root=ROOT, inventory=None, runner=None):
                         f"{entry['path']} is not curated in "
                         f"{INTEGRATION_LIST}")
             continue
-        if entry["cell"] != "privileged":
+        if entry["cell"] not in LIB_CELLS:
             continue
         _line, macro = matches[0]
         if macro is None:
             if entry["path"] not in registered:
                 failures.append(
-                    f"FAIL {where}: privileged {entry['path']} is not "
+                    f"FAIL {where}: {entry['cell']} {entry['path']} is not "
                     f"curated in {runner.relative_to(root)
                                      if runner.is_relative_to(root)
                                      else runner}")
@@ -582,15 +604,15 @@ def check(root=ROOT, inventory=None, runner=None):
                                     f"{macro}! invocation")
                 elif not absent and expanded not in registered:
                     failures.append(
-                        f"FAIL {where}: privileged macro {macro}! expands "
-                        f"to {expanded}, not curated in "
+                        f"FAIL {where}: {entry['cell']} macro {macro}! "
+                        f"expands to {expanded}, not curated in "
                         f"{runner.relative_to(root)
                             if runner.is_relative_to(root) else runner}")
                 elif absent and expanded not in wide:
                     failures.append(
-                        f"FAIL {where}: privileged macro {macro}! expands "
-                        f"to feature-gated {expanded}, not curated in "
-                        f"{WIDE_LIST}")
+                        f"FAIL {where}: {entry['cell']} macro {macro}! "
+                        f"expands to feature-gated {expanded}, not "
+                        f"curated in {WIDE_LIST}")
 
     for (rel, full), matches in sorted(indexed.items()):
         if (rel, full) not in seen:
@@ -606,7 +628,7 @@ def check(root=ROOT, inventory=None, runner=None):
             wide_sites.add(entry.get("path"))
         path = entry.get("path")
         if (isinstance(path, str) and path.endswith("!")
-                and entry.get("cell") == "privileged"
+                and entry.get("cell") in LIB_CELLS
                 and (entry.get("file"), path) in indexed):
             stem = path[:-1]
             macro = stem.rsplit("::", 1)[-1]
@@ -632,6 +654,25 @@ def check(root=ROOT, inventory=None, runner=None):
             failures.append(f"FAIL runner: {INTEGRATION_LIST} member "
                             f"{member} is not a live-kernel/privileged "
                             "integration inventory entry")
+
+    owned_sites = {owner: set() for owner, _, _ in OWNER_LISTS}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("cell") != "feature":
+            continue
+        for owner, _name, form in OWNER_LISTS:
+            if entry.get("owner") == owner:
+                key = entry.get("path") if form == "path" else (
+                    f"{entry.get('file')}:{entry.get('path')}")
+                owned_sites[owner].add(key)
+    for owner, name, _ in OWNER_LISTS:
+        if name == WIDE_LIST:
+            continue  # the wide list owns expansions too; checked above
+        for member in sorted(lists.get(name, set())):
+            if member not in owned_sites[owner]:
+                failures.append(f"FAIL runner: {name} member {member} is "
+                                f"not an inventory site owned by {owner}")
     return failures
 
 
@@ -650,6 +691,13 @@ def main(argv):
         count = len(entries)
     except (FileNotFoundError, OSError):
         count = 0
+    runner = Path(args.runner) if args.runner else root / DEFAULT_RUNNER
+    try:
+        lists = runner_lists(runner)
+        print("ignored-tests counts: " + " ".join(
+            f"{name}={len(lists[name])}" for name in COUNT_LISTS))
+    except (FileNotFoundError, ValueError):
+        pass
     for failure in failures:
         print(failure)
     if failures:

@@ -687,10 +687,12 @@ pub(crate) struct InstanceRouter {
     /// only for observed keys: flagged keys stay a subset of the
     /// observed keys under the same cap. If ever latched, the next
     /// observation that would otherwise continue mints instead and
-    /// consumes the latch — fail closed by splitting, never joining.
-    /// Same-epoch scans neither mint nor consume (identical stamps
-    /// cannot route calls apart). Cleared by every era reset beside
-    /// `absent`. Bounded: one bit, no allocation past the cap.
+    /// consumes the latch — a best-effort split that cannot target
+    /// the dropped key: it splits whichever key would continue next,
+    /// not the key whose flag was dropped. Same-epoch scans neither
+    /// mint nor consume (identical stamps cannot route calls apart).
+    /// Cleared by every era reset beside `absent`. Bounded: one bit,
+    /// no allocation past the cap.
     absence_overflowed: bool,
     faulted: BTreeSet<(ImageKey, u32)>,
     /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
@@ -965,6 +967,7 @@ impl InstanceRouter {
             self.absent.clear();
             self.absence_overflowed = false;
             self.ranges = 0;
+            self.debug_check_absent_subset();
             return self.fail_pending(|_| true, UnknownReason::AuthorityExhausted);
         }
         let mut resolved = Vec::new();
@@ -983,6 +986,7 @@ impl InstanceRouter {
                 self.absence_overflowed = false;
                 self.ranges = 0;
                 resolved.extend(self.fail_pending(|_| true, UnknownReason::AuthorityExhausted));
+                self.debug_check_absent_subset();
                 return resolved;
             };
             self.fault = fault;
@@ -1006,6 +1010,7 @@ impl InstanceRouter {
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         }
+        self.debug_check_absent_subset();
         resolved
     }
 
@@ -1015,6 +1020,7 @@ impl InstanceRouter {
         self.absent.clear();
         self.absence_overflowed = false;
         self.ranges = 0;
+        self.debug_check_absent_subset();
         self.fail_pending(|_| true, UnknownReason::CoverageFault)
     }
 
@@ -1024,6 +1030,7 @@ impl InstanceRouter {
         self.absent.clear();
         self.absence_overflowed = false;
         self.ranges = 0;
+        self.debug_check_absent_subset();
         self.fail_pending(|_| true, UnknownReason::AuthorityExhausted)
     }
 
@@ -1063,6 +1070,7 @@ impl InstanceRouter {
             }
         }
         self.absent.retain(|(owner, _)| *owner != key);
+        self.debug_check_absent_subset();
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
 
@@ -1098,6 +1106,7 @@ impl InstanceRouter {
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,
         ));
+        self.debug_check_absent_subset();
         resolved
     }
 
@@ -1399,6 +1408,7 @@ impl InstanceRouter {
                         self.counters.observed_evictions =
                             self.counters.observed_evictions.saturating_add(1);
                     }
+                    self.debug_check_absent_subset();
                     let list = self.observed.entry(key).or_default();
                     list.push_back(Observed {
                         epochs,

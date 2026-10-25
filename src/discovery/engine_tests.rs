@@ -48013,6 +48013,165 @@ fn collected_graph_install_checks_every_sink_before_swapping() {
     assert_eq!(case.engine.plan.slots, slots);
 }
 
+/// No-half-swap helper: drive a graph case to Install before its first
+/// credit. Check-before-service: Install step 0 advances in a single
+/// credit, so a service-then-check drive would miss it.
+fn drive_graph_case_to_install_step0(case: &mut CollectedFinishGraphCase) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut reached = false;
+    while std::time::Instant::now() < deadline {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Install && graph.install_step == 0)
+        {
+            reached = true;
+            break;
+        }
+        case.service(1);
+        std::thread::yield_now();
+    }
+    assert!(reached, "Install before its first credit");
+}
+
+#[test]
+fn collected_graph_install_pins_refusal_swaps_nothing() {
+    // The pins sink never became ready (a fresh cursor answers no
+    // retired entry count): the step-0 precheck refuses before the
+    // first swap, so every canonical stays put.
+    let mut case = graph_case_with_exit(true);
+    drive_graph_case_to_install_step0(&mut case);
+    let view = case.view;
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retiring view is claimed before install"
+    );
+    assert!(
+        case.engine
+            .collected_graph
+            .as_ref()
+            .expect("boxed")
+            .pins
+            .loaned_output()
+            .is_some(),
+        "the pins loan is outstanding before install"
+    );
+    let revision = case.engine.pinned.revision();
+    let modules = case.engine.modules.clone();
+    let slots = case.engine.plan.slots.clone();
+    // Test-only seam: the pins sink is not ready at install.
+    case.engine.collected_graph.as_mut().expect("boxed").pins =
+        PinnedConservativeCursor::new();
+    assert!(case.service(1).pending);
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert!(!graph.installed);
+    // No half-swap: the pins sink is first, so its refusal swaps
+    // nothing and every canonical (pins, modules, plan) is unchanged.
+    // (No loan assert: the surgery replaced the loaning cursor.)
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retired view stays claimed"
+    );
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.modules, modules);
+    assert_eq!(case.engine.plan.slots, slots);
+}
+
+#[test]
+fn collected_graph_install_rebind_refusal_swaps_nothing() {
+    // The rebind sink never became ready (a fresh cursor answers no
+    // modules): the step-0 precheck refuses before the first swap, so
+    // the pins stay canonical.
+    let mut case = graph_case_with_exit(true);
+    drive_graph_case_to_install_step0(&mut case);
+    let view = case.view;
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retiring view is claimed before install"
+    );
+    assert!(
+        case.engine
+            .collected_graph
+            .as_ref()
+            .expect("boxed")
+            .pins
+            .loaned_output()
+            .is_some(),
+        "the pins loan is outstanding before install"
+    );
+    let revision = case.engine.pinned.revision();
+    let modules = case.engine.modules.clone();
+    let slots = case.engine.plan.slots.clone();
+    // Test-only seam: the rebind sink is not ready at install.
+    case.engine.collected_graph.as_mut().expect("boxed").rebind =
+        ScannedRebindCursor::new();
+    assert!(case.service(1).pending);
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert!(!graph.installed);
+    // No half-swap: the pins loan is untouched and every canonical
+    // (pins, modules, plan) is unchanged.
+    assert!(
+        graph.pins.loaned_output().is_some(),
+        "the pins never swapped"
+    );
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retired view stays claimed"
+    );
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.modules, modules);
+    assert_eq!(case.engine.plan.slots, slots);
+}
+
+#[test]
+fn collected_graph_install_backing_refusal_swaps_nothing() {
+    // The backing sink never became ready (no storage lease): the
+    // step-0 precheck refuses before the first swap, so the pins stay
+    // canonical.
+    let mut case = graph_case_with_exit(true);
+    drive_graph_case_to_install_step0(&mut case);
+    let view = case.view;
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retiring view is claimed before install"
+    );
+    assert!(
+        case.engine
+            .collected_graph
+            .as_ref()
+            .expect("boxed")
+            .pins
+            .loaned_output()
+            .is_some(),
+        "the pins loan is outstanding before install"
+    );
+    let revision = case.engine.pinned.revision();
+    let modules = case.engine.modules.clone();
+    let slots = case.engine.plan.slots.clone();
+    // Test-only seam: the backing sink is not ready at install.
+    case.engine.collected_graph.as_mut().expect("boxed").backing_storage = None;
+    assert!(case.service(1).pending);
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::RefusedRetained));
+    assert!(!graph.installed);
+    // No half-swap: the pins loan is untouched and every canonical
+    // (pins, modules, plan) is unchanged.
+    assert!(
+        graph.pins.loaned_output().is_some(),
+        "the pins never swapped"
+    );
+    assert!(
+        case.engine.pinned.view_claims(view).is_some(),
+        "the retired view stays claimed"
+    );
+    assert_eq!(case.engine.pinned.revision(), revision);
+    assert_eq!(case.engine.modules, modules);
+    assert_eq!(case.engine.plan.slots, slots);
+}
+
 #[test]
 fn collected_graph_reclaim_drains_removed_rows_and_selection() {
     // Small case: at Closed the input splits into removed rows plus

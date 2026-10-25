@@ -715,7 +715,11 @@ impl Presentation {
         // deny the observed feed (see semantics_view).
         let claimed_children: std::collections::BTreeSet<(CallerId, ModuleId)> = registry
             .instance_semantic_edges()
-            .filter(|row| row.semantics.as_ref().is_some_and(EdgeSemantics::has_claims))
+            .filter(|row| {
+                row.semantics
+                    .as_ref()
+                    .is_some_and(EdgeSemantics::has_claims)
+            })
             .map(|row| (row.caller, row.module))
             .collect();
         let mut edges = Vec::with_capacity(edge_keys.len());

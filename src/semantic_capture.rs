@@ -6,13 +6,13 @@
 use crate::attach::Session;
 use crate::attach::capture::{NativeDomainId, ReadWindow};
 use crate::attach::image_query::{CompleteEpochs, ImageQueryRefusal, ImageScanProof};
+use crate::discovery::caller_registry::now_ns;
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
     Route, RouterLimits, UnknownReason,
 };
 use crate::events::DecodedEventRecord;
-use crate::discovery::caller_registry::now_ns;
 use crate::process::{PidPin, process_start_time};
 use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, H0Delivery};
 use crate::semantics_objects::journal::{
@@ -3087,9 +3087,8 @@ impl SemanticCapture {
                 (image.task_cookie, image.exec_id)
             })
             .collect();
-        self.retained.retain(|key, _| {
-            awaited.contains(key) || self.bindings.contains_key(&key.0)
-        });
+        self.retained
+            .retain(|key, _| awaited.contains(key) || self.bindings.contains_key(&key.0));
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
         let mut attempted_keys = BTreeSet::new();

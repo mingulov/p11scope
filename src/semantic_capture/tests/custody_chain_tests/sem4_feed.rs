@@ -55,7 +55,9 @@ fn stage_physical_use(scene: &mut RealScene, caller: CallerId, first_ns: u64, la
 
 /// (api_returns, historical_only_returns, lossy, [(mechanism, calls)],
 /// completed) of the first instance semantic row, if any.
-fn semantic_row_summary(scene: &RealScene) -> Option<(Option<u64>, u64, bool, Vec<(u64, u64)>, u64)> {
+fn semantic_row_summary(
+    scene: &RealScene,
+) -> Option<(Option<u64>, u64, bool, Vec<(u64, u64)>, u64)> {
     let row = scene
         .scene
         .coordinator
@@ -144,7 +146,10 @@ fn post_attach_first_burst_joins_without_boundary_gap() {
     let (api_returns, historical, lossy, mechanisms, completed) =
         semantic_row_summary(&scene).expect("the retained burst registers an instance row");
     assert_eq!(api_returns, Some(2), "both retained calls join as current");
-    assert_eq!(historical, 0, "retained calls are current, never historical");
+    assert_eq!(
+        historical, 0,
+        "retained calls are current, never historical"
+    );
     assert!(!lossy, "nothing was lost: the whole burst joined");
     assert_eq!(
         mechanisms,
@@ -228,7 +233,10 @@ fn bound_caller_with_other_cookie_never_joins_retained_calls() {
     let (api_returns, _, _, mechanisms, _) =
         semantic_row_summary(&scene).expect("the binding still registers an instance row");
     assert_eq!(api_returns, None, "another task's calls never join");
-    assert!(mechanisms.is_empty(), "another task's calls attribute nothing");
+    assert!(
+        mechanisms.is_empty(),
+        "another task's calls attribute nothing"
+    );
     assert!(
         unrouted_reasons(&scene).is_empty(),
         "mismatched retained calls stay held, never shed as unobserved: {:?}",
@@ -345,18 +353,16 @@ fn withheld_edge_with_claimed_children_names_the_children() {
         .unwrap();
     let edge_line = snapshot
         .lines()
-        .find(|line| {
-            line.starts_with(&format!("edge {} -> {}", caller.label(), module.label()))
-        })
+        .find(|line| line.starts_with(&format!("edge {} -> {}", caller.label(), module.label())))
         .unwrap_or_else(|| panic!("no edge line for the fixture pair:\n{snapshot}"));
     assert!(
         edge_line.contains("unknown (per-edge summary withheld; see semantic children)"),
         "the edge label points at the claimed children: {edge_line}"
     );
     assert!(
-        snapshot.lines().any(|line| {
-            line.starts_with("  instance ") && line.contains("observed")
-        }),
+        snapshot
+            .lines()
+            .any(|line| { line.starts_with("  instance ") && line.contains("observed") }),
         "the instance child line shows the observed feed:\n{snapshot}"
     );
 }

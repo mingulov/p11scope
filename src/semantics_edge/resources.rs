@@ -177,6 +177,12 @@ impl SemanticResourcePool {
         }
     }
 
+    /// A pool with an explicit byte limit. It keeps the permanent 1 MiB
+    /// scratch charge, which counts against the limit.
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self::new(limit)
+    }
+
     #[cfg(test)]
     pub(crate) fn reference_set_limit(&self, limit: usize) {
         let mut state = self

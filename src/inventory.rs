@@ -1346,7 +1346,7 @@ fn run_with_terminal_budget(
         semantic,
         semantic_staged: false,
         seated_summary: None,
-        second_signal: None,
+        second_signal: Some(request.second_signal),
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,
@@ -4442,6 +4442,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
             // The Joint finish begins once here when the stop request
             // did not begin it; a begun finish steps once (§8.3).
+            // The second operator signal escalates a begun finish
+            // instead of stepping it: the run is leaving, so the
+            // finish is held for exit rather than reaped.
+            if self.second_signal.is_some_and(|signal| signal())
+                && !matches!(self.joint_finish, JointFinishDriver::NotBegun)
+            {
+                self.escalate_joint_finish();
+                return;
+            }
             if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
                 self.begin_final_joint_finish();
                 return;
@@ -5409,7 +5418,7 @@ fn run_dashboard(
         semantic,
         semantic_staged: false,
         seated_summary: None,
-        second_signal: None,
+        second_signal: Some(second_signal),
         lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
         completion_source: None,
         pending_install: None,

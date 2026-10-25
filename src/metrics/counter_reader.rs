@@ -3197,7 +3197,7 @@ mod tests {
         use crate::attach::counter_banks::{BankExtent, BankPublication};
         assert!(
             matches!(publication, BankPublication::Published { extent, .. } if extent == BankExtent { first, end }),
-            "growth publication mismatch"
+            "growth publication for {first}..{end}: {publication:?}"
         );
     }
 
@@ -3236,17 +3236,10 @@ mod tests {
             let text = message
                 .downcast_ref::<String>()
                 .cloned()
-                .or_else(|| {
-                    message
-                        .downcast_ref::<&str>()
-                        .map(|text| text.to_string())
-                })
+                .or_else(|| message.downcast_ref::<&str>().map(|text| text.to_string()))
                 .expect("panic carries its message");
             for word in expected {
-                assert!(
-                    text.contains(word),
-                    "mismatch message names {word}: {text}"
-                );
+                assert!(text.contains(word), "mismatch message names {word}: {text}");
             }
         }
         assert_growth_published(
@@ -3652,7 +3645,6 @@ mod tests {
         }
 
         fn grow(&mut self, end: usize) {
-            use crate::attach::counter_banks::{BankExtent, BankPublication};
             let first = self.history.slots.len();
             let ids = self.bank_ids();
             let candidate = AttachPlan::from_slots_with_policy(
@@ -3663,10 +3655,13 @@ mod tests {
             let delta = self.history.extend_exact(candidate).unwrap();
             assert_eq!(delta.new.len(), end - first);
             assert!(delta.retire.is_empty() && delta.replace.is_empty());
-            assert!(
-                matches!(self.session.stage_counter_banks(&mut self.history, &self.pins, self.stage, &self.pool.reserver()),
-                BankPublication::Published { extent, .. } if extent == BankExtent { first: first as u32, end: end as u32 })
+            let publication = self.session.stage_counter_banks(
+                &mut self.history,
+                &self.pins,
+                self.stage,
+                &self.pool.reserver(),
             );
+            assert_growth_published(publication, first as u32, end as u32);
             assert_eq!(self.history.counter_consumed_end() as usize, end);
             let after = self.bank_ids();
             assert_eq!(after[..ids.len()], ids);

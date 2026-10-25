@@ -27,6 +27,93 @@ const NATIVE_SLOTS: usize = 512;
 const NATIVE_RVS: usize = 4096;
 const NATIVE_STARTS: u32 = 16384;
 
+/// The exact check behind a [`ReadStage::Shape`]. One variant per refusal
+/// origin, so diagnostics name the failing gate; the public refusal token
+/// stays undifferentiated. The shared map-shape helper takes the caller's
+/// variant, so each checked map keeps its own cause.
+#[allow(dead_code)] // Wired to each refusal site in the following commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReaderShapeCause {
+    BankInnerShape,
+    BindingAbsent,
+    CookieMapMissing,
+    CookieShape,
+    CookieView,
+    CpuCountMismatch,
+    CpuCountUnavailable,
+    DuplicateTargets,
+    EvidenceMapMissing,
+    EvidenceShape,
+    EvidenceView,
+    FaultShape,
+    HealthMapMissing,
+    HealthShape,
+    HealthView,
+    OwnerMapMissing,
+    OwnerShape,
+    OwnerView,
+    PlanLimitsMismatch,
+    PublishedIndexDuplicate,
+    PublishedIndexMissing,
+    RootMapMissing,
+    RootShape,
+    RootView,
+    RvKeysOverflow,
+    RvMapMissing,
+    RvShape,
+    RvView,
+    SnapshotModeMismatch,
+    StartsMapMissing,
+    StartsShape,
+    StatsMapMissing,
+    StatsShape,
+    StatsViewCounts,
+    StatsViewLatency,
+    StatsViewTimestamps,
+}
+
+#[allow(dead_code)] // Wired to each refusal site in the following commit.
+impl ReaderShapeCause {
+    pub(super) const ALL: [Self; 36] = [
+        Self::BankInnerShape,
+        Self::BindingAbsent,
+        Self::CookieMapMissing,
+        Self::CookieShape,
+        Self::CookieView,
+        Self::CpuCountMismatch,
+        Self::CpuCountUnavailable,
+        Self::DuplicateTargets,
+        Self::EvidenceMapMissing,
+        Self::EvidenceShape,
+        Self::EvidenceView,
+        Self::FaultShape,
+        Self::HealthMapMissing,
+        Self::HealthShape,
+        Self::HealthView,
+        Self::OwnerMapMissing,
+        Self::OwnerShape,
+        Self::OwnerView,
+        Self::PlanLimitsMismatch,
+        Self::PublishedIndexDuplicate,
+        Self::PublishedIndexMissing,
+        Self::RootMapMissing,
+        Self::RootShape,
+        Self::RootView,
+        Self::RvKeysOverflow,
+        Self::RvMapMissing,
+        Self::RvShape,
+        Self::RvView,
+        Self::SnapshotModeMismatch,
+        Self::StartsMapMissing,
+        Self::StartsShape,
+        Self::StatsMapMissing,
+        Self::StatsShape,
+        Self::StatsViewCounts,
+        Self::StatsViewLatency,
+        Self::StatsViewTimestamps,
+    ];
+}
+
 /// Real Session identity only. A legacy Detailed/Inventory Session lacks the
 /// required counter health/shape and refuses; this adds no counter loader.
 #[allow(dead_code)] // Staged Session bridge; no counter loader/selector is active.
@@ -739,6 +826,23 @@ mod tests {
 
     fn test_pool() -> SemanticResourcePool {
         SemanticResourcePool::reference_limit(32 * 1024 * 1024)
+    }
+
+    #[test]
+    fn reader_shape_causes_are_distinct_and_complete() {
+        let mut seen = Vec::with_capacity(ReaderShapeCause::ALL.len());
+        for cause in ReaderShapeCause::ALL {
+            assert!(
+                !seen.contains(&cause),
+                "duplicate reader shape cause: {cause:?}"
+            );
+            seen.push(cause);
+        }
+        assert_eq!(
+            ReaderShapeCause::ALL.len(),
+            36,
+            "every new cause variant must join ALL"
+        );
     }
 
     fn key(slot: u32, rv: u64) -> RvKey {

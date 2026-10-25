@@ -436,6 +436,137 @@ enum CommitObservation {
     Unreadable,
 }
 
+/// The exact check behind a [`BankRefusal::Shape`]. One variant per refusal
+/// origin, so diagnostics name the failing gate; the public refusal token
+/// stays undifferentiated. Name-parameterized map funnels share the per-map
+/// variants through a map-name mapper; every other site owns its variant.
+#[allow(dead_code)] // Wired to each refusal site in the following commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BankShapeCause {
+    AttachEndOverflow,
+    AttachWithoutBanks,
+    BankIndexOutsideGeometry,
+    BanksMissingForView,
+    BanksOuterShape,
+    BindingGeometryChanged,
+    CommitShape,
+    ExtentBounds,
+    FaultShape,
+    GeometryDims,
+    GeometryInvalid,
+    HealthShape,
+    InnerTemplateMissing,
+    InnerTemplateShape,
+    InsertCommitMissing,
+    InsertCommitViewGrowth,
+    InsertCommitViewLegacy,
+    InsertInnerHeldVariant,
+    InsertInnerOuterMissing,
+    InsertInnerOuterView,
+    InsertRouteMetaMissing,
+    InsertRouteMetaViewGrowth,
+    InsertRouteMetaViewLegacy,
+    LegacyCommitConfig,
+    LegacyRouteFields,
+    MetaMapMissing,
+    MetaShape,
+    MetaViewGrowth,
+    MetaViewLegacy,
+    ObjectAmbiguous,
+    ObjectUnknown,
+    OuterNotHashOfMaps,
+    PlanBudgetMismatch,
+    PlanNotCounters,
+    RemoveBankOuterMissing,
+    RemoveBankOuterView,
+    RemoveRouteMetaMissing,
+    RemoveRouteMetaViewGrowth,
+    RemoveRouteMetaViewLegacy,
+    RoutingHeldVariant,
+    RoutingRetainedBank,
+    RvShape,
+    SlotFileShape,
+    SlotOutsideLimit,
+    SnapshotGeometryChanged,
+    StagedExtentMismatch,
+    StagedGeometryChanged,
+    StagedWithoutBanks,
+    StartShape,
+    StatsShape,
+    TestArtifactUnknown,
+    TestLegacyIndexInvalid,
+    TestNonLegacyMask,
+    TestReaderMetadataUnknown,
+    TokenNotEmitted,
+    UnknownMapShape,
+    UnknownProfile,
+    VerifyRetainedBank,
+}
+
+#[allow(dead_code)] // Wired to each refusal site in the following commit.
+impl BankShapeCause {
+    pub(crate) const ALL: [Self; 58] = [
+        Self::AttachEndOverflow,
+        Self::AttachWithoutBanks,
+        Self::BankIndexOutsideGeometry,
+        Self::BanksMissingForView,
+        Self::BanksOuterShape,
+        Self::BindingGeometryChanged,
+        Self::CommitShape,
+        Self::ExtentBounds,
+        Self::FaultShape,
+        Self::GeometryDims,
+        Self::GeometryInvalid,
+        Self::HealthShape,
+        Self::InnerTemplateMissing,
+        Self::InnerTemplateShape,
+        Self::InsertCommitMissing,
+        Self::InsertCommitViewGrowth,
+        Self::InsertCommitViewLegacy,
+        Self::InsertInnerHeldVariant,
+        Self::InsertInnerOuterMissing,
+        Self::InsertInnerOuterView,
+        Self::InsertRouteMetaMissing,
+        Self::InsertRouteMetaViewGrowth,
+        Self::InsertRouteMetaViewLegacy,
+        Self::LegacyCommitConfig,
+        Self::LegacyRouteFields,
+        Self::MetaMapMissing,
+        Self::MetaShape,
+        Self::MetaViewGrowth,
+        Self::MetaViewLegacy,
+        Self::ObjectAmbiguous,
+        Self::ObjectUnknown,
+        Self::OuterNotHashOfMaps,
+        Self::PlanBudgetMismatch,
+        Self::PlanNotCounters,
+        Self::RemoveBankOuterMissing,
+        Self::RemoveBankOuterView,
+        Self::RemoveRouteMetaMissing,
+        Self::RemoveRouteMetaViewGrowth,
+        Self::RemoveRouteMetaViewLegacy,
+        Self::RoutingHeldVariant,
+        Self::RoutingRetainedBank,
+        Self::RvShape,
+        Self::SlotFileShape,
+        Self::SlotOutsideLimit,
+        Self::SnapshotGeometryChanged,
+        Self::StagedExtentMismatch,
+        Self::StagedGeometryChanged,
+        Self::StagedWithoutBanks,
+        Self::StartShape,
+        Self::StatsShape,
+        Self::TestArtifactUnknown,
+        Self::TestLegacyIndexInvalid,
+        Self::TestNonLegacyMask,
+        Self::TestReaderMetadataUnknown,
+        Self::TokenNotEmitted,
+        Self::UnknownMapShape,
+        Self::UnknownProfile,
+        Self::VerifyRetainedBank,
+    ];
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BankRefusal {
     Shape,
@@ -3532,6 +3663,23 @@ pub(crate) mod tests {
             metadata_bytes: 64 * 1024,
             file_descriptors: 128,
         }
+    }
+
+    #[test]
+    fn bank_shape_causes_are_distinct_and_complete() {
+        let mut seen = Vec::with_capacity(BankShapeCause::ALL.len());
+        for cause in BankShapeCause::ALL {
+            assert!(
+                !seen.contains(&cause),
+                "duplicate bank shape cause: {cause:?}"
+            );
+            seen.push(cause);
+        }
+        assert_eq!(
+            BankShapeCause::ALL.len(),
+            58,
+            "every new cause variant must join ALL"
+        );
     }
 
     #[test]

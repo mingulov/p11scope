@@ -2360,7 +2360,7 @@ fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     target
         .command(b'c')
         .with_context(|| "punch-hole call b (after the hole): fixture did not answer")?;
-    let routed = pump_until_routed(&mut harness, &mut target, 1, Duration::from_secs(10))?;
+    let routed = pump_until_routed(&mut harness, &target, 1, Duration::from_secs(10))?;
     ensure!(
         routed.len() == 1,
         "punch-hole call b: expected one routed outcome, got {routed:?}"

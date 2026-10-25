@@ -806,7 +806,7 @@ fn assert_overlay_outcome(
             // Userspace follows recorded truth on xino-off ×
             // post-copy-up (non-persistent st_ino); otherwise it edges
             // against the stale anchor while the kernel says other.
-            let want_edge = target.xino_off_copy_up_stable.map_or(true, |stable| stable);
+            let want_edge = target.xino_off_copy_up_stable.unwrap_or(true);
             if want_edge {
                 edge(pid, row_key, userspace, "userspace")?;
             } else {

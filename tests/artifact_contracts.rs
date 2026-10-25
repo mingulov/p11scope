@@ -8788,6 +8788,14 @@ fn k8s_entry_hardens_the_scratch_mount() {
         daemonset.contains("mountPath: /tmp"),
         "the hardened path must stay the manifest's scratch mount"
     );
+    // K3 regression: a direct `kubectl exec ... p11scope inventory --system
+    // -o /tmp/...` (the documented inventory command) runs without the entry
+    // script, so the pod itself must harden the mount at start.
+    assert!(
+        daemonset
+            .contains(r#"command: ["/bin/sh", "-c", "chmod 1777 /tmp && exec sleep infinity"]"#),
+        "the observer container must harden /tmp at pod start"
+    );
 }
 
 #[test]

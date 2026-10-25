@@ -1,4 +1,5 @@
-# p11scope node observer: one agent pod per node. It idles (`sleep infinity`)
+# p11scope node observer: one agent pod per node. It idles (`sleep infinity`,
+# after making the /tmp scratch mount sticky)
 # and runs one-shot captures on operator request through `kubectl exec`
 # (scripts/k8s-profile-entry.sh), so every capture keeps an explicit human
 # trigger, a bounded --duration and its own output file. See README.md here
@@ -71,9 +72,11 @@
 # capabilities; measured: Unconfined does not lift the CAP_SYS_ADMIN
 # requirement). Read-only root filesystem.
 # Kubelet creates the /tmp emptyDir 0777 without the sticky bit, which the
-# observer's output trust check refuses: the entry script restores 1777
-# before every exec. Copy results out with `kubectl cp` before the pod is
-# replaced: the emptyDir does not survive a rollout.
+# observer's output trust check refuses: the container command restores 1777
+# at pod start, so a direct `kubectl exec ... p11scope inventory -o /tmp/...`
+# works, and the entry script restores it again before every exec. Copy
+# results out with `kubectl cp` before the pod is replaced: the emptyDir does
+# not survive a rollout.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -109,7 +112,7 @@ spec:
         - name: observer
           image: p11scope-observer:1
           imagePullPolicy: Never
-          command: ["sleep", "infinity"]
+          command: ["/bin/sh", "-c", "chmod 1777 /tmp && exec sleep infinity"]
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

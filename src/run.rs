@@ -16981,6 +16981,47 @@ mod tests {
         assert!(!rendered.contains("reading manifest"), "{rendered}");
     }
 
+    /// A planted flavor mismatch refuses capture policy before anything
+    /// else runs. Fails while policy derives the flavor from the feature.
+    #[test]
+    fn capture_policy_refuses_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let error = capture_policy(Kind::Profile, false, false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+    }
+
+    /// Capture policy follows the probed unsafe presence, not the feature:
+    /// planted decoders admit the unsafe flag in a safe build, and planted
+    /// absence in an unsafe build refuses as a mismatch. Fails while
+    /// policy passes the feature through.
+    #[test]
+    fn capture_policy_uses_probed_unsafe_presence() {
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            let planted = crate::attach::EmbeddedFlavor {
+                stubbed: cfg!(feature = "stub-object-attributes"),
+                unsafe_present: false,
+            };
+            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+            let error = capture_policy(Kind::Profile, false, true).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("stale or mismatched"), "{message}");
+            assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
+        } else {
+            let planted = crate::attach::EmbeddedFlavor {
+                stubbed: cfg!(feature = "stub-object-attributes"),
+                unsafe_present: true,
+            };
+            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+            let policy = capture_policy(Kind::Profile, false, true).unwrap();
+            assert_eq!(policy, CapturePolicy::UnsafeUnvalidatedMetadata);
+        }
+    }
+
     #[test]
     fn broken_stdout_closes_only_that_sink_and_file_continues() {
         let mut stdout = FailingWriter {

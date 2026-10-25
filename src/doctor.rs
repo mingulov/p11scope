@@ -2354,6 +2354,30 @@ mod tests {
         }
     }
 
+    /// A planted flavor mismatch fails the object-capture row with the
+    /// same reason capture setup refuses with, and extra-strict counts
+    /// it. Fails while the row derives the flavor from the feature.
+    #[test]
+    fn object_capture_check_fails_on_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = object_capture_check();
+        assert_eq!(check.name, "object-attribute capture");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "mismatched flavor must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+        assert!(detail.contains("FULL"), "{detail}");
+        assert!(detail.contains("P0"), "{detail}");
+        assert!(!extra_strict_violations(&[check]).is_empty());
+    }
+
     /// A budget refusal names its cause: E2BIG through preflight formats
     /// as a verifier-budget refusal with the bounded log excerpt.
     #[test]

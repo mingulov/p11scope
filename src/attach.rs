@@ -42,6 +42,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4566,6 +4567,177 @@ fn embedded_object_capture_is_stubbed(parsed: aya_obj::Object) -> bool {
         !entry_stub
     );
     entry_stub
+}
+
+/// Flavor of the embedded Detailed BPF object, probed from its bytes rather
+/// than from the Cargo features the observer was built with. `stubbed` is
+/// true when object-attribute capture is stubbed (P0); `unsafe_present` is
+/// true when the unsafe-unvalidated-metadata decoders are compiled in.
+/// Output and policy report the bytes: a stale or mismatched embedded object
+/// must never let output claim P0 while the loaded program does FULL reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EmbeddedFlavor {
+    pub stubbed: bool,
+    pub unsafe_present: bool,
+}
+
+/// Why the embedded flavor could not be determined: the object does not
+/// parse, or its capture evidence is missing, ambiguous or half-wired.
+/// A production refusal, never a panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlavorProbeError {
+    reason: String,
+}
+
+impl FlavorProbeError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for FlavorProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for FlavorProbeError {}
+
+/// Production byte probe: stubbed vs wired attribute capture from parsed
+/// bytes. STUB until the probe lands: returns the build feature so the
+/// byte-reading tests fail.
+fn probed_capture_is_stubbed(_parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    Ok(cfg!(feature = "stub-object-attributes"))
+}
+
+/// Production byte probe: whether the unsafe-unvalidated-metadata decoders
+/// are present in parsed bytes. STUB until the probe lands.
+fn probed_unsafe_is_present(_parsed: &aya_obj::Object) -> Result<bool, FlavorProbeError> {
+    Ok(cfg!(feature = "unsafe-unvalidated-metadata"))
+}
+
+/// Probe the flavor of one Detailed object's bytes: parse, then derive
+/// stubbed-vs-wired capture and unsafe-decoder presence from the bytes.
+/// STUB until the probe lands: reports the build features without reading
+/// `object`, so the byte controls fail.
+pub(crate) fn embedded_flavor_from_bytes(
+    _object: &[u8],
+) -> Result<EmbeddedFlavor, FlavorProbeError> {
+    Ok(EmbeddedFlavor {
+        stubbed: cfg!(feature = "stub-object-attributes"),
+        unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+    })
+}
+
+static EMBEDDED_FLAVOR: OnceLock<Result<EmbeddedFlavor, FlavorProbeError>> = OnceLock::new();
+
+/// The embedded Detailed object's flavor, parsed once per process and cached.
+/// Test builds honor a held override first (see
+/// [`hold_embedded_flavor_for_test`]); every other read shares the cache.
+pub(crate) fn embedded_flavor() -> Result<EmbeddedFlavor, FlavorProbeError> {
+    #[cfg(test)]
+    if let Some(overridden) = test_flavor_override() {
+        return overridden;
+    }
+    EMBEDDED_FLAVOR
+        .get_or_init(|| embedded_flavor_from_bytes(crate::EBPF_OBJECT))
+        .clone()
+}
+
+#[cfg(test)]
+static TEST_FLAVOR_OVERRIDE: std::sync::Mutex<Option<Result<EmbeddedFlavor, FlavorProbeError>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_FLAVOR_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test seam: hold a planted flavor (or probe error) while the guard lives.
+/// The guard holds the serial mutex, so planted-mismatch tests run one at
+/// a time; the value mutex is only ever locked briefly, so ordinary flavor
+/// reads never observe a planted value and never block on a holder. The
+/// slot clears on drop. Lock poisoning is ignored: a panicked holder must
+/// not cascade into unrelated tests.
+#[cfg(test)]
+pub(crate) struct FlavorOverrideGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for FlavorOverrideGuard {
+    fn drop(&mut self) {
+        *TEST_FLAVOR_OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_embedded_flavor_for_test(
+    flavor: Result<EmbeddedFlavor, FlavorProbeError>,
+) -> FlavorOverrideGuard {
+    let serial = TEST_FLAVOR_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *TEST_FLAVOR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(flavor);
+    FlavorOverrideGuard { _serial: serial }
+}
+
+#[cfg(test)]
+fn test_flavor_override() -> Option<Result<EmbeddedFlavor, FlavorProbeError>> {
+    TEST_FLAVOR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The probed flavor must match the build features: a stale or mismatched
+/// embedded object refuses with one plain message naming both values.
+/// Pure over its argument so tests plant flavors without touching bytes.
+pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<EmbeddedFlavor> {
+    let expect_stubbed = cfg!(feature = "stub-object-attributes");
+    if probed.stubbed != expect_stubbed {
+        let (expected, actual) = if expect_stubbed {
+            ("stubbed (P0)", "wired (FULL)")
+        } else {
+            ("FULL", "stubbed (P0)")
+        };
+        bail!(
+            "embedded BPF object flavor mismatch: build expects {expected} object-attribute capture, embedded bytes are {actual} (stale or mismatched embedded object)"
+        );
+    }
+    let expect_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
+    if probed.unsafe_present != expect_unsafe {
+        let (expected, actual) = if expect_unsafe {
+            ("with", "lack")
+        } else {
+            ("without", "contain")
+        };
+        bail!(
+            "embedded BPF object flavor mismatch: build was compiled {expected} unsafe-unvalidated-metadata, embedded bytes {actual} its decoders (stale or mismatched embedded object)"
+        );
+    }
+    Ok(probed)
+}
+
+/// The cached probed flavor, refused unless it matches the build features.
+/// Missing, ambiguous or half-wired evidence refuses here, before any
+/// attach or load.
+pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
+    match embedded_flavor() {
+        Ok(probed) => check_flavor_against_build(probed),
+        Err(error) => bail!(
+            "cannot determine embedded BPF object flavor: {} (stale or mismatched embedded object)",
+            error.reason()
+        ),
+    }
 }
 
 /// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
@@ -15389,6 +15561,332 @@ mod tests {
             cfg!(feature = "stub-object-attributes"),
             "embedded Detailed bytes must follow the stub feature"
         );
+    }
+
+    /// Production probe, positive control: the real embedded bytes report
+    /// this build's flavor in every flavor (FULL default, P0, unsafe).
+    #[test]
+    fn production_probe_matches_embedded_bytes_in_this_build() {
+        let flavor = super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+            .expect("embedded Detailed bytes must probe");
+        assert_eq!(
+            flavor.stubbed,
+            cfg!(feature = "stub-object-attributes"),
+            "probed stub flavor must match the build feature"
+        );
+        assert_eq!(
+            flavor.unsafe_present,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+            "probed unsafe presence must match the build feature"
+        );
+    }
+
+    /// Production stub rule agrees with the exact-symbol test probe on the
+    /// real bytes, in every flavor.
+    #[test]
+    fn production_stub_probe_matches_test_probe_on_embedded_bytes() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::probed_capture_is_stubbed(parsed),
+            Ok(super::embedded_object_is_stubbed())
+        );
+    }
+
+    /// Production probe, negative byte control: garbage bytes are a probe
+    /// error, never a flavor. Fails while the probe returns the feature.
+    #[test]
+    fn production_probe_rejects_garbage_bytes() {
+        let error = super::embedded_flavor_from_bytes(b"not an ELF object")
+            .expect_err("garbage bytes must not probe as any flavor");
+        assert!(
+            error.reason().contains("does not parse"),
+            "{}",
+            error.reason()
+        );
+    }
+
+    /// Production stub core, negative controls: missing, ambiguous and
+    /// half-wired evidence are errors, never a flavor and never a panic.
+    /// Mirrors the test-probe refusal matrix; fails while the core
+    /// returns the build feature.
+    #[test]
+    fn production_stub_core_refuses_missing_ambiguous_and_half_wired() {
+        fn refused(parsed: aya_obj::Object, reason: &str) {
+            let error = super::probed_capture_is_stubbed(parsed)
+                .expect_err("mutated embedded object must be refused");
+            assert!(
+                error.reason().contains(reason),
+                "wrong refusal: {}",
+                error.reason()
+            );
+        }
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let reader = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == "p11_request_cell")
+            .unwrap()
+            .0;
+        let mut missing = parsed.clone();
+        missing.functions.remove(&emit);
+        refused(missing, "no exact return adapter");
+        let mut misleading = parsed.clone();
+        misleading
+            .functions
+            .get_mut(&emit)
+            .unwrap()
+            .name
+            .push_str("_suffix");
+        refused(misleading, "no exact return adapter");
+        let mut duplicate = parsed.clone();
+        let address = duplicate
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        let mut clone = duplicate.functions[&emit].clone();
+        clone.name = "_RNvCsa_13p11scope_ebpf26object_emit_get_attributes".into();
+        duplicate.functions.insert((emit.0, address), clone);
+        refused(duplicate, "several exact return adapters");
+        let mut missing = parsed.clone();
+        missing.functions.remove(&reader);
+        refused(missing, "lacks request reader");
+        let mut wrong_btf = parsed.clone();
+        wrong_btf
+            .functions
+            .get_mut(&reader)
+            .unwrap()
+            .func_info
+            .func_info[0]
+            .type_id = 0;
+        refused(wrong_btf, "original BTF FUNC");
+        let mut half_wired = parsed;
+        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
+        let instruction = *body.last().unwrap();
+        body.resize(
+            if cfg!(feature = "stub-object-attributes") {
+                300
+            } else {
+                49
+            },
+            instruction,
+        );
+        refused(half_wired, "half-wired embedded object");
+    }
+
+    /// Production unsafe probe, positive control: the real bytes report
+    /// unsafe-decoder presence matching the build feature, in every flavor.
+    #[test]
+    fn production_unsafe_probe_matches_feature_in_this_build() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::probed_unsafe_is_present(&parsed),
+            Ok(cfg!(feature = "unsafe-unvalidated-metadata"))
+        );
+    }
+
+    /// Production unsafe probe reads the bytes, not the feature: planting
+    /// every unsafe marker into default bytes reports present; stripping
+    /// every marker from unsafe bytes reports absent. Fails while the
+    /// probe returns the build feature.
+    #[test]
+    fn production_unsafe_probe_reads_bytes_not_feature() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            for name in super::UNSAFE_PROGRAMS {
+                assert!(
+                    parsed.programs.remove(name).is_some(),
+                    "unsafe bytes lack {name}"
+                );
+            }
+            for (name, _) in super::FEATURE_POLICY_MAPS {
+                assert!(
+                    parsed.maps.remove(name).is_some(),
+                    "unsafe bytes lack {name}"
+                );
+            }
+            assert_eq!(super::probed_unsafe_is_present(&parsed), Ok(false));
+        } else {
+            let program = parsed
+                .programs
+                .values()
+                .next()
+                .expect("detailed bytes carry programs")
+                .clone();
+            for name in super::UNSAFE_PROGRAMS {
+                assert!(
+                    parsed.programs.get(name).is_none(),
+                    "default bytes carry {name}"
+                );
+                parsed.programs.insert(name.to_string(), program.clone());
+            }
+            let map = parsed
+                .maps
+                .values()
+                .next()
+                .expect("detailed bytes carry maps")
+                .clone();
+            for (name, _) in super::FEATURE_POLICY_MAPS {
+                assert!(
+                    parsed.maps.get(name).is_none(),
+                    "default bytes carry {name}"
+                );
+                parsed.maps.insert(name.to_string(), map.clone());
+            }
+            assert_eq!(super::probed_unsafe_is_present(&parsed), Ok(true));
+        }
+    }
+
+    /// Production unsafe probe, half-wired control: a single planted
+    /// marker in default bytes (or a single stripped marker in unsafe
+    /// bytes) is an error, never a flavor.
+    #[test]
+    fn production_unsafe_probe_refuses_half_wired() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            parsed.programs.remove(super::UNSAFE_PROGRAMS[0]);
+        } else {
+            let program = parsed
+                .programs
+                .values()
+                .next()
+                .expect("detailed bytes carry programs")
+                .clone();
+            parsed
+                .programs
+                .insert(super::UNSAFE_PROGRAMS[0].to_string(), program);
+        }
+        let error = super::probed_unsafe_is_present(&parsed)
+            .expect_err("half-wired unsafe evidence must be refused");
+        assert!(error.reason().contains("half-wired"), "{}", error.reason());
+    }
+
+    /// The flavor check accepts agreeing bytes in every flavor.
+    #[test]
+    fn flavor_check_accepts_agreeing_bytes() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        assert_eq!(super::check_flavor_against_build(probed).unwrap(), probed);
+    }
+
+    /// A stubbed parse in a wired build (or the reverse) refuses with one
+    /// plain message naming both values.
+    #[test]
+    fn flavor_check_refuses_stub_mismatch() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let error = super::check_flavor_against_build(probed).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("FULL"), "{message}");
+        assert!(message.contains("P0"), "{message}");
+    }
+
+    /// An unsafe-presence disagreement refuses naming both values.
+    #[test]
+    fn flavor_check_refuses_unsafe_mismatch() {
+        let probed = super::EmbeddedFlavor {
+            stubbed: cfg!(feature = "stub-object-attributes"),
+            unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let error = super::check_flavor_against_build(probed).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");
+        if cfg!(feature = "unsafe-unvalidated-metadata") {
+            assert!(message.contains("lack"), "{message}");
+        } else {
+            assert!(message.contains("contain"), "{message}");
+        }
+    }
+
+    /// The checked flavor honors a planted mismatch with the refusal
+    /// message, and agreeing bytes pass through.
+    #[test]
+    fn checked_flavor_honors_planted_mismatch() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        let error = super::checked_embedded_flavor().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stale or mismatched"),
+            "{error:#}"
+        );
+    }
+
+    /// The test seam plants a flavor for the guard's lifetime and clears
+    /// it on drop, so ordinary reads see real bytes again.
+    #[test]
+    fn flavor_override_holds_planted_value_until_drop() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: true,
+            unsafe_present: true,
+        };
+        {
+            let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+            assert_eq!(super::embedded_flavor().unwrap(), planted);
+            assert_eq!(super::embedded_flavor().unwrap(), planted);
+        }
+        assert_eq!(
+            super::embedded_flavor().unwrap().stubbed,
+            super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+                .unwrap()
+                .stubbed
+        );
+    }
+
+    /// A planted stub mismatch refuses capture setup before any attach:
+    /// `diagnostic` fails with the mismatch message without loading BPF,
+    /// so this passes unprivileged. Fails while setup derives the flavor
+    /// from the feature.
+    #[test]
+    fn mismatched_flavor_refuses_setup_before_attach() {
+        let planted = super::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        let error = super::Session::diagnostic()
+            .err()
+            .expect("mismatched flavor must refuse setup");
+        let message = format!("{error:#}");
+        assert!(message.contains("stale or mismatched"), "{message}");
+        assert!(message.contains("FULL"), "{message}");
+        assert!(message.contains("P0"), "{message}");
+    }
+
+    /// Undeterminable bytes refuse setup the same way, with the probe
+    /// reason attached. Fails while setup ignores the probe.
+    #[test]
+    fn undeterminable_flavor_refuses_setup_before_attach() {
+        let _guard = super::hold_embedded_flavor_for_test(Err(super::FlavorProbeError::new(
+            "no exact return adapter",
+        )));
+        let error = super::Session::diagnostic()
+            .err()
+            .expect("undeterminable flavor must refuse setup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot determine embedded BPF object flavor"),
+            "{message}"
+        );
+        assert!(message.contains("no exact return adapter"), "{message}");
     }
 
     /// Load-refusal detector matrix: only the E2BIG budget errno

@@ -47976,6 +47976,91 @@ fn insert_sizing_selection_rows(engine: &mut Engine, views: u32) {
 }
 
 #[test]
+fn collected_finish_partial_multi_keeps_surviving_sibling() {
+    // Two native groups: {0, 1} retires whole, {2, 3} retires only 2.
+    // Sibling 3 stays active and attached; 2 retires logically while its
+    // physical close waits for the Session's terminal detach.
+    let (_guards, mut engine) = engine_with_accepted_providers(4);
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    assert_eq!(engine.plan.slots.len(), 4);
+    let view_of: Vec<ProcessViewId> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| {
+            let module = engine.plan.module_of_slot(slot.index).unwrap();
+            engine.modules[module.0 as usize].scanned.view
+        })
+        .collect();
+    assert_eq!(
+        view_of
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4,
+        "each slot belongs to its own view: {view_of:?}"
+    );
+    session
+        .global_retirement
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .combine_slot_groups(&[&[0, 1], &[2, 3]]);
+    for view in &view_of[..3] {
+        assert!(
+            engine
+                .retirement_intents
+                .insert(*view, RetirementCause::ExpectedRemoval)
+                .is_none()
+        );
+        assert!(engine.ready_expected_removals.insert(*view));
+    }
+    let mut outcome = engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .unwrap();
+    for _ in 0..512 {
+        if !outcome.pending {
+            break;
+        }
+        outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+    }
+    assert!(!outcome.pending, "the partial graph drains");
+    let leaf = session.global_retirement.as_ref().unwrap().borrow();
+    assert_eq!(leaf.begins, 1, "begins counts whole groups only");
+    assert_eq!(
+        leaf.deferred_slots(),
+        &std::collections::BTreeSet::from([2]),
+        "the partial member is deferred"
+    );
+    assert!(engine.plan.is_active(3), "the sibling stays active");
+    assert!(leaf.has_slot_link(3), "the sibling stays attached");
+    assert!(
+        !engine.plan.is_active(2),
+        "the deferred member retires logically"
+    );
+    assert!(
+        leaf.has_slot_link(2),
+        "the deferred member stays attached for terminal close"
+    );
+    assert!(!engine.plan.is_active(0) && !engine.plan.is_active(1));
+    assert!(!leaf.has_slot_link(0) && !leaf.has_slot_link(1));
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "global native retirement"
+                && skip.reason == "physical close deferred to Session cleanup")
+            .count(),
+        1,
+        "the deferral is disclosed once"
+    );
+}
+
+#[test]
 #[ignore = "scale: system-population graph sizing; run by exact selector at V2 and L"]
 fn collected_graph_peak_fits_pool_at_system_scale() {
     // FD headroom for the 4096 pin files plus the 16384 native links.

@@ -2246,3 +2246,327 @@ fn collected_retirement_input_measure_covers_preflight() {
         assert_eq!(native.native_counts(), (0, 0, 0, 0));
     }
 }
+
+#[test]
+fn collected_partial_group_defers_to_joined_session_closure() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        4,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    // No-partial prelude: single-member groups pass the input through
+    // untouched, with the same allocation and identity.
+    let mut whole_only = Some(collected_input(
+        vec![slots[0].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ptr = whole_only.as_ref().unwrap().removed.as_ptr();
+    let mut scanning = 0;
+    let passed = loop {
+        match native.defer(&q, &mut whole_only, &reserve, 1).unwrap() {
+            DeferralProgress::Yielded => panic!("a credited deferral scans"),
+            DeferralProgress::Scanning => {
+                scanning += 1;
+                assert_eq!(whole_only.as_ref().unwrap().removed.as_ptr(), ptr);
+            }
+            DeferralProgress::Split { .. } => panic!("whole groups never split"),
+            DeferralProgress::NoPartial(input) => break input,
+        }
+    };
+    assert_eq!(scanning, 1, "one member per credit");
+    assert_eq!(passed.removed.as_ptr(), ptr);
+    assert!(native.deferred_slots().is_empty());
+    drop(passed);
+    // Partial groups split: {0, 1} is whole, {2} is deferred, {3} survives.
+    native.combine_slot_groups(&[&[0, 1], &[2, 3]]);
+    let before = native.original_links();
+    let mut input = Some(collected_input(
+        vec![slots[0].clone(), slots[1].clone(), slots[2].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ptr = input.as_ref().unwrap().removed.as_ptr();
+    let mut scanning = 0;
+    let (whole, deferred) = loop {
+        match native.defer(&q, &mut input, &reserve, 1).unwrap() {
+            DeferralProgress::Yielded => panic!("a credited deferral scans"),
+            DeferralProgress::Scanning => {
+                scanning += 1;
+                assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+            }
+            DeferralProgress::Split { whole, deferred } => break (whole, deferred),
+            DeferralProgress::NoPartial(_) => panic!("a partial group must split"),
+        }
+    };
+    assert_eq!(scanning, 3, "one member per credit");
+    assert!(input.is_none(), "the split takes the caller input");
+    assert_eq!(
+        whole
+            .removed
+            .iter()
+            .map(|slot| slot.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(deferred.q(), &q as *const _ as usize);
+    assert!(std::sync::Arc::ptr_eq(
+        deferred.owner(),
+        native.allocation_for_test()
+    ));
+    let expected: Vec<_> = before
+        .iter()
+        .filter(|link| link.slots.contains(&2))
+        .map(|link| link.registration.expect("a registered original link"))
+        .collect();
+    assert_eq!(expected.len(), 2);
+    assert_eq!(deferred.registrations(), expected.as_slice());
+    assert_eq!(
+        native.deferred_slots(),
+        &BTreeSet::from([2]),
+        "the partial member is recorded"
+    );
+    // The whole input closes natively; the deferred link stays exactly.
+    let mut whole = Some(whole);
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut whole, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    assert_eq!(native.native_counts(), (2, 2, 2, 0));
+    for link in native.original_links() {
+        let original = before
+            .iter()
+            .find(|candidate| candidate.program == link.program && candidate.slots == link.slots)
+            .expect("no rebuilt link appears");
+        assert_eq!(&link, original);
+    }
+    assert!(
+        native.has_slot_link(2),
+        "the deferred member keeps its links"
+    );
+    assert!(
+        native.has_slot_link(3),
+        "the surviving sibling keeps its links"
+    );
+    assert!(
+        !native.has_slot_link(0) && !native.has_slot_link(1),
+        "whole members detach"
+    );
+    assert_eq!(native.recorded_generation(2), Some(1));
+    assert_eq!(native.recorded_generation(3), Some(1));
+    // Joined session closure: the terminal submit takes every remaining
+    // link, and the deferred slots are proven submitted.
+    let submitted = native.submit_terminal_links(&BTreeSet::new());
+    assert_eq!(submitted, BTreeSet::from([2, 3]));
+    assert!(super::super::deferred_slots_proven(
+        native.deferred_slots(),
+        &submitted
+    ));
+    let receipt = native.join();
+    assert!(receipt.completed);
+    assert_eq!(
+        (receipt.total, receipt.released, receipt.uncertain),
+        (4, 4, 0)
+    );
+}
+
+#[test]
+fn collected_partial_group_deferral_refuses_selective_detach_and_rebuild() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        4,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    native.combine_slot_groups(&[&[0, 1], &[2, 3]]);
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        vec![slots[0].clone(), slots[1].clone(), slots[2].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let before = native.original_links();
+    let whole = loop {
+        match native.defer(&q, &mut input, &reserve, 1).unwrap() {
+            DeferralProgress::Split { whole, .. } => break whole,
+            DeferralProgress::Scanning | DeferralProgress::Yielded => {}
+            DeferralProgress::NoPartial(_) => panic!("a partial group must split"),
+        }
+    };
+    assert_eq!(native.deferred_slots(), &BTreeSet::from([2]));
+    let mut whole = Some(whole);
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut whole, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    // No selective detach: the deferred member and its sibling keep
+    // their exact links, retained targets and pair stamps.
+    assert_eq!(native.original_links().len(), 2);
+    for link in native.original_links() {
+        let original = before
+            .iter()
+            .find(|candidate| candidate.program == link.program && candidate.slots == link.slots)
+            .expect("no rebuilt link appears");
+        assert_eq!(&link, original);
+    }
+    assert_eq!(
+        native
+            .retained_slots()
+            .iter()
+            .map(|slot| slot.index)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([2, 3])
+    );
+    assert_eq!(native.recorded_generation(2), Some(1));
+    assert_eq!(native.recorded_generation(3), Some(1));
+    // Re-naming the deferred member cannot detach it: the group is whole
+    // by this input, so no new split happens, and Extract skips the
+    // deferred link while the batch still closes.
+    let mut renamed = Some(collected_input(
+        vec![slots[2].clone(), slots[3].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let renamed_ptr = renamed.as_ref().unwrap().removed.as_ptr();
+    let whole = loop {
+        match native.defer(&q, &mut renamed, &reserve, 1).unwrap() {
+            DeferralProgress::NoPartial(input) => break input,
+            DeferralProgress::Scanning | DeferralProgress::Yielded => {}
+            DeferralProgress::Split { .. } => panic!("no partial group remains"),
+        }
+    };
+    assert_eq!(whole.removed.as_ptr(), renamed_ptr);
+    assert_eq!(native.deferred_slots(), &BTreeSet::from([2]));
+    let mut whole = Some(whole);
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut whole, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    assert_eq!(native.original_links().len(), 2);
+    for link in native.original_links() {
+        let original = before
+            .iter()
+            .find(|candidate| candidate.program == link.program && candidate.slots == link.slots)
+            .expect("the skipped link is the original");
+        assert_eq!(&link, original);
+    }
+    assert_eq!(native.deferred_slots(), &BTreeSet::from([2]));
+}
+
+#[test]
+fn collected_partial_group_deferral_requires_stop_and_quiescence() {
+    use p11scope_ebpf_common::STOP_GATE_STOP;
+    let (_dir, _pins, mut native, slots) = collected_case(
+        2,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        vec![slots[0].clone()],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let ptr = input.as_ref().unwrap().removed.as_ptr();
+    // Work zero yields without consulting the gate.
+    assert!(matches!(
+        native.defer(&q, &mut input, &reserve, 0).unwrap(),
+        DeferralProgress::Yielded
+    ));
+    assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+    // Without a requested stop the entry refuses and keeps the input.
+    native.set_gate_word_for_test(0);
+    let error = native.defer(&q, &mut input, &reserve, 1).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "collected group deferral requires a requested stop with proven quiescence"
+    );
+    assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+    // A requested stop with an admitted body refuses the same way.
+    native.set_gate_word_for_test(STOP_GATE_STOP | 1);
+    let error = native.defer(&q, &mut input, &reserve, 1).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "collected group deferral requires a requested stop with proven quiescence"
+    );
+    assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+    // Restored quiescence proceeds; the refused scan left no residue.
+    native.set_gate_word_for_test(STOP_GATE_STOP);
+    let mut scanning = 0;
+    let passed = loop {
+        match native.defer(&q, &mut input, &reserve, 1).unwrap() {
+            DeferralProgress::Yielded => panic!("a credited deferral scans"),
+            DeferralProgress::Scanning => {
+                scanning += 1;
+                assert_eq!(input.as_ref().unwrap().removed.as_ptr(), ptr);
+            }
+            DeferralProgress::Split { .. } => panic!("whole groups never split"),
+            DeferralProgress::NoPartial(input) => break input,
+        }
+    };
+    assert_eq!(scanning, 1, "one member per credit");
+    assert_eq!(passed.removed.as_ptr(), ptr);
+    assert!(native.deferred_slots().is_empty());
+}
+
+#[test]
+fn collected_partial_group_mint_requires_deferred_slots_submitted() {
+    let (_dir, _pins, mut native, slots) = collected_case(
+        6,
+        Box::new(|owned, _| {
+            drop(owned);
+            Ok(())
+        }),
+    );
+    native.combine_slot_groups(&[&[0, 1], &[2, 3], &[4, 5]]);
+    let q = native.observe_q();
+    let pool = SemanticResourcePool::reference_limit(COLLECTED_POOL_BYTES);
+    let reserve = pool.reserver();
+    let mut input = Some(collected_input(
+        vec![
+            slots[0].clone(),
+            slots[1].clone(),
+            slots[2].clone(),
+            slots[4].clone(),
+        ],
+        reserve.reserve(COLLECTED_INPUT_BYTES).unwrap(),
+    ));
+    let whole = loop {
+        match native.defer(&q, &mut input, &reserve, 1).unwrap() {
+            DeferralProgress::Split { whole, .. } => break whole,
+            DeferralProgress::Scanning | DeferralProgress::Yielded => {}
+            DeferralProgress::NoPartial(_) => panic!("partial groups must split"),
+        }
+    };
+    assert_eq!(native.deferred_slots(), &BTreeSet::from([2, 4]));
+    let mut whole = Some(whole);
+    let ticket = collected_prepare_to_ticket(&mut native, &q, &mut whole, &reserve).unwrap();
+    collected_submit(&mut native, &q, &ticket);
+    drop(collected_close(&mut native, &q, &ticket));
+    // A terminal submit that held back a deferred link proves nothing.
+    let submitted = native.submit_terminal_links(&BTreeSet::from([4]));
+    assert_eq!(submitted, BTreeSet::from([2, 3]));
+    assert!(!super::super::deferred_slots_proven(
+        native.deferred_slots(),
+        &submitted
+    ));
+    // Submitting the held link completes the proof.
+    let rest = native.submit_terminal_links(&BTreeSet::new());
+    assert_eq!(rest, BTreeSet::from([4, 5]));
+    let submitted: BTreeSet<u32> = submitted.union(&rest).copied().collect();
+    assert!(super::super::deferred_slots_proven(
+        native.deferred_slots(),
+        &submitted
+    ));
+    let receipt = native.join();
+    assert!(receipt.completed);
+    // Without a deferral the mint gate is vacuous.
+    assert!(super::super::deferred_slots_proven(
+        &BTreeSet::new(),
+        &BTreeSet::new()
+    ));
+}

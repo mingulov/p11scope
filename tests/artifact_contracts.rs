@@ -3837,6 +3837,90 @@ trap - EXIT
 }
 
 #[test]
+fn snapshot_fails_for_zombie_leader_with_live_thread() {
+    let directory = tempfile::tempdir().expect("temporary thread-group directory");
+    let script = directory.path().join("thread-group.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; wait "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+cat > "$work/thread-leader.c" <<'C'
+#include <pthread.h>
+#include <unistd.h>
+static void *sleeper(void *arg) {
+    (void)arg;
+    sleep(30);
+    return NULL;
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, sleeper, NULL) != 0) return 1;
+    sleep(1);
+    pthread_exit(NULL);
+    return 0;
+}
+C
+cc -pthread -O2 -o "$work/thread-leader" "$work/thread-leader.c"
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" "$work/thread-leader"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+attempt=0
+while :; do
+    tgid_state=$(awk '$1 == "State:" { print $2; exit }' "/proc/$leader/status")
+    task_count=$(ls -d "/proc/$leader/task/"[0-9]* 2>/dev/null | wc -l)
+    live_tasks=$(for task in "/proc/$leader/task/"[0-9]*; do awk '$1 == "State:" { print $2; exit }' "$task/status" 2>/dev/null; done | grep -Ev '^(Z|X|x)$' | wc -l)
+    [ "$tgid_state" = Z ] && [ "$task_count" = 2 ] && [ "$live_tasks" = 1 ] && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "thread-group never reached zombie-leader/live-thread state" >&2; exit 1; }
+    sleep 0.05
+done
+python3 -c 'import sys; open(f"/proc/{sys.argv[1]}/exe", "rb")' "$leader" 2>/dev/null && { echo "zombie leader exe unexpectedly readable" >&2; exit 1; } || true
+if snapshot_user_process_session "$sid" > "$work/members.json" 2> "$work/snapshot.err"; then
+    echo "snapshot unexpectedly succeeded for zombie leader with live thread" >&2
+    cat "$work/members.json" >&2
+    exit 1
+fi
+[ "$(cat "$work/members.json")" != "[]" ]
+grep -Fq "cannot close process-group member $leader" "$work/snapshot.err"
+[ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$leader/status")" = Z ]
+live_after=$(for task in "/proc/$leader/task/"[0-9]*; do awk '$1 == "State:" { print $2; exit }' "$task/status" 2>/dev/null; done | grep -Ev '^(Z|X|x)$' | wc -l)
+[ "$live_after" = 1 ]
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+    )
+    .expect("write thread-group script");
+    // SLACK hang guard: the script's own waits are event-driven or bounded,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(20);
+    let output = Command::new("timeout")
+        .args(["--kill-after=2s", bound.as_str(), "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise thread-group snapshot");
+    assert!(
+        output.status.success(),
+        "thread-group snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn user_process_session_lifecycle_is_identity_pinned() {
     let output = Command::new("sh")
         .args([

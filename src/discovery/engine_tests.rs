@@ -48866,3 +48866,105 @@ fn collected_graph_matches_conservative_reference() {
     assert!(outcome.accepted(), "pair 2 replay commits");
     facts_assert_twins_match(&case.engine, &twin_case.engine, "pair 2");
 }
+
+/// T8 helper: the `engine_lowers_export_table_owner_and_prefix`
+/// lowered module for the test process itself.
+fn facts_lowered_self_export() -> (ProcessView, ScannedModule) {
+    use p11scope_ebpf_common::{DISCOVERY_KIND_FUNCTION_LIST_RETURN, DiscoveryRecord};
+
+    let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
+    let executable = std::env::current_exe().unwrap();
+    let executable = executable.canonicalize().unwrap_or(executable);
+    let owner = maps
+        .iter()
+        .find(|mapping| {
+            mapping.inode != 0
+                && mapping.permissions[0] == b'r'
+                && mapping.permissions[2] != b'x'
+                && matches!(
+                    map_index.resolve(mapping.start),
+                    Resolved::File {
+                        path: MappedPath::Usable(ref path),
+                        ..
+                    } if path == &executable
+                )
+        })
+        .expect("the test executable has a file-backed data mapping");
+    let code = maps
+        .iter()
+        .find(|mapping| {
+            mapping.inode == owner.inode
+                && mapping.device == owner.device
+                && mapping.permissions[2] == b'x'
+        })
+        .expect("the test executable has a matching code mapping");
+
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = 1;
+    record.table_ptr = owner.start;
+    record.version_major = 2;
+    record.version_minor = 40;
+    record.pointers[0] = code.start;
+    record.pointers_attempted = 1;
+    record.completed_prefix = 1;
+    record.usable_n = 1;
+
+    let hooks = crate::discovery::hooks::HookRegistry::builtin();
+    let limits = ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    };
+    let mut budget = CaptureWorkBudget::new(limits);
+    let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
+    let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
+        .expect("the structurally valid record lowers")
+        .expect("one usable pointer gives one table");
+    (view, lowered)
+}
+
+#[test]
+fn collected_finish_lowered_original_is_consumed_without_pin_io() {
+    let (view, lowered) = facts_lowered_self_export();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let revision = engine.pinned.revision();
+    let modules = engine.modules.len();
+    engine.collected_finish_actions = Some(1);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = engine
+        .apply_lowered_module(lowered, 0, 1_000, &mut session, &mut additions, &mut pending)
+        .unwrap();
+    assert_eq!(
+        engine.pinned.revision(),
+        revision,
+        "no pin I/O runs under the terminal stop"
+    );
+    assert!(
+        matches!(
+            outcome,
+            DiscoveryRecordOutcome::Applied {
+                changed: false,
+                required_complete: false,
+            }
+        ),
+        "the record is consumed, not complete"
+    );
+    assert_eq!(engine.modules.len(), modules, "no module is bound");
+    assert!(engine.plan.slots.is_empty(), "no slot is added");
+    let skips: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live export discovery")
+        .collect();
+    assert_eq!(skips.len(), 1, "the refusal discloses once");
+    assert_eq!(
+        skips[0].reason,
+        "a publication lowered after the terminal stop was not admitted; its objects were not pinned"
+    );
+}

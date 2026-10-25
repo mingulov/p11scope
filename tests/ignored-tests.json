@@ -523,6 +523,24 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_ext4_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
+      "reason": "root: loop ext4 mounts plus eligible BTF/task_vma identity (5.15 shutdown included)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",
+      "reason": "root: loop overlay mounts (mkfs.ext4, mount, umount) plus eligible BTF/task_vma identity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
+      "reason": "RED by design: post-copy-up re-edge stands; root loop overlay mounts (lanes B only), never qualifies",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/engine_tests.rs",
       "path": "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
       "reason": "private manifest helper; invoked by DiscoveryLifecycleFixture",

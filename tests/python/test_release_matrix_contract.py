@@ -23,6 +23,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/release-matrix-contract.py"
 CHECKER_MOD = runpy.run_path(str(CHECKER))
+CHECK_IGNORED_MOD = runpy.run_path(str(ROOT / "scripts/check-ignored-tests.py"))
+PRIV_RUNNER = ROOT / "scripts/run-privileged-lib-tests.sh"
+OVERLAY_CELL = ("discovery::sweep_attribution::tests::d4_overlay_cells::"
+                "privileged_d4_overlay_xino_backend_parity")
+EXT4_CELL = ("discovery::sweep_attribution::tests::d4_ext4_cells::"
+             "privileged_d4_ext4_inode_reuse_confirmation_parity")
+COPY_UP_RED = ("discovery::sweep_attribution::tests::d4_overlay_cells::"
+               "overlay_copy_up_userspace_edge_absent")
 RUNNER = ROOT / "scripts/qualify-release-matrix.sh"
 LIB_A = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"
 LIB_B = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"
@@ -2363,6 +2371,69 @@ class MatrixContract(unittest.TestCase):
         self.assertTrue(report["pass"])
         self.assertFalse(report["full_stage5_ready"])
 
+    def test_d4_ready_pair_check_rejects_bad_pairs(self):
+        cells = {"D4:x": ("sel-x",)}
+        lanes = {"D4:x": ("6.1.188",)}
+        check_d4_ready_pair(("D4:x", "6.1.188"), cells, lanes, ("6.1.188",), {"sel-x"})
+        bad = [
+            # (pair, cells, lanes, lanes_all, runnable)
+            (("D4:y", "6.1.188"), cells, lanes, ("6.1.188",), {"sel-x"}),
+            (("D4:x", "9.9.9"), cells, lanes, ("6.1.188",), {"sel-x"}),
+            (("D4:x", "6.1.188"), cells, {"D4:x": ("6.6.157",)}, ("6.1.188", "6.6.157"), {"sel-x"}),
+            (("D4:x", "6.1.188"), cells, lanes, ("6.1.188",), set()),
+        ]
+        for pair, pair_cells, pair_lanes, lanes_all, runnable in bad:
+            with self.subTest(pair=pair), self.assertRaises(AssertionError):
+                check_d4_ready_pair(pair, pair_cells, pair_lanes, lanes_all, runnable)
+
+    def test_d4_ready_pairs_need_curated_selectors_and_listed_lanes(self):
+        cells = CHECKER_MOD["D4_CELLS"]
+        lanes = CHECKER_MOD["D4_LANES"]
+        ready = CHECKER_MOD["D4_READY"]
+        lanes_all = CHECKER_MOD["LANES"]
+        lists = CHECK_IGNORED_MOD["runner_lists"](PRIV_RUNNER)
+        runnable = (lists["DEFAULT_TESTS"] | lists["ALTERNATIVE_TESTS"] | lists["LONG_TESTS"])
+        self.assertTrue(ready, "the staged registry carries the qualified pairs")
+        for pair in sorted(ready):
+            with self.subTest(pair=pair):
+                check_d4_ready_pair(pair, cells, lanes, lanes_all, runnable)
+
+    def test_d4_cells_and_lanes_are_coherent(self):
+        cells = CHECKER_MOD["D4_CELLS"]
+        lanes = CHECKER_MOD["D4_LANES"]
+        lanes_all = CHECKER_MOD["LANES"]
+        self.assertEqual(set(cells), set(lanes), "every staged cell names its lanes")
+        self.assertEqual(cells["D4:overlay-6.1"], (OVERLAY_CELL,))
+        self.assertEqual(cells["D4:overlay-6.6"], (OVERLAY_CELL,))
+        self.assertEqual(cells["D4:overlay-6.8+"], (OVERLAY_CELL,))
+        self.assertEqual(cells["D4:ext4-inode-reuse"], (EXT4_CELL,))
+        for obligation, selectors in cells.items():
+            self.assertTrue(selectors, f"{obligation} names its qualifying cells")
+            for selector in selectors:
+                with self.subTest(selector=selector):
+                    self.assertIsInstance(selector, str)
+                    self.assertIn("::", selector)
+        for obligation, obligation_lanes in lanes.items():
+            for lane in obligation_lanes:
+                with self.subTest(obligation=obligation, lane=lane):
+                    self.assertIn(lane, lanes_all)
+
+    def test_d4_ext4_inode_reuse_stays_unready(self):
+        ready = CHECKER_MOD["D4_READY"]
+        self.assertEqual(
+            [pair for pair in ready if pair[0] == "D4:ext4-inode-reuse"], [],
+            "ext4-inode-reuse flips only when the fixed cell qualifies",
+        )
+
+    def test_d4_copy_up_red_cell_is_never_a_qualifying_cell(self):
+        cells = CHECKER_MOD["D4_CELLS"]
+        for obligation, selectors in cells.items():
+            with self.subTest(obligation=obligation):
+                self.assertNotIn(COPY_UP_RED, selectors)
+        lists = CHECK_IGNORED_MOD["runner_lists"](PRIV_RUNNER)
+        runnable = (lists["DEFAULT_TESTS"] | lists["ALTERNATIVE_TESTS"] | lists["LONG_TESTS"])
+        self.assertNotIn(COPY_UP_RED, runnable)
+
 
 OBJECT_EXTERNALS = r'''
 import hashlib, json, os, pathlib, pwd, stat, sys
@@ -2800,6 +2871,18 @@ class Registration(unittest.TestCase):
     def test_empty_selection_is_rejected(self):
         result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lib-test", "")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+
+def check_d4_ready_pair(pair, cells, lanes, lanes_all, runnable):
+    """A READY (obligation, lane) pair needs a registered obligation, a
+    listed lane of that obligation, and every qualifying selector curated
+    in the privileged runner's runnable lists."""
+    obligation, lane = pair
+    assert obligation in cells, f"ready obligation {obligation} has no D4_CELLS entry"
+    assert lane in lanes_all, f"ready lane {lane} is not a listed lane"
+    assert lane in lanes[obligation], f"ready lane {lane} is not in D4_LANES[{obligation}]"
+    for selector in cells[obligation]:
+        assert selector in runnable, f"ready selector {selector} is not curated runnable"
 
 
 if __name__ == "__main__":

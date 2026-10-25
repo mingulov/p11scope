@@ -212,6 +212,12 @@ discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192
+# D4 file-identity qualifying cells: ext4 inode-reuse confirmation
+# parity (own loop ext4 per row) and overlay xino backend parity (own
+# loop layers per mode). The copy-up RED reproducer stays skipped below:
+# it fails by design and never qualifies.
+discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
@@ -330,6 +336,9 @@ metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_l
 discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity
 discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity
 metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
+# D4 copy-up RED reproducer: fails by design (the post-copy-up D-C7-3
+# re-edge stands), investigation target, never qualifies.
+discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -363,6 +372,7 @@ SKIP_REASONS=(
 "needs root Btrfs disk TMPDIR and eligible task_vma/BTF for required actual hardlink alias kernel/userspace parity; run exact selector with --ignored --test-threads=1 on a matching prebuilt binary"
 "needs root/CAP_SYS_ADMIN, private child mount namespaces, Btrfs disk TMPDIR and eligible task_vma/BTF; actual bind alias parity requires a separately admitted exact ignored run with unchanged parent mounts"
 "needs proof1/artifacts0 prebuilt libtest and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
+"RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -570,6 +580,8 @@ list_mode() {
             *broad_p11kit_admission_arithmetic)
                 echo "$name :: preflight: host python3 must load libp11-kit.so.0" ;;
             *_never_attributed_on_ext4)
+                echo "$name :: preflight: host must mkfs.ext4 and loop-mount an ext4 image" ;;
+            *d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity)
                 echo "$name :: preflight: host must mkfs.ext4 and loop-mount an ext4 image" ;;
             *) echo "$name" ;;
         esac
@@ -793,6 +805,7 @@ main() {
             *_ia32) need_m32=1 ;;
             *broad_p11kit_admission_arithmetic) need_p11kit=1 ;;
             *_never_attributed_on_ext4) need_ext4loop=1 ;;
+            *d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity) need_ext4loop=1 ;;
         esac
     done
     if [ "$need_m32" -eq 1 ]; then

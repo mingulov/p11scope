@@ -894,8 +894,16 @@ pub fn encode_tid_selector(tgid: u32, tid: u32) -> io::Result<(IterLinkInfo, u32
     if tgid == 0 || tid == 0 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    // SAFETY: signal 0 sends nothing; only the existence check runs.
-    let done = unsafe { libc::tgkill(tgid as libc::pid_t, tid as libc::pid_t, 0) };
+    // SAFETY: signal 0 sends nothing; only the existence check runs. The raw
+    // syscall keeps the static musl build, whose libc has no tgkill wrapper.
+    let done = unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::c_long::from(tgid),
+            libc::c_long::from(tid),
+            0,
+        )
+    };
     if done != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EPERM) {

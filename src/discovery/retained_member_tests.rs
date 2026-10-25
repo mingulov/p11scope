@@ -357,7 +357,14 @@ fn poll_thread_dead(tgid: u32, tid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         // SAFETY: signal 0 sends nothing.
-        let done = unsafe { libc::tgkill(tgid as libc::pid_t, tid as libc::pid_t, 0) };
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                libc::c_long::from(tgid),
+                libc::c_long::from(tid),
+                0,
+            )
+        };
         if done != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
             return;
         }

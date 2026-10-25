@@ -75,6 +75,14 @@ valid_cluster() {
     esac
 }
 
+ledger_is() {
+    kc -n "$WL_NS" logs "$1" | grep -qx "LEDGER iterations=$2 nonzero_rv=0" || {
+        echo "$1 did not ledger $2 clean iterations" >&2
+        kc -n "$WL_NS" logs "$1" >&2
+        return 1
+    }
+}
+
 self_test() {
     python3 -I "$ORACLE" --self-test
     sh scripts/k8s-profile-entry.sh --self-test
@@ -102,6 +110,37 @@ self_test() {
         sh "$0" $bad >/dev/null 2>&1 || status=$?
         [ "$status" -eq 2 ] || { echo "kind-e2e exited $status (want 2) for: [$bad]" >&2; exit 1; }
     done
+    # The K pods print the JSON ledger: holder-entry execs the gated client
+    # built from tests/fixtures/public-cli/gated.c. Each form goes through
+    # ledger_is with a stubbed kc, no cluster.
+    kc() {
+        cat "$LEDGER_STUB_LOG"
+    }
+    ledger_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-ledger-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$ledger_stub'" EXIT
+    printf '%s\n' 'READY pid=1' \
+        'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":400},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
+        > "$ledger_stub/good.log"
+    printf '%s\n' 'READY pid=1' 'LEDGER iterations=400 nonzero_rv=0' > "$ledger_stub/legacy.log"
+    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":false,"functions":[]}' \
+        > "$ledger_stub/incomplete.log"
+    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":399,"successful":399}]}' \
+        > "$ledger_stub/short.log"
+    printf '%s\n' 'LEDGER {"schema":"p11scope/public-cli-ledger/v1","pid":1,"complete":true,"functions":[{"name":"C_GenerateRandom","attempts":400,"successful":399},{"name":"C_DigestInit","attempts":400,"successful":400},{"name":"C_Digest","attempts":400,"successful":400},{"name":"C_FindObjectsInit","attempts":400,"successful":400},{"name":"C_FindObjects","attempts":400,"successful":400},{"name":"C_FindObjectsFinal","attempts":400,"successful":400}]}' \
+        > "$ledger_stub/failed.log"
+    printf '%s\n' 'READY pid=1' > "$ledger_stub/missing.log"
+    LEDGER_STUB_LOG=$ledger_stub/good.log
+    ledger_is stub-pod 400 || { echo "good JSON LEDGER refused" >&2; exit 1; }
+    for bad in legacy incomplete short failed missing; do
+        LEDGER_STUB_LOG=$ledger_stub/$bad.log
+        if ledger_is stub-pod 400 >/dev/null 2>&1; then
+            echo "bad LEDGER accepted: $bad" >&2
+            exit 1
+        fi
+    done
+    rm -rf "$ledger_stub"
+    trap - EXIT
     echo "kind-e2e self-test: OK"
     exit 0
 }
@@ -327,14 +366,6 @@ release() {
         wait_log "$pod" '^LEDGER ' 120
     done
 }
-ledger_is() {
-    kc -n "$WL_NS" logs "$1" | grep -qx "LEDGER iterations=$2 nonzero_rv=0" || {
-        echo "$1 did not ledger $2 clean iterations" >&2
-        kc -n "$WL_NS" logs "$1" >&2
-        return 1
-    }
-}
-
 OBS=$(kc -n "$OBS_NS" get pod -l app.kubernetes.io/component=observer -o jsonpath='{.items[0].metadata.name}')
 [ -n "$OBS" ] || { echo "no observer pod" >&2; exit 1; }
 observe() {

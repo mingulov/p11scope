@@ -3260,7 +3260,42 @@ fn instance_s1_does_not_change_physical_totals() {
         1,
     ))["edges"]
         .clone();
-    assert_eq!(before, after);
+    // Instance claims must not change physical totals: every edge field
+    // renders identically before and after except the per-edge semantic
+    // summary, which claimed children withhold by design (the F1 ruling).
+    let before_edges = before.as_array().expect("edges array");
+    let after_edges = after.as_array().expect("edges array");
+    assert_eq!(
+        before_edges.len(),
+        after_edges.len(),
+        "claims add no edges"
+    );
+    for (position, (lhs, rhs)) in before_edges.iter().zip(after_edges.iter()).enumerate() {
+        let lhs_object = lhs.as_object().expect("edge object");
+        let rhs_object = rhs.as_object().expect("edge object");
+        assert_eq!(
+            lhs_object.len(),
+            rhs_object.len(),
+            "edge {position} keeps its fields under instance claims"
+        );
+        for (field, lhs_value) in lhs_object {
+            if field == "semantics" {
+                continue;
+            }
+            assert_eq!(
+                Some(lhs_value),
+                rhs_object.get(field),
+                "edge {position} field {field} unchanged by instance claims"
+            );
+        }
+        assert_eq!(
+            rhs_object
+                .get("semantics")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown (per-edge summary withheld; see semantic children)"),
+            "edge {position} withholds its summary under claimed children"
+        );
+    }
 }
 
 #[test]

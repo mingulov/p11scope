@@ -1947,10 +1947,11 @@ struct ClassicDriver<'a> {
     /// retained step (§8.3 item 7): ProviderStorage retries up to
     /// 100 hooks, mirroring the winding counter.
     joint_commit_retries: u16,
-    /// Tests-only spies: terminal-sequence runs, reclaim calls with
-    /// their end, finish-begin attempts, driver steps, joint commit
-    /// polls, promotion-work takes, held-install drives, caller
-    /// metadata services, classic commits.
+    /// Tests-only spies: terminal-sequence runs, reclaim takes with
+    /// their end (recorded after the take, never for a bare attempt),
+    /// finish-begin attempts, driver steps, joint commit polls,
+    /// promotion-work takes, held-install drives, caller metadata
+    /// services, classic commits.
     #[cfg(test)]
     terminal_seq_calls: usize,
     #[cfg(test)]
@@ -2795,13 +2796,15 @@ impl ClassicDriver<'_> {
     /// install implies outstanding) parks again rather than stranding
     /// the lane.
     fn reclaim_pending_install(&mut self, end: crate::inventory_promotion::PromotionEnd) {
+        let Some(pending) = self.pending_install.take() else {
+            return;
+        };
+        // The spy sits after the take: it records a handoff actually
+        // taken for reclaim (I4), never a bare attempt.
         #[cfg(test)]
         {
             self.reclaim_calls.push(end);
         }
-        let Some(pending) = self.pending_install.take() else {
-            return;
-        };
         if let Err(pending) = self.lifecycle.reclaim_install(pending, Some(end)) {
             self.pending_install = Some(pending);
         }

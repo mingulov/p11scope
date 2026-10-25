@@ -436,8 +436,8 @@ fn heldinstall_pre_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(
         driver.reclaim_calls,
-        vec![PromotionEnd::RunStopped],
-        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
+        Vec::<PromotionEnd>::new(),
+        "H: without a handoff the stop records no take"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -666,8 +666,8 @@ fn heldinstall_disp_body(scene: Scene, event: JointEvent) {
     );
     assert_eq!(
         driver.reclaim_calls,
-        vec![PromotionEnd::RunStopped],
-        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
+        Vec::<PromotionEnd>::new(),
+        "H: without a handoff the stop records no take"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -1065,8 +1065,8 @@ fn heldinstall_graph_body(scene: Scene, event: JointEvent) {
     assert_eq!(seat.drops.get(), 0, "O: held means kept");
     assert_eq!(
         driver.reclaim_calls,
-        vec![PromotionEnd::RunStopped],
-        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
+        Vec::<PromotionEnd>::new(),
+        "H: without a handoff the stop records no take"
     );
     assert!(
         driver.pending_install.is_none(),
@@ -1797,8 +1797,8 @@ fn heldinstall_pub_body(scene: Scene, event: JointEvent) {
     driver.on_stop_requested();
     assert_eq!(
         driver.reclaim_calls,
-        vec![PromotionEnd::RunStopped],
-        "H: the stop attempts the held-install reclaim once with RunStopped (no handoff held)"
+        Vec::<PromotionEnd>::new(),
+        "H: without a handoff the stop records no take"
     );
     assert!(
         driver.pending_install.is_none(),

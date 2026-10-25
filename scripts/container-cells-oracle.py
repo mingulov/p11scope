@@ -6,19 +6,25 @@ Subcommands: copy-up (D1 shared-layer / copy-up), late-reported (N4 never-seen
 late provider), --self-test. Every check ships a mutation this oracle refuses;
 see --self-test and tests/python/test_container_cells_oracle.py.
 
-D1 follows the live run-5/6 shape (Opus D1 identity investigation): pre-copy-up
-both backends collapse B onto A's module (same lower file, honest); the span
-shows B-pre's old edge ended plus a mapped edge to the new module with B's
-overlay key, and B2 plus the round-2 twin mapped to that module new-only, on
-BOTH backends with no named identity loss (B-pre's new edge is the known issue
-copy-up-stale-caller: B-pre still runs the lower file, and its later calls are
-not counted; the twin's post-copy-up calls are measured as missed or fully
-counted, never partial). Every kernel run reports backend kernel with a
-non-null fallback, recorded as "kernel proof checked no container edge", never
-as qualification. The copy-up itself is proven from facts.log (a different
-real inode in B's upper layer, same sha256). Fresh captures after B restarts
-attribute B exactly on lane B. The observer runs on the host in the initial
-PID namespace, so no pid_namespace cause is allowed.
+D1 follows the live run-5/6 shape (dev host, over the deep-scan cap) and
+the d1fed1 shape (Fedora host, under it): pre-copy-up both backends
+collapse B onto A's module (same lower file, honest); the span shows
+B-pre's old edge ended plus a mapped edge to the new module with B's
+overlay key, and B2 mapped to that module, on BOTH backends with no named
+identity loss (B-pre's new edge is the known issue copy-up-stale-caller:
+B-pre still runs the lower file, and its later calls are not counted).
+The round-2 twin is new-only when first scanned after the collapse
+resolves (over-cap hosts) or keeps an ended old edge plus the mapped new
+edge, both deep_scan, when first scanned before it (under-cap hosts);
+its post-copy-up calls are measured as missed or fully counted (old +
+new entries together), never partial. A forced-kernel run either names
+its first proof fallback or reports null (no proof attempted: the sweep
+skipped under the 256 cap, never a proof claim); the kernel and
+userspace legs of every phase must agree on every provider module key
+and edge shape. The copy-up itself is proven from facts.log (a different
+real inode in B's upper layer, same sha256). Fresh captures after B
+restarts attribute B exactly on lane B. The observer runs on the host in
+the initial PID namespace, so no pid_namespace cause is allowed.
 
 N4 follows the run-1 ruling: O exact and gap-free; L passes when scanned and
 EITHER a named gap from the frozen vocabulary references the late module OR
@@ -68,6 +74,44 @@ ALLOWED_LATE_SUBJECTS = {
 # strings): the raw maps path (src/discovery/scan.rs:4101), the pinned path
 # (src/inspect_system.rs:1828), /proc/<pid>/mem (src/discovery/scan.rs:4041),
 # and "device M:m inode I" (src/discovery/scan.rs:4104).
+
+# Finite kernel-fallback vocabulary a forced-kernel run may name (anything
+# else is drift, never silently accepted). Runtime labels come from
+# KernelFallbackReason::label (src/discovery/kernel_identity.rs:529-543)
+# plus the fixed target-run-limit detail rendered by
+# runtime_fallback_label (src/inspect_system.rs:3185-3191); selection and
+# session-setup labels come from IdentityUnavailable::label
+# (src/inspect_system.rs:2724-2736); the anchor-install sites note
+# anchor_not_installed directly (src/inspect_system.rs:3639, 3755).
+# zombie_batch is deliberately excluded: it never becomes the surfaced
+# first reason (src/discovery/kernel_identity.rs:521-525).
+KERNEL_FALLBACK_LABELS = frozenset({
+    "below_threshold",
+    "fd_headroom",
+    "fd_headroom: target_run_limit",
+    "anchor_not_installed",
+    "scope_unavailable",
+    "deadline",
+    "clock_unavailable",
+    "stream_invalid",
+    "target_unavailable",
+    "unvisited",
+    "conflicting_duplicate",
+    "no_btf",
+    "kernel_fix_missing",
+    "no_task_iter_pidfd",
+    "numbering_mismatch",
+    "numbering_unknown",
+    "permission_denied",
+    "load_failed",
+    "probe_failed",
+})
+
+KERNEL_PROOF_FINDING = (
+    "kernel runs recorded per capture (see runs): a fallback names the "
+    "first attempted proof's fallback, null is forced selection with no "
+    "proof attempted (the sweep skipped under the 256 cap)"
+)
 
 
 def known_late_subject(subject, late_module):
@@ -125,6 +169,46 @@ def module_keys(document, module_suffix=PROVIDER):
             keys[module["id"]] = (device["major"], device["minor"],
                                   module["identity"]["inode"])
     return keys
+
+
+def edge_shapes_by_key(records, keys):
+    """{(pid, module key): semantic edge shape} for provider edges.
+
+    Module ids are capture-local (first-seen order), so edges compare by
+    key; timestamps are excluded (independent captures).
+    """
+    shapes = {}
+    for (pid, module), edge in records.items():
+        shapes[(pid, keys[module])] = (
+            edge["mapping"]["evidence"], edge["mapping"]["state"],
+            edge["mapping"].get("reason"), edge["entries"]["count"],
+            edge["entries"]["coverage"].get("state"),
+            edge["entries"]["coverage"].get("reason"))
+    return shapes
+
+
+def assert_backends_agree(phase, kernel_document, userspace_document,
+                          module_suffix=PROVIDER):
+    """One phase's legs agree on every provider module key and edge shape.
+
+    Provider-scoped like every other D1 check (ambient modules churn
+    between the sequential legs); a divergence is product news, never
+    silently accepted.
+    """
+    kernel_keys = module_keys(kernel_document, module_suffix)
+    userspace_keys = module_keys(userspace_document, module_suffix)
+    assert sorted(kernel_keys.values()) == sorted(userspace_keys.values()), \
+        (phase, "backends disagree on provider module keys",
+         sorted(kernel_keys.values()), sorted(userspace_keys.values()))
+    _, kernel_records = edge_records(kernel_document, module_suffix)
+    _, userspace_records = edge_records(userspace_document, module_suffix)
+    kernel_shapes = edge_shapes_by_key(kernel_records, kernel_keys)
+    userspace_shapes = edge_shapes_by_key(userspace_records, userspace_keys)
+    divergent = sorted(pid_key
+                       for pid_key in set(kernel_shapes) | set(userspace_shapes)
+                       if kernel_shapes.get(pid_key) != userspace_shapes.get(pid_key))
+    assert kernel_shapes == userspace_shapes, \
+        (phase, "backends disagree on provider edges", divergent)
 
 
 COLLAPSE_RE = re.compile(
@@ -240,7 +324,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             pid_a, pid_b_pre, pid_b_span, pid_b_post, iters_a, iters_b, lane, dc73_note,
             facts_text, b_pre_round2_calls=None, b_pre_round2_pid=None,
             module_suffix=PROVIDER):
-    """D1: pre collapse, the run-5/6 span shape on both backends, fresh exactness.
+    """D1: pre collapse, the over/under-cap span shapes, fresh exactness.
 
     pid_b_pre is B's first process (lower mapper, alive through the span);
     pid_b_span is the second process in B that maps the upper copy inside the
@@ -250,11 +334,17 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     LEDGER total of the round-2 caller b_pre_round2_pid (default pid_b_pre)
     when the driver ran that round, else None (unmeasured). The driver runs
     round 2 on a second pre-copy-up mapper (gated.c runs one round per
-    process); that twin is first scanned after the collapse resolves, so its
-    only provider edge is the new module. The oracle accepts exactly two
-    outcomes for its post-copy-up calls: missed (counted 0, the R-41 known
-    issue) or fully counted (a future fix); anything in between fails named.
-    The same two outcomes apply to B-pre's own later calls when measured.
+    process); that twin takes exactly two span shapes: new-only (first
+    scanned after the collapse resolves, over-cap hosts) or old-ended plus
+    new-mapped with both edges deep_scan (first scanned before it,
+    under-cap hosts). The oracle accepts exactly two outcomes for its
+    post-copy-up calls: missed (counted 0, the R-41 known issue) or fully
+    counted (a future fix); the measured total is the old + new entries
+    together, and anything in between fails named. The same two outcomes
+    (new edge only) apply to B-pre's own later calls when measured. A
+    forced-kernel run names its first proof fallback or null (no proof
+    attempted); the kernel and userspace legs of every phase must agree
+    on every provider module key and edge shape.
     """
     assert lane in ("A", "B"), lane
     assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
@@ -280,14 +370,18 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                  ("fresh-userspace", fresh_userspace, "userspace"))
     for label, document, _want in documents:
         require_initial_observer(document, label)
-    kernel_proof = {"finding": "kernel proof checked no container edge",
-                    "runs": {}}
+    kernel_proof = {"finding": KERNEL_PROOF_FINDING, "runs": {}}
     for label, document, want in documents:
         identity = document["observation"]["identity"]
         assert identity["backend"] == want, (label, identity)
         if want == "kernel":
-            assert identity["fallback"], (label, "kernel run without a fallback",
-                                          identity)
+            # A forced-kernel capture either attempted kernel proof (the
+            # sweep ran: first finite fallback recorded) or attempted
+            # none (the sweep skipped under the 256 cap: null is the
+            # forced-selection label, never a proof claim).
+            fallback = identity["fallback"]
+            assert fallback is None or fallback in KERNEL_FALLBACK_LABELS, \
+                (label, "kernel run with an unknown fallback", identity)
         kernel_proof["runs"][label] = {"backend": identity["backend"],
                                        "fallback": identity["fallback"]}
 
@@ -391,6 +485,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                 ("bad round-2 pid", b_pre_round2_pid)
             round2_pid = b_pre_round2_pid
         legs = {}
+        shapes = {}
         for label, records in (("span_kernel", span_k_records),
                                ("span_userspace", span_u_records)):
             old_id, new_id = span_shapes[label.replace("_", "-")]
@@ -399,30 +494,66 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             m8_record = records[(round2_pid, new_id)]
             assert m8_record["mapping"]["state"] == "mapped", \
                 (label, "the round-2 new edge is not mapped", round2_pid)
+            m8_entries = m8_record["entries"]["count"]
+            m8_status = m8_record["entries"]["coverage"]["state"]
             if round2_pid == pid_b_pre:
                 # B-pre was first scanned before the collapse resolved, so it
                 # keeps its ended old edge next to the new one.
                 assert (round2_pid, old_id) in records, \
                     (label, "no old-module edge for B-pre", round2_pid)
                 m7_entries = records[(round2_pid, old_id)]["entries"]["count"]
-            else:
-                # A B process first scanned after the collapse resolves never
-                # had the old module: the twin is new-only by construction.
-                assert (round2_pid, old_id) not in records, \
-                    (label, "round-2 twin must not have an old-module edge",
-                     round2_pid)
+                counted = m8_entries
+            elif (round2_pid, old_id) not in records:
+                # First scanned after the collapse resolves (over-cap
+                # hosts): new-only.
+                shapes[label] = "new-only"
                 m7_entries = None
-            m8_entries = m8_record["entries"]["count"]
-            m8_status = m8_record["entries"]["coverage"]["state"]
-            assert m8_entries == 0 or m8_entries == b_pre_round2_calls, \
+                counted = m8_entries
+            else:
+                # First scanned before the collapse resolves (under-cap
+                # hosts: every pid deep-scanned): old-ended plus
+                # new-mapped, both deep_scan, like B-pre.
+                shapes[label] = "old-ended-plus-new"
+                m7_record = records[(round2_pid, old_id)]
+                assert m7_record["mapping"]["state"] == "ended", \
+                    (label, "the round-2 twin old edge is not ended",
+                     round2_pid)
+                assert m7_record["mapping"]["evidence"] == "deep_scan", \
+                    (label, "the round-2 twin old edge is not deep_scan",
+                     round2_pid)
+                assert m8_record["mapping"]["evidence"] == "deep_scan", \
+                    (label, "the round-2 twin new edge is not deep_scan",
+                     round2_pid)
+                m7_entries = m7_record["entries"]["count"]
+                counted = m7_entries + m8_entries
+            assert counted == 0 or counted == b_pre_round2_calls, \
                 (label, "partial round-2 count: neither missed nor fully counted",
-                 round2_pid, m8_entries, b_pre_round2_calls)
+                 round2_pid, counted, b_pre_round2_calls)
             legs[label] = {"m7_entries": m7_entries, "m8_entries": m8_entries,
-                           "m8_status": m8_status}
-        assert legs["span_kernel"]["m8_entries"] == legs["span_userspace"]["m8_entries"], \
+                           "m8_status": m8_status, "counted": counted}
+        assert legs["span_kernel"]["counted"] == legs["span_userspace"]["counted"], \
             ("span backends disagree on the round-2 count", legs)
         b_pre_round2 = {"measured": True, "calls": b_pre_round2_calls,
                         "pid": round2_pid, **legs}
+        if round2_pid != pid_b_pre:
+            assert shapes["span_kernel"] == shapes["span_userspace"], \
+                ("span backends disagree on the round-2 twin shape", shapes)
+            b_pre_round2["twin_shape"] = shapes["span_kernel"]
+
+    # Backend agreement runs after the round-2 rule so a partial count
+    # keeps its named failure instead of surfacing as a generic
+    # disagreement. Where no kernel proof ran both legs are the same
+    # userspace attribution; where proof ran it fell back to userspace
+    # decisions. Either way the legs must agree, except fresh on lane A:
+    # that leg allows edge-or-named-gap per leg, so mixed legs are legal.
+    for phase, kernel_document, userspace_document in (
+            ("pre", pre_kernel, pre_userspace),
+            ("span", span_kernel, span_userspace),
+            ("fresh", fresh_kernel, fresh_userspace)):
+        if phase == "fresh" and lane != "B":
+            continue
+        assert_backends_agree(phase, kernel_document, userspace_document,
+                              module_suffix)
 
     assert "copy-up-stale-caller" in dc73_note, \
         "run log without the copy-up-stale-caller disclosure"
@@ -1097,6 +1228,13 @@ def self_test():
                                                backend="userspace",
                                                fallback=None,
                                                modules=ST_MODULES_SPAN))
+    # Lane A allows edge-or-named-gap per fresh leg, so mixed legs pass
+    # without backend agreement on fresh.
+    lane_a_mixed = good_copy_up("A")
+    lane_a_mixed["fresh_userspace"] = good_inventory(
+        [st_edge(101, "m7")], [("x", "identity_mismatch: stale", 103)],
+        backend="userspace", fallback=None, modules=ST_MODULES_SPAN)
+    assert copy_up(**lane_a_mixed)["ok"] is True
     mutate_copy("fresh A inexact",
                 fresh_userspace=good_inventory([st_edge(103, "m8")],
                                                backend="userspace",
@@ -1269,7 +1407,7 @@ def main(argv):
         round2 = result["b_pre_round2"]
         if round2.get("measured"):
             print(measured_issue_line(round2["pid"], round2["calls"],
-                                      round2["span_kernel"]["m8_entries"],
+                                      round2["span_kernel"]["counted"],
                                       known["new_module"]),
                   file=sys.stderr)
     elif options.command == "late-reported":

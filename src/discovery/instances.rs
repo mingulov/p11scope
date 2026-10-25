@@ -653,6 +653,12 @@ pub(crate) struct RouterCounters {
     pub(crate) observed_evictions: u64,
     pub(crate) faulted_evictions: u64,
     pub(crate) retired_evictions: u64,
+    /// Proven absences that could not be recorded because the flag table
+    /// was full. Each latches the overflow: the next observation that
+    /// would otherwise continue mints instead (splitting the load
+    /// lifetime whose break is missing) and consumes the latch, so one
+    /// dropped flag costs at most one spurious split.
+    pub(crate) absence_overflows: u64,
 }
 
 /// Capture-owned instance registry and per-call router. `Debug` is redacted
@@ -671,6 +677,16 @@ pub(crate) struct InstanceRouter {
     /// consumes the flag; retained observations stay, so late calls
     /// stamped at the old epochs still join the old ID.
     absent: BTreeSet<(ImageKey, u32)>,
+    /// Latched when a proven absence could not be recorded because the
+    /// flag table is full. The next observation that would otherwise
+    /// continue mints instead and consumes the latch — fail closed by
+    /// splitting, never joining — so one dropped flag costs at most
+    /// one spurious split and the capture never churns. Same-epoch
+    /// scans neither mint nor consume (identical stamps cannot route
+    /// calls apart). Cleared by every era reset beside `absent`:
+    /// post-era calls cannot join pre-era lifetimes, so pre-era
+    /// breaks are moot. Bounded: one bit, no allocation past the cap.
+    absence_overflowed: bool,
     faulted: BTreeSet<(ImageKey, u32)>,
     /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
     /// The router can no longer name the discredited key, so every unknown
@@ -737,6 +753,7 @@ impl fmt::Debug for InstanceRouter {
             .field("pending", &self.pending.len())
             .field("sticky", &self.sticky)
             .field("absent_keys", &self.absent.len())
+            .field("absence_overflowed", &self.absence_overflowed)
             .field("misses", &self.misses)
             .field("miss_latched", &self.miss_latched)
             .field("minted", &self.minted)
@@ -754,6 +771,7 @@ impl InstanceRouter {
             limits,
             observed: BTreeMap::new(),
             absent: BTreeSet::new(),
+            absence_overflowed: false,
             faulted: BTreeSet::new(),
             faulted_overflowed: false,
             retired: BTreeSet::new(),
@@ -1128,8 +1146,15 @@ impl InstanceRouter {
         {
             return;
         }
+        if self.absent.contains(&(key, file)) {
+            return;
+        }
         if self.absent.len() < self.limits.observed_keys {
             self.absent.insert((key, file));
+        } else {
+            self.absence_overflowed = true;
+            self.counters.absence_overflows =
+                self.counters.absence_overflows.saturating_add(1);
         }
     }
 

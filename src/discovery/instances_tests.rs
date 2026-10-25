@@ -694,6 +694,173 @@ fn mapped_scan_at_unchanged_epochs_closes_the_absence_window() {
 }
 
 #[test]
+fn absence_overflow_forces_a_split_instead_of_joining() {
+    // At capacity the flag table cannot record the break, so the router
+    // latches an overflow and counts it instead of dropping the absence
+    // silently. The next global-only advance that would otherwise
+    // continue mints — fail closed by splitting — and consumes the
+    // latch, so later advances continue normally and the capture never
+    // churns. Late calls stamped at the old epochs still join the old ID.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 2,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "filling the table latches nothing"
+    );
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        1,
+        "the unrecordable break counts once"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New,
+        "the reload after a dropped break mints instead of continuing"
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
+    assert_eq!(
+        r.observe_legacy(observation(2, 2, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued,
+        "the latch is consumed by the forced split: no churn"
+    );
+    assert_eq!(joined(r.route(call(4, stamp(2, 2, 0), ip_in(BASE_A)))), new);
+}
+
+#[test]
+fn absence_below_capacity_mints_through_the_flag_without_overflow() {
+    // The healthy twin: below capacity the same script records the flag
+    // (no latch, the counter stays zero) and the reload mints through
+    // it; a further advance continues.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 3,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(
+        r.counters().absence_overflows,
+        0,
+        "a recorded break overflows nothing"
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let new = joined(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.instances_minted(), 2);
+    assert_eq!(
+        r.observe_legacy(observation(2, 2, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(joined(r.route(call(4, stamp(2, 2, 0), ip_in(BASE_A)))), new);
+}
+
+#[test]
+fn same_epoch_scan_under_absence_overflow_continues_without_consuming() {
+    // Identical stamps cannot route calls apart, so a mapped scan at
+    // unchanged epochs continues even while the overflow is latched —
+    // and it does not consume the latch: the next global-only advance
+    // still mints.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 2,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(r.counters().absence_overflows, 1);
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::Continued,
+        "a same-epoch scan continues: a mint could not split identical stamps"
+    );
+    assert_eq!(joined(r.route(call(2, stamp(2, 0, 0), ip_in(BASE_A)))), old);
+    assert_eq!(r.counters().absence_overflows, 1, "no new drop happened");
+    assert_eq!(
+        r.observe_legacy(observation(2, 1, 0, load(BASE_A))).0,
+        ObserveOutcome::New,
+        "the latch survived the same-epoch scan"
+    );
+    assert_ne!(
+        joined(r.route(call(3, stamp(2, 1, 0), ip_in(BASE_A)))),
+        old
+    );
+}
+
+#[test]
+fn absence_overflow_clears_on_fault_era_advance() {
+    // The overflow protects pre-era continuity only: a fault-era advance
+    // clears observations and flags alike, and post-era calls can never
+    // join pre-era lifetimes (the fault reading refuses), so the latch
+    // clears with the era instead of forcing a spurious post-era split.
+    // The counter stays as a lifetime diagnostic.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 2,
+            ..RouterLimits::default()
+        },
+    );
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    r.note_proven_absence(image(COOKIE + 1, 0), FILE);
+    r.note_proven_absence(image(COOKIE + 2, 0), FILE);
+    r.note_proven_absence(image(COOKIE, 0), FILE);
+    assert_eq!(r.counters().absence_overflows, 1);
+    assert!(r.audit(1, 0, 0).is_empty());
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))))
+            .0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(2, 1, 1, load(BASE_A))))
+            .0,
+        ObserveOutcome::Continued,
+        "the era cleared the latch: no spurious split"
+    );
+    assert_eq!(r.counters().absence_overflows, 1);
+}
+
+#[test]
 fn storage_null_move_breaks_global_only_continuity() {
     // Q1(b): a global-only advance observed after INSTANCE_COUNT.storage_null
     // moved mints instead of continuing: the counter proves a hook event the

@@ -384,9 +384,20 @@ enum Ext4Expect {
     DeadHolderRejected,
     RecycledRefused,
     DeletedMappingRefused,
+    DeletedMappingStaleKey,
     LiveHolderEdge,
     WrongFileNone,
     DataOnlyNone,
+}
+
+/// Whether the row behind `expected` binds a replacement file under a stale
+/// key, so its index key needs per-range proof: only the deleted-mapping
+/// row does (its kernel leg still runs zero proof — the unusable line
+/// refuses first). The stale-key driver asserts this; the ordinary
+/// precondition test pins it per row shape without root.
+fn ext4_row_takes_per_range_proof(expected: Ext4Expect) -> bool {
+    let _ = expected;
+    false
 }
 
 fn ext4_edge(pid: u32, key: ObjectKey, out: &SweepAttribution, side: &str) -> Result<(), String> {
@@ -547,6 +558,24 @@ fn assert_ext4_outcome(
             Ok(())
         }
         Ext4Expect::DeletedMappingRefused => {
+            if !target.maps_line.contains("(deleted)") {
+                return Err("ext4 deleted-mapping premise needs the (deleted) line".into());
+            }
+            if anchor.maps_line.contains("(deleted)") {
+                return Err("ext4 deleted-mapping premise needs a live anchor line".into());
+            }
+            if keys_equal {
+                return Err("ext4 deleted-mapping premise needs a fresh number".into());
+            }
+            assert_brsv_changed(target)?;
+            assert_brsv_live(anchor)?;
+            ext4_deleted(userspace, "userspace")?;
+            ext4_deleted(kernel, "kernel")?;
+            classified(evidence)?;
+            zero_run(evidence)?;
+            Ok(())
+        }
+        Ext4Expect::DeletedMappingStaleKey => {
             if !target.maps_line.contains("(deleted)") {
                 return Err("ext4 deleted-mapping premise needs the (deleted) line".into());
             }
@@ -1196,6 +1225,163 @@ fn ext4_deleted_evaluator_refuses_the_unusable_mapping() {
     );
 }
 
+/// The per-row proof precondition, pinned without root: each privileged
+/// row's (key, pinned identity, filesystem) shape classifies in production
+/// exactly as its kernel driver asserts. Only the deleted-mapping row binds
+/// a replacement file under a stale key, so only its key needs per-range
+/// proof.
+#[test]
+fn ext4_row_proof_classification_matches_index_shape() {
+    use p11scope_manifest::maps::Device;
+    let key = ObjectKey {
+        device: Device { major: 7, minor: 2 },
+        inode: 13,
+    };
+    let identity = |ino: u64| FileIdentity {
+        dev: libc::makedev(7, 2),
+        ino,
+    };
+    // (row, expectation, pinned inode): the recycled shape covers both the
+    // recycled and the equal-bytes rows (one shared setup).
+    let rows = [
+        ("recycled", Ext4Expect::RecycledRefused, 13),
+        ("deleted-mapping", Ext4Expect::DeletedMappingStaleKey, 14),
+        ("wrong-file", Ext4Expect::WrongFileNone, 13),
+        ("data-only", Ext4Expect::DataOnlyNone, 13),
+        ("equal-bytes", Ext4Expect::RecycledRefused, 13),
+        ("live-holder", Ext4Expect::LiveHolderEdge, 13),
+    ];
+    for (row, expected, pinned_ino) in rows {
+        let index = index_binding(key, identity(pinned_ino), Some(0xef53));
+        let takes_proof = ext4_row_takes_per_range_proof(expected);
+        assert_eq!(
+            index.map_files_keys().contains(&key),
+            takes_proof,
+            "ext4 {row}: the row's proof precondition must match its index shape"
+        );
+    }
+    // Legacy arms keep the identity assumption they were pinned with; no
+    // privileged row uses them anymore.
+    assert!(!ext4_row_takes_per_range_proof(
+        Ext4Expect::DeadHolderRejected
+    ));
+    assert!(!ext4_row_takes_per_range_proof(
+        Ext4Expect::DeletedMappingRefused
+    ));
+}
+
+/// The stale-key evaluator refuses the unusable line before proof: a deleted
+/// target line against a live anchor line under a FRESH number, with the
+/// per-range no-run evidence — while identity evidence (the uniform
+/// assumption), an edge, recycled numbers or live lines fail.
+#[test]
+fn ext4_stale_key_evaluator_refuses_before_proof() {
+    let pid = 4348u32;
+    let stat = |ino: u64, size: u64, mtime: i64| Ext4Stat {
+        dev: libc::makedev(7, 2),
+        ino,
+        size,
+        mtime_secs: mtime,
+        mtime_nanos: 0,
+    };
+    // Position 0: the live holder's deleted line (old number) against
+    // the current file's live line (fresh number from temp+rename).
+    let target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so (deleted)".into(),
+        map_files: stat(13, 8192, 100),
+        path_stat: stat(14, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    let anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 14 /lib.so".into(),
+        map_files: stat(14, 4096, 200),
+        path_stat: stat(14, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(target.maps_key() != anchor.maps_key(), "a fresh number");
+    let refused = synthetic_deleted();
+    assert_ext4_outcome(
+        pid,
+        &target,
+        &anchor,
+        &refused,
+        &refused,
+        &synthetic_no_run_stale_evidence(),
+        Ext4Expect::DeletedMappingStaleKey,
+    )
+    .expect("the stale key refuses before proof with its named loss");
+    // Identity evidence misrecords the stale key: it stays per-range.
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &refused,
+            &refused,
+            &synthetic_no_run_identity_evidence(),
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "the stale key stays a per-range key"
+    );
+    // An edge for the stale key joins and must fail.
+    let edged = synthetic_edged(pid, target.maps_key());
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &synthetic_no_run_stale_evidence(),
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "the stale identity must never join"
+    );
+    // Recycled numbers under a deleted line are not this row: a live
+    // deleted-mapping holder and a recycled number cannot coexist.
+    let recycled_anchor = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13, 4096, 200),
+        path_stat: stat(13, 4096, 200),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &target,
+            &recycled_anchor,
+            &refused,
+            &refused,
+            &synthetic_no_run_stale_evidence(),
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "temp+rename takes a fresh number"
+    );
+    // Two live lines are not a deleted mapping.
+    let live_target = Ext4Truth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 07:02 13 /lib.so".into(),
+        map_files: stat(13, 8192, 100),
+        path_stat: stat(13, 8192, 100),
+        statfs_magic: 0xef53,
+    };
+    assert!(
+        assert_ext4_outcome(
+            pid,
+            &live_target,
+            &anchor,
+            &refused,
+            &refused,
+            &synthetic_no_run_stale_evidence(),
+            Ext4Expect::DeletedMappingStaleKey,
+        )
+        .is_err(),
+        "refusal needs the deleted line"
+    );
+}
+
 /// The live-holder evaluator edges without per-range proof: a live pair
 /// under one key with an edge on both backends, the kernel leg through
 /// its AnchorNotInstalled fallback with zero reads — while a refusal, a
@@ -1347,6 +1533,20 @@ fn synthetic_no_run_identity_evidence() -> Ext4LegEvidence {
         userspace_reads: 0,
         per_range_key: false,
         no_proof_classification: Some("no kernel proof (identity key)"),
+    }
+}
+
+fn synthetic_no_run_stale_evidence() -> Ext4LegEvidence {
+    Ext4LegEvidence {
+        fallback: crate::discovery::kernel_identity::KernelFallbackTotals {
+            passes: 0,
+            pids: 0,
+            keys: 0,
+            first_reason: None,
+        },
+        userspace_reads: 0,
+        per_range_key: true,
+        no_proof_classification: Some("no kernel proof (unusable line)"),
     }
 }
 

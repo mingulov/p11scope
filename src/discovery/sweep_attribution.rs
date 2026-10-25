@@ -1762,12 +1762,15 @@ pub(crate) fn finish_confirmation<Io: ConfirmIo>(
         Err(error) => return Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error),
     };
     // The member exe re-read serves zombie leaders, whose own exe link
-    // is unreadable; live confirms see the ordinary read unchanged.
-    let after = prepared
-        .member
-        .as_ref()
-        .and_then(|member| member.read_exe_identity())
-        .or_else(|| io.exe(pid));
+    // is unreadable; live confirms see the ordinary read unchanged. A
+    // carried member is the ONLY exe authority: when its re-proof
+    // refuses (a same-binary nonleader exec released the survivor TID
+    // while the TGID exe serves the same binary), falling back to the
+    // TGID exe would confirm on pre-exec proofs.
+    let after = match prepared.member.as_ref() {
+        Some(member) => member.read_exe_identity(),
+        None => io.exe(pid),
+    };
     if controlled && !budget.poll_collection(1) {
         return stopped_confirmation();
     }

@@ -13550,6 +13550,170 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_winding_empty_mint_then_mint_retries_and_retires() {
+        // The first retire attempt after the handoff does not mint;
+        // the retry retires A instead of abandoning it. The joined
+        // retry never re-polls the wound-down: the session is gone,
+        // so reaping again would fail closed and strand B.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let io = WindDownIo::completing();
+        let polls = Rc::clone(&io.polls);
+        driver.semantic = Some(joint_lane(io, true));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let (source, _, _) = CountingSource::scripted(None);
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.coordinator.promotion_finish(),
+            "A's promotion finish runs"
+        );
+        // The seal drains before the first retire poll, as in
+        // production (a finished lane retains no frame past the take).
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "an empty mint holds A without abandoning it"
+        );
+        assert_eq!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Published,
+            "the held retry never abandons"
+        );
+        assert_eq!(polls.get(), 1, "the wind-down reaped once");
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|(subject, _)| subject != "joint wound-down failed"),
+            "no wound-down failure on the held mint: {:?}",
+            gaps(&mut driver)
+        );
+        let (source, mint_polls, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+        driver.completion_source = Some(Box::new(source));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the retry mint retires A"
+        );
+        assert!(
+            !driver.coordinator.promotion_finish(),
+            "the flag clears only after A's retire"
+        );
+        assert_eq!(
+            polls.get(),
+            1,
+            "the joined retry never re-polls the wound-down"
+        );
+        assert_eq!(
+            mint_polls.load(Ordering::SeqCst),
+            1,
+            "the retry mints once"
+        );
+    }
+
+    #[test]
+    fn joint_winding_retire_refused_then_ok_retries_without_reaping() {
+        // A refused retire retains its proof; the retry retires on
+        // the drained seal without reaping the wound-down again. The
+        // hold is staged h9 ledger work (the seal drain); the frame
+        // is already gone, as in production past the take.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let io = WindDownIo::completing();
+        let polls = Rc::clone(&io.polls);
+        driver.semantic = Some(joint_lane(io, true));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let (source, mint_polls, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            driver.coordinator.promotion_finish(),
+            "A's promotion finish runs"
+        );
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver
+            .coordinator
+            .joint_capture_mut()
+            .ledger_mut()
+            .charge(7, 64)
+            .expect("one h9 entry stages");
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "a refused retire holds A with its proof retained"
+        );
+        assert_eq!(polls.get(), 1, "the wind-down reaped once");
+        assert_eq!(
+            mint_polls.load(Ordering::SeqCst),
+            1,
+            "the refused proof minted once"
+        );
+        // The seal drains; the retry retires on the retained proof.
+        driver
+            .coordinator
+            .joint_capture_mut()
+            .ledger_mut()
+            .release(7, 64);
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the drained retry retires A"
+        );
+        assert!(
+            !driver.coordinator.promotion_finish(),
+            "the flag clears only after A's retire"
+        );
+        assert_eq!(
+            polls.get(),
+            1,
+            "the joined retry never re-polls the wound-down"
+        );
+        assert_eq!(
+            mint_polls.load(Ordering::SeqCst),
+            1,
+            "the retained proof is reused, never re-polled"
+        );
+    }
+
+    #[test]
     fn promotion_wind_down_scopes_promotion_finish_to_a() {
         for _ in 0..3 {
             let mut coordinator = coordinator();

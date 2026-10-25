@@ -4296,6 +4296,32 @@ mod joint_terminal_tests {
     }
 
     #[test]
+    fn take_after_recorded_wound_down_hands_off_finished_and_frame() {
+        // Production takes the live Session here, so a later
+        // `is_finished` reads false and no frame is retained. The
+        // substituted take mirrors that handoff: no native session
+        // ran, but finished and the frame go with it.
+        let mut coordinator = coordinator_for_test();
+        let (mut lane, _, _) = io_lane_for_test(DetachScript::Complete);
+        lane.test_finished = true;
+        lane.set_test_joint_frame(true);
+        assert_eq!(lane.poll_wound_down(&mut coordinator), Ok(true));
+        lane.set_test_joint_frame(false);
+        assert!(lane.take_joined_session().unwrap().is_none());
+        assert!(
+            !lane.is_finished(),
+            "the handoff takes finished with the session, like production"
+        );
+        assert!(
+            !lane.has_joint_frame(),
+            "the handoff takes the retained frame too"
+        );
+        // A second take stays not-ready, never a refusal: nothing is
+        // left to hand off, exactly like a taken live lane.
+        assert!(lane.take_joined_session().unwrap().is_none());
+    }
+
+    #[test]
     fn take_after_abandon_refuses() {
         let mut coordinator = coordinator_for_test();
         let mut lane = shell_lane_for_test();

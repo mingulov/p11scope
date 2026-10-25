@@ -989,6 +989,8 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     {
                         return self.userspace(batch, reason);
                     }
+                    #[cfg(test)]
+                    tests::maybe_expire_pre_member_check(&mut work);
                     if let Err(reason) = work.check(budget) {
                         // Reset before refusing: a stale target would
                         // hijack later ordinary runs. Fail closed on a

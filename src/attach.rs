@@ -4158,6 +4158,7 @@ fn attach_targets_observed_with(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
 fn attach_targets_observed_with_roots(
     slots: &[Slot],
     policy: CapturePolicy,

@@ -2833,10 +2833,11 @@ impl ClassicDriver<'_> {
     }
 
     /// Hold a Joint lane for exit after its finish failed (item 7,
-    /// §6.4): abandon where admitted (best-effort commit, first
-    /// error kept), then hold the whole lane. Returns the first
-    /// error: the disposition where latched, else the trigger cause.
-    /// Callers disclose the skips (finished or unadmitted holds).
+    /// §6.4): abandon where admitted (best-effort commit, whose
+    /// failure is kept as its own gap; first error kept), then hold
+    /// the whole lane. Returns the first error: the disposition
+    /// where latched, else the trigger cause. Callers disclose the
+    /// skips (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -2853,7 +2854,12 @@ impl ClassicDriver<'_> {
             && let Ok(batch) = lane.abandon_finish_for_exit(coordinator, reason)
         {
             coordinator.stage_semantic_batch(batch);
-            let _ = commit_semantic_finish(coordinator, &mut lane);
+            if let Err(error) = commit_semantic_finish(coordinator, &mut lane) {
+                coordinator.note_scope_gap(
+                    "joint abandon commit failed".to_string(),
+                    format!("{error:#}"),
+                );
+            }
         }
         ExitRetention::hold(lane);
         if latched {
@@ -2887,11 +2893,12 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| lane.joint_finish_disposition_required())
                 {
                     if let Some(owned) = lane.take() {
-                        *first_error = Some(Self::hold_joint_lane_for_exit(
+                        let error = Self::hold_joint_lane_for_exit(
                             owned,
                             coordinator,
                             "joint finish disposition required",
-                        ));
+                        );
+                        first_error.get_or_insert(error);
                     }
                     *finish = JointFinishDriver::Abandoned;
                     return JointStepOutcome::Abandoned;
@@ -2955,11 +2962,12 @@ impl ClassicDriver<'_> {
         match Self::begin_lane_finish(lane, coordinator) {
             JointFinishDriver::Abandoned => {
                 let lane = semantic.take().expect("joint lane");
-                self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                let error = Self::hold_joint_lane_for_exit(
                     lane,
                     coordinator,
                     "joint finish disposition required",
-                ));
+                );
+                self.joint_first_error.get_or_insert(error);
                 self.joint_finish = JointFinishDriver::Abandoned;
             }
             begun => {
@@ -2984,11 +2992,12 @@ impl ClassicDriver<'_> {
         };
         let latched = lane.joint_finish_disposition_required();
         let finished = lane.is_finished();
-        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+        let error = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             "second stop during joint finish",
-        ));
+        );
+        self.joint_first_error.get_or_insert(error);
         if finished || !latched {
             self.coordinator.note_scope_gap(
                 "joint finish held for exit".to_string(),
@@ -3275,11 +3284,12 @@ impl ClassicDriver<'_> {
                 match begun {
                     JointFinishDriver::Abandoned => {
                         let live = lane.take().expect("a begun lane holds");
-                        *first_error = Some(Self::hold_joint_lane_for_exit(
+                        let error = Self::hold_joint_lane_for_exit(
                             live,
                             coordinator,
                             "joint finish disposition required",
-                        ));
+                        );
+                        first_error.get_or_insert(error);
                         *finish = JointFinishDriver::Abandoned;
                     }
                     begun => {
@@ -3297,11 +3307,12 @@ impl ClassicDriver<'_> {
                     None => return NotBegunStep::Idle,
                 };
                 let live = lane.take().expect("a failed lane holds");
-                *first_error = Some(Self::hold_joint_lane_for_exit(
+                let error = Self::hold_joint_lane_for_exit(
                     live,
                     coordinator,
                     "joint finish disposition required",
-                ));
+                );
+                first_error.get_or_insert(error);
                 if finished {
                     let reason = coordinator
                         .collected_graph_refused()
@@ -3476,11 +3487,12 @@ impl ClassicDriver<'_> {
                 match Self::begin_lane_finish(lane, &mut *self.coordinator) {
                     JointFinishDriver::Abandoned => {
                         let lane = winding.lane.take().expect("winding lane");
-                        self.joint_first_error = Some(Self::hold_joint_lane_for_exit(
+                        let error = Self::hold_joint_lane_for_exit(
                             lane,
                             &mut *self.coordinator,
                             "joint finish disposition required",
-                        ));
+                        );
+                        self.joint_first_error.get_or_insert(error);
                         winding.finish = JointFinishDriver::Abandoned;
                     }
                     begun => {

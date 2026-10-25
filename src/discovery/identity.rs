@@ -2302,15 +2302,35 @@ mod conservative_copy {
 
         /// Installed-mode step: every field behaves as `advance` except the
         /// file share, which moves into the handoff when no live alias holds
-        /// this exact share. A full handoff refuses with the pool's own
-        /// storage refusal; the share is never dropped here.
+        /// this exact share, and the exports share, which drops our clone
+        /// when a Session-held clone proves our drop cannot be last. A full
+        /// handoff refuses with the pool's own storage refusal; the file share
+        /// is never dropped here.
         fn advance_installed(
             &mut self,
             source: Option<&PinnedObjects>,
             handoff: &mut RetiredFileHandoff,
             reserve: &SemanticResourceReserver,
         ) -> Result<bool, GraphRefusal> {
-            if self.field != 4 {
+            if self.field != 4 && self.field != 5 {
+                return self.advance(source);
+            }
+            if self.field == 5 {
+                if let Some(exports) = self.exports.as_ref() {
+                    let live_alias = source
+                        .and_then(|pins| pins.by_id.get(&self.id))
+                        .is_some_and(|held| Arc::ptr_eq(&held.exports, exports));
+                    if !live_alias && Arc::strong_count(exports) > 1 {
+                        // A Session-held clone (Singles retains the entry
+                        // through its terminal detach) proves our drop cannot
+                        // be the last one. Release our share as one leaf
+                        // instead of forgetting the graph. Even a race could
+                        // only free one slice bounded by standard names.
+                        drop(self.exports.take());
+                        self.field += 1;
+                        return Ok(false);
+                    }
+                }
                 return self.advance(source);
             }
             let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
@@ -5289,7 +5309,7 @@ mod conservative_copy {
                         continue;
                     }
                     let actual = pins.as_deref().and_then(|owner| owner.output.as_ref());
-                    self.reclaim_one(actual, None)?;
+                    self.reclaim_one(actual, None, false)?;
                     if self.phase == BindPhase::Reclaimed {
                         self.release_loan(pins)?;
                         return Ok(GraphStep::Ready);
@@ -5325,8 +5345,9 @@ mod conservative_copy {
             }
 
             /// Reclaims the old canonical modules against the live installed
-            /// pins: aliased exports are released, exclusive slices drain
-            /// element-wise, and the pins loan is released last.
+            /// pins: aliased exports are released, Session-shared exports drop
+            /// our clone, exclusive slices drain element-wise, and the pins
+            /// loan is released last.
             pub(crate) fn reclaim_installed(
                 &mut self,
                 pins: &mut PinnedConservativeCursor,
@@ -5359,7 +5380,7 @@ mod conservative_copy {
                 }
                 for _ in 0..work {
                     let old = pins.output.as_ref();
-                    self.reclaim_one(Some(live_pins), old)?;
+                    self.reclaim_one(Some(live_pins), old, true)?;
                     if self.phase == BindPhase::Reclaimed {
                         pins.rebind_owner = None;
                         return Ok(GraphStep::Ready);
@@ -5399,6 +5420,7 @@ mod conservative_copy {
                 &mut self,
                 pins: Option<&PinnedObjects>,
                 old: Option<&PinnedObjects>,
+                installed: bool,
             ) -> Result<(), GraphRefusal> {
                 if let Some(skip) = &mut self.old_skip_leaf {
                     if reclaim_skip(skip) {
@@ -5415,7 +5437,7 @@ mod conservative_copy {
                     return Ok(());
                 }
                 if let Some(module) = &mut self.reconciled_drain {
-                    if module.advance(pins, old)? {
+                    if module.advance(pins, old, installed)? {
                         self.reconciled_drain = None;
                     }
                     return Ok(());
@@ -5593,6 +5615,7 @@ mod conservative_copy {
                 &mut self,
                 pins: Option<&PinnedObjects>,
                 old: Option<&PinnedObjects>,
+                installed: bool,
             ) -> Result<bool, GraphRefusal> {
                 if let Some(module) = &mut self.module {
                     if module.advance() {
@@ -5615,6 +5638,13 @@ mod conservative_copy {
                         .and_then(|pins| pins.by_id.get(&self.object))
                         .is_some_and(|entry| Arc::ptr_eq(&entry.exports, exports));
                     if live_alias || old_alias {
+                        drop(self.exports.take());
+                        return Ok(false);
+                    }
+                    if installed && Arc::strong_count(exports) > 1 {
+                        // Installed mode only: a Session-held clone proves our
+                        // drop cannot be the last one. Release our share as
+                        // one leaf instead of forgetting the graph.
                         drop(self.exports.take());
                         return Ok(false);
                     }
@@ -7026,6 +7056,28 @@ pub(crate) mod test_fixture {
         for entry in pins.by_id.values_mut() {
             entry.file = Arc::clone(file);
         }
+    }
+
+    /// Attaches the scan-time ownership a `real_scan_pin` + `absorb` fixture
+    /// bypasses: the view's `ownership.pins` entry and its `raw_ownership`
+    /// row. Runs exactly the two inserts `record_scanned_candidate` performs
+    /// for an accepted entry; panics when the key/path names no pinned raw.
+    pub(crate) fn record_scan_ownership(
+        pins: &mut PinnedObjects,
+        view: ProcessViewId,
+        key: ObjectKey,
+        path: &str,
+    ) {
+        let normalized =
+            super::normalize_target_path(path).expect("test ownership path normalizes");
+        let (raw, id) = pins
+            .raw_to_id
+            .iter()
+            .find(|(raw, _)| raw.key == key && raw.path == normalized)
+            .map(|(raw, id)| (raw.clone(), *id))
+            .expect("test key/path names a pinned raw");
+        pins.ownership.entry(view).or_default().pins.push(id);
+        pins.raw_ownership.entry(view).or_default().insert(raw);
     }
 
     /// The mount both halves of a forged pre-6.8 split resolve in: the scan
@@ -12949,6 +13001,55 @@ mod tests {
             drop(pins_backing);
             drop(modules_backing);
             drop(handoff);
+        }
+    }
+
+    #[test]
+    fn test_fixture_record_scan_ownership_adds_product_shape_ownership() {
+        let shared_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 4096]).unwrap();
+        let shared_path = shared_file.path().to_path_buf();
+        let shared_path_text = shared_path.to_str().unwrap().to_string();
+        let keys: Vec<ObjectKey> = (0..2u64)
+            .map(|index| ObjectKey {
+                device: Device {
+                    major: 8,
+                    minor: index,
+                },
+                inode: 1000 + index,
+            })
+            .collect();
+        let mut pins = PinnedObjects::empty();
+        for (index, key) in keys.iter().enumerate() {
+            let absorbed = pins.absorb(test_fixture::real_scan_pin(
+                &shared_path,
+                Some(*key),
+                index as u64,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ));
+            assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        }
+        assert!(pins.ownership.is_empty(), "absorb bypasses scan ownership");
+        assert!(pins.raw_ownership.is_empty(), "absorb bypasses raw ownership");
+        for (index, key) in keys.iter().enumerate() {
+            test_fixture::record_scan_ownership(
+                &mut pins,
+                ProcessViewId(index as u32),
+                *key,
+                &shared_path_text,
+            );
+        }
+        assert_eq!(pins.ownership.len(), 2);
+        assert_eq!(pins.raw_ownership.len(), 2);
+        for (index, key) in keys.iter().enumerate() {
+            let view = ProcessViewId(index as u32);
+            let claims = pins.ownership.get(&view).unwrap();
+            assert_eq!(claims.pins.len(), 1);
+            let raws = pins.raw_ownership.get(&view).unwrap();
+            assert_eq!(raws.len(), 1);
+            let raw = raws.iter().next().unwrap();
+            assert_eq!(raw.key, *key);
+            assert_eq!(pins.raw_to_id.get(raw).copied(), Some(claims.pins[0]));
         }
     }
 }

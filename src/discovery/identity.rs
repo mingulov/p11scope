@@ -12633,30 +12633,17 @@ mod tests {
             drop(map);
         }
         for entries in [0, 1, 5, 11, 12, 64, 4096] {
-            for order in [
-                ascending(entries),
-                descending(entries),
-                xorshifted(entries),
-            ] {
+            for order in [ascending(entries), descending(entries), xorshifted(entries)] {
                 check_cover::<u64, u64>(entries, &order, |k| k, |k| k.wrapping_mul(3));
                 check_cover::<u64, ()>(entries, &order, |k| k, |_| ());
                 check_cover::<u64, [u64; 16]>(entries, &order, |k| k, |k| [k; 16]);
-                check_cover::<[u64; 4], [u64; 4]>(
-                    entries,
-                    &order,
-                    |k| [k, 0, 1, 2],
-                    |k| [k; 4],
-                );
+                check_cover::<[u64; 4], [u64; 4]>(entries, &order, |k| [k, 0, 1, 2], |k| [k; 4]);
             }
             if entries >= 2 {
                 check_half_removed::<u64, u64>(entries, |k| k, |k| k);
                 check_half_removed::<u64, ()>(entries, |k| k, |_| ());
                 check_half_removed::<u64, [u64; 16]>(entries, |k| k, |k| [k; 16]);
-                check_half_removed::<[u64; 4], [u64; 4]>(
-                    entries,
-                    |k| [k, 0, 1, 2],
-                    |k| [k; 4],
-                );
+                check_half_removed::<[u64; 4], [u64; 4]>(entries, |k| [k, 0, 1, 2], |k| [k; 4]);
             }
         }
         #[repr(align(16))]
@@ -12731,11 +12718,7 @@ mod tests {
                 &reserve,
             );
             assert!(outcome.is_ok(), "shared exports release: {outcome:?}");
-            assert_eq!(
-                handoff.len_for_test(),
-                2,
-                "files hand off, exports do not"
-            );
+            assert_eq!(handoff.len_for_test(), 2, "files hand off, exports do not");
             assert_eq!(Arc::strong_count(&outside_r1), 1);
             assert_eq!(Arc::strong_count(&outside_r2), 1);
             assert_eq!(outside_r1.len(), 2);
@@ -12848,11 +12831,8 @@ mod tests {
             );
             let pool = SemanticResourcePool::default();
             let reserve = pool.reserver();
-            let selection = conservative_selection(
-                &pool,
-                BTreeSet::from([ProcessViewId(3)]),
-                BTreeSet::new(),
-            );
+            let selection =
+                conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
             let mut pins = PinnedConservativeCursor::new();
             finish_conservative_copy(&source, &mut pins, &selection, &reserve);
             assert!(!pins.pinned().unwrap().by_id.contains_key(&id_r));
@@ -12880,7 +12860,10 @@ mod tests {
                 &mut handoff,
                 &reserve,
             );
-            assert!(outcome.is_ok(), "shared module exports release: {outcome:?}");
+            assert!(
+                outcome.is_ok(),
+                "shared module exports release: {outcome:?}"
+            );
             assert_eq!(
                 handoff.len_for_test(),
                 0,
@@ -12943,11 +12926,8 @@ mod tests {
             );
             let pool = SemanticResourcePool::default();
             let reserve = pool.reserver();
-            let selection = conservative_selection(
-                &pool,
-                BTreeSet::from([ProcessViewId(3)]),
-                BTreeSet::new(),
-            );
+            let selection =
+                conservative_selection(&pool, BTreeSet::from([ProcessViewId(3)]), BTreeSet::new());
             let mut pins = PinnedConservativeCursor::new();
             finish_conservative_copy(&source, &mut pins, &selection, &reserve);
             let rows: Vec<ScannedModule> = modules
@@ -13030,7 +13010,10 @@ mod tests {
             assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
         }
         assert!(pins.ownership.is_empty(), "absorb bypasses scan ownership");
-        assert!(pins.raw_ownership.is_empty(), "absorb bypasses raw ownership");
+        assert!(
+            pins.raw_ownership.is_empty(),
+            "absorb bypasses raw ownership"
+        );
         for (index, key) in keys.iter().enumerate() {
             test_fixture::record_scan_ownership(
                 &mut pins,

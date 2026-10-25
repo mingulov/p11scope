@@ -11167,30 +11167,17 @@ mod tests {
             drop(map);
         }
         for entries in [0, 1, 5, 11, 12, 64, 4096] {
-            for order in [
-                ascending(entries),
-                descending(entries),
-                xorshifted(entries),
-            ] {
+            for order in [ascending(entries), descending(entries), xorshifted(entries)] {
                 check_cover::<u64, u64>(entries, &order, |k| k, |k| k.wrapping_mul(3));
                 check_cover::<u64, ()>(entries, &order, |k| k, |_| ());
                 check_cover::<u64, [u64; 16]>(entries, &order, |k| k, |k| [k; 16]);
-                check_cover::<[u64; 4], [u64; 4]>(
-                    entries,
-                    &order,
-                    |k| [k, 0, 1, 2],
-                    |k| [k; 4],
-                );
+                check_cover::<[u64; 4], [u64; 4]>(entries, &order, |k| [k, 0, 1, 2], |k| [k; 4]);
             }
             if entries >= 2 {
                 check_half_removed::<u64, u64>(entries, |k| k, |k| k);
                 check_half_removed::<u64, ()>(entries, |k| k, |_| ());
                 check_half_removed::<u64, [u64; 16]>(entries, |k| k, |k| [k; 16]);
-                check_half_removed::<[u64; 4], [u64; 4]>(
-                    entries,
-                    |k| [k, 0, 1, 2],
-                    |k| [k; 4],
-                );
+                check_half_removed::<[u64; 4], [u64; 4]>(entries, |k| [k, 0, 1, 2], |k| [k; 4]);
             }
         }
         #[repr(align(16))]

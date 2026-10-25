@@ -457,10 +457,7 @@ mod tests {
         assert!(reserver.covers(&lease, 1024));
         assert!(!reserver.covers(&lease, 1025));
         drop(lease);
-        assert_eq!(
-            pool.snapshot().charged_bytes,
-            SEMANTIC_TRANSITION_SCRATCH
-        );
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
         assert_eq!(
             pool.snapshot().peak_charged_bytes,
             SEMANTIC_TRANSITION_SCRATCH + 1024
@@ -485,9 +482,6 @@ mod tests {
         assert!(!foreign.reserver().covers(&lease, 0));
         drop(lease);
         drop(foreign_lease);
-        assert_eq!(
-            pool.snapshot().charged_bytes,
-            SEMANTIC_TRANSITION_SCRATCH
-        );
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
     }
 }

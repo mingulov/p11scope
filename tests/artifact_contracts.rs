@@ -745,10 +745,21 @@ fn contracts_shard_count(ci: &str) -> Result<usize, String> {
 
 fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
     let lint = job_block(ci, "lint");
+    // The shipped configurations compile on push, not only on a manual
+    // dispatch: the static musl observer plus the P0 feature set on both
+    // libcs. A musl-only break (a libc wrapper with no musl binding) once
+    // landed and was found only by a manual build. The musl gates stay on
+    // default targets (lib and bins) until the product source fixes its
+    // three pre-existing musl-only breaks (two test-only check errors and
+    // one manifest clippy error); then they widen back to --all-targets
+    // and clippy.
     for gate in [
         "fmt --all -- --check",
         "check --locked --offline --workspace --all-targets",
         "clippy --locked --offline --workspace --all-targets -- -D warnings",
+        "check --locked --offline --workspace --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
+        "check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
     ] {
         if !step_calls(lint)
             .any(|call| call == format!("cargo +\"$(cat .release-rust-version)\" {gate}"))
@@ -773,6 +784,66 @@ fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
                  run as `{expected}`"
             ));
         }
+    }
+    Ok(())
+}
+
+/// The manual release preview builds both shipped capture modes, FULL and
+/// P0: one static musl pre-build, one official receipt run and one packaged
+/// public candidate each. The driver selects one mode per invocation
+/// (`--capture-mode full|p0`, default full), so a single receipt run can only
+/// ever prove one mode.
+fn assert_release_preview_builds_full_and_p0(ci: &str) -> Result<(), String> {
+    let preview = job_block(ci, "release-preview");
+    let cargo = "cargo +\"$(cat .release-rust-version)\"";
+    let evidence = "\"$RUNNER_TEMP/release-evidence";
+    for (marker, contract) in [
+        (
+            format!(
+                "{cargo} build --locked --offline --release --target x86_64-unknown-linux-musl"
+            ),
+            "FULL static pre-build",
+        ),
+        (
+            format!(
+                "{cargo} build --locked --offline --release --no-default-features \
+                 --features stub-object-attributes --target x86_64-unknown-linux-musl"
+            ),
+            "P0 static pre-build",
+        ),
+        (
+            format!("TMPDIR={evidence}\" scripts/build-release.sh {evidence}/receipt\""),
+            "FULL official receipt run",
+        ),
+        (
+            format!(
+                "TMPDIR={evidence}\" scripts/build-release.sh --capture-mode p0 \
+                 {evidence}/receipt-p0\""
+            ),
+            "P0 official receipt run",
+        ),
+        (
+            format!(
+                "python3 -I scripts/package-release.py \\\n            --receipt {evidence}/receipt\" \\"
+            ),
+            "FULL public candidate",
+        ),
+        (
+            format!(
+                "python3 -I scripts/package-release.py \\\n            --capture-mode p0 \\\n            --receipt {evidence}/receipt-p0\" \\"
+            ),
+            "P0 public candidate",
+        ),
+        (
+            format!("for receipt in {evidence}/receipt\" {evidence}/receipt-p0\"; do"),
+            "receipt summary over both receipts",
+        ),
+        (
+            "name: release-preview-public-assets-p0\n".to_string(),
+            "P0 public asset upload",
+        ),
+    ] {
+        require_contract_marker(preview, &marker, contract)?;
     }
     Ok(())
 }
@@ -9829,6 +9900,9 @@ fn hosted_python_privilege_covers_real_owned_launcher_call_sites() {
 /// ones the job runs
 /// in full — and the label says whether the script's `--self-test` runs in
 /// this job, so a lane whose self-test is hosted is not mislabelled as absent.
+/// The same test owns the workflow's gate pins: the lint offline gates
+/// (including the shipped musl/P0 configurations) and the release preview's
+/// FULL and P0 builds.
 #[test]
 fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let ci = read(".github/workflows/ci.yml");
@@ -10265,6 +10339,39 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
     assert_hosted_offline_gates(&ci).unwrap();
+    assert_release_preview_builds_full_and_p0(&ci).unwrap();
+    // A removed shipped-configuration step must fail, not silently narrow the
+    // push gate back to gnu FULL: drop each new lint gate line in turn.
+    for gate in [
+        "check --locked --offline --workspace --target x86_64-unknown-linux-musl",
+        "check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes",
+        "check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl",
+    ] {
+        let step = format!("- run: cargo +\"$(cat .release-rust-version)\" {gate}\n");
+        let dropped = ci.replacen(&step, "", 1);
+        assert!(
+            assert_hosted_offline_gates(&dropped).is_err(),
+            "removing the lint {gate} step must fail"
+        );
+        let online = gate.replacen(" --offline", "", 1);
+        let online_ci = ci.replacen(gate, &online, 1);
+        assert!(
+            assert_hosted_offline_gates(&online_ci).is_err(),
+            "removing --offline from the lint {gate} step must fail"
+        );
+    }
+    // The same for the preview's P0 half: without its own receipt run and
+    // packaging the job proves FULL only.
+    for marker in [
+        "scripts/build-release.sh --capture-mode p0",
+        "python3 -I scripts/package-release.py \\\n            --capture-mode p0 \\",
+    ] {
+        let dropped = ci.replacen(marker, "", 1);
+        assert!(
+            assert_release_preview_builds_full_and_p0(&dropped).is_err(),
+            "removing the preview {marker:?} step must fail"
+        );
+    }
     let bpf_driver = read("scripts/check-bpf-noninterference.py");
     assert_hosted_dependency_preparation(&ci, &bpf_driver).unwrap();
     for marker in [

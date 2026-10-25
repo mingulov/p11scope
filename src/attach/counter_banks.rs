@@ -5301,6 +5301,8 @@ pub(crate) mod tests {
         // At1024 possible CPUs a whole bank needs12,582,912 payload bytes.
         // The one-cell amount is only24,576: metadata and FD headroom are
         // deliberately ample, so forgetting the other511 cells is causal.
+        // The fixed kernel maps alone (~555 MiB at P=1024) exceed the 256 MiB
+        // cap, so even the funded envelope refuses the memory cap here.
         let geometry = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
         assert_eq!(geometry.bank_payload_bytes(1024), Ok(12_582_912));
         for enough in [false, true] {
@@ -5320,8 +5322,16 @@ pub(crate) mod tests {
             };
             let result = directory.stage_with(&mut io, &mut plan(1), envelope, &pool.reserver());
             if enough {
-                assert!(matches!(result, BankPublication::Published { .. }));
-                assert_eq!(io.maps.len(), 1);
+                assert_eq!(
+                    result,
+                    BankPublication::Refused(BankRefusal::BudgetExhausted {
+                        resource: "counter-memory-limit",
+                        needed: 568_068_096,
+                        available: 268_435_456,
+                    }),
+                    "funded P=1024 refuses the kernel map cap: {result:?}"
+                );
+                assert!(io.trace.is_empty() && io.maps.is_empty());
             } else {
                 assert_eq!(result, BankPublication::Refused(BankRefusal::Budget));
                 assert!(io.trace.is_empty() && io.maps.is_empty());
@@ -8307,12 +8317,12 @@ pub(crate) mod tests {
         );
         // Sixteen latency banks at P=256 (~620 MiB of payload) refuse against
         // a 256 MiB envelope before any allocation; counts and timestamps fit
-        // the same envelope, and latency fits once funded.
+        // the same envelope, and funded latency refuses the 256 MiB kernel map
+        // cap (fixed 143,394,816 plus 16 banks, needed 764,151,808).
         for (mode, retained, funded) in [
             (CounterMode::Counts, 256 * 1024 * 1024, true),
             (CounterMode::Timestamps, 256 * 1024 * 1024, true),
             (CounterMode::Latency, 256 * 1024 * 1024, false),
-            (CounterMode::Latency, 1024 * 1024 * 1024, true),
         ] {
             let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
             let baseline = pool.snapshot().charged_bytes;
@@ -8350,6 +8360,40 @@ pub(crate) mod tests {
                 assert_eq!(directory.allocated_high_water(), 0);
             }
         }
+        let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        let mut directory = BankDirectory::growth_v2_for(CounterMode::Latency);
+        let mut history = plan(8192);
+        let mut io = GrowthIo::new(&pool);
+        io.cpus = 256;
+        let publication = directory.stage_with(
+            &mut io,
+            &mut history,
+            BankReservation {
+                retained_bytes: 1024 * 1024 * 1024,
+                transient_bytes: 256 * 1024 * 1024,
+                metadata_bytes: 16 * 1024 * 1024,
+                file_descriptors: 131_072,
+            },
+            &pool.reserver(),
+        );
+        assert_eq!(
+            publication,
+            BankPublication::Refused(BankRefusal::BudgetExhausted {
+                resource: "counter-memory-limit",
+                needed: 764_151_808,
+                available: 268_435_456,
+            }),
+            "funded latency 16 banks refuse the kernel map cap: {publication:?}"
+        );
+        assert!(
+            io.trace.is_empty(),
+            "memory-cap refusal precedes native work: {:?}",
+            io.trace
+        );
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+        assert!(directory.published_indices().next().is_none());
+        assert_eq!(directory.allocated_high_water(), 0);
     }
 
     #[test]

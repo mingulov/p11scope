@@ -4268,14 +4268,19 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             self.step_retained_joint_finish();
             return;
         }
-        // Item 9: while the final Joint finish polls or reaps outside
-        // any promotion, the hook runs only the display tick above
-        // and one driver step.
+        // Item 9: while the final Joint finish polls or reaps, the
+        // hook runs only the display tick above and one driver
+        // step. No promotion conjunct: the promotion flag arms only
+        // on a fresh wind-down begin (which leaves the driver
+        // finish NotBegun) and disarms when the winding retires,
+        // before any new lane seats — so a begun driver finish
+        // never coincides with an armed flag (R1.4 minor ruling:
+        // the old `!promotion_finish()` conjunct was dead by
+        // design; mutant H is inapplicable).
         if matches!(
             self.joint_finish,
             JointFinishDriver::Polling | JointFinishDriver::Published
-        ) && !self.coordinator.promotion_finish()
-        {
+        ) {
             #[cfg(test)]
             {
                 self.joint_step_calls += 1;

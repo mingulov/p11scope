@@ -3767,6 +3767,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn production_geometry_selects_mode_and_gates_token() {
+        const FULL_OUTPUTS: &str =
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2";
+        // Omitted builds carry empty statics, so byte identity is ambiguous
+        // and selection refuses; legacy still resolves. This arm asserts
+        // instead of early-returning, so =0/WIDE/SMALL builds execute it.
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            for mode in [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ] {
+                assert!(
+                    counter_object_for_mode(mode).is_empty(),
+                    "{mode:?} must be omitted when disabled"
+                );
+            }
+            assert_eq!(
+                production_geometry_for(counter_object_for_mode(CounterMode::Counts), ""),
+                Err(BankRefusal::Shape(BankShapeCause::ObjectAmbiguous))
+            );
+            assert_eq!(
+                production_geometry_for(b"", FULL_OUTPUTS),
+                Err(BankRefusal::Shape(BankShapeCause::ObjectAmbiguous))
+            );
+            assert_eq!(
+                production_geometry_for(b"", "counts-bank-proof"),
+                Ok(BankGeometry::legacy())
+            );
+            return;
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert_eq!(
+                production_geometry_for(counter_object_for_mode(mode), FULL_OUTPUTS),
+                Ok(BankGeometry::checked(mode, 16, 512).unwrap()),
+                "{mode:?} positive"
+            );
+        }
+        assert_eq!(
+            production_geometry_for(
+                counter_object_for_mode(CounterMode::Timestamps),
+                "counts-bank-growth-v2",
+            ),
+            Err(BankRefusal::Shape(BankShapeCause::TokenNotEmitted)),
+            "a token missing from the emitted outputs refuses"
+        );
+        assert_eq!(
+            production_geometry_for(crate::EBPF_OBJECT, FULL_OUTPUTS),
+            Err(BankRefusal::Shape(BankShapeCause::ObjectUnknown)),
+            "an unknown object refuses"
+        );
+        assert_eq!(
+            production_geometry_for(crate::EBPF_OBJECT, "counts-bank-proof"),
+            Ok(BankGeometry::legacy()),
+            "legacy resolves without consulting embedded bytes"
+        );
+    }
+
+    #[test]
     fn embedded_bank_objects_refuse_wrong_reader_expectations() {
         if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
             assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");

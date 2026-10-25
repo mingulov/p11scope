@@ -196,12 +196,11 @@ jobs:
       # Every shipped configuration compiles on push: the static musl
       # observer plus the P0 feature set on both libcs. A musl-only break (a
       # libc wrapper with no musl binding) once landed and was found only by
-      # a manual build. The musl gates stay on default targets (lib and
-      # bins) until the product source fixes its three pre-existing
-      # musl-only breaks; then they widen back to --all-targets and clippy.
-      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --target x86_64-unknown-linux-musl
+      # a manual build.
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
       - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes
-      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets --no-default-features --features stub-object-attributes --target x86_64-unknown-linux-musl
       # libtest exits 0 when a filter matches nothing, so this step proves a test
       # actually ran rather than trusting the source to keep naming one. A rename,
       # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the

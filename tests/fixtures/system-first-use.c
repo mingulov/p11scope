@@ -145,25 +145,141 @@ static int wait_gate(const char *path) {
 
 #include "system-first-use-receipt.h"
 
+/* Cell knobs (sweep runs only; absent knobs keep default behavior byte for
+ * byte, including the usage line and the ledger phases):
+ *   --delay-us 0|10|100|1000   sleep between table verification and the
+ *                              entry gate; the ledger stamps prove it
+ *   --mode known-inode         label only; the provider file is used as is
+ *   --mode equal-bytes-new-inode
+ *                              copy the provider bytes to <ledger> +
+ *                              ".provider-copy.so" and use the copy (new
+ *                              inode, identical bytes)
+ *   --mode unseen-provider     copy plus 256 appended zero bytes (new inode,
+ *                              differing bytes); trailing bytes never map
+ *   --mode late-heap           refuse unless the table is heap-published
+ * (T2_HEAP_TABLE build); a file-backed table exits 1 before the entry gate.
+ * With knobs present the driver emits one "cell" row after the entry gate
+ * carrying mode, delay_us and armed (ungated: both gates "-"; prearmed:
+ * both gates already present and neither wait blocked; gated: a gate
+ * waited, which never counts as a positive). Copy modes add source_dev/
+ * source_ino/bytes_equal/size_delta. Copy setup failures exit 5.
+ */
+static int parse_cell_knobs(int argc, char **argv, int base,
+                            unsigned *delay_us, const char **mode) {
+    int have_delay = 0, have_mode = 0;
+    *delay_us = 0;
+    *mode = "known-inode";
+    for (int i = base; i < argc; i += 2) {
+        if (!strcmp(argv[i], "--delay-us") && !have_delay && i + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long value = strtoul(argv[i + 1], &end, 10);
+            if (errno || !end || *end || (value != 0 && value != 10 &&
+                value != 100 && value != 1000)) return -1;
+            *delay_us = (unsigned)value;
+            have_delay = 1;
+        } else if (!strcmp(argv[i], "--mode") && !have_mode && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "known-inode") &&
+                strcmp(argv[i + 1], "equal-bytes-new-inode") &&
+                strcmp(argv[i + 1], "unseen-provider") &&
+                strcmp(argv[i + 1], "late-heap")) return -1;
+            *mode = argv[i + 1];
+            have_mode = 1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int copy_provider_bytes(const char *source, const char *dest,
+                               int unseen) {
+    int in = open(source, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return -1;
+    int out = open(dest, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0) { close(in); return -1; }
+    char chunk[65536];
+    ssize_t got;
+    int failed = 0;
+    while ((got = read(in, chunk, sizeof chunk)) != 0) {
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            failed = 1;
+            break;
+        }
+        if (write_all(out, chunk, (size_t)got)) { failed = 1; break; }
+    }
+    if (!failed && unseen) {
+        static const char zeros[256] = {0};
+        if (write_all(out, zeros, sizeof zeros)) failed = 1;
+    }
+    if (close(in)) failed = 1;
+    if (close(out)) failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int sleep_cell_delay(unsigned delay_us) {
+    if (!delay_us) return 0;
+    struct timespec wait = {(time_t)(delay_us / 1000000),
+                            (long)(delay_us % 1000000) * 1000L};
+    while (nanosleep(&wait, &wait) && errno == EINTR) {}
+    return 0;
+}
+
+static int wait_gate_timed(const char *path, int *waited) {
+    int present = !strcmp(path, "-") || !access(path, F_OK);
+    uint64_t start = now_ns();
+    if (wait_gate(path)) return 1;
+    *waited = !present || now_ns() - start > UINT64_C(5000000);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 5 && argc != 8) {
+    int receipt_form = argc == 8 || argc == 10 || argc == 12;
+    if (!receipt_form && argc != 5 && argc != 7 && argc != 9) {
         fprintf(stderr, "usage: %s provider.so ledger.jsonl publication-gate|- entry-gate|- [receipt-fd nonce receipt-dir]\n", argv[0]);
         return 2;
     }
-    int receipt_fd = argc == 8 ? receipt_arguments(argv[5], argv[6]) : -1;
-    if (argc == 8 && receipt_fd < 0) {
+    unsigned delay_us = 0;
+    const char *mode = "known-inode";
+    int base = receipt_form ? 8 : 5;
+    int knobs = argc > base;
+    if (parse_cell_knobs(argc, argv, base, &delay_us, &mode)) {
+        fprintf(stderr, "usage: %s provider.so ledger.jsonl publication-gate|- entry-gate|- [receipt-fd nonce receipt-dir]\n", argv[0]);
+        return 2;
+    }
+    int receipt_fd = receipt_form ? receipt_arguments(argv[5], argv[6]) : -1;
+    if (receipt_form && receipt_fd < 0) {
         fprintf(stderr, "invalid receipt arguments\n");
         return 2;
     }
+    const char *provider_path = argv[1];
+    char copy_path[4096];
+    struct stat source_identity;
+    int copy_mode = knobs && (strcmp(mode, "equal-bytes-new-inode") == 0 ||
+                              strcmp(mode, "unseen-provider") == 0);
+    int unseen = knobs && strcmp(mode, "unseen-provider") == 0;
+    if (copy_mode) {
+        int length = snprintf(copy_path, sizeof copy_path, "%s.provider-copy.so",
+                              argv[2]);
+        if (length < 0 || (size_t)length >= sizeof copy_path ||
+            stat(argv[1], &source_identity) ||
+            copy_provider_bytes(argv[1], copy_path, unseen)) {
+            perror("provider copy");
+            return 5;
+        }
+        provider_path = copy_path;
+    }
     birth = process_birth();
-    if (!birth || stat(argv[1], &module_identity) ||
+    if (!birth || stat(provider_path, &module_identity) ||
         stat("/proc/self/ns/mnt", &namespace_identity)) return 3;
     ledger = fopen(argv[2], "wx");
     if (!ledger) { perror("ledger open"); return 4; }
     int status = 1;
     void *handle = NULL;
+    int pub_waited = 0, entry_waited = 0;
     if (emit("object_stat", now_ns(), "")) goto done;
-    handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    handle = dlopen(provider_path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) { fprintf(stderr, "dlopen: %s\n", dlerror()); goto done; }
     unsigned long (*publish)(void **) = dlsym(handle, "C_GetFunctionList");
     int (*present)(void) = dlsym(handle, "t2_table_present");
@@ -172,7 +288,7 @@ int main(int argc, char **argv) {
     if (!publish || !present || !observation) goto done;
     if (emit("mapped", now_ns(), present() ? ",\"table_present\":true" :
                                            ",\"table_present\":false")) goto done;
-    if (wait_gate(argv[3])) goto done;
+    if (wait_gate_timed(argv[3], &pub_waited)) goto done;
     void *pointer = NULL;
     unsigned long publication_rv = publish(&pointer);
     if (emit("publication_returned", now_ns(), "")) goto done;
@@ -191,7 +307,35 @@ int main(int argc, char **argv) {
         ",\"entries\":68,\"table_storage\":\"%s\",\"entry_address\":%" PRIuPTR,
         storage, (uintptr_t)table->functions[0]);
     if (size < 0 || (size_t)size >= sizeof extra ||
-        emit("table_verified", now_ns(), extra) || wait_gate(argv[4])) goto done;
+        emit("table_verified", now_ns(), extra)) goto done;
+    if (knobs && !strcmp(mode, "late-heap") && strcmp(storage, "heap")) {
+        fprintf(stderr, "late-heap mode requires a heap-published table\n");
+        goto done;
+    }
+    sleep_cell_delay(delay_us);
+    if (wait_gate_timed(argv[4], &entry_waited)) goto done;
+    if (knobs) {
+        const char *armed = (pub_waited || entry_waited) ? "gated" :
+            (!strcmp(argv[3], "-") && !strcmp(argv[4], "-") ? "ungated" :
+             "prearmed");
+        char copy_extra[160] = "";
+        if (copy_mode) {
+            int copy_size = snprintf(copy_extra, sizeof copy_extra,
+                ",\"source_dev\":%ju,\"source_ino\":%ju,\"bytes_equal\":%s,"
+                "\"size_delta\":%d",
+                (uintmax_t)source_identity.st_dev,
+                (uintmax_t)source_identity.st_ino,
+                unseen ? "false" : "true", unseen ? 256 : 0);
+            if (copy_size < 0 || (size_t)copy_size >= sizeof copy_extra)
+                goto done;
+        }
+        char cell_extra[256];
+        int cell_size = snprintf(cell_extra, sizeof cell_extra,
+            ",\"mode\":\"%s\",\"delay_us\":%u,\"armed\":\"%s\"%s",
+            mode, delay_us, armed, copy_extra);
+        if (cell_size < 0 || (size_t)cell_size >= sizeof cell_extra ||
+            emit("cell", now_ns(), cell_extra)) goto done;
+    }
     unsigned long (*initialize)(void *) = (void *)table->functions[0];
     unsigned long rv = initialize(NULL);
     uint64_t returned = now_ns();

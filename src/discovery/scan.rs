@@ -6273,17 +6273,157 @@ mod tests {
     /// read-only and never executed: it must carry the mislabelled {3,2}
     /// 68-slot table this fix accepts. Skips cleanly where the copy is
     /// absent; the synthetic tests above stay the positive. File bytes
-    /// hold unrelocated addends rather than runtime pointers, so this
-    /// locks the synthetic premise (version word, missing export), while
+    /// hold unrelocated addends rather than runtime pointers, so the slot
+    /// contents are pinned through the file's own `R_X86_64_64`
+    /// relocations (which name each slot's target in 2.x order), while
     /// decoding is covered synthetically.
     #[test]
     fn fedora_softhsm_copy_carries_a_mislabelled_68_slot_table() {
         use p11scope_manifest::identity::{inspect_file_with_reader_exporting, open_object};
         use std::os::unix::fs::FileExt as _;
         const LANE_COPY: &str = "/var/tmp/p11scope-ws-tmp/scan-1/libsofthsm2-fc44.so";
+        const CONTROLLER_COPY: &str = "/var/tmp/p11scope-ws-tmp/fedora-inputs/libsofthsm2-fc44.so";
         const FEDORA_STOCK: &str = "/usr/lib64/pkcs11/libsofthsm2.so";
-        const TABLE_OFFSET: usize = 0xe7000;
-        const TABLE_END: usize = 0xe7000 + 8 + 104 * 8;
+        // The table's virtual address in Fedora's build (the start of
+        // `.data`). Translated to a file offset through the program
+        // headers below; never used as a file offset directly.
+        const TABLE_VADDR: u64 = 0xe7000;
+        // The 2.x `CK_FUNCTION_LIST` width (`LEGACY_PREFIX_SLOTS`): the
+        // number of slot relocations the Fedora table must carry.
+        const TABLE_SLOTS: usize = 68;
+        const EXPECTED_VERSION: u64 = 0x0203;
+        const PT_LOAD: u32 = 1;
+        const SHT_RELA: u32 = 4;
+        const R_X86_64_64: u32 = 1;
+
+        fn le16(bytes: &[u8], at: usize, what: &str) -> u16 {
+            u16::from_le_bytes(
+                bytes
+                    .get(at..at + 2)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("two bytes"),
+            )
+        }
+
+        fn le32(bytes: &[u8], at: usize, what: &str) -> u32 {
+            u32::from_le_bytes(
+                bytes
+                    .get(at..at + 4)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("four bytes"),
+            )
+        }
+
+        fn le64(bytes: &[u8], at: usize, what: &str) -> u64 {
+            u64::from_le_bytes(
+                bytes
+                    .get(at..at + 8)
+                    .unwrap_or_else(|| panic!("{what} at {at:#x} runs past the file"))
+                    .try_into()
+                    .expect("eight bytes"),
+            )
+        }
+
+        // Translate a virtual address to a file offset through the
+        // `PT_LOAD` program headers. The whole `len` bytes must be
+        // file-backed (`p_filesz`, not `p_memsz`).
+        fn file_offset_of(bytes: &[u8], vaddr: u64, len: u64) -> usize {
+            // ELF64 header: e_phoff@0x20, e_phentsize@0x36, e_phnum@0x38.
+            let phoff = le64(bytes, 0x20, "program header offset") as usize;
+            let phentsize = le16(bytes, 0x36, "program header size") as usize;
+            let phnum = le16(bytes, 0x38, "program header count") as usize;
+            assert_eq!(phentsize, 56, "ELF64 program headers are 56 bytes");
+            // p_type@0, p_offset@8, p_vaddr@16, p_filesz@32.
+            for index in 0..phnum {
+                let header = phoff + index * phentsize;
+                if le32(bytes, header, "program header type") != PT_LOAD {
+                    continue;
+                }
+                let offset = le64(bytes, header + 8, "segment file offset");
+                let start = le64(bytes, header + 16, "segment virtual address");
+                let filesz = le64(bytes, header + 32, "segment file size");
+                let end = start.checked_add(filesz).expect("segment range");
+                let want_end = vaddr.checked_add(len).expect("table range");
+                if start <= vaddr && want_end <= end {
+                    return (vaddr - start + offset) as usize;
+                }
+            }
+            panic!("{vaddr:#x} (+{len:#x}) is not file-backed by any LOAD segment");
+        }
+
+        // Every RELA entry in the file as (address, type, symbol name),
+        // resolving symbols through each RELA section's linked symbol
+        // and string tables.
+        fn rela_entries(bytes: &[u8]) -> Vec<(u64, u32, String)> {
+            // ELF64 header: e_shoff@0x28, e_shentsize@0x3a, e_shnum@0x3c.
+            let shoff = le64(bytes, 0x28, "section header offset") as usize;
+            let shentsize = le16(bytes, 0x3a, "section header size") as usize;
+            let shnum = le16(bytes, 0x3c, "section header count") as usize;
+            assert_eq!(shentsize, 64, "ELF64 section headers are 64 bytes");
+            // sh_type@4, sh_offset@24, sh_size@32, sh_link@40, sh_entsize@56.
+            let mut out = Vec::new();
+            for index in 0..shnum {
+                let header = shoff + index * shentsize;
+                if le32(bytes, header + 4, "section type") != SHT_RELA {
+                    continue;
+                }
+                let rela_off = le64(bytes, header + 24, "RELA section offset") as usize;
+                let rela_size = le64(bytes, header + 32, "RELA section size") as usize;
+                let link = le32(bytes, header + 40, "RELA symbol table link") as usize;
+                let entsize = le64(bytes, header + 56, "RELA entry size") as usize;
+                assert_eq!(entsize, 24, "ELF64 RELA entries are 24 bytes");
+                assert_eq!(rela_size % 24, 0, "RELA size is a multiple of 24");
+                assert!(link < shnum, "RELA links to section {link} of {shnum}");
+                let symtab = shoff + link * shentsize;
+                let sym_off = le64(bytes, symtab + 24, "symbol table offset") as usize;
+                let sym_size = le64(bytes, symtab + 32, "symbol table size") as usize;
+                let sym_entsize = le64(bytes, symtab + 56, "symbol entry size") as usize;
+                assert_eq!(sym_entsize, 24, "ELF64 symbol entries are 24 bytes");
+                let strlink = le32(bytes, symtab + 40, "string table link") as usize;
+                assert!(
+                    strlink < shnum,
+                    "symtab links to section {strlink} of {shnum}"
+                );
+                let strtab = shoff + strlink * shentsize;
+                let str_off = le64(bytes, strtab + 24, "string table offset") as usize;
+                let str_size = le64(bytes, strtab + 32, "string table size") as usize;
+                assert!(
+                    str_off
+                        .checked_add(str_size)
+                        .is_some_and(|end| end <= bytes.len()),
+                    "the string table fits the file"
+                );
+                for entry in 0..rela_size / 24 {
+                    let at = rela_off + entry * 24;
+                    let r_offset = le64(bytes, at, "relocation offset");
+                    let r_info = le64(bytes, at + 8, "relocation info");
+                    let sym = (r_info >> 32) as usize;
+                    let typ = (r_info & 0xffff_ffff) as u32;
+                    assert!(
+                        sym < sym_size / 24,
+                        "relocation symbol {sym} fits its table"
+                    );
+                    // st_name@0.
+                    let name_off = le32(bytes, sym_off + sym * 24, "symbol name offset") as usize;
+                    assert!(name_off < str_size, "symbol name offset fits its table");
+                    let tail = bytes.get(str_off + name_off..).unwrap_or_else(|| {
+                        panic!("symbol name at {name_off:#x} runs past the file")
+                    });
+                    let end = tail
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or_else(|| panic!("symbol name at {name_off:#x} is unterminated"));
+                    let name = std::str::from_utf8(&tail[..end])
+                        .unwrap_or_else(|_| panic!("symbol name at {name_off:#x} is UTF-8"))
+                        .to_string();
+                    out.push((r_offset, typ, name));
+                }
+            }
+            out
+        }
+
         let path = match std::env::var("P11SCOPE_SCAN1_SOFTHSM") {
             Ok(path) if !path.is_empty() => {
                 let path = PathBuf::from(path);
@@ -6295,7 +6435,7 @@ mod tests {
                 path
             }
             _ => {
-                let found = [LANE_COPY, FEDORA_STOCK]
+                let found = [LANE_COPY, CONTROLLER_COPY, FEDORA_STOCK]
                     .into_iter()
                     .map(PathBuf::from)
                     .find(|path| path.is_file());
@@ -6312,18 +6452,60 @@ mod tests {
         };
         let bytes =
             std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(
+            &bytes[..4],
+            b"\x7fELF",
+            "{} is an ELF object",
+            path.display()
+        );
+        assert_eq!(bytes[4], 2, "{} is 64-bit", path.display());
+        assert_eq!(bytes[5], 1, "{} is little-endian", path.display());
+        assert_eq!(
+            le16(&bytes, 18, "machine"),
+            62,
+            "{} is x86-64",
+            path.display()
+        );
+        let table_len = 8 + TABLE_SLOTS * 8;
+        let table_off = file_offset_of(&bytes, TABLE_VADDR, table_len as u64);
         assert!(
-            bytes.len() > TABLE_END,
-            "{} is {} bytes; the Fedora table ends at {TABLE_END:#x}",
+            table_off
+                .checked_add(table_len)
+                .is_some_and(|end| end <= bytes.len()),
+            "{} is {} bytes; the Fedora table needs {table_len} bytes at file offset {table_off:#x}",
             path.display(),
             bytes.len()
         );
         let word = u64::from_le_bytes(
-            bytes[TABLE_OFFSET..TABLE_OFFSET + 8]
+            bytes[table_off..table_off + 8]
                 .try_into()
                 .expect("eight version bytes"),
         );
-        assert_eq!(word, 0x0203, "the Fedora table declares version 3.2");
+        assert_eq!(
+            word, EXPECTED_VERSION,
+            "the Fedora table declares version 3.2"
+        );
+        let first_slot = TABLE_VADDR + 8;
+        let past_slots = first_slot + (TABLE_SLOTS as u64) * 8;
+        let mut slots: Vec<(u64, u32, String)> = rela_entries(&bytes)
+            .into_iter()
+            .filter(|(offset, _, _)| *offset >= first_slot && *offset < past_slots)
+            .collect();
+        slots.sort_by_key(|(offset, _, _)| *offset);
+        assert_eq!(
+            slots.len(),
+            TABLE_SLOTS,
+            "{} carries exactly {TABLE_SLOTS} slot relocations from {first_slot:#x}",
+            path.display()
+        );
+        for (ordinal, (offset, typ, name)) in slots.iter().enumerate() {
+            let want = first_slot + (ordinal as u64) * 8;
+            assert_eq!(*offset, want, "slot {ordinal} relocation address");
+            assert_eq!(*typ, R_X86_64_64, "slot {ordinal} ({name}) relocation type");
+            let expected = function_name(ordinal)
+                .unwrap_or_else(|| panic!("ordinal {ordinal} has a catalog name"));
+            assert_eq!(*name, expected, "slot {ordinal} names its 2.x function");
+        }
         let file =
             open_object(&path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
         let inspected = inspect_file_with_reader_exporting(

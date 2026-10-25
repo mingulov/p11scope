@@ -2798,6 +2798,23 @@ pub(super) fn maybe_cross_work_deadline(work: &mut TargetWorkDeadline) {
     }
 }
 
+thread_local! {
+    static PRE_MEMBER_CHECK_EXPIRE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one deterministic cooperative-deadline crossing just before the
+/// post-write member `work.check`. The install-time and eligibility
+/// checks already passed, so only that site observes the crossing.
+pub(super) fn arm_pre_member_check_expiry() {
+    PRE_MEMBER_CHECK_EXPIRE.set(true);
+}
+
+pub(super) fn maybe_expire_pre_member_check(work: &mut TargetWorkDeadline) {
+    if PRE_MEMBER_CHECK_EXPIRE.take() {
+        work.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
+}
+
 /// One direct promotion packet: shared charged preparation on the original
 /// pin, then the kernel hook, then live finish. The hook is the installed
 /// probe's; the packet I/O is a fresh handle on the shared world/events.
@@ -4216,6 +4233,10 @@ enum MemberOutcome {
     Slot,
     /// The run fails before any byte (demotes later segments).
     Failure(RunFailure),
+    /// The prove consumes no scripted step: a pre-read refusal skips
+    /// the run entirely. Later `Slot` steps still key by their own
+    /// prove position, so the following prove reads its own records.
+    NoRead,
 }
 
 /// Drives member-cell proves against a fixture session. Singleton
@@ -4272,11 +4293,14 @@ fn member_cell(spec: MemberCellSpec) -> MemberObservation {
         .outcomes
         .iter()
         .enumerate()
-        .map(|(position, outcome)| match outcome {
-            MemberOutcome::Slot => {
-                FixtureTarget::Bytes(target_stream(&[(pids[position], ranges[position], 0)]))
-            }
-            MemberOutcome::Failure(reason) => FixtureTarget::Failure(*reason),
+        .filter_map(|(position, outcome)| match outcome {
+            MemberOutcome::Slot => Some(FixtureTarget::Bytes(target_stream(&[(
+                pids[position],
+                ranges[position],
+                0,
+            )]))),
+            MemberOutcome::Failure(reason) => Some(FixtureTarget::Failure(*reason)),
+            MemberOutcome::NoRead => None,
         })
         .collect();
     let entries: Vec<Vec<MapEntry>> = pids
@@ -4814,5 +4838,154 @@ fn fd_headroom_member_refusal_resets_target_before_ordinary_run() {
         out.config_writes.len(),
         3,
         "install, member target, then the refusal reset"
+    );
+}
+
+/// A member-carrying preparation whose member re-proof refuses while
+/// the IO exe answers the same identity is NOT confirmed. The member
+/// is the only exe authority when one is carried: after a same-binary
+/// nonleader exec the survivor's TID is released (re-proof refuses)
+/// while the TGID exe serves the same binary, and falling back to it
+/// would confirm on pre-exec proofs.
+#[test]
+fn refused_member_exe_with_matching_io_exe_is_not_confirmed() {
+    use super::super::sweep_attribution::{finish_confirmation, prepare_confirmation};
+    let child = SleepChild::spawn();
+    let pid = child.pid();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut io = MemberIo::canned(
+        vec![],
+        FileIdentity { dev: 1, ino: 2 },
+        true,
+        Rc::new(RefCell::new(vec![])),
+    );
+    let prepared = prepare_confirmation(&mut io, pid, &BTreeSet::new(), &mut budget, None)
+        .expect("member request prepares");
+    assert!(
+        prepared.member.is_some(),
+        "the preparation carries its member"
+    );
+    let before = prepared.before.clone();
+    // The survivor dies; the member re-proof now refuses.
+    drop(child);
+    assert!(
+        prepared
+            .member
+            .as_ref()
+            .expect("member")
+            .read_exe_identity()
+            .is_none(),
+        "a dead member has no exe"
+    );
+    // The TGID exe answers the same identity (a live new leader after
+    // de_thread serves the same binary): the fallback must not confirm.
+    io.exe = before.clone();
+    let confirmation = finish_confirmation(
+        &io,
+        pid,
+        prepared,
+        MappedIdentities::new(),
+        None,
+        &mut budget,
+    );
+    assert!(
+        !matches!(confirmation, Confirmation::Confirmed(_)),
+        "a refused member exe never confirms, even when the TGID exe agrees: {confirmation:?}"
+    );
+}
+
+/// A healthy member still confirms at the finish: the member-only exe
+/// authority agrees with the preparation read.
+#[test]
+fn healthy_member_exe_confirms_at_finish() {
+    use super::super::sweep_attribution::{finish_confirmation, prepare_confirmation};
+    let child = SleepChild::spawn();
+    let pid = child.pid();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut io = MemberIo::canned(
+        vec![],
+        FileIdentity { dev: 1, ino: 2 },
+        true,
+        Rc::new(RefCell::new(vec![])),
+    );
+    let prepared = prepare_confirmation(&mut io, pid, &BTreeSet::new(), &mut budget, None)
+        .expect("member request prepares");
+    assert!(
+        prepared.member.is_some(),
+        "the preparation carries its member"
+    );
+    let confirmation = finish_confirmation(
+        &io,
+        pid,
+        prepared,
+        MappedIdentities::new(),
+        None,
+        &mut budget,
+    );
+    assert!(
+        matches!(confirmation, Confirmation::Confirmed(_)),
+        "a healthy member confirms: {confirmation:?}"
+    );
+    drop(child);
+}
+
+/// The `work.check` refusal right after the member-target write resets
+/// the target before refusing: the trailing config write zeroes it, so
+/// the following ordinary run executes under no member target. Mirrors
+/// the FdHeadroom-arm twin; the hook expires the work deadline
+/// deterministically between the eligibility check and this one.
+#[test]
+fn work_check_member_refusal_resets_target_before_ordinary_run() {
+    arm_pre_member_check_expiry();
+    let out = member_cell(MemberCellSpec {
+        mint: vec![true, false],
+        outcomes: vec![MemberOutcome::NoRead, MemberOutcome::Slot],
+        threshold: None,
+        fail_config: false,
+        multi: false,
+    });
+    assert_eq!(out.confirmations.len(), 2);
+    // The refused member run falls back without attempting; the
+    // ordinary run still proves by kernel.
+    assert_userspace_mapped(&out.confirmations[0]);
+    assert_kernel_slot(&out.confirmations[1], Slot(0));
+    assert_eq!(out.attempts, 1, "the refusal is not an attempt");
+    assert!(out.failed_target.is_none(), "no demotion");
+    assert_eq!(out.tids.len(), 1, "the refused run never selected");
+    assert!(out.tids[0].is_none(), "the ordinary run selects by scope");
+    // The member write named its target, so the reset below pins a
+    // real installed target rather than a vacuous zero.
+    assert!(
+        out.config_writes.len() >= 2,
+        "install plus the member target write"
+    );
+    assert_eq!(
+        (
+            out.config_writes[1].target_tgid,
+            out.config_writes[1].target_tid
+        ),
+        (out.pids[0], out.pids[0]),
+        "the member write named its target"
+    );
+    // The refusal reset the target before the ordinary run: the
+    // trailing write zeroes it, so the ordinary run executes under
+    // no member target. Ordinaries add no config write, so the reset
+    // precedes the ordinary run.
+    let last = out.config_writes.last().expect("the install wrote");
+    assert_eq!(
+        (last.target_tgid, last.target_tid),
+        (0, 0),
+        "the trailing config write zeroes the member target"
+    );
+    assert_eq!(
+        out.config_writes.len(),
+        3,
+        "install, member target, then the refusal reset"
+    );
+    assert_eq!(
+        out.fallback.first_reason,
+        Some(KernelFallbackReason::Deadline),
+        "the refusal names its site: {:?}",
+        out.fallback.first_reason
     );
 }

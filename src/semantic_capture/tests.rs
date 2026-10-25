@@ -1983,6 +1983,40 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
     harness.ingest(quiet, &admitted);
 }
 
+#[test]
+fn joint_exec_marker_birth_without_publication_refuses_closed() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    // Live marker state: no BPF root publishes (contract-pinned
+    // inactive until slice B authorizes the transactions), so the
+    // bootstrap word reads Unpublished and the observed-call birth
+    // refuses closed. The machine S1-discloses this refusal; slice B
+    // flips this pin to a witness assertion (live R16 cells are its
+    // acceptance).
+    let publisher = NativePublisher::build();
+    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    let mut rows = NativeBirthRows { row, control };
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    assert!(
+        matches!(
+            crate::attach::observe_retained_birth(
+                &mut rows,
+                harness.fixture.binding(),
+                harness.fixture.attachment(),
+                &binding,
+                BirthKind::ExecMarker,
+            ),
+            Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
+        ),
+        "an unpublished bootstrap marker cannot authorize an observed-call birth"
+    );
+}
+
 pub(super) fn actual_absence_birth_fixture() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     let mut harness = JointBirthHarness::new();

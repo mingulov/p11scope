@@ -63,7 +63,7 @@ fn counter_bank_proof_path() -> PathBuf {
     assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
     assert_eq!(
         env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-        "counts-bank-growth-v2"
+        "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
     );
     Path::new(env!("OUT_DIR"))
         .join("counter-bank-growth-v2")
@@ -100,7 +100,7 @@ fn counter_bank_proof_build_selection_matches_emitted_contract() {
     assert_eq!(
         env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
         if requested {
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         } else {
             ""
         },
@@ -273,6 +273,146 @@ fn counter_bank_proof_mutations_are_causally_rejected() {
             Some(&serde_json::json!("refused")),
             "{name}"
         );
+    }
+}
+
+fn counter_bank_mode_path(token: &str) -> PathBuf {
+    assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+    assert!(
+        env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS")
+            .split(',')
+            .any(|entry| entry == token),
+        "proof outputs must list {token}"
+    );
+    Path::new(env!("OUT_DIR"))
+        .join("counter-bank-growth-v2")
+        .join(format!("p11scope-ebpf-{token}"))
+}
+
+fn counter_bank_mode_check(mode: &str, profile: &str, path: &Path) -> std::process::Output {
+    Command::new("python3")
+        .args([
+            "-I",
+            "scripts/check-counter-object.py",
+            "--mode",
+            mode,
+            "--profile",
+            profile,
+        ])
+        .arg(path)
+        .output()
+        .expect("run bank timing checker")
+}
+
+#[test]
+#[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1 in its own build configuration"]
+fn counter_bank_timing_objects_have_exact_maps_and_clocks() {
+    for (mode, profile, value_bytes, configuration) in [
+        (
+            "timestamps",
+            "timestamps-bank-growth-v2",
+            40u64,
+            0x0200_0028_0010_0200u64,
+        ),
+        (
+            "latency",
+            "latency-bank-growth-v2",
+            296u64,
+            0x0200_0128_0010_0200u64,
+        ),
+    ] {
+        let path = counter_bank_mode_path(profile);
+        let output = counter_bank_mode_check(mode, profile, &path);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["schema"], "p11scope-counter-bank-object/v2",
+            "{mode}"
+        );
+        assert_eq!(report["configuration"], configuration, "{mode}");
+        assert_eq!(report["native_owner_slot_bound"], 8_192, "{mode}");
+        let slots: Vec<u64> = report["logical_slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|slot| slot.as_u64().unwrap())
+            .collect();
+        assert_eq!(slots, [0, 511, 512, 8191], "{mode}");
+        for (name, kind, key, value, entries, flags) in [
+            ("STATS", 6, 4, 24, 512, 0),
+            ("COUNTER_BANKS", 13, 4, 4, 16, 128),
+            ("COUNTER_BANK_META", 1, 4, 32, 8_192, 128),
+            ("COUNTER_BANK_COMMIT", 1, 8, 16, 8_192, 128),
+            ("COUNTER_BANK_FAULT", 6, 4, 8, 1, 0),
+            ("COUNTER_HEALTH", 6, 4, 8, 2, 0),
+            ("START", 1, 16, 288, 16_384, 0),
+            ("RV_COUNTS", 5, 16, 8, 65_536, 0),
+            ("SLOT_FILE", 2, 4, 4, 8_192, 128),
+        ] {
+            for (field, expected) in [
+                ("type", kind),
+                ("key_size", key),
+                ("value_size", value),
+                ("max_entries", entries),
+                ("flags", flags),
+            ] {
+                assert_eq!(
+                    report["maps"][name][field], expected,
+                    "{mode} {name}.{field}"
+                );
+            }
+        }
+        assert_eq!(report["inner_template"]["type"], 6, "{mode}");
+        assert_eq!(report["inner_template"]["key_size"], 4, "{mode}");
+        assert_eq!(
+            report["inner_template"]["value_size"], value_bytes,
+            "{mode}"
+        );
+        assert_eq!(report["inner_template"]["max_entries"], 512, "{mode}");
+        assert_eq!(report["inner_template"]["flags"], 0, "{mode}");
+        assert_eq!(report["ordinary_counter_profile"], "refused", "{mode}");
+        for root in ["p11_counter_bank_entry", "p11_counter_bank_return"] {
+            assert!(
+                report["roots"][root]["stack_chain"].as_u64().unwrap() <= 512,
+                "{mode} {root}"
+            );
+            assert!(
+                report["roots"][root]["clocks"].as_u64().unwrap() >= 1,
+                "{mode} {root}"
+            );
+            assert_eq!(
+                report["roots"][root]["semantic_or_event_work"], false,
+                "{mode} {root}"
+            );
+        }
+        let controls = report["controls"].as_object().unwrap();
+        assert!(!controls.is_empty(), "{mode}");
+        for (name, verdict) in controls {
+            assert_eq!(verdict, "accepted", "{mode} {name}");
+        }
+        for (wrong_mode, wrong_profile) in [
+            ("counts", "counts-bank-growth-v2"),
+            ("timestamps", "timestamps-bank-growth-v2"),
+            ("latency", "latency-bank-growth-v2"),
+        ] {
+            if wrong_profile == profile {
+                continue;
+            }
+            let wrong = counter_bank_mode_check(wrong_mode, wrong_profile, &path);
+            assert_eq!(
+                wrong.status.code(),
+                Some(2),
+                "{mode} accepted as {wrong_mode}"
+            );
+            assert!(
+                String::from_utf8_lossy(&wrong.stderr).contains("counter object refused:"),
+                "{mode} refused without a cause as {wrong_mode}"
+            );
+        }
     }
 }
 

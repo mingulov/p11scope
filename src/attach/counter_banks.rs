@@ -227,6 +227,31 @@ impl CountsBankGeometry {
     }
 }
 
+/// One private per-mode bank artifact of the opt-in proof build. Production
+/// preparation stays Counts-only; the timing rows serve the checker and load
+/// cells until a later task routes them.
+#[derive(Clone, Copy, Debug)]
+#[cfg(test)]
+struct BankModeArtifact {
+    token: &'static str,
+    object: &'static str,
+    value_bytes: u32,
+    configuration: u64,
+}
+
+#[cfg(test)]
+fn bank_mode_artifact(_token: &str) -> Result<BankModeArtifact, BankRefusal> {
+    Err(BankRefusal::Shape)
+}
+
+fn proof_counts_token(_outputs: &str) -> Result<&str, BankRefusal> {
+    Err(BankRefusal::Shape)
+}
+
+fn production_geometry(_outputs: &str) -> Result<CountsBankGeometry, BankRefusal> {
+    Err(BankRefusal::Shape)
+}
+
 struct StagedExtent {
     transaction: NonZeroU64,
     commit: CountsBankCommit,
@@ -6627,7 +6652,7 @@ pub(crate) mod tests {
         assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let path = std::path::Path::new(env!("OUT_DIR"))
             .join("counter-bank-growth-v2")
@@ -6709,7 +6734,7 @@ pub(crate) mod tests {
         assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         let bytes = std::fs::read(
             std::path::Path::new(env!("OUT_DIR"))
@@ -6772,6 +6797,293 @@ pub(crate) mod tests {
             }
             drop(preparation);
             assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    #[test]
+    fn bank_mode_artifacts_select_exactly_three_growth_v2_modes() {
+        for (token, object, value_bytes, configuration) in [
+            (
+                "counts-bank-growth-v2",
+                "p11scope-ebpf-counts-bank-growth-v2",
+                24u32,
+                0x0200_0018_0010_0200u64,
+            ),
+            (
+                "timestamps-bank-growth-v2",
+                "p11scope-ebpf-timestamps-bank-growth-v2",
+                40u32,
+                0x0200_0028_0010_0200u64,
+            ),
+            (
+                "latency-bank-growth-v2",
+                "p11scope-ebpf-latency-bank-growth-v2",
+                296u32,
+                0x0200_0128_0010_0200u64,
+            ),
+        ] {
+            let artifact = bank_mode_artifact(token).unwrap();
+            assert_eq!(artifact.token, token);
+            assert_eq!(artifact.object, object);
+            assert_eq!(artifact.value_bytes, value_bytes);
+            assert_eq!(artifact.configuration, configuration);
+        }
+        for bad in [
+            "",
+            "counts-bank-proof",
+            "counts-bank-growth-v3",
+            "Counts-Bank-Growth-v2",
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2",
+        ] {
+            assert!(
+                matches!(bank_mode_artifact(bad), Err(BankRefusal::Shape)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bank_proof_counts_token_selects_counts_from_emitted_outputs() {
+        assert_eq!(
+            proof_counts_token("counts-bank-growth-v2"),
+            Ok("counts-bank-growth-v2")
+        );
+        assert_eq!(
+            proof_counts_token(
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+            ),
+            Ok("counts-bank-growth-v2")
+        );
+        for bad in [
+            "",
+            "counts-bank-proof",
+            "timestamps-bank-growth-v2",
+            "latency-bank-growth-v2,timestamps-bank-growth-v2",
+        ] {
+            assert!(
+                matches!(proof_counts_token(bad), Err(BankRefusal::Shape)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bank_proof_production_geometry_stays_counts() {
+        let growth = CountsBankGeometry::checked(16, 512).unwrap();
+        assert_eq!(production_geometry("counts-bank-growth-v2"), Ok(growth));
+        assert_eq!(
+            production_geometry(
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+            ),
+            Ok(growth)
+        );
+        assert!(
+            production_geometry("counts-bank-proof")
+                .unwrap()
+                .is_legacy()
+        );
+        for bad in [
+            "",
+            "counts-bank-growth-v3",
+            "timestamps-bank-growth-v2",
+            "latency-bank-growth-v2",
+            "latency-bank-growth-v2,timestamps-bank-growth-v2",
+        ] {
+            assert!(
+                matches!(production_geometry(bad), Err(BankRefusal::Shape)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Loads every bank mode object: sixteen per-mode inner maps are staged
+    /// into the outer map, then the two bank roots and the two lifecycle
+    /// roots load against them. No attachment, commit publication or
+    /// workload runs here.
+    #[test]
+    #[ignore = "requires P11SCOPE_COUNTER_BANK_PROOF=1, BPF privilege and LP64 map/program load"]
+    fn counter_bank_mode_objects_load_lp64() {
+        assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        let directory = std::path::Path::new(env!("OUT_DIR")).join("counter-bank-growth-v2");
+        for (mode, token) in [
+            ("counts", "counts-bank-growth-v2"),
+            ("timestamps", "timestamps-bank-growth-v2"),
+            ("latency", "latency-bank-growth-v2"),
+        ] {
+            let artifact = bank_mode_artifact(token).unwrap();
+            let path = directory.join(artifact.object);
+            let check = std::process::Command::new("python3")
+                .args([
+                    "-I",
+                    "scripts/check-counter-object.py",
+                    "--mode",
+                    mode,
+                    "--profile",
+                    token,
+                ])
+                .arg(&path)
+                .output()
+                .expect("run bank checker");
+            assert!(
+                check.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            let parsed = aya_obj::Object::parse(&bytes).unwrap();
+            for (name, expected) in [
+                ("COUNTER_BANKS", (13, 4, 4, 16, 128)),
+                ("COUNTER_BANK_META", (1, 4, 32, 8192, 128)),
+                ("COUNTER_BANK_COMMIT", (1, 8, 16, 8192, 128)),
+                ("RV_COUNTS", (5, 16, 8, 65536, 0)),
+                ("SLOT_FILE", (2, 4, 4, 8192, 128)),
+                ("STATS", (6, 4, 24, 512, 0)),
+                ("START", (1, 16, 288, 16384, 0)),
+            ] {
+                let map = parsed.maps.get(name).expect("actual required bank map");
+                assert_eq!(
+                    (
+                        map.map_type(),
+                        map.key_size(),
+                        map.value_size(),
+                        map.max_entries(),
+                        map.map_flags()
+                    ),
+                    expected,
+                    "{mode} actual emitted {name}"
+                );
+            }
+            let inner = parsed.maps["COUNTER_BANKS"].inner().unwrap();
+            assert_eq!(
+                (
+                    inner.map_type(),
+                    inner.key_size(),
+                    inner.value_size(),
+                    inner.max_entries(),
+                    inner.map_flags()
+                ),
+                (6, 4, artifact.value_bytes, 512, 0),
+                "{mode} actual inner template"
+            );
+            drop(parsed);
+            let mut object = aya::EbpfLoader::new()
+                .allow_unsupported_maps()
+                .load_file(&path)
+                .expect("load bank BTF and maps");
+            let storage: std::collections::BTreeMap<_, _> = object
+                .maps()
+                .filter_map(|(name, map)| match map {
+                    aya::maps::Map::Unsupported(data) => Some((name, data)),
+                    _ => None,
+                })
+                .collect();
+            let expected = std::collections::BTreeMap::from([
+                ("PROC_EPOCH", 152u32),
+                ("ROOT_AFFILIATION", 8),
+                ("TASK_COOKIE", 8),
+                ("THREAD_OWNER", 560),
+            ]);
+            assert_eq!(
+                storage.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>(),
+                "{mode}"
+            );
+            for (name, value_size) in expected {
+                let info = storage[name].info().expect("read native task-storage info");
+                assert_eq!(
+                    (
+                        info.map_type().unwrap(),
+                        info.key_size(),
+                        info.value_size(),
+                        info.max_entries(),
+                        info.map_flags(),
+                    ),
+                    (aya::maps::MapType::TaskStorage, 4, value_size, 0, 1),
+                    "{mode} {name}"
+                );
+            }
+            drop(storage);
+            let native_banks: Vec<_> = (0..16)
+                .map(|bank| {
+                    aya::maps::MapData::create(
+                        aya_obj::Map::new_from_params(6, 4, artifact.value_bytes, 512, 0),
+                        &format!("{mode}_bank{bank}"),
+                        None,
+                    )
+                    .expect("allocate actual 512-cell bank")
+                })
+                .collect();
+            let ids: std::collections::BTreeSet<_> = native_banks
+                .iter()
+                .map(|bank| {
+                    let info = bank.info().expect("actual inner-map metadata");
+                    assert_eq!(
+                        (
+                            info.map_type().unwrap(),
+                            info.key_size(),
+                            info.value_size(),
+                            info.max_entries(),
+                            info.map_flags()
+                        ),
+                        (
+                            aya::maps::MapType::PerCpuArray,
+                            4,
+                            artifact.value_bytes,
+                            512,
+                            0
+                        ),
+                        "{mode}",
+                    );
+                    assert_ne!(info.id(), 0, "{mode}");
+                    info.id()
+                })
+                .collect();
+            assert_eq!(
+                ids.len(),
+                16,
+                "{mode} all sixteen banks retain distinct native IDs"
+            );
+            {
+                let mut banks: aya::maps::HashOfMaps<_, u32> = object
+                    .map_mut("COUNTER_BANKS")
+                    .expect("real outer map")
+                    .try_into()
+                    .expect("real HashOfMaps ABI");
+                for (index, bank) in native_banks.iter().enumerate() {
+                    banks
+                        .insert(index as u32, bank, 1)
+                        .expect("stage bank with BPF_NOEXIST");
+                    assert_eq!(
+                        banks.get(&(index as u32), 0).unwrap().info().unwrap().id(),
+                        bank.info().unwrap().id(),
+                        "{mode}",
+                    );
+                }
+            }
+            for name in PROGRAMS {
+                let program: &mut aya::programs::UProbe = object
+                    .program_mut(name)
+                    .expect("bank root")
+                    .try_into()
+                    .expect("uprobe program kind");
+                program
+                    .load()
+                    .expect("actual outer-to-inner verifier bridge");
+            }
+            for name in ["sched_process_exec", "sched_process_exit"] {
+                let program: &mut aya::programs::RawTracePoint = object
+                    .program_mut(name)
+                    .expect("actual lifecycle root")
+                    .try_into()
+                    .expect("raw tracepoint program kind");
+                program
+                    .load()
+                    .expect("actual full-bound owner cleanup verifier");
+            }
         }
     }
 
@@ -7067,7 +7379,7 @@ pub(crate) mod tests {
         assert_eq!(env!("P11SCOPE_COUNTER_BANK_PROOF_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_BANK_PROOF_OUTPUTS"),
-            "counts-bank-growth-v2"
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
         );
         // Wrong kernel for this cell fails loud here, never as a vacuous pass.
         assert!(

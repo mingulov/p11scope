@@ -14111,6 +14111,102 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn foreign_completion_for_another_domain_reports_without_debug_id() {
+        use crate::attach::capture::NativeDomainId;
+        // A completion for another domain with no live finalizer
+        // state is genuinely foreign: one gap, worded without the
+        // opaque domain id (NativeDomainId is equality-only; no
+        // Display exists and numeric access is journal-only).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let foreign = NativeDomainId::try_mint().expect("domain mints");
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(foreign)));
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "the foreign proof holds A"
+        );
+        let failures: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "selected promotion completion failed")
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the foreign completion reports exactly once: {:?}",
+            gaps(&mut driver)
+        );
+        assert_eq!(
+            failures[0].1, "foreign completion for a domain with no live finalizer state",
+            "the gap words the foreign domain without a Debug id"
+        );
+        assert!(
+            !failures[0].1.contains("NativeDomainId"),
+            "no Debug domain id leaks: {:?}",
+            failures[0].1
+        );
+    }
+
+    #[test]
+    fn own_domain_completion_without_live_finalizer_stays_silent() {
+        // A's own late completion with no live finalizer state is
+        // not foreign: no gap fires, and the winding still holds
+        // for the next poll.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            Some(domain),
+            "A holds while its finalizer stays unproven"
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|(subject, _)| subject != "selected promotion completion failed"),
+            "A's own domain never reports a foreign completion: {:?}",
+            gaps(&mut driver)
+        );
+    }
+
+    #[test]
     fn promotion_wind_down_scopes_promotion_finish_to_a() {
         for _ in 0..3 {
             let mut coordinator = coordinator();

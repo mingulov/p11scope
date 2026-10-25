@@ -7,9 +7,11 @@ proof evidence in the pressure-live driver protocol (TARGET/READY/LEDGER
 lines from tests/fixtures/pressure-live/driver.c) against snapshot rows:
 exactly the expected owners, each with a complete burst and a completed
 call; old and new providers both retained; the newcomer inside its
-declared bound; pid->caller->instance->module joins on kernel (device,
-inode) identity with a digest; key rows that never over-claim their
-ledger; no ambient positives; the association bound.
+declared bound; pid->caller->instance->module joins on the inode plus
+the module digest, with each device compared only inside its own domain
+(maps-domain TARGET devices never equate fstat-domain module devices);
+key rows that never over-claim their ledger; no ambient positives; the
+association bound.
 
 Healthy and mutation twins run unignored; the live tests build the
 tracked pressure-live driver and version-matrix provider with gcc, run a
@@ -54,13 +56,15 @@ def require_oracle(test):
 
 def owner_text(pid, mode="retain", dev=(8, 1), ino=101, attempts=25,
                successful=25, complete=True, bursts=1, schema=SCHEMA,
-               surfaces=("C_GetFunctionList",)):
+               surfaces=("C_GetFunctionList",), sha=None):
     """One owner child stdout: TARGET lines, READY, LEDGER rows."""
     lines = []
     for surface in surfaces:
-        lines.append("TARGET " + json.dumps(
-            {"name": surface, "dev": list(dev), "ino": ino,
-             "file_offset": 4096}))
+        target = {"name": surface, "dev": list(dev), "ino": ino,
+                  "file_offset": 4096}
+        if sha is not None:
+            target["sha256"] = sha
+        lines.append("TARGET " + json.dumps(target))
     lines.append(f"READY pid={pid}")
     for burst in range(1, bursts + 1):
         lines.append("LEDGER " + json.dumps(
@@ -140,6 +144,26 @@ def wave_entries(pids, late, dev=(8, 1), ino_early=101, ino_late=102,
     return entries
 
 
+BTRFS_MAPS_DEV = (0, 35)
+BTRFS_FSTAT_DEV = (0, 37)
+
+
+def btrfs_specs():
+    """Two-owner wave with maps-domain TARGET devices (btrfs shape)."""
+    return {
+        "owner-5000": owner_text(5000, dev=BTRFS_MAPS_DEV, ino=101,
+                                 sha=SHA_EARLY),
+        "owner-5001": owner_text(5001, mode="late", dev=BTRFS_MAPS_DEV,
+                                 ino=102, sha=SHA_LATE),
+    }
+
+
+def btrfs_entries():
+    """Snapshot entries with fstat-domain module devices (btrfs shape)."""
+    return [(5000, BTRFS_FSTAT_DEV, 101, SHA_EARLY, 25, 25),
+            (5001, BTRFS_FSTAT_DEV, 102, SHA_LATE, 25, 25)]
+
+
 def compare_wave(oracle, tmp, count=3, expect=3, newcomer=None):
     specs, pids, late = wave_specs(count=count)
     directory = write_owners(Path(tmp) / "owners", specs)
@@ -188,6 +212,15 @@ class OwnerFileTwins(unittest.TestCase):
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(oracle.LedgerError,
                                         "targets disagree"):
+                oracle.read_owner(str(path))
+
+    def test_mutation_target_sha256_invalid_rejected(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "owner-1"
+            path.write_text(owner_text(4242, sha="zz"), encoding="utf-8")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "target sha256 invalid"):
                 oracle.read_owner(str(path))
 
     def test_mutation_missing_ready_rejected(self):
@@ -500,6 +533,63 @@ class PopulationTwins(unittest.TestCase):
             result = oracle.compare(oracle.read_owners(directory), snapshot,
                                     expect=3)
         self.assertEqual(result["owners"], 3)
+
+    def test_btrfs_devices_join_by_inode_and_digest(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = write_owners(Path(tmp) / "owners", btrfs_specs())
+            snapshot = population_snapshot(btrfs_entries())
+            result = oracle.compare(oracle.read_owners(directory), snapshot,
+                                    expect=2)
+        self.assertEqual(result["owners"], 2)
+        self.assertEqual(result["modules"], 2)
+        self.assertEqual(result["associations"], 2)
+
+    def test_btrfs_inode_mismatch_rejected(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = write_owners(Path(tmp) / "owners", btrfs_specs())
+            snapshot = population_snapshot(btrfs_entries())
+            snapshot["modules"][0]["key"]["inode"] = 999
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "target disagrees"):
+                oracle.compare(oracle.read_owners(directory), snapshot,
+                               expect=2)
+
+    def test_btrfs_digest_mismatch_rejected(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = write_owners(Path(tmp) / "owners", btrfs_specs())
+            snapshot = population_snapshot(btrfs_entries())
+            snapshot["modules"][0]["key"]["sha256"] = "33" * 32
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "target digest disagrees"):
+                oracle.compare(oracle.read_owners(directory), snapshot,
+                               expect=2)
+
+    def test_target_without_digest_ignores_cross_domain_device(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = {
+                "owner-5000": owner_text(5000, dev=BTRFS_MAPS_DEV, ino=101),
+                "owner-5001": owner_text(5001, mode="late",
+                                         dev=BTRFS_MAPS_DEV, ino=102),
+            }
+            directory = write_owners(Path(tmp) / "owners", specs)
+            snapshot = population_snapshot(btrfs_entries())
+            result = oracle.compare(oracle.read_owners(directory), snapshot,
+                                    expect=2)
+        self.assertEqual(result["owners"], 2)
+
+    def test_empty_owners_dir_rejected(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = write_owners(Path(tmp) / "owners", {})
+            snapshot = population_snapshot([])
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "expected 3 owners, found 0"):
+                oracle.compare(oracle.read_owners(directory), snapshot,
+                               expect=3)
 
     def test_mutation_short_wave_rejected(self):
         oracle = require_oracle(self)

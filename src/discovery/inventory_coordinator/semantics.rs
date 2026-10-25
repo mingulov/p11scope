@@ -3630,6 +3630,187 @@ mod finalizer_history_tests {
         );
     }
 
+    fn drop_test_lanes() -> (
+        InventoryCoordinator<OsProcessSource>,
+        AttestedSemanticLane,
+        NativeDomainId,
+    ) {
+        let pid = std::process::id();
+        let coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let fixture = HistoryFixture::new();
+        let lane =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let domain = lane.domain();
+        (coordinator, lane, domain)
+    }
+
+    fn drop_test_batch(domain: NativeDomainId, routes: Vec<Route>) -> SemanticBatch {
+        let outcomes = routes
+            .into_iter()
+            .enumerate()
+            .map(|(n, route)| {
+                let stamp = InstanceStamp::default();
+                TickOutcome::Call(RoutedCall::scripted(
+                    domain,
+                    crate::events::DecodedEventRecord {
+                        joint_resource: None,
+                        base: crate::semantic_capture::event_record_with_routing(
+                            Event::default(),
+                            stamp,
+                            0x2200,
+                        ),
+                        object: None,
+                    },
+                    route,
+                    None,
+                    Some(n as u64 + 1),
+                ))
+            })
+            .collect();
+        SemanticBatch::from_tick_report(
+            domain,
+            TickReport::scripted(outcomes, Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap()
+    }
+
+    fn unrouted_gap_reasons(
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> Vec<(String, u64)> {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == "semantic calls unrouted")
+            .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+            .collect()
+    }
+
+    #[test]
+    fn stage_ended_domain_drop_counts_unjoined_calls_into_shed() {
+        use crate::discovery::instances::UnknownReason;
+        // A batch refused at staging for an ended domain still sheds its
+        // unjoined calls with the drop label at the next commit: joined
+        // calls stay joined (already counted), unknown and pending calls
+        // shed once with their route labels.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let batch = drop_test_batch(
+            domain,
+            vec![
+                Route::Joined(InstanceId::from_raw(1)),
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Unknown(UnknownReason::Evicted),
+                Route::Pending,
+            ],
+        );
+        coordinator.refused_semantic_domains.insert(domain);
+        coordinator.stage_semantic_batch(batch);
+        assert_eq!(
+            lane.shed_calls_disclosed(),
+            0,
+            "the staged drop waits for the commit flush"
+        );
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            lane.shed_calls_disclosed(),
+            4,
+            "the three unknown plus the pending call shed once"
+        );
+        assert_eq!(
+            unrouted_gap_reasons(&coordinator),
+            vec![(
+                "4 calls shed from a dropped ended_domain batch (evicted=1 pending=1 unobserved=2) with 0 bindings"
+                    .to_string(),
+                1
+            )],
+            "the drop shed keeps its drop label and route labels"
+        );
+    }
+
+    #[test]
+    fn stage_backpressure_drop_counts_unjoined_calls_into_shed() {
+        use crate::discovery::instances::UnknownReason;
+        // A batch dropped for backpressure sheds its unjoined calls with
+        // the drop label when the occupying batch commits.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let occupying = SemanticBatch::scripted(domain, Vec::new(), 120);
+        let dropped = drop_test_batch(
+            domain,
+            vec![
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Unknown(UnknownReason::Unobserved),
+            ],
+        );
+        coordinator.stage_semantic_batch(occupying);
+        coordinator.stage_semantic_batch(dropped);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            lane.shed_calls_disclosed(),
+            2,
+            "the backpressure drop sheds its unknown calls once"
+        );
+        assert_eq!(
+            unrouted_gap_reasons(&coordinator),
+            vec![(
+                "2 calls shed from a dropped backpressure batch (unobserved=2) with 0 bindings"
+                    .to_string(),
+                1
+            )],
+            "the drop shed keeps its drop label"
+        );
+    }
+
+    #[test]
+    fn prepare_ended_domain_drop_counts_unjoined_calls_into_shed() {
+        use crate::discovery::instances::UnknownReason;
+        // A batch staged while live but finalized after its domain ended
+        // sheds its unjoined calls directly at preparation.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let batch = drop_test_batch(
+            domain,
+            vec![
+                Route::Joined(InstanceId::from_raw(1)),
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Pending,
+            ],
+        );
+        coordinator.stage_semantic_batch(batch);
+        coordinator.refused_semantic_domains.insert(domain);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            lane.shed_calls_disclosed(),
+            2,
+            "the refused preparation sheds unknown plus pending once"
+        );
+        assert_eq!(
+            unrouted_gap_reasons(&coordinator),
+            vec![(
+                "2 calls shed from a dropped ended_domain batch (pending=1 unobserved=1) with 0 bindings"
+                    .to_string(),
+                1
+            )],
+            "the drop shed keeps its drop label and route labels"
+        );
+    }
+
     #[test]
     fn finalizer_mints_h3_disposition_from_complete_state() {
         // C5: the actual finalizer derives H3 disposition from staged

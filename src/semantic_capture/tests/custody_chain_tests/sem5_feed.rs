@@ -710,6 +710,74 @@ fn retained_never_bound_burst_sheds_at_the_horizon_and_frees_admission() {
 }
 
 #[test]
+fn backpressure_drop_sheds_unjoined_calls_with_the_drop_label() {
+    // A batch dropped for backpressure sheds its unjoined calls with
+    // the drop label at the commit: joined + shed still equals the
+    // physical calls, on the drop path as on the success path.
+    let mut scene = workload_scene();
+    let pid = std::process::id();
+    let caller = admit_mapped(&mut scene, pid);
+    // The first burst drains pinless and pre-attach: the contracted
+    // R-34 shed, two Unknown outcomes inside its batch.
+    let pin = std::sync::Arc::new(
+        scene
+            .scene
+            .coordinator
+            .adapter()
+            .live_pin(pid)
+            .unwrap()
+            .1
+            .try_clone()
+            .unwrap(),
+    );
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(pid, (pin, image(7)));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    scene.h0.0.borrow_mut().io.targets.clear();
+    let shed_batch = scene.lane.tick(&[]).unwrap();
+    // Then the caller binds and its live burst joins.
+    production_bind(&mut scene, caller, pid, image(7));
+    for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+        enqueue_live_like(&mut scene, pid, name, *mechanism);
+    }
+    let first = scene.tick();
+    // The occupying batch commits only after the shed batch stages,
+    // so the shed batch drops for backpressure.
+    scene.scene.coordinator.stage_semantic_batch(first);
+    scene.scene.coordinator.stage_semantic_batch(shed_batch);
+    scene
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut scene.lane))
+        .unwrap();
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    let shed = scene.lane.shed_calls_disclosed();
+    assert_eq!(joined, 2, "the occupying batch joins exactly once");
+    assert_eq!(shed, 2, "the dropped batch sheds its unknown calls once");
+    assert_eq!(
+        joined + shed,
+        4,
+        "joined + shed equals the physical calls across the drop"
+    );
+    assert_eq!(
+        unrouted_reasons(&scene),
+        vec![(
+            "2 calls shed from a dropped backpressure batch (unobserved=2) with 1 bindings"
+                .to_string(),
+            1
+        )],
+        "the drop shed keeps its drop label"
+    );
+}
+
+#[test]
 fn physical_calls_count_once_across_ticks_and_bindings() {
     // The test runner started long before the lane: pre-attach, R-34.
     let mut scene = workload_scene();

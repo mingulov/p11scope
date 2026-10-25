@@ -2853,6 +2853,55 @@ fn merge_stashed_outcomes_sheds_calls_before_invalidations() {
 }
 
 #[test]
+fn dropped_batch_shed_counts_unjoined_calls_by_route() {
+    // A dropped batch sheds its unjoined calls by route: Unknown under
+    // their reason label, Pending under `pending`. Joined calls are
+    // already counted in joined and must not shed; invalidations carry
+    // no calls.
+    let domain = NativeDomainId::mint();
+    let call = |route, token| {
+        let stamp = InstanceStamp::default();
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            DecodedEventRecord {
+                joint_resource: None,
+                base: event_record_with_routing(
+                    p11scope_ebpf_common::Event::default(),
+                    stamp,
+                    0x2200,
+                ),
+                object: None,
+            },
+            route,
+            None,
+            Some(token),
+        ))
+    };
+    let outcomes = vec![
+        call(Route::Joined(InstanceId::from_raw(1)), 1),
+        call(Route::Joined(InstanceId::from_raw(1)), 2),
+        call(Route::Unknown(UnknownReason::Unobserved), 3),
+        call(Route::Unknown(UnknownReason::Unobserved), 4),
+        call(Route::Unknown(UnknownReason::Evicted), 5),
+        call(Route::Pending, 6),
+        TickOutcome::Invalidation(Invalidation {
+            domain,
+            scope: InvalidationScope::FaultEra,
+            position: Some(1025),
+        }),
+    ];
+    assert_eq!(
+        unjoined_shed_counts(&outcomes),
+        BTreeMap::from([("evicted", 1), ("pending", 1), ("unobserved", 2),]),
+        "joined calls and invalidations shed nothing"
+    );
+    assert!(
+        unjoined_shed_counts(&[]).is_empty(),
+        "an empty drop sheds nothing"
+    );
+}
+
+#[test]
 fn tick_report_carries_disposition_inputs() {
     // C5: each tick stamps its allocation watermark and
     // route-waiting floor for the finalizer's disposition evidence.

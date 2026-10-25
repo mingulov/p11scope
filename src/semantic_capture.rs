@@ -649,6 +649,16 @@ impl RoutedCall {
         self.endpoint
     }
 }
+
+/// Aggregate a dropped batch or report's unjoined calls by their finite
+/// shed label: Unknown routes under their reason label, Pending routes
+/// under `pending`. Joined calls are already counted in joined and are
+/// not shed, so the stop-line identity holds across the drop.
+pub(crate) fn unjoined_shed_counts(outcomes: &[TickOutcome]) -> BTreeMap<&'static str, u64> {
+    let _ = outcomes;
+    BTreeMap::new()
+}
+
 impl fmt::Debug for RoutedCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoutedCall")

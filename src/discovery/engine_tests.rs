@@ -47863,6 +47863,231 @@ fn collected_graph_reclaim_refusal_retains_and_finishes() {
 }
 
 #[test]
+fn collected_graph_reclaim_drains_removed_rows_and_selection() {
+    // Small case: at Closed the input splits into removed rows plus
+    // storage instead of riding whole to Done; Reclaim drains the rows
+    // and the selection in bounded steps before Done.
+    let mut case = graph_case_with_exit(true);
+    let mut installed = false;
+    for _ in 0..2000 {
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Install)
+        {
+            installed = true;
+            break;
+        }
+        case.service(1);
+    }
+    assert!(installed, "the graph reaches Install");
+    let graph = case.engine.collected_graph.as_ref().expect("boxed");
+    assert_eq!(graph.verdict, Some(Verdict::Closed));
+    assert!(
+        graph.removed.is_none(),
+        "Closed splits the input into removed rows"
+    );
+    eprintln!("reclaim-drain: removed rows at Install: {}", graph.removed_rows.len());
+    assert!(
+        !graph.removed_rows.is_empty(),
+        "the removed rows move into removed_rows"
+    );
+    assert!(
+        graph.removed_storage.is_some(),
+        "the removed storage moves with the rows"
+    );
+    assert!(
+        graph.selection.is_some(),
+        "the selection seals before Install"
+    );
+    // Reclaim drains both before Done, in bounded steps.
+    let mut reclaimed = false;
+    for _ in 0..200 {
+        case.service(1);
+        if case
+            .engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Reclaim)
+        {
+            reclaimed = true;
+            break;
+        }
+    }
+    assert!(reclaimed, "the graph reaches Reclaim");
+    let mut reclaim_credits = 0u32;
+    let mut rows_drained_in_reclaim = false;
+    let mut selection_drained_in_reclaim = false;
+    for _ in 0..200 {
+        if case.engine.collected_graph.is_none() {
+            break;
+        }
+        case.service(1);
+        reclaim_credits += 1;
+        if let Some(graph) = case.engine.collected_graph.as_ref() {
+            assert_eq!(graph.phase, GraphPhase::Reclaim);
+            if graph.removed_rows.is_empty() {
+                rows_drained_in_reclaim = true;
+            }
+            if graph.selection.is_none() {
+                selection_drained_in_reclaim = true;
+            }
+        }
+    }
+    assert!(
+        case.engine.collected_graph.is_none(),
+        "the graph reaches Done"
+    );
+    assert!(rows_drained_in_reclaim, "Reclaim drains the removed rows");
+    assert!(
+        selection_drained_in_reclaim,
+        "Reclaim drains the selection before Done"
+    );
+    assert!(
+        reclaim_credits <= 64,
+        "the drain takes bounded steps ({reclaim_credits})"
+    );
+
+    // Wide case: more removed rows than one stride, so the drain must
+    // span credits — a bulk drop would empty them in one.
+    const VIEWS: u32 = 48;
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        record_scan_ownership(
+            &mut pins,
+            ProcessViewId(index as u32),
+            *key,
+            &shared_path_text,
+        );
+    }
+    overlay_reback(
+        &mut pins,
+        &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
+    );
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut module = overlay_module(*key);
+            module.view = ProcessViewId(index as u32);
+            module.path.clone_from(&shared_path_text);
+            module.exports = (0..16)
+                .map(|slot| format!("export-{index}-{slot}"))
+                .collect();
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
+            let mut second = module.tables[0].clone();
+            second.address += 0x1000;
+            second.entries[0].file_offset = 0x1800;
+            module.tables.push(second);
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every wide row must reconcile");
+    assert_eq!(reconciled.len(), VIEWS as usize);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(96)).unwrap(),
+        ),
+    );
+    assert_eq!(engine.plan.slots.len(), 96);
+    engine.bind_plan_module_ids_for_test();
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    engine
+        .collected_test_pool
+        .reference_set_limit(COLLECTED_GRAPH_POOL_BYTES);
+    engine
+        .pending_retirements
+        .extend((0..40u32).map(ProcessViewId));
+    let mut wide_installed = false;
+    for _ in 0..20_000 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Install)
+        {
+            wide_installed = true;
+            break;
+        }
+    }
+    assert!(wide_installed, "the wide graph reaches Install");
+    let staged = engine
+        .collected_graph
+        .as_ref()
+        .expect("boxed")
+        .removed_rows
+        .len();
+    eprintln!("reclaim-drain: wide removed rows at Install: {staged}");
+    assert!(
+        staged > GRAPH_STRIDE,
+        "the wide removal exceeds one stride ({staged})"
+    );
+    // The drain passes through a partial length: never whole at Done.
+    let mut partial = false;
+    for _ in 0..200 {
+        if engine.collected_graph.is_none() {
+            break;
+        }
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if let Some(graph) = engine.collected_graph.as_ref() {
+            let len = graph.removed_rows.len();
+            if len > 0 && len < staged {
+                partial = true;
+            }
+        }
+    }
+    assert!(
+        engine.collected_graph.is_none(),
+        "the wide graph reaches Done"
+    );
+    assert!(
+        partial,
+        "the wide drain strides across credits (never whole at Done)"
+    );
+    assert!(engine.collected_graph_refused().is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
+}
+
+#[test]
 fn collected_graph_singles_logical_retire_matches_multi_report() {
     let mut multi = graph_case_with_exit(true);
     assert!(!multi.session.logical_retirement.get());

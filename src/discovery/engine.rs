@@ -3627,6 +3627,10 @@ struct GraphBacking {
     modules: InstalledModulesBacking,
     plan: plan::InstalledPlanBacking,
     storage: Option<ResourceLease>,
+    /// Leases paying for the Facts maps Install made live (claims,
+    /// tables, corroboration, fallbacks, skips). Charged while this
+    /// backing is canonical; released when the retired handoff reclaims.
+    facts: Vec<ResourceLease>,
 }
 
 /// Raw scanned-module copy cursor (§1.6): exact-capacity clone of one
@@ -3955,6 +3959,11 @@ struct CollectedFacts {
     scratch_table: usize,
     scratch_storage: Option<ResourceLease>,
     storage: Vec<ResourceLease>,
+    /// Leases paying for buffers Install makes live (claims, tables,
+    /// corroboration, fallbacks, skips). They move into the installed
+    /// backing at Install step 4; `storage` keeps the graph-private
+    /// index leases until their Reclaim step drains them.
+    live_storage: Vec<ResourceLease>,
 }
 
 impl CollectedFacts {
@@ -3993,6 +4002,7 @@ impl CollectedFacts {
             scratch_table: 0,
             scratch_storage: None,
             storage: Vec::new(),
+            live_storage: Vec::new(),
         }
     }
 
@@ -24810,6 +24820,7 @@ impl Engine {
                 modules: modules_backing,
                 plan: plan_backing,
                 storage: Some(backing_storage),
+                facts: Vec::new(),
             }));
             std::mem::swap(&mut graph.facts.claims, &mut self.selection_claims);
             std::mem::swap(&mut graph.facts.tables, &mut self.selection_tables);

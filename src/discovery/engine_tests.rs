@@ -48617,6 +48617,191 @@ fn collected_graph_charge_covers_requested_heap() {
     );
 }
 
+#[test]
+fn collected_graph_installed_facts_stay_charged_while_canonical() {
+    // The installed Facts maps stay charged while their backing is
+    // canonical: graph 1's live-map leases survive its Done, move to the
+    // retired handoff when graph 2 installs, and release at its reclaim.
+    const VIEWS: u32 = 32;
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        record_scan_ownership(
+            &mut pins,
+            ProcessViewId(index as u32),
+            *key,
+            &shared_path_text,
+        );
+    }
+    overlay_reback(
+        &mut pins,
+        &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
+    );
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut module = overlay_module(*key);
+            module.view = ProcessViewId(index as u32);
+            module.path.clone_from(&shared_path_text);
+            module.exports = (0..16)
+                .map(|slot| format!("export-{index}-{slot}"))
+                .collect();
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
+            let mut second = module.tables[0].clone();
+            second.address += 0x1000;
+            second.entries[0].file_offset = 0x1800;
+            module.tables.push(second);
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every twin row must reconcile");
+    assert_eq!(reconciled.len(), VIEWS as usize);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(64)).unwrap(),
+        ),
+    );
+    assert_eq!(engine.plan.slots.len(), 64);
+    engine.bind_plan_module_ids_for_test();
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    engine
+        .collected_test_pool
+        .reference_set_limit(COLLECTED_GRAPH_POOL_BYTES);
+    let baseline = engine.collected_test_pool.snapshot().charged_bytes;
+    // Graph 1 retires the first half.
+    engine
+        .pending_retirements
+        .extend((0..16u32).map(ProcessViewId));
+    let mut drained = false;
+    for _ in 0..20_000 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    assert!(drained, "graph 1 drains");
+    assert!(engine.pending_retirements.is_empty());
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert!(engine.collected_graph_refused().is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
+    // Six live-map leases (one per Facts row) stay with the installed
+    // backing past graph 1's Done.
+    let backing = engine.graph_backing.as_ref().expect("graph 1 installed");
+    assert_eq!(
+        backing.facts.len(),
+        6,
+        "the installed backing holds the live-map leases"
+    );
+    // Graph 2 retires the second half; at its reclaim the graph-1 backing
+    // (with its facts leases) sits in the retired handoff.
+    engine
+        .pending_retirements
+        .extend((16..32u32).map(ProcessViewId));
+    let mut reclaimed = false;
+    for _ in 0..20_000 {
+        engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Reclaim)
+        {
+            reclaimed = true;
+            break;
+        }
+    }
+    assert!(reclaimed, "graph 2 reaches reclaim");
+    let graph = engine.collected_graph.as_ref().expect("graph 2 boxed");
+    assert_eq!(
+        graph
+            .retired_backing
+            .as_ref()
+            .expect("graph 1 handed off at install")
+            .facts
+            .len(),
+        6,
+        "graph 2's install moves graph 1's facts leases to the handoff"
+    );
+    drained = false;
+    for _ in 0..20_000 {
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        if !outcome.pending {
+            drained = true;
+            break;
+        }
+    }
+    assert!(drained, "graph 2 drains");
+    assert_eq!(engine.collected_graphs_created, 2);
+    assert!(engine.collected_graph_refused().is_none());
+    assert_eq!(engine.collected_graph_reclaim_forgotten, 0);
+    // The pool holds graph 2's installed facts leases: dropping them
+    // shrinks the charge.
+    let held = engine.collected_test_pool.snapshot().charged_bytes;
+    assert!(held > baseline);
+    let live = std::mem::take(
+        &mut engine
+            .graph_backing
+            .as_mut()
+            .expect("graph 2 installed")
+            .facts,
+    );
+    assert_eq!(live.len(), 6);
+    drop(live);
+    assert!(
+        engine.collected_test_pool.snapshot().charged_bytes < held,
+        "the installed facts leases stay charged while canonical"
+    );
+    // The handoff's reclaim released graph 1's facts leases: dropping the
+    // remaining live backing returns the pool to baseline.
+    drop(engine.graph_backing.take());
+    drop(engine.retired_files.take());
+    assert_eq!(
+        engine.collected_test_pool.snapshot().charged_bytes,
+        baseline,
+        "both graphs release to baseline"
+    );
+}
+
 /// T5 helper: the deterministic (exe, libc) provider pair for one
 /// view. Index-picked peers race the child's exec; path-picked ones do
 /// not, and twin engines must agree on the peer below.

@@ -4183,6 +4183,18 @@ mod publication_progress_tests {
         Fail,
     }
 
+    /// One scripted driver step spent per `dispose_retained` call: a pending
+    /// commit poll, a finish begin, or a finish poll. `Fail` makes disposal
+    /// itself fail. The draining script models the owned publication's
+    /// completion; the loop never replays the failed callback.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DisposeStep {
+        CommitPoll,
+        FinishBegin,
+        FinishPoll,
+        Fail,
+    }
+
     struct Driver {
         scene: Scene,
         control: Option<CollectionControl>,
@@ -4211,6 +4223,14 @@ mod publication_progress_tests {
         legacy_commits: usize,
         legacy_stops: usize,
         lane_stops: usize,
+        dispose_script: VecDeque<DisposeStep>,
+        dispose_armed: bool,
+        dispose_calls: usize,
+        dispose_commit_polls: usize,
+        dispose_finish_begins: usize,
+        dispose_finish_polls: usize,
+        commit_failures: VecDeque<&'static str>,
+        stop_in_collector: bool,
     }
 
     impl Driver {
@@ -4243,7 +4263,22 @@ mod publication_progress_tests {
                 legacy_commits: 0,
                 legacy_stops: 0,
                 lane_stops: 0,
+                dispose_script: VecDeque::new(),
+                dispose_armed: false,
+                dispose_calls: 0,
+                dispose_commit_polls: 0,
+                dispose_finish_begins: 0,
+                dispose_finish_polls: 0,
+                commit_failures: VecDeque::new(),
+                stop_in_collector: false,
             }
+        }
+
+        /// Arm retained-block disposal with one scripted driver step per
+        /// call. Unarmed drivers hold every block pending, as before.
+        fn arm_dispose(&mut self, steps: &[DisposeStep]) {
+            self.dispose_armed = true;
+            self.dispose_script.extend(steps.iter().copied());
         }
 
         fn assert_retained(&self, outcome: &ClassicOutcome<ScriptedLane>) {
@@ -4343,6 +4378,9 @@ mod publication_progress_tests {
         fn collector(&mut self) -> CollectJob {
             self.scene.scans += 1;
             self.scene.note("collect");
+            if self.stop_in_collector {
+                self.stop.set(true);
+            }
             if self.pending_on_collect {
                 self.pending = true;
             }
@@ -4374,6 +4412,10 @@ mod publication_progress_tests {
             Ok(report)
         }
         fn commit(&mut self, changed: bool) -> Result<()> {
+            if let Some(text) = self.commit_failures.pop_front() {
+                self.legacy_commits += 1;
+                anyhow::bail!("{text}");
+            }
             self.legacy_commits += 1;
             self.scene.commit(changed)
         }
@@ -5159,6 +5201,108 @@ mod publication_progress_tests {
             panic!("bounded scripted terminal work did not finish");
         }
 
+        /// Slice until the run finalizes or a retained block is set. Blocked
+        /// slices are disposal tests' own assertions, not a failure here.
+        fn pump_until_block_or_final(
+            driver: &mut Driver,
+            mut outcome: ClassicOutcome<ScriptedLane>,
+            now: Instant,
+            emit: &mut dyn FnMut(&mut Driver, Publish<'_>) -> Result<()>,
+        ) -> ClassicOutcome<ScriptedLane> {
+            for _ in 0..512 {
+                if outcome.retained.is_none() || outcome.retained.as_ref().unwrap().block.is_some()
+                {
+                    return outcome;
+                }
+                outcome = slice_with(driver, outcome, now, 1, emit);
+            }
+            panic!("bounded scripted work neither finalized nor blocked");
+        }
+
+        /// Slice until the run finalizes. Callers arm disposal first; a
+        /// block that never resolves fails loudly instead of hanging.
+        fn pump_to_final(
+            driver: &mut Driver,
+            mut outcome: ClassicOutcome<ScriptedLane>,
+            now: Instant,
+            emit: &mut dyn FnMut(&mut Driver, Publish<'_>) -> Result<()>,
+        ) -> ClassicOutcome<ScriptedLane> {
+            for _ in 0..512 {
+                if outcome.retained.is_none() {
+                    return outcome;
+                }
+                outcome = slice_with(driver, outcome, now, 1, emit);
+            }
+            panic!("bounded scripted terminal work did not finish");
+        }
+
+        /// The `gap:` log subjects in order (reasons stay in the coordinator;
+        /// error texts are compared separately through the outcome).
+        fn gap_subjects(log: &Log) -> Vec<String> {
+            entries(log)
+                .into_iter()
+                .filter(|line| line.starts_with("gap:"))
+                .collect()
+        }
+
+        fn error_text(outcome: &ClassicOutcome<ScriptedLane>) -> Option<String> {
+            outcome.error.as_ref().map(|error| error.to_string())
+        }
+
+        /// A synchronous run whose pass emission fails once with `text`: the
+        /// running-error analogue of a retained publication failure.
+        fn sync_emit_fail(
+            log: &Log,
+            scoped: bool,
+            polls: &[Poll],
+            text: &'static str,
+        ) -> (ClassicOutcome<ScriptedLane>, Driver) {
+            let mut driver = Driver::new(log, scoped, polls);
+            let lane = NativeLane::start(ScriptedLane::new(log), &mut driver, windows(), None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+            let stop = || false;
+            let clock = LoopClock {
+                deadline: None,
+                stop: &stop,
+                now: &Instant::now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            let outcome = run_classic_finalizing(
+                &mut driver,
+                Some(lane),
+                &clock,
+                None,
+                &mut |driver: &mut Driver, point| {
+                    if matches!(point, Publish::Pass { .. }) {
+                        driver.emissions += 1;
+                        anyhow::bail!("{text}");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(
+                outcome.retained.is_none(),
+                "a running emission error finalizes synchronously"
+            );
+            (outcome, driver)
+        }
+
+        /// A synchronous zero-pass unscoped stop: the analogue of a retained
+        /// run that reaches its native stop without completing a pass.
+        fn sync_unscoped_zero_pass_stop(log: &Log) -> (ClassicOutcome<ScriptedLane>, Driver) {
+            let mut driver = Driver::new(log, false, &[]);
+            driver.stop.set(true);
+            let outcome = drive(&mut driver, ScriptedLane::new(log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "a pre-requested unscoped stop finalizes synchronously"
+            );
+            (outcome, driver)
+        }
+
         // A zero allowance must not even sample the injected controls. A slice
         // deadline must fence work, not become an operator/collection stop.
         #[test]
@@ -5739,6 +5883,1424 @@ mod publication_progress_tests {
                     );
                 }
             }
+        }
+
+        // P1: a failed publication before any collection resolves to the
+        // terminal failure gap without replaying the failed poll.
+        #[test]
+        fn retained_block_p1_resolves_like_sync() {
+            for between_passes in [false, true] {
+                let log = Log::default();
+                let mut driver = if between_passes {
+                    let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Fail]);
+                    driver.pending_on_tick = Some(1);
+                    driver.stop_on_emission = false;
+                    driver.interval = Duration::from_secs(60);
+                    driver
+                } else {
+                    let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+                    driver.pending = true;
+                    driver
+                };
+                let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+                driver.assert_retained(&outcome);
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("original publication failure".into())
+                );
+                let run = outcome.retained.as_ref().unwrap();
+                assert_eq!(run.block, Some(RetainedBlock::Publication));
+                assert!(matches!(run.pass, RetainedPass::BeforeCollection));
+                assert_eq!(run.completed_passes, u64::from(between_passes));
+                assert_eq!(run.discarded_collections, 0);
+                assert_eq!((driver.collected_ptr, driver.report_ptr), (0, 0));
+                let polls = driver.changes.len();
+                assert_eq!(polls, if between_passes { 2 } else { 1 });
+
+                driver.arm_dispose(&[
+                    DisposeStep::CommitPoll,
+                    DisposeStep::FinishBegin,
+                    DisposeStep::FinishPoll,
+                ]);
+                assert!(driver.dispose_armed);
+                let now = Instant::now();
+                let mut outcome = slice(&mut driver, outcome, now, 1);
+                assert_eq!(
+                    outcome.retained.as_ref().unwrap().block,
+                    Some(RetainedBlock::Publication)
+                );
+                assert_eq!((driver.dispose_calls, driver.dispose_commit_polls), (1, 1));
+                assert!(driver.publication_pending());
+                outcome = slice(&mut driver, outcome, now, 1);
+                assert_eq!(
+                    outcome.retained.as_ref().unwrap().block,
+                    Some(RetainedBlock::Publication)
+                );
+                assert_eq!((driver.dispose_calls, driver.dispose_finish_begins), (2, 1));
+                outcome = slice(&mut driver, outcome, now, 1);
+                let run = outcome.retained.as_ref().unwrap();
+                assert_eq!(run.block, None);
+                assert!(matches!(
+                    run.pass,
+                    RetainedPass::Terminal {
+                        phase: RetainedTerminalPhase::FailureGap
+                    }
+                ));
+                assert_eq!((driver.dispose_calls, driver.dispose_finish_polls), (3, 1));
+                assert!(driver.dispose_script.is_empty());
+                assert!(!driver.publication_pending());
+                assert_eq!(driver.changes.len(), polls, "the failed poll never replays");
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("original publication failure".into())
+                );
+                assert_eq!(run.discarded_collections, 0);
+
+                let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("original publication failure".into())
+                );
+                assert!(outcome.zero_pass.is_none());
+                assert_eq!(
+                    outcome.stopped.as_ref().unwrap().summary.passes,
+                    u64::from(between_passes)
+                );
+                assert_eq!(
+                    driver.changes.len(),
+                    polls + 1,
+                    "only the final commit polls again"
+                );
+
+                let twin_log = Log::default();
+                let (twin, _) = if between_passes {
+                    sync_emit_fail(
+                        &twin_log,
+                        false,
+                        &[Poll::Published],
+                        "original publication failure",
+                    )
+                } else {
+                    let mut twin = Driver::new(&twin_log, false, &[]);
+                    let outcome = drive_initial(
+                        &mut twin,
+                        ScriptedLane::new(&twin_log),
+                        windows(),
+                        Some(anyhow!("original publication failure")),
+                    );
+                    assert!(outcome.retained.is_none());
+                    (outcome, twin)
+                };
+                assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+                assert_eq!(error_text(&outcome), error_text(&twin));
+                assert_eq!(
+                    outcome.stopped.as_ref().unwrap().events,
+                    twin.stopped.as_ref().unwrap().events
+                );
+                assert_eq!(
+                    outcome.stopped.as_ref().unwrap().summary.passes,
+                    twin.stopped.as_ref().unwrap().summary.passes
+                );
+            }
+        }
+
+        // P2: a failed publication over an unapplied collection discards that
+        // collection exactly like the synchronous mid-pass stop, then reports
+        // the failure gap.
+        #[test]
+        fn retained_block_p2_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+            driver.pending_on_collect = true;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(run.pass, RetainedPass::Collected { .. }));
+            assert_eq!(driver.changes, [false]);
+            assert_eq!((driver.scene.scans, driver.applies), (1, 0));
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let now = Instant::now();
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            assert_eq!((driver.dispose_calls, driver.dispose_commit_polls), (1, 1));
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(run.discarded_collections, 1);
+            assert_eq!(driver.changes, [false], "the failed poll never replays");
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert!(outcome.zero_pass.is_none());
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 0);
+
+            let twin_log = Log::default();
+            let mut twin = Driver::new(&twin_log, false, &[]);
+            let twin = drive_initial(
+                &mut twin,
+                ScriptedLane::new(&twin_log),
+                windows(),
+                Some(anyhow!("original publication failure")),
+            );
+            assert!(twin.retained.is_none());
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        // P3: a failed first commit resolves to the failure gap; the applied
+        // report stays the same object and the commit never replays.
+        #[test]
+        fn retained_block_p3_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            let RetainedPass::Applied { report, phase } = &run.pass else {
+                panic!("retain the exact applied report");
+            };
+            assert_eq!(*phase, AppliedPassPhase::FirstCommitAttempted);
+            assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+            assert_eq!((driver.scene.scans, driver.applies), (1, 1));
+            assert_eq!(driver.changes.len(), 1);
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let now = Instant::now();
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(driver.changes.len(), 1, "the failed commit never replays");
+            assert_eq!(driver.applies, 1, "no report is applied twice");
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(run.discarded_collections, 0);
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 1);
+
+            let twin_log = Log::default();
+            let (twin, _) = sync_emit_fail(
+                &twin_log,
+                false,
+                &[Poll::Published],
+                "original publication failure",
+            );
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().summary.passes,
+                twin.stopped.as_ref().unwrap().summary.passes
+            );
+        }
+
+        // P4: a failed scoped-receipts commit resolves to the failure gap;
+        // scoped completion ran exactly once and never runs again.
+        #[test]
+        fn retained_block_p4_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, true, &[Poll::Published, Poll::Pending, Poll::Fail]);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            let RetainedPass::Applied { report, phase } = &run.pass else {
+                panic!("retain the exact applied report");
+            };
+            assert_eq!(*phase, AppliedPassPhase::ScopedReceiptsAttempted);
+            assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+            assert_eq!((driver.finishes, driver.changes.len()), (1, 3));
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let now = Instant::now();
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(driver.changes.len(), 3, "the failed commit never replays");
+            assert_eq!(driver.finishes, 1, "scoped completion never reruns");
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+
+            let twin_log = Log::default();
+            let (twin, _) = sync_emit_fail(
+                &twin_log,
+                true,
+                &[Poll::Published, Poll::Published],
+                "original publication failure",
+            );
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        // P5: a failed pass emission resolves to the failure gap; the pass
+        // stays counted once and the emission never replays.
+        #[test]
+        fn retained_block_p5_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.stop_after_poll = Some(1);
+            let mut outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.polls.push_back(Poll::Published);
+            for _ in 0..8 {
+                if matches!(
+                    outcome.retained.as_ref().unwrap().pass,
+                    RetainedPass::Applied {
+                        phase: AppliedPassPhase::ReadyToEmit,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+                outcome = slice(&mut driver, outcome, Instant::now(), 1);
+            }
+            let outcome = slice_with(
+                &mut driver,
+                outcome,
+                Instant::now(),
+                1,
+                &mut |driver, point| {
+                    assert!(matches!(point, Publish::Pass { .. }));
+                    driver.emissions += 1;
+                    Err(anyhow!("partial pass output failed"))
+                },
+            );
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            let RetainedPass::Applied { report, phase } = &run.pass else {
+                panic!("retain the same report on output failure");
+            };
+            assert_eq!(*phase, AppliedPassPhase::EmissionAttempted);
+            assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+            assert_eq!(run.completed_passes, 1);
+            assert_eq!(driver.emissions, 1);
+            assert_eq!(
+                error_text(&outcome),
+                Some("partial pass output failed".into())
+            );
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let now = Instant::now();
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(run.completed_passes, 1, "the pass stays counted once");
+            assert_eq!(driver.emissions, 1, "the failed emission never replays");
+            assert_eq!(
+                error_text(&outcome),
+                Some("partial pass output failed".into())
+            );
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("partial pass output failed".into())
+            );
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 1);
+
+            let twin_log = Log::default();
+            let (twin, _) = sync_emit_fail(
+                &twin_log,
+                false,
+                &[Poll::Published],
+                "partial pass output failed",
+            );
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        // P6: a scoped-startup gap without a collection control records its
+        // own first error, then reports the failure gap. The loop cannot
+        // reach this state on its own (entering the phase needs a cancelled
+        // control, blocking needs none, and cancellation is sticky), so the
+        // test plants the blocked state the loop arm describes.
+        #[test]
+        fn retained_block_p6_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, true, &[Poll::Published]);
+            let mut outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+            let now = Instant::now();
+            for _ in 0..8 {
+                if matches!(
+                    outcome.retained.as_ref().unwrap().pass,
+                    RetainedPass::Terminal {
+                        phase: RetainedTerminalPhase::ScopedStartupGap,
+                    }
+                ) {
+                    break;
+                }
+                outcome = slice(&mut driver, outcome, now, 1);
+            }
+            let (mut run, error) = retained(outcome);
+            assert!(error.is_none());
+            assert!(run.control.as_ref().unwrap().check().is_err());
+            run.control = None;
+            run.block = Some(RetainedBlock::Publication);
+            let mut outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
+
+            driver.arm_dispose(&[]);
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(driver.dispose_calls, 1);
+            assert_eq!(
+                error_text(&outcome),
+                Some("scoped startup gap without collection control".into())
+            );
+            assert_eq!(driver.changes.len(), 1, "no callback replays");
+            assert_eq!(run.completed_passes, 0);
+            assert_eq!(run.discarded_collections, 0);
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("scoped startup gap without collection control".into())
+            );
+            assert_eq!(gap_subjects(&log), ["gap:inventory capture failed"]);
+            assert!(outcome.zero_pass.is_none());
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 0);
+        }
+
+        // P7: a failed scoped-startup commit resolves to the failure gap.
+        #[test]
+        fn retained_block_p7_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, true, &[Poll::Published, Poll::Fail]);
+            let outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+            let now = Instant::now();
+            let outcome = pump_until_block_or_final(&mut driver, outcome, now, &mut publish);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::ScopedStartupCommitAttempted,
+                }
+            ));
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(driver.changes.len(), 2);
+            assert_eq!(run.completed_passes, 0);
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(driver.changes.len(), 2, "the failed commit never replays");
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(
+                gap_subjects(&log),
+                [
+                    "gap:cgroup collection cancelled before launch",
+                    "gap:inventory capture failed",
+                ]
+            );
+            assert!(outcome.zero_pass.is_none());
+        }
+
+        // P8: a failed retiring publication resolves back to the native stop,
+        // where the set error makes the error disposition admissible.
+        #[test]
+        fn retained_block_p8_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+            driver.pending = true;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(run.pass, RetainedPass::BeforeCollection));
+
+            driver.arm_dispose(&[]);
+            let now = Instant::now();
+            let outcome = slice(&mut driver, outcome, now, 1);
+            assert!(matches!(
+                outcome.retained.as_ref().unwrap().pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            let outcome =
+                pump_until_block_or_final(&mut driver, outcome, now, &mut |driver, point| {
+                    if matches!(point, Publish::Retiring { .. }) {
+                        Err(anyhow!("retiring publish failed"))
+                    } else {
+                        publish(driver, point)
+                    }
+                });
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::RetiringAttempted,
+                }
+            ));
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into()),
+                "the first error is kept"
+            );
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop
+                }
+            ));
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(gap_subjects(&log), ["gap:inventory capture failed"]);
+
+            let twin_log = Log::default();
+            let mut twin = Driver::new(&twin_log, false, &[]);
+            let lane = NativeLane::start(ScriptedLane::new(&twin_log), &mut twin, windows(), None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+            let stop = || false;
+            let clock = LoopClock {
+                deadline: None,
+                stop: &stop,
+                now: &Instant::now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            let twin = run_classic_finalizing(
+                &mut twin,
+                Some(lane),
+                &clock,
+                Some(anyhow!("original publication failure")),
+                &mut |_, point| {
+                    if matches!(point, Publish::Retiring { .. }) {
+                        Err(anyhow!("retiring publish failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(twin.retained.is_none());
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        // P9: a failed final commit resolves to the stop emission when a
+        // native owner or a zero-pass diagnostic remains, else completes.
+        #[test]
+        fn retained_block_p9_resolves_like_sync() {
+            // Native owner: emit the stop after disposal.
+            let log = Log::default();
+            let mut driver =
+                Driver::new(&log, false, &[Poll::Published, Poll::Pending, Poll::Fail]);
+            let outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+            let now = Instant::now();
+            let outcome = pump_until_block_or_final(&mut driver, outcome, now, &mut publish);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FinalCommitAttempted,
+                }
+            ));
+            assert!(matches!(run.native, Some(RetainedNative::Stopped(_))));
+            assert_eq!(driver.changes.len(), 3);
+            driver.arm_dispose(&[DisposeStep::FinishPoll]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::EmitStop
+                }
+            ));
+            assert_eq!(driver.changes.len(), 3, "the failed commit never replays");
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+            assert!(outcome.zero_pass.is_some());
+
+            let twin_log = Log::default();
+            let mut twin = Driver::new(&twin_log, false, &[]);
+            twin.commit_failures
+                .push_back("original publication failure");
+            twin.stop.set(true);
+            let twin_outcome = drive(&mut twin, ScriptedLane::new(&twin_log), windows());
+            assert!(twin_outcome.retained.is_none());
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin_outcome));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin_outcome.stopped.as_ref().unwrap().events
+            );
+
+            // Best effort: no native owner but a zero-pass diagnostic keeps
+            // the terminal error on its own channel and still emits the stop.
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Fail]);
+            let outcome = before_collection(&mut driver, None, None);
+            let outcome = pump_until_block_or_final(&mut driver, outcome, now, &mut publish);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FinalCommitAttempted,
+                }
+            ));
+            assert!(run.native.is_none());
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(
+                run.terminal_callback_error.as_ref().unwrap().to_string(),
+                "original publication failure"
+            );
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::EmitStop
+                }
+            ));
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(outcome.retained.is_none());
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+            assert!(outcome.zero_pass.is_some());
+            assert!(outcome.stopped.is_none());
+
+            // Neither owner nor diagnostic: complete at once.
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Fail]);
+            let outcome = before_collection(&mut driver, None, Some(anyhow!("first run failure")));
+            let outcome = pump_until_block_or_final(&mut driver, outcome, now, &mut publish);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FinalCommitAttempted,
+                }
+            ));
+            assert!(run.native.is_none());
+            assert_eq!(error_text(&outcome), Some("first run failure".into()));
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::Complete
+                }
+            ));
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(error_text(&outcome), Some("first run failure".into()));
+            assert_eq!(gap_subjects(&log), ["gap:inventory capture failed"]);
+            assert!(outcome.zero_pass.is_none());
+            assert!(outcome.stopped.is_none());
+        }
+
+        // P10: a failed stop emission completes; the failed emission never
+        // replays and a best-effort diagnostic keeps its own channel.
+        #[test]
+        fn retained_block_p10_resolves_like_sync() {
+            // Native owner with a failed stop emission.
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
+            let outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+            let now = Instant::now();
+            let outcome =
+                pump_until_block_or_final(&mut driver, outcome, now, &mut |driver, point| {
+                    if matches!(point, Publish::Stop { .. }) {
+                        driver.scene.note("diagnostic-output-attempt");
+                        Err(anyhow!("partial stop output failed"))
+                    } else {
+                        publish(driver, point)
+                    }
+                });
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::EmitStopAttempted,
+                }
+            ));
+            assert!(matches!(run.native, Some(RetainedNative::Stopped(_))));
+            assert_eq!(
+                error_text(&outcome),
+                Some("partial stop output failed".into())
+            );
+            let stops = entries(&log)
+                .iter()
+                .filter(|line| *line == "diagnostic-output-attempt")
+                .count();
+            assert_eq!(stops, 1);
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::Complete
+                }
+            ));
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("partial stop output failed".into())
+            );
+            assert_eq!(
+                entries(&log)
+                    .iter()
+                    .filter(|line| *line == "diagnostic-output-attempt")
+                    .count(),
+                1,
+                "the failed stop emission never replays"
+            );
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+
+            let twin_log = Log::default();
+            let mut twin = Driver::new(&twin_log, false, &[]);
+            twin.stop.set(true);
+            let lane = NativeLane::start(ScriptedLane::new(&twin_log), &mut twin, windows(), None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+            let stop = Rc::clone(&twin.stop);
+            let clock = LoopClock {
+                deadline: None,
+                stop: &|| stop.get(),
+                now: &Instant::now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            let twin =
+                run_classic_finalizing(&mut twin, Some(lane), &clock, None, &mut |_, point| {
+                    if matches!(point, Publish::Stop { .. }) {
+                        Err(anyhow!("partial stop output failed"))
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(twin.retained.is_none());
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+
+            // Best effort: no native owner, zero-pass diagnostic, the stop
+            // emission failure stays on the terminal channel.
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Published]);
+            let outcome = before_collection(&mut driver, None, None);
+            let outcome =
+                pump_until_block_or_final(&mut driver, outcome, now, &mut |driver, point| {
+                    if matches!(point, Publish::Stop { .. }) {
+                        Err(anyhow!("partial diagnostic output failed"))
+                    } else {
+                        publish(driver, point)
+                    }
+                });
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::EmitStopAttempted,
+                }
+            ));
+            assert!(run.native.is_none());
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(
+                run.terminal_callback_error.as_ref().unwrap().to_string(),
+                "partial diagnostic output failed"
+            );
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::Complete
+                }
+            ));
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(outcome.retained.is_none());
+            assert!(error_text(&outcome).is_none());
+            assert!(outcome.zero_pass.is_some());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+        }
+
+        // C1: an unapplied collection is discarded exactly like the
+        // synchronous mid-pass stop, then the zero-pass gap accounts it.
+        #[test]
+        fn retained_block_c1_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.pending_on_collect = true;
+            driver.stop_after_poll = Some(1);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert!(error_text(&outcome).is_none());
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Collected));
+            let RetainedPass::Collected {
+                collected,
+                scan_now_ns,
+            } = &run.pass
+            else {
+                panic!("retain the exact unapplied collection");
+            };
+            assert!(*scan_now_ns > 0);
+            let CollectedPass::Legacy(Ok(catalog)) = collected else {
+                panic!("the original catalog must remain owned");
+            };
+            assert_eq!(catalog.processes.as_ptr() as usize, driver.collected_ptr);
+            assert_eq!((driver.scene.scans, driver.applies), (1, 0));
+            assert_eq!(driver.changes.len(), 1);
+
+            driver.arm_dispose(&[]);
+            let now = Instant::now();
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::ZeroPassGap,
+                }
+            ));
+            assert_eq!(run.discarded_collections, 1);
+            assert_eq!(driver.dispose_calls, 1);
+            assert_eq!(driver.applies, 0, "the collection is never applied");
+            assert_eq!(driver.changes.len(), 1, "no callback replays");
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            let zero = outcome.zero_pass.unwrap();
+            assert_eq!(zero.cause, ZeroPassCause::OperatorStop);
+            assert_eq!(zero.discarded, 1);
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+
+            let twin_log = Log::default();
+            let mut twin = Driver::new(&twin_log, false, &[]);
+            twin.stop_in_collector = true;
+            let twin = drive(&mut twin, ScriptedLane::new(&twin_log), windows());
+            assert!(
+                twin.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!(twin.zero_pass.as_ref().unwrap().discarded, 1);
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(zero.cause, twin.zero_pass.as_ref().unwrap().cause);
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        // S1: a failed scoped completion keeps its mutated report without
+        // retry, notes the scoped gap once, then reports the failure gap.
+        #[test]
+        fn retained_block_s1_resolves_like_sync() {
+            for planted_attempted in [false, true] {
+                let log = Log::default();
+                let mut driver = Driver::new(&log, true, &[Poll::Published]);
+                driver.fail_finish = true;
+                let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+                driver.assert_retained(&outcome);
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("completion failed after mutating the original report".into())
+                );
+                let (mut run, error) = retained(outcome);
+                let RetainedPass::Applied { report, phase } = &run.pass else {
+                    panic!("retain the exact applied report");
+                };
+                assert_eq!(*phase, AppliedPassPhase::ScopedCompletionFailed);
+                assert_eq!(report.pending_refresh.as_ptr() as usize, driver.report_ptr);
+                assert_eq!(report.scan_callers, 73);
+                assert_eq!((driver.finishes, driver.changes.len()), (1, 1));
+                if planted_attempted {
+                    // The same mutated report under the attempted phase: the
+                    // loop arm describes both, the sync path retains Failed.
+                    let RetainedPass::Applied { phase, .. } = &mut run.pass else {
+                        unreachable!();
+                    };
+                    *phase = AppliedPassPhase::ScopedCompletionAttempted;
+                }
+                let (scans, applies, emissions) =
+                    (driver.scene.scans, driver.applies, driver.emissions);
+                let outcome = ClassicOutcome {
+                    stopped: None,
+                    error,
+                    zero_pass: None,
+                    retained: Some(run),
+                };
+
+                driver.arm_dispose(&[]);
+                let now = Instant::now();
+                let outcome = slice(&mut driver, outcome, now, 1);
+                let run = outcome.retained.as_ref().unwrap();
+                assert_eq!(run.block, None);
+                assert!(matches!(
+                    run.pass,
+                    RetainedPass::Terminal {
+                        phase: RetainedTerminalPhase::FailureGap
+                    }
+                ));
+                assert_eq!(driver.finishes, 1, "scoped completion never reruns");
+                assert_eq!(
+                    (driver.scene.scans, driver.applies, driver.emissions),
+                    (scans, applies, emissions),
+                    "no new pass work starts"
+                );
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("completion failed after mutating the original report".into())
+                );
+
+                let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+                assert_eq!(
+                    error_text(&outcome),
+                    Some("completion failed after mutating the original report".into())
+                );
+                assert_eq!(
+                    gap_subjects(&log),
+                    [
+                        "gap:scoped completion failed",
+                        "gap:inventory capture failed"
+                    ]
+                );
+            }
+        }
+
+        // N1: a native stop with no admissible disposition waits for the
+        // sampled stop, gates the host once, then stops like the synchronous
+        // cancelled unscoped startup. The selection-failed state cannot arise
+        // from the loop on its own (an error-free retention always sampled a
+        // stop), so the test plants the block the loop arm describes.
+        #[test]
+        fn retained_block_n1_resolves_like_sync() {
+            fn drive_to_native_stop(log: &Log) -> (ClassicOutcome<ScriptedLane>, Driver, Instant) {
+                let mut driver = Driver::new(log, false, &[Poll::Published]);
+                let mut outcome =
+                    before_collection(&mut driver, Some(ScriptedLane::new(log)), None);
+                let now = Instant::now();
+                for _ in 0..16 {
+                    let run = outcome.retained.as_ref().unwrap();
+                    if matches!(
+                        run.pass,
+                        RetainedPass::Terminal {
+                            phase: RetainedTerminalPhase::NativeStop,
+                        }
+                    ) {
+                        assert!(matches!(run.native, Some(RetainedNative::Live(_))));
+                        return (outcome, driver, now);
+                    }
+                    outcome = slice(&mut driver, outcome, now, 1);
+                }
+                panic!("the retained run never reached its native stop");
+            }
+
+            // A stop requested while blocked resolves within one hook.
+            let log = Log::default();
+            let (outcome, mut driver, now) = drive_to_native_stop(&log);
+            let (mut run, error) = retained(outcome);
+            assert!(error.is_none());
+            run.block = Some(RetainedBlock::Native);
+            run.stop_cause = None;
+            driver.stop.set(false);
+            let mut outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
+            driver.arm_dispose(&[]);
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(
+                run.block,
+                Some(RetainedBlock::Native),
+                "no sampled stop waits"
+            );
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert!(matches!(run.native, Some(RetainedNative::Live(_))));
+            assert_eq!(driver.dispose_calls, 1);
+            assert_eq!(driver.host_stops, 1);
+            driver.stop.set(true);
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None, "one hook resolves the sampled stop");
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert_eq!(run.stop_cause, Some(ZeroPassCause::OperatorStop));
+            assert_eq!(driver.host_stops, 1, "the gated host stops once");
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+            assert_eq!(outcome.zero_pass.as_ref().unwrap().discarded, 0);
+
+            let twin_log = Log::default();
+            let (twin, _) = sync_unscoped_zero_pass_stop(&twin_log);
+            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
+            assert_eq!(error_text(&outcome), error_text(&twin));
+            assert_eq!(
+                outcome.zero_pass.as_ref().unwrap().cause,
+                twin.zero_pass.as_ref().unwrap().cause
+            );
+            assert_eq!(
+                outcome.stopped.as_ref().unwrap().events,
+                twin.stopped.as_ref().unwrap().events
+            );
+
+            // An already sampled stop with a planted block resolves at once.
+            let log = Log::default();
+            let (outcome, mut driver, now) = drive_to_native_stop(&log);
+            let (mut run, error) = retained(outcome);
+            run.block = Some(RetainedBlock::Native);
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert_eq!(driver.host_stops, 1);
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+
+            // An ungated host is gated exactly once on resolution.
+            let log = Log::default();
+            let (outcome, mut driver, now) = drive_to_native_stop(&log);
+            let (mut run, error) = retained(outcome);
+            run.block = Some(RetainedBlock::Native);
+            run.host_stopped = false;
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(run.host_stopped);
+            assert_eq!(driver.host_stops, 2, "the host gate runs once here");
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+        }
+
+        // N2: a refused native stop admission records its own first error,
+        // then stops through the error disposition. A scoped clock deadline
+        // retains the run without cancelling its collection control, so the
+        // scoped disposition is selected but refused.
+        #[test]
+        fn retained_block_n2_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, true, &[Poll::Published]);
+            driver.pending = true;
+            let mut lane = ScriptedLane::new(&log);
+            lane.scope_coverage = CaptureScopeCoverage::Cgroup;
+            let started = NativeLane::start(lane, &mut driver, windows(), None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+            let stop = || false;
+            let clock = LoopClock {
+                deadline: Some(Instant::now() - Duration::from_secs(1)),
+                stop: &stop,
+                now: &Instant::now,
+                interval: Duration::ZERO,
+                tick: Duration::from_millis(1),
+                collection_tick: NO_COLLECTION_TICK,
+            };
+            let outcome =
+                run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, _| {
+                    panic!("a deadline retention cannot emit")
+                });
+            driver.assert_retained(&outcome);
+            assert!(error_text(&outcome).is_none());
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.stop_cause, Some(ZeroPassCause::Deadline));
+            assert!(run.control.as_ref().unwrap().check().is_ok());
+            assert!(matches!(run.pass, RetainedPass::BeforeCollection));
+
+            let now = Instant::now();
+            let outcome = pump_until_block_or_final(&mut driver, outcome, now, &mut publish);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Native));
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert!(matches!(run.native, Some(RetainedNative::Live(_))));
+            assert!(run.control.as_ref().unwrap().check().is_ok());
+
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert_eq!(
+                error_text(&outcome),
+                Some("native stop admission refused".into())
+            );
+            assert_eq!(driver.changes.len(), 1, "no callback replays");
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("native stop admission refused".into())
+            );
+            // The admission error lands after the failure-gap phase passed,
+            // so only the earlier zero-pass diagnostic is streamed.
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+            assert_eq!(
+                outcome.zero_pass.as_ref().unwrap().cause,
+                ZeroPassCause::Deadline
+            );
+            assert!(outcome.stopped.is_some());
+        }
+
+        // N3: a complete phase with a live native owner returns to the native
+        // stop instead of dropping the capture. The loop cannot reach this
+        // state on its own (completion only follows a stopped native owner),
+        // so the test plants the blocked state the loop arm describes.
+        #[test]
+        fn retained_block_n3_resolves_like_sync() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published]);
+            let mut outcome = before_collection(&mut driver, Some(ScriptedLane::new(&log)), None);
+            let now = Instant::now();
+            for _ in 0..16 {
+                if matches!(
+                    outcome.retained.as_ref().unwrap().pass,
+                    RetainedPass::Terminal {
+                        phase: RetainedTerminalPhase::NativeStop,
+                    }
+                ) {
+                    break;
+                }
+                outcome = slice(&mut driver, outcome, now, 1);
+            }
+            let (mut run, error) = retained(outcome);
+            assert!(error.is_none());
+            assert!(matches!(run.native, Some(RetainedNative::Live(_))));
+            run.pass = RetainedPass::Terminal {
+                phase: RetainedTerminalPhase::Complete,
+            };
+            run.block = Some(RetainedBlock::Native);
+            let outcome = ClassicOutcome {
+                stopped: None,
+                error,
+                zero_pass: None,
+                retained: Some(run),
+            };
+
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::NativeStop,
+                }
+            ));
+            assert!(matches!(run.native, Some(RetainedNative::Live(_))));
+            assert_eq!(driver.dispose_calls, 1);
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
+            assert!(outcome.stopped.is_some());
+            assert_eq!(outcome.stopped.as_ref().unwrap().summary.passes, 0);
+        }
+
+        // The suspension gate only latches: no commit, emission or poll runs
+        // inside the hook. (The joint commit/finish/wound-down counters do
+        // not exist on this driver's API yet; they arrive with the real
+        // joint driver.)
+        #[test]
+        fn prompt_gate_latches_without_terminal_io() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Published, Poll::Fail]);
+            driver.pending_on_tick = Some(1);
+            driver.stop_on_emission = false;
+            driver.interval = Duration::from_secs(60);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            assert_eq!(driver.suspended, 1, "retention latches the gate once");
+            assert_eq!(driver.legacy_commits, 0);
+            assert_eq!(driver.legacy_stops, 0);
+            // Positive controls: the spies do observe ordinary loop I/O.
+            assert_eq!(driver.changes.len(), 2);
+            assert_eq!(driver.emissions, 1);
+
+            let (commits, emissions, polls) = (
+                driver.legacy_commits,
+                driver.emissions,
+                driver.changes.len(),
+            );
+            driver.on_publication_suspended();
+            assert_eq!(driver.suspended, 2);
+            assert_eq!(driver.legacy_commits, commits, "no commit inside the hook");
+            assert_eq!(driver.emissions, emissions, "no emission inside the hook");
+            assert_eq!(driver.changes.len(), polls, "no poll inside the hook");
+        }
+
+        // A failing disposal keeps the block and never overwrites the first
+        // error; a later disposal still resolves the same owners.
+        #[test]
+        fn dispose_error_keeps_block_and_first_error() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.pending_on_collect = true;
+            driver.stop_after_poll = Some(1);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Collected));
+            assert!(error_text(&outcome).is_none());
+
+            driver.arm_dispose(&[DisposeStep::Fail]);
+            let now = Instant::now();
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Collected));
+            assert_eq!(
+                error_text(&outcome),
+                Some("scripted dispose failure".into())
+            );
+            assert_eq!(driver.dispose_calls, 1);
+
+            driver.arm_dispose(&[]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap
+                }
+            ));
+            assert_eq!(run.discarded_collections, 1);
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("scripted dispose failure".into())
+            );
+            assert_eq!(gap_subjects(&log), ["gap:inventory capture failed"]);
+
+            // A retained first error survives a later disposal failure.
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+            driver.pending = true;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            driver.arm_dispose(&[DisposeStep::Fail]);
+            let outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into()),
+                "the first error is kept"
+            );
+            driver.arm_dispose(&[]);
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert!(outcome.retained.is_none());
         }
     }
 }

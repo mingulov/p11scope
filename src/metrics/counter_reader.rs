@@ -3187,6 +3187,297 @@ mod tests {
         }
     }
 
+    /// Cell slot-shape mirror for envelope tests: one provider object, a
+    /// provider-length path, one caller-named symbol per slot, like the
+    /// growth and old-return cells build. Identity still comes from pins.
+    fn envelope_shape_slots(
+        count: usize,
+        name: impl Fn(usize) -> String,
+    ) -> (
+        tempfile::TempDir,
+        crate::discovery::identity::PinnedObjects,
+        Vec<Slot>,
+    ) {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter-growth-provider.so");
+        let bytes = b"counter growth provider fixture";
+        std::fs::write(&path, bytes).unwrap();
+        let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes));
+        let pins = real_scan_pin(&path, None, 1, &digest);
+        let object = pins.pinned().next().unwrap().id;
+        // Same length as the cell provider paths, so the per-slot path
+        // charge matches the cells' class.
+        let object_path =
+            "/home/user/.cache/p11scope-vng/a2dev-ba4a/cells/counter-growth-provider.so".to_owned();
+        assert_eq!(object_path.len(), 74);
+        let slots = (0..count)
+            .map(|i| {
+                let mut target = slot(i as u32, 0);
+                target.object = object;
+                target.object_path = object_path.clone();
+                target.file_offset = 0x80 + 16 * i as u64;
+                target.names = vec![name(i)];
+                target.aliased = false;
+                target
+            })
+            .collect();
+        (dir, pins, slots)
+    }
+
+    /// The same provider-copy charge `NativeIo` levies, summed over slots.
+    fn provider_copy_charge(
+        pins: &crate::discovery::identity::PinnedObjects,
+        slots: &[Slot],
+    ) -> usize {
+        slots
+            .iter()
+            .try_fold(0usize, |bytes, slot| {
+                bytes.checked_add(
+                    pins.retained_target_copy_allocation_charge(slot.object)?
+                        .checked_mul(4)?,
+                )
+            })
+            .expect("fixture provider charges fit")
+    }
+
+    /// The growth cells' stage envelope under test: payload plus headroom
+    /// on retained, with fixed transient/metadata/FD legs.
+    fn growth_stage_envelope(
+        mode: CounterMode,
+        cpus: usize,
+        _slots: &[Slot],
+        _provider_copies: usize,
+        _multi: bool,
+    ) -> crate::attach::counter_banks::BankReservation {
+        crate::attach::counter_banks::BankReservation {
+            retained_bytes: stage_retained_for_banks(mode, cpus, 16),
+            transient_bytes: 256 * 1024 * 1024,
+            metadata_bytes: 16 * 1024 * 1024,
+            file_descriptors: cpus
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(4))
+                .and_then(|n| n.checked_mul(GROWTH_ENDPOINTS))
+                .and_then(|n| n.checked_add(16))
+                .unwrap(),
+        }
+    }
+
+    /// The old-return cells' stage envelope under test: one funded bank on
+    /// retained, with fixed transient/metadata/FD legs.
+    fn old_return_stage_envelope(
+        mode: CounterMode,
+        cpus: usize,
+        _slots: &[Slot],
+        _provider_copies: usize,
+    ) -> crate::attach::counter_banks::BankReservation {
+        crate::attach::counter_banks::BankReservation {
+            retained_bytes: stage_retained_for_banks(mode, cpus, 1),
+            transient_bytes: 1024 * 1024,
+            metadata_bytes: 256 * 1024,
+            file_descriptors: cpus.checked_mul(8).unwrap() + 16,
+        }
+    }
+
+    #[test]
+    fn growth_stage_envelope_covers_real_staged_requirements() {
+        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        let (_dir, pins, slots) = envelope_shape_slots(GROWTH_ENDPOINTS, |i| {
+            format!("counter_bank_growth_e{i:04x}")
+        });
+        let provider_all = provider_copy_charge(&pins, &slots);
+        // The cells' three true stages: slots staged, fresh extent,
+        // pre-stage positions capacity, fresh banks, and (Multi) pre-stage
+        // link length/capacity by construction.
+        let stages = [
+            (512usize, 0u32, 512u32, 0usize, 1usize, (0usize, 0usize)),
+            (513, 512, 513, 512, 1, (1024, 1024)),
+            (8192, 513, 8192, 513, 14, (1026, 1026)),
+        ];
+        let mut failures = Vec::new();
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for cpus in [12usize, 256] {
+                for multi in [false, true] {
+                    let envelope = growth_stage_envelope(mode, cpus, &slots, provider_all, multi);
+                    for (all, first, end, old_capacity, new_banks, links) in stages {
+                        let required = estimate_counter_stage_reservation(
+                            mode,
+                            16,
+                            512,
+                            &slots[..all],
+                            first,
+                            end,
+                            old_capacity,
+                            cpus,
+                            new_banks,
+                            provider_copy_charge(&pins, &slots[first as usize..end as usize]),
+                            multi.then_some(links),
+                        )
+                        .unwrap();
+                        let context =
+                            format!("growth {mode:?} P={cpus} multi={multi} stage {first}..{end}");
+                        for (field, have, need) in [
+                            ("retained", envelope.retained_bytes, required.retained_bytes),
+                            (
+                                "transient",
+                                envelope.transient_bytes,
+                                required.transient_bytes,
+                            ),
+                            ("metadata", envelope.metadata_bytes, required.metadata_bytes),
+                            ("fds", envelope.file_descriptors, required.file_descriptors),
+                        ] {
+                            if have < need {
+                                failures.push(format!("{context}: {field} {have} < {need}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stage envelope shortfalls:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn old_return_stage_envelope_covers_real_staged_requirements() {
+        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        let (_dir, pins, slots) = envelope_shape_slots(2, |i| {
+            ["counter_bank_old", "counter_bank_hot"][i].to_owned()
+        });
+        let provider_all = provider_copy_charge(&pins, &slots);
+        let stages = [(1usize, 0u32, 1u32, 0usize, 1usize), (2, 1, 2, 1, 0)];
+        let mut failures = Vec::new();
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for cpus in [12usize, 256] {
+                let envelope = old_return_stage_envelope(mode, cpus, &slots, provider_all);
+                for (all, first, end, old_capacity, new_banks) in stages {
+                    let required = estimate_counter_stage_reservation(
+                        mode,
+                        16,
+                        512,
+                        &slots[..all],
+                        first,
+                        end,
+                        old_capacity,
+                        cpus,
+                        new_banks,
+                        provider_copy_charge(&pins, &slots[first as usize..end as usize]),
+                        None,
+                    )
+                    .unwrap();
+                    let context = format!("old-return {mode:?} P={cpus} stage {first}..{end}");
+                    for (field, have, need) in [
+                        ("retained", envelope.retained_bytes, required.retained_bytes),
+                        (
+                            "transient",
+                            envelope.transient_bytes,
+                            required.transient_bytes,
+                        ),
+                        ("metadata", envelope.metadata_bytes, required.metadata_bytes),
+                        ("fds", envelope.file_descriptors, required.file_descriptors),
+                    ] {
+                        if have < need {
+                            failures.push(format!("{context}: {field} {have} < {need}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stage envelope shortfalls:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn stage_reservation_check_refuses_below_requirement() {
+        use crate::attach::counter_banks::{
+            BankRefusal, BankReservation, check_counter_stage_reservation,
+            tests::estimate_counter_stage_reservation,
+        };
+        let (_dir, pins, slots) = envelope_shape_slots(GROWTH_ENDPOINTS, |i| {
+            format!("counter_bank_growth_e{i:04x}")
+        });
+        // The largest real requirement: counts at P=12, final growth stage.
+        let required = estimate_counter_stage_reservation(
+            CounterMode::Counts,
+            16,
+            512,
+            &slots,
+            513,
+            8192,
+            513,
+            12,
+            14,
+            provider_copy_charge(&pins, &slots[513..]),
+            None,
+        )
+        .unwrap();
+        let need = (
+            required.retained_bytes,
+            required.transient_bytes,
+            required.metadata_bytes,
+            required.file_descriptors,
+        );
+        assert!(
+            need.0 > 0 && need.1 > 0 && need.2 > 0 && need.3 > 0,
+            "the twin needs a nonzero requirement: {need:?}"
+        );
+        assert!(
+            check_counter_stage_reservation(required, need).is_ok(),
+            "exact fit admits"
+        );
+        for (field, short) in [
+            (
+                "retained",
+                BankReservation {
+                    retained_bytes: need.0 - 1,
+                    ..required
+                },
+            ),
+            (
+                "transient",
+                BankReservation {
+                    transient_bytes: need.1 - 1,
+                    ..required
+                },
+            ),
+            (
+                "metadata",
+                BankReservation {
+                    metadata_bytes: need.2 - 1,
+                    ..required
+                },
+            ),
+            (
+                "file descriptors",
+                BankReservation {
+                    file_descriptors: need.3 - 1,
+                    ..required
+                },
+            ),
+        ] {
+            assert_eq!(
+                check_counter_stage_reservation(short, need),
+                Err(BankRefusal::Budget),
+                "{field} minus one refuses"
+            );
+        }
+    }
+
     /// Assert the staged extent published. A mismatch names the actual
     /// publication (variant, extent, refusal) instead of failing silent.
     fn assert_growth_published(

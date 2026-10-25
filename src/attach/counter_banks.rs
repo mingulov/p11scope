@@ -740,6 +740,23 @@ fn stage_requirements(
     Ok((retained, transient, metadata, fds))
 }
 
+/// The four-field envelope comparison both staging prechecks apply: the
+/// envelope must cover the required retained, transient, metadata and FD
+/// charges, else the stage refuses `Budget`.
+pub(crate) fn check_counter_stage_reservation(
+    envelope: BankReservation,
+    required: (usize, usize, usize, usize),
+) -> Result<(), BankRefusal> {
+    if envelope.retained_bytes < required.0
+        || envelope.transient_bytes < required.1
+        || envelope.metadata_bytes < required.2
+        || envelope.file_descriptors < required.3
+    {
+        return Err(BankRefusal::Budget);
+    }
+    Ok(())
+}
+
 fn counter_allocation_bytes<T>(items: usize) -> Option<usize> {
     if items == 0 {
         Some(0)
@@ -6017,6 +6034,70 @@ pub(crate) mod tests {
             pool,
             digest,
         }
+    }
+
+    /// Upper bound on the `BankReservation` one `stage_counter_banks` call
+    /// charges, for harness envelopes. It runs the same `stage_requirements`
+    /// (plus the Multi storage check inputs) rather than a second formula, so
+    /// accounting changes move both sides together. Every input must dominate
+    /// the matching production value at staging time:
+    /// - `new_banks`: every bank the fresh extent spans (production counts only
+    ///   the not-yet-allocated subset);
+    /// - `old_capacity`: at least `positions.capacity()` (the directory replaces
+    ///   its positions vector every stage with exactly the staged length);
+    /// - `provider_copies`: at least the fresh slots'
+    ///   `retained_target_copy_allocation_charge × 4` sum `NativeIo` charges;
+    /// - `multi_links`: at least the session link length and capacity (Multi
+    ///   attaches at most two leaves per endpoint and reserves exactly that).
+    /// Slot copies use 16, the `NativeIo` charge, which dominates the directory
+    /// precheck's 4. `all_slots` must cover `first..end`. Callers add headroom
+    /// on top of the returned requirement.
+    pub(crate) fn estimate_counter_stage_reservation(
+        mode: CounterMode,
+        banks: u32,
+        cells: u32,
+        all_slots: &[Slot],
+        first: u32,
+        end: u32,
+        old_capacity: usize,
+        cpus: usize,
+        new_banks: usize,
+        provider_copies: usize,
+        multi_links: Option<(usize, usize)>,
+    ) -> Result<BankReservation, BankRefusal> {
+        let geometry = BankGeometry::checked(mode, banks, cells)?;
+        let fresh = BankExtent::checked(first, end, geometry.limit())?;
+        let base = stage_requirements(
+            geometry,
+            all_slots,
+            fresh,
+            old_capacity,
+            cpus,
+            new_banks,
+            provider_copies,
+            16,
+        )?;
+        let (retained, transient, metadata) = match multi_links {
+            None => (base.0, base.1, base.2),
+            Some((old_link_len, old_link_capacity)) => {
+                let extra = counter_multi_requirements(
+                    &all_slots[first as usize..end as usize],
+                    old_link_len,
+                    old_link_capacity,
+                )?;
+                (
+                    base.0.checked_add(extra.0).ok_or(BankRefusal::Budget)?,
+                    base.1.checked_add(extra.1).ok_or(BankRefusal::Budget)?,
+                    base.2.checked_add(extra.2).ok_or(BankRefusal::Budget)?,
+                )
+            }
+        };
+        Ok(BankReservation {
+            retained_bytes: retained,
+            transient_bytes: transient,
+            metadata_bytes: metadata,
+            file_descriptors: base.3,
+        })
     }
 
     /// Actual Directory publication/rollback and real retained files supply

@@ -100,6 +100,56 @@ def healthy_ledger(mode="pair", b_calls=8, pid=4242, tid=4242):
     return rows
 
 
+def holdless_ledger(b_calls=1, pid=4242, tid=4242):
+    """Canned hold-less ledger: ready, side-B calls, ack with held 0."""
+    rows = [{"kind": "ready", "pid": pid, "tid": tid, "t": 1000,
+             "clock": "CLOCK_MONOTONIC", "unit": "ns"}]
+    tick = 1000
+    seq = 0
+    for _ in range(b_calls):
+        seq += 1
+        tick += 10
+        t0 = tick
+        tick += 5
+        rows.append({"kind": "call", "seq": seq, "side": "B",
+                     "fn": "table[12]", "rv": 0, "pid": pid, "tid": tid,
+                     "t0": t0, "t1": tick})
+    rows.append({"kind": "ack", "issued": b_calls, "held": 0,
+                 "t": tick + 10})
+    return rows
+
+
+def hold_only_ledger(pid=4242, tid=4242):
+    """Canned hold-only ledger: one A hold window, zero B calls."""
+    return [
+        {"kind": "ready", "pid": pid, "tid": tid, "t": 1000,
+         "clock": "CLOCK_MONOTONIC", "unit": "ns"},
+        {"kind": "hold_begin", "seq": 1, "side": "A", "fn": "table[4]",
+         "pid": pid, "tid": tid, "t0": 1010},
+        {"kind": "hold_end", "seq": 2, "side": "A", "ref": 1, "rv": 0,
+         "t1": 1100},
+        {"kind": "ack", "issued": 0, "held": 1, "t": 1110},
+    ]
+
+
+def transfer_events_over_holdless(rows, req=1, seal=1):
+    """Drawn/revalidated/seal/detailed/completed/transfer chain over rows."""
+    call = next(row for row in rows if row.get("kind") == "call")
+    return [
+        {"kind": "drawn", "req": req, "caller": 3, "provider": 7,
+         "view": 11, "t": rows[0]["t"]},
+        {"kind": "revalidated", "req": req, "t": call["t0"]},
+        {"kind": "seal_settled", "seal": seal, "t": call["t0"]},
+        {"kind": "detailed", "req": req, "seal": seal, "t": call["t0"]},
+        {"kind": "inventory_pulse", "t": call["t0"] - 1, "calls": 3},
+        {"kind": "completed", "req": req, "seal": seal,
+         "t": call["t1"] + 5},
+        {"kind": "owner_transferred", "req": req, "from": "A", "to": "B",
+         "seal": seal, "t": call["t1"] + 10},
+        {"kind": "inventory_pulse", "t": rows[-1]["t"] + 5, "calls": 5},
+    ]
+
+
 def renumber(rows):
     """Reassign contiguous seqs after moving body rows; repair ref/after links."""
     old = {id(row): row["seq"] for row in rows[1:-1]}
@@ -726,6 +776,23 @@ class PromotionLedgerTwins(unittest.TestCase):
                           completed.stderr)
             self.assertNotIn("Traceback", completed.stderr)
 
+    def test_cli_holdless_transfer_refused_without_traceback(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            events_path = Path(tmp) / "events.jsonl"
+            rows = holdless_ledger(b_calls=1)
+            write_jsonl(ledger, rows)
+            write_jsonl(events_path, transfer_events_over_holdless(rows))
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger),
+                 str(events_path)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("promotion refused: transfer without an A hold "
+                          "window", completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
+
 
 class PromotionEvidenceTwins(unittest.TestCase):
     def test_mutation_refusal_label_outside_cells_rejected(self):
@@ -1270,6 +1337,39 @@ class PromotionCompareTwins(unittest.TestCase):
         cancel["t"] = end["t1"] + 1
         with self.assertRaisesRegex(oracle.LedgerError, "outside the A hold window"):
             oracle.compare_promotion(rows, healthy_events(rows, chain="cancel"))
+
+    def test_mutation_holdless_transfer_rejected(self):
+        oracle = require_oracle(self)
+        rows = holdless_ledger(b_calls=1)
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual((summary["issued"], summary["held"]), (1, 0))
+        events = transfer_events_over_holdless(rows)
+        oracle.validate_events(events)
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "transfer without an A hold window"):
+            oracle.compare_promotion(rows, events)
+
+    def test_mutation_hold_only_against_empty_evidence_rejected(self):
+        oracle = require_oracle(self)
+        rows = hold_only_ledger()
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual((summary["issued"], summary["held"]), (0, 1))
+        oracle.validate_events([])
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "comparison without drawn populations"):
+            oracle.compare_promotion(rows, [])
+
+    def test_mutation_drawn_only_against_empty_ledger_rejected(self):
+        oracle = require_oracle(self)
+        rows = holdless_ledger(b_calls=0)
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual((summary["issued"], summary["held"]), (0, 0))
+        events = [{"kind": "drawn", "req": 1, "caller": 3, "provider": 7,
+                   "view": 11, "t": rows[0]["t"]}]
+        oracle.validate_events(events)
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "comparison without ledger populations"):
+            oracle.compare_promotion(rows, events)
 
 
 class PromotionRunTwins(unittest.TestCase):

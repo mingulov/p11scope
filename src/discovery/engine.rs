@@ -66,9 +66,7 @@ use pkcs11_module::{LinuxLayout, read_function_pointer};
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
-#[cfg(test)]
-use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd as _;
@@ -23302,7 +23300,7 @@ impl Engine {
             let Some(lease) = self.facts_reserve(graph, reserve, required) else {
                 return Self::graph_idle(true);
             };
-            let clone = graph.plan.plan().map(|cursor| cursor.clone());
+            let clone = graph.plan.plan().cloned();
             let Some(clone) = clone else {
                 self.refuse_graph_before_native(graph);
                 return Self::graph_idle(true);
@@ -24016,7 +24014,7 @@ impl Engine {
         let Some(lease) = self.facts_reserve(graph, reserve, required) else {
             return false;
         };
-        let clone = graph.plan.plan().map(|cursor| cursor.clone());
+        let clone = graph.plan.plan().cloned();
         let Some(clone) = clone else {
             self.refuse_graph_before_native(graph);
             return false;

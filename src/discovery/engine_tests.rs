@@ -48196,17 +48196,18 @@ fn facts_admit_selection_rows(engine: &mut Engine) {
     assert!(outcome.accepted(), "the selection rows admit cleanly");
 }
 
-/// T5 helper: a collected native carrier over the engine's current plan
-/// and pins (the `CollectedFinishGraphCase` closer shape, over any engine).
-fn facts_attach_collected_carrier(
-    engine: &Engine,
-    fail_return: bool,
-) -> (
+/// T5 helper: the collected native carrier bundle returned by
+/// [`facts_attach_collected_carrier`].
+type FactsCollectedCarrier = (
     ScriptedSession,
     std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     std::sync::mpsc::Receiver<()>,
     std::sync::mpsc::Receiver<()>,
-) {
+);
+
+/// T5 helper: a collected native carrier over the engine's current plan
+/// and pins (the `CollectedFinishGraphCase` closer shape, over any engine).
+fn facts_attach_collected_carrier(engine: &Engine, fail_return: bool) -> FactsCollectedCarrier {
     let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let gate = std::sync::Arc::clone(&release);
     let (entered_sender, entered) = std::sync::mpsc::channel();

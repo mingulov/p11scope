@@ -11,6 +11,8 @@
 # process keeps an ended edge to the old module plus a mapped edge to the new
 # one (the known issue copy-up-stale-caller: it still runs the lower file)
 # while the second mapper is attributed to the upper copy with no loss.
+# A second pre-copy-up mapper (the round-2 twin) ledgers after the copy-up
+# inside the span; the oracle asserts the new edge claims none of its calls.
 # After B restarts, fresh captures open their anchor from the upper copy and
 # attribute B exactly. The observer is the host release binary run through
 # `sudo -n` in the initial PID namespace.
@@ -33,8 +35,12 @@ DURATION_DEFAULT=30
 SPAN_DEFAULT=60
 # The second mapper in B: the ledgered client on the image's own token, held
 # at a gate nobody releases (it only has to map the upper copy).
+# The round-2 twin: a second pre-copy-up mapper in B whose own gate is held
+# until after the copy-up. gated.c runs one round per process, so B-pre
+# itself cannot re-ledger; the twin's in-span round measures the false zero.
 GATED=/usr/local/bin/p11scope-ledger-gated
 B2_GATE=/tmp/gate-b2
+B3_GATE=/tmp/gate-b3
 
 usage() {
     cat >&2 <<'EOF'
@@ -44,8 +50,9 @@ usage: scripts/docker-shared-layer-e2e.sh --host dev|fedora-private --observer B
 
   Cell D1 driver. Run modes share one flow: build (or load) the holder image,
   start containers A and B, capture pre-copy-up evidence, start two
-  inventory captures that span B's same-bytes copy-up and a second mapper of
-  the upper copy, restart B, capture fresh evidence, and check it with
+  inventory captures that span B's same-bytes copy-up, a held round-2 gate
+  released after it, and a second mapper of the upper copy, restart B,
+  capture fresh evidence, and check it with
   scripts/container-cells-oracle.py copy-up.
 
   --host dev            use the local docker daemon (dev host)
@@ -171,6 +178,12 @@ self_test() {
     fi
     grep -q -- '--facts-log "\$FACT[S]"' "$0" \
         || { echo "oracle call lost --facts-log" >&2; exit 1; }
+    grep -q -- '--b-pre-round2-calls "\$((6' "$0" \
+        || { echo "oracle call lost --b-pre-round2-calls" >&2; exit 1; }
+    grep -q -- '--b-pre-round2-pid "\$PID_B[3]"' "$0" \
+        || { echo "oracle call lost --b-pre-round2-pid" >&2; exit 1; }
+    grep -q 'release_gate "\$PID_B3" "\$B3_GAT[E]"' "$0" \
+        || { echo "round-2 twin gate is not released from the host" >&2; exit 1; }
     d1_help_self_test
     d1_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -245,6 +258,14 @@ EOF
         "SUDO -n /nonexistent/p11scope inventory --system") ;;
         *) echo "observer command lost sudo -n: $got" >&2; exit 1 ;;
     esac
+    # Gate releases go through the host's /proc view: the holder default and
+    # the round-2 twin's own gate file.
+    got=$(PATH="$stub/echobin:$stub" release_gate 9999)
+    [ "$got" = "SUDO -n touch /proc/9999/root/tmp/gate" ] \
+        || { echo "default gate release drifted: $got" >&2; exit 1; }
+    got=$(PATH="$stub/echobin:$stub" release_gate 9999 /tmp/gate-b3)
+    [ "$got" = "SUDO -n touch /proc/9999/root/tmp/gate-b3" ] \
+        || { echo "twin gate release drifted: $got" >&2; exit 1; }
     # LEDGER lines: exactly one complete JSON ledger with 6xN successes.
     ledger_log() {
         printf '%s\n' "$2" > "$stub/$1.log"
@@ -624,8 +645,10 @@ prov_sha() {
 # Create a container's gate file from the host through its own root: a
 # `docker exec touch` would add short-lived processes to the captured
 # cgroup, which the capture rightly counts as pid_descendant_gaps.
+# The gate path defaults to the holder's /tmp/gate; the round-2 twin waits
+# on its own gate file.
 release_gate() {
-    sudo -n touch "/proc/$1/root/tmp/gate"
+    sudo -n touch "/proc/$1/root${2:-/tmp/gate}"
 }
 
 wait_docker_log() {
@@ -730,6 +753,15 @@ wait_file_line() {
 start_second_mapper() {
     dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH 1 200 $B2_GATE" \
         >"$WORK/b2.log" 2>&1 &
+    CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
+}
+
+# A second pre-copy-up mapper in B: it maps the lower copy (like B's first
+# process) and holds at its own gate until the driver releases it from the
+# host after the copy-up, so its in-span round measures the false zero.
+start_round2_mapper() {
+    dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH $ITERS_B 200 $B3_GATE" \
+        >"$WORK/b3.log" 2>&1 &
     CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
 }
 
@@ -1012,6 +1044,15 @@ PID_SPAN_U=$STARTED_PID
 wait_passes span-kernel "$PID_SPAN_K" 1 || fail_cell "spanning kernel capture never completed pass 0"
 wait_passes span-userspace "$PID_SPAN_U" 1 || fail_cell "spanning userspace capture never completed pass 0"
 
+say "=== round-2 twin in B maps the lower copy (gate held) ==="
+start_round2_mapper
+wait_file_line "$WORK/b3.log" '^READY ' 60 || fail_cell "round-2 twin in $D1_B never became ready"
+PID_B3=$(pid_in_cgroup_with "$CG_B" "$B3_GATE") || fail_cell "no host pid for the round-2 twin"
+maps_provider "$PID_B3" || fail_cell "round-2 twin does not map the provider"
+STAT_B3=$(prov_stat "$PID_B3") || fail_cell "cannot stat the round-2 twin's provider"
+[ "$STAT_B3" = "$STAT_B_PRE" ] || fail_cell "round-2 twin does not map the lower copy (stat $STAT_B3, want $STAT_B_PRE)"
+fact "pid-b3=$PID_B3 stat-b3=$STAT_B3"
+
 say "=== same-bytes copy-up in B only (OQ5) ==="
 STAT_B_COPY_PRE=$(prov_stat "$PID_B_PRE") || fail_cell "cannot re-stat B provider"
 dcli exec "$D1_B" sh -c 'p=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; cp "$p" /tmp/p && cat /tmp/p > "$p" && rm /tmp/p' \
@@ -1029,6 +1070,9 @@ fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
 [ "$SHA_B_POST" = "$SHA_B_PRE" ] || fail_cell "copy-up changed bytes (not same-bytes)"
 [ "$STAT_A_CHECK" = "$STAT_A_PRE" ] || fail_cell "A provider moved during B copy-up"
 
+say "=== release the round-2 twin's gate (it ledgers while B2 is set up) ==="
+release_gate "$PID_B3" "$B3_GATE" || fail_cell "gate release failed for the round-2 twin"
+
 say "=== second mapper in B maps the upper copy ==="
 start_second_mapper
 wait_file_line "$WORK/b2.log" '^READY ' 60 || fail_cell "second mapper in $D1_B never became ready"
@@ -1043,7 +1087,18 @@ wait_passes span-kernel "$PID_SPAN_K" "$((SPAN_K0 + 2))" \
     || fail_cell "spanning kernel capture ran fewer than two passes after the second mapper"
 wait_passes span-userspace "$PID_SPAN_U" "$((SPAN_U0 + 2))" \
     || fail_cell "spanning userspace capture ran fewer than two passes after the second mapper"
-if ! maps_provider "$PID_B2" || ! maps_provider "$PID_B_PRE"; then
+say "=== round-2 twin ledger completes inside the span ==="
+wait_file_line "$WORK/b3.log" '^LEDGER ' 60 || fail_cell "round-2 twin ledger never completed"
+ledger_is "$WORK/b3.log" "$ITERS_B" || fail_cell "round-2 twin ledger is not 6x$ITERS_B"
+grep -h '^LEDGER ' "$WORK/b3.log" >>"$FACTS"
+R2_K0=$(pass_count span-kernel)
+R2_U0=$(pass_count span-userspace)
+fact "round2-passes-at-ledger=$R2_K0,$R2_U0"
+wait_passes span-kernel "$PID_SPAN_K" "$((R2_K0 + 2))" \
+    || fail_cell "spanning kernel capture ran fewer than two passes after the round-2 ledger"
+wait_passes span-userspace "$PID_SPAN_U" "$((R2_U0 + 2))" \
+    || fail_cell "spanning userspace capture ran fewer than two passes after the round-2 ledger"
+if ! maps_provider "$PID_B2" || ! maps_provider "$PID_B_PRE" || ! maps_provider "$PID_B3"; then
     fail_cell "a B mapper stopped mapping the provider inside the span"
 fi
 wait "$PID_SPAN_K" || fail_cell "spanning kernel capture failed"
@@ -1110,6 +1165,7 @@ if python3 -I "$ORACLE" copy-up --lane "$LANE" \
         --iters-a "$ITERS_A" --iters-b "$ITERS_B" \
         --dc73-note "$WORK/dc73-note.txt" \
         --facts-log "$FACTS" \
+        --b-pre-round2-calls "$((6 * ITERS_B))" --b-pre-round2-pid "$PID_B3" \
         >"$WORK/oracle.json" 2>"$WORK/oracle.err"; then
     cat "$WORK/oracle.json" >>"$SUMMARY_JSONL"
     cat "$WORK/oracle.json" >>"$FACTS"

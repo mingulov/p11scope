@@ -70,7 +70,7 @@ META = {"source_revision": "0" * 40,
 
 def fake_cell(mode="known-inode", delay_us=100, armed="ungated", missed=0,
               observed=1, attributed=1, body=1, status="ok", reason="",
-              armed_ledger=None):
+              armed_ledger=None, stall_ms=0):
     record = {"mode": mode, "delay_us": delay_us, "armed": armed,
               "status": status}
     if status == "ok":
@@ -80,7 +80,8 @@ def fake_cell(mode="known-inode", delay_us=100, armed="ungated", missed=0,
             "missed_calls": missed, "attributed_calls": attributed,
             "positive": True, "duration_s": 7.5,
             "completeness": "COMPLETE", "final_drain": True,
-            "event_loss": 0, "extra_functions": {},
+            "event_loss": 0, "sink_stall_ms": stall_ms,
+            "extra_functions": {},
             "observer_argv": ["p11scope", "run"]})
     else:
         record["reason"] = reason or f"{status} in cell"
@@ -175,6 +176,53 @@ class CampaignTableTests(unittest.TestCase):
         result = sweep.build_campaign(records, dict(META))
         self.assertEqual(result["verdict"], "fail")
         self.assertTrue(any("integer" in error for error in result["errors"]))
+
+    def test_campaign_table_carries_sink_stall_per_cell_and_max(self):
+        sweep = require_sweep(self)
+        records = healthy_campaign()
+        stalled = next(record for record in records
+                       if (record["mode"], record["delay_us"],
+                           record["armed"])
+                       == ("known-inode", 100, "ungated"))
+        stalled["sink_stall_ms"] = 14
+        unknown = next(record for record in records
+                       if (record["mode"], record["delay_us"],
+                           record["armed"])
+                       == ("late-heap", 0, "prearmed"))
+        del unknown["sink_stall_ms"]
+        result = sweep.build_campaign(records, dict(META))
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["table"].get("max_sink_stall_ms"), 14)
+        cell = next(cell for cell in result["table"]["cells"]
+                    if (cell["mode"], cell["delay_us"], cell["armed"])
+                    == ("known-inode", 100, "ungated"))
+        self.assertEqual(cell["sink_stall_ms"], 14)
+        lines = result["markdown"].splitlines()
+        header = ("| sink stall (ms) | arm | 0 us | 10 us | 100 us | "
+                  "1000 us |")
+        self.assertIn(header, lines)
+        stall_rows = lines[lines.index(header) + 1:]
+        known_ungated = next(line for line in stall_rows
+                             if line.startswith("| known-inode | "
+                                                "ungated |"))
+        self.assertEqual(known_ungated,
+                         "| known-inode | ungated | 0 | 0 | 14 | 0 |")
+        late_prearmed = next(line for line in stall_rows
+                             if line.startswith("| late-heap | prearmed |"))
+        self.assertEqual(late_prearmed,
+                         "| late-heap | prearmed | ? | 0 | 0 | 0 |")
+
+    def test_non_integer_sink_stall_fails_the_campaign(self):
+        sweep = require_sweep(self)
+        for corrupt in ("14", -1, 1.5):
+            with self.subTest(stall=corrupt):
+                records = healthy_campaign()
+                records[0]["sink_stall_ms"] = corrupt
+                result = sweep.build_campaign(records, dict(META))
+                self.assertEqual(result["verdict"], "fail")
+                self.assertTrue(any("sink_stall_ms" in error
+                                    for error in result["errors"]),
+                                result["errors"])
 
 
 class MissingCellTests(unittest.TestCase):
@@ -724,13 +772,31 @@ class EvidenceStrictnessTests(unittest.TestCase):
                                                 "sink_dropped_bytes": 0})
         self.assertEqual(sweep.check_evidence(evidence), [])
 
-    def test_sink_stall_milliseconds_are_an_error(self):
+    def test_stall_only_evidence_passes(self):
+        # sink_stall_ms is backpressure timing, not loss: the sink waits
+        # for a slow reader inside its tick budget and sheds only through
+        # drop_pending, which always counts a timeout and the shed bytes
+        # (src/sink.rs). A stall with zero timeouts and zero dropped
+        # bytes loses nothing, so the exact-count cell stands.
         sweep = require_sweep(self)
-        evidence = _strict_evidence(scheduling={"sink_stall_ms": 1,
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 14,
                                                 "sink_timeouts": 0,
                                                 "sink_dropped_bytes": 0})
-        self.assertTrue(any("sink_stall_ms" in error for error in
-                            sweep.check_evidence(evidence)))
+        self.assertEqual(sweep.check_evidence(evidence), [])
+
+    def test_dropped_bytes_with_a_timeout_are_an_error(self):
+        sweep = require_sweep(self)
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 14,
+                                                "sink_timeouts": 1,
+                                                "sink_dropped_bytes": 1})
+        errors = sweep.check_evidence(evidence)
+        self.assertTrue(any("sink_timeouts" in error for error in errors),
+                        errors)
+        self.assertTrue(any("sink_dropped_bytes" in error
+                            for error in errors),
+                        errors)
+        self.assertFalse(any("sink_stall_ms" in error for error in errors),
+                         errors)
 
 
 def _cell_line(**extra):

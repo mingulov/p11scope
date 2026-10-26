@@ -32,7 +32,7 @@ use p11scope_ebpf_common::{
     InstanceCalib, InstanceCounters, InstanceFileKey, InstanceRecord, JournalAdmissionControl,
     instance,
 };
-use p11scope_manifest::maps::ObjectKey;
+use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::mem::size_of_val;
@@ -744,7 +744,19 @@ fn calibrate(ebpf: &mut Ebpf, path: &Path) -> Result<(InstanceFileKey, MappedFil
 /// (the same `f_inode` both sides). On 6.8+ the raw key matches and the
 /// calibration key is a harmless dead key. Identity confirmation still
 /// gates every selected candidate.
-fn maps_keys_for_watch(raw: Vec<ObjectKey>, _calib: InstanceFileKey) -> Vec<ObjectKey> {
+fn maps_keys_for_watch(mut raw: Vec<ObjectKey>, calib: InstanceFileKey) -> Vec<ObjectKey> {
+    // Kernel kdev_t decoding (12-bit major at bits 20-31, 20-bit minor):
+    // the hook reports the raw `s_dev`, not a userspace `st_dev`, so
+    // `libc::major`/`libc::minor` would misread it.
+    raw.push(ObjectKey {
+        device: Device {
+            major: (calib.dev >> 20) & 0xfff,
+            minor: calib.dev & 0xfffff,
+        },
+        inode: calib.ino,
+    });
+    raw.sort();
+    raw.dedup();
     raw
 }
 

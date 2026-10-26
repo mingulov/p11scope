@@ -1902,6 +1902,11 @@ fn assemble(
         }));
     }
     let (skipped, mut notes) = split_gaps(gaps);
+    // Kernel threads classified during the deep scans: one counted note,
+    // never one gap per thread.
+    if let Some(note) = kernel_thread_absence_note(collection.budget.kernel_thread_absences()) {
+        notes.push(note);
+    }
     let attribution_complete = collection.cap_hit && !capped && lost == 0;
     if attribution_complete {
         notes.push(PidGap {

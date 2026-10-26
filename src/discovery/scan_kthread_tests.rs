@@ -242,16 +242,18 @@ fn scan_empty_maps_recycled_generation_still_refuses() {
 
 #[test]
 fn scan_empty_maps_exited_view_is_never_absence() {
-    // A child that already exited (or is exiting): the pinned generation
-    // is gone, so even scripted kernel-thread bytes must not classify.
-    // The child is left unreaped until after the scan so its pid cannot be
-    // recycled mid-test; it is reaped before the test returns.
-    let mut child = std::process::Command::new("true")
+    // A child pinned alive, then killed and reaped before the scan: the
+    // pinned generation is provably gone, so even scripted kernel-thread
+    // bytes bound to its old start time must not classify.
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::null())
         .spawn()
-        .expect("spawn an exiting child");
+        .expect("spawn a child that waits to be killed");
     let pid = child.id();
-    let view = ProcessView::open(ProcessViewId(503), pid).expect("pin the exiting child");
+    let view = ProcessView::open(ProcessViewId(503), pid).expect("pin the live child");
     let start_time = view.start_time().unwrap_or(0);
+    child.kill().expect("kill the child");
+    child.wait().expect("reap the child");
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::default();
     let mut fixture = EmptyMapsFixture {
@@ -269,7 +271,6 @@ fn scan_empty_maps_exited_view_is_never_absence() {
         &mut budget,
         &mut fixture,
     );
-    child.wait().expect("reap the child");
     match result {
         Err(error) => assert!(
             error.contains("exited before discovery") || error.contains("generation changed"),

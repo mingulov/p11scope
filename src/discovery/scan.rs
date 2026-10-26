@@ -3712,18 +3712,46 @@ impl<'a> ScanDependencies<'a> {
     }
 }
 
+/// Failure of [`acquire_scan_maps`]: the refusal reason plus whether the
+/// snapshot itself read successfully but carried no mappings — the shape a
+/// kernel thread (and a zombie) always presents, classified at the initial
+/// call site instead of refused outright.
+struct AcquireMapsError {
+    reason: String,
+    empty_snapshot: bool,
+}
+
+impl AcquireMapsError {
+    fn refused(reason: String) -> Self {
+        Self {
+            reason,
+            empty_snapshot: false,
+        }
+    }
+
+    fn empty(reason: String) -> Self {
+        Self {
+            reason,
+            empty_snapshot: true,
+        }
+    }
+}
+
 fn acquire_scan_maps(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
-) -> Result<Vec<MapEntry>, String> {
+) -> Result<Vec<MapEntry>, AcquireMapsError> {
     if let Some(reason) = budget.stopped_now() {
-        return Err(reason.into());
+        return Err(AcquireMapsError::refused(reason.into()));
     }
     let reader = view
-        .run_while_same(|| io.open_maps(view, budget))?
-        .map_err(|error| error.to_string())?;
-    budget.spend(1).map_err(str::to_owned)?;
+        .run_while_same(|| io.open_maps(view, budget))
+        .map_err(AcquireMapsError::refused)?
+        .map_err(|error| AcquireMapsError::refused(error.to_string()))?;
+    budget
+        .spend(1)
+        .map_err(|error| AcquireMapsError::refused(error.to_owned()))?;
     let (bytes, reasons) = read_maps_with_limits(
         reader,
         budget,
@@ -3732,22 +3760,101 @@ fn acquire_scan_maps(
         64 * 1024,
         || io.maps_now(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| AcquireMapsError::refused(error.to_string()))?;
     if let Some(reason) = reasons.first().copied().or(budget.stopped_now()) {
-        return Err(reason.into());
+        return Err(AcquireMapsError::refused(reason.into()));
     }
-    if bytes.is_empty() || !bytes.ends_with(b"\n") {
-        return Err("empty or truncated /proc maps snapshot".into());
+    if bytes.is_empty() {
+        // A successful 0-byte read: the kernel-thread/zombie shape, which
+        // the initial call site classifies — never conflated with a
+        // truncated snapshot.
+        return Err(AcquireMapsError::empty(
+            "empty or truncated /proc maps snapshot".into(),
+        ));
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(AcquireMapsError::refused(
+            "empty or truncated /proc maps snapshot".into(),
+        ));
     }
     // Parsing is charged independently of the single charged index construction.
     budget
         .spend(bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
-        .map_err(str::to_owned)?;
-    let maps = parse_maps(&bytes)?;
+        .map_err(|error| AcquireMapsError::refused(error.to_owned()))?;
+    let maps = parse_maps(&bytes).map_err(AcquireMapsError::refused)?;
     if maps.is_empty() {
-        return Err("empty /proc maps snapshot".into());
+        return Err(AcquireMapsError::refused(
+            "empty /proc maps snapshot".into(),
+        ));
     }
     Ok(maps)
+}
+
+/// The scan-level exited outcome: the engine proves the end through the
+/// view's pin (`original_exited`) and stays silent when proven, so this is
+/// never a public refusal skip and never an admitted scanned-absent view.
+/// Shared by the entry check and the empty-maps classifier so the zombie /
+/// exiting shape follows exactly the existing exited path.
+fn exited_before_discovery(pid: u32) -> String {
+    format!("pid {pid} exited before discovery")
+}
+
+/// How a successfully read but empty initial maps snapshot classifies.
+/// Only a positively identified kernel thread is verified absence;
+/// everything unproven keeps the refusal.
+enum EmptyMapsClass {
+    KernelThread,
+    Refuse,
+}
+
+/// Classify an initial maps snapshot that read successfully but carried no
+/// mappings.
+///
+/// A kernel thread has no user address space, so its `/proc/<pid>/maps`
+/// always reads 0 bytes — verified absence (it can never call a
+/// provider), not a refusal. Identification is positive only: the
+/// `PF_KTHREAD` flag in `/proc/<pid>/stat` field 9, read under the same
+/// pidfd/start-time generation pin as the maps read, so a recycled pid
+/// can never be misclassified. A lost generation, or empty maps with no
+/// kernel-thread flag and no executable (a zombie or an exiting process),
+/// follows the exited path ([`exited_before_discovery`]): an error the
+/// engine proves or keeps as loss, never an admitted scanned-absent view
+/// and never a public refusal skip. Empty maps with an executable, an
+/// unreadable or malformed stat, a stat from another generation, or any
+/// other error keeps the refusal (fail closed).
+fn classify_empty_maps_snapshot(
+    view: &ProcessView,
+    io: &mut impl ScanIo,
+) -> Result<EmptyMapsClass, String> {
+    let stat = match view.run_while_same(|| io.stat_text(view)) {
+        Err(_) => return Err(exited_before_discovery(view.pid())),
+        Ok(Err(_)) => return Ok(EmptyMapsClass::Refuse),
+        Ok(Ok(stat)) => stat,
+    };
+    let flags = match crate::process::stat_flags_from_stat_text(&stat) {
+        Some(flags) => flags,
+        None => return Ok(EmptyMapsClass::Refuse),
+    };
+    // Byte-level generation binding: the stat line must describe the
+    // view's own pinned generation. Flags from a recycled pid — however
+    // kernel-thread-shaped — refuse instead of classifying.
+    let bound = crate::process::start_time_from_stat(&stat)
+        .is_ok_and(|start| Some(start) == view.start_time());
+    if !bound {
+        return Ok(EmptyMapsClass::Refuse);
+    }
+    if flags & crate::process::PF_KTHREAD != 0 {
+        return Ok(EmptyMapsClass::KernelThread);
+    }
+    // Not a kernel thread: only a missing executable (zombie/exiting)
+    // follows the exited path; a live executable keeps the refusal.
+    match view.run_while_same(|| io.exe_target(view)) {
+        Err(_) => Err(exited_before_discovery(view.pid())),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(exited_before_discovery(view.pid()))
+        }
+        Ok(_) => Ok(EmptyMapsClass::Refuse),
+    }
 }
 
 /// Scan through an already accepted process-generation pin. Capture discovery uses
@@ -3892,7 +3999,7 @@ fn scan_view_examined_mode(
         return Err("scan request pid does not match its process view".into());
     }
     if !view.still_the_same() {
-        return Err(format!("pid {} exited before discovery", request.pid));
+        return Err(exited_before_discovery(request.pid));
     }
     let started = Instant::now();
     let pid = request.pid;
@@ -3915,7 +4022,21 @@ fn scan_view_examined_mode(
     };
     let maps = match acquire_scan_maps(view, budget, io) {
         Ok(maps) => maps,
-        Err(reason) => return Ok(refused_initial(reason)),
+        Err(error) if error.empty_snapshot => match classify_empty_maps_snapshot(view, io)? {
+            EmptyMapsClass::KernelThread => {
+                budget.note_kernel_thread_absence();
+                return Ok((
+                    ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: Vec::new(),
+                        scan_ms: started.elapsed().as_millis() as u64,
+                    },
+                    Vec::new(),
+                ));
+            }
+            EmptyMapsClass::Refuse => return Ok(refused_initial(error.reason)),
+        },
+        Err(error) => return Ok(refused_initial(error.reason)),
     };
     let map_index = match index_maps_or_refuse(&maps, budget) {
         Ok(index) => index,
@@ -4285,7 +4406,7 @@ fn scan_view_examined_mode(
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
     let validation = (|| {
-        let maps_b = acquire_scan_maps(view, budget, io)?;
+        let maps_b = acquire_scan_maps(view, budget, io).map_err(|error| error.reason)?;
         let index_b = index_maps_or_refuse(&maps_b, budget)?;
         budget.spend(maps_b.len() as u64).map_err(str::to_owned)?;
         let groups_b = candidate_groups(&maps_b);

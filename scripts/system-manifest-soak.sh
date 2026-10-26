@@ -272,14 +272,25 @@ gcc -O0 -o "$WORK/workload" tests/fixtures/public-cli/inventory-ledger.c -ldl -l
 if [ "$MODE" = live ]; then
     INSTALLED_SHA_PRE=$(sha256sum "$INSTALLED" | cut -d' ' -f1)
     INSTALLED_SIZE=$(stat -c%s "$INSTALLED")
-    mkdir -p "$WORK/installed"
-    chmod 700 "$WORK/installed"
-    rm -f "$WORK/installed/p11scope" "$WORK/installed/p11scope-discover"
-    install -m 0555 "$INSTALLED" "$WORK/installed/p11scope"
-    install -m 0555 "$DISCOVER" "$WORK/installed/p11scope-discover"
-    INSTALLED_COPY="$WORK/installed/p11scope"
-    DISCOVER_COPY="$WORK/installed/p11scope-discover"
-    chmod 500 "$WORK/installed"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        # The dropped discover identity re-opens its own executable
+        # mapping, so as root the private copies live in the
+        # world-traversable stage dir rather than a 0700 root dir.
+        rm -f "$STAGE/p11scope" "$STAGE/p11scope-discover"
+        install -m 0555 "$INSTALLED" "$STAGE/p11scope"
+        install -m 0555 "$DISCOVER" "$STAGE/p11scope-discover"
+        INSTALLED_COPY="$STAGE/p11scope"
+        DISCOVER_COPY="$STAGE/p11scope-discover"
+    else
+        mkdir -p "$WORK/installed"
+        chmod 700 "$WORK/installed"
+        rm -f "$WORK/installed/p11scope" "$WORK/installed/p11scope-discover"
+        install -m 0555 "$INSTALLED" "$WORK/installed/p11scope"
+        install -m 0555 "$DISCOVER" "$WORK/installed/p11scope-discover"
+        INSTALLED_COPY="$WORK/installed/p11scope"
+        DISCOVER_COPY="$WORK/installed/p11scope-discover"
+        chmod 500 "$WORK/installed"
+    fi
     OBSERVER_PRIVILEGE=user
     [ "$IS_ROOT" -eq 1 ] || OBSERVER_PRIVILEGE=root
 else
@@ -315,12 +326,12 @@ if [ "$MODE" = live ]; then
         # name, then install it privately. The manifest file itself is
         # always checked: discover can report an error yet exit 0.
         MANIFEST_TMP=$(mktemp /tmp/manifest-soak-manifest.XXXXXX.json)
-        "$DISCOVER_COPY" --module "$MODULE" -o "$MANIFEST_TMP"
+        env -u SOFTHSM2_CONF "$DISCOVER_COPY" --module "$MODULE" -o "$MANIFEST_TMP"
         [ -f "$MANIFEST_TMP" ] || refuse "discover wrote no manifest"
         install -m 0444 "$MANIFEST_TMP" "$WORK/manifest.json"
         rm -f "$MANIFEST_TMP"
     else
-        "$DISCOVER_COPY" --module "$MODULE" -o "$WORK/manifest.json"
+        env -u SOFTHSM2_CONF "$DISCOVER_COPY" --module "$MODULE" -o "$WORK/manifest.json"
         [ -f "$WORK/manifest.json" ] || refuse "discover wrote no manifest"
     fi
 else

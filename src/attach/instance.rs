@@ -2572,5 +2572,23 @@ mod tests {
                 inode: 7
             }]
         );
+        // A major above 255 (NVMe-style 259:7) needs the 12-bit major
+        // field; userspace `st_dev` decoding would read this as (0, 66311).
+        assert_eq!(
+            super::maps_keys_for_watch(
+                Vec::new(),
+                InstanceFileKey {
+                    dev: (259 << 20) | 7,
+                    ino: 5
+                }
+            ),
+            vec![ObjectKey {
+                device: Device {
+                    major: 259,
+                    minor: 7
+                },
+                inode: 5
+            }]
+        );
     }
 }

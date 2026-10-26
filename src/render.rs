@@ -1242,12 +1242,66 @@ const UNSUPPORTED_TABLE_VERSION: &str =
     "unsupported function-table version; the scanner does not walk this layout";
 const STATIC_GAP_INCOMPLETE: &str = "static probe coverage gap incomplete";
 const STATIC_GAP_RECOVERED: &str = "static probes detached and exact pairs reattached";
+const PROCESS_VIEW_CAPACITY_EXHAUSTED: &str =
+    "capture process-view capacity was exhausted; remaining generations were not scanned";
+const LOADER_CONTEXT_CAPACITY_EXHAUSTED: &str = "loader context capacity 256 is exhausted";
+const LOADER_SCAN_LEDGER_EXCEEDED: &str =
+    "a deferred loader memory scan exceeded the bounded loader-context ledger";
+const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was full";
+
+/// The engine's view-capacity sentence with its configured limit value
+/// still in place: exact prefix, ASCII digits, exact suffix, whole string
+/// consumed. Anything appended, prepended or non-numeric fails — a path
+/// can never satisfy this, so the value that normalizes out is the
+/// product limit alone, never target data.
+fn is_view_capacity_exhaustion(reason: &str) -> bool {
+    const PREFIX: &str = "capture process-view capacity ";
+    const SUFFIX: &str = " was exhausted; remaining generations were not scanned";
+    let Some(rest) = reason.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some(value) = rest.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Closed allowlist of fixed product-limit skips (OD34/E1): the user must
+/// read WHICH limit was hit. Each entry matches an exact internal
+/// (subject, reason) pair whose text is fixed product wording with no
+/// target-derived data (no path, pid, name or bytes) and maps it to its
+/// finite public reason. Everything else keeps today's redaction.
+fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
+    if subject == "process view" && is_view_capacity_exhaustion(reason) {
+        return Some(PROCESS_VIEW_CAPACITY_EXHAUSTED);
+    }
+    if (subject == "live loader arming" || subject == "owned initial-set discovery")
+        && reason == LOADER_CONTEXT_CAPACITY_EXHAUSTED
+    {
+        return Some(LOADER_CONTEXT_CAPACITY_EXHAUSTED);
+    }
+    if subject == "live loader memory discovery" && reason == LOADER_SCAN_LEDGER_EXCEEDED {
+        return Some(LOADER_SCAN_LEDGER_EXCEEDED);
+    }
+    if subject == "post-arm provider discovery" && reason == LOADER_ARM_LEDGER_FULL {
+        return Some(LOADER_ARM_LEDGER_FULL);
+    }
+    None
+}
 
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
 /// diagnostics; capture output keeps only the categorical loss needed to make
 /// completeness honest.
 pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
+    // Fixed product-limit skips name their limit; the allowlist holds
+    // exact pairs only, disjoint from function subjects and the gated null.
+    if let Some(reason) = limit_skip_reason(&s.subject, &s.reason) {
+        return SkippedOut {
+            name: DISCOVERY_SUBJECT.into(),
+            reason: reason.into(),
+        };
+    }
     let function = kinds::function_id(&s.subject).is_some();
     // A gated null fact: the mislabel guard renamed an unlinked table's null
     // slot to `unknown`, and the nullness itself is still evidence worth
@@ -1992,13 +2046,34 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                 continue;
             }
             "attach_failures" => count(ev.attach_failures.len() as u64, "attach failures"),
-            "skipped" => count(
-                ev.skipped
-                    .iter()
-                    .filter(|skip| skip.reason != NULL_POINTER_REASON)
-                    .count() as u64,
-                "entries skipped",
-            ),
+            "skipped" => {
+                fragments.push(count(
+                    ev.skipped
+                        .iter()
+                        .filter(|skip| skip.reason != NULL_POINTER_REASON)
+                        .count() as u64,
+                    "entries skipped",
+                ));
+                // One histogram line per named limit present, in canonical
+                // order; the labels are the finite public reasons, never
+                // raw skip text, so no target data can reach this line.
+                for reason in [
+                    PROCESS_VIEW_CAPACITY_EXHAUSTED,
+                    LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+                    LOADER_SCAN_LEDGER_EXCEEDED,
+                    LOADER_ARM_LEDGER_FULL,
+                ] {
+                    let hits = ev
+                        .skipped
+                        .iter()
+                        .filter(|skip| skip.reason == reason)
+                        .count() as u64;
+                    if hits > 0 {
+                        fragments.push(format!("{reason}: {hits}"));
+                    }
+                }
+                continue;
+            }
             "in_flight_at_end" => count(ev.in_flight_at_end, "calls in flight"),
             "surfaces" => count(
                 ev.surfaces

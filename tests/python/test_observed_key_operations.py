@@ -616,6 +616,10 @@ def s1_operations(calls=65, started=23, completed=21, cancelled=0, failed=2,
             "evidence": {name: 0 for name in S1_EVIDENCE_KEYS}}
 
 
+def s1_zero_operations():
+    return s1_operations(calls=0, started=0, completed=0, failed=0)
+
+
 def s1_rsa_row():
     return mech_row(mechanism=0x40, name="CKM_SHA256_RSA_PKCS",
                     operations=("sign", "verify"), calls=55, errors=3,
@@ -696,6 +700,43 @@ class S1ModeTests(unittest.TestCase):
                            "operations": ["sign", "verify"],
                            "calls": 55, "errors": 3}])
         json.dumps(result)
+
+    def test_s1_zero_count_edge_passes_when_empty(self):
+        with self.subTest("zero content"):
+            doc = s1_doc()
+            doc["edges"].append(
+                s1_edge(count=0,
+                        mechanisms=[
+                            mech_row(
+                                mechanism=0x0,
+                                name="CKM_RSA_PKCS_KEY_PAIR_GEN",
+                                operations=("generate_key_pair",),
+                                calls=0, errors=0,
+                                functions=("C_GenerateKeyPair",)),
+                            mech_row(
+                                mechanism=0x40,
+                                name="CKM_SHA256_RSA_PKCS",
+                                operations=("sign", "verify"),
+                                calls=0, errors=0,
+                                functions=S1_RSA_FUNCTIONS,
+                                returns=S1_RSA_RETURNS)],
+                        operations=s1_zero_operations()))
+            result = ORACLE.compare_s1(APP_TESTS.application_rows(), doc)
+            self.assertTrue(result.get("match"))
+            seen = result.get("observed", {})
+            self.assertEqual(seen.get("entries"), 68)
+            self.assertEqual(seen.get("operations"),
+                             {"calls": 65, "started": 23, "completed": 21,
+                              "cancelled": 0, "failed": 2, "unknown": 0,
+                              "orphans": 0, "dropped": 0, "active": 0})
+        with self.subTest("absent content"):
+            doc = s1_doc()
+            edge = s1_edge(count=0, mechanisms=[])
+            del edge["operations"]
+            doc["edges"].append(edge)
+            result = ORACLE.compare_s1(APP_TESTS.application_rows(), doc)
+            self.assertTrue(result.get("match"))
+            self.assertEqual(result.get("observed", {}).get("entries"), 68)
 
     def test_s1_reasons_carry_journal_unavailable(self):
         self.assertIn("journal_unavailable", ORACLE.REASONS)
@@ -925,6 +966,56 @@ class S1ModeTests(unittest.TestCase):
             doc["edges"][0]["operations"]["evidence"][
                 "future_counter"] = 999
 
+        def zero_count_bogus_mech(doc):
+            doc["edges"].append(
+                s1_edge(count=0,
+                        mechanisms=[
+                            mech_row(mechanism=0x41,
+                                     name="CKM_SHA1_RSA_PKCS",
+                                     operations=("digest",),
+                                     calls=99, errors=0,
+                                     functions=("C_DigestInit",))],
+                        operations=s1_zero_operations()))
+
+        def zero_count_garbage_ops(doc):
+            doc["edges"].append(
+                s1_edge(count=0, mechanisms=[],
+                        operations=s1_operations(calls=9999, started=0,
+                                                 completed=0, failed=0)))
+
+        def zero_count_allowed_mech_with_calls(doc):
+            row = s1_rsa_row()
+            row["calls"] = 1
+            row["errors"] = 0
+            doc["edges"].append(
+                s1_edge(count=0, mechanisms=[row],
+                        operations=s1_zero_operations()))
+
+        def zero_count_bogus_mech_zero_calls(doc):
+            doc["edges"].append(
+                s1_edge(count=0,
+                        mechanisms=[
+                            mech_row(mechanism=0x41,
+                                     name="CKM_SHA1_RSA_PKCS",
+                                     operations=("digest",),
+                                     calls=0, errors=0,
+                                     functions=("C_DigestInit",))],
+                        operations=s1_zero_operations()))
+
+        def zero_count_mech_errors(doc):
+            row = s1_rsa_row()
+            row["calls"] = 0
+            row["errors"] = 1
+            doc["edges"].append(
+                s1_edge(count=0, mechanisms=[row],
+                        operations=s1_zero_operations()))
+
+        def zero_count_ops_started(doc):
+            doc["edges"].append(
+                s1_edge(count=0, mechanisms=[],
+                        operations=s1_operations(calls=0, started=1,
+                                                 completed=0, failed=0)))
+
         cases = [
             ("one sign result missing", drop_sign_function,
              ["misses expected functions", "C_Sign"]),
@@ -1000,6 +1091,24 @@ class S1ModeTests(unittest.TestCase):
             ("operations evidence extra key",
              operations_evidence_extra_key,
              ["unexpected fields"]),
+            ("zero-count edge with bogus mechanism",
+             zero_count_bogus_mech,
+             ["unexpected S1 mechanism", "0x41"]),
+            ("zero-count edge with garbage operations",
+             zero_count_garbage_ops,
+             ["S1 zero-count edge", "operations calls 9999"]),
+            ("zero-count edge with allowed mechanism calls",
+             zero_count_allowed_mech_with_calls,
+             ["S1 zero-count edge", "mechanism calls 1"]),
+            ("zero-count edge with bogus mechanism, zero calls",
+             zero_count_bogus_mech_zero_calls,
+             ["unexpected S1 mechanism", "0x41"]),
+            ("zero-count edge with mechanism errors",
+             zero_count_mech_errors,
+             ["S1 zero-count edge", "mechanism errors 1"]),
+            ("zero-count edge with started operations",
+             zero_count_ops_started,
+             ["S1 zero-count edge", "operations started 1"]),
         ]
         for label, mutate, tokens in cases:
             with self.subTest(label):

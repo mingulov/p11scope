@@ -1,6 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Behavioral retirement tests over retained real file identities.
-use super::tests::{NativeScene, capture_catalog};
+use super::tests::{CaptureScene, NativeScene, capture_catalog};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
 thread_local! { static QUERY_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
@@ -4954,5 +4954,270 @@ fn demotion_retirement_round3_staged_growth_keeps_original_fence_until_publicati
             .unwrap()
             .count,
         8
+    );
+}
+
+/// cnt-1 steady sole pair: one caller, one 68-endpoint module, production
+/// pass order (apply the catalog, stage a lifecycle drain, stage one
+/// witness read, then a single commit). Catalog scans run before the
+/// native stamps, the way a live observer scans before first use.
+struct Cnt1Steady {
+    native: NativeScene,
+    caller: CallerId,
+    a: std::path::PathBuf,
+    pins: crate::discovery::identity::PinnedObjects,
+    offsets: Vec<u64>,
+    generation: crate::inspect_system::MemberGeneration,
+    row_at: u64,
+}
+
+impl Cnt1Steady {
+    fn new() -> Self {
+        let mut scene = CaptureScene::new(68);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(7, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_current_binding_clock(query_clock);
+        native.answer(7, 500, 41);
+        let a = native.scene.path.clone();
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let offsets = fx::offsets(68);
+        let generation = crate::inspect_system::MemberGeneration {
+            start_time: Some(500),
+            exe: native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .exe
+                .clone(),
+        };
+        Self {
+            native,
+            caller,
+            a,
+            pins,
+            offsets,
+            generation,
+            row_at: 0,
+        }
+    }
+
+    fn catalog(&self, at: u64) -> crate::inspect_system::Catalog {
+        let mut catalog = capture_catalog(&self.pins, &[&self.a], 7, Some(self.generation.clone()));
+        catalog.processes[0].complete_scan =
+            Some(crate::inspect_system::CompleteMemberScan::scripted(
+                self.generation.clone(),
+                at,
+                at + 1,
+            ));
+        let targets: Vec<(&std::path::Path, u64)> = self
+            .offsets
+            .iter()
+            .map(|offset| (self.a.as_path(), *offset))
+            .collect();
+        let modules = vec![fx::module_with_targets(&self.pins, &self.a, &targets)];
+        catalog.lowering = Some(crate::inspect_system::CatalogLowering {
+            plan: fx::lower_named(
+                &modules,
+                &self.pins,
+                crate::plan::AdmissionPolicy::Inventory(
+                    self.native.scene.coordinator.attach_set.budget(),
+                ),
+            ),
+            pins: fx::pass_pins(&[(&self.a, "sha-a")]),
+        });
+        catalog
+    }
+
+    fn apply(&mut self, at: u64) {
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.native.scene.coordinator.apply_catalog(
+            self.catalog(at),
+            &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+            &mut self.native.cookies,
+            at + 100,
+            at,
+        );
+    }
+
+    fn drain(&mut self) {
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.native.drain();
+    }
+
+    fn commit(&mut self) {
+        self.native.scene.coordinator.commit_batch(false).unwrap();
+    }
+
+    /// A quiet pass: catalog, drain, empty witness read, commit.
+    fn pass(&mut self, at: u64) {
+        self.apply(at);
+        self.drain();
+        self.native.read(Vec::new());
+        self.commit();
+    }
+
+    /// The first-use pass: the row arrives with no advanced count yet.
+    fn pass_row(&mut self, at: u64) {
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.row_at = self.native.stamps.tick();
+        self.apply(at);
+        self.drain();
+        let row = self.native.row(41, 1, 7, self.row_at, 0);
+        self.native.read(vec![row]);
+        self.commit();
+    }
+
+    /// A counted pass: the refresh carries only the advanced absolute.
+    /// Live reports each witness row exactly once (the witness sweep
+    /// reports the unseen and skips the seen); steady passes re-read
+    /// counts, never rows.
+    fn pass_count(&mut self, at: u64, absolute: u64) {
+        self.apply(at);
+        self.drain();
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.native
+            .counts_read(Vec::new(), vec![(41, 1, 0, absolute)]);
+        self.commit();
+    }
+
+    fn edge_count(&self) -> u64 {
+        self.native
+            .scene
+            .coordinator
+            .registry()
+            .edges_of(self.caller)
+            .next()
+            .map(|edge| edge.entry_count)
+            .unwrap()
+    }
+
+    fn owner_unproven_gaps(&self) -> Vec<String> {
+        self.native
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.reason.contains("physical owner is not proven"))
+            .map(|gap| format!("{}: {}", gap.subject, gap.reason))
+            .collect()
+    }
+}
+
+#[test]
+fn cnt1_steady_sole_pair_attributes_every_refresh() {
+    let mut scene = Cnt1Steady::new();
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    assert_eq!(scene.edge_count(), 0);
+    assert!(scene.owner_unproven_gaps().is_empty());
+    // The live absolute sequence, extended: every refresh must land on the
+    // sole edge with no "owner not proven" gap once the index finishes.
+    for (step, absolute) in [
+        270106, 413539, 531131, 629874, 700000, 750000, 800000, 850000, 900000, 950000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        scene.pass_count(230 + step as u64 * 10, absolute);
+        assert_eq!(
+            scene.edge_count(),
+            absolute,
+            "steady refresh {absolute} attributes exactly"
+        );
+        assert!(
+            scene.owner_unproven_gaps().is_empty(),
+            "steady refresh {absolute} leaves no owner-unproven gap: {:?}",
+            scene.owner_unproven_gaps()
+        );
+    }
+}
+
+/// cnt-1 disclosure guard: an exit that is not clean (the pair was
+/// refused or a transition is armed) keeps today's cancel-and-disclose
+/// path. Only a clean exit attributes terminal growth.
+#[test]
+fn cnt1_blocked_exit_still_discloses_owner_unproven_gap() {
+    let mut scene = Scene::shared();
+    let before = scene.counts();
+    scene.native.scene.source.kill(7);
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "cannot inventory pid 7: the process could not be read",
+        2000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.counts_read(Vec::new(), vec![(41, 1, 0, 12)]);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        scene.counts(),
+        before,
+        "a blocked exit attributes no terminal growth"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.reason.contains("physical owner is not proven")),
+        "a blocked exit discloses the owner-unproven range"
+    );
+}
+
+#[test]
+fn cnt1_terminal_growth_of_exited_sole_owner_attributes() {
+    let mut scene = Cnt1Steady::new();
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    for (step, absolute) in [270106, 413539, 531131].into_iter().enumerate() {
+        scene.pass_count(230 + step as u64 * 10, absolute);
+    }
+    assert_eq!(scene.edge_count(), 531131);
+    // The process exits; an empty pass retires the caller with proven exit,
+    // then the terminal count arrives late.
+    scene.native.scene.source.kill(7);
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "cannot inventory pid 7: the process could not be read",
+        2000,
+    );
+    scene.commit();
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, 629874)]);
+    scene.commit();
+    assert_eq!(
+        scene.edge_count(),
+        629874,
+        "terminal growth of the proven-exited sole owner attributes"
+    );
+    assert!(
+        scene.owner_unproven_gaps().is_empty(),
+        "terminal growth leaves no owner-unproven gap: {:?}",
+        scene.owner_unproven_gaps()
     );
 }

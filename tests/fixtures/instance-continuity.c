@@ -144,6 +144,7 @@ CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -214,6 +215,7 @@ static int held_sharer_child(void *unused)
  * provider frame. 'u' releases it and joins the thread. At most one call
  * is held at a time. */
 static pthread_t held_call_thread;
+static pid_t held_call_tid = -1;
 static int held_call_active = 0;
 static int held_call_entry = -1;
 static int held_call_release = -1;
@@ -228,6 +230,7 @@ static struct {
 static void *held_call_worker(void *unused)
 {
     (void)unused;
+    held_call_tid = (pid_t)syscall(SYS_gettid);
     held_call.rv = held_call.call(held_call.tag, held_call.info);
     return NULL;
 }
@@ -664,15 +667,37 @@ static int cmd_mode(const char *provider)
             /* Cancel the 'b' call's thread while it is blocked inside
              * C_GetSlotInfo: the call entered in scope and never
              * returns, so thread exit must reclaim its START. The
-             * process keeps running. */
+             * process keeps running. pthread_join wakes at exit_mm,
+             * before the exit tracepoint on pre-6.16 kernels, while
+             * the tid vanishes only at release_task, after the
+             * tracepoint, so wait for the task dir to disappear. */
             void *result = NULL;
+            char task_path[64];
+            struct stat probe;
+            struct timespec nap = { 0, 1000000 };
+            uint64_t deadline;
             if (!held_call_active)
                 die("no held call");
+            if (held_call_tid <= 0)
+                die("held-call tid");
             if (pthread_cancel(held_call_thread) != 0)
                 die("held-call cancel");
             pthread_join(held_call_thread, &result);
             if (result != PTHREAD_CANCELED)
                 die("held-call cancel join");
+            snprintf(task_path, sizeof task_path, "/proc/self/task/%d", (int)held_call_tid);
+            deadline = now_ns() + 10ULL * 1000000000ULL;
+            for (;;) {
+                if (stat(task_path, &probe) != 0) {
+                    if (errno == ENOENT)
+                        break;
+                    die("held-call task poll");
+                }
+                if (now_ns() > deadline)
+                    die("held-call task reap timeout");
+                nanosleep(&nap, NULL);
+            }
+            held_call_tid = -1;
             held_call_active = 0;
             held_call_disarm();
             held_call_disarm = NULL;

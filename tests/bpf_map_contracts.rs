@@ -207,5 +207,8 @@ fn embedded_birth_marker_twins_are_driven() {
     );
     assert!(output.status.success(), "birth marker twins: {report}");
     assert!(report.contains("Ran 17 tests"), "zero selection: {report}");
-    assert!(!report.contains("skipped"), "skipped marker proof: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped marker proof: {report}"
+    );
 }

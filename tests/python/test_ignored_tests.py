@@ -20,6 +20,7 @@ Run: python3 -I tests/python/test_ignored_tests.py -v
 """
 
 import json
+import re
 import runpy
 import subprocess
 import sys
@@ -235,6 +236,28 @@ def run_runner(*args):
         text=True,
         cwd=ROOT,
     )
+
+
+def runner_array_lines(path, name):
+    """Ordered entries of one `NAME=(...)` shell array, comments stripped.
+
+    Quoted reason lines are kept whole (a `#` inside quotes is data);
+    test lines strip `#` comments. Empty lines contribute nothing.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    head = f"{name}=(\n"
+    start = text.index(head) + len(head)
+    end = text.index("\n)", start)
+    lines = []
+    for line in text[start:end].splitlines():
+        stripped = line.strip()
+        if stripped.startswith('"'):
+            lines.append(stripped)
+        else:
+            entry = line.split("#")[0].strip()
+            if entry:
+                lines.append(entry.split()[0])
+    return lines
 
 
 class IgnoredTestsTests(unittest.TestCase):
@@ -496,6 +519,61 @@ class IgnoredTestsTests(unittest.TestCase):
         for name in SRC_LIVE_KERNEL_SKIP_EXPECTED:
             with self.subTest(name=name):
                 self.assertIn(name, lists["SKIP_TESTS"])
+
+    def test_skip_reasons_align_with_skip_tests(self):
+        tests = runner_array_lines(RUNNER, "SKIP_TESTS")
+        reasons = runner_array_lines(RUNNER, "SKIP_REASONS")
+        self.assertEqual(
+            len(tests), len(reasons),
+            f"SKIP_TESTS={len(tests)} SKIP_REASONS={len(reasons)}",
+        )
+        for name, needs_fixture in [
+            ("metrics::counter_reader::tests::"
+             "counter_cli_profile_counts_matches_workload_ledger_lp64", True),
+            ("metrics::counter_reader::tests::"
+             "counter_cli_profile_timestamps_matches_workload_ledger_lp64", True),
+            ("metrics::counter_reader::tests::"
+             "counter_cli_profile_latency_matches_workload_ledger_lp64", True),
+            ("metrics::counter_reader::tests::"
+             "counter_cli_run_counts_with_owned_child_lp64", False),
+        ]:
+            with self.subTest(name=name):
+                self.assertIn(name, tests)
+                reason = reasons[tests.index(name)]
+                self.assertIn("needs root", reason)
+                self.assertIn("by hand", reason)
+                if needs_fixture:
+                    self.assertIn(
+                        "P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER", reason)
+                    self.assertIn(
+                        "P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD", reason)
+                else:
+                    self.assertIn("no fixture", reason)
+
+    def test_runner_list_refuses_skip_misalignment(self):
+        text = RUNNER.read_text(encoding="utf-8")
+        match = re.search(r"^SKIP_REASONS=\(\n(.*?)\n\)", text, re.M | re.S)
+        self.assertIsNotNone(match, "real runner has no SKIP_REASONS list")
+        lines = match.group(1).splitlines()
+        dropped = "\n".join(
+            line for line in lines
+            if not line.strip().startswith('"needs punch-hole support'))
+        self.assertLess(len(dropped.splitlines()), len(lines),
+                        "fixture must drop one reason")
+        broken = text[:match.start(1)] + dropped + text[match.end(1):]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Path(tmp) / "run-privileged-lib-tests.sh"
+            runner.write_text(broken, encoding="utf-8")
+            runner.chmod(0o755)
+            binary = Path(tmp) / "libtest-empty"
+            write_fake_binary(binary, [])
+            result = subprocess.run(
+                [str(runner), "--list", str(binary)],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertNotEqual(
+            result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("differ in length", result.stderr)
 
     def test_checker_prints_exact_per_list_counts(self):
         with tempfile.TemporaryDirectory() as tmp:

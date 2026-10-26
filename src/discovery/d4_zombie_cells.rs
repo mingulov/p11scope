@@ -1779,3 +1779,339 @@ fn privileged_d4_btrfs_zombie_cold_admission_backend_parity() {
     drop(pins);
     std::fs::remove_file(&held_path).unwrap();
 }
+
+/// Two live survivors refuse cold admission by name — never a pick.
+/// Control first: a whole-group-dead zombie refuses with the generic
+/// gone message, never the ambiguity name, so the named assertion
+/// below discriminates.
+#[test]
+fn cold_admission_two_survivors_refuses_ambiguity() {
+    use crate::discovery::caller_registry::ImageAuthority;
+    let mut dead = std::process::Command::new("true")
+        .spawn()
+        .expect("true spawns");
+    let dead_pid = dead.id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !crate::process::process_is_zombie(dead_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "spawned `true` never showed zombie"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut dead_adapter = cold_caller_adapter();
+    let dead_error = dead_adapter
+        .admit(dead_pid, ImageAuthority::ScanPinned, 10)
+        .unwrap_err();
+    let dead_message = format!("{dead_error:#}");
+    assert!(
+        dead_message.contains("no live process"),
+        "dead groups keep the generic gone refusal: {dead_message}"
+    );
+    assert!(
+        !dead_message.contains("more than one live survivor"),
+        "dead groups never read ambiguous: {dead_message}"
+    );
+    assert!(dead_adapter.live_id(dead_pid).is_none());
+    dead.wait().expect("the dead control reaps");
+    // Then the ambiguous group: two live survivors, one named refusal.
+    let group = ZombieLeaderGroup::spawn_two();
+    wait_leader_zombie(group.tgid);
+    assert_two_survivors(&group);
+    let mut adapter = cold_caller_adapter();
+    let error = adapter
+        .admit(group.tgid, ImageAuthority::ScanPinned, 20)
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("more than one live survivor"),
+        "named ambiguity refusal, got {message}"
+    );
+    assert!(
+        adapter.live_id(group.tgid).is_none(),
+        "ambiguity never picks a survivor"
+    );
+}
+
+/// A cold-minted member handed into the confirm routes the confirm
+/// through the survivor. Non-vacuity: while the handed member lives,
+/// its slot refuses a fresh mint — so the prepare below can only carry
+/// the HANDED member, never a silent re-mint. A handoff for another pid
+/// drops and the ordinary mint runs (control).
+#[test]
+fn cold_member_handoff_routes_confirm_through_survivor() {
+    use crate::discovery::caller_registry::{cold_admit_member, cold_member_owner};
+    use crate::discovery::retained_member::RetainedGroupMember;
+    use crate::process::PidPin;
+    use std::sync::Arc;
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    // Cold-mint outside the confirm, from a duplicated pin (never a
+    // numeric reopen), and hand it in; the hander's own Arc drops, so
+    // only the handed minter sustains the member from here on.
+    let pin = Arc::new(PidPin::open(group.tgid).expect("cold pin opens"));
+    let mut work = CaptureWorkBudget::default();
+    let minted = cold_admit_member(&pin, &mut work).expect("cold mints outside the confirm");
+    let rival = Arc::new(pin.try_clone().expect("rival dup"));
+    let mut rival_work = CaptureWorkBudget::default();
+    let rival_owner = cold_member_owner();
+    let rival_deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        RetainedGroupMember::acquire(
+            &rival,
+            group.survivor,
+            &rival_owner,
+            &mut rival_work,
+            rival_deadline
+        )
+        .is_err(),
+        "the handed slot refuses a fresh mint"
+    );
+    let mut io = OsConfirmIo::default();
+    io.hand_cold_member(group.tgid, minted);
+    drop(pin);
+    drop(rival);
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+        .expect("the handed confirm prepares");
+    let selector = prepared
+        .member
+        .as_ref()
+        .expect("prepare carries the handed survivor")
+        .selector()
+        .expect("carried member selects");
+    assert_eq!(selector.tgid(), group.tgid);
+    assert_eq!(selector.tid(), group.survivor);
+    drop(prepared);
+    drop(io);
+    // Control: a handoff for another pid drops and the ordinary mint runs.
+    let pin = Arc::new(PidPin::open(group.tgid).expect("second cold pin opens"));
+    let mut work = CaptureWorkBudget::default();
+    let minted = cold_admit_member(&pin, &mut work).expect("second cold mint");
+    let mut io = OsConfirmIo::default();
+    io.hand_cold_member(group.tgid.wrapping_add(1), minted);
+    drop(pin);
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+        .expect("a mismatched handoff falls back to the ordinary mint");
+    assert_eq!(
+        prepared
+            .member
+            .as_ref()
+            .expect("the ordinary mint carries")
+            .selector()
+            .expect("carried member selects")
+            .tid(),
+        group.survivor
+    );
+}
+
+/// A zombie-leader group whose view the test opens while the leader
+/// still lives: the forked child blocks on a pipe until released, then
+/// raw-clones one survivor (reusing the survivor entry point, which
+/// reports its TID over the pipe) and exits its leader thread. Killed
+/// and reaped on drop.
+struct WarmViewZombie {
+    tgid: u32,
+    survivor: u32,
+}
+
+/// The blocked child before release: closing the pipes or killing
+/// the group releases it. Dropped without release on early failure.
+/// Two single-direction pipes — a parent-to-child go pipe plus a
+/// survivor-to-parent TID pipe — so no read can consume its own
+/// side's write.
+struct BlockedChild {
+    tgid: u32,
+    go_write: libc::c_int,
+    tid_read: libc::c_int,
+}
+
+impl BlockedChild {
+    fn fork() -> Self {
+        let (mut go, mut tid) = ([0; 2], [0; 2]);
+        // SAFETY: two valid two-element arrays for pipe2.
+        assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(unsafe { libc::pipe2(tid.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child only reads one go byte, mmaps a stack,
+        // clones, and exits its leader thread; no allocator, no
+        // pthread, no locks.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "blocked fork failed");
+        if pid == 0 {
+            let mut go_byte = [0u8; 1];
+            unsafe {
+                libc::close(go[1]);
+                libc::close(tid[0]);
+                // One go byte; EOF or error exits instead of hanging.
+                let got = libc::read(go[0], go_byte.as_mut_ptr().cast(), go_byte.len());
+                if got != go_byte.len() as isize {
+                    libc::_exit(1);
+                }
+                // SAFETY: an anonymous stack mapping, page-aligned.
+                let stack = libc::mmap(
+                    std::ptr::null_mut(),
+                    65536,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if stack == libc::MAP_FAILED {
+                    libc::_exit(2);
+                }
+                const FLAGS: libc::c_int = libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD
+                    | libc::CLONE_SYSVSEM;
+                let cloned = libc::clone(
+                    clone_survivor_main,
+                    (stack as *mut u8).add(65536).cast(),
+                    FLAGS,
+                    tid[1] as isize as *mut std::ffi::c_void,
+                );
+                if cloned < 0 {
+                    libc::_exit(3);
+                }
+                // The main thread exits alone; the survivor keeps the group.
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the parent keeps one end of each pipe.
+        unsafe {
+            libc::close(go[0]);
+            libc::close(tid[1]);
+        }
+        Self {
+            tgid: pid as u32,
+            go_write: go[1],
+            tid_read: tid[0],
+        }
+    }
+
+    /// Release the child: one go byte, then the survivor's TID report.
+    /// Waits until the leader reads Z.
+    fn release(self) -> WarmViewZombie {
+        // SAFETY: writing one go byte down the go pipe.
+        assert_eq!(
+            unsafe { libc::write(self.go_write, [1u8].as_ptr().cast(), 1) },
+            1,
+            "the go byte lands"
+        );
+        let mut tid_bytes = [0u8; 4];
+        let mut done = 0;
+        while done < tid_bytes.len() {
+            // SAFETY: reading into a valid stack buffer; EOF (a dead
+            // child) fails loud instead of hanging.
+            let got = unsafe {
+                libc::read(
+                    self.tid_read,
+                    tid_bytes.as_mut_ptr().add(done).cast(),
+                    tid_bytes.len() - done,
+                )
+            };
+            assert!(got > 0, "the survivor never reported its tid");
+            done += got as usize;
+        }
+        // SAFETY: both ends served their single transfer.
+        unsafe {
+            libc::close(self.go_write);
+            libc::close(self.tid_read);
+        }
+        let group = WarmViewZombie {
+            tgid: self.tgid,
+            survivor: u32::from_ne_bytes(tid_bytes),
+        };
+        std::mem::forget(self);
+        wait_leader_zombie(group.tgid);
+        group
+    }
+}
+
+impl Drop for BlockedChild {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.go_write);
+            libc::close(self.tid_read);
+            libc::kill(self.tgid as libc::pid_t, libc::SIGKILL);
+            let mut status = 0;
+            while libc::waitpid(self.tgid as libc::pid_t, &mut status, 0) < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err == Some(libc::ECHILD) {
+                    break;
+                }
+                assert_eq!(err, Some(libc::EINTR));
+            }
+        }
+    }
+}
+
+impl Drop for WarmViewZombie {
+    fn drop(&mut self) {
+        unsafe {
+            // SIGKILL to the TGID stops the survivor; the leader is dead.
+            libc::kill(self.tgid as libc::pid_t, libc::SIGKILL);
+            let mut status = 0;
+            while libc::waitpid(self.tgid as libc::pid_t, &mut status, 0) < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err == Some(libc::ECHILD) {
+                    break;
+                }
+                assert_eq!(err, Some(libc::EINTR));
+            }
+        }
+    }
+}
+
+/// A view retained from while the leader lived scans the survivor's
+/// maps after the leader exits instead of exiting. Control: once the
+/// whole group dies, the same view exits again.
+#[test]
+fn retained_view_scans_survivor_maps_after_leader_exit() {
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::scan::{
+        CaptureWorkBudget, ScanOutcome, ScanRequest, scan_process_view_without_memory,
+    };
+    use crate::process::{ProcessView, ProcessViewId};
+    let blocked = BlockedChild::fork();
+    let tgid = blocked.tgid;
+    let view = ProcessView::open(ProcessViewId(7499), tgid).expect("a warm view opens while alive");
+    let group = blocked.release();
+    assert_eq!(group.tgid, tgid);
+    assert_ne!(group.survivor, tgid, "the survivor is a nonleader");
+    let hooks = HookRegistry::builtin();
+    let request = ScanRequest {
+        pid: tgid,
+        hints: &[],
+        hooks: &hooks,
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan_process_view_without_memory(&request, &view, &mut budget)
+        .expect("the retained view scans past the leader exit");
+    assert!(
+        matches!(outcome, ScanOutcome::Scanned { .. }),
+        "survivor maps scan, not an exit: {outcome:?}"
+    );
+    // Control: once the whole group dies, the same view exits again.
+    unsafe {
+        libc::kill(tgid as libc::pid_t, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while view.still_the_same() {
+        assert!(
+            Instant::now() < deadline,
+            "the killed group never read dead"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut budget = CaptureWorkBudget::default();
+    let error = scan_process_view_without_memory(&request, &view, &mut budget).unwrap_err();
+    assert!(
+        error.contains("exited before discovery"),
+        "dead groups still exit the scan: {error}"
+    );
+}

@@ -5152,27 +5152,40 @@ pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
 /// Permission, map-policy, identity and malformed-object failures — and
 /// every non-load error — return false and keep their own errors.
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
-    verifier_budget_refusal_errno_name(error).is_some()
+    match error {
+        aya::programs::ProgramError::LoadError { io_error, .. } => {
+            // ENOSPC joins E2BIG only here, at the attach/doctor seam: a
+            // too-complex program whose verbose log fills the load buffer
+            // first. The shared errno predicate above stays E2BIG-only so
+            // the counter mapping keeps rewriting genuine E2BIG alone.
+            matches!(io_error.raw_os_error(), Some(libc::E2BIG | libc::ENOSPC))
+        }
+        _ => false,
+    }
 }
 
 /// The errno name a verifier-budget load refusal carries for hint text:
 /// E2BIG when the program exceeds the complexity limit, ENOSPC when
 /// verbose verification logging fills the load log buffer first
 /// (observed on 5.15 for an over-budget worker: the same refusal
-/// through a different errno). `None` for every other error — the one
-/// routing behind `is_verifier_budget_refusal` — so hints name the
-/// real errno without re-classifying. The shared errno predicate above
-/// stays E2BIG-only so the counter mapping keeps rewriting genuine
-/// E2BIG alone.
+/// through a different errno). `None` unless
+/// `is_verifier_budget_refusal` holds — the one routing — so hints
+/// name the real errno without re-classifying.
 pub(crate) fn verifier_budget_refusal_errno_name(
     error: &aya::programs::ProgramError,
 ) -> Option<&'static str> {
+    if !is_verifier_budget_refusal(error) {
+        return None;
+    }
     match error {
-        aya::programs::ProgramError::LoadError { io_error, .. } => match io_error.raw_os_error() {
-            Some(libc::E2BIG) => Some("E2BIG"),
-            Some(libc::ENOSPC) => Some("ENOSPC"),
-            _ => None,
-        },
+        aya::programs::ProgramError::LoadError { io_error, .. } => {
+            match io_error.raw_os_error() {
+                Some(libc::ENOSPC) => Some("ENOSPC"),
+                // The routing above holds, so any other load errno here is E2BIG.
+                _ => Some("E2BIG"),
+            }
+        }
+        // Unreachable: non-load errors never classify; stay total anyway.
         _ => None,
     }
 }

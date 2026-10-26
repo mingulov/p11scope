@@ -2308,6 +2308,51 @@ fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
 }
 
 #[test]
+fn joint_birth_recheck_measures_the_window_on_the_test_clock() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    // Plant the descheduling a parallel run inflicts: wall time passes
+    // mid-recheck while every observed fact stays coherent. The test-only
+    // recheck is bounded by the fixture clock, not the wall clock.
+    struct StalledRows<'a>(&'a mut NativeBirthRows);
+    impl crate::attach::BirthRowReader for StalledRows<'_> {
+        fn read_marker_row(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
+            std::thread::sleep(Duration::from_millis(60));
+            crate::attach::BirthRowReader::read_marker_row(self.0)
+        }
+        fn read_admission_control(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
+        {
+            crate::attach::BirthRowReader::read_admission_control(self.0)
+        }
+    }
+    assert!(
+        witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut StalledRows(&mut rows),
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding()
+            )
+            .is_ok(),
+        "a descheduled-but-coherent recheck succeeds on the frozen test clock"
+    );
+}
+
+#[test]
 fn joint_birth_cut_cannot_bridge_busy_discard_or_malformed_movement() {
     use crate::events::{BoundedRecord, BoundedRecordSource, EventDrain, RecordSource};
     use crate::semantics_objects::journal::joint_driver::RawJointQuantum;

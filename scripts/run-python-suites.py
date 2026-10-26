@@ -41,6 +41,7 @@ RUN = [
     ("test_automatic_exec_system_disclosures.py", []),
     ("test_automatic_initial_readiness.py", []),
     ("test_bench_count_overhead.py", []),
+    ("test_bpf_load_report.py", []),
     ("test_bpf_noninterference.py", []),
     ("test_cargo_wrapper.py", []),
     ("test_e16_oracle.py", []),

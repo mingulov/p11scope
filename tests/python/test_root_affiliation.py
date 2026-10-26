@@ -38,22 +38,44 @@ def wrapper_contract(main, name):
 def hook_contract(main, identity):
     wrapper_contract(main, "sched_process_exit")
     exit_body = function(main, "sched_process_exit_impl")
-    # Owner cleanup executes first and unconditionally in both cfgs; a
-    # failed cleanup faults through a fault-only arm that never diverts
-    # teardown (exact text pins the arm: no return, no other call).
-    guard = ('#[cfg(not(feature = "inventory-only"))]\n'
-             '    if unsafe { p11_owner_cleanup() } != 0 {\n'
+    # Owner cleanup executes first and unconditionally in both cfgs. The
+    # Detailed outcome is read once; a failed cleanup (1) faults through a
+    # fault-only arm that never diverts teardown, and a healthy settle that
+    # abandoned a live START gaps the leader row through a Detailed-only arm
+    # that likewise never diverts teardown (exact text pins each arm: no
+    # return, no other call). Inventory ignores the outcome.
+    read = ('#[cfg(not(feature = "inventory-only"))]\n'
+            '    let cleanup = unsafe { p11_owner_cleanup() };')
+    fault = ('#[cfg(not(feature = "inventory-only"))]\n'
+             '    if cleanup == 1 {\n'
              '        unsafe { p11_object_fault() };\n'
-             '    }\n'
-             '    #[cfg(feature = "inventory-only")]\n'
-             '    let _ = unsafe { p11_owner_cleanup() };')
-    guard_at = exit_body.index(guard)
-    before_guard = re.sub(r"//[^\n]*", "", exit_body[:guard_at]).strip()
-    if before_guard != "{":
+             '    }')
+    gap = ('#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
+           '    if cleanup == OWNER_CLEANUP_ABANDONED_START {\n'
+           '        unsafe {\n'
+           '            p11_instance_scope_gap();\n'
+           '        }\n'
+           '    }')
+    inventory = ('#[cfg(feature = "inventory-only")]\n'
+                 '    let _ = unsafe { p11_owner_cleanup() };')
+    read_at = exit_body.index(read)
+    before_read = re.sub(r"//[^\n]*", "", exit_body[:read_at]).strip()
+    if before_read != "{":
         raise AssertionError("owner cleanup must unconditionally begin the exit handler")
     if exit_body.count("p11_owner_cleanup") != 2:
         raise AssertionError("exit must run owner cleanup exactly once per cfg")
-    tail = exit_body[guard_at + len(guard):]
+    if exit_body.count("let cleanup = unsafe { p11_owner_cleanup() };") != 1:
+        raise AssertionError("exit must read the Detailed cleanup outcome exactly once")
+    fault_at = exit_body.index(fault)
+    gap_at = exit_body.index(gap)
+    inventory_at = exit_body.index(inventory)
+    if not (read_at < fault_at < gap_at < inventory_at):
+        raise AssertionError("exit must order cleanup read, fault arm, gap arm, then inventory arm")
+    if exit_body.count("p11_instance_scope_gap") != 1:
+        raise AssertionError("exit must gap the abandoned START exactly once")
+    if exit_body.count("OWNER_CLEANUP_ABANDONED_START") != 1:
+        raise AssertionError("exit must key the gap arm on the abandoned-START outcome exactly once")
+    tail = exit_body[inventory_at + len(inventory):]
     root = re.match(
         r'\s*#\[cfg\(not\(feature = "inventory-only"\)\)\]'
         r'\s*unsafe\s*\{\s*p11_root_current_exit\(\)\s*\};', tail)
@@ -109,8 +131,27 @@ class RootAffiliationTests(unittest.TestCase):
         root_end = exit_body.index('};', root_start) + 2
         root_block = exit_body[root_start:root_end]
         owner = "unsafe { p11_owner_cleanup() };"
+        gap_block = ('#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
+                     '    if cleanup == OWNER_CLEANUP_ABANDONED_START {\n'
+                     '        unsafe {\n'
+                     '            p11_instance_scope_gap();\n'
+                     '        }\n'
+                     '    }')
+        leader_filter = ('    let pid_tgid = helpers::bpf_get_current_pid_tgid();\n'
+                         '    if pid_tgid as u32 != (pid_tgid >> 32) as u32 {\n'
+                         '        return 0;\n'
+                         '    }\n')
+        gap_moved = exit_body.replace(gap_block, "", 1).replace(
+            leader_filter, leader_filter + gap_block + "\n", 1)
         changed_exits = [
             exit_body.replace(root_block, ""),
+            exit_body.replace(gap_block, gap_block.replace(
+                "p11_instance_scope_gap();",
+                "p11_instance_scope_gap();\n            return 0;", 1), 1),
+            exit_body.replace("if cleanup == OWNER_CLEANUP_ABANDONED_START {",
+                              "if cleanup == 1 {", 1),
+            gap_moved,
+            exit_body.replace(gap_block, gap_block.split("\n", 1)[1], 1),
             exit_body.replace(root_block, "if false { " + root_block + " }"),
             exit_body.replace(owner, "if false { " + owner, 1)
                      .replace(root_block, root_block + " }", 1),
@@ -148,16 +189,16 @@ class RootAffiliationTests(unittest.TestCase):
                  "        || !image_pair_matches(start.image, image)\n"
                  "    {\n"
                  "        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);\n"
-                 "        return 0;\n"
+                 "        return RETURN_CALL_LOST;\n"
                  "    }\n")
         facts_line = ("    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);\n")
         swapped = ordinary.replace(guard + facts_line, facts_line + guard, 1)
         self.assertNotEqual(swapped, ordinary, "guard/facts swap must apply")
         mutants += [
-            main.replace("        ordinary_return(ctx, &key, start, flags, layout)\n",
-                         "        object_return(ctx, &key, start, flags, layout)\n", 1),
-            main.replace("        object_return(ctx, &key, start, flags, layout)\n",
-                         "        ordinary_return(ctx, &key, start, flags, layout)\n", 1),
+            main.replace("if ordinary_return(ctx, &key, start, flags, layout) != 0 {",
+                         "if object_return(ctx, &key, start, flags, layout) != 0 {", 1),
+            main.replace("} else if object_return(ctx, &key, start, flags, layout) != 0 {",
+                         "} else if ordinary_return(ctx, &key, start, flags, layout) != 0 {", 1),
             main.replace(ordinary, swapped, 1),
             main.replace("        || !image_pair_matches(start.image, image)\n", "", 1),
             main.replace("        || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),

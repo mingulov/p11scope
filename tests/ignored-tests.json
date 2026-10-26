@@ -979,6 +979,12 @@
       "cell": "privileged"
     },
     {
+      "file": "tests/entry_object_paired.rs",
+      "path": "paired_default_and_unsafe_objects_satisfy_the_entry_contract",
+      "reason": "needs default and unsafe-unvalidated-metadata target dirs from the paired-build lane; static object analysis, no BPF load; run by hand, about 75 minutes",
+      "cell": "live-kernel"
+    },
+    {
       "file": "tests/exec_task_continuity.rs",
       "path": "exec_task_core_shapes_kernel_load_without_attachment",
       "reason": "requires the root-owned privileged verifier lane",

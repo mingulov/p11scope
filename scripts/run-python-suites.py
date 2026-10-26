@@ -142,6 +142,7 @@ DRIVEN = {
     "test_diagnostic_linkage.py": _ARTIFACT_CONTRACTS,
     "test_discovery_flow_object.py": _ARTIFACT_CONTRACTS,
     "test_dual_build_callers.py": _ARTIFACT_CONTRACTS,
+    "test_entry_object.py": "tests/entry_object_paired.rs",
     "test_export_source.py": _ARTIFACT_CONTRACTS,
     "test_ia32_lifecycle.py": _ARTIFACT_CONTRACTS,
     "test_image_identity_core.py": _ARTIFACT_CONTRACTS,
@@ -183,15 +184,7 @@ DRIVEN = {
     "test_task_storage_canary.py": _ARTIFACT_CONTRACTS,
 }
 
-EXCLUDED = {
-    "test_entry_object.py": (
-        "needs the default and the unsafe-unvalidated-metadata eBPF objects "
-        "at once (--default-object/--unsafe-object), which no single build "
-        "has; a driver for the matching pair is still required. Explicit "
-        "paired-object runs remain separate from the ordinary host suite; "
-        "the checker reports partial coverage and does not replace source guards"
-    ),
-}
+EXCLUDED = {}
 
 
 def _strip_driver_comments(text, driver):

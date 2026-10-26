@@ -472,6 +472,7 @@ tests/object_producer_activation.rs:counter_artifact_mutations_are_causally_reje
 # against a directory of built test binaries: every entry must resolve to
 # exactly one binary and select exactly one ignored test there.
 INTEGRATION_TESTS=(
+tests/entry_object_paired.rs:paired_default_and_unsafe_objects_satisfy_the_entry_contract
 tests/exec_task_continuity.rs:exec_task_core_shapes_kernel_load_without_attachment
 tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs
 tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_population

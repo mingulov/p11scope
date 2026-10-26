@@ -60,6 +60,7 @@ WIDE_EXPECTED = [
 
 
 INTEGRATION_EXPECTED = [
+    "tests/entry_object_paired.rs:paired_default_and_unsafe_objects_satisfy_the_entry_contract",
     "tests/exec_task_continuity.rs:exec_task_core_shapes_kernel_load_without_attachment",
     "tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs",
     "tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_population",
@@ -520,7 +521,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=3",
             "COUNTER_ARTIFACTS_TESTS=2",
-            "INTEGRATION_TESTS=5",
+            "INTEGRATION_TESTS=6",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -614,6 +615,9 @@ class IgnoredTestsTests(unittest.TestCase):
             deps = Path(tmp) / "deps"
             deps.mkdir()
             write_fake_integration_binary(
+                deps, "entry_object_paired",
+                ["paired_default_and_unsafe_objects_satisfy_the_entry_contract"])
+            write_fake_integration_binary(
                 deps, "exec_task_continuity",
                 ["exec_task_core_shapes_kernel_load_without_attachment",
                  "noise::t_other"])
@@ -630,11 +634,11 @@ class IgnoredTestsTests(unittest.TestCase):
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (5)", result.stdout)
+        self.assertIn("integration (6)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (5 entries)", result.stdout)
+                      "test per entry (6 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

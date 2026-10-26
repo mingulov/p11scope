@@ -1074,6 +1074,19 @@ class DriverFixture(unittest.TestCase):
             self.assertIn(">= 2", proc.stdout)
             self.assertIn("smoke only", proc.stdout)
 
+    def test_driver_dry_run_names_the_teardown_ledger(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-tddry-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            for mode, ledger, expect in (
+                    ("single", "ledger.jsonl", "ledger-teardown.jsonl"),
+                    ("churn", "churn", "churn-teardown.jsonl")):
+                proc = subprocess.run(
+                    [str(driver), "--dry-run", "/no-provider.so", mode,
+                     "1k", "2", ledger], capture_output=True, text=True,
+                    timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(expect, proc.stdout)
+
     def test_driver_stub_run_emits_a_valid_1k_ledger(self):
         t0 = require_t0(self)
         s1 = require_s1(self)

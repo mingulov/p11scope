@@ -3855,13 +3855,16 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     // H8-D birth marker: the outlined return halves report a lost
     // in-scope call with a nonzero code instead of calling the leaf (a
     // call there would deepen return's 512-byte chain); the root dirties
-    // the leader row here at root depth.
-    let lost = if unsafe { (*start).object_required } == 0 {
-        ordinary_return(ctx, &key, start, flags, layout)
-    } else {
-        object_return(ctx, &key, start, flags, layout)
-    };
-    if lost != 0 {
+    // the leader row here at root depth. Each result is consumed by its
+    // own compare, so no cross-branch slot grows the root frame.
+    if unsafe { (*start).object_required } == 0 {
+        if ordinary_return(ctx, &key, start, flags, layout) != 0 {
+            #[cfg(not(feature = "counter-broad"))]
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+    } else if object_return(ctx, &key, start, flags, layout) != 0 {
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -4052,13 +4055,13 @@ fn ordinary_return(
                 let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
             }
             e.submit(0);
+            0
         }
         None => {
             bump_evidence(EVIDENCE_RING_LOSS);
-            return RETURN_CALL_LOST;
+            RETURN_CALL_LOST
         }
     }
-    0
 }
 
 #[cfg(not(feature = "inventory-only"))]
@@ -4134,14 +4137,14 @@ fn object_return(
     let descriptor = cookie_descriptor(cookie_of(ctx));
     let rv = accounting.rv;
     let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
-        if owned_start_remove(&key, true).is_err() {
-            // The fault below already refuses births; report no loss.
+        // The fault below already refuses births; report loss only when
+        // the START removal settles.
+        let failed = owned_start_remove(&key, true).is_err();
+        if failed {
             unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_RING_LOSS);
-            return 0;
         }
         bump_evidence(EVIDENCE_RING_LOSS);
-        return RETURN_CALL_LOST;
+        return if failed { 0 } else { RETURN_CALL_LOST };
     };
     // H7-E1: populate in place under ownership with the base event
     // and its continuity landing in the reserved record FIRST, then

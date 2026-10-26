@@ -376,6 +376,19 @@ PHYSICAL_IDENTITY_AMBIGUITY = (
 UNSUPPORTED_TABLE_VERSION = (
     "unsupported function-table version; the scanner does not walk this layout"
 )
+# OD34: fixed product-limit skips name their limit instead of redacting to
+# `discovery unavailable` (render.rs `capture_skipped_out` allowlist). Each
+# is fixed product wording with no target-derived data; the view form
+# normalizes the configured limit value out so the public vocabulary stays
+# finite. The validator must accept what the producer emits.
+PROCESS_VIEW_CAPACITY_EXHAUSTED = (
+    "capture process-view capacity was exhausted; remaining generations were not scanned"
+)
+LOADER_CONTEXT_CAPACITY_EXHAUSTED = "loader context capacity 256 is exhausted"
+LOADER_SCAN_LEDGER_EXCEEDED = (
+    "a deferred loader memory scan exceeded the bounded loader-context ledger"
+)
+LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
@@ -384,6 +397,10 @@ DISCOVERY_REASONS = {
     UNSUPPORTED_TABLE_VERSION,
     "static probe coverage gap incomplete",
     "static probes detached and exact pairs reattached",
+    PROCESS_VIEW_CAPACITY_EXHAUSTED,
+    LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+    LOADER_SCAN_LEDGER_EXCEEDED,
+    LOADER_ARM_LEDGER_FULL,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a

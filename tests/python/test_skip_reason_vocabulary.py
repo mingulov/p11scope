@@ -36,6 +36,11 @@ PRODUCER_CONSTANTS = (
     "UNSUPPORTED_TABLE_VERSION",
     "STATIC_GAP_INCOMPLETE",
     "STATIC_GAP_RECOVERED",
+    # OD34: fixed product-limit skips name their limit.
+    "PROCESS_VIEW_CAPACITY_EXHAUSTED",
+    "LOADER_CONTEXT_CAPACITY_EXHAUSTED",
+    "LOADER_SCAN_LEDGER_EXCEEDED",
+    "LOADER_ARM_LEDGER_FULL",
 )
 
 
@@ -55,7 +60,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; everything else renders one of the
-    seven discovery reasons. The split mirrors `capture_skipped_out`'s
+    eleven discovery reasons. The split mirrors `capture_skipped_out`'s
     branches; the strings themselves come from the source, never from a
     copy pasted into this test.
     """
@@ -71,8 +76,12 @@ def producer_reasons():
         const["UNSUPPORTED_TABLE_VERSION"],
         const["STATIC_GAP_INCOMPLETE"],
         const["STATIC_GAP_RECOVERED"],
+        const["PROCESS_VIEW_CAPACITY_EXHAUSTED"],
+        const["LOADER_CONTEXT_CAPACITY_EXHAUSTED"],
+        const["LOADER_SCAN_LEDGER_EXCEEDED"],
+        const["LOADER_ARM_LEDGER_FULL"],
     }
-    assert len(entry) == 2 and len(discovery) == 7, const
+    assert len(entry) == 2 and len(discovery) == 11, const
     return entry, discovery
 
 

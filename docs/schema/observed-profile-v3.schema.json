@@ -431,7 +431,11 @@
                   "physical identity is ambiguous; the collision group was not attached",
                   "unsupported function-table version; the scanner does not walk this layout",
                   "static probe coverage gap incomplete",
-                  "static probes detached and exact pairs reattached"
+                  "static probes detached and exact pairs reattached",
+                  "capture process-view capacity was exhausted; remaining generations were not scanned",
+                  "loader context capacity 256 is exhausted",
+                  "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                  "the bounded loader-arm catch-up ledger was full"
                 ]
               }
             }

@@ -11888,6 +11888,23 @@ mod tests {
     }
 
     #[test]
+    fn log_exhaustion_refusal_gets_verifier_hint_not_privilege_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("p11scope doctor"), "{rendered}");
+        assert!(!rendered.contains("CAP_BPF"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
     fn permission_refusal_keeps_unsupported_environment_hint() {
         let error = unsupported_environment_context(
             anyhow::Error::new(aya::programs::ProgramError::LoadError {
@@ -16839,6 +16856,29 @@ mod tests {
         assert!(!super::is_verifier_budget_errno(None));
     }
 
+    /// Log-exhaustion twin: a too-complex program whose verbose verifier
+    /// log fills the load buffer surfaces as ENOSPC instead of E2BIG
+    /// (observed on 5.15); it classifies as the same budget refusal.
+    /// Genuine non-budget errnos — including EAGAIN — still stay out.
+    #[test]
+    fn verifier_budget_errno_includes_log_exhaustion() {
+        assert!(super::is_verifier_budget_errno(Some(libc::ENOSPC)));
+        for errno in [
+            libc::EINVAL,
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENOMEM,
+            libc::EFAULT,
+            libc::EAGAIN,
+        ] {
+            assert!(
+                !super::is_verifier_budget_errno(Some(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_errno(None));
+    }
+
     /// Load-refusal detector on real error values, both directions: a
     /// LoadError with E2BIG classifies; LoadErrors with other errnos —
     /// and non-load errors — never do, whatever the verifier log says.
@@ -16852,6 +16892,29 @@ mod tests {
         }
         assert!(super::is_verifier_budget_refusal(&load_error(libc::E2BIG)));
         for errno in [libc::EINVAL, libc::EACCES, libc::EPERM] {
+            assert!(
+                !super::is_verifier_budget_refusal(&load_error(errno)),
+                "errno {errno} must not classify as a budget refusal"
+            );
+        }
+        assert!(!super::is_verifier_budget_refusal(
+            &aya::programs::ProgramError::NotLoaded
+        ));
+    }
+
+    /// Log-exhaustion twin on real error values: an ENOSPC LoadError
+    /// classifies; EAGAIN and permission LoadErrors — and non-load
+    /// errors — never do, whatever the verifier log says.
+    #[test]
+    fn verifier_budget_refusal_classifies_log_exhaustion() {
+        fn load_error(errno: i32) -> aya::programs::ProgramError {
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(errno),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            }
+        }
+        assert!(super::is_verifier_budget_refusal(&load_error(libc::ENOSPC)));
+        for errno in [libc::EAGAIN, libc::EINVAL, libc::EACCES, libc::EPERM] {
             assert!(
                 !super::is_verifier_budget_refusal(&load_error(errno)),
                 "errno {errno} must not classify as a budget refusal"

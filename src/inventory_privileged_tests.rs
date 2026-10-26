@@ -5030,7 +5030,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
                 Some(caller),
             )),
     );
-    ensure_joint_birth_refusal(&coordinator, "r16-q1")?;
+    ensure_joint_birth_marker_wired(&coordinator, "r16-q1")?;
 
     // Release A's return into q2.
     std::fs::OpenOptions::new().write(true).open(&release)?;
@@ -5271,7 +5271,7 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     // `api_returns`/`reduced` cover the semantic side only, never the
     // raw entered total.
     let qa_polls = service_to_published(&mut lane_a, &mut coordinator, true, "r16c-qa")?;
-    ensure_joint_birth_refusal(&coordinator, "r16c-qa")?;
+    ensure_joint_birth_marker_wired(&coordinator, "r16c-qa")?;
     let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "soft-copy.so")?;
     let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
@@ -6057,9 +6057,9 @@ fn has_gap(coordinator: &InventoryCoordinator<OsProcessSource>, subject: &str) -
         .any(|gap| gap.subject == subject)
 }
 
-/// Reasons of the retained-S1 birth disclosures. Until the
-/// object-journal marker lands, every observed-call birth discloses
-/// its native refusal here instead of installing a Joint feed.
+/// Reasons of the retained-S1 birth disclosures. With the object-journal
+/// marker wired, an observed-call birth installs a Joint feed instead of
+/// disclosing its native refusal here.
 fn joint_birth_gap_reasons(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
     coordinator
         .registry()
@@ -6070,20 +6070,20 @@ fn joint_birth_gap_reasons(coordinator: &InventoryCoordinator<OsProcessSource>) 
         .collect()
 }
 
-/// Pin the disclosed birth refusal after a publish. The marker is
-/// unwired, so observed-call births must disclose RowUnreadable; the
-/// cells' Joint assertions below fail until the marker lands and flips
-/// this pin.
-fn ensure_joint_birth_refusal(
+/// Pin the wired marker after a publish: no observed-call birth may
+/// disclose RowUnreadable (the unwired-marker refusal), so the cells'
+/// Joint assertions below run against installed feeds.
+fn ensure_joint_birth_marker_wired(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     tag: &str,
 ) -> Result<()> {
     let gaps = joint_birth_gap_reasons(coordinator);
     eprintln!("JOINT_R16 {tag}-births gaps={gaps:?}");
     ensure!(
-        gaps.iter()
+        !gaps
+            .iter()
             .any(|reason| reason == "joint_birth_native_RowUnreadable"),
-        "{tag}: observed-call births disclose the unwired marker"
+        "{tag}: an observed-call birth disclosed the unwired marker: {gaps:?}"
     );
     Ok(())
 }
@@ -6397,7 +6397,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         ),
         joint_edge_census(&coordinator),
     );
-    ensure_joint_birth_refusal(&coordinator, "r16b-q1")?;
+    ensure_joint_birth_marker_wired(&coordinator, "r16b-q1")?;
 
     // Release H into q2; S stays held on its own FIFO.
     std::fs::OpenOptions::new().write(true).open(&release_h)?;

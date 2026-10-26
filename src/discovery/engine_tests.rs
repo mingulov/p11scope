@@ -4118,7 +4118,11 @@ fn stuck_cleanup_after_target_exit_ends_with_named_partial() {
         "collected skips are kept: {:?}",
         engine.counters.object_skips
     );
-    let trip = engine.counters.object_skips.last().expect("the trip reason");
+    let trip = engine
+        .counters
+        .object_skips
+        .last()
+        .expect("the trip reason");
     assert_eq!(trip.subject, "live discovery transaction");
     assert!(
         trip.reason.contains("cleanup was still pending"),

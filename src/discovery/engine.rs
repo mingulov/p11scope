@@ -18441,6 +18441,37 @@ impl Engine {
         {
             self.expected_target_exit_pending = None;
             self.expected_target_exit = true;
+            return;
+        }
+        if self.expected_target_exit {
+            // Already latched — owned `run` settlement, or an all-clear
+            // behind a re-armed pending: no wait is outstanding, so there
+            // is nothing to bound and no PARTIAL mark to add. `run`
+            // behaviour is unchanged.
+            return;
+        }
+        // A retirement cleanup that stays queued must not hold a
+        // `profile --pid` capture open past its target's exit forever:
+        // when the armed wait observes no all-clear for the whole
+        // no-progress bound, end the wait with a named PARTIAL reason and
+        // keep the calls collected so far. The arm proves the target
+        // exited, so the bound can only trip after the exit — never while
+        // the target is alive.
+        let since = *self
+            .expected_target_exit_since
+            .get_or_insert_with(std::time::Instant::now);
+        let stalled = since.elapsed();
+        if stalled >= EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT {
+            self.mark_partial(
+                "live discovery transaction",
+                &format!(
+                    "the named target exited but its cleanup was still pending after {}s; \
+                     the capture ends with the calls collected so far",
+                    stalled.as_secs()
+                ),
+            );
+            self.expected_target_exit_pending = None;
+            self.expected_target_exit = true;
         }
     }
 

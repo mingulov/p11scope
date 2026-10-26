@@ -5996,7 +5996,10 @@ mod tests {
     /// privilege-dropped child can create it, like the other owned-run
     /// cells (CARGO_TARGET_TMPDIR), never under a root-owned TMPDIR.
     fn counter_cli_run_marker_path(id: u32) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("p11scope-counter-run-{id}.marker"))
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_TARGET_TMPDIR").expect("CARGO_TARGET_TMPDIR for owned-child marker"),
+        )
+        .join(format!("p11scope-counter-run-{id}.marker"))
     }
 
     #[test]
@@ -6033,7 +6036,7 @@ mod tests {
         let id = std::process::id();
         let out_path = std::env::temp_dir().join(format!("p11scope-counter-run-{id}.json"));
         let _cleanup = RemoveReportOnDrop(out_path.clone());
-        let marker_path = std::env::temp_dir().join(format!("p11scope-counter-run-{id}.marker"));
+        let marker_path = counter_cli_run_marker_path(id);
         let _marker_cleanup = RemoveReportOnDrop(marker_path.clone());
         let out_text = out_path.to_string_lossy().into_owned();
         let marker_text = marker_path.to_string_lossy().into_owned();

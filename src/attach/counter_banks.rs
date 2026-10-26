@@ -5291,6 +5291,106 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_growth_stages_fresh_adopted_plan_after_prefix() {
+        // The Engine growth seam: the candidate plan is rebuilt fresh
+        // (unconsumed) and adopts the staged prefix from the directory
+        // high-water before staging its tail — the same adopt
+        // `Session::stage_counter_growth` performs. The fresh tail must
+        // publish exactly its extent.
+        let (_fixture, pins, first, second, _) = growth_provider_fixture();
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let keepalive = CounterKeepalive::precharge_with_geometry(
+            &pool.reserver(),
+            16 * 1024 * 1024,
+            BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
+        )
+        .unwrap();
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
+        let mut history =
+            AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_store = Some(&pins);
+        io.provider_owner = Some(&keepalive.custody);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { extent, .. }
+                if extent == BankExtent { first: 0, end: 1 }
+        ));
+        let mut candidate =
+            AttachPlan::from_slots_with_policy(vec![first, second], policy).unwrap();
+        assert_eq!(candidate.counter_consumed_end(), 0);
+        candidate.adopt_counter_consumed(1).unwrap();
+        io.next_stage();
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut candidate,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { extent, .. }
+                if extent == BankExtent { first: 1, end: 2 }
+        ));
+        assert_eq!(candidate.counter_consumed_end(), 2);
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn counter_growth_fresh_plan_without_adopt_refuses_without_publish() {
+        // Failure twin: without the adopt, the fresh candidate's consumed
+        // floor disagrees with the directory and staging refuses before
+        // any native work, leaving the published prefix intact.
+        let (_fixture, pins, first, second, _) = growth_provider_fixture();
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let keepalive = CounterKeepalive::precharge_with_geometry(
+            &pool.reserver(),
+            16 * 1024 * 1024,
+            BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap(),
+        )
+        .unwrap();
+        let policy = crate::plan::AdmissionPolicy::counters(
+            crate::capacity::CounterBudget::new(8192).unwrap(),
+        );
+        let mut history =
+            AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_store = Some(&pins);
+        io.provider_owner = Some(&keepalive.custody);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { .. }
+        ));
+        let mut candidate =
+            AttachPlan::from_slots_with_policy(vec![first, second], policy).unwrap();
+        io.next_stage();
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut candidate,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("counter plan consumed prefix differs from the staged length"));
+        assert_eq!(candidate.counter_consumed_end(), 0);
+        assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
+        assert_eq!(io.routes.len(), 1, "no fresh route was inserted");
+    }
+
+    #[test]
     fn counter_stage_check_names_inactive_fresh_slots() {
         // The a2-7a root shape: loader arming retired every endpoint, so the
         // Engine stages an all-inactive plan and the refusal must name it.

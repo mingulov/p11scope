@@ -64,6 +64,87 @@ impl BankReservation {
     }
 }
 
+/// Engine-built counter capture request: the mode to prepare, the
+/// preparation envelope, and the capture pool reserver funding the terminal
+/// hold, keepalive and load overlap. The Engine mints one per counter
+/// capture from its own pool; preparation runs inside the Session start
+/// chain so the FD raise covers it.
+pub(crate) struct CounterSpec {
+    mode: CounterMode,
+    reservation: BankReservation,
+    reserve: SemanticResourceReserver,
+}
+
+impl CounterSpec {
+    pub(crate) fn new(
+        mode: CounterMode,
+        reservation: BankReservation,
+        reserve: SemanticResourceReserver,
+    ) -> Self {
+        Self {
+            mode,
+            reservation,
+            reserve,
+        }
+    }
+
+    /// Production envelope: the proven growth-cell base (retained,
+    /// transient, metadata) with FDs for the host CPU count plus the
+    /// 512-endpoint stage. Preparation validates the floors; the capture
+    /// pool funds the charges.
+    pub(crate) fn for_production(
+        mode: CounterMode,
+        cpus: usize,
+        reserve: SemanticResourceReserver,
+    ) -> Result<Self, BankRefusal> {
+        if cpus == 0 {
+            return Err(BankRefusal::Topology);
+        }
+        let file_descriptors = cpus
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(512))
+            .ok_or(BankRefusal::Budget)?;
+        Ok(Self::new(
+            mode,
+            BankReservation {
+                retained_bytes: 128 * 1024 * 1024,
+                transient_bytes: 64 * 1024 * 1024,
+                metadata_bytes: 32 * 1024 * 1024,
+                file_descriptors,
+            },
+            reserve,
+        ))
+    }
+
+    pub(crate) fn mode(self) -> CounterMode {
+        self.mode
+    }
+
+    /// Production preparation: the embedded object for the spec mode with
+    /// the real kernel probe and the real CPU count.
+    pub(super) fn prepare(self, backend: super::AttachBackend) -> Result<CounterPreparation<'static>> {
+        self.prepare_with_probe_and_cpus(backend, super::kernel_bpf_loop_probe, None)
+    }
+
+    /// Preparation with an injected probe verdict and CPU count, so tests
+    /// pin the envelope deterministically on any kernel.
+    pub(super) fn prepare_with_probe_and_cpus(
+        self,
+        backend: super::AttachBackend,
+        probe: impl FnOnce() -> BpfLoopVerdict,
+        cpus_override: Option<usize>,
+    ) -> Result<CounterPreparation<'static>> {
+        CounterPreparation::new_with_backend_probe_and_cpus(
+            counter_object_for_mode(self.mode),
+            self.reservation,
+            &self.reserve,
+            backend,
+            probe,
+            cpus_override,
+        )
+    }
+}
+
 // Mirrors the already-verified native proof layouts, without changing that ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +335,10 @@ impl BankGeometry {
 /// precharge (RV keys, START, STATS) plus every bank. This is kernel map
 /// bytes, not RSS. No CLI override in v0.5.0.
 pub(crate) const COUNTER_MAP_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Shared return-value key pool for counter reads: every growth geometry
+/// publishes at most this many RV keys. Read limits pin here.
+pub(crate) const COUNTER_RV_KEY_POOL: usize = 65536;
 
 /// Fixed kernel map bytes: RV_COUNTS plus START plus STATS, with P possible
 /// CPUs. RV is a preallocated PERCPU_HASH charged like `configured_payload`
@@ -1198,6 +1283,72 @@ fn check_counter_multi_reservation(
         return Err(BankRefusal::Budget);
     }
     Ok(())
+}
+
+/// Upper bound on the `BankReservation` one `stage_counter_banks` call
+/// charges, for Engine staging envelopes and harness envelopes. It runs the
+/// same `stage_requirements` (plus the Multi storage check inputs) rather
+/// than a second formula, so accounting changes move both sides together.
+/// Every input must dominate the matching production value at staging time:
+/// - `new_banks`: every bank the fresh extent spans (production counts only
+///   the not-yet-allocated subset);
+/// - `old_capacity`: at least `positions.capacity()` (the directory replaces
+///   its positions vector every stage with exactly the staged length);
+/// - `provider_copies`: at least the fresh slots'
+///   `retained_target_copy_allocation_charge × 4` sum `NativeIo` charges;
+/// - `multi_links`: at least the session link length and capacity (Multi
+///   attaches at most two leaves per endpoint and reserves exactly that).
+///
+/// Slot copies use 16, the `NativeIo` charge, which dominates the directory
+/// precheck's 4. `all_slots` must cover `first..end`. Callers add headroom
+/// on top of the returned requirement.
+#[allow(clippy::too_many_arguments)] // Explicit mirror of stage_requirements' checked inputs plus the Multi extent.
+pub(crate) fn estimate_counter_stage_reservation(
+    mode: CounterMode,
+    banks: u32,
+    cells: u32,
+    all_slots: &[Slot],
+    first: u32,
+    end: u32,
+    old_capacity: usize,
+    cpus: usize,
+    new_banks: usize,
+    provider_copies: usize,
+    multi_links: Option<(usize, usize)>,
+) -> Result<BankReservation, BankRefusal> {
+    let geometry = BankGeometry::checked(mode, banks, cells)?;
+    let fresh = BankExtent::checked(first, end, geometry.limit())?;
+    let base = stage_requirements(
+        geometry,
+        all_slots,
+        fresh,
+        old_capacity,
+        cpus,
+        new_banks,
+        provider_copies,
+        16,
+    )?;
+    let (retained, transient, metadata) = match multi_links {
+        None => (base.0, base.1, base.2),
+        Some((old_link_len, old_link_capacity)) => {
+            let extra = counter_multi_requirements(
+                &all_slots[first as usize..end as usize],
+                old_link_len,
+                old_link_capacity,
+            )?;
+            (
+                base.0.checked_add(extra.0).ok_or(BankRefusal::Budget)?,
+                base.1.checked_add(extra.1).ok_or(BankRefusal::Budget)?,
+                base.2.checked_add(extra.2).ok_or(BankRefusal::Budget)?,
+            )
+        }
+    };
+    Ok(BankReservation {
+        retained_bytes: retained,
+        transient_bytes: transient,
+        metadata_bytes: metadata,
+        file_descriptors: base.3,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3155,6 +3306,103 @@ impl Session {
             reservation,
         };
         directory.stage_with(&mut native, plan, reservation, reserve)
+    }
+
+    /// Engine-driven growth staging: size this extent's envelope from live
+    /// directory, custody and link state (both new-bank counts, provider
+    /// copies, Multi link facts) and publish through the standard
+    /// transaction. Appends only; refusals leave the published prefix
+    /// intact.
+    pub(crate) fn stage_counter_growth(
+        &mut self,
+        plan: &mut AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> BankPublication {
+        let Some(banks) = self.counter_banks.as_ref() else {
+            return BankPublication::Refused(BankRefusal::Shape(
+                BankShapeCause::StagedWithoutBanks,
+            ));
+        };
+        let geometry = banks.geometry;
+        let cpus = banks.cpus;
+        // Lock order matches stage_with (directory, then custody); both are
+        // released before the delegation below re-acquires them.
+        let directory = match banks.directory.lock() {
+            Ok(directory) => directory,
+            Err(_) => return BankPublication::Refused(BankRefusal::Quarantined),
+        };
+        if directory.geometry != geometry {
+            return BankPublication::Refused(BankRefusal::Shape(
+                BankShapeCause::StagedGeometryChanged,
+            ));
+        };
+        let first = directory.allocated_high_water();
+        let end = plan.slots.len();
+        if first == end {
+            return BankPublication::Refused(BankRefusal::Allocated);
+        }
+        let extent = match BankExtent::checked(first as u32, end as u32, geometry.limit()) {
+            Ok(extent) => extent,
+            Err(reason) => return BankPublication::Refused(reason),
+        };
+        let old_capacity = directory.positions.capacity();
+        let directory_new_banks = (0..geometry.banks as usize)
+            .filter(|&bank| {
+                directory.bank_ids.get(bank).copied().flatten().is_none()
+                    && bank >= (extent.first / geometry.cells) as usize
+                    && bank <= ((extent.end - 1) / geometry.cells) as usize
+            })
+            .count();
+        let custody = match banks.keepalive.custody.lock() {
+            Ok(custody) => custody,
+            Err(_) => return BankPublication::Refused(BankRefusal::Quarantined),
+        };
+        let custody_new_banks = (extent.first / geometry.cells..=(extent.end - 1) / geometry.cells)
+            .filter(|&bank| custody.banks[bank as usize].is_none())
+            .count();
+        let new_banks = directory_new_banks.max(custody_new_banks);
+        let provider_copies = plan.slots[extent.first as usize..extent.end as usize]
+            .iter()
+            .try_fold(0usize, |bytes, slot| {
+                if self.has_slot_link(slot.index)
+                    || custody
+                        .providers
+                        .get(slot.index as usize)
+                        .is_none_or(Option::is_some)
+                {
+                    return None;
+                }
+                bytes.checked_add(
+                    objects
+                        .retained_target_copy_allocation_charge(slot.object)?
+                        .checked_mul(4)?,
+                )
+            });
+        let Some(provider_copies) = provider_copies else {
+            return BankPublication::Refused(BankRefusal::Budget);
+        };
+        let multi_links = (self.backend == super::AttachBackend::Multi)
+            .then(|| (self.links.len(), self.links.capacity()));
+        drop(custody);
+        drop(directory);
+        let reservation = match estimate_counter_stage_reservation(
+            geometry.mode(),
+            geometry.banks,
+            geometry.cells,
+            &plan.slots,
+            extent.first,
+            extent.end,
+            old_capacity,
+            cpus,
+            new_banks,
+            provider_copies,
+            multi_links,
+        ) {
+            Ok(reservation) => reservation,
+            Err(reason) => return BankPublication::Refused(reason),
+        };
+        self.stage_counter_banks(plan, objects, reservation, reserve)
     }
 }
 
@@ -6448,72 +6696,6 @@ pub(crate) mod tests {
             pool,
             digest,
         }
-    }
-
-    /// Upper bound on the `BankReservation` one `stage_counter_banks` call
-    /// charges, for harness envelopes. It runs the same `stage_requirements`
-    /// (plus the Multi storage check inputs) rather than a second formula, so
-    /// accounting changes move both sides together. Every input must dominate
-    /// the matching production value at staging time:
-    /// - `new_banks`: every bank the fresh extent spans (production counts only
-    ///   the not-yet-allocated subset);
-    /// - `old_capacity`: at least `positions.capacity()` (the directory replaces
-    ///   its positions vector every stage with exactly the staged length);
-    /// - `provider_copies`: at least the fresh slots'
-    ///   `retained_target_copy_allocation_charge × 4` sum `NativeIo` charges;
-    /// - `multi_links`: at least the session link length and capacity (Multi
-    ///   attaches at most two leaves per endpoint and reserves exactly that).
-    ///
-    /// Slot copies use 16, the `NativeIo` charge, which dominates the directory
-    /// precheck's 4. `all_slots` must cover `first..end`. Callers add headroom
-    /// on top of the returned requirement.
-    #[allow(clippy::too_many_arguments)] // Explicit mirror of stage_requirements' checked inputs plus the Multi extent.
-    pub(crate) fn estimate_counter_stage_reservation(
-        mode: CounterMode,
-        banks: u32,
-        cells: u32,
-        all_slots: &[Slot],
-        first: u32,
-        end: u32,
-        old_capacity: usize,
-        cpus: usize,
-        new_banks: usize,
-        provider_copies: usize,
-        multi_links: Option<(usize, usize)>,
-    ) -> Result<BankReservation, BankRefusal> {
-        let geometry = BankGeometry::checked(mode, banks, cells)?;
-        let fresh = BankExtent::checked(first, end, geometry.limit())?;
-        let base = stage_requirements(
-            geometry,
-            all_slots,
-            fresh,
-            old_capacity,
-            cpus,
-            new_banks,
-            provider_copies,
-            16,
-        )?;
-        let (retained, transient, metadata) = match multi_links {
-            None => (base.0, base.1, base.2),
-            Some((old_link_len, old_link_capacity)) => {
-                let extra = counter_multi_requirements(
-                    &all_slots[first as usize..end as usize],
-                    old_link_len,
-                    old_link_capacity,
-                )?;
-                (
-                    base.0.checked_add(extra.0).ok_or(BankRefusal::Budget)?,
-                    base.1.checked_add(extra.1).ok_or(BankRefusal::Budget)?,
-                    base.2.checked_add(extra.2).ok_or(BankRefusal::Budget)?,
-                )
-            }
-        };
-        Ok(BankReservation {
-            retained_bytes: retained,
-            transient_bytes: transient,
-            metadata_bytes: metadata,
-            file_descriptors: base.3,
-        })
     }
 
     /// Actual Directory publication/rollback and real retained files supply

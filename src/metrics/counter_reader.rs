@@ -3247,7 +3247,7 @@ mod tests {
         provider_copies: usize,
         multi: bool,
     ) -> crate::attach::counter_banks::BankReservation {
-        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        use crate::attach::counter_banks::estimate_counter_stage_reservation;
         let bound = slots.len();
         let required = estimate_counter_stage_reservation(
             mode,
@@ -3282,7 +3282,7 @@ mod tests {
 
     #[test]
     fn growth_stage_envelope_covers_real_staged_requirements() {
-        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        use crate::attach::counter_banks::estimate_counter_stage_reservation;
         let (_dir, pins, slots) = envelope_shape_slots(GROWTH_ENDPOINTS, |i| {
             format!("counter_bank_growth_e{i:04x}")
         });
@@ -3349,7 +3349,7 @@ mod tests {
 
     #[test]
     fn old_return_stage_envelope_covers_real_staged_requirements() {
-        use crate::attach::counter_banks::tests::estimate_counter_stage_reservation;
+        use crate::attach::counter_banks::estimate_counter_stage_reservation;
         let (_dir, pins, slots) = envelope_shape_slots(2, |i| {
             ["counter_bank_old", "counter_bank_hot"][i].to_owned()
         });
@@ -3407,7 +3407,7 @@ mod tests {
     fn stage_reservation_check_refuses_below_requirement() {
         use crate::attach::counter_banks::{
             BankRefusal, BankReservation, check_counter_stage_reservation,
-            tests::estimate_counter_stage_reservation,
+            estimate_counter_stage_reservation,
         };
         let (_dir, pins, slots) = envelope_shape_slots(GROWTH_ENDPOINTS, |i| {
             format!("counter_bank_growth_e{i:04x}")

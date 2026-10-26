@@ -4567,9 +4567,18 @@ mod tests {
         assert_native_growth_backend(&session, crate::attach::AttachBackend::Multi, true);
         let budgets = session.counter_budgets(0).unwrap();
         assert_eq!(budgets.endpoints.published, 512);
-        // Finite stop on Multi: an unbounded stop would hang the bounded cell.
+        // S9 Multi finite-stop proof: teardown reuses the existing drop
+        // path with no new machinery, and a Multi detach of one link per
+        // object completes promptly. The Singles stop-estimate twin is a
+        // later slice (its ~16k-link detach is the slow one).
+        let stop = std::time::Instant::now();
         drop(session);
         drop(engine);
+        assert!(
+            stop.elapsed() < std::time::Duration::from_secs(120),
+            "Multi counter stop is finite and prompt, took {:?}",
+            stop.elapsed()
+        );
     }
 
     #[test]

@@ -4339,6 +4339,8 @@ struct JointEdgeSnapshot {
     joint: bool,
     started: Option<u64>,
     completed: Option<u64>,
+    /// S1 mechanism rows as (mechanism, attributed calls, errors), by id.
+    mechanisms: Vec<(u64, u64, u64)>,
 }
 
 fn joint_edge_snapshot(
@@ -4353,12 +4355,24 @@ fn joint_edge_snapshot(
         .instance_semantic_edges()
         .find(|record| record.caller == caller && record.module == module)
         .with_context(|| format!("no semantic edge for pid {pid} on {module_substr:?}"))?;
+    let mut mechanisms: Vec<(u64, u64, u64)> = record
+        .semantics
+        .as_ref()
+        .map(|edge| {
+            edge.mechanisms()
+                .iter()
+                .map(|(id, row)| (*id, row.calls, row.errors))
+                .collect()
+        })
+        .unwrap_or_default();
+    mechanisms.sort();
     Ok(JointEdgeSnapshot {
         api_returns: record.api_returns,
         reduced: record.feed.reduced(),
         joint: record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
         started: record.semantics.as_ref().map(|edge| edge.started()),
         completed: record.semantics.as_ref().map(|edge| edge.completed()),
+        mechanisms,
     })
 }
 
@@ -4832,6 +4846,209 @@ fn finish_stop_take_mint(
     }
 }
 
+/// The fixture's held-sign mechanism: mode `a` (A/H/S) signs with
+/// CKM_SHA256_HMAC (tests/fixtures/object-journal/live-joint.c defines
+/// `CKM_SHA256_HMAC` and mode `a` sets it on its sign mechanism).
+const A_SIGN_MECHANISM: u64 = 0x251;
+
+/// The od33-1 lane disclosure, counted by its frozen reason code: the
+/// subject text may evolve, the reason is the contract. Caller-less by
+/// construction (once per lane).
+fn count_joint_journal_unavailable(coordinator: &InventoryCoordinator<OsProcessSource>) -> u64 {
+    let registry = coordinator.registry();
+    registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .filter(|(gap, _)| gap.caller.is_none() && gap.reason == "joint_journal_unavailable")
+        .map(|(_, repeats)| *repeats)
+        .fold(0u64, |total, repeats| total.saturating_add(repeats))
+}
+
+/// Named route-loss gaps covering `caller`: its non-conversion gaps
+/// plus every caller-less semantic/Joint/instance gap. Conversion
+/// refusals ("semantic input refused") cover count-only calls only and
+/// never explain a missing semantic edge, so they do not count; the
+/// `joint_journal_unavailable` lane disclosure is caller-less but
+/// carries a `key operations ...` subject outside this set, so it never
+/// masks a silent drop either.
+fn count_named_route_gaps(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    caller: crate::discovery::caller_registry::CallerId,
+) -> u64 {
+    let registry = coordinator.registry();
+    registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .filter(|(gap, _)| {
+            (gap.caller == Some(caller) && gap.subject != "semantic input refused")
+                || (gap.caller.is_none()
+                    && (gap.subject.starts_with("semantic")
+                        || gap.subject.starts_with("Joint")
+                        || gap.subject.starts_with("instance")))
+        })
+        .map(|(_, repeats)| *repeats)
+        .fold(0u64, |total, repeats| total.saturating_add(repeats))
+}
+
+/// The v0.5.0 S1 pins shared by the three converted cells (R-51): no
+/// Joint feed anywhere, exactly one `joint_journal_unavailable` lane
+/// disclosure, and `object_observations` unavailable with the frozen
+/// `journal_unavailable` reason.
+fn assert_s1_joint_absence(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Result<()> {
+    ensure!(
+        coordinator.registry().joint_feeds() == 0,
+        "{tag}: no Joint feed without a journal producer: {}",
+        coordinator.registry().joint_feeds()
+    );
+    ensure!(
+        count_joint_journal_unavailable(coordinator) == 1,
+        "{tag}: exactly one joint_journal_unavailable disclosure: {}",
+        count_joint_journal_unavailable(coordinator)
+    );
+    ensure!(
+        observations.status == crate::key_operation_projection::ObsStatus::Unavailable
+            && observations.reason == "journal_unavailable",
+        "{tag}: object observations are unavailable without a journal producer: {:?} ({})",
+        observations.status,
+        observations.reason
+    );
+    eprintln!(
+        "JOINT_R16 {tag}-s1 feeds=0 disclosure=1 status={:?} reason={}",
+        observations.status, observations.reason
+    );
+    Ok(())
+}
+
+/// Per-owner S1 feed state after a publish, plus the silent-drop rule.
+/// For each owner: its caller id and binding; each of its semantic
+/// edges (module, API returns, feed mode, receipt selection, staged and
+/// reduced counts); its non-path gaps; then the caller-less semantic,
+/// Joint and instance gaps. Ids, counts and reason codes only, no paths.
+///
+/// `completed` marks owners whose ledger is DONE: a completed owner that
+/// is bound but shows no semantic edge and no named route-loss gap fails
+/// loudly (silent drop = release blocker). A named route-loss gap passes
+/// and is printed above. Held owners (`completed == false`) print only:
+/// their returns may legitimately route in a later quantum.
+fn s1_feed_check(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    owners: &[(&str, u32, bool)],
+) -> Result<()> {
+    let registry = coordinator.registry();
+    for (name, pid, _) in owners {
+        let caller = coordinator.adapter().live_id(*pid);
+        let bound = caller.is_some_and(|id| coordinator.semantic_bindings().get(id).is_some());
+        eprintln!("JOINT_R16 {tag}-feed {name} caller={caller:?} bound={bound}");
+        let Some(id) = caller else {
+            continue;
+        };
+        for record in registry
+            .instance_semantic_edges()
+            .filter(|record| record.caller == id)
+        {
+            eprintln!(
+                "JOINT_R16 {tag}-feed {name} edge module={:?} api={:?} mode={:?} selected={} staged={} reduced={}",
+                record.module,
+                record.api_returns,
+                record.feed.mode(),
+                record.feed.selected_receipt().is_some(),
+                record.feed.staged_len(),
+                record.feed.reduced(),
+            );
+        }
+        for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
+            if gap.caller == Some(id) && !gap.subject.contains('/') {
+                eprintln!(
+                    "JOINT_R16 {tag}-feed {name} gap subject={:?} reason={:?} repeats={repeats}",
+                    gap.subject, gap.reason
+                );
+            }
+        }
+    }
+    for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
+        if gap.caller.is_none()
+            && (gap.subject.starts_with("semantic")
+                || gap.subject.starts_with("Joint")
+                || gap.subject.starts_with("instance"))
+        {
+            eprintln!(
+                "JOINT_R16 {tag}-feed gap subject={:?} reason={:?} repeats={repeats}",
+                gap.subject, gap.reason
+            );
+        }
+    }
+    eprintln!(
+        "JOINT_R16 {tag}-feed suppressed={}",
+        registry.gaps_suppressed()
+    );
+    for (name, pid, completed) in owners {
+        if !completed {
+            continue;
+        }
+        let caller = coordinator.adapter().live_id(*pid);
+        let bound = caller.is_some_and(|id| coordinator.semantic_bindings().get(id).is_some());
+        let Some(id) = caller else {
+            continue;
+        };
+        if !bound {
+            continue;
+        }
+        let edges = registry
+            .instance_semantic_edges()
+            .filter(|record| record.caller == id)
+            .count();
+        if edges == 0 && count_named_route_gaps(coordinator, id) == 0 {
+            anyhow::bail!(
+                "{tag}: SILENT ROUTE LOSS for {name} (pid {pid} caller {id:?}): bound with \
+                 completed calls but no semantic edge and no named gap (release blocker)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Per-owner mapping state after a native drive: process liveness, the
+/// live caller id, every adapter record for the pid (id, incarnation,
+/// lifecycle, retired), and every registry edge of those callers
+/// (module, mapping state). Ids, counts and states only, no paths.
+fn mapping_diagnosis(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    owners: &[(&str, u32)],
+) {
+    for (name, pid) in owners {
+        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let live = coordinator.adapter().live_id(*pid);
+        eprintln!(
+            "JOINT_R16 {tag}-map {name} pid={pid} alive={} live={live:?}",
+            u8::from(alive)
+        );
+        for record in coordinator
+            .adapter()
+            .records()
+            .filter(|record| record.pid == *pid)
+        {
+            eprintln!(
+                "JOINT_R16 {tag}-map {name} record id={:?} incarnation={} lifecycle={:?} retired={}",
+                record.id, record.incarnation, record.lifecycle, record.retired,
+            );
+            for edge in coordinator.registry().edges_of(record.id) {
+                eprintln!(
+                    "JOINT_R16 {tag}-map {name} edge module={:?} mapping={:?}",
+                    edge.module, edge.mapping,
+                );
+            }
+        }
+    }
+}
+
 /// R1.6 cell 1: the first birth through a held q1 to q2 and stop. Process
 /// A runs C_SignInit (returns at once) and enters a held C_Sign (its
 /// return is genuinely absent until the harness releases the FIFO); the
@@ -4842,6 +5059,9 @@ fn finish_stop_take_mint(
 /// everything semantic exactly once (B's two count-only calls are
 /// counted but refused from conversion by design, each refusal
 /// disclosed); the lane stops finite with joined same-owner cleanup.
+/// v0.5.0 runs the S1 branch below (`journal_linked() == false`, pinned
+/// by `production_seal_is_not_journal_linked`); the Joint asserts stay
+/// behind the flag for 0.5.1.
 #[test]
 #[ignore = "privileged: live Joint first birth through a held q1 to q2 and stop"]
 fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
@@ -4920,6 +5140,11 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // q1: B completed, A's return genuinely absent. The publication keeps
     // A retained without replaying anything through the missing END.
     let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16-q1")?;
+    s1_feed_check(
+        &coordinator,
+        "r16-q1",
+        &[("A", process_a.pid(), false), ("B", process_b.pid(), true)],
+    )?;
     let q1_end_ns = monotonic_ns();
     let edge_a_q1 = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so");
     let edge_b_q1 = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so");
@@ -5071,6 +5296,11 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // refusal disclosed; `api_returns`/`reduced` cover the semantic
     // side only, never the raw entered total.
     let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+    s1_feed_check(
+        &coordinator,
+        "r16-q2",
+        &[("A", process_a.pid(), true), ("B", process_b.pid(), true)],
+    )?;
     let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
     let (b_semantic, b_count_only) = ledger_semantic_split(&b_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")?;
@@ -5126,29 +5356,6 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         ) == b_count_only,
         "B's count-only calls are disclosed as slot refusals: {b_count_only}"
     );
-    diagnose(
-        edge_a.reduced == a_semantic,
-        process_a.pid(),
-        "live-joint-held.so",
-        &a_by_fn,
-    );
-    ensure!(
-        edge_a.reduced == a_semantic,
-        "A reduces exactly once: {} vs {a_semantic}",
-        edge_a.reduced
-    );
-    diagnose(
-        edge_b.reduced == b_semantic,
-        process_b.pid(),
-        "soft-copy.so",
-        &b_by_fn,
-    );
-    ensure!(
-        edge_b.reduced == b_semantic,
-        "B reduces exactly once: {} vs {b_semantic}",
-        edge_b.reduced
-    );
-    ensure!(edge_a.joint && edge_b.joint, "both feeds are Joint");
     // B's script starts 2 digests + 1 sign + 1 direct keygen (unit-pinned
     // 1/1 each); session/query calls start nothing.
     ensure!(
@@ -5164,33 +5371,73 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         edge_a.completed
     );
     let receipts = coordinator.registry().pending_joint_receipts_for_test();
-    ensure!(
-        receipts.len() >= 2,
-        "nonzero observed Joint receipts: {}",
-        receipts.len()
-    );
-    ensure!(
-        coordinator.registry().joint_feeds() >= 2,
-        "both owners hold Joint feeds"
-    );
     let aggregates = coordinator.registry().keyuse_for_test().aggregates();
-    ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
     let revision = coordinator.registry().published_revision();
     let observations = coordinator.registry().joint_observations(revision);
-    ensure!(
-        observations.status == crate::key_operation_projection::ObsStatus::Populated,
-        "the guarded H9 section populates: {:?} ({})",
-        observations.status,
-        observations.reason
-    );
-    ensure!(
-        !observations.key_operations.is_empty(),
-        "the populated section carries key-operation rows"
-    );
-    ensure!(
-        observations.revision == revision,
-        "the section tags the published revision"
-    );
+    // v0.5.0 seals every production attachment without a journal
+    // producer (OD33/R-50): the S1 branch below runs, and the Joint
+    // asserts stay for the 0.5.1 linked world.
+    let linked = coordinator.registry().journal_linked();
+    if linked {
+        diagnose(
+            edge_a.reduced == a_semantic,
+            process_a.pid(),
+            "live-joint-held.so",
+            &a_by_fn,
+        );
+        ensure!(
+            edge_a.reduced == a_semantic,
+            "A reduces exactly once: {} vs {a_semantic}",
+            edge_a.reduced
+        );
+        diagnose(
+            edge_b.reduced == b_semantic,
+            process_b.pid(),
+            "soft-copy.so",
+            &b_by_fn,
+        );
+        ensure!(
+            edge_b.reduced == b_semantic,
+            "B reduces exactly once: {} vs {b_semantic}",
+            edge_b.reduced
+        );
+        ensure!(edge_a.joint && edge_b.joint, "both feeds are Joint");
+        ensure!(
+            receipts.len() >= 2,
+            "nonzero observed Joint receipts: {}",
+            receipts.len()
+        );
+        ensure!(
+            coordinator.registry().joint_feeds() >= 2,
+            "both owners hold Joint feeds"
+        );
+        ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
+        ensure!(
+            observations.status == crate::key_operation_projection::ObsStatus::Populated,
+            "the guarded H9 section populates: {:?} ({})",
+            observations.status,
+            observations.reason
+        );
+        ensure!(
+            !observations.key_operations.is_empty(),
+            "the populated section carries key-operation rows"
+        );
+        ensure!(
+            observations.revision == revision,
+            "the section tags the published revision"
+        );
+    } else {
+        ensure!(
+            !edge_a.joint && !edge_b.joint,
+            "both feeds stay S1-only without a journal producer"
+        );
+        ensure!(
+            edge_a.mechanisms == vec![(A_SIGN_MECHANISM, a_semantic, 0)],
+            "A's S1 edge carries its mechanism: {:?} vs [(0x251, {a_semantic}, 0)]",
+            edge_a.mechanisms
+        );
+        assert_s1_joint_absence(&coordinator, "r16-q2", &observations)?;
+    }
     assert_quiet_twins_except(
         &coordinator,
         "r16-q2",
@@ -5238,6 +5485,9 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
 /// minter mints, and the seal-drained gate retires A's namespace; only
 /// then is B's request taken, B seated on the same coordinator, and B's
 /// useful calls published. A retires before B is admitted.
+/// v0.5.0 runs the S1 branches below (`journal_linked() == false`,
+/// pinned by `production_seal_is_not_journal_linked`); the Joint asserts
+/// stay behind the flag for 0.5.1.
 #[test]
 #[ignore = "privileged: live Joint promotion retires A before B is admitted"]
 fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
@@ -5289,6 +5539,11 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     // `api_returns`/`reduced` cover the semantic side only, never the
     // raw entered total.
     let qa_polls = service_to_published(&mut lane_a, &mut coordinator, true, "r16c-qa")?;
+    s1_feed_check(
+        &coordinator,
+        "r16c-qa",
+        &[("A", process_a.pid(), true), ("B", process_b.pid(), false)],
+    )?;
     ensure_joint_birth_marker_wired(&coordinator, "r16c-qa")?;
     let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "soft-copy.so")?;
@@ -5320,24 +5575,42 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         ) == a_count_only,
         "A's count-only calls are disclosed as slot refusals: {a_count_only}"
     );
-    diagnose(
-        edge_a.reduced == a_semantic,
-        process_a.pid(),
-        "soft-copy.so",
-        &a_by_fn,
-    );
-    ensure!(
-        edge_a.reduced == a_semantic,
-        "A reduces exactly: {} vs {a_semantic}",
-        edge_a.reduced
-    );
     ensure!(
         edge_a.started == Some(3) && edge_a.completed == Some(3),
         "A completions are exact: {:?}/{:?}",
         edge_a.started,
         edge_a.completed
     );
-    ensure!(edge_a.joint, "A is Joint");
+    // v0.5.0 seals every production attachment without a journal
+    // producer (OD33/R-50): the S1 branch below runs, and the Joint
+    // asserts stay for the 0.5.1 linked world.
+    let linked = coordinator.registry().journal_linked();
+    if linked {
+        diagnose(
+            edge_a.reduced == a_semantic,
+            process_a.pid(),
+            "soft-copy.so",
+            &a_by_fn,
+        );
+        ensure!(
+            edge_a.reduced == a_semantic,
+            "A reduces exactly: {} vs {a_semantic}",
+            edge_a.reduced
+        );
+        ensure!(edge_a.joint, "A is Joint");
+    } else {
+        ensure!(!edge_a.joint, "A stays S1-only without a journal producer");
+        ensure!(
+            coordinator.registry().joint_feeds() == 0,
+            "r16c-qa: no Joint feed without a journal producer: {}",
+            coordinator.registry().joint_feeds()
+        );
+        ensure!(
+            count_joint_journal_unavailable(&coordinator) == 1,
+            "r16c-qa: exactly one joint_journal_unavailable disclosure: {}",
+            count_joint_journal_unavailable(&coordinator)
+        );
+    }
     eprintln!(
         "JOINT_R16 r16c-qa polls={qa_polls} a_api={:?}",
         edge_a.api_returns
@@ -5527,6 +5800,11 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     let (b_by_fn, b_total, b_bad) = ledger_calls(&process_b.out)?;
     ensure!(b_bad == 0 && b_total > 0, "B ran its script");
     let qb_polls = service_to_published(&mut lane_b, &mut *coordinator, false, "r16c-qb")?;
+    s1_feed_check(
+        coordinator,
+        "r16c-qb",
+        &[("A", process_a.pid(), false), ("B", process_b.pid(), true)],
+    )?;
     let (b_semantic, b_count_only) = ledger_semantic_split(&b_by_fn);
     let edge_b = joint_edge_snapshot(coordinator, process_b.pid(), "soft-copy.so")?;
     let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
@@ -5556,47 +5834,56 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         ) == b_count_only,
         "B's count-only calls are disclosed as slot refusals: {b_count_only}"
     );
-    diagnose(
-        edge_b.reduced == b_semantic,
-        process_b.pid(),
-        "soft-copy.so",
-        &b_by_fn,
-    );
-    ensure!(
-        edge_b.reduced == b_semantic,
-        "B reduces exactly: {} vs {b_semantic}",
-        edge_b.reduced
-    );
     ensure!(
         edge_b.started == Some(3) && edge_b.completed == Some(3),
         "B completions are exact: {:?}/{:?}",
         edge_b.started,
         edge_b.completed
     );
-    ensure!(edge_b.joint, "B is Joint");
-    ensure!(
-        !coordinator
-            .registry()
-            .pending_joint_receipts_for_test()
-            .is_empty(),
-        "nonzero observed Joint receipts"
-    );
-    ensure!(
-        !coordinator
-            .registry()
-            .keyuse_for_test()
-            .aggregates()
-            .is_empty(),
-        "nonzero observed key receipts"
-    );
     let revision = coordinator.registry().published_revision();
     let observations = coordinator.registry().joint_observations(revision);
-    ensure!(
-        observations.status == crate::key_operation_projection::ObsStatus::Populated,
-        "the guarded H9 section populates after promotion: {:?} ({})",
-        observations.status,
-        observations.reason
-    );
+    // v0.5.0 seals every production attachment without a journal
+    // producer (OD33/R-50): the S1 branch below runs, and the Joint
+    // asserts stay for the 0.5.1 linked world.
+    let linked = coordinator.registry().journal_linked();
+    if linked {
+        diagnose(
+            edge_b.reduced == b_semantic,
+            process_b.pid(),
+            "soft-copy.so",
+            &b_by_fn,
+        );
+        ensure!(
+            edge_b.reduced == b_semantic,
+            "B reduces exactly: {} vs {b_semantic}",
+            edge_b.reduced
+        );
+        ensure!(edge_b.joint, "B is Joint");
+        ensure!(
+            !coordinator
+                .registry()
+                .pending_joint_receipts_for_test()
+                .is_empty(),
+            "nonzero observed Joint receipts"
+        );
+        ensure!(
+            !coordinator
+                .registry()
+                .keyuse_for_test()
+                .aggregates()
+                .is_empty(),
+            "nonzero observed key receipts"
+        );
+        ensure!(
+            observations.status == crate::key_operation_projection::ObsStatus::Populated,
+            "the guarded H9 section populates after promotion: {:?} ({})",
+            observations.status,
+            observations.reason
+        );
+    } else {
+        ensure!(!edge_b.joint, "B stays S1-only without a journal producer");
+        assert_s1_joint_absence(coordinator, "r16c-qb", &observations)?;
+    }
     // The quiet twins excuse exactly the disclosed populations: both
     // callers' count-only slot refusals (A's rows survive its retire;
     // gaps are audit rows, not domain state) and the single expected
@@ -6140,6 +6427,9 @@ fn joint_edge_census(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec
 /// so S stays mapped-but-silent with its admission refusal disclosed:
 /// never bound, never an edge, never Joint. Three transactions, one
 /// revision each, then a finite stop with joined same-owner cleanup.
+/// v0.5.0 runs the S1 branches below (`journal_linked() == false`,
+/// pinned by `production_seal_is_not_journal_linked`); the Joint asserts
+/// stay behind the flag for 0.5.1.
 #[test]
 #[ignore = "privileged: live Joint absence and S1Only siblings beside an exec"]
 fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
@@ -6260,6 +6550,18 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         ],
         &[],
     )?;
+    // Release C/H (`go`) and E-post's late gate (`late_e`) before the
+    // spanning drive: the fixture's gate wait times out after 30 s
+    // (live-joint.c `wait_for_file`: 3000 x 10 ms, then it exits), and
+    // the 16-pass drive runs past that on a loaded host (47 s with 459
+    // processes on the dev host, where C/H died waiting and C was
+    // unmapped at the check). Neither gate depends on the drive's
+    // phase: the lane is already attached, so C/H/E-post still run
+    // under it, and q1 is the first semantic service either way. E's
+    // exec gates (go_e/exec/trig) stay pass-gated: the mint needs gen
+    // 0's bound image, the EXEC record and gen 1's row in that order.
+    std::fs::write(&go, b"")?;
+    std::fs::write(&late_e, b"")?;
     // One native drive spans mapping and the exec: run_classic gates the
     // coordinator when the drive ends, so a second drive's passes would
     // refuse while its counter never advances. The binder mints the
@@ -6308,6 +6610,16 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         );
         Ok(passes >= 16)
     })?;
+    mapping_diagnosis(
+        &coordinator,
+        "r16b-drive",
+        &[
+            ("E", process_e.pid()),
+            ("C", process_c.pid()),
+            ("S", process_s.pid()),
+            ("H", process_h.pid()),
+        ],
+    );
     for (name, pid) in [
         ("E", process_e.pid()),
         ("C", process_c.pid()),
@@ -6334,6 +6646,12 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             .map(|id| id.0),
         u8::from(has_mapped_edge(&coordinator, process_e.pid())),
     );
+    for record in &exec_records {
+        eprintln!(
+            "JOINT_R16 r16b-exec record id={:?} incarnation={} lifecycle={:?} retired={}",
+            record.id, record.incarnation, record.lifecycle, record.retired
+        );
+    }
     ensure!(
         exec_records.len() >= 2,
         "the exec minted a new incarnation: {} records",
@@ -6344,12 +6662,11 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         "the exec successor maps in the spanning drive"
     );
 
-    // E-post, C and H run under the attached lane. Both probes ran after
-    // attach too: gen 0's sheds (its image is retired at conversion)
-    // while gen 1's stages, so the ledger counts the b script plus the
-    // gen 1 probe.
-    std::fs::write(&go, b"")?;
-    std::fs::write(&late_e, b"")?;
+    // E-post, C and H run under the attached lane (`go` and `late_e`
+    // opened before the drive, so the fixture's 30 s gate wait cannot
+    // expire mid-drive). Both probes ran after attach too: gen 0's
+    // sheds (its image is retired at conversion) while gen 1's stages,
+    // so the ledger counts the b script plus the gen 1 probe.
     process_e.wait_for("DONE ", Duration::from_secs(60))?;
     process_c.wait_for("DONE ", Duration::from_secs(60))?;
     process_h.wait_for("HELD ", Duration::from_secs(30))?;
@@ -6371,6 +6688,18 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // and the refresh mints no receipt. Fail-closed absence, disclosed
     // below — not an upgrade to come.
     let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16b-q1")?;
+    // Print-only at q1: the frame gates replay as a whole while H is
+    // held, so edge presence for E/C at q1 is unpinned.
+    s1_feed_check(
+        &coordinator,
+        "r16b-q1",
+        &[
+            ("E", process_e.pid(), false),
+            ("C", process_c.pid(), false),
+            ("H", process_h.pid(), false),
+            ("S", process_s.pid(), false),
+        ],
+    )?;
     let q1_end_ns = monotonic_ns();
     let reduced_q1: u64 = coordinator
         .registry()
@@ -6435,16 +6764,39 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         "H made exactly SignInit plus its held Sign"
     );
     let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q2")?;
+    s1_feed_check(
+        &coordinator,
+        "r16b-q2",
+        &[
+            ("E", process_e.pid(), true),
+            ("C", process_c.pid(), true),
+            ("H", process_h.pid(), true),
+            ("S", process_s.pid(), false),
+        ],
+    )?;
     let (e_semantic, e_count_only) = ledger_semantic_split(&e_by_fn);
     let (c_semantic, c_count_only) = ledger_semantic_split(&c_by_fn);
     let (h_semantic, h_count_only) = ledger_semantic_split(&h_by_fn);
     let edge_e = joint_edge_snapshot(&coordinator, process_e.pid(), "soft-copy.so")?;
     let edge_c = joint_edge_snapshot(&coordinator, process_c.pid(), "soft-copy.so")?;
     let edge_h = joint_edge_snapshot(&coordinator, process_h.pid(), "live-joint-held.so")?;
-    ensure!(
-        edge_e.joint && edge_c.joint && edge_h.joint,
-        "E, C and H are Joint"
-    );
+    let caller_e = caller_of(&coordinator, process_e.pid())?;
+    let caller_c = caller_of(&coordinator, process_c.pid())?;
+    // v0.5.0 seals every production attachment without a journal
+    // producer (OD33/R-50): the S1 branches below run, and the Joint
+    // asserts stay for the 0.5.1 linked world.
+    let linked = coordinator.registry().journal_linked();
+    if linked {
+        ensure!(
+            edge_e.joint && edge_c.joint && edge_h.joint,
+            "E, C and H are Joint"
+        );
+    } else {
+        ensure!(
+            !edge_e.joint && !edge_c.joint && !edge_h.joint,
+            "E, C and H stay S1-only without a journal producer"
+        );
+    }
     let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
         if !ok {
             for line in exactness_diagnosis(&coordinator, pid, module, by_fn) {
@@ -6453,44 +6805,89 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         }
     };
     diagnose(
-        edge_e.api_returns == Some(e_semantic) && edge_e.reduced == e_semantic,
+        edge_e.api_returns == Some(e_semantic),
         process_e.pid(),
         "soft-copy.so",
         &e_by_fn,
     );
-    ensure!(
-        edge_e.api_returns == Some(e_semantic) && edge_e.reduced == e_semantic,
-        "E-post is exact: {:?}/{} vs semantic {e_semantic} \
-         (entered {e_total}, count-only {e_count_only})",
-        edge_e.api_returns,
-        edge_e.reduced
-    );
+    // E-post (exec-ordering race): attributed, or its miss is disclosed
+    // as a named gap — never dropped silently. The strict Joint shape
+    // stays for the 0.5.1 linked world.
+    let e_attributed = edge_e.api_returns == Some(e_semantic);
+    if linked {
+        diagnose(
+            edge_e.reduced == e_semantic,
+            process_e.pid(),
+            "soft-copy.so",
+            &e_by_fn,
+        );
+        ensure!(
+            e_attributed && edge_e.reduced == e_semantic,
+            "E-post is exact: {:?}/{} vs semantic {e_semantic} \
+             (entered {e_total}, count-only {e_count_only})",
+            edge_e.api_returns,
+            edge_e.reduced
+        );
+    } else if !e_attributed {
+        let named = count_named_route_gaps(&coordinator, caller_e);
+        eprintln!(
+            "JOINT_R16 r16b-q2 e_miss api={:?} expected={e_semantic} named_gaps={named}",
+            edge_e.api_returns
+        );
+        ensure!(
+            named > 0,
+            "E-post calls missed with no named gap (silent drop): {:?} vs semantic {e_semantic}",
+            edge_e.api_returns
+        );
+    }
     diagnose(
-        edge_c.api_returns == Some(c_semantic) && edge_c.reduced == c_semantic,
+        edge_c.api_returns == Some(c_semantic),
         process_c.pid(),
         "soft-copy.so",
         &c_by_fn,
     );
     ensure!(
-        edge_c.api_returns == Some(c_semantic) && edge_c.reduced == c_semantic,
-        "C is exact: {:?}/{} vs semantic {c_semantic} \
+        edge_c.api_returns == Some(c_semantic),
+        "C is exact: {:?} vs semantic {c_semantic} \
          (entered {c_total}, count-only {c_count_only})",
         edge_c.api_returns,
-        edge_c.reduced
     );
     diagnose(
-        edge_h.api_returns == Some(h_semantic) && edge_h.reduced == h_semantic,
+        edge_h.api_returns == Some(h_semantic),
         process_h.pid(),
         "live-joint-held.so",
         &h_by_fn,
     );
     ensure!(
-        edge_h.api_returns == Some(h_semantic) && edge_h.reduced == h_semantic,
-        "H is exact: {:?}/{} vs semantic {h_semantic} \
+        edge_h.api_returns == Some(h_semantic),
+        "H is exact: {:?} vs semantic {h_semantic} \
          (entered {h_total}, count-only {h_count_only})",
         edge_h.api_returns,
-        edge_h.reduced
     );
+    if linked {
+        diagnose(
+            edge_c.reduced == c_semantic,
+            process_c.pid(),
+            "soft-copy.so",
+            &c_by_fn,
+        );
+        ensure!(
+            edge_c.reduced == c_semantic,
+            "C reduces exactly: {} vs {c_semantic}",
+            edge_c.reduced
+        );
+        diagnose(
+            edge_h.reduced == h_semantic,
+            process_h.pid(),
+            "live-joint-held.so",
+            &h_by_fn,
+        );
+        ensure!(
+            edge_h.reduced == h_semantic,
+            "H reduces exactly: {} vs {h_semantic}",
+            edge_h.reduced
+        );
+    }
     // The count-only calls never admit: each refusal is disclosed.
     for (pid, count_only, who) in [
         (process_e.pid(), e_count_only, "E-post"),
@@ -6504,12 +6901,16 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             "{who}'s count-only calls are disclosed as slot refusals: {count_only}"
         );
     }
-    ensure!(
-        edge_e.started == Some(3) && edge_e.completed == Some(3),
-        "E-post completions are exact: {:?}/{:?}",
-        edge_e.started,
-        edge_e.completed
-    );
+    // E-post completions are exact when its calls attributed (or on the
+    // strict linked branch); a disclosed S1 miss skips them.
+    if linked || e_attributed {
+        ensure!(
+            edge_e.started == Some(3) && edge_e.completed == Some(3),
+            "E-post completions are exact: {:?}/{:?}",
+            edge_e.started,
+            edge_e.completed
+        );
+    }
     ensure!(
         edge_c.started == Some(0) && edge_c.completed == Some(0),
         "C starts no operation: {:?}/{:?}",
@@ -6705,50 +7106,77 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         "S contributes no key facts while kernel-silent: {unknown_before} -> {unknown_after}"
     );
     let receipts = coordinator.registry().pending_joint_receipts_for_test();
-    ensure!(!receipts.is_empty(), "nonzero observed Joint receipts");
-    let aggregates = coordinator.registry().keyuse_for_test().aggregates();
-    ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
     let revision = coordinator.registry().published_revision();
     let observations = coordinator.registry().joint_observations(revision);
-    ensure!(
-        observations.status == crate::key_operation_projection::ObsStatus::Populated,
-        "the guarded H9 section populates: {:?} ({})",
-        observations.status,
-        observations.reason
-    );
-    ensure!(
-        !observations.key_operations.is_empty(),
-        "the populated section carries key-operation rows"
-    );
-    let caller_e = caller_of(&coordinator, process_e.pid())?;
-    let caller_c = caller_of(&coordinator, process_c.pid())?;
-    assert_quiet_twins_except(
-        &coordinator,
-        "r16b-q3",
-        &[
-            QuietExemption {
-                subject: "semantic input refused",
-                reason: "slot",
-                caller: Some(caller_e),
-                min: e_count_only,
-                max: Some(e_count_only),
-            },
-            QuietExemption {
-                subject: "semantic input refused",
-                reason: "slot",
-                caller: Some(caller_c),
-                min: c_count_only,
-                max: Some(c_count_only),
-            },
-            QuietExemption {
-                subject: "semantic admission refused",
-                reason: "semantic_unavailable:no_receipt",
-                caller: Some(caller_s),
-                min: s_floor,
-                max: None,
-            },
-        ],
-    )?;
+    let linked = coordinator.registry().journal_linked();
+    if linked {
+        ensure!(!receipts.is_empty(), "nonzero observed Joint receipts");
+        let aggregates = coordinator.registry().keyuse_for_test().aggregates();
+        ensure!(!aggregates.is_empty(), "nonzero observed key receipts");
+        ensure!(
+            observations.status == crate::key_operation_projection::ObsStatus::Populated,
+            "the guarded H9 section populates: {:?} ({})",
+            observations.status,
+            observations.reason
+        );
+        ensure!(
+            !observations.key_operations.is_empty(),
+            "the populated section carries key-operation rows"
+        );
+    } else {
+        assert_s1_joint_absence(&coordinator, "r16b-q3", &observations)?;
+    }
+    // E-post missed its calls (exec-ordering race): its slot floor drops
+    // to zero (unobserved calls convert nothing) while the ledger max
+    // still holds, and its named miss gaps, printed at q2, are exempt
+    // here so the miss path passes disclosed. Attributed E-post keeps
+    // the exact floor and gains no dynamic exemption.
+    let e_slot_min = if e_attributed { e_count_only } else { 0 };
+    let mut exemptions = vec![
+        QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller_e),
+            min: e_slot_min,
+            max: Some(e_count_only),
+        },
+        QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller_c),
+            min: c_count_only,
+            max: Some(c_count_only),
+        },
+        QuietExemption {
+            subject: "semantic admission refused",
+            reason: "semantic_unavailable:no_receipt",
+            caller: Some(caller_s),
+            min: s_floor,
+            max: None,
+        },
+    ];
+    let mut e_miss_gaps: Vec<(String, String)> = Vec::new();
+    if !e_attributed {
+        for gap in coordinator.registry().gaps() {
+            if gap.caller != Some(caller_e) || gap.subject == "semantic input refused" {
+                continue;
+            }
+            let key = (gap.subject.clone(), gap.reason.clone());
+            if !e_miss_gaps.contains(&key) {
+                e_miss_gaps.push(key);
+            }
+        }
+    }
+    for (subject, reason) in &e_miss_gaps {
+        exemptions.push(QuietExemption {
+            subject: subject.as_str(),
+            reason: reason.as_str(),
+            caller: Some(caller_e),
+            min: 1,
+            max: None,
+        });
+    }
+    assert_quiet_twins_except(&coordinator, "r16b-q3", &exemptions)?;
     eprintln!(
         "JOINT_R16 r16b-q3 polls={q3_polls} revision={revision} feeds={} receipts={} \
          unknown_key={unknown_before}->{unknown_after} s_refusals={s_refusals} \

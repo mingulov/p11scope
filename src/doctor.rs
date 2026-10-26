@@ -3343,8 +3343,15 @@ mod tests {
     #[test]
     fn counter_modes_footer_names_availability_per_verdict() {
         use crate::attach::BpfLoopVerdict;
+        // Builds without embedded counter objects (WIDE, SMALL) keep the
+        // not-enabled line; the ordinary build names the modes available.
+        let available_marker = if cfg!(p11scope_counter_objects) {
+            "counter modes: available"
+        } else {
+            "not enabled in this build"
+        };
         for (verdict, marker) in [
-            (BpfLoopVerdict::Available, "not enabled in this build"),
+            (BpfLoopVerdict::Available, available_marker),
             (
                 BpfLoopVerdict::Unavailable("test old kernel".into()),
                 "counter-mode-unavailable-on-kernel",
@@ -3374,5 +3381,12 @@ mod tests {
             !counter_modes_footer(&BpfLoopVerdict::Unknown("x".into()))
                 .contains("counter-mode-unavailable-on-kernel")
         );
+        // The ordinary build names every available mode.
+        if cfg!(p11scope_counter_objects) {
+            let line = counter_modes_footer(&BpfLoopVerdict::Available);
+            for mode in ["counts", "timestamps", "latency"] {
+                assert!(line.contains(mode), "{line:?}");
+            }
+        }
     }
 }

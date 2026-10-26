@@ -12055,41 +12055,52 @@ mod tests {
     }
 
     #[test]
-    fn staged_counter_modes_refuse_before_capture_setup() {
-        for (mode, name) in [
-            (p11scope_ebpf_common::CounterMode::Counts, "counts"),
-            (p11scope_ebpf_common::CounterMode::Timestamps, "timestamps"),
-            (p11scope_ebpf_common::CounterMode::Latency, "latency"),
+    fn counter_modes_pass_the_cli_gate_into_capture_setup() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
         ] {
             let mut args = capture_args(ScopeArg::Pid(i32::MAX as u32));
             args.metrics = true;
             args.counter_mode = Some(mode);
-            // The existing namespace poison prevents target or BPF work even
-            // while the staged counter refusal is still missing.
-            let error = nested(|| capture(&args)).expect_err("unwired counters must refuse");
+            // The blanket counter refusal is gone: the next refusal is the
+            // nested-namespace poison inside real capture setup (still no
+            // target or BPF work). Reaching it proves the mode passed CLI
+            // selection.
+            let error = nested(|| capture(&args)).expect_err("counter mode must reach real setup");
             let text = format!("{error:#}");
-            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
-            assert!(text.contains(&format!("--counter-mode {name}")), "{text}");
+            assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
+            assert!(
+                text.starts_with("pid-namespace-mismatch:"),
+                "{mode:?}: {text}"
+            );
         }
     }
 
     #[test]
-    fn staged_counter_modes_refuse_before_owned_run_setup() {
-        for (mode, name) in [
-            (p11scope_ebpf_common::CounterMode::Counts, "counts"),
-            (p11scope_ebpf_common::CounterMode::Timestamps, "timestamps"),
-            (p11scope_ebpf_common::CounterMode::Latency, "latency"),
+    fn counter_modes_pass_the_cli_gate_into_owned_run_setup() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
         ] {
             let mut args = run_args(
                 cli::PausePolicy::Never,
-                &["/definitely/missing/p11scope-unwired-counter"],
+                &["/definitely/missing/p11scope-counter-cli-gate"],
             );
             args.metrics = true;
             args.counter_mode = Some(mode);
-            let error = nested(|| run_owned(&args)).expect_err("unwired counters must refuse");
+            // Same gate proof on the run path: the poison fires before
+            // anything is resolved or forked.
+            let error =
+                nested(|| run_owned(&args)).expect_err("counter mode must reach real setup");
             let text = format!("{error:#}");
-            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
-            assert!(text.contains(&format!("--counter-mode {name}")), "{text}");
+            assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
+            assert!(
+                text.starts_with("pid-namespace-mismatch:"),
+                "{mode:?}: {text}"
+            );
         }
     }
 

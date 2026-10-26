@@ -3763,6 +3763,37 @@ mod tests {
     }
 
     #[test]
+    fn help_names_counter_mode_availability() {
+        for statement in [
+            "--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.",
+            "counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.",
+            "Omit --counter-mode to keep existing metrics behavior.",
+            "refuse with a named reason on kernels without bpf_loop (helper 181)",
+        ] {
+            assert!(
+                USAGE.contains(statement),
+                "missing help statement: {statement}"
+            );
+        }
+        assert!(
+            !USAGE.contains("counter-mode-unwired"),
+            "help still states the removed refusal"
+        );
+        assert!(
+            USAGE.contains("[--counter-mode counts|timestamps|latency]"),
+            "profile/run synopsis never names --counter-mode"
+        );
+        assert!(
+            PROFILE_HELP.contains("[--counter-mode counts|timestamps|latency]"),
+            "profile --help never names --counter-mode"
+        );
+        assert!(
+            RUN_HELP.contains("[--counter-mode counts|timestamps|latency]"),
+            "run --help never names --counter-mode"
+        );
+    }
+
+    #[test]
     fn ring_bytes_accepts_plain_and_suffixed_powers_of_two() {
         for (input, want) in [
             ("4096", 4096u32),

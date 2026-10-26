@@ -16518,6 +16518,40 @@ mod tests {
         assert_eq!(super::check_flavor_against_build(probed).unwrap(), probed);
     }
 
+    /// The Detailed-shaped byte probe does NOT apply to counter bank
+    /// objects (they carry no return adapter): this pins why counter
+    /// sessions need their own flavor check. What that check consumes —
+    /// unsafe-decoder absence from the parsed object — holds on every
+    /// embedded bank object. Omitted-object builds (WIDE, SMALL) carry
+    /// empty statics and skip.
+    #[test]
+    fn counter_objects_lack_the_detailed_flavor_adapter() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let bytes = super::counter_banks::counter_object_for_mode(mode);
+            let error = super::embedded_flavor_from_bytes(bytes)
+                .expect_err("counter bytes must not take the Detailed probe");
+            assert!(
+                error.reason().contains("no exact return adapter"),
+                "{mode:?}: {}",
+                error.reason()
+            );
+            let parsed = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+            assert_eq!(
+                super::probed_unsafe_is_present(&parsed).unwrap(),
+                false,
+                "{mode:?}"
+            );
+        }
+    }
+
     /// A stubbed parse in a wired build (or the reverse) refuses with one
     /// plain message naming both values.
     #[test]

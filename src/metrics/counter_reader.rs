@@ -4735,6 +4735,11 @@ mod tests {
     /// that merely exited 0 while filtered to nothing fails loudly.
     const SOFT1024_DONE_MARKER: &str = "P11SCOPE_SOFT1024_CHILD_DONE";
 
+    /// The exact bytes the re-executed child prints after `body()` returns.
+    fn soft1024_child_marker_line(cell: &str) -> String {
+        format!("{SOFT1024_DONE_MARKER} {cell}\n")
+    }
+
     fn soft_nofile() -> u64 {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -4805,7 +4810,7 @@ mod tests {
         if let Some(requested) = std::env::var_os(SOFT1024_CHILD) {
             if requested == cell {
                 body();
-                println!("{SOFT1024_DONE_MARKER} {cell}");
+                print!("{}", soft1024_child_marker_line(cell));
             }
             return;
         }
@@ -4913,6 +4918,29 @@ mod tests {
         let foreign = "P11SCOPE_SOFT1024_CHILD_DONE bypass\n\
             test result: ok. 1 passed; 0 failed; 0 ignored\n";
         assert!(!soft1024_child_output_ok("raise", true, foreign));
+    }
+
+    #[test]
+    fn soft1024_marker_matches_on_its_own_nocapture_line() {
+        // Under `--nocapture`, libtest prints `test <name> ... ` with no
+        // trailing newline, so the child's marker bytes land on that
+        // progress line unless they start their own. The parent keeps its
+        // exact-line match, so the marker must match inside this stream.
+        let progress = "test metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64 ... ";
+        let stdout = format!(
+            "running 1 test\n{progress}{}ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.01s\n",
+            soft1024_child_marker_line("raise")
+        );
+        assert!(
+            soft1024_child_output_ok("raise", true, &stdout),
+            "the done marker must match exactly inside a nocapture stream: {stdout:?}"
+        );
+        // The interleaved root shape stays rejected: pinning the parent's
+        // strictness is what makes the marker's own line load-bearing.
+        let interleaved = format!(
+            "running 1 test\n{progress}{SOFT1024_DONE_MARKER} raise\nok\n\ntest result: ok. 1 passed; 0 failed\n"
+        );
+        assert!(!soft1024_child_output_ok("raise", true, &interleaved));
     }
 
     #[test]

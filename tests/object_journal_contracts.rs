@@ -1176,9 +1176,12 @@ fn object_journal_marker_build_uses_one_gate() {
 /// H8-D marker drop arms: every silent in-scope drop arm calls the scope
 /// gap at its own site, not just somewhere in its root. The entry ABI
 /// refusals, the entry identity and START failures, the return ABI
-/// refusal and missing START, and both lost-code root branches each name
-/// their arm; deleting any one call fails. E2/R2 are covered live, and
-/// the six fault-only object arms are a different row class.
+/// refusal and missing START, and the three in-halves lost-call arms
+/// (ordinary identity mismatch, ordinary ring loss, object ring loss
+/// with settled removal) each name their arm; deleting any one call
+/// fails. The halves gap in place so no lost code crosses to the root
+/// (the 6.1/5.15 verifier shape). E2/R2 are covered live, and the six
+/// fault-only object arms are a different row class.
 #[test]
 fn object_journal_marker_drop_arms_call_the_gap() {
     const GAP: &str = "p11_instance_scope_gap();";
@@ -1196,8 +1199,22 @@ fn object_journal_marker_drop_arms_call_the_gap() {
         .iter()
         .position(|line| line.starts_with("struct ReturnAccounting"))
         .expect("return impl end");
+    let ordinary_at = lines
+        .iter()
+        .position(|line| line.starts_with("fn ordinary_return("))
+        .expect("ordinary half");
+    let object_at = lines
+        .iter()
+        .position(|line| line.starts_with("fn object_return("))
+        .expect("object half");
+    let fork_at = lines
+        .iter()
+        .position(|line| line.starts_with("pub extern \"C\" fn p11_link_fork_allowed"))
+        .expect("halves end");
     let entry = &lines[entry_at..return_at];
     let returned = &lines[return_at..accounting_at];
+    let ordinary = &lines[ordinary_at..object_at];
+    let object = &lines[object_at..fork_at];
     // (region, arm anchor, expected arms, gap above the anchor).
     let arms: &[(&[&str], &str, usize, bool)] = &[
         (entry, "bump_evidence(EVIDENCE_ABI_REFUSALS);", 3, true),
@@ -1211,17 +1228,13 @@ fn object_journal_marker_drop_arms_call_the_gap() {
         (returned, "bump_evidence(EVIDENCE_ABI_REFUSALS);", 1, true),
         (returned, "if start.is_null() {", 1, false),
         (
-            returned,
-            "ordinary_return(ctx, &key, start, flags, layout) != 0 {",
+            ordinary,
+            "bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);",
             1,
             false,
         ),
-        (
-            returned,
-            "object_return(ctx, &key, start, flags, layout) != 0 {",
-            1,
-            false,
-        ),
+        (ordinary, "bump_evidence(EVIDENCE_RING_LOSS);", 1, false),
+        (object, "bump_evidence(EVIDENCE_RING_LOSS);", 1, false),
     ];
     for (region, anchor, expected, above) in arms {
         let hits: Vec<usize> = region

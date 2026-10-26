@@ -311,45 +311,41 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
         "struct ReturnAccounting",
     );
-    // The outlined halves report a lost in-scope call with a nonzero code
-    // that the root turns into a marker gap at root depth, keeping return's
-    // 512-byte chain intact. The dispatcher still owns no lifetime: it only
-    // routes to the two halves and consumes each lost code by its own compare.
+    // The outlined halves gap a lost in-scope call at their own arms, in
+    // place at depth 3 inside return's 512-byte chain. The dispatcher
+    // still owns no lifetime: it only tail-routes to the two halves and
+    // consumes no lost code, keeping the 6.1/5.15 verifier shape.
     assert!(
         dispatch.contains(
-            "if unsafe { (*start).object_required } == 0 {\n        if ordinary_return(ctx, &key, start, flags, layout) != 0 {"
+            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {\n        object_return(ctx, &key, start, flags, layout)\n    }"
         ),
-        "dispatcher must route ordinary calls and consume its lost code"
+        "dispatcher must tail-route ordinary and object calls through a plain else"
     );
-    assert!(
-        dispatch.contains("\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {"),
-        "dispatcher must route object calls and consume its lost code"
-    );
-    assert_eq!(
-        dispatch
-            .matches("ordinary_return(ctx, &key, start, flags, layout)")
-            .count(),
-        1,
-        "dispatcher must call ordinary_return exactly once with the live pointer"
-    );
-    assert_eq!(
-        dispatch
-            .matches("object_return(ctx, &key, start, flags, layout)")
-            .count(),
-        1,
-        "dispatcher must call object_return exactly once with the live pointer"
-    );
+    for half in [
+        "ordinary_return(ctx, &key, start, flags, layout)",
+        "object_return(ctx, &key, start, flags, layout)",
+    ] {
+        assert_eq!(
+            dispatch.matches(half).count(),
+            1,
+            "dispatcher must call {half} exactly once with the live pointer"
+        );
+        assert!(
+            !dispatch.contains(&format!("{half} != 0")),
+            "dispatcher must not consume a lost code from {half}"
+        );
+    }
     // Mutant control: an object call nested inside the ordinary arm still
     // matches the old unindented anchor and both exact-once counts, so only
     // the 4-space anchor above catches it.
     let nested = dispatch.replacen(
-        "\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {",
-        "\n        } else if object_return(ctx, &key, start, flags, layout) != 0 {",
+        "\n    } else {\n        object_return(ctx, &key, start, flags, layout)\n    }",
+        "\n        } else {\n        object_return(ctx, &key, start, flags, layout)\n        }",
         1,
     );
     assert_ne!(nested, dispatch, "nesting mutant must change the dispatch");
     assert!(
-        nested.contains("} else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        nested.contains("} else {\n        object_return(ctx, &key, start, flags, layout)"),
         "nesting mutant must stay on target for the unindented anchor"
     );
     assert_eq!(
@@ -367,7 +363,9 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         "nesting mutant must keep the object count"
     );
     assert!(
-        !nested.contains("\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        !nested.contains(
+            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {"
+        ),
         "nesting mutant must be caught by the 4-space anchor"
     );
     for forbidden in [

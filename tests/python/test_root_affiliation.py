@@ -197,16 +197,22 @@ class RootAffiliationTests(unittest.TestCase):
                  "        || !image_pair_matches(start.image, image)\n"
                  "    {\n"
                  "        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);\n"
-                 "        return RETURN_CALL_LOST;\n"
+                 "        // H8-D birth marker: an identity-mismatched return loses the\n"
+                 "        // completion, so it gaps here in place at depth 3.\n"
+                 "        #[cfg(not(feature = \"counter-broad\"))]\n"
+                 "        unsafe {\n"
+                 "            p11_instance_scope_gap();\n"
+                 "        }\n"
+                 "        return 0;\n"
                  "    }\n")
         facts_line = ("    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);\n")
         swapped = ordinary.replace(guard + facts_line, facts_line + guard, 1)
         self.assertNotEqual(swapped, ordinary, "guard/facts swap must apply")
         mutants += [
-            main.replace("if ordinary_return(ctx, &key, start, flags, layout) != 0 {",
-                         "if object_return(ctx, &key, start, flags, layout) != 0 {", 1),
-            main.replace("} else if object_return(ctx, &key, start, flags, layout) != 0 {",
-                         "} else if ordinary_return(ctx, &key, start, flags, layout) != 0 {", 1),
+            main.replace("        ordinary_return(ctx, &key, start, flags, layout)\n",
+                         "        object_return(ctx, &key, start, flags, layout)\n", 1),
+            main.replace("        object_return(ctx, &key, start, flags, layout)\n",
+                         "        ordinary_return(ctx, &key, start, flags, layout)\n", 1),
             main.replace(ordinary, swapped, 1),
             main.replace("        || !image_pair_matches(start.image, image)\n", "", 1),
             main.replace("        || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),

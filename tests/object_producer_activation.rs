@@ -2401,6 +2401,9 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// ordinary emitted-object noninterference remains a separate compiled check.
 /// The private bank RV cfg stays on its existing line; its conditional
 /// re-export is appended. Measured with the unchanged executable lexer.
+/// Re-baselined after the return lost-code removal (the halves gap the
+/// leader row in place; the dispatcher is a plain tail again):
+/// 123277 B, sha256 below, measured with this actual lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2410,8 +2413,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            123229,
-            "69186a7f6dc1dee8d7c3b7fe72e942662982ae23b4f8e5b226657f06117e8bff"
+            123277,
+            "082e108ffa680f5aa6ad857ad1ca9397dcb148d3d869fdc4e156472c78850aca"
         ),
         "stripped BPF dump must stay byte-identical"
     );

@@ -84,6 +84,7 @@ static struct instance_counters counters;
 static struct instance_record records[4];
 static int record_present[4];
 static int storage_fail;
+static int storage_lookup_fail_once;
 static int storage_creates;
 static u64 pid_tgid = (77ULL << 32) | 78;
 static int read_fail_at = -1;
@@ -246,6 +247,12 @@ static struct instance_record *storage(void *map, void *task, void *init, u64 fl
     int index = task_index(task);
     assert(map == &PROC_EPOCH);
     assert(index != 2 && "records live on the group leader only");
+    if (!flags && storage_lookup_fail_once) {
+        /* A scripted spurious lookup NULL: the later CREATE still
+         * returns the existing row. */
+        storage_lookup_fail_once = 0;
+        return 0;
+    }
     if (record_present[index])
         return &records[index];
     if (!flags || storage_fail)
@@ -302,6 +309,7 @@ static void reset(void)
     watched_slot = 5;
     watched_present = 1;
     g_epoch_missing = gen_missing = storage_fail = storage_creates = 0;
+    storage_lookup_fail_once = 0;
     cas_lose = 0;
     read_fail_at = -1;
     reads = 0;
@@ -520,15 +528,60 @@ static void check_exec_birth(void)
         assert(records[0].journal_bootstrap == (u64)(shape ? 4 : 3));
     }
 
-    /* CREATE failure: the reservation stands, the latch trips, no fault. */
+    /* CREATE NULL: no row, no READY, no latch, no refund, no fault.
+     * The storage-null counter (the continuity gate) stays 0. */
     reset();
     birth_ready();
     gen[INST_GEN_ATTACH] = 7;
     leader.self_exec_id = 5;
     storage_fail = 1;
     assert(p11_instance_exec_birth() == 0);
-    assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
     assert(!record_present[0] && !gen[INST_GEN_FAULT] && !counters.faults);
+    assert(!counters.storage_null && !records[0].journal_bootstrap);
+    assert(!records[0].exec_attach_gen && !exec_id_reads);
+
+    /* A lookup NULL followed by a CREATE that returns an existing
+     * READY row: republish with no second charge. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = ((4ULL << 2) | 2ULL);
+    storage_lookup_fail_once = 1;
+    assert(p11_instance_exec_birth() == 1);
+    assert(!storage_lookup_fail_once && !storage_creates);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == ((5ULL << 2) | 2ULL));
+    assert(records[0].exec_attach_gen == 7);
+
+    /* The same spurious lookup NULL on a DIRTY row: the word rules
+     * apply, so it stays DIRTY with no exec-ID read and no store. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    records[0].journal_bootstrap = P11_JOURNAL_MARKER_DIRTY;
+    storage_lookup_fail_once = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+    assert(!records[0].exec_attach_gen && !exec_id_reads);
+
+    /* A CREATE-returned row with SHARED_MM set: no READY, latch. */
+    reset();
+    birth_ready();
+    gen[INST_GEN_ATTACH] = 7;
+    leader.self_exec_id = 5;
+    record_present[0] = 1;
+    records[0].flags = INST_RECORD_SHARED_MM;
+    storage_lookup_fail_once = 1;
+    assert(p11_instance_exec_birth() == 0);
+    assert(marker_ctl_cell.failed == 1 && marker_ctl_cell.spent == 1);
+    assert(!records[0].journal_bootstrap && !records[0].exec_attach_gen);
+    assert(!exec_id_reads && !gen[INST_GEN_FAULT]);
 
     /* An unrepresentable exec ID latches after reserving. */
     reset();

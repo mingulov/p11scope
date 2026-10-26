@@ -9866,6 +9866,26 @@ mod tests {
         }
     }
 
+    /// The same negative arm under a crowded inherited table: hosted
+    /// runners hand the test dozens of descriptors, so the child report
+    /// must fit the whole scan range and still show every sample number.
+    #[test]
+    fn a_close_range_error_closes_nothing_under_a_crowded_table() {
+        let _crowd: Vec<File> = (0..128).map(|_| File::open("/dev/null").unwrap()).collect();
+        let outcome = closer_with_refused_close_range(libc::EINVAL);
+        if !close_range_refusal_available(outcome.install) {
+            return;
+        }
+        assert_eq!(outcome.closer, libc::EINVAL);
+        for fd in outcome.sample {
+            assert!(
+                outcome.left.iter().any(|(open, _)| *open == fd),
+                "fd {fd} was closed without the fallback: {:?}",
+                outcome.left
+            );
+        }
+    }
+
     /// The pre-exec child keeps exactly its two handoff pipe ends and the
     /// launch file; every other inherited descriptor is closed before it
     /// waits, and the command itself still starts with stdio only.

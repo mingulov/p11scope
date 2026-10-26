@@ -13460,6 +13460,10 @@ mod tests {
 mod privileged_tests;
 
 #[cfg(test)]
+#[path = "inventory_manifest_e2e_tests.rs"]
+mod manifest_e2e_tests;
+
+#[cfg(test)]
 #[path = "inventory_edge_stream_tests.rs"]
 mod edge_stream_tests;
 

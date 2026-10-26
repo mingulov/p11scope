@@ -901,6 +901,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory_manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softsm_edges_lp64",
+      "reason": "privileged: inventory --system --manifest end to end with a SoftHSM workload exits 0 with populated S1 edges or named route-loss gaps",
+      "cell": "privileged"
+    },
+    {
       "file": "src/inventory_privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",

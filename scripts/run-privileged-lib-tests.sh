@@ -305,6 +305,14 @@ inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_woun
 inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64
 inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64
 inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
+# v0.5.0 headline end to end: inventory --system --manifest over a live
+# SoftHSM2 ledger workload (gates its dlopen on the observer's pass 0
+# publish, strictly post-attach) exits 0 with populated S1 edges
+# (mechanisms and API results) or named route-loss gaps, plus the
+# journal_unavailable S1 marker. Spawns a real observer binary:
+# P11SCOPE_E2E_OBSERVER, else the p11scope sibling of the test
+# binary. Prints MAN1_E2E lines (about a minute).
+inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softsm_edges_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

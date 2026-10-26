@@ -5141,13 +5141,9 @@ pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
 
 /// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
 /// what BPF_PROG_LOAD returns when the program exceeds the complexity
-/// limit, and ENOSPC is what it returns when verbose verification
-/// logging fills the load log buffer first (observed on 5.15 for an
-/// over-budget worker: the same refusal surfaces as ENOSPC with a
-/// truncated log instead of E2BIG with the full log). Every other errno
-/// keeps its own meaning.
+/// limit. Every other errno keeps its own meaning.
 pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
-    matches!(errno, Some(libc::E2BIG | libc::ENOSPC))
+    errno == Some(libc::E2BIG)
 }
 
 /// Load-refusal detector for doctor/diagnostics: true only for a genuine
@@ -5158,7 +5154,14 @@ pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
     match error {
         aya::programs::ProgramError::LoadError { io_error, .. } => {
-            is_verifier_budget_errno(io_error.raw_os_error())
+            // ENOSPC joins E2BIG only here, at the attach/doctor seam: a
+            // too-complex program whose verbose log fills the load buffer
+            // first. The shared errno predicate above stays E2BIG-only so
+            // the counter mapping keeps rewriting genuine E2BIG alone.
+            matches!(
+                io_error.raw_os_error(),
+                Some(libc::E2BIG | libc::ENOSPC)
+            )
         }
         _ => false,
     }

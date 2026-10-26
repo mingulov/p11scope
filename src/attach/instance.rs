@@ -741,9 +741,15 @@ fn calibrate(ebpf: &mut Ebpf, path: &Path) -> Result<(InstanceFileKey, MappedFil
 /// (v6.8), /proc/PID/maps shows an overlayfs-backed mapping under the
 /// backing file's (device, inode), which the mountinfo-derived raw key
 /// never matches; the calibration pair is exactly what those kernels show
-/// (the same `f_inode` both sides). On 6.8+ the raw key matches and the
-/// calibration key is a harmless dead key. Identity confirmation still
-/// gates every selected candidate.
+/// (the same `f_inode` both sides; probed on 6.6.157 for upper-only and
+/// lower-layer files). On 6.8+ the raw key matches and the calibration key
+/// is normally dead, but it can still select another mount's ranges:
+/// pre-6.8 every mount of the same lower file shares the backing maps line
+/// (probed `(52, 11)` on both mounts on 6.6); on 6.8+ only by numeric
+/// coincidence. Identity confirmation still gates every selected
+/// candidate, so such extras only cost a few refused `map_files` stats —
+/// never a false join (a second mount compares unequal: `(66, 11)` vs
+/// `(68, 11)` on 6.6, `(69, 11)` vs `(71, 11)` on 7.0).
 fn maps_keys_for_watch(mut raw: Vec<ObjectKey>, calib: InstanceFileKey) -> Vec<ObjectKey> {
     // Kernel kdev_t decoding (12-bit major at bits 20-31, 20-bit minor):
     // the hook reports the raw `s_dev`, not a userspace `st_dev`, so

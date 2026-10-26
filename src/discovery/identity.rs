@@ -421,13 +421,19 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 ///   maps device). And since 4.19 (stacked file operations) overlayfs
 ///   `mmap` installs the BACKING file in the VMA (`ovl_mmap` ->
 ///   `backing_file_mmap` -> `vma_set_file(realfile)`); what changed around
-///   6.8 is only what procfs renders for it. Before, maps and `map_files`
-///   show the backing file itself (observed on 6.1 and 6.6, 5498046); from
-///   then on they render the user-visible overlay file (`file_user_inode`
-///   in `show_map_vma`, `file_user_path` in `map_files_get_link`; read in
-///   the 6.17 source). An fd opened through the overlay path `fstat`s as
-///   the overlay file, so comparing `map_files` against `fstat` would
-///   refuse every pre-6.8 container.
+///   6.8 is only what procfs renders for maps lines. Before, maps shows
+///   the backing file itself (observed on 6.1 and 6.6, 5498046); from
+///   then on it renders the user-visible overlay file (`file_user_inode`
+///   in `show_map_vma`; read in the 6.17 source). `map_files` stat is the
+///   overlay identity on BOTH sides of 6.8, never the backing file:
+///   probed on 6.6.157 and 7.0.14 (upper-only, lower-layer and
+///   second-mount files, xino=off), the `map_files` stat always equals
+///   `fstat` of the same path — with xino=off both even share the layer's
+///   pseudo `st_dev` (upper `(49, *)`, lower `(50, *)` while the mount
+///   itself is `0:48` on 6.6), never the backing device maps shows
+///   pre-6.8. An earlier revision of this comment claimed pre-6.8
+///   `map_files` shows the backing file; the probe refutes that half
+///   (the maps half stands).
 /// - So both sides use the kernel's own `vm_file`: the candidate side
 ///   stats the target's `map_files` range; the pinned side mmaps the held
 ///   fd itself (one private read-only page, like `KernelSelfMappingProbe`)
@@ -435,8 +441,9 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 ///   path installs both VMAs and the same procfs code renders both
 ///   (overlay or not, before or after 6.8), so equal identities are the
 ///   same kernel file: on btrfs the subvolume's `(anon dev, ino)`, unique;
-///   on pre-6.8 overlay both render the backing file; on 6.8+ overlay both
-///   render the overlay file of the same backing file.
+///   on overlay both render this mount's view of the file, which is also
+///   why a second mount of the same lower file compares unequal (probed
+///   `(66, 11)` vs `(68, 11)` on 6.6).
 /// - Following a `map_files` link needs `CAP_SYS_ADMIN` or
 ///   `CAP_CHECKPOINT_RESTORE` in the initial user namespace (`EPERM`
 ///   otherwise), for `/proc/self` too. Without it nothing is proven and

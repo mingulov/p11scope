@@ -3064,6 +3064,10 @@ fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<
         marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
         "in-scope calls never dirty"
     );
+    ensure!(
+        proc_record_of(&harness, &outer)?.is_none(),
+        "the outsider must start rowless so the first call drives reserve-then-create"
+    );
     // Two out-of-scope calls on the absent row: one DIRTY, one admission.
     outer.command(b'c')?;
     outer.command(b'c')?;
@@ -3150,7 +3154,7 @@ fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
     outer.command(b'c')?;
     let absent = proc_record_of(&harness, &outer)?;
     ensure!(
-        marker_word_of(&absent) == 0,
+        absent.is_none(),
         "an unobserved outsider must have no row: {}",
         marker_summary(&absent)
     );

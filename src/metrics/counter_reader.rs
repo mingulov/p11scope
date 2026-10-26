@@ -4655,7 +4655,7 @@ mod tests {
             crate::metrics::CounterCaptureInputs::new(8192, 65536, engine.counter_reserver()),
         ));
         let snapshot = collection
-            .fresh(&mut session, engine.plan(), engine.pinned(), true)
+            .fresh(&session, engine.plan(), engine.pinned(), true)
             .unwrap();
         assert_eq!(snapshot.reports().len(), 8192);
         drop(session);
@@ -4863,7 +4863,7 @@ mod tests {
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine = engine_over_counter_fixture(&mut parts, first);
-        let mut session = engine
+        let session = engine
             .start_session(
                 crate::attach::CapturePolicy::Counter(CounterMode::Counts),
                 None,
@@ -4880,7 +4880,7 @@ mod tests {
         parts.fixture.command("START");
         parts.fixture.expect("HELD 0");
         let live = collection
-            .fresh(&mut session, engine.plan(), engine.pinned(), true)
+            .fresh(&session, engine.plan(), engine.pinned(), true)
             .unwrap();
         let reports = live.reports();
         assert_eq!(reports.len(), 512);
@@ -4893,7 +4893,7 @@ mod tests {
         parts.fixture.command("RELEASE");
         parts.fixture.expect("RELEASED 0 0000000000000204");
         let terminal = collection
-            .terminal(&mut session, engine.plan(), engine.pinned(), true)
+            .terminal(&session, engine.plan(), engine.pinned(), true)
             .unwrap();
         let reports = terminal.reports();
         assert_eq!(reports.len(), 512);

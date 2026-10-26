@@ -692,8 +692,8 @@
     },
     {
       "file": "src/discovery/pressure_native_tests.rs",
-      "path": "discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_loader_capacity_gap",
-      "reason": "privileged: live BPF 257-provider-load loader-context gap; run as root with --ignored --test-threads=1 under the privileged lane",
+      "path": "discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_view_capacity_gap",
+      "reason": "privileged: live BPF cgroup-scoped 257-provider-load view-capacity gap; run as root with --ignored --test-threads=1 under the privileged lane",
       "cell": "privileged"
     },
     {

@@ -224,10 +224,15 @@ discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control
 # host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient
 # EXEC refuses the cell, so run it on a controlled host).
 discovery::engine::pressure_native_tests::pressure_live_ticket_spend_control_refuses_ambient
-# life-1 (OD34 cell 3.6, loader half): 257 genuine provider loads spend the
-# 256 loader contexts; the 257th refuses as a named, counted gap. Expected
-# ~2-4 min, 257 sleeping children, quiet host.
-discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_loader_capacity_gap
+# life-1 (OD34 cell 3.6, loader half): 257 genuine provider loads in an
+# owned cgroup overflow the 256 view slots, so the 257th strands at the
+# view gate (views gate loader arms one to one and the loader refusal
+# cannot fire here); the cell asserts the named view-capacity gap, nothing
+# silently dropped, and no loader refusal. Cgroup-scoped so no ambient
+# shares the slots (the boundary is forced, not host luck). Expected
+# ~2-4 min (bounded ~7 min on a loaded host), 257 sleeping children,
+# needs a writable cgroup v2 hierarchy.
+discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_view_capacity_gap
 discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530

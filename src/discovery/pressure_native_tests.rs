@@ -1996,6 +1996,27 @@ fn ambient_exec_pids(records: &[DiscoveryRecord], owned: &BTreeSet<u32>) -> Vec<
         .collect()
 }
 
+fn cgroup_args(hints: Vec<PathBuf>, path: PathBuf) -> CaptureArgs {
+    CaptureArgs {
+        kind: Kind::Profile,
+        modules: hints,
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: ScopeArg::Cgroup(path),
+        metrics: false,
+        counter_mode: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        max_scan_pids: None,
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    }
+}
+
 fn start_live_system_capture(hints: Vec<PathBuf>, what: &str) -> (Engine, crate::attach::Session) {
     let started = Instant::now();
     let mut engine =
@@ -2241,81 +2262,323 @@ fn pressure_live_ticket_spend_control_refuses_ambient() {
     );
 }
 
-/// OD34 release-path cell 3.6 (loader half): 257 genuine provider loads on
-/// a real kernel spend the 256 loader contexts; the 257th arm refuses as a
-/// named, counted gap, never silence. One wave on a single provider file
-/// (the live path arms each owned view: live-control precedent), released
-/// and settled. Expected ~2-4 min, 257 sleeping children (<512 MiB), quiet
-/// host; any ambient provider-bearing view refuses the cell.
+/// A privately owned cgroup v2 scope for the 257 wave (the i3a owned-cgroup
+/// shape): one pid-suffixed directory under /sys/fs/cgroup holding exactly
+/// the owned loads, removed once they are reaped. Creation heals a stale
+/// EMPTY directory (a crashed run's litter) and refuses loudly on a live
+/// one; `Drop` best-effort removes for panic paths.
+struct OwnedCgroup {
+    path: PathBuf,
+}
+
+impl OwnedCgroup {
+    fn create(tag: &str, what: &str) -> Self {
+        let path = PathBuf::from(format!(
+            "/sys/fs/cgroup/p11scope-{tag}-{}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_dir(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "{what}: stale cgroup {} is live, refusing: {error}",
+                        path.display()
+                    )
+                });
+                std::fs::create_dir(&path).unwrap_or_else(|error| {
+                    panic!("{what}: creating cgroup {} failed: {error}", path.display())
+                });
+            }
+            Err(error) => panic!("{what}: creating cgroup {} failed: {error}", path.display()),
+        }
+        assert!(
+            path.join("cgroup.procs").is_file(),
+            "{what}: {} is not a live cgroup (no cgroup.procs)",
+            path.display()
+        );
+        Self { path }
+    }
+
+    fn move_in(&self, pid: u32, what: &str) {
+        std::fs::write(self.path.join("cgroup.procs"), pid.to_string()).unwrap_or_else(|error| {
+            panic!(
+                "{what}: moving {pid} into {} failed: {error}",
+                self.path.display()
+            )
+        });
+    }
+
+    fn members(&self, what: &str) -> BTreeSet<u32> {
+        let text =
+            std::fs::read_to_string(self.path.join("cgroup.procs")).unwrap_or_else(|error| {
+                panic!("{what}: reading {} failed: {error}", self.path.display())
+            });
+        text.lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    fn remove(&self, what: &str) {
+        std::fs::remove_dir(&self.path).unwrap_or_else(|error| {
+            panic!(
+                "{what}: removing cgroup {} failed: {error}",
+                self.path.display()
+            )
+        });
+    }
+}
+
+impl Drop for OwnedCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// OD34 release-path cell 3.6 (loader half), corrected routing: 257 genuine
+/// provider loads on a real kernel. Views gate loader arms, and the view
+/// table holds 256, so the overflow strands at the VIEW gate: the 257th
+/// process never gets a view, never attempts a loader arm, and the
+/// loader-context refusal cannot fire here. The engine must name the
+/// view-capacity gap (finite: emitted on the first at-capacity tick, and
+/// published toward the report/JSON, where any skip forces PARTIAL) instead
+/// of dropping the process silently; the stranded request stays queued for
+/// a later slot ("queued is not loss"); and no loader arm ever refuses.
+/// The 257th-ARM refusal itself is proven unprivileged through the real arm
+/// path by `pressure_257th_loader_arm_through_real_path_is_a_named_gap`
+/// (plus the owned twin `owned_prearm_at_256_contexts_names_the_capacity_gap`);
+/// the ordinary view-exhaustion skip/retention shapes are pinned unprivileged
+/// by `id_exhaustion_publishes_skip_instead_of_failing` and
+/// `probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity`,
+/// and the pressure twin by
+/// `pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe`
+/// ("ruled out is not refused"). The healthy twin is the live control
+/// `pressure_live_ticket_spend_control_refuses_ambient`: below capacity the
+/// wave settles fully with zero loss and no capacity skip.
+///
+/// Cgroup-scoped by determinism, not by product need: under System scope
+/// ambient processes share the 256 view slots, so whether the table sits
+/// exactly full when the wave lands is host churn luck, and the skip's
+/// timing flaps with it. The owned cgroup holds exactly the 257 loads — no
+/// ambient anywhere — so the end state (256 housed, 1 stranded, skip
+/// published) is forced on every host. The engine paths are
+/// scope-independent: same admission gate, same skip text, same arm path.
+/// Setup order is load-bearing: EXEC records are scope-gated at event time
+/// (BPF `scope_auth`), so the test moves itself into the cgroup, spawns
+/// the wave there (every EXEC in scope), then moves itself back out; no
+/// tick runs until the wait loop, so enumeration never observes the test.
+///
+/// Bounded wait, never full settlement: the stranded request cannot settle
+/// while the table is full, so the loop stops once every owned pid is
+/// viewed or refresh-queued and the view-capacity skip is published. The
+/// cell fails if the gap is missing (no skip), if a process is dropped
+/// silently (owned neither viewed nor queued), or if a loader arm refuses.
+/// One wave on a single provider file, released, then the bounded wait.
+/// Expected ~2-4 min (bounded ~7 min on a loaded host), 257 sleeping
+/// children (<512 MiB); any ambient arming refuses the cell as a scope leak.
 #[test]
-#[ignore = "privileged: live BPF 257-provider-load loader-context gap; run as root with --ignored --test-threads=1 under the privileged lane"]
-fn pressure_257_provider_loads_name_the_loader_capacity_gap() {
+#[ignore = "privileged: live BPF cgroup-scoped 257-provider-load view-capacity gap; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     const WHAT: &str = "life-257-live";
-    const LOADS: usize = MAX_LOADER_CONTEXTS + 1;
+    const LOADS: usize = MAX_SCAN_PIDS + 1;
     assert_privileged_lane(WHAT);
     assert_eq!(
+        MAX_SCAN_PIDS, 256,
+        "{WHAT}: the cell proves the real 256 views"
+    );
+    assert_eq!(
         MAX_LOADER_CONTEXTS, 256,
-        "{WHAT}: the cell proves the real 256"
+        "{WHAT}: views gate the 256 loader contexts one to one"
     );
     let wall_start = Instant::now();
 
     // Fixtures compile before capture: no forks inside the window.
     let fixtures = FixtureBuild::compile_all("life-257");
     let hints = vec![fixtures.early.clone()];
-    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+    let cgroup = OwnedCgroup::create("life257", WHAT);
+    let started = Instant::now();
+    let scope = crate::scope::capture_cgroup(&cgroup.path)
+        .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
+    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
+        .expect("live cgroup discovery");
+    let mut session = engine
+        .start_session(
+            CapturePolicy::Allowlisted,
+            None,
+            BackendSelection::default(),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: start_session failed: {error:#}"));
+    println!("t8: {WHAT}: capture live after {:?}", started.elapsed());
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: capture startup arms nothing"
+    );
 
+    // Born inside the scope: the test moves itself in, spawns the wave
+    // there, then moves itself back out. No tick runs on this path, so
+    // enumeration only ever sees the wave.
+    let this = std::process::id();
+    cgroup.move_in(this, WHAT);
+    assert!(
+        cgroup.members(WHAT).contains(&this),
+        "{WHAT}: the test must spawn from inside the cgroup"
+    );
     let mut population = Population::spawn_on(fixtures, LOADS, LIVE_REPEAT, false, false, None);
     assert_eq!(population.children.len(), LOADS);
     let owned = population.pids();
     assert_eq!(owned.len(), LOADS);
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned,
+        "{WHAT}: the cgroup holds exactly the 257 owned loads"
+    );
     population.release_and_wait_ledgers();
-    let settle = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
     for child in &population.children {
         let ledger = parse_provider_ledger(&child.log_text(), WHAT);
         assert_eq!(ledger.burst, 1, "{WHAT}: {} bursts once", child.pid());
         assert!(ledger.complete, "{WHAT}: {} ledger complete", child.pid());
     }
-    assert_eq!(
-        engine.loader_arms, LOADS as u64,
-        "{WHAT}: every owned view attempted exactly one arm"
-    );
-    assert_eq!(
-        minted_ids(&engine),
-        (1..=256).collect::<BTreeSet<_>>(),
-        "{WHAT}: tickets 1..=256 minted exactly once"
-    );
-    assert_eq!(
-        engine.loader_registry.discovery_truncated(),
-        1,
-        "{WHAT}: the 257th arm counts exactly one loader truncation"
-    );
-    assert!(
-        engine.capture_facts().discovery_truncated >= 1,
-        "{WHAT}: the refusal reaches the published facts"
-    );
+
+    // Bounded wait for the stable stranded state: every owned pid viewed
+    // or refresh-queued (nothing silently dropped), and the view-capacity
+    // skip published. Full settlement is impossible by design — the
+    // overflow request stays queued while the table is full — so this
+    // loop never waits for it. Production cadence per tick, as in
+    // `settle_live_episode`. The bound is a hang guard, not a bar: one
+    // tick costs ~20 s when the host is loaded (reconcile sweeps over
+    // 257 members plus the burst-event drain), 4-8 ticks house the wave,
+    // and 300 s holds twice the worst observed ~170 s — the same shape
+    // as the quota cell's 600 s wave bound for its slow spawns.
+    const STRANDED_WAIT: Duration = Duration::from_secs(300);
+    let start = Instant::now();
+    let deadline = start + STRANDED_WAIT;
+    let mut ticks = 0u64;
+    let view_gap_reason = format!("capture process-view capacity {MAX_SCAN_PIDS} was exhausted");
+    // A pid is accounted when viewed or queued; the union cannot
+    // double-count a pid that is both.
+    let accounted_owned = |engine: &Engine| -> BTreeSet<u32> {
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .filter(|pid| owned.contains(pid))
+            .chain(
+                engine
+                    .refresh_requested
+                    .keys()
+                    .filter(|pid| owned.contains(pid))
+                    .copied(),
+            )
+            .collect()
+    };
+    loop {
+        let force_full = ticks.is_multiple_of(20);
+        engine
+            .drain_discovery_shallow(&mut session, force_full)
+            .unwrap_or_else(|error| panic!("{WHAT}: shallow drain failed: {error:#}"));
+        engine
+            .service_backlog_quantum(&mut session)
+            .unwrap_or_else(|error| panic!("{WHAT}: service quantum failed: {error:#}"));
+        ticks += 1;
+        let viewed: usize = engine
+            .views
+            .iter()
+            .filter(|view| owned.contains(&view.pid()))
+            .count();
+        let queued: usize = engine
+            .refresh_requested
+            .keys()
+            .filter(|pid| owned.contains(pid))
+            .count();
+        let accounted = accounted_owned(&engine);
+        let gap_in_counters =
+            engine.counters.object_skips.iter().any(|skip| {
+                skip.subject == "process view" && skip.reason.contains(&view_gap_reason)
+            });
+        if ticks.is_multiple_of(10) {
+            println!(
+                "life: {WHAT}: tick {ticks}: views={} owned-viewed={viewed} owned-queued={queued} accounted={} gap={gap_in_counters} arms={} expired_quantum={}",
+                engine.views.len(),
+                accounted.len(),
+                engine.loader_arms,
+                engine
+                    .counters
+                    .object_skips
+                    .iter()
+                    .any(|skip| skip.reason.contains("quantum exhausted")),
+            );
+        }
+        if accounted.len() == LOADS && gap_in_counters {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{WHAT}: stranded state unreachable after {:?}: ticks={ticks} views={} owned-viewed={viewed} owned-queued={queued} accounted={} gap_in_counters={gap_in_counters} arms={} minted={} truncated={} skips={:?}",
+            start.elapsed(),
+            engine.views.len(),
+            accounted.len(),
+            engine.loader_arms,
+            minted_ids(&engine).len(),
+            engine.capture_facts().discovery_truncated,
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .map(|skip| (skip.subject.clone(), skip.reason.clone()))
+                .collect::<Vec<_>>(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The real gap: the view gate names its capacity, in the counters and
+    // published toward the report/JSON (any skip forces PARTIAL there).
+    // Missing in either place is silence, and fails.
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live loader arming"
-                && skip
-                    .reason
-                    .contains("loader context capacity 256 is exhausted")
+            skip.subject == "process view" && skip.reason.contains(&view_gap_reason)
         }),
-        "{WHAT}: the 257th arm names the capacity: {:?}",
+        "{WHAT}: the overflow names the view capacity in the counters: {:?}",
         engine.counters.object_skips
     );
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == "process view" && skip.reason.contains(&view_gap_reason)
+        }),
+        "{WHAT}: the view-capacity gap reaches the published plan: {:?}",
+        engine.plan.skipped
+    );
+    // Nothing silently dropped: every owned pid is still viewed or queued.
+    let accounted = accounted_owned(&engine);
     assert_eq!(
-        engine.loader_discovery().strategies.unavailable,
-        1,
-        "{WHAT}: the refused view aggregates as unbound"
+        accounted, owned,
+        "{WHAT}: every owned load is viewed or queued, none silently dropped"
+    );
+    // Views gated first: no loader arm ever refused.
+    assert_eq!(
+        engine.loader_registry.discovery_truncated(),
+        0,
+        "{WHAT}: no loader arm refused"
+    );
+    assert_eq!(
+        engine.loader_arms,
+        minted_ids(&engine).len() as u64,
+        "{WHAT}: every arm attempt minted"
+    );
+    // Non-vacuity: the wave really flowed through views into arms.
+    assert!(
+        engine.loader_arms > 0,
+        "{WHAT}: at least one owned view armed"
     );
     assert_no_ambient_arms(&engine, &owned, WHAT);
 
     population.terminate_all(WHAT, &|_| 0);
     drop(session);
     drop(engine);
+    cgroup.remove(WHAT);
     println!(
-        "life: 257-live: PASS: 256 tickets, 257th refused as a named gap; ticks={} wall={:?} VmHWM={}KiB",
-        settle.ticks,
+        "life: 257-live: PASS: view capacity named, nothing dropped, no loader refusal; ticks={ticks} wall={:?} VmHWM={}KiB",
         wall_start.elapsed(),
         vm_hwm_kb(),
     );

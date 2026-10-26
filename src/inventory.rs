@@ -7511,6 +7511,84 @@ mod tests {
         }
     }
 
+    /// A raw verifier dump must never land in a user-visible gap reason:
+    /// a 267 KiB dump once broke `inventory diff` (16,384-byte per-string
+    /// limit). The reason names the program, the errno and the processed
+    /// count, points at doctor, and stays far below the diff limit; the
+    /// synthetic log body must not survive. Both user-visible surfaces
+    /// (the auto-mode gap and the native-mode error) carry the summary.
+    #[test]
+    fn native_preparation_failure_keeps_a_bounded_named_reason() {
+        const MARKER: &str = "SYNTHETIC_VERIFIER_BODY_MARKER_9f3c";
+        let log = format!(
+            "0: R1=ctx R10=fp0\n{MARKER} {}\nprocessed 1000001 insns (limit 1000000) max_states_per_insn 1\n",
+            "x".repeat(300 * 1024)
+        );
+        assert!(log.len() > 267 * 1024, "the synthetic log must dwarf the dump");
+        let failure = || {
+            anyhow::Error::from(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new(log.clone()),
+            })
+            .context("Inventory program interface_list_worker")
+            .context("preparing Inventory: LoadProgram(\"interface_list_worker\", UProbe)")
+        };
+        let budget = inventory_endpoint_budget(None).unwrap();
+        for mode in [CaptureMode::Auto, CaptureMode::Native] {
+            let mut coordinator = InventoryCoordinator::new_with_budget(
+                Scope::System,
+                HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                budget,
+            )
+            .unwrap();
+            let result = open_native_lane_with(
+                mode,
+                crate::attach::BackendSelection::Auto,
+                InspectScope::System,
+                &mut coordinator,
+                |_, _, _| Err(failure()),
+            );
+            let reason = match mode {
+                CaptureMode::Native => {
+                    let error = result
+                        .err()
+                        .expect("forced native must refuse preparation failure");
+                    assert!(error.to_string().contains("--capture native"));
+                    format!("{error:#}")
+                }
+                _ => {
+                    assert!(result.unwrap().is_none());
+                    coordinator.commit_batch(false).unwrap();
+                    let document = render_json(&coordinator, "system", 1, 2, 0);
+                    document["gaps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|gap| gap["subject"] == "native usage feed unavailable")
+                        .unwrap_or_else(|| panic!("{}", document["gaps"]))
+                        ["reason"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                }
+            };
+            assert!(
+                reason.len() < 16_384,
+                "reason must fit the diff per-string limit: {} bytes",
+                reason.len()
+            );
+            assert!(reason.contains("interface_list_worker"), "{reason}");
+            assert!(reason.contains("E2BIG"), "{reason}");
+            assert!(reason.contains("1000001"), "{reason}");
+            assert!(reason.contains("doctor"), "{reason}");
+            assert!(!reason.contains(MARKER), "raw log body leaked: {reason}");
+            assert!(!reason.contains("SYNTHETIC"), "raw log body leaked");
+        }
+    }
+
     #[test]
     fn invalid_inventory_endpoint_budget_precedes_runtime_sinks() {
         let dir = private_tempdir();

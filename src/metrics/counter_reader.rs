@@ -4589,6 +4589,15 @@ mod tests {
         parts: &mut EngineCounterFixture,
         slots: Vec<Slot>,
     ) -> crate::discovery::engine::Engine {
+        let pid = parts.fixture.child.id();
+        engine_over_counter_fixture_with_scope(parts, slots, crate::attach::Scope::Pid(pid))
+    }
+
+    fn engine_over_counter_fixture_with_scope(
+        parts: &mut EngineCounterFixture,
+        slots: Vec<Slot>,
+        scope: crate::attach::Scope,
+    ) -> crate::discovery::engine::Engine {
         let mut engine = crate::discovery::engine::Engine::empty_for_test();
         let pid = parts.fixture.child.id();
         let view =
@@ -4608,13 +4617,7 @@ mod tests {
             &mut parts.pins,
             crate::discovery::identity::PinnedObjects::empty(),
         );
-        engine.inject_counter_start_state_for_test(
-            crate::attach::Scope::Pid(pid),
-            vec![view],
-            plan,
-            pins,
-            modules,
-        );
+        engine.inject_counter_start_state_for_test(scope, vec![view], plan, pins, modules);
         engine
     }
 
@@ -4725,6 +4728,234 @@ mod tests {
             .fresh(&session, engine.plan(), engine.pinned(), true)
             .unwrap();
         assert_eq!(snapshot.reports().len(), 8192);
+        drop(session);
+        drop(engine);
+    }
+
+    /// Exclusively owned cgroup for counter scope cells: the fixture child
+    /// moves in, so it is the only in-scope task and no foreign discovery
+    /// record disturbs the deterministic prefix. Declared before the
+    /// fixture so it drops (and removes the emptied dir) after the child.
+    struct OwnedCounterCgroup {
+        path: std::path::PathBuf,
+    }
+
+    impl OwnedCounterCgroup {
+        fn create() -> std::io::Result<Self> {
+            let path = std::path::PathBuf::from(format!(
+                "/sys/fs/cgroup/p11scope-a27counter-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+
+        fn move_in(&self, pid: u32) -> std::io::Result<()> {
+            std::fs::write(self.path.join("cgroup.procs"), pid.to_string())
+        }
+    }
+
+    impl Drop for OwnedCounterCgroup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures, a cgroup v2 hierarchy, and authorized native Multi staging as root: Engine-driven cgroup growth to 8192, then an atomic over-ceiling refusal"]
+    fn counter_engine_growth_cgroup_counts_multi_lp64() {
+        let group = OwnedCounterCgroup::create()
+            .expect("cgroup v2 hierarchy for the counter cgroup cell");
+        let mut parts = engine_counter_fixture();
+        group
+            .move_in(parts.fixture.child.id())
+            .expect("fixture child joins the owned cgroup");
+        let first = parts.slots[..512].to_vec();
+        let scope = crate::scope::cgroup(&group.path).expect("retained cgroup scope");
+        let mut engine = engine_over_counter_fixture_with_scope(&mut parts, first, scope);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            512
+        );
+        // Cgroup growth stages through the same seam as PID growth.
+        let full = parts.slots.clone();
+        let fresh = full[512..].to_vec();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            full,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (7680, 0));
+        assert!(
+            partials.is_empty(),
+            "clean growth marks no PARTIAL: {partials:?}"
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192
+        );
+        // One endpoint past the ceiling refuses atomically; the published
+        // prefix stays intact.
+        let mut past = parts.slots.clone();
+        let mut last = parts.extra.clone();
+        last.index = 8192;
+        past.push(last);
+        let fresh = past[8192..].to_vec();
+        let mut plan = crate::plan::AttachPlan::from_slots_with_policy(
+            past[..8192].to_vec(),
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        plan.slots.push(past[8192].clone());
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(partials.len(), 1);
+        assert!(
+            partials[0].contains("PlanBudgetMismatch"),
+            "refusal carries the honest budget token: {}",
+            partials[0]
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192,
+            "the published prefix stays intact"
+        );
+        eprintln!("COUNTER_ENGINE_CGROUP_GROWTH published=8192 over_ceiling_partials=1");
+        drop(session);
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven system growth to 8192, then an atomic over-ceiling refusal"]
+    fn counter_engine_growth_system_counts_multi_lp64() {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture_with_scope(
+            &mut parts,
+            first,
+            crate::attach::Scope::System,
+        );
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        // Foreign execs during start may have appended keys through real
+        // discovery, so grow the CURRENT plan to the ceiling instead of
+        // assuming the deterministic 512 prefix. Nothing processes
+        // discovery between the manual applies below, so the over-ceiling
+        // delta below is exact.
+        let current = engine.plan().slots.clone();
+        let high_water = current.len();
+        assert!(
+            high_water >= 512 && high_water < 8192,
+            "start stages the 512 prefix plus bounded foreign keys, got {high_water}"
+        );
+        let budgets = session.counter_budgets(0).unwrap();
+        assert_eq!(
+            budgets.endpoints.published + budgets.endpoints.holes,
+            high_water,
+            "every adopted slot staged exactly once"
+        );
+        let staged: std::collections::BTreeSet<_> = current
+            .iter()
+            .map(|slot| (slot.object, slot.file_offset))
+            .collect();
+        let mut candidate_slots = current;
+        let mut fresh = Vec::new();
+        for slot in &parts.slots {
+            if candidate_slots.len() == 8192 {
+                break;
+            }
+            if staged.contains(&(slot.object, slot.file_offset)) {
+                continue;
+            }
+            let mut grown = slot.clone();
+            grown.index = candidate_slots.len() as u32;
+            candidate_slots.push(grown.clone());
+            fresh.push(grown);
+        }
+        assert_eq!(
+            candidate_slots.len(),
+            8192,
+            "the fixture holds the ceiling plus foreign headroom"
+        );
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            candidate_slots,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let fresh_len = fresh.len();
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (fresh_len, 0));
+        let budgets = session.counter_budgets(0).unwrap();
+        assert_eq!(
+            budgets.endpoints.published + budgets.endpoints.holes,
+            8192,
+            "growth reaches the ceiling"
+        );
+        // One endpoint past the ceiling refuses atomically; the published
+        // prefix stays intact. PARTIALs are cumulative, so the refusal
+        // adds exactly one to whatever foreign applies marked. The budget
+        // check precedes the key checks, so the PID-mirror plan refuses
+        // with the budget token regardless of foreign keys.
+        let mut past = parts.slots.clone();
+        let mut last = parts.extra.clone();
+        last.index = 8192;
+        past.push(last);
+        let fresh = past[8192..].to_vec();
+        let mut plan = crate::plan::AttachPlan::from_slots_with_policy(
+            past[..8192].to_vec(),
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        plan.slots.push(past[8192].clone());
+        let (completed, failed, over_partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(
+            over_partials.len(),
+            partials.len() + 1,
+            "the refusal adds exactly one PARTIAL: {over_partials:?} vs {partials:?}"
+        );
+        assert!(
+            over_partials.last().is_some_and(|reason| reason.contains("PlanBudgetMismatch")),
+            "refusal carries the honest budget token: {over_partials:?}"
+        );
+        let budgets = session.counter_budgets(0).unwrap();
+        assert_eq!(
+            budgets.endpoints.published + budgets.endpoints.holes,
+            8192,
+            "the published prefix stays intact"
+        );
+        eprintln!("COUNTER_ENGINE_SYSTEM_GROWTH endpoints=8192 over_ceiling_delta=1");
         drop(session);
         drop(engine);
     }

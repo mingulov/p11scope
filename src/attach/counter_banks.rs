@@ -2822,10 +2822,18 @@ fn observe_native_commit(
 /// backend, scope, pin stability and CPU continuity, in short-circuit
 /// order. A free function so unit tests can pin every predicate without a
 /// Session; the refusal is always a bare `Topology`, named here.
+/// Counter staging admits the session scopes whose links it can bound:
+/// one process (PID) and all processes (cgroup/system, enforced by the
+/// in-BPF scope gate; link counts are offset-based and scope-independent).
+/// The diagnostic-only calling-process scope is never a session scope.
+fn counter_scope_admitted(scope: aya::programs::uprobe::UProbeScope) -> bool {
+    matches!(scope, aya::programs::uprobe::UProbeScope::OneProcess(_))
+}
+
 fn native_target_gate(
     stopped: bool,
     backend_ok: bool,
-    one_process: bool,
+    scope_admitted: bool,
     unchanged_ok: bool,
     cpus_now: Option<usize>,
     cpus_expected: usize,
@@ -2836,7 +2844,7 @@ fn native_target_gate(
     if !backend_ok {
         return Err(COUNTER_CHECK_BACKEND);
     }
-    if !one_process {
+    if !scope_admitted {
         return Err(COUNTER_CHECK_SCOPE);
     }
     if !unchanged_ok {
@@ -2874,16 +2882,13 @@ impl NativeIo<'_> {
             .counter_banks
             .as_ref()
             .is_some_and(|banks| banks.validate_backend(self.session.backend).is_ok());
-        let one_process = matches!(
-            self.session.uprobe_scope,
-            aya::programs::uprobe::UProbeScope::OneProcess(_)
-        );
+        let scope_admitted = counter_scope_admitted(self.session.uprobe_scope);
         let unchanged_ok = self.objects.check_unchanged() == Ok(true);
         let cpus_now = aya::util::nr_cpus().ok();
         if let Err(check) = native_target_gate(
             stopped,
             backend_ok,
-            one_process,
+            scope_admitted,
             unchanged_ok,
             cpus_now,
             self.cpus,
@@ -3114,10 +3119,7 @@ impl BankIo for NativeIo<'_> {
                 .counter_banks
                 .as_ref()
                 .is_none_or(|banks| banks.validate_backend(self.session.backend).is_err())
-            || !matches!(
-                self.session.uprobe_scope,
-                aya::programs::uprobe::UProbeScope::OneProcess(_)
-            )
+            || !counter_scope_admitted(self.session.uprobe_scope)
             || self.objects.check_unchanged() != Ok(true)
         {
             return CandidateCheck::Contradictory;
@@ -5616,6 +5618,24 @@ pub(crate) mod tests {
             BankPublication::Refused(BankRefusal::Shape(BankShapeCause::PlanNotCounters))
         );
         assert_eq!(check, None);
+    }
+
+    #[test]
+    fn counter_scope_admission_covers_process_and_machine_scopes() {
+        // Cgroup/system sessions stage through the same seam: their links
+        // are offset-based (scope-independent counts) with membership
+        // enforced by the in-BPF scope gate. The diagnostic-only
+        // calling-process scope is never a session scope.
+        use aya::programs::uprobe::UProbeScope;
+        use std::num::NonZeroU32;
+        assert!(super::counter_scope_admitted(UProbeScope::OneProcess(
+            NonZeroU32::new(7).unwrap()
+        )));
+        assert!(
+            super::counter_scope_admitted(UProbeScope::AllProcesses),
+            "cgroup/system sessions stage through the same seam"
+        );
+        assert!(!super::counter_scope_admitted(UProbeScope::CallingProcess));
     }
 
     #[test]

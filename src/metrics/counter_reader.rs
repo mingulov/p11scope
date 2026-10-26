@@ -5724,6 +5724,237 @@ mod tests {
         drop(engine);
     }
 
+    /// Guard removing a CLI cell's `-o` report on scope exit (success or
+    /// panic), so TMPDIR keeps no scratch.
+    struct RemoveReportOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveReportOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// CLI-shaped counter capture for one mode: real parsed argv → the real
+    /// `capture_policy` → the injected Engine over the counter fixture →
+    /// the real session start → the real profile loop to `-o` JSON, whose
+    /// numbers must equal the workload ledger exactly. Only discovery is
+    /// injected (the fixture provider exports no PKCS#11 surface for real
+    /// discovery); everything from parsed args to rendered bytes is
+    /// production. The transcript runs after the probes attach but before
+    /// the loop: the terminal read is cumulative, so pre-loop calls land
+    /// exactly with no threads and no timing dependence. Module attribution
+    /// is not pinned here (injected discovery carries no discovery
+    /// evidence); discovery cells own it.
+    fn counter_cli_capture_cell(mode: CounterMode) {
+        const STAGED: usize = 512;
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..STAGED].to_vec();
+        let offsets: Vec<u64> = first.iter().map(|slot| slot.file_offset).collect();
+        let pid = parts.fixture.child.id();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        // Real argv, exactly as a user runs it (the workload PID and the
+        // `-o` path are the only runtime values).
+        let out_path = std::env::temp_dir().join(format!(
+            "p11scope-counter-cli-{}-{}.json",
+            mode.name(),
+            std::process::id()
+        ));
+        let _cleanup = RemoveReportOnDrop(out_path.clone());
+        let pid_text = pid.to_string();
+        let out_text = out_path.to_string_lossy().into_owned();
+        let argv = [
+            "profile",
+            "--pid",
+            pid_text.as_str(),
+            "--mode",
+            "metrics",
+            "--counter-mode",
+            mode.name(),
+            "--attach-backend",
+            "multi",
+            "--duration",
+            "3s",
+            "-o",
+            out_text.as_str(),
+        ];
+        let Ok(crate::cli::Command::Profile(capture_args)) = crate::cli::parse(argv) else {
+            panic!("counter argv must parse as a profile capture");
+        };
+        assert_eq!(capture_args.counter_mode, Some(mode));
+        assert!(capture_args.metrics);
+        assert_eq!(
+            capture_args.attach_backend,
+            crate::attach::BackendSelection::Multi
+        );
+        let policy = crate::run::capture_policy(
+            capture_args.kind,
+            capture_args.metrics,
+            capture_args.unsafe_requested,
+            capture_args.counter_mode,
+        )
+        .expect("counter argv builds its policy");
+        assert_eq!(policy, crate::attach::CapturePolicy::Counter(mode));
+        let mut session = engine
+            .start_session(policy, capture_args.ring_bytes, capture_args.attach_backend)
+            .expect("counter session starts");
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            STAGED
+        );
+        parts.fixture.command("START");
+        parts.fixture.expect("HELD 0");
+        parts.fixture.command("RUN 0 512");
+        parts.fixture.expect("RAN 0 512");
+        let hot = format!("HOT_RV 511 {:016x} 3", 0x2_0000_0204u64);
+        parts.fixture.command(&hot);
+        parts.fixture.expect(&hot);
+        parts.fixture.command("RELEASE");
+        parts.fixture.expect("RELEASED 0 0000000000000204");
+        let ledger = parts.fixture.ledger();
+        assert_eq!(
+            ledger.hot,
+            Some(GrowthHotRange {
+                index: 511,
+                first: 0x2_0000_0204,
+                count: 3,
+                completed: 3,
+            })
+        );
+        let scope = crate::attach::Scope::Pid(pid);
+        let duration = capture_args.duration.expect("parsed duration");
+        drop(
+            crate::run::run_profile_loop_for_test(
+                &mut engine,
+                &mut session,
+                &scope,
+                policy,
+                duration,
+                &out_path,
+            )
+            .expect("profile loop completes"),
+        );
+        let text = std::fs::read_to_string(&out_path).expect("-o report exists");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(document["schema"], "p11scope/observed-profile/v3-metrics");
+        assert_eq!(document["lane"], "metrics");
+        assert_eq!(document["capture"]["mode"], "metrics");
+        assert_eq!(document["capture"]["scope"], "pid");
+        let collection = &document["evidence"]["counter_collection"];
+        assert_eq!(collection["mode"], mode.name());
+        assert_eq!(collection["status"], "fresh");
+        assert_eq!(collection["health"]["saturated"], false);
+        assert_eq!(collection["health"]["contended"], false);
+        assert_eq!(collection["discontinuity"], false);
+        assert!(collection["failure"].is_null());
+        let functions = document["functions"].as_array().expect("functions array");
+        assert_eq!(functions.len(), STAGED);
+        let by_offset: std::collections::BTreeMap<u64, &serde_json::Value> = functions
+            .iter()
+            .map(|function| {
+                (
+                    function["target"]["file_offset"].as_u64().unwrap(),
+                    function,
+                )
+            })
+            .collect();
+        assert_eq!(by_offset.len(), STAGED, "distinct reported offsets");
+        for (index, offset) in offsets.iter().enumerate() {
+            let function = by_offset[offset];
+            let row = ledger.rows[index];
+            assert_eq!(
+                function["names"],
+                serde_json::json!([format!("counter_bank_growth_e{index:04x}")]),
+                "row {index} names"
+            );
+            assert_eq!(
+                function["calls"].as_u64().unwrap(),
+                row.returned,
+                "row {index}"
+            );
+            assert_eq!(
+                function["errors"].as_u64().unwrap(),
+                row.errors,
+                "row {index}"
+            );
+            assert_eq!(
+                function["pending_returns"].as_u64().unwrap(),
+                row.rvs[1],
+                "row {index}"
+            );
+            assert_eq!(
+                function["in_flight"].as_u64().unwrap(),
+                row.entered - row.returned,
+                "row {index}"
+            );
+            let expected_rvs = ledger.rv_counts(index);
+            let actual_rvs = function["rv_counts"].as_object().expect("rv map");
+            assert_eq!(actual_rvs.len(), expected_rvs.len(), "row {index} rv keys");
+            for (rv, count) in &expected_rvs {
+                let key = format!("0x{rv:016x}");
+                assert_eq!(actual_rvs[key.as_str()], *count, "row {index} rv {rv:#x}");
+            }
+            match mode {
+                CounterMode::Counts => {
+                    assert!(function["latency_ns"].is_null(), "row {index}");
+                }
+                CounterMode::Timestamps => {
+                    let latency = &function["latency_ns"];
+                    assert_eq!(latency["approximate"], false, "row {index}");
+                    assert!(
+                        latency["p50"].is_null()
+                            && latency["p95"].is_null()
+                            && latency["p99"].is_null(),
+                        "row {index}"
+                    );
+                    let total = latency["total"].as_u64().unwrap();
+                    let max = latency["max"].as_u64().unwrap();
+                    assert!(total >= max, "row {index}");
+                }
+                CounterMode::Latency => {
+                    let latency = &function["latency_ns"];
+                    assert_eq!(latency["approximate"], true, "row {index}");
+                    let total = latency["total"].as_u64().unwrap();
+                    let max = latency["max"].as_u64().unwrap();
+                    assert!(total >= max, "row {index}");
+                    for quantile in ["p50", "p95", "p99"] {
+                        let percentile = latency[quantile]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("row {index} {quantile} present"));
+                        assert!(percentile <= max, "row {index} {quantile}");
+                    }
+                }
+            }
+        }
+        parts.fixture.command("QUIT");
+        parts.fixture.expect("DONE 512");
+        parts.fixture.wait_after_done();
+        drop(session);
+        drop(engine);
+        eprintln!(
+            "COUNTER_CLI_{} functions={} status=fresh",
+            mode.name().to_uppercase(),
+            STAGED
+        );
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers"]
+    fn counter_cli_profile_counts_matches_workload_ledger_lp64() {
+        counter_cli_capture_cell(CounterMode::Counts);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode timestamps to -o JSON with exact workload-ledger numbers"]
+    fn counter_cli_profile_timestamps_matches_workload_ledger_lp64() {
+        counter_cli_capture_cell(CounterMode::Timestamps);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode latency to -o JSON with exact workload-ledger numbers"]
+    fn counter_cli_profile_latency_matches_workload_ledger_lp64() {
+        counter_cli_capture_cell(CounterMode::Latency);
+    }
+
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
     fn counter_bank_session_boundary_511_512_timestamps_growth_lp64() {

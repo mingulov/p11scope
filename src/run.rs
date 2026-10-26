@@ -12105,19 +12105,58 @@ mod tests {
     }
 
     #[test]
-    fn counter_modes_stay_cli_refused_during_wiring() {
-        // A2.9 narrows this list per mode (pre-declared flip, not an
-        // assertion edit): each newly wired mode leaves this loop.
+    fn counter_modes_select_counter_policies_through_capture_policy() {
         for mode in [
             p11scope_ebpf_common::CounterMode::Counts,
             p11scope_ebpf_common::CounterMode::Timestamps,
             p11scope_ebpf_common::CounterMode::Latency,
         ] {
-            let error =
-                refuse_unwired_counter_mode(Some(mode)).expect_err("unwired mode must refuse");
-            let text = format!("{error:#}");
-            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
+            // Metrics profile/run select the counter policy for every mode.
+            assert_eq!(
+                capture_policy(Kind::Profile, true, false, Some(mode)).unwrap(),
+                CapturePolicy::Counter(mode),
+                "{mode:?}"
+            );
+            // Every other combination refuses by name, never with the
+            // removed blanket token.
+            let requires_metrics = format!(
+                "--counter-mode {} requires --mode metrics on profile or run",
+                mode.name()
+            );
+            for (kind, metrics, unsafe_requested, expected) in [
+                (Kind::Trace, false, false, requires_metrics.as_str()),
+                (Kind::Trace, true, false, requires_metrics.as_str()),
+                (Kind::Profile, false, false, requires_metrics.as_str()),
+                (
+                    Kind::Profile,
+                    true,
+                    true,
+                    "--counter-mode cannot be combined with --unsafe-unvalidated-metadata",
+                ),
+            ] {
+                let error =
+                    capture_policy(kind, metrics, unsafe_requested, Some(mode)).unwrap_err();
+                let text = format!("{error:#}");
+                assert_eq!(
+                    text, expected,
+                    "{mode:?} metrics={metrics} unsafe={unsafe_requested}"
+                );
+                assert!(!text.contains("counter-mode-unwired"), "{text}");
+            }
         }
+        // Omission keeps every legacy selection.
+        assert_eq!(
+            capture_policy(Kind::Profile, false, false, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            capture_policy(Kind::Profile, true, false, None).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            capture_policy(Kind::Trace, false, false, None).unwrap(),
+            CapturePolicy::Allowlisted
+        );
     }
 
     #[test]

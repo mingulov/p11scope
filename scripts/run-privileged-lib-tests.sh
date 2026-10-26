@@ -416,6 +416,12 @@ metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp6
 metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
 metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
 metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
+# CLI-shaped counter captures (parsed argv, real policy, real profile loop
+# to -o JSON, numbers equal to the workload ledger): root with prebuilt
+# growth fixtures.
+metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale

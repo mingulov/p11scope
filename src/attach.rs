@@ -16552,6 +16552,158 @@ mod tests {
         }
     }
 
+    /// The counter flavor check accepts every embedded bank object: FULL
+    /// without unsafe decoders on every build (counter flavors never take
+    /// the stub or unsafe features). Omitted-object builds skip.
+    #[test]
+    fn counter_flavor_accepts_embedded_bank_objects() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let flavor = super::checked_counter_flavor(
+                mode,
+                super::counter_banks::counter_object_for_mode(mode),
+            )
+            .unwrap();
+            assert_eq!(
+                flavor,
+                super::EmbeddedFlavor {
+                    stubbed: false,
+                    unsafe_present: false,
+                },
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Unparseable bytes refuse naming the mode and the reason.
+    #[test]
+    fn counter_flavor_refuses_unparseable_bytes() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let error = super::checked_counter_flavor(mode, b"not an ELF object").unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(&format!("--counter-mode {}", mode.name())),
+                "{text}"
+            );
+            assert!(
+                text.contains("cannot determine counter BPF object flavor"),
+                "{text}"
+            );
+            assert!(text.contains("stale or mismatched"), "{text}");
+        }
+    }
+
+    /// The parsed-object mapping: unsafe-absent yields the FULL counter
+    /// flavor; unsafe-present refuses as a mismatch; half-wired evidence
+    /// refuses as cannot-determine. Each names the mode.
+    #[test]
+    fn counter_flavor_maps_parsed_unsafe_evidence() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+            return;
+        }
+        let mode = p11scope_ebpf_common::CounterMode::Counts;
+        let bytes = super::counter_banks::counter_object_for_mode(mode);
+        let parsed = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        assert_eq!(
+            super::counter_flavor_from_parsed(mode, &parsed).unwrap(),
+            super::EmbeddedFlavor {
+                stubbed: false,
+                unsafe_present: false,
+            }
+        );
+        // Half-wired: one planted marker refuses as cannot-determine.
+        let mut half = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        let program = half
+            .programs
+            .values()
+            .next()
+            .expect("counter bytes carry programs")
+            .clone();
+        half.programs
+            .insert(super::UNSAFE_PROGRAMS[0].to_string(), program);
+        let error = super::counter_flavor_from_parsed(mode, &half).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("cannot determine counter BPF object flavor"),
+            "{text}"
+        );
+        assert!(text.contains("half-wired"), "{text}");
+        // Present: every marker planted refuses as a mismatch.
+        let mut present = aya_obj::Object::parse(bytes).expect("counter bytes parse");
+        let program = present
+            .programs
+            .values()
+            .next()
+            .expect("counter bytes carry programs")
+            .clone();
+        for name in super::UNSAFE_PROGRAMS {
+            assert!(
+                !present.programs.contains_key(name),
+                "counter bytes carry {name}"
+            );
+            present.programs.insert(name.to_string(), program.clone());
+        }
+        let map = present
+            .maps
+            .values()
+            .next()
+            .expect("counter bytes carry maps")
+            .clone();
+        for (name, _) in super::FEATURE_POLICY_MAPS {
+            assert!(
+                !present.maps.contains_key(name),
+                "counter bytes carry {name}"
+            );
+            present.maps.insert(name.to_string(), map.clone());
+        }
+        let error = super::counter_flavor_from_parsed(mode, &present).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("counter BPF object flavor mismatch"),
+            "{text}"
+        );
+        assert!(text.contains("unsafe-unvalidated-metadata"), "{text}");
+    }
+
+    /// Real unsafe-present evidence refuses as a mismatch: in an
+    /// unsafe-compiled build the Detailed bytes carry every unsafe
+    /// marker, so they must fail the counter check. Unsafe lane only.
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
+    #[test]
+    fn counter_flavor_refuses_unsafe_present_bytes() {
+        let mode = p11scope_ebpf_common::CounterMode::Latency;
+        let error = super::checked_counter_flavor(mode, crate::EBPF_OBJECT).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("--counter-mode {}", mode.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains("counter BPF object flavor mismatch"),
+            "{text}"
+        );
+    }
+
     /// A stubbed parse in a wired build (or the reverse) refuses with one
     /// plain message naming both values.
     #[test]

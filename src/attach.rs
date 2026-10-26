@@ -5599,9 +5599,11 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// or the mechanism registry step never reaches that far) — never at
 /// the per-slot attach loop, which is reached only after those succeed.
 /// Every realistic cause at that point is an unsupported-environment
-/// one, so every early failure gets the same actionable hint appended,
-/// naming the concrete things to check instead of leaving a bare
-/// syscall error for the operator to diagnose alone.
+/// one, so every early failure gets an actionable hint appended, naming
+/// the concrete things to check instead of leaving a bare syscall error
+/// for the operator to diagnose alone. A verifier-budget refusal (E2BIG
+/// from a program load) is the one exception: it gets the verifier hint,
+/// since privileges are not the cause.
 pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
 lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
@@ -5609,8 +5611,21 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 docs/notes/phase5-unsupported.md for what each looks like when observed. Run \
 `p11scope doctor` to see which cause applies on this host.";
 
+pub(crate) const VERIFIER_BUDGET_HINT: &str = "hint: the kernel's verifier found a p11scope program too \
+complex and refused it (E2BIG) — this is a p11scope bug on this kernel, not a privilege \
+problem. Report it with the `p11scope doctor` output.";
+
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
-    error.context(UNSUPPORTED_ENV_HINT)
+    let budget_refusal = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<aya::programs::ProgramError>()
+            .is_some_and(is_verifier_budget_refusal)
+    });
+    if budget_refusal {
+        error.context(VERIFIER_BUDGET_HINT)
+    } else {
+        error.context(UNSUPPORTED_ENV_HINT)
+    }
 }
 
 fn read_pid_health_with(
@@ -11851,6 +11866,38 @@ mod tests {
         assert!(rendered.contains("loading required typed task_newtask"));
         assert!(rendered.contains("injected loader failure"));
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT));
+    }
+
+    #[test]
+    fn verifier_budget_refusal_gets_verifier_hint_not_privilege_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new("Processed 1000001 insn".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("p11scope doctor"), "{rendered}");
+        assert!(!rendered.contains("CAP_BPF"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
+    fn permission_refusal_keeps_unsupported_environment_hint() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+                verifier_log: aya_obj::VerifierLog::new("denied".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("loading p11_return"), "{rendered}");
+        assert!(rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+        assert!(!rendered.contains("too complex"), "{rendered}");
     }
     use super::*;
 

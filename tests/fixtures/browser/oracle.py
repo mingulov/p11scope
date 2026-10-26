@@ -279,3 +279,119 @@ CR_ENUMERATION_FLOORS = {
 # There are deliberately no FF-PINBOUND floors: Firefox stalls at the
 # interactive-PIN boundary with racy selection enumeration (x0 or x16
 # across runs), so only the login/signing absences are pinned.
+
+#: Top-level report keys that would publish object facts. Profile never
+#: publishes them (key-operation browser populations are 0.5.1); their
+#: presence fails the S1 proof below.
+JOINT_CONTENT_KEYS = ("object_observations", "key_operations",
+                      "unknown_key_operations")
+
+#: S1 session counters rendered by the profile lane (render.rs
+#: SessionsOut); balance is opened+inherited-closed with saturation.
+SESSION_COUNTERS = ("opened", "inherited", "closed", "async_opened",
+                    "peak_concurrent", "balance")
+
+MAX_U64 = (1 << 64) - 1
+
+
+def _u64(value: Any) -> bool:
+    """A JSON u64 counter (booleans are not counters)."""
+    return type(value) is int and 0 <= value <= MAX_U64
+
+
+def check_no_joint_content(report: dict[str, Any]) -> list[str]:
+    """The report publishes no object facts (the S1-active negative half).
+
+    Key-operation browser populations arrive in 0.5.1; a v0.5.0
+    profile report carrying a Joint section fails instead of passing
+    with the S1 checks blind to it.
+    """
+    failures = []
+    for key in JOINT_CONTENT_KEYS:
+        if key in report:
+            failures.append(
+                f"report carries top-level {key!r}: profile never publishes "
+                f"object facts")
+    return failures
+
+
+def check_s1_mechanisms_absent(report: dict[str, Any]) -> list[str]:
+    """No mechanism-attributed calls happened in the enumeration flow.
+
+    Enumeration (slot/token/object discovery) never initializes an
+    operation, so the S1 mechanisms section must be present and empty;
+    a missing section fails closed (use is then unverifiable).
+    """
+    if "mechanisms" not in report:
+        return ["mechanisms section missing: cannot verify S1 mechanism use"]
+    mechanisms = report["mechanisms"]
+    if not isinstance(mechanisms, list):
+        return ["mechanisms section is not a list"]
+    failures = []
+    for entry in mechanisms:
+        if isinstance(entry, dict) and _u64(entry.get("mechanism")):
+            detail = ""
+            if _u64(entry.get("calls")) and _u64(entry.get("errors")):
+                detail = (f" (calls={entry['calls']}"
+                          f" errors={entry['errors']})")
+            failures.append(
+                f"mechanism 0x{entry['mechanism']:x} used by an enumeration "
+                f"flow, want none{detail}")
+        else:
+            failures.append("mechanisms section carries a malformed entry")
+    return failures
+
+
+def check_s1_logins_absent(report: dict[str, Any]) -> list[str]:
+    """No login happened (the S1 login accounting is empty).
+
+    A missing section fails closed, like the mechanisms section.
+    """
+    if "logins" not in report:
+        return ["logins section missing: cannot verify S1 logins"]
+    logins = report["logins"]
+    if not isinstance(logins, dict):
+        return ["logins section is not an object"]
+    if logins:
+        return [f"logins observed {logins}, want none (boundary crossed?)"]
+    return []
+
+
+def check_s1_sessions(report: dict[str, Any], opened_min: int = 0,
+                      zero: bool = False) -> list[str]:
+    """S1 session accounting balances, with a per-cell opened floor.
+
+    The six counters must be present u64 values with
+    balance == opened+inherited-closed (saturating, as rendered);
+    ``opened_min`` floors opened sessions for cells whose floored
+    calls need one (FindObjects cannot run without a session), and
+    ``zero`` requires all counters at zero for never-mapped cells.
+    """
+    if "sessions" not in report:
+        return ["sessions section missing: cannot verify S1 sessions"]
+    sessions = report["sessions"]
+    if not isinstance(sessions, dict):
+        return ["sessions section is not an object"]
+    failures = []
+    for name in SESSION_COUNTERS:
+        if not _u64(sessions.get(name)):
+            failures.append(f"sessions.{name} is not a u64 counter")
+    if failures:
+        return failures
+    total = min(sessions["opened"] + sessions["inherited"], MAX_U64)
+    balance = total - min(sessions["closed"], total)
+    if sessions["balance"] != balance:
+        failures.append(
+            f"sessions balance {sessions['balance']} != opened "
+            f"{sessions['opened']}+inherited {sessions['inherited']}-closed "
+            f"{sessions['closed']}")
+    if zero:
+        for name in SESSION_COUNTERS:
+            if sessions[name] != 0:
+                failures.append(
+                    f"sessions.{name}={sessions[name]}, want 0 "
+                    f"(module never mapped)")
+    elif sessions["opened"] < opened_min:
+        failures.append(
+            f"sessions.opened={sessions['opened']}, want >= {opened_min}")
+    return failures

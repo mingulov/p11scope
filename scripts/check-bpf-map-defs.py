@@ -725,9 +725,9 @@ def validate_marker_call_sites(elf):
     Objects without both globals skip this check (fixtures without a
     marker, counter and inventory objects). Core roots (p11_entry,
     p11_return, sched_process_exec, sched_process_exit) must exist;
-    unsafe-only roots (p11_entry_ia32, the template continuation) must
-    call when defined. Each call must resolve to the GLOBAL .text
-    definition, never a same-named local.
+    unsafe-only roots (p11_entry_ia32, the template entries and the
+    template continuation) must call when defined. Each call must
+    resolve to the GLOBAL .text definition, never a same-named local.
     """
     markers = {symbol[0] for symbol in elf.symbols
                if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS}
@@ -759,6 +759,9 @@ def validate_marker_call_sites(elf):
     }
     optional = {
         "p11_entry_ia32": "p11_instance_scope_gap",
+        "p11_entry_template": "p11_instance_scope_gap",
+        "p11_entry_template_types": "p11_instance_scope_gap",
+        "p11_entry_template_pair": "p11_instance_scope_gap",
         "p11_entry_template_second": "p11_instance_scope_gap",
     }
     for root in required:

@@ -5369,10 +5369,14 @@ fn load_refusal_errno_name(errno: i32) -> Option<&'static str> {
 /// log tail where the kernel prints it. Pure parsing: the log itself is
 /// never copied into the reason.
 fn verifier_processed_counts(log: &str) -> Option<(u64, u64)> {
-    let rest = log.rfind("processed ").map(|at| &log[at + "processed ".len()..])?;
+    let rest = log
+        .rfind("processed ")
+        .map(|at| &log[at + "processed ".len()..])?;
     let processed: u64 = rest.split_whitespace().next()?.parse().ok()?;
     let limit_key = "insns (limit ";
-    let limit_rest = rest.find(limit_key).map(|at| &rest[at + limit_key.len()..])?;
+    let limit_rest = rest
+        .find(limit_key)
+        .map(|at| &rest[at + limit_key.len()..])?;
     let limit: u64 = limit_rest
         .split(|c: char| !c.is_ascii_digit())
         .next()?
@@ -5431,8 +5435,7 @@ fn summarize_native_preparation_error(error: &anyhow::Error) -> String {
                 verifier_log,
             } = load
             {
-                refusal
-                    .get_or_insert((io_error.raw_os_error(), verifier_log.to_string()));
+                refusal.get_or_insert((io_error.raw_os_error(), verifier_log.to_string()));
             }
             continue;
         }
@@ -7671,7 +7674,10 @@ mod tests {
             "0: R1=ctx R10=fp0\n{MARKER} {}\nprocessed 1000001 insns (limit 1000000) max_states_per_insn 1\n",
             "x".repeat(300 * 1024)
         );
-        assert!(log.len() > 267 * 1024, "the synthetic log must dwarf the dump");
+        assert!(
+            log.len() > 267 * 1024,
+            "the synthetic log must dwarf the dump"
+        );
         let failure = || {
             anyhow::Error::from(aya::programs::ProgramError::LoadError {
                 io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
@@ -7715,8 +7721,7 @@ mod tests {
                         .unwrap()
                         .iter()
                         .find(|gap| gap["subject"] == "native usage feed unavailable")
-                        .unwrap_or_else(|| panic!("{}", document["gaps"]))
-                        ["reason"]
+                        .unwrap_or_else(|| panic!("{}", document["gaps"]))["reason"]
                         .as_str()
                         .unwrap()
                         .to_string()

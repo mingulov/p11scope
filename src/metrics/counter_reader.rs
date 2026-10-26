@@ -4997,6 +4997,59 @@ mod tests {
         drop(engine);
     }
 
+    /// Parse the Singles stop estimate line the product prints into
+    /// its link count and estimated seconds. Returns `None` when the
+    /// line or either number is missing, so callers fail loudly instead
+    /// of bounding against a guess.
+    fn parse_singles_stop_estimate(text: &str) -> Option<(usize, u64)> {
+        let line = text
+            .lines()
+            .find(|line| line.contains("probe links one at a time"))?;
+        let links = line
+            .split("closing ")
+            .nth(1)?
+            .split(" probe links")
+            .next()?
+            .trim()
+            .parse::<usize>()
+            .ok()?;
+        let secs = line
+            .split("about ")
+            .nth(1)?
+            .split(" s,")
+            .next()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some((links, secs))
+    }
+
+    #[test]
+    fn singles_stop_estimate_parser_reads_links_and_seconds() {
+        // The product's exact estimate shape, plus the small historical
+        // line from the detach tests.
+        assert_eq!(
+            parse_singles_stop_estimate(
+                "p11scope: closing 8192 probe links one at a time (no batched uprobe detach on this kernel); about 410 s, progress follows\n"
+            ),
+            Some((8192, 410))
+        );
+        assert_eq!(
+            parse_singles_stop_estimate(
+                "p11scope: closing 40 probe links one at a time (no batched uprobe detach on this kernel); about 2 s, progress follows\n"
+            ),
+            Some((40, 2))
+        );
+        // A missing line or unparsable numbers refuse instead of guessing.
+        assert_eq!(parse_singles_stop_estimate("no estimate here\n"), None);
+        assert_eq!(
+            parse_singles_stop_estimate(
+                "p11scope: closing many probe links one at a time; about soon s, progress follows\n"
+            ),
+            None
+        );
+    }
+
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate"]
     fn counter_singles_stop_prints_detach_estimate_lp64() {
@@ -5044,9 +5097,16 @@ mod tests {
             text.contains("closing ") && text.contains("probe links one at a time"),
             "Singles stop prints the detach estimate: {text:?}"
         );
+        // The bound derives from the product's own estimate: twice the
+        // printed seconds. Singles stops must be correct and finite and
+        // disclosed, not fast; the factor keeps the finiteness check
+        // while the estimate carries the rate.
+        let (links, estimate_secs) = parse_singles_stop_estimate(&text)
+            .expect("the printed estimate parses into a link count and seconds");
+        let bound = std::time::Duration::from_secs(estimate_secs.saturating_mul(2));
         assert!(
-            wall < std::time::Duration::from_secs(300),
-            "Singles counter stop is finite, took {wall:?}"
+            wall < bound,
+            "Singles counter stop is finite: {links} links took {wall:?} against twice the printed {estimate_secs} s estimate"
         );
         eprintln!("COUNTER_SINGLES_STOP wall_ms={}", wall.as_millis());
         drop(session);

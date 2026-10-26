@@ -4053,6 +4053,10 @@ fn armed_expected_exit_without_views_is_not_a_lost_generation() {
     );
     engine
         .loader_registry
+        .tombstone(context)
+        .expect("tombstoning the drained loader context");
+    engine
+        .loader_registry
         .remove(context)
         .expect("draining the loader context");
     engine

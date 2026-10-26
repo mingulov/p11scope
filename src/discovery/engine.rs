@@ -21213,7 +21213,18 @@ impl Engine {
                     closure,
                 )?;
             }
-            if self.expected_target_exit && self.views.is_empty() {
+            // A settled expected removal whose follow-up bookkeeping
+            // (ended-pid proof, loader ids, parked records) is still
+            // draining: the arm proves the named exit, so the empty view
+            // set is the expected end, not a vanished generation. Record
+            // processing already ran this batch and runs every batch, so
+            // drainage — and the latch — proceed; refresh itself has no
+            // views to refresh. Without this, the first pass after the
+            // settling batch bails "no longer retained", and a
+            // short-lived `run` child exits 1 after writing its report.
+            if self.views.is_empty()
+                && (self.expected_target_exit || self.expected_target_exit_pending.is_some())
+            {
                 return Ok(false);
             }
             if !stale.is_empty() {

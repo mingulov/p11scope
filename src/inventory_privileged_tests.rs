@@ -4228,11 +4228,15 @@ fn service_to_published(
     let started = Instant::now();
     let mut polls = 0u64;
     loop {
+        // The drive line prints before the budget starts: the 10 ms
+        // service slice covers the service work, never the logging
+        // latency (a slow log, e.g. 9p in a guest, would otherwise
+        // exhaust the slice and every service would no-op).
+        joint_drive_line(lane, coordinator, tag, &format!("service{polls}"));
         let mut budget = JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
-        joint_drive_line(lane, coordinator, tag, &format!("service{polls}"));
         lane.service_joint(&mut *coordinator, JointServiceMode::Running, &mut budget)
             .map_err(|reason| {
                 joint_drive_line(lane, coordinator, tag, "service-FAILED");
@@ -4241,11 +4245,11 @@ fn service_to_published(
                     lane.joint_stuck_diagnostic_for_test(),
                 )
             })?;
+        joint_drive_line(lane, coordinator, tag, &format!("poll{polls}"));
         let mut budget = JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
-        joint_drive_line(lane, coordinator, tag, &format!("poll{polls}"));
         let commit = lane
             .poll_joint_commit(&mut *coordinator, &mut budget)
             .map_err(|reason| {
@@ -5187,11 +5191,13 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         .len();
     let mut idle_publishes = 0u64;
     for idle in 0..3 {
+        // Drive line before the budget starts (see service_to_published):
+        // logging latency must not consume the service slice.
+        joint_drive_line(&lane, &coordinator, "r16-q1", &format!("idle{idle}"));
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
-        joint_drive_line(&lane, &coordinator, "r16-q1", &format!("idle{idle}"));
         let progress = lane
             .service_joint(
                 &mut coordinator,
@@ -5697,9 +5703,12 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     // chain that would have produced it is interactive-only and covered
     // by unit scenes; everything from the wind-down entry on is live.
     // B's promotion request queues with B's real ids; its viewed frame
-    // is scripted, which the assertions never depend on: the §8.6 hold
-    // fires before any view read, and the post-retire take is proven by
-    // queue consumption plus the refusal record, never by preparation.
+    // is the scripted presentation rebound to the live capture and pair
+    // (the promoter verifies the exact pair against the immutable frame,
+    // so the raw scripted frame would refuse). The assertions never read
+    // the frame: the §8.6 hold fires before any view read, and the
+    // post-retire take is proven by queue consumption plus the refusal
+    // record, never by preparation.
     let held_display = super::promotion_driver_tests::headless_display();
     let mut driver =
         super::promotion_driver_tests::driver_with_display(&mut coordinator, held_display.display);
@@ -5720,11 +5729,11 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     let module_b = module_of(driver.coordinator, "soft-copy.so")?;
     display
         .queue_promotion_request_for_test(
-            crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test(),
+            promotion_view_for_live_pair_for_test(CaptureId::new(41), caller_b, module_b),
             caller_b,
             module_b,
         )
-        .map_err(|_| anyhow::anyhow!("B's promotion request queues"))?;
+        .map_err(|reason| anyhow::anyhow!("B's promotion request queues: {reason:?}"))?;
     eprintln!("JOINT_R16 r16c-queued b_request=ok");
 
     // The wind-down entry retires nothing yet: A's whole lane winds in

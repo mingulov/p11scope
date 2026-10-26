@@ -4960,6 +4960,167 @@ mod tests {
         drop(engine);
     }
 
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate"]
+    fn counter_singles_stop_prints_detach_estimate_lp64() {
+        // Singles growth is backend selection, not a separate code path:
+        // the same Engine seams stage and grow, and the stop reuses the
+        // existing detach drive with no new machinery.
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Singles,
+            )
+            .unwrap();
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            512
+        );
+        let full = parts.slots.clone();
+        let fresh = full[512..].to_vec();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            full,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (7680, 0));
+        assert!(
+            partials.is_empty(),
+            "clean growth marks no PARTIAL: {partials:?}"
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192
+        );
+        let stop = std::time::Instant::now();
+        let mut out = Vec::new();
+        session
+            .detach_producers_driven(|| false, &mut out)
+            .unwrap();
+        let wall = stop.elapsed();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("closing ") && text.contains("probe links one at a time"),
+            "Singles stop prints the detach estimate: {text:?}"
+        );
+        assert!(
+            wall < std::time::Duration::from_secs(300),
+            "Singles counter stop is finite, took {wall:?}"
+        );
+        eprintln!("COUNTER_SINGLES_STOP wall_ms={}", wall.as_millis());
+        drop(session);
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven Multi stop prints no one-at-a-time detach estimate"]
+    fn counter_multi_stop_prints_no_detach_estimate_lp64() {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            512
+        );
+        let stop = std::time::Instant::now();
+        let mut out = Vec::new();
+        session
+            .detach_producers_driven(|| false, &mut out)
+            .unwrap();
+        let wall = stop.elapsed();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("probe links one at a time"),
+            "Multi stop prints no detach estimate: {text:?}"
+        );
+        assert!(
+            wall < std::time::Duration::from_secs(120),
+            "Multi counter stop is finite and prompt, took {wall:?}"
+        );
+        eprintln!("COUNTER_MULTI_STOP_NO_ESTIMATE completed=1");
+        drop(session);
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: a second stop signal abandons a Singles counter detach promptly with the typed interruption"]
+    fn counter_singles_stop_second_signal_abandons_lp64() {
+        // The run_abandon_report harness shape at session level: the drive
+        // runs on this thread while a second signal arrives from another,
+        // and the drive returns the typed interruption instead of joining
+        // the remaining closes.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Singles,
+            )
+            .unwrap();
+        let grown = parts.slots[..2048].to_vec();
+        let fresh = grown[512..].to_vec();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            grown,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (completed, failed, _) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (1536, 0));
+        let second = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&second);
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let stop = std::time::Instant::now();
+        let mut out = Vec::new();
+        let error = session
+            .detach_producers_driven(|| second.load(Ordering::SeqCst), &mut out)
+            .unwrap_err();
+        let wall = stop.elapsed();
+        signal.join().unwrap();
+        assert!(
+            error.is::<crate::attach::CleanupInterrupted>(),
+            "second signal abandons with the typed interruption: {error:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("probe links one at a time"),
+            "the one-shot estimate still prints before abandonment: {text:?}"
+        );
+        assert!(
+            wall < std::time::Duration::from_secs(30),
+            "abandonment is prompt, took {wall:?}"
+        );
+        eprintln!("COUNTER_SINGLES_ABANDON interrupted=1 wall_ms={}", wall.as_millis());
+        drop(session);
+        drop(engine);
+    }
+
     const SOFT1024_CHILD: &str = "P11SCOPE_A27_SOFT1024_CHILD";
     /// Marker the re-executed child prints after `body()` returns. The
     /// parent requires this line plus libtest's `1 passed`, so a child

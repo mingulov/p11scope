@@ -1910,6 +1910,10 @@ struct WindingLane {
     /// gone, so reaping again would fail closed — and retry the
     /// completion/retire tail with the retained proof.
     joined: bool,
+    /// A stop path already disclosed this winding: later stop calls
+    /// stay silent, and the join tail skips its own disclosure when
+    /// a stray tick reaps the handoff past the stop.
+    stop_disclosed: bool,
 }
 
 /// A wound-down domain whose coordinator namespace still retires. The
@@ -1946,6 +1950,7 @@ impl RetiringDomain {
                 finish: JointFinishDriver::NotBegun,
                 joint,
                 joined: false,
+                stop_disclosed: false,
             }),
         }
     }
@@ -3464,7 +3469,8 @@ impl ClassicDriver<'_> {
             // not-ready take (framed, or a re-polled pending detach)
             // keeps the lane finishable, so the next tick reaps
             // again; only a handoff arms the joined tail — and
-            // discloses the lane's stop counts once.
+            // discloses the lane's stop counts once, unless a stop
+            // path already disclosed them.
             {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let winding = retiring.winding.as_mut().expect("winding");
@@ -3474,10 +3480,12 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| !lane.is_finished())
                 {
                     winding.joined = true;
-                    let mut warn = WarnSink {
-                        display: &mut self.display,
-                    };
-                    disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
+                    if !winding.stop_disclosed {
+                        let mut warn = WarnSink {
+                            display: &mut self.display,
+                        };
+                        disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
+                    }
                 }
             }
             if let Some(session) = session {
@@ -3934,7 +3942,8 @@ impl ClassicDriver<'_> {
     /// that. A Joint winding that never disclosed also discloses its
     /// stop counts here, like every other hold; a lane that already
     /// disclosed (joined, held, or a legacy lane disclosed at
-    /// wind-down) stays quiet. Callers run it once per stop path.
+    /// wind-down) stays quiet. Once-only per winding: the disclosed
+    /// flag keeps every later call — from any stop path — silent.
     fn record_unjoined_winding_gap(&mut self) {
         let joint = self.retiring.as_ref().and_then(|retiring| {
             retiring
@@ -3946,6 +3955,17 @@ impl ClassicDriver<'_> {
         let Some(joint) = joint else {
             return;
         };
+        let winding = self
+            .retiring
+            .as_mut()
+            .expect("winding checked above")
+            .winding
+            .as_mut()
+            .expect("winding checked above");
+        if winding.stop_disclosed {
+            return;
+        }
+        winding.stop_disclosed = true;
         self.coordinator.note_scope_gap(
             "promotion wind-down held for exit".to_string(),
             if joint {

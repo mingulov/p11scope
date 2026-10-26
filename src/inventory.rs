@@ -2235,6 +2235,28 @@ fn record_warned_for_test(line: &str) {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Every seal-readiness line the startup noted, in order. Tests
+    /// drain it through `take_sealed_for_test` (thread-local, like
+    /// the warned record above: no shared sink, so no churn in the
+    /// stop twins' exact vectors).
+    static SEALED_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the seal-line record (tests).
+#[cfg(test)]
+fn take_sealed_for_test() -> Vec<String> {
+    SEALED_FOR_TEST.with(|sealed| sealed.take())
+}
+
+/// Record one seal-readiness line (tests).
+#[cfg(test)]
+fn record_sealed_for_test(line: &str) {
+    SEALED_FOR_TEST.with(|sealed| sealed.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
 pub(crate) fn classic_semantic_stop_refusing_publication_for_test(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: crate::inventory_semantics::AttestedSemanticLane,
@@ -4158,7 +4180,7 @@ fn start_semantic_lane(
     backend: crate::attach::BackendSelection,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     use crate::inventory_semantics::AttestedSemanticLane;
-    let preparation = coordinator.prepare_semantic_subset();
+    let preparation = seal_prepare_subset(coordinator);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
             "semantic subset refused".into(),
@@ -4169,7 +4191,7 @@ fn start_semantic_lane(
     // The second mint over the same retained sources stays the lane's
     // conversion envelope; it fails only when the retained inputs
     // moved under the startup.
-    let second = coordinator.prepare_semantic_subset();
+    let second = seal_prepare_subset(coordinator);
     let convert_subset = match second.subset {
         Some(subset) => subset,
         None => {
@@ -4182,15 +4204,14 @@ fn start_semantic_lane(
             return None;
         }
     };
-    match AttestedSemanticLane::start_live(attach_subset, convert_subset, scope, backend) {
+    match seal_start_live(attach_subset, convert_subset, scope, backend) {
         Ok(lane) => Some(lane),
         Err(refusal) => {
             coordinator.note_scope_gap(
                 "semantic lane unavailable".into(),
                 format!("{refusal}; broad inventory continues without instance semantics"),
             );
-            coordinator
-                .prepare_semantic_subset()
+            seal_prepare_subset(coordinator)
                 .subset
                 .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
                 .map(|mut shell| {
@@ -4198,6 +4219,89 @@ fn start_semantic_lane(
                     shell
                 })
         }
+    }
+}
+
+/// The subset-mint boundary of the lane startup: the coordinator's
+/// real mint in production; tests queue scripted preparations
+/// through `seal_startup_test::with` instead of attesting manifests.
+fn seal_prepare_subset(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+) -> crate::discovery::engine::inventory_coordinator::semantics::SubsetPreparation {
+    #[cfg(test)]
+    if let Some(prepared) = seal_startup_test::take_prepared() {
+        return prepared;
+    }
+    coordinator.prepare_semantic_subset()
+}
+
+/// The seal boundary of the lane startup (BPF): the live lane start
+/// in production; tests script the verdict through
+/// `seal_startup_test::with` instead of loading BPF.
+fn seal_start_live(
+    attach_subset: crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+    convert_subset: crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+    scope: &Scope,
+    backend: crate::attach::BackendSelection,
+) -> Result<
+    crate::inventory_semantics::AttestedSemanticLane,
+    crate::inventory_semantics::SemanticRefusal,
+> {
+    #[cfg(test)]
+    if let Some(verdict) = seal_startup_test::take_start_verdict() {
+        return verdict;
+    }
+    crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        scope,
+        backend,
+    )
+}
+
+#[cfg(test)]
+mod seal_startup_test {
+    //! Scripted lane startups: queued subset preparations plus one
+    //! live-start verdict, consumed in order by the startup above, so
+    //! the seal twins drive the real match arms without manifests or
+    //! BPF. The `with` guard clears leftovers, so a twin that returns
+    //! early cannot leak scripts into the next test on its thread.
+    use super::*;
+    use std::collections::VecDeque;
+    type Preparation =
+        crate::discovery::engine::inventory_coordinator::semantics::SubsetPreparation;
+    type StartVerdict = Result<
+        crate::inventory_semantics::AttestedSemanticLane,
+        crate::inventory_semantics::SemanticRefusal,
+    >;
+    thread_local! {
+        static PREPARE: std::cell::RefCell<VecDeque<Preparation>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
+        static START: std::cell::RefCell<Option<StartVerdict>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn take_prepared() -> Option<Preparation> {
+        PREPARE.with(|queued| queued.borrow_mut().pop_front())
+    }
+    pub(super) fn take_start_verdict() -> Option<StartVerdict> {
+        START.with(|verdict| verdict.borrow_mut().take())
+    }
+    pub(super) fn with<R>(
+        prepares: Vec<Preparation>,
+        start: Option<StartVerdict>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PREPARE.with(|queued| queued.borrow_mut().clear());
+                START.with(|verdict| verdict.borrow_mut().take());
+            }
+        }
+        PREPARE.with(|queued| queued.borrow_mut().extend(prepares));
+        START.with(|verdict| *verdict.borrow_mut() = start);
+        let _restore = Restore;
+        run()
     }
 }
 
@@ -15814,6 +15918,346 @@ mod promotion_driver_tests {
         );
     }
 
+    /// A shell lane over a scripted subset, without substituted I/O:
+    /// no live session, so its stop counts are unreadable.
+    fn shell_lane_for_wind_down() -> crate::inventory_semantics::AttestedSemanticLane {
+        use crate::discovery::identity::PinnedObjectId;
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        let subset =
+            crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![slot]),
+                crate::discovery::identity::PinnedObjects::empty(),
+                std::collections::BTreeMap::from([(
+                    PinnedObjectId(0),
+                    std::collections::BTreeSet::from([0]),
+                )]),
+            );
+        crate::inventory_semantics::AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            crate::attach::BackendSelection::Auto,
+        )
+        .expect("shell lane starts")
+    }
+
+    /// Stop counts for the final lane twin, distinct from the
+    /// winding lane's in every field.
+    fn distinct_final_stop_counts() -> crate::inventory_semantics::ScriptedStopCounts {
+        use crate::attach::image_query::ImageQueryRefusal;
+        let mut refusal_counts = [0u64; 12];
+        for _ in 0..3 {
+            crate::inventory_semantics::count_scan_refusals(
+                &mut refusal_counts,
+                &[ImageQueryRefusal::Unknown],
+            );
+        }
+        crate::inventory_semantics::ScriptedStopCounts {
+            refusal_counts,
+            collected_calls: 11,
+            joined_calls: 3,
+            scan_refusals: 5,
+        }
+    }
+
+    /// The stop line the final-lane twin expects: its own scripted
+    /// collected/joined/refused, its own real shed, no bound callers.
+    fn expected_final_stop_line() -> String {
+        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 5)
+    }
+
+    #[test]
+    fn joint_stop_during_winding_discloses_once() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A stop while A's promotion finish still winds discloses A's
+        // stop counts before the final commit: the drop hold stays
+        // silent, so the stop path is the winding lane's only honest
+        // disclosure.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), true);
+            let counts = scripted_nonzero_stop_counts();
+            lane.set_scripted_stop_counts_for_test(Some(counts));
+            lane.note_shed_calls(7);
+            driver.semantic = Some(lane);
+            install_promotion_for_wind_down(&mut driver);
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            assert!(
+                take_warned_for_test().is_empty(),
+                "no disclosure at wind-down start"
+            );
+            driver.on_stop_requested();
+            assert_eq!(
+                take_warned_for_test(),
+                vec![expected_stop_line()],
+                "the stop discloses the winding lane once"
+            );
+            driver
+                .coordinator
+                .commit_batch(false)
+                .expect("the final commit runs");
+            let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+            assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+            assert_eq!(
+                scans[0].1,
+                crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                    .expect("nonzero refusals name a reason"),
+                "the gap carries the winding lane's per-reason counts"
+            );
+            // A further stop and the lane-stop hook disclose nothing
+            // more; the driver drops below with the winding held.
+            driver.on_stop_requested();
+            driver.on_lane_stopped();
+            assert!(
+                take_warned_for_test().is_empty(),
+                "the winding lane discloses exactly once"
+            );
+        }
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the drop hold stays silent"
+        );
+    }
+
+    #[test]
+    fn joint_stop_during_winding_after_join_discloses_nothing_more() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A winding that already handed its session off disclosed at
+        // the join; a later stop must not print its counts again.
+        // After the take the lane reads zeros, so a second line would
+        // invent them.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        // The seal drains before the completion, as in production.
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the join discloses once"
+        );
+        driver.on_stop_requested();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the stop discloses nothing more for a joined winding"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "still exactly one scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap still carries the join's per-reason counts"
+        );
+    }
+
+    #[test]
+    fn joint_stop_winding_and_final_lane_both_disclose_once() {
+        use crate::inventory_semantics::SemanticRefusal;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A stop with A's finish winding and B seated discloses both
+        // lanes, each once with its own counts: A at the stop, B at
+        // its exit hold.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane_a = joint_lane(WindDownIo::completing(), true);
+        let counts_a = scripted_nonzero_stop_counts();
+        lane_a.set_scripted_stop_counts_for_test(Some(counts_a));
+        lane_a.note_shed_calls(7);
+        driver.semantic = Some(lane_a);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        let mut lane_b = joint_lane(WindDownIo::completing(), false);
+        let counts_b = distinct_final_stop_counts();
+        lane_b.set_scripted_stop_counts_for_test(Some(counts_b));
+        lane_b.note_shed_calls(4);
+        lane_b.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane_b);
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure before the stop"
+        );
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Polling,
+            "the final lane begins at the stop"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the stop discloses the winding lane once"
+        );
+        // The disposition admits B's abandon at the exit hold.
+        driver
+            .semantic
+            .as_mut()
+            .expect("final lane")
+            .note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        driver.on_stop_requested();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second stop escalates the final lane"
+        );
+        assert!(driver.semantic.is_none(), "the final lane is held");
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_final_stop_line()],
+            "the exit hold discloses the final lane once, with its own counts"
+        );
+        // Neither lane discloses twice.
+        driver.on_lane_stopped();
+        driver.on_stop_requested();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "neither lane discloses twice"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 2, "one scan-refusal gap per lane");
+        let mut reasons: Vec<String> = scans.into_iter().map(|(_, reason)| reason).collect();
+        reasons.sort();
+        let mut expected = vec![
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts_a.refusal_counts)
+                .expect("A refused"),
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts_b.refusal_counts)
+                .expect("B refused"),
+        ];
+        expected.sort();
+        assert_eq!(
+            reasons, expected,
+            "each gap carries its own lane's per-reason counts"
+        );
+    }
+
+    #[test]
+    fn joint_stop_winding_without_live_session_names_unknown_counts() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A winding whose counts are unreadable (no live session left
+        // to read) still discloses: a named gap says its
+        // key-operation counts after the promotion began are unknown.
+        // Never a silent hold, never an invented zero line.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = shell_lane_for_wind_down();
+        assert!(!lane.is_live(), "the shell lane owns no session");
+        lane.set_test_joint_machine(true);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Polling,
+            "the scripted begin keeps the winding lane"
+        );
+        driver.on_stop_requested();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no invented zero line for unreadable counts"
+        );
+        let unknown: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "winding lane key-operation counts unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "exactly one unknown-counts gap");
+        assert_eq!(
+            unknown[0].1,
+            "stop held the winding lane with its counts unreadable; \
+             its key-operation counts after the promotion began are unknown",
+            "the gap names the unknown post-promotion counts"
+        );
+    }
+
+    #[test]
+    fn legacy_stop_during_winding_warns_nothing_new() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A legacy winding disclosed at wind-down through the terminal
+        // sequence; the stop holds it with its gap only and warns no
+        // second stop line.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                0, 0, 0, 0, 0
+            )],
+            "the wind-down discloses the legacy lane once"
+        );
+        driver.on_stop_requested();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the stop warns no second line for a legacy winding"
+        );
+    }
+
     #[test]
     fn joint_driver_wound_down_error_exits_retained() {
         let mut coordinator = coordinator();
@@ -17311,5 +17755,242 @@ mod promotion_driver_tests {
     // contract's `joint_cells` module (§8.7).
     mod joint_cells {
         include!("inventory_joint_cells_tests.rs");
+    }
+}
+
+#[cfg(test)]
+mod seal_readiness_tests {
+    //! The seal-readiness line (T6): the startup notes one stderr
+    //! line when the semantic lane seals, so users and scripts know
+    //! from when newly started programs are covered. The scripted
+    //! startups drive the real match arms without manifests or BPF.
+    use super::promotion_driver_tests::{WindDownIo, joint_lane};
+    use super::*;
+    use crate::discovery::engine::inventory_coordinator::semantics::{
+        AttestedSubset, SubsetPreparation,
+    };
+    use crate::inventory_semantics::SemanticRefusal;
+
+    /// The exact seal line, pinned as a literal: the wording is the
+    /// contract with users and scripts, independent of the builder.
+    const SEAL_LINE: &str =
+        "p11scope: key-operation lane sealed; programs started from now on are covered";
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            crate::discovery::hooks::HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            crate::discovery::caller_registry::RegistryLimits::default_limits(),
+        )
+        .expect("test coordinator builds")
+    }
+
+    /// A scripted subset, like the wind-down lane's: the preparations
+    /// carry real subset values without attesting manifests.
+    fn scripted_subset() -> AttestedSubset {
+        use crate::discovery::identity::PinnedObjectId;
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        AttestedSubset::scripted(
+            crate::plan::AttachPlan::from_slots(vec![slot]),
+            crate::discovery::identity::PinnedObjects::empty(),
+            std::collections::BTreeMap::from([(
+                PinnedObjectId(0),
+                std::collections::BTreeSet::from([0]),
+            )]),
+        )
+    }
+
+    fn some_preparation() -> SubsetPreparation {
+        SubsetPreparation {
+            subset: Some(scripted_subset()),
+            refusals: Vec::new(),
+        }
+    }
+
+    fn gaps_for_subject(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        subject: &str,
+    ) -> Vec<(String, String)> {
+        coordinator.registry_mut().publish();
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .filter(|(candidate, _)| candidate == subject)
+            .collect()
+    }
+
+    #[test]
+    fn seal_line_present_once_on_sealed_path() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        // A live start that seals notes exactly one line with the
+        // exact wording.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                )
+            },
+        );
+        assert!(lane.is_some(), "the scripted seal seats a lane");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE.to_string()],
+            "exactly one seal line with the exact wording"
+        );
+    }
+
+    #[test]
+    fn seal_line_absent_without_manifest_subset() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        // No manifests: the real mint yields no subset, no lane seats,
+        // and no seal line prints. (The run also short-circuits empty
+        // manifests before the startup; this pins the function arm a
+        // line at the top would break.)
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = start_semantic_lane(
+            &mut coordinator,
+            &scope,
+            crate::attach::BackendSelection::Auto,
+        );
+        assert!(lane.is_none(), "no subset seats no lane");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal without a subset"
+        );
+    }
+
+    #[test]
+    fn seal_line_absent_when_attach_subset_refused() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        // The attach mint refuses: no lane seats, the refusal's own
+        // gap stays, and no seal line prints.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::Unattested],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line on a refused mint"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+            1,
+            "the refusal's own disclosure stays"
+        );
+    }
+
+    #[test]
+    fn seal_line_absent_when_conversion_subset_refused() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        // The attach mint succeeds but the conversion envelope
+        // refuses: no lane seats and no seal line prints.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![
+                some_preparation(),
+                SubsetPreparation {
+                    subset: None,
+                    refusals: vec![SemanticRefusal::Unattested],
+                },
+            ],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused envelope seats no lane");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line on a refused envelope"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+            1,
+            "the refusal's own disclosure stays"
+        );
+    }
+
+    #[test]
+    fn seal_line_absent_when_start_refuses() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        // The live start is attempted and refused: the shell fallback
+        // seats with the refusal's own disclosure, and no seal line
+        // prints. (A line before the seal would fail this twin.)
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![some_preparation(), some_preparation(), some_preparation()],
+            Some(Err(SemanticRefusal::Unavailable)),
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                )
+            },
+        );
+        let lane = lane.expect("the shell fallback seats");
+        assert!(!lane.is_live(), "the fallback owns no session");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line on a refused start"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "semantic lane unavailable").len(),
+            1,
+            "the refusal's own disclosure stays"
+        );
     }
 }

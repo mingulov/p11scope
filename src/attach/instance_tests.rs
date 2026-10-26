@@ -15,7 +15,10 @@ use crate::semantic_capture::{
     InvalidationScope, SemanticCapture, TickLimits, TickOutcome, TickReport,
 };
 use anyhow::ensure;
-use p11scope_ebpf_common::{EventRecord, SlotSemantics, event_type, instance};
+use p11scope_ebpf_common::{
+    EventRecord, ImageIdentity, InstanceRecord, JournalAdmissionControl, SlotSemantics, event_type,
+    instance, journal_marker,
+};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{mapping_file_key, open_object};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -287,6 +290,7 @@ struct Harness {
     offsets: BTreeMap<u32, u64>,
 
     routed: Vec<Routed>,
+    images: Vec<ImageIdentity>,
     retired_images: Vec<p11scope_ebpf_common::ImageIdentity>,
     retired_instances: Vec<InstanceId>,
     retired_tasks: Vec<u64>,
@@ -306,9 +310,28 @@ impl Harness {
         pins: &PinnedObjects,
         backend: BackendSelection,
     ) -> Result<Self> {
+        Self::start_with_scope(plan, &Scope::Pid(pid), pins, backend)
+    }
+
+    /// Cgroup-scoped twin of [`Harness::start`]: the same Session start and
+    /// the same checks, with the caller's cgroup scope instead of a PID.
+    fn start_cgroup(plan: &AttachPlan, scope: &Scope, pins: &PinnedObjects) -> Result<Self> {
+        ensure!(
+            matches!(scope, Scope::Cgroup { .. }),
+            "start_cgroup needs a cgroup scope"
+        );
+        Self::start_with_scope(plan, scope, pins, BackendSelection::Singles)
+    }
+
+    fn start_with_scope(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+        backend: BackendSelection,
+    ) -> Result<Self> {
         let session = Session::start(
             plan,
-            &Scope::Pid(pid),
+            scope,
             pins,
             CapturePolicy::Allowlisted,
             None,
@@ -346,6 +369,7 @@ impl Harness {
             offsets,
 
             routed: Vec::new(),
+            images: Vec::new(),
             retired_images: Vec::new(),
             retired_instances: Vec::new(),
             retired_tasks: Vec::new(),
@@ -386,11 +410,14 @@ impl Harness {
         let last = report.observations.last().cloned();
         for outcome in report.into_outcomes() {
             match outcome {
-                TickOutcome::Call(call) => self.routed.push(Routed {
-                    slot: call.record().event.slot,
-                    tag: call.record().event.slot_id,
-                    route: call.route(),
-                }),
+                TickOutcome::Call(call) => {
+                    self.images.push(call.image());
+                    self.routed.push(Routed {
+                        slot: call.record().event.slot,
+                        tag: call.record().event.slot_id,
+                        route: call.route(),
+                    });
+                }
                 TickOutcome::Invalidation(change) => match change.scope() {
                     InvalidationScope::ImageRetired(image) => self.retired_images.push(*image),
                     InvalidationScope::InstancesRetired { ids, .. } => {
@@ -474,6 +501,13 @@ impl Harness {
     fn take_routed(&mut self) -> Vec<Routed> {
         std::mem::take(&mut self.routed)
     }
+
+    /// The image identities of the drained calls, index-aligned with the
+    /// [`Harness::take_routed`] vector taken at the same point: every Call
+    /// outcome pushes exactly one of each, in order.
+    fn take_images(&mut self) -> Vec<ImageIdentity> {
+        std::mem::take(&mut self.images)
+    }
 }
 
 fn single_join(routed: &[Routed]) -> Result<InstanceId> {
@@ -545,6 +579,141 @@ fn spawn_cmd_target() -> Result<CmdSetup> {
         provider,
         target,
     })
+}
+
+/// Two cmd targets sharing one provider file: the in-scope target and an
+/// out-of-scope sibling whose calls hit the same probed offsets.
+struct PairSetup {
+    _directory: tempfile::TempDir,
+    provider: PathBuf,
+    inner: Target,
+    outer: Target,
+}
+
+fn spawn_pair_targets() -> Result<PairSetup> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let args = ["cmd".as_ref(), provider.as_os_str()];
+    let mut inner = Target::spawn(&driver, &args, &[])?;
+    let ready = inner.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let mut outer = Target::spawn(&driver, &args, &[])?;
+    let ready = outer.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    ensure!(inner.pid() != outer.pid(), "sibling targets share a pid");
+    Ok(PairSetup {
+        _directory: directory,
+        provider,
+        inner,
+        outer,
+    })
+}
+
+/// The target leader's PROC_EPOCH row, if the kernel created one.
+fn proc_record_of(harness: &Harness, target: &Target) -> Result<Option<InstanceRecord>> {
+    harness.session.instance_maps().record(target.pin.pidfd()?)
+}
+
+/// The row's marker word, or 0 when no row exists. `InstanceRecord` has no
+/// Debug impl, so cells format rows through this and [`marker_summary`].
+fn marker_word_of(record: &Option<InstanceRecord>) -> u64 {
+    record.map(|record| record.journal_bootstrap).unwrap_or(0)
+}
+
+fn marker_summary(record: &Option<InstanceRecord>) -> String {
+    match record {
+        None => "no row".to_string(),
+        Some(record) => format!(
+            "word {:#x} gen {}",
+            record.journal_bootstrap, record.exec_attach_gen
+        ),
+    }
+}
+
+/// The session's marker admission row, read directly through the session's
+/// instance maps.
+fn admission_of(harness: &Harness) -> Result<JournalAdmissionControl> {
+    harness.session.instance_maps().journal_admission_control()
+}
+
+/// The READY exec ID of a row that must already be published, or a loud
+/// refusal naming the actual word.
+fn ready_exec_of(record: &Option<InstanceRecord>, what: &str) -> Result<u64> {
+    let word = marker_word_of(record);
+    match journal_marker::read_word(word) {
+        journal_marker::MarkerRead::Ready(exec) => Ok(exec),
+        other => bail!(
+            "{what} must publish READY, got {other:?} ({})",
+            marker_summary(record),
+        ),
+    }
+}
+
+/// Pumps `rounds` ticks and returns whatever routed. For pins where the
+/// expected outcome is silence (an out-of-scope return emits no call).
+fn pump_rounds(harness: &mut Harness, target: &Target, rounds: u32) -> Result<Vec<Routed>> {
+    for _ in 0..rounds {
+        harness.pump(target)?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(harness.take_routed())
+}
+
+/// The process's current cgroup v2 directory: parses the `0::` line of
+/// `/proc/<pid>/cgroup` under the v2 mount.
+fn current_cgroup(pid: u32) -> Result<PathBuf> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    for line in text.lines() {
+        if let Some(relative) = line.strip_prefix("0::") {
+            return Ok(PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/')));
+        }
+    }
+    bail!("no cgroup v2 entry for process {pid}: {text:?}")
+}
+
+/// Moves the whole process to `cgroup` and proves the move landed: a
+/// misplaced process would flip every later scope assertion, so a silent
+/// miss must fail here instead.
+fn move_process_to(pid: u32, cgroup: &Path) -> Result<()> {
+    std::fs::write(cgroup.join("cgroup.procs"), pid.to_string())
+        .with_context(|| format!("moving {pid} to {}", cgroup.display()))?;
+    let placed = current_cgroup(pid)?;
+    ensure!(
+        placed == cgroup,
+        "process {pid} did not land in {} (in {})",
+        cgroup.display(),
+        placed.display()
+    );
+    Ok(())
+}
+
+/// One privately owned cgroup v2 child for the marker scope cells. The cell
+/// moves its target back out and removes the directory explicitly; Drop
+/// only best-effort retries the removal.
+struct MarkerCgroup {
+    path: PathBuf,
+}
+
+impl MarkerCgroup {
+    fn create(tag: &str) -> Result<Self> {
+        let path = PathBuf::from(format!(
+            "/sys/fs/cgroup/p11scope-marker-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn move_in(&self, pid: u32) -> Result<()> {
+        move_process_to(pid, &self.path)
+    }
+}
+
+impl Drop for MarkerCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
 /// Timeout-only reads of the owned fixture's actual capture path.
@@ -2568,6 +2737,449 @@ fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
     ensure!(harness.false_joins().is_empty());
     ensure!(after.faults == 0 && harness.misses == 0);
     ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker: an exec before closure publishes nothing; the first exec
+/// after the mint publishes READY with the minted generation and one
+/// admission, and the next call carries the same exec ID.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "a fresh session must not have minted a closure"
+    );
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let before = harness.take_images();
+    ensure!(before.len() == 1, "one call, one image");
+    // Pre-closure twin: an exec with no minted generation publishes
+    // nothing and spends nothing.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let pre = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&pre) == 0,
+        "a pre-closure exec must leave word 0 or no row: {}",
+        marker_summary(&pre)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a pre-closure exec must spend nothing: {control:?}"
+    );
+    // Closure, then the exec under test.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "a post-closure exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    // The first call after the exec carries the published exec ID.
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let images = harness.take_images();
+    ensure!(images.len() == 1, "one call, one image");
+    ensure!(
+        images[0].exec_id == exec,
+        "the post-exec call must carry the published exec id: call {} marker {exec}",
+        images[0].exec_id
+    );
+    ensure!(
+        exec > before[0].exec_id,
+        "the exec must advance the exec id: {exec} <= {}",
+        before[0].exec_id
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker: a non-leader exec gives the fresh leader its own READY
+/// row with one admission and no latch. Post-exec calls stay untraced
+/// (the neighbor detachment gate pins that bound), so this cell reads the
+/// row, never events.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, pid, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "the mint spends nothing: {control:?}"
+    );
+    let ready = target.command(b'E')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 2 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after nonleader exec: {ready}"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the fresh leader")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "the fresh row must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one fresh leader, one admission: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_NONLEADER_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker: a fork without exec publishes nothing. The reaped child
+/// keeps no row (task storage dies with the task), every marker write
+/// charges first, and the parent's row is untouched.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, target.pid(), &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let parent_before = proc_record_of(&harness, &target)?;
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "the mint spends nothing: {control:?}"
+    );
+    let forked = target.command(b'f')?;
+    ensure!(forked == "FORKED", "{forked}");
+    let parent_after = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&parent_after) == marker_word_of(&parent_before)
+            && parent_after.map(|row| row.exec_attach_gen)
+                == parent_before.map(|row| row.exec_attach_gen),
+        "a fork must not touch the parent row: {} -> {}",
+        marker_summary(&parent_before),
+        marker_summary(&parent_after)
+    );
+    ensure!(
+        marker_word_of(&parent_after) == 0,
+        "the parent must have no READY without an exec: {}",
+        marker_summary(&parent_after)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a fork must charge nothing: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_FORK control={control:?} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker: a process outside Scope::Pid dirties its own row once no
+/// matter how often it calls, and a later exec keeps DIRTY. The in-scope
+/// target's calls never dirty. PID scope follows no children by
+/// construction, so the outsider stays out for the whole cell.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_out_of_scope_call_dirties_once() -> Result<()> {
+    let PairSetup {
+        _directory,
+        provider,
+        mut inner,
+        mut outer,
+    } = spawn_pair_targets()?;
+    let (_view, pins, plan, _key) = pin_and_plan(inner.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, inner.pid(), &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    // Twin: the in-scope target joins, spending nothing and dirtying nothing.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    // Two out-of-scope calls: one DIRTY, one admission.
+    outer.command(b'c')?;
+    outer.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "out-of-scope calls must dirty the outsider row: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "two calls, one admission: {control:?}"
+    );
+    // A later exec by the same leader keeps DIRTY and spends nothing.
+    let ready = outer.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a DIRTY exec spends nothing: {control:?}"
+    );
+    // The in-scope target still joins with a clean row.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_OUT_OF_SCOPE minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Birth marker under Scope::Cgroup: READY after closure, then a move out
+/// and one call stick DIRTY across the move back, another call, and a
+/// later in-scope exec. The private cgroup is removed at the end.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("gap")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    // One call outside the cgroup dirties without charging: the row is READY.
+    move_process_to(pid, &home)?;
+    target.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    // Back inside: a call still joins (S1 continues) and keeps DIRTY.
+    group.move_in(pid)?;
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let reentered = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&reentered) == journal_marker::MARKER_DIRTY,
+        "re-entry must not clear DIRTY: {}",
+        marker_summary(&reentered)
+    );
+    // A later in-scope exec keeps DIRTY and spends nothing.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an in-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "sticky DIRTY spends nothing more: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_CGROUP_GAP exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker return-side twin: one provider call held inside the
+/// provider while the process leaves the cgroup dirties on return, with no
+/// other call in between. The same held call released in scope leaves READY.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("return")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let published = journal_marker::ready_word(exec);
+    // Healthy twin: hold and release inside the scope; the word never moves.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "an in-scope entry must not mark"
+    );
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "an in-scope return must not mark"
+    );
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let images = harness.take_images();
+    ensure!(
+        images.len() == 1 && images[0].exec_id == exec,
+        "the released call must carry the published exec id"
+    );
+    // The return under test: hold in scope, release outside it.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    move_process_to(pid, &home)?;
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    let marked = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&marked) == journal_marker::MARKER_DIRTY,
+        "an out-of-scope return must dirty: {}",
+        marker_summary(&marked)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "the return charged nothing: {control:?}"
+    );
+    // The discarded return emitted no call, and the ledger shows the held
+    // call as the only one between the hold and the release: only the
+    // return path can have marked it.
+    let stray = pump_rounds(&mut harness, &target, 10)?;
+    ensure!(
+        stray.is_empty(),
+        "the out-of-scope return must emit no call"
+    );
+    let ledger = &target.ledger;
+    ensure!(
+        ledger.len() >= 2
+            && ledger[ledger.len() - 2] == "HELD"
+            && ledger[ledger.len() - 1].starts_with("UNHELD"),
+        "no other call ran between the hold and the release"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_RETURN_OUTSIDE_SCOPE exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
     Ok(())
 }
 

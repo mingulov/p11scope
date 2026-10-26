@@ -749,6 +749,39 @@ impl Invalidation {
             position,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        self.scope.owned_storage_bytes()
+    }
+}
+
+impl InvalidationScope {
+    /// Nested id-list bytes owned by this scope. Only `InstancesRetired`
+    /// owns heap ids; every other scope is inline. The match stays
+    /// exhaustive so a future id-carrying scope must account itself here.
+    #[cfg(test)]
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        match self {
+            InvalidationScope::InstancesRetired { ids, .. } => {
+                let capacity = ids.capacity();
+                capacity
+                    .checked_mul(std::mem::size_of::<InstanceId>())?
+                    .checked_add(if capacity == 0 {
+                        0
+                    } else {
+                        crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING
+                    })
+            }
+            InvalidationScope::CoverageFailed
+            | InvalidationScope::AuthorityExhausted
+            | InvalidationScope::FaultEra
+            | InvalidationScope::ImageRetired(_)
+            | InvalidationScope::TaskRetired(_)
+            | InvalidationScope::File { .. }
+            | InvalidationScope::Stopped => Some(0),
+        }
+    }
 }
 impl fmt::Debug for Invalidation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -808,6 +841,17 @@ impl TickOutcome {
             TickOutcome::Call(call) => call.token(),
             TickOutcome::Invalidation(invalidation) => invalidation.position(),
             TickOutcome::Other(other) => other.position(),
+        }
+    }
+
+    /// Nested allocations owned by this outcome. Calls and other records
+    /// are fully inline (their event records are `Copy`); only an
+    /// invalidation may own a heap id list.
+    #[cfg(test)]
+    pub(crate) fn owned_storage_bytes(&self) -> Option<usize> {
+        match self {
+            TickOutcome::Call(_) | TickOutcome::Other(_) => Some(0),
+            TickOutcome::Invalidation(invalidation) => invalidation.owned_storage_bytes(),
         }
     }
 }

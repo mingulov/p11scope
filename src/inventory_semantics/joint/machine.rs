@@ -485,6 +485,62 @@ fn array_bytes<T>(capacity: usize) -> Option<usize> {
         })
 }
 
+/// Binding budgets computed from measured Binding inputs. A pure function
+/// of its arguments so tests can exercise the exact production formula.
+struct CollectedBudgets {
+    receipt_limit: usize,
+    nested_per_receipt: usize,
+    nested_limit: usize,
+    bytes: usize,
+}
+
+fn collected_budgets(
+    partitions: usize,
+    stashed_count: usize,
+    stashed_nested: usize,
+    watched_bound: usize,
+) -> Option<CollectedBudgets> {
+    let receipt_limit = partitions
+        .checked_add(stashed_count)?
+        .checked_add(REFRESHES_PER_BIND)?;
+    let allocation_limit = receipt_limit.checked_next_power_of_two()?;
+    let nested_per_receipt =
+        array_bytes::<InstanceId>(MAX_INSTANCES)?.checked_add(watched_bound)?;
+    // Nested bytes are bounded globally, not per receipt times the
+    // count: every pass receipt names its own partition's current
+    // instances from the router's shared minted pool, so the distinct
+    // keys together name at most MAX_INSTANCES ids. Each id list is
+    // collected with capacity at most twice its length plus one
+    // minimal allocation (pinned-toolchain growth law), plus its own
+    // padding and one watched-file copy. The merge checks below
+    // enforce this cumulative limit before taking any batch.
+    let tick_nested = (|| {
+        MAX_INSTANCES
+            .checked_mul(2)?
+            .checked_add(partitions.checked_mul(4)?)?
+            .checked_mul(size_of::<InstanceId>())?
+            .checked_add(partitions.checked_mul(OWNED_ALLOCATION_PADDING)?)?
+            .checked_add(partitions.checked_mul(watched_bound)?)
+    })()?;
+    let nested_limit = tick_nested.checked_add(stashed_nested)?;
+    // Both the accumulator and the current callback's original buffers
+    // coexist. Each Current keeps its actual IDs/watched-file allocation.
+    // Empty-input retries resolve those same jobs, never add interests.
+    let bytes = (|| {
+        size_of::<CollectedReports>()
+            .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
+            .checked_add(array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?)?
+            .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
+            .checked_add(nested_limit.checked_mul(2)?)
+    })()?;
+    Some(CollectedBudgets {
+        receipt_limit,
+        nested_per_receipt,
+        nested_limit,
+        bytes,
+    })
+}
+
 impl CollectedReports {
     fn new(
         lane: &AttestedSemanticLane,
@@ -540,13 +596,6 @@ impl CollectedReports {
                     .ok_or(SemanticRefusal::ProviderStorage)?;
             }
         }
-        let receipt_limit = partitions
-            .checked_add(stashed_count)
-            .and_then(|count| count.checked_add(REFRESHES_PER_BIND))
-            .ok_or(SemanticRefusal::ProviderStorage)?;
-        let allocation_limit = receipt_limit
-            .checked_next_power_of_two()
-            .ok_or(SemanticRefusal::ProviderStorage)?;
         let mut watched_bound = 0;
         for object in lane.subset().required().keys() {
             watched_bound = watched_bound.max(
@@ -556,44 +605,10 @@ impl CollectedReports {
                     .ok_or(SemanticRefusal::ProviderStorage)?,
             );
         }
-        let nested_per_receipt = array_bytes::<InstanceId>(MAX_INSTANCES)
-            .and_then(|bytes| bytes.checked_add(watched_bound))
+        let budgets = collected_budgets(partitions, stashed_count, stashed_nested, watched_bound)
             .ok_or(SemanticRefusal::ProviderStorage)?;
-        // Nested bytes are bounded globally, not per receipt times the
-        // count: every pass receipt names its own partition's current
-        // instances from the router's shared minted pool, so the distinct
-        // keys together name at most MAX_INSTANCES ids. Each id list is
-        // collected with capacity at most twice its length plus one
-        // minimal allocation (pinned-toolchain growth law), plus its own
-        // padding and one watched-file copy. The merge checks below
-        // enforce this cumulative limit before taking any batch.
-        let tick_nested = (|| {
-            MAX_INSTANCES
-                .checked_mul(2)?
-                .checked_add(partitions.checked_mul(4)?)?
-                .checked_mul(size_of::<InstanceId>())?
-                .checked_add(partitions.checked_mul(OWNED_ALLOCATION_PADDING)?)?
-                .checked_add(partitions.checked_mul(watched_bound)?)
-        })()
-        .ok_or(SemanticRefusal::ProviderStorage)?;
-        let nested_limit = tick_nested
-            .checked_add(stashed_nested)
-            .ok_or(SemanticRefusal::ProviderStorage)?;
-        // Both the accumulator and the current callback's original buffers
-        // coexist. Each Current keeps its actual IDs/watched-file allocation.
-        // Empty-input retries resolve those same jobs, never add interests.
-        let bytes = (|| {
-            size_of::<Self>()
-                .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
-                .checked_add(
-                    array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?,
-                )?
-                .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
-                .checked_add(nested_limit.checked_mul(2)?)
-        })()
-        .ok_or(SemanticRefusal::ProviderStorage)?;
         let storage = reserve
-            .reserve(bytes)
+            .reserve(budgets.bytes)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
         let mut outcomes = Vec::new();
         let mut current = Vec::new();
@@ -602,13 +617,13 @@ impl CollectedReports {
             .try_reserve_exact(MAX_INSTANCES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
         current
-            .try_reserve_exact(receipt_limit)
+            .try_reserve_exact(budgets.receipt_limit)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
         negatives
             .try_reserve_exact(MAX_LANE_NEGATIVES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
         if outcomes.capacity() != MAX_INSTANCES
-            || current.capacity() != receipt_limit
+            || current.capacity() != budgets.receipt_limit
             || negatives.capacity() != MAX_LANE_NEGATIVES
         {
             return Err(SemanticRefusal::ProviderStorage);
@@ -625,12 +640,76 @@ impl CollectedReports {
                 exhausted: false,
             }),
             refused: None,
-            receipt_limit,
-            nested_per_receipt,
-            nested_limit,
+            receipt_limit: budgets.receipt_limit,
+            nested_per_receipt: budgets.nested_per_receipt,
+            nested_limit: budgets.nested_limit,
             nested_used: 0,
             _storage: storage,
         })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        domain: crate::attach::capture::NativeDomainId,
+        budgets: CollectedBudgets,
+        storage: ResourceLease,
+    ) -> Result<Self, SemanticRefusal> {
+        let mut outcomes = Vec::new();
+        let mut current = Vec::new();
+        let mut negatives = Vec::new();
+        outcomes
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        current
+            .try_reserve_exact(budgets.receipt_limit)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        negatives
+            .try_reserve_exact(MAX_LANE_NEGATIVES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        if outcomes.capacity() != MAX_INSTANCES
+            || current.capacity() != budgets.receipt_limit
+            || negatives.capacity() != MAX_LANE_NEGATIVES
+        {
+            return Err(SemanticRefusal::ProviderStorage);
+        }
+        Ok(Self {
+            batch: Some(SemanticBatch {
+                domain,
+                outcomes,
+                current,
+                negatives,
+                observed_ns: 0,
+                awaiting_floor: None,
+                shed_floor: None,
+                exhausted: false,
+            }),
+            refused: None,
+            receipt_limit: budgets.receipt_limit,
+            nested_per_receipt: budgets.nested_per_receipt,
+            nested_limit: budgets.nested_limit,
+            nested_used: 0,
+            _storage: storage,
+        })
+    }
+
+    #[cfg(test)]
+    fn receipt_limit_for_test(&self) -> usize {
+        self.receipt_limit
+    }
+
+    #[cfg(test)]
+    fn nested_per_receipt_for_test(&self) -> usize {
+        self.nested_per_receipt
+    }
+
+    #[cfg(test)]
+    fn nested_limit_for_test(&self) -> usize {
+        self.nested_limit
+    }
+
+    #[cfg(test)]
+    fn nested_used_for_test(&self) -> usize {
+        self.nested_used
     }
 
     fn merge(&mut self, mut incoming: SemanticBatch) -> Result<bool, SemanticRefusal> {
@@ -3527,5 +3606,326 @@ impl AttestedSemanticLane {
         self.with_machine(coordinator, |machine, lane, coordinator, io| {
             machine.poll_commit_with_io(lane, coordinator, io, budget)
         })
+    }
+}
+
+#[cfg(test)]
+mod binding_reservation_tests {
+    use super::*;
+    use crate::attach::capture::NativeDomainId;
+    use crate::attach::image_query::CompleteEpochs;
+    use crate::discovery::identity::RetainedInventoryTarget;
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    use crate::process::PidPin;
+    use crate::semantic_capture::{Endpoint, Invalidation, InvalidationScope};
+    use crate::semantics_edge::resources::{SEMANTIC_RESOURCE_LIMIT, SemanticResourcePool};
+    use p11scope_ebpf_common::ImageIdentity;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn watched_target() -> RetainedInventoryTarget {
+        let pins = real_scan_pin(
+            &std::env::current_exe().unwrap(),
+            None,
+            1,
+            "binding-reservation-test",
+        );
+        pins.retain_inventory_target(PinnedObjectId(0)).unwrap()
+    }
+
+    /// Id lists built with the exact production shape
+    /// (`filter_map(...).collect()`, as `current_instances` builds them),
+    /// so capacities follow the pinned-toolchain growth law for real.
+    fn growth_ids(base: u64, len: usize) -> Vec<InstanceId> {
+        let partitions: Vec<(u64, Option<InstanceId>)> = (0..len as u64)
+            .map(|offset| (base + offset, Some(InstanceId::from_raw(base + offset))))
+            .collect();
+        partitions.iter().filter_map(|(_, id)| *id).collect()
+    }
+
+    fn scripted_receipt(
+        domain: NativeDomainId,
+        cookie: u64,
+        watched: &RetainedInventoryTarget,
+        ids: Vec<InstanceId>,
+    ) -> CurrentPartitionReceipt {
+        CurrentPartitionReceipt::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 1,
+            },
+            Arc::new(PidPin::test_proc_only(4321)),
+            Endpoint {
+                object: PinnedObjectId(0),
+                file_slot: 0,
+                offset: 0x1200,
+            },
+            0,
+            watched.share(),
+            CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            0,
+            Instant::now() + Duration::from_secs(60),
+            ids,
+        )
+    }
+
+    fn scripted_invalidation(
+        domain: NativeDomainId,
+        cookie: u64,
+        ids: Vec<InstanceId>,
+    ) -> TickOutcome {
+        TickOutcome::Invalidation(Invalidation::scripted(
+            domain,
+            InvalidationScope::InstancesRetired {
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 1,
+                },
+                file_slot: 0,
+                ids,
+            },
+            None,
+        ))
+    }
+
+    fn accumulator(domain: NativeDomainId, budgets: CollectedBudgets) -> CollectedReports {
+        let pool = SemanticResourcePool::reference_limit(SEMANTIC_RESOURCE_LIMIT);
+        let lease = pool
+            .reserve(budgets.bytes)
+            .expect("the test pool covers the computed budgets");
+        CollectedReports::for_test(domain, budgets, lease).expect("exact test capacities")
+    }
+
+    /// The binder's up to four refresh receipts reach the stash after the
+    /// reservation measured it, so the nested limit must carry an explicit
+    /// binder margin: a saturated tick (1,024 receipts naming the full
+    /// 4,096-id mint budget with growth-law capacities) plus four binder
+    /// receipts re-naming that pool must still fit the production limit
+    /// and merge. Count and per-receipt checks pass on both trees; only
+    /// the cumulative nested limit distinguishes them.
+    #[test]
+    fn binding_nested_limit_covers_binder_receipts_at_saturation() {
+        const PARTITIONS: usize = 1_024;
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let mut receipts = Vec::with_capacity(PARTITIONS + REFRESHES_PER_BIND);
+        let mut next_id = 0u64;
+        for index in 0..PARTITIONS {
+            let len = if index < 819 {
+                5
+            } else if index == 819 {
+                1
+            } else {
+                0
+            };
+            let ids = growth_ids(next_id, len);
+            next_id += len as u64;
+            if len == 5 {
+                assert_eq!(
+                    ids.capacity(),
+                    8,
+                    "the twin's saturation shape needs the pinned growth law"
+                );
+            }
+            if len == 1 {
+                assert_eq!(
+                    ids.capacity(),
+                    4,
+                    "the twin's saturation shape needs the pinned growth law"
+                );
+            }
+            receipts.push(scripted_receipt(
+                domain,
+                1_000 + index as u64,
+                &watched,
+                ids,
+            ));
+        }
+        assert_eq!(
+            next_id, MAX_INSTANCES as u64,
+            "the saturated tick names the whole mint budget"
+        );
+        let mut binder_base = 0u64;
+        for (slot, len) in [1_025usize, 1_025, 1_025, 1_021].iter().enumerate() {
+            let ids = growth_ids(binder_base, *len);
+            binder_base += *len as u64;
+            receipts.push(scripted_receipt(domain, 2_000 + slot as u64, &watched, ids));
+        }
+        assert_eq!(binder_base, MAX_INSTANCES as u64);
+        assert_eq!(receipts.len(), PARTITIONS + REFRESHES_PER_BIND);
+        // The four binder receipts re-scan bound pairs, so overlap with
+        // tick keys is honest; disjointness among the four follows from
+        // the binder's distinct pairs.
+        let binder_ids: usize = receipts[PARTITIONS..]
+            .iter()
+            .map(|receipt| receipt.instances().len())
+            .sum();
+        assert_eq!(binder_ids, MAX_INSTANCES);
+
+        let budgets =
+            collected_budgets(PARTITIONS, 0, 0, watched_bound).expect("saturated budgets");
+        assert_eq!(budgets.receipt_limit, PARTITIONS + REFRESHES_PER_BIND);
+        let measured: usize = receipts
+            .iter()
+            .map(|receipt| receipt.owned_storage_bytes().expect("a measurable receipt"))
+            .sum();
+        assert!(
+            measured <= budgets.nested_limit,
+            "a saturated tick plus 4 binder receipts must fit the nested limit: \
+             measured={measured} limit={}",
+            budgets.nested_limit
+        );
+        let mut reports = accumulator(domain, budgets);
+        assert_eq!(
+            reports.receipt_limit_for_test(),
+            PARTITIONS + REFRESHES_PER_BIND
+        );
+        assert!(
+            receipts.iter().all(|receipt| {
+                receipt
+                    .owned_storage_bytes()
+                    .is_some_and(|bytes| bytes <= reports.nested_per_receipt_for_test())
+            }),
+            "every receipt passes the per-receipt sanity check"
+        );
+        let batch = SemanticBatch::from_tick_report(
+            domain,
+            TickReport::scripted(Vec::new(), receipts),
+            Vec::new(),
+            0,
+        )
+        .expect("a scripted batch respects lane bounds");
+        reports
+            .merge(batch)
+            .expect("an honest saturated transaction must merge");
+        assert_eq!(reports.nested_used_for_test(), measured);
+    }
+
+    /// Outcome-owned invalidation id lists count toward the same
+    /// cumulative nested limit in `merge`: an over-bound invalidation
+    /// batch refuses with the named storage reason, while an honest
+    /// saturated shape binds with exact accounting.
+    #[test]
+    fn merge_measures_invalidation_id_bytes() {
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let heavy: Vec<TickOutcome> = (0..128u64)
+            .map(|slot| scripted_invalidation(domain, slot, growth_ids(slot * 1_024, 1_024)))
+            .collect();
+        let heavy_bytes: usize = heavy
+            .iter()
+            .map(|outcome| outcome.owned_storage_bytes().expect("measurable"))
+            .sum();
+        assert!(
+            heavy_bytes > budgets.nested_limit,
+            "the over-bound shape must exceed the whole nested limit: \
+             {heavy_bytes} vs {}",
+            budgets.nested_limit
+        );
+        let mut reports = accumulator(domain, budgets);
+        let batch = SemanticBatch::from_tick_report(
+            domain,
+            TickReport::scripted(heavy, Vec::new()),
+            Vec::new(),
+            0,
+        )
+        .expect("a scripted batch respects lane bounds");
+        assert_eq!(
+            reports.merge(batch).unwrap_err(),
+            SemanticRefusal::ProviderStorage
+        );
+
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let saturated: Vec<TickOutcome> = (0..MAX_INSTANCES as u64)
+            .map(|slot| scripted_invalidation(domain, slot, growth_ids(slot, 1)))
+            .collect();
+        let saturated_bytes: usize = saturated
+            .iter()
+            .map(|outcome| outcome.owned_storage_bytes().expect("measurable"))
+            .sum();
+        assert!(
+            saturated_bytes <= reports.nested_limit_for_test(),
+            "honest saturation (one id per outcome, the full mint budget) must fit: \
+             {saturated_bytes} vs {}",
+            reports.nested_limit_for_test()
+        );
+        let batch = SemanticBatch::from_tick_report(
+            domain,
+            TickReport::scripted(saturated, Vec::new()),
+            Vec::new(),
+            0,
+        )
+        .expect("a scripted batch respects lane bounds");
+        reports
+            .merge(batch)
+            .expect("honest invalidation saturation must merge");
+        assert_eq!(reports.nested_used_for_test(), saturated_bytes);
+    }
+
+    /// The pending-Q merge measures outcome-owned id lists exactly like
+    /// `merge`: over-bound invalidations refuse, honest saturation binds.
+    #[test]
+    fn merge_pending_q_measures_invalidation_id_bytes() {
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let heavy: Vec<TickOutcome> = (0..128u64)
+            .map(|slot| scripted_invalidation(domain, slot, growth_ids(slot * 1_024, 1_024)))
+            .collect();
+        let heavy_bytes: usize = heavy
+            .iter()
+            .map(|outcome| outcome.owned_storage_bytes().expect("measurable"))
+            .sum();
+        assert!(
+            heavy_bytes > budgets.nested_limit,
+            "the over-bound shape must exceed the whole nested limit: \
+             {heavy_bytes} vs {}",
+            budgets.nested_limit
+        );
+        let mut reports = accumulator(domain, budgets);
+        let mut report = TickReport::scripted(heavy, Vec::new());
+        assert_eq!(
+            reports.merge_pending_q(domain, &mut report).unwrap_err(),
+            SemanticRefusal::ProviderStorage
+        );
+
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let saturated: Vec<TickOutcome> = (0..MAX_INSTANCES as u64)
+            .map(|slot| scripted_invalidation(domain, slot, growth_ids(slot, 1)))
+            .collect();
+        let saturated_bytes: usize = saturated
+            .iter()
+            .map(|outcome| outcome.owned_storage_bytes().expect("measurable"))
+            .sum();
+        assert!(
+            saturated_bytes <= reports.nested_limit_for_test(),
+            "honest saturation (one id per outcome, the full mint budget) must fit: \
+             {saturated_bytes} vs {}",
+            reports.nested_limit_for_test()
+        );
+        let mut report = TickReport::scripted(saturated, Vec::new());
+        reports
+            .merge_pending_q(domain, &mut report)
+            .expect("honest invalidation saturation must merge");
+        assert_eq!(reports.nested_used_for_test(), saturated_bytes);
     }
 }

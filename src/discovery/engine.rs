@@ -8837,7 +8837,7 @@ fn counter_growth_attach_outcome(
                     .collect(),
             ))
         }
-        publication => Err(anyhow!("counter bank growth refused: {publication:?}")),
+        publication => Err(anyhow!("{publication:?}")),
     }
 }
 
@@ -13130,7 +13130,13 @@ impl Engine {
                     }
                 }
             }
-            if *additions_allowed && !generation_lost {
+            // Counter growth is append-only: replacements never run here
+            // (the bank guard would refuse the empty attach). Non-empty
+            // counter replacements keep flowing below and refuse honestly.
+            if *additions_allowed
+                && !generation_lost
+                && (!counter_growth || !candidate.delta.replace.is_empty())
+            {
                 let detach_failures = session.detach_failures().len();
                 #[cfg(feature = "h6-reexec-diagnostic")]
                 let replace_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {

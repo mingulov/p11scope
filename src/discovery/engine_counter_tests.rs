@@ -261,6 +261,10 @@ fn counter_growth_stages_fresh_tail_through_apply() {
     assert!(additions_allowed);
     assert_eq!(engine.plan.counter_consumed_end(), 3);
     assert_eq!(engine.plan.slots.len(), 3);
+    assert!(
+        session.replaced_slot_indices.is_empty(),
+        "append-only growth never replaces"
+    );
 }
 
 #[test]

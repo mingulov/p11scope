@@ -680,12 +680,14 @@ static int cmd_mode(const char *provider)
                 die("no held call");
             if (held_call_tid <= 0)
                 die("held-call tid");
+            snprintf(task_path, sizeof task_path, "/proc/self/task/%d", (int)held_call_tid);
+            if (stat(task_path, &probe) != 0)
+                die("held-call task before cancel");
             if (pthread_cancel(held_call_thread) != 0)
                 die("held-call cancel");
             pthread_join(held_call_thread, &result);
             if (result != PTHREAD_CANCELED)
                 die("held-call cancel join");
-            snprintf(task_path, sizeof task_path, "/proc/self/task/%d", (int)held_call_tid);
             deadline = now_ns() + 10ULL * 1000000000ULL;
             for (;;) {
                 if (stat(task_path, &probe) != 0) {

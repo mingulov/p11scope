@@ -3945,6 +3945,16 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(scripted) = self
+            .scripted_commit_poll_queue
+            .pop_front()
+            .or(self.scripted_commit_poll)
+        {
+            // A scripted error never latches: the driver's
+            // conversion owns the verdict for commit refusals.
+            return scripted;
+        }
         self.with_machine(coordinator, |machine, lane, coordinator, io| {
             machine.poll_commit_with_io(lane, coordinator, io, budget)
         })

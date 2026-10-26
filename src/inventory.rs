@@ -13900,6 +13900,111 @@ mod tests {
     }
 
     #[test]
+    fn joint_poll_commit_pending_repolls_without_rebeginning() {
+        // Begin-once lock-in (the E1 rewrites kept the fail-the-call
+        // parts superseded but must keep this): a commit still Pending
+        // is re-polled without a new begin. Only the first call
+        // carries engine_changed; every call polls.
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_commit_poll_queue_for_test(vec![
+            Ok(JointCommitProgress::Pending),
+            Ok(JointCommitProgress::Pending),
+            Ok(JointCommitProgress::Published(BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            })),
+        ]);
+        driver.semantic = Some(lane);
+        // The first call carries the engine change, begins once, and
+        // polls Pending; the commit pends across the call.
+        let first = driver.poll_commit(true);
+        assert!(
+            matches!(
+                first,
+                Ok(crate::inventory_capture::PassCommitProgress::Pending)
+            ),
+            "a pending poll stays pending"
+        );
+        assert!(
+            driver.joint_commit_pending,
+            "a begun commit pends across hooks"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "begin runs once per publication"
+        );
+        assert_eq!(driver.joint_commit_polls, 1, "the first call polls once");
+        // Retries pass false and resume polling without re-beginning.
+        let second = driver.poll_commit(false);
+        assert!(
+            matches!(
+                second,
+                Ok(crate::inventory_capture::PassCommitProgress::Pending)
+            ),
+            "the resumed poll still pends"
+        );
+        assert!(
+            driver.joint_commit_pending,
+            "the commit still pends between calls"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "retries never re-begin"
+        );
+        assert_eq!(driver.joint_commit_polls, 2, "every call polls");
+        let third = driver.poll_commit(false);
+        assert!(
+            matches!(
+                third,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the final poll publishes"
+        );
+        assert!(
+            !driver.joint_commit_pending,
+            "a published commit pends nothing"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .joint_commit_begin_calls_for_test(),
+            1,
+            "one publication begins exactly once"
+        );
+        assert_eq!(driver.joint_commit_polls, 3, "all three calls polled");
+        assert_eq!(
+            driver.commit_calls, 0,
+            "no legacy commit on the Joint path"
+        );
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|gap| gap.0 != "semantic lane stopped"),
+            "a healthy commit discloses no lane stop"
+        );
+    }
+
+    #[test]
     fn joint_service_runs_during_slow_scan_and_staged_retry() {
         use std::cell::Cell;
         use std::rc::Rc;

@@ -1340,7 +1340,17 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         use crate::key_operation_projection::ObsStatus;
         let observations = &presentation.object_observations;
         if observations.status == ObsStatus::Unavailable {
-            let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);
+            // v0.5.0 ships no journal producer: say plainly that this
+            // version never reports key operations (OD33/R-50). Other
+            // reasons keep the generic unavailable wording.
+            if observations.reason == "journal_unavailable" {
+                let _ = writeln!(
+                    out,
+                    "key operations: not reported by this version (planned for 0.5.1)"
+                );
+            } else {
+                let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);
+            }
         } else {
             let status = if observations.reason == "none" {
                 observations.status.label().to_string()

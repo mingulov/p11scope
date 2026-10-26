@@ -4048,15 +4048,15 @@ impl ClassicDriver<'_> {
         let Some(joint) = joint else {
             return;
         };
-        if self
-            .retiring
-            .as_ref()
-            .expect("winding checked above")
-            .winding
-            .as_ref()
-            .expect("winding checked above")
-            .stop_disclosed
-        {
+        if !stop_counts_owed(
+            self.retiring
+                .as_ref()
+                .expect("winding checked above")
+                .winding
+                .as_ref()
+                .expect("winding checked above")
+                .stop_disclosed,
+        ) {
             return;
         }
         self.coordinator.note_scope_gap(
@@ -4343,13 +4343,13 @@ fn commit_semantic_finish(
 }
 
 /// The stderr line a sealed semantic lane starts with: from now on,
-/// newly started programs are covered. Startup only: the seal runs
+/// mechanisms and API results are recorded. Startup only: the seal runs
 /// before the display opens, so the classic sink is correct on both
 /// paths. A promotion seals its new lane silently (its install and
 /// end already disclose through gaps); only the run's first seal
-/// readies users and scripts.
-const SEMANTIC_SEAL_LINE: &str =
-    "p11scope: key-operation lane sealed; programs started from now on are covered";
+/// readies users and scripts. v0.5.0 seals no key-operation lane
+/// (OD33/R-50), so the line says so plainly.
+const SEMANTIC_SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.5.1)";
 
 /// Note the lane seal once, through the classic stderr sink.
 fn note_semantic_lane_sealed() {

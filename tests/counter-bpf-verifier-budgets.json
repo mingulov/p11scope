@@ -1,0 +1,42 @@
+{
+  "limit": 1000000,
+  "min_headroom_percent": 5,
+  "programs": {
+    "counter-counts/p11_counter_bank_entry": {
+      "v6.12.111": 4744,
+      "v6.18.58": 5493,
+      "v6.6.157": 4744,
+      "v7.0.14": 5493
+    },
+    "counter-counts/p11_counter_bank_return": {
+      "v6.12.111": 5509,
+      "v6.18.58": 6905,
+      "v6.6.157": 5750,
+      "v7.0.14": 6905
+    },
+    "counter-latency/p11_counter_bank_entry": {
+      "v6.12.111": 4751,
+      "v6.18.58": 5670,
+      "v6.6.157": 4751,
+      "v7.0.14": 5670
+    },
+    "counter-latency/p11_counter_bank_return": {
+      "v6.12.111": 13844,
+      "v6.18.58": 18236,
+      "v6.6.157": 13937,
+      "v7.0.14": 18236
+    },
+    "counter-timestamps/p11_counter_bank_entry": {
+      "v6.12.111": 4751,
+      "v6.18.58": 5670,
+      "v6.6.157": 4751,
+      "v7.0.14": 5670
+    },
+    "counter-timestamps/p11_counter_bank_return": {
+      "v6.12.111": 5795,
+      "v6.18.58": 7337,
+      "v6.6.157": 6002,
+      "v7.0.14": 7337
+    }
+  }
+}

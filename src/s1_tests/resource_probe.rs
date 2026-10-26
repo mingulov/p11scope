@@ -778,7 +778,8 @@ fn native_semantic_resource_final_types_pinned() {
     );
     // TickReport carries the H0 disposition watermarks C5 requires
     // (allocated floor, awaiting/shed floors, exhaustion: +48 B).
-    pin!(crate::semantic_capture::TickReport, 160);
+    // cd44b5f7 adds the no-progress guard's pending_scans counter (+8 B).
+    pin!(crate::semantic_capture::TickReport, 168);
     pin!(
         crate::semantic_capture::RoutedCall,
         752 + size_of::<Option<CollectedCallOrigin>>()

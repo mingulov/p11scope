@@ -124,6 +124,7 @@ RUN = [
     ("test_skip_reason_vocabulary.py", []),
     ("test_system_first_use_fixture.py", []),
     ("test_system_first_use_receipt.py", []),
+    ("test_system_manifest_soak_oracle.py", []),
     ("test_system_scope_measure_launch.py", []),
     ("test_system_scope_receipt.py", []),
     ("test_system_scope_sample.py", []),

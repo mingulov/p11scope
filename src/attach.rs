@@ -15840,6 +15840,29 @@ mod tests {
     }
 
     #[test]
+    fn counter_start_path_raises_nofile_before_first_link() {
+        // Every Session start raises the soft FD limit before any link
+        // exists. The counter path routes through this same chain (no
+        // direct-preparation bypass), so the 1,026-FD first 512-endpoint
+        // stage is covered. The soft-1024 privileged twin proves the raise
+        // behaviorally; this pins the order in source.
+        let source = include_str!("attach.rs");
+        let chain = source
+            .split_once("    fn start_with_selected(")
+            .expect("start chain entry")
+            .1
+            .split_once("\n    }\n")
+            .expect("start chain end")
+            .0;
+        let raise = chain.find("raise_nofile()").expect("raise site");
+        let backend = chain.find("start_on_backend(").expect("backend start");
+        assert!(
+            raise < backend,
+            "the soft-limit raise must precede backend start (first links)"
+        );
+    }
+
+    #[test]
     fn embedded_capture_adapter_symbol_match_is_exact() {
         let helper = "object_emit_get_attributes";
         for symbol in [

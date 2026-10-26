@@ -7230,6 +7230,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_preflight_names_ceiling_before_preparation() {
+        // The S4 preflight names the requested count and charges nothing:
+        // refusal happens before preparation with the pool untouched.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        for (mode, cpus, requested) in [
+            (CounterMode::Counts, 12usize, 8193usize),
+            (CounterMode::Latency, 490usize, 1usize),
+        ] {
+            let ceiling = super::counter_affordable_endpoints(mode, cpus).unwrap();
+            assert!(
+                requested > ceiling,
+                "{mode:?} P={cpus}: requested {requested} must exceed ceiling {ceiling}"
+            );
+            let refusal = super::check_counter_endpoints_fit(mode, cpus, requested)
+                .expect_err("over-ceiling request must refuse");
+            assert!(
+                refusal.starts_with("counter-memory-limit:"),
+                "{mode:?} P={cpus}: {refusal}"
+            );
+            assert!(
+                refusal.contains(&format!("(requested {requested})")),
+                "{mode:?} P={cpus}: refusal names the requested count: {refusal}"
+            );
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
     fn counter_memory_growth_to_ceiling_then_n_plus_one_refuses() {
         use super::{BankExtent, BankGeometry, counter_affordable_endpoints};
         let mode = CounterMode::Latency;

@@ -11999,6 +11999,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn counter_modes_stay_cli_refused_during_wiring() {
+        // A2.9 narrows this list per mode (pre-declared flip, not an
+        // assertion edit): each newly wired mode leaves this loop.
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let error =
+                refuse_unwired_counter_mode(Some(mode)).expect_err("unwired mode must refuse");
+            let text = format!("{error:#}");
+            assert!(text.starts_with("counter-mode-unwired:"), "{text}");
+        }
+    }
+
+    #[test]
+    fn run_loop_forwards_built_counter_inputs_to_capture_profile() {
+        // The profile loop builds real CounterCaptureInputs from the active
+        // policy instead of passing None. The privileged collection cell
+        // proves it behaviorally; this pins the wiring in source.
+        let source = include_str!("run.rs");
+        let profile_arm = source
+            .split_once("fn run_loop(")
+            .expect("run loop")
+            .1
+            .split_once("Kind::Trace =>")
+            .expect("profile arm")
+            .0;
+        assert!(
+            profile_arm.contains("counter_inputs_for_capture(policy, engine)"),
+            "run_loop must build counter inputs from the active policy"
+        );
+        let call = profile_arm
+            .split_once("capture_profile(")
+            .expect("profile call")
+            .1
+            .split_once(')')
+            .expect("call end")
+            .0;
+        assert!(
+            call.contains("counter_inputs,"),
+            "forward built inputs, not None"
+        );
+        assert!(
+            !call.contains("None"),
+            "no None literal in the inputs position"
+        );
+    }
+
     /// Review P2: a PID-scoped capture refuses by name before its target is
     /// even opened (this PID cannot exist).
     #[test]

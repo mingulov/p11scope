@@ -12,12 +12,19 @@ cell, a gated cell counted positive, an oracle refusal (copy mode without
 source identity) and a timeout. Nothing here needs privileges.
 """
 
+import contextlib
+import grp
 import importlib.util
+import io
 import json
+import os
 import sys
+import tempfile
 import time
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SWEEP_PATH = ROOT / "scripts" / "run-first-use-sweep.py"
@@ -435,6 +442,344 @@ class TraceParseTests(unittest.TestCase):
         evidence = [{"privacy_mode": "allowlisted", "event_loss": 0,
                      "final_drain": False}]
         self.assertTrue(sweep.check_evidence(evidence))
+
+
+def _unknown_gid():
+    """A gid the host does not know, for the unknown-gid twin."""
+    candidate = 59999
+    while True:
+        try:
+            grp.getgrgid(candidate)
+        except KeyError:
+            return candidate
+        candidate += 1
+
+
+def _preflight_args(tmp, uid, gid, out=None):
+    """A preflight namespace whose files all exist and pass."""
+    observer = tmp / "p11scope"
+    observer.write_bytes(b"#!/bin/sh\nexit 0\n")
+    observer.chmod(0o755)
+    measure = tmp / "measure-first-use.py"
+    measure.write_text("# oracle\n")
+    fixture = tmp / "system-first-use.c"
+    fixture.write_text("/* fixture */\n")
+    return Namespace(uid=uid, gid=gid, observer=str(observer),
+                     measure=str(measure), fixture_source=str(fixture),
+                     gcc=sys.executable, cell_timeout=120,
+                     out=str(tmp / "out") if out is None else out)
+
+
+class PreflightTests(unittest.TestCase):
+    def test_unknown_gid_is_refused_up_front(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _preflight_args(Path(tmp), os.getuid(), _unknown_gid())
+            with mock.patch("os.geteuid", return_value=0):
+                with self.assertRaisesRegex(sweep.SweepError,
+                                            "unknown workload gid"):
+                    sweep.preflight(args)
+
+    def test_known_uid_and_gid_pass_preflight(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _preflight_args(Path(tmp), os.getuid(), os.getgid())
+            with mock.patch("os.geteuid", return_value=0):
+                ready = sweep.preflight(args)
+            self.assertTrue(ready["out"].is_dir())
+
+    def test_uncreatable_out_dir_is_a_refusal_not_a_traceback(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a dir\n")
+            args = _preflight_args(Path(tmp), os.getuid(), os.getgid(),
+                                   out=str(blocker / "sub"))
+            with mock.patch("os.geteuid", return_value=0):
+                with self.assertRaisesRegex(sweep.SweepError,
+                                            "cannot create out dir"):
+                    sweep.preflight(args)
+
+    def test_existing_out_dir_keeps_its_refusal(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            args = _preflight_args(Path(tmp), os.getuid(), os.getgid(),
+                                   out=str(out))
+            with mock.patch("os.geteuid", return_value=0):
+                with self.assertRaisesRegex(sweep.SweepError,
+                                            "refusing to reuse out dir"):
+                    sweep.preflight(args)
+
+    def test_main_turns_an_os_error_into_a_refusal(self):
+        sweep = require_sweep(self)
+        argv = ["--observer", "/tmp/p11scope", "--uid", "1", "--gid", "1",
+               "--out", "/tmp/out"]
+        stderr = io.StringIO()
+        with mock.patch.object(sweep, "preflight",
+                               side_effect=OSError("disk gone")):
+            with contextlib.redirect_stderr(stderr):
+                status = sweep.main(argv)
+        self.assertEqual(status, 1)
+        self.assertIn("sweep refused: disk gone", stderr.getvalue())
+
+
+FAKE_GCC_FAIL = ("import sys\n"
+                 "sys.stderr.write('cc1: fatal error: boom\\n')\n"
+                 "sys.exit(1)\n")
+
+FAKE_GCC_PROVIDER_FAIL = (
+    "import sys\n"
+    "argv = sys.argv[1:]\n"
+    "if '-shared' in argv:\n"
+    "    sys.stderr.write('provider boom\\n')\n"
+    "    sys.exit(1)\n"
+    "out = argv[argv.index('-o') + 1]\n"
+    "open(out, 'wb').write(b'fake')\n")
+
+FAKE_GCC_OK = ("import sys\n"
+               "argv = sys.argv[1:]\n"
+               "out = argv[argv.index('-o') + 1]\n"
+               "open(out, 'wb').write(b'fake')\n")
+
+
+def _fake_gcc(tmp, body):
+    path = tmp / "gcc"
+    path.write_text(f"#!{sys.executable}\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+class FixtureBuildTests(unittest.TestCase):
+    def test_driver_build_failure_keeps_the_compiler_error(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "system-first-use.c"
+            source.write_text("/* fixture */\n")
+            with self.assertRaisesRegex(sweep.SweepError, "cc1.*boom"):
+                sweep.compile_fixture(_fake_gcc(tmp, FAKE_GCC_FAIL),
+                                      source, tmp / "build")
+
+    def test_provider_build_failure_keeps_the_compiler_error(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "system-first-use.c"
+            source.write_text("/* fixture */\n")
+            with self.assertRaisesRegex(sweep.SweepError, "provider boom"):
+                sweep.compile_fixture(
+                    _fake_gcc(tmp, FAKE_GCC_PROVIDER_FAIL), source,
+                    tmp / "build")
+
+    def test_successful_build_returns_driver_and_providers(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "system-first-use.c"
+            source.write_text("/* fixture */\n")
+            built = sweep.compile_fixture(_fake_gcc(tmp, FAKE_GCC_OK),
+                                          source, tmp / "build")
+            self.assertTrue(built["driver"].is_file())
+            self.assertEqual(set(built["providers"]), {"file", "heap"})
+
+
+def _stream_row(pid=4242, fn="C_Initialize"):
+    return {"label": "fixture", "pid": pid, "tid": pid, "path": "/tmp/fixture",
+            "fn": fn, "rv": "CKR_OK", "duration": "3.0µs"}
+
+
+def _stream_counts(count=1):
+    return [{"stats_entered": count, "stats_returned": count,
+             "raw_calls": count}]
+
+
+def _stream_evidence(**extra):
+    record = {"privacy_mode": "allowlisted", "completeness": "COMPLETE",
+              "final_drain": True, "event_loss": 0}
+    record.update(extra)
+    return [record]
+
+
+def _parsed(rows, counts, evidence):
+    return {"rows": rows, "counts": counts, "evidence": evidence, "errors": []}
+
+
+class StreamCompareTests(unittest.TestCase):
+    def test_row_disagreement_is_an_error(self):
+        sweep = require_sweep(self)
+        file_parsed = _parsed([_stream_row()], _stream_counts(),
+                              _stream_evidence())
+        stdout_parsed = _parsed([_stream_row(fn="C_GetFunctionList")],
+                                _stream_counts(), _stream_evidence())
+        self.assertEqual(sweep.compare_streams(file_parsed, stdout_parsed),
+                         ["stdout/file trace row disagreement"])
+
+    def test_count_disagreement_is_an_error(self):
+        sweep = require_sweep(self)
+        file_parsed = _parsed([_stream_row()], _stream_counts(count=1),
+                              _stream_evidence())
+        stdout_parsed = _parsed([_stream_row()], _stream_counts(count=2),
+                                _stream_evidence())
+        self.assertEqual(sweep.compare_streams(file_parsed, stdout_parsed),
+                         ["stdout/file terminal count disagreement"])
+
+    def test_evidence_disagreement_is_an_error(self):
+        sweep = require_sweep(self)
+        file_parsed = _parsed([_stream_row()], _stream_counts(),
+                              _stream_evidence())
+        stdout_parsed = _parsed([_stream_row()], _stream_counts(),
+                                _stream_evidence(event_loss=1))
+        self.assertEqual(sweep.compare_streams(file_parsed, stdout_parsed),
+                         ["stdout/file terminal evidence disagreement"])
+
+    def test_sink_only_difference_passes(self):
+        sweep = require_sweep(self)
+        file_parsed = _parsed(
+            [_stream_row()], _stream_counts(),
+            _stream_evidence(scheduling={"sink_stall_ms": 0,
+                                         "sink_timeouts": 0,
+                                         "sink_dropped_bytes": 0}))
+        stdout_parsed = _parsed(
+            [_stream_row()], _stream_counts(),
+            _stream_evidence(scheduling={"sink_stall_ms": 5,
+                                         "sink_timeouts": 0,
+                                         "sink_dropped_bytes": 0}))
+        self.assertEqual(sweep.compare_streams(file_parsed, stdout_parsed),
+                         [])
+
+    def test_identical_streams_agree(self):
+        sweep = require_sweep(self)
+        file_parsed = _parsed([_stream_row()], _stream_counts(),
+                              _stream_evidence())
+        stdout_parsed = _parsed([_stream_row()], _stream_counts(),
+                                _stream_evidence())
+        self.assertEqual(sweep.compare_streams(file_parsed, stdout_parsed),
+                         [])
+
+    def test_foreign_pid_rows_are_rejected(self):
+        sweep = require_sweep(self)
+        selected = sweep.select_body_rows(
+            [_stream_row(pid=4242), _stream_row(pid=9999)], 4242)
+        self.assertEqual(sweep.check_foreign_rows(selected, 4242),
+                         ["trace captured 1 rows outside the cell pid 4242"])
+
+    def test_cell_only_rows_pass_the_pid_check(self):
+        sweep = require_sweep(self)
+        selected = sweep.select_body_rows([_stream_row(pid=4242)], 4242)
+        self.assertEqual(sweep.check_foreign_rows(selected, 4242), [])
+
+
+def _strict_evidence(**extra):
+    record = {"privacy_mode": "allowlisted", "completeness": "COMPLETE",
+              "final_drain": True, "event_loss": 0}
+    record.update(extra)
+    return [record]
+
+
+class EvidenceStrictnessTests(unittest.TestCase):
+    def test_missing_completeness_is_an_error(self):
+        sweep = require_sweep(self)
+        evidence = [{"privacy_mode": "allowlisted", "final_drain": True,
+                     "event_loss": 0}]
+        self.assertTrue(any("completeness" in error for error in
+                            sweep.check_evidence(evidence)),
+                        "an exact-count cell must prove its completeness")
+
+    def test_unknown_completeness_is_an_error(self):
+        sweep = require_sweep(self)
+        self.assertTrue(any("completeness" in error for error in
+                            sweep.check_evidence(
+                                _strict_evidence(completeness="BOGUS"))))
+
+    def test_complete_and_partial_pass(self):
+        sweep = require_sweep(self)
+        for value in ("COMPLETE", "PARTIAL"):
+            with self.subTest(completeness=value):
+                self.assertEqual(
+                    sweep.check_evidence(_strict_evidence(completeness=value)),
+                    [])
+
+    def test_sink_timeouts_are_an_error(self):
+        sweep = require_sweep(self)
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 0,
+                                                "sink_timeouts": 1,
+                                                "sink_dropped_bytes": 0})
+        self.assertTrue(any("sink_timeouts" in error for error in
+                            sweep.check_evidence(evidence)))
+
+    def test_sink_dropped_bytes_are_an_error(self):
+        sweep = require_sweep(self)
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 0,
+                                                "sink_timeouts": 0,
+                                                "sink_dropped_bytes": 9})
+        self.assertTrue(any("sink_dropped_bytes" in error for error in
+                            sweep.check_evidence(evidence)))
+
+    def test_zero_sink_counters_pass(self):
+        sweep = require_sweep(self)
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 0,
+                                                "sink_timeouts": 0,
+                                                "sink_dropped_bytes": 0})
+        self.assertEqual(sweep.check_evidence(evidence), [])
+
+    def test_a_small_sink_stall_with_proven_drain_passes(self):
+        # sink_stall_ms is backpressure timing, not loss: the Linux 7.0.14
+        # sweep measured 1 ms stalls in passing exact cells (PARTIAL, drain
+        # proven, zero loss), and src/render.rs documents the field as
+        # stall milliseconds. Only the loss counters gate the cell.
+        sweep = require_sweep(self)
+        evidence = _strict_evidence(scheduling={"sink_stall_ms": 1,
+                                                "sink_timeouts": 0,
+                                                "sink_dropped_bytes": 0})
+        self.assertEqual(sweep.check_evidence(evidence), [])
+
+
+def _cell_line(**extra):
+    row = {"phase": "cell", "mono_ns": 2, "pid": 7, "birth": 9,
+           "module_dev": 3, "module_ino": 8, "mount_ns_ino": 5,
+           "mode": "known-inode", "delay_us": 0, "armed": "ungated"}
+    row.update(extra)
+    return json.dumps(row) + "\n"
+
+
+class LedgerBoundTests(unittest.TestCase):
+    def test_oversize_ledger_is_refused(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            pad = json.dumps({"phase": "pad", "blob": "x" * 40000}) + "\n"
+            ledger.write_text(_cell_line() + pad * 30)
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                sweep._read_ledger(ledger)
+
+    def test_overlong_ledger_is_refused(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            pad = json.dumps({"phase": "pad"}) + "\n"
+            ledger.write_text(pad * 1024 + _cell_line())
+            with self.assertRaisesRegex(ValueError, "row limit"):
+                sweep._read_ledger(ledger)
+
+    def test_duplicate_key_ledger_is_refused(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            ledger.write_text('{"phase": "cell", "phase": "cell"}\n')
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                sweep._read_ledger(ledger)
+
+    def test_small_valid_ledger_reads(self):
+        sweep = require_sweep(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            pad = json.dumps({"phase": "pad"}) + "\n"
+            ledger.write_text(pad * 3 + _cell_line() + "\n")
+            rows, cell = sweep._read_ledger(ledger)
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(cell["pid"], 7)
 
 
 if __name__ == "__main__":

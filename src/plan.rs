@@ -5974,6 +5974,41 @@ mod tests {
     }
 
     #[test]
+    fn counter_policy_conversion_preserves_plan() {
+        let mut detailed = object_plan(vec![
+            object_slot(0, &["C_SignInit"], 43),
+            object_slot(1, &["C_Sign"], 43),
+            object_slot(2, &["C_Verify"], 43),
+        ]);
+        detailed.deactivate(1);
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        let converted = detailed.with_counters_policy(budget).unwrap();
+        assert!(
+            matches!(
+                converted.admission_policy(),
+                AdmissionPolicy::Counters(budget) if budget.endpoint_limit() == 8192
+            )
+        );
+        assert_eq!(converted.slots, detailed.slots);
+        assert_eq!(converted.modules, detailed.modules);
+        for index in 0..3 {
+            assert_eq!(
+                converted.is_active(index),
+                detailed.is_active(index),
+                "activity survives conversion"
+            );
+        }
+        assert!(!converted.is_active(1));
+        // Over-budget conversion refuses without mutating the source.
+        let tight = crate::capacity::CounterBudget::new(2).unwrap();
+        assert!(detailed.with_counters_policy(tight).is_err());
+        assert!(matches!(
+            detailed.admission_policy(),
+            AdmissionPolicy::Detailed
+        ));
+    }
+
+    #[test]
     fn object_producer_plan_eligibility_requires_current_authority() {
         use ObjectSlotEligibility::{Eligible, Refused};
         let plan = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);

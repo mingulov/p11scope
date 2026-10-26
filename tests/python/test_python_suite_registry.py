@@ -100,6 +100,21 @@ class SuiteRegistryTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn(f"test_b.py: driver {driver}", problems[0])
 
+    def test_a_commented_out_invocation_still_reads_missing(self):
+        for driver, text in (
+            ("tests/x.rs",
+             '// run_ok("python3", &["-I", "tests/python/test_b.py"])\n'),
+            ("scripts/s.py",
+             '# run_ok("python3", ["-I", "tests/python/test_b.py"])\n'),
+        ):
+            with self.subTest(driver=driver):
+                problems = problems_of(
+                    {"test_b.py"}, [], {"test_b.py": driver}, {},
+                    reader({driver: text}),
+                )
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("no longer names it", problems[0])
+
     def test_a_message_only_reference_does_not_drive(self):
         for driver, text in (
             ("tests/x.rs", 'panic!(r#"suite "tests/python/test_b.py" failed"#);\n'),

@@ -5139,6 +5139,48 @@ pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
     }
 }
 
+/// Flavor of one embedded counter bank object, from its parsed bytes.
+/// Counter flavors never take the stub or unsafe features, so unsafe
+/// decoders present (or half-wired evidence) refuse with the mode named.
+/// Only the unsafe dimension is probed — the Detailed stub probe needs
+/// the return adapter, which bank objects do not carry — while FULL is
+/// the build-construction fact (counter objects are identical across
+/// FULL, P0 and unsafe builds) and counter sessions never publish
+/// object facts.
+pub(crate) fn counter_flavor_from_parsed(
+    mode: CounterMode,
+    parsed: &aya_obj::Object,
+) -> Result<EmbeddedFlavor> {
+    match probed_unsafe_is_present(parsed) {
+        Ok(false) => Ok(EmbeddedFlavor {
+            stubbed: false,
+            unsafe_present: false,
+        }),
+        Ok(true) => bail!(
+            "counter BPF object flavor mismatch for --counter-mode {}: embedded bytes contain unsafe-unvalidated-metadata decoders, which counter objects never take (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name()
+        ),
+        Err(error) => bail!(
+            "cannot determine counter BPF object flavor for --counter-mode {}: {} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name(),
+            error.reason()
+        ),
+    }
+}
+
+/// Flavor of one embedded counter bank object, from its bytes: parse,
+/// then [`counter_flavor_from_parsed`]. Unparseable bytes refuse with
+/// the mode named.
+pub(crate) fn checked_counter_flavor(mode: CounterMode, object: &[u8]) -> Result<EmbeddedFlavor> {
+    let parsed = aya_obj::Object::parse(object).map_err(|error| {
+        anyhow!(
+            "cannot determine counter BPF object flavor for --counter-mode {}: {error:#} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
+            mode.name()
+        )
+    })?;
+    counter_flavor_from_parsed(mode, &parsed)
+}
+
 /// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
 /// what BPF_PROG_LOAD returns when the program exceeds the complexity
 /// limit. Every other errno keeps its own meaning.
@@ -6195,7 +6237,17 @@ impl Session {
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         // The bytes rule before anything loads or attaches: a stale or
         // mismatched embedded object refuses here with both values named.
-        let flavor = checked_embedded_flavor()?;
+        // Counter sessions check their own object's flavor, never the
+        // Detailed bytes.
+        let flavor = match policy.counter_mode() {
+            Some(mode) => {
+                let prepared = counter
+                    .as_ref()
+                    .context("counter policy requires its preparation")?;
+                checked_counter_flavor(mode, prepared.object)?
+            }
+            None => checked_embedded_flavor()?,
+        };
         if policy.uses_unsafe_decoders() && !flavor.unsafe_present {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
@@ -16544,9 +16596,8 @@ mod tests {
                 error.reason()
             );
             let parsed = aya_obj::Object::parse(bytes).expect("counter bytes parse");
-            assert_eq!(
-                super::probed_unsafe_is_present(&parsed).unwrap(),
-                false,
+            assert!(
+                !super::probed_unsafe_is_present(&parsed).unwrap(),
                 "{mode:?}"
             );
         }

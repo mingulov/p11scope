@@ -707,12 +707,13 @@ fn production_geometry_for(object: &[u8], outputs: &str) -> Result<BankGeometry,
     BankGeometry::selected(bank_growth_token(mode))
 }
 
-/// Deterministic build gate, checked before the kernel probe: builds that
-/// omit counter objects (`=0`, SMALL, WIDE) refuse every mode with
+/// Deterministic build gate, checked before the kernel probe (and before
+/// the CLI policy resolves any object bytes): builds that omit counter
+/// objects (`=0`, SMALL, WIDE) refuse every mode with
 /// `counter-mode-unavailable-in-build`. build.rs already folds WIDE into the
 /// emitted `ENABLED` flag, so this gate reads only the emitted pair. P0 and
 /// unsafe-compiled builds embed identical bytes and pass.
-fn check_counter_build(enabled: &str, outputs: &str) -> Result<(), String> {
+pub(crate) fn check_counter_build(enabled: &str, outputs: &str) -> Result<(), String> {
     if enabled != "1" {
         return Err("counter-mode-unavailable-in-build: this build omits counter objects".into());
     }

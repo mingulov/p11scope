@@ -1740,8 +1740,13 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
 pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> String {
     match verdict {
         crate::attach::BpfLoopVerdict::Available => {
-            "counter modes: not enabled in this build (the kernel provides bpf_loop (helper 181))\n"
-                .to_string()
+            if cfg!(p11scope_counter_objects) {
+                "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181))\n"
+                    .to_string()
+            } else {
+                "counter modes: not enabled in this build (the kernel provides bpf_loop (helper 181))\n"
+                    .to_string()
+            }
         }
         crate::attach::BpfLoopVerdict::Unavailable(reason) => {
             format!("counter modes: counter-mode-unavailable-on-kernel ({reason})\n")

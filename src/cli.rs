@@ -379,7 +379,7 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 usage:
   p11scope --version
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
-                   [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -389,7 +389,7 @@ usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
@@ -425,9 +425,9 @@ ends a capture cleanly (final frame printed, -o written). --cgroup matches that 
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
 no cgroup path. Aggregate across the selected scope; counts are not per application.
 Inventory usage entries and trace completed events have separate attribution rules.
---counter-mode counts|timestamps|latency is reserved for profile or run with --mode metrics.
-Explicit selections are unavailable in this checkpoint and return counter-mode-unwired
-before capture setup or owned-child launch. Omit --counter-mode to keep existing metrics behavior.
+--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
+counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
+Omit --counter-mode to keep existing metrics behavior. Selections refuse with a named reason on kernels without bpf_loop (helper 181), on builds without counter objects, and past the mode's endpoint ceiling.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
@@ -438,7 +438,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
-                   [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -482,7 +482,7 @@ Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED n
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
@@ -3743,8 +3743,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 6888);
-        assert_eq!(hash, 0x44572964ae81e261);
+        assert_eq!(USAGE.len(), 7139);
+        assert_eq!(hash, 0x0a7e6bc71efaad75);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

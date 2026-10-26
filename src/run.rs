@@ -2189,9 +2189,8 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
 /// discover and pin what is in scope, install the stop flag, then run the same
 /// loop `run` runs — with no owned child, so no pause is ever possible.
 pub fn capture(a: &CaptureArgs) -> Result<()> {
-    refuse_unwired_counter_mode(a.counter_mode)?;
     let kind = a.kind;
-    let policy = capture_policy(kind, a.metrics, a.unsafe_requested)?;
+    let policy = capture_policy(kind, a.metrics, a.unsafe_requested, a.counter_mode)?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
         emit_capture_diagnostic(&warning);
     }
@@ -2318,17 +2317,39 @@ fn no_profile_duration_notice() -> String {
         .to_string()
 }
 
-fn refuse_unwired_counter_mode(mode: Option<p11scope_ebpf_common::CounterMode>) -> Result<()> {
-    if let Some(mode) = mode {
-        anyhow::bail!(
-            "counter-mode-unwired: --counter-mode {} is unavailable in this build",
-            mode.name()
-        );
+pub(crate) fn capture_policy(
+    kind: Kind,
+    metrics: bool,
+    unsafe_requested: bool,
+    counter_mode: Option<p11scope_ebpf_common::CounterMode>,
+) -> Result<CapturePolicy> {
+    if let Some(mode) = counter_mode {
+        if kind != Kind::Profile || !metrics {
+            anyhow::bail!(
+                "--counter-mode {} requires --mode metrics on profile or run",
+                mode.name()
+            );
+        }
+        if unsafe_requested {
+            anyhow::bail!("--counter-mode cannot be combined with --unsafe-unvalidated-metadata");
+        }
+        // Builds without counter objects (WIDE, SMALL) refuse here by
+        // name: the statics are empty there, and preparation never runs
+        // to refuse instead.
+        if let Err(refusal) = crate::attach::counter_banks::check_counter_build(
+            env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        ) {
+            anyhow::bail!("{refusal}");
+        }
+        // The bytes rule before discovery: the counter object's own flavor,
+        // so stale bytes refuse before any scan or attach.
+        crate::attach::checked_counter_flavor(
+            mode,
+            crate::attach::counter_banks::counter_object_for_mode(mode),
+        )?;
+        return Ok(CapturePolicy::Counter(mode));
     }
-    Ok(())
-}
-
-fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
     let mode = match (kind, metrics) {
         (Kind::Trace, _) => "trace",
         (Kind::Profile, true) => "metrics",
@@ -2461,6 +2482,41 @@ fn run_loop(
     // or second-signal-abandoned capture included, before its error returns.
     engine.report_discovery_noise();
     evidence
+}
+
+/// Test-only profile loop over an already-started Engine/Session: the
+/// privileged CLI cells inject discovery (the counter fixture exports no
+/// PKCS#11 surface for real discovery), then run this real loop to `-o`
+/// JSON. Production `capture()` runs the same `run_loop` after real
+/// discovery.
+#[cfg(test)]
+pub(crate) fn run_profile_loop_for_test(
+    engine: &mut Engine,
+    session: &mut Session,
+    scope: &Scope,
+    policy: CapturePolicy,
+    duration: Duration,
+    out_path: &std::path::Path,
+) -> Result<render::Evidence> {
+    let stop = SignalState::new();
+    let out = OutputSink::open(Kind::Profile, Some(out_path))?;
+    let resource_start = crate::timing::read_resource_sample();
+    run_loop(
+        engine,
+        session,
+        scope,
+        Kind::Profile,
+        policy,
+        Some(duration),
+        None,
+        out,
+        &stop,
+        None,
+        None,
+        None,
+        None,
+        resource_start,
+    )
 }
 
 /// What `run` reports back to its caller. `evidence` is the exact finalized
@@ -3057,7 +3113,6 @@ fn cancelled_by(interrupted: &SignalState) -> impl Fn() -> std::result::Result<b
 /// applies the pause policy, runs live discovery and the capture loop, and
 /// writes the final artifact.
 pub fn run_owned(args: &RunArgs) -> Result<OwnedRunOutcome> {
-    refuse_unwired_counter_mode(args.counter_mode)?;
     let stop = install_stop_flag()?;
     let outcome = run_owned_inner(args, stop.clone());
     match (args.pause, outcome) {
@@ -3092,7 +3147,12 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 }
 
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
-    let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
+    let policy = capture_policy(
+        args.kind,
+        args.metrics,
+        args.unsafe_requested,
+        args.counter_mode,
+    )?;
     // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
     // observer's namespace; refuse before anything is forked.
     crate::pidns::require_numbering_agrees(crate::pidns::numbering(), "run")?;
@@ -12056,6 +12116,9 @@ mod tests {
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_capture_setup() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name at the policy gate instead of reaching setup.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [
             p11scope_ebpf_common::CounterMode::Counts,
             p11scope_ebpf_common::CounterMode::Timestamps,
@@ -12071,15 +12134,25 @@ mod tests {
             let error = nested(|| capture(&args)).expect_err("counter mode must reach real setup");
             let text = format!("{error:#}");
             assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
-            assert!(
-                text.starts_with("pid-namespace-mismatch:"),
-                "{mode:?}: {text}"
-            );
+            if objects {
+                assert!(
+                    text.starts_with("pid-namespace-mismatch:"),
+                    "{mode:?}: {text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("counter-mode-unavailable-in-build:"),
+                    "{mode:?}: {text}"
+                );
+            }
         }
     }
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_owned_run_setup() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name at the policy gate instead of reaching setup.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [
             p11scope_ebpf_common::CounterMode::Counts,
             p11scope_ebpf_common::CounterMode::Timestamps,
@@ -12097,26 +12170,46 @@ mod tests {
                 nested(|| run_owned(&args)).expect_err("counter mode must reach real setup");
             let text = format!("{error:#}");
             assert!(!text.contains("counter-mode-unwired"), "{mode:?}: {text}");
-            assert!(
-                text.starts_with("pid-namespace-mismatch:"),
-                "{mode:?}: {text}"
-            );
+            if objects {
+                assert!(
+                    text.starts_with("pid-namespace-mismatch:"),
+                    "{mode:?}: {text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("counter-mode-unavailable-in-build:"),
+                    "{mode:?}: {text}"
+                );
+            }
         }
     }
 
     #[test]
     fn counter_modes_select_counter_policies_through_capture_policy() {
+        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // by name instead of selecting it.
+        let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [
             p11scope_ebpf_common::CounterMode::Counts,
             p11scope_ebpf_common::CounterMode::Timestamps,
             p11scope_ebpf_common::CounterMode::Latency,
         ] {
             // Metrics profile/run select the counter policy for every mode.
-            assert_eq!(
-                capture_policy(Kind::Profile, true, false, Some(mode)).unwrap(),
-                CapturePolicy::Counter(mode),
-                "{mode:?}"
-            );
+            if objects {
+                assert_eq!(
+                    capture_policy(Kind::Profile, true, false, Some(mode)).unwrap(),
+                    CapturePolicy::Counter(mode),
+                    "{mode:?}"
+                );
+            } else {
+                let error = capture_policy(Kind::Profile, true, false, Some(mode)).unwrap_err();
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("counter-mode-unavailable-in-build"),
+                    "{mode:?}: {text}"
+                );
+                assert!(!text.contains("counter-mode-unwired"), "{text}");
+            }
             // Every other combination refuses by name, never with the
             // removed blanket token.
             let requires_metrics = format!(
@@ -17250,7 +17343,7 @@ mod tests {
             unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, false).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, false, None).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
     }
@@ -17266,7 +17359,7 @@ mod tests {
             unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, true).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, true, None).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
         assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");

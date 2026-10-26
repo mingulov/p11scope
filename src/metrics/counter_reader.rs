@@ -4861,7 +4861,7 @@ mod tests {
         let current = engine.plan().slots.clone();
         let high_water = current.len();
         assert!(
-            high_water >= 512 && high_water < 8192,
+            (512..8192).contains(&high_water),
             "start stages the 512 prefix plus bounded foreign keys, got {high_water}"
         );
         let budgets = session.counter_budgets(0).unwrap();

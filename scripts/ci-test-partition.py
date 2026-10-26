@@ -15,7 +15,8 @@ SAME command; the script narrows `--all-targets` to one partition:
   target, read from `cargo metadata`, so a new test target joins `rest`
   without anyone editing the workflow). `rest` proves from the combined
   cargo output that every binary cargo ran printed a libtest summary
-  with total > 0 (the one testless bin is pinned, not proved).
+  with total > 0 (the one testless bin is pinned, not proved) and that
+  every selected target ran a section (a silently skipped target fails).
 - `contracts:K/N`: shard K of N of `artifact_contracts`. The test list comes
   from the compiled binary (`-- --list --format terse`), the shards from a
   greedy longest-first assignment over the checked-in weights
@@ -33,7 +34,9 @@ from the same list, so the N shards together run every listed test exactly
 once; `plan` prints that partition and checks it. `rest` proves from the
 combined output that every binary cargo ran printed a libtest summary
 with total > 0, naming any binary that prints none or runs zero (the
-testless p11scope bin is pinned, and a nonzero pin fails as stale).
+testless p11scope bin is pinned, and a nonzero pin fails as stale),
+and that every selected target ran (an expected target with no
+`Running` section fails naming it).
 
 Under `cargo llvm-cov` the script names the raw profiles after the partition
 (LLVM_PROFILE_FILE_NAME) so profiles from different runners never collide,
@@ -83,7 +86,11 @@ RESULT = re.compile(
     r"(\d+) measured; (\d+) filtered out;"
 )
 RUNNING_HEADER = re.compile(r"^\s*Running (\S+) (\S+) \((.*?)\)\s*$")
+# Integration tests and benches print the target source without a kind word:
+# `Running tests/foo.rs (target/debug/deps/foo-<hash>)`.
+RUNNING_SRC_HEADER = re.compile(r"^\s*Running (\S+) \((.*?)\)\s*$")
 BARE_RUNNING_HEADER = re.compile(r"^\s*Running (\S+)\s*$")
+DOCTEST_HEADER = re.compile(r"^\s*Doc-tests (\S+)\s*$")
 # The one rest binary that legitimately holds no tests: the p11scope bin
 # is CLI dispatch only (src/main.rs), so its total-0 summary is pinned,
 # not proved. (binary stem, target source) from the Running header; a
@@ -244,12 +251,47 @@ def rest_binary_stem(path):
     return re.sub(r"-[0-9a-f]{16}$", "", path.rsplit("/", 1)[-1])
 
 
-def verify_rest_output(output):
+def rest_expected_targets(metadata):
+    """(binary stem, package-relative source) cargo must run for rest.
+
+    Lib, bin and integration-test targets run only when their `test` flag
+    is set; examples and benches run under `--examples`/`--benches` even
+    with `test = false` (observed on cargo 1.99.1), so they are always
+    expected. The sharded `artifact_contracts` target runs in the
+    contracts partitions, never here.
+    """
+    members = set(metadata["workspace_members"])
+    expected = set()
+    for package in metadata["packages"]:
+        if package["id"] not in members:
+            continue
+        root = str(Path(package["manifest_path"]).parent) + "/"
+        for target in package["targets"]:
+            kind = tuple(target["kind"])
+            if kind == ("test",) and target["name"] == SHARDED_TARGET:
+                continue
+            if kind in (("lib",), ("bin",), ("test",), ("bench",)) \
+                    and not target.get("test", True):
+                continue
+            if kind not in (("lib",), ("bin",), ("example",), ("bench",), ("test",)):
+                continue
+            src = target["src_path"]
+            src = src.removeprefix(root)
+            expected.add((target["name"].replace("-", "_"), src))
+    return expected
+
+
+def verify_rest_output(output, expected=None):
     """Every binary cargo ran proved a nonzero libtest selection.
 
     Cargo's `Running` headers (stderr) delimit one section per binary;
     the binary's own summary is its section's last `test result:` line
-    (a nested libtest run inside a test can only print earlier).
+    (a nested libtest run inside a test can only print earlier). A
+    `Doc-tests` header starts its own section so a doctest summary can
+    never stand in for its lib's. When `expected` (from
+    `rest_expected_targets`) is given, every expected target must have
+    run a section: a selected target cargo silently skips fails naming
+    it instead of passing invisibly.
     """
     sections = []  # [(src, binary, [lines])]
     for line in output.splitlines():
@@ -257,6 +299,15 @@ def verify_rest_output(output):
         if modern is not None:
             _kind, src, binary = modern.groups()
             sections.append((src, binary, []))
+            continue
+        srcheader = RUNNING_SRC_HEADER.match(line)
+        if srcheader is not None:
+            src, binary = srcheader.groups()
+            sections.append((src, binary, []))
+            continue
+        doctest = DOCTEST_HEADER.match(line)
+        if doctest is not None:
+            sections.append((None, f"Doc-tests {doctest.group(1)}", []))
             continue
         bare = BARE_RUNNING_HEADER.match(line)
         if bare is not None:
@@ -281,6 +332,13 @@ def verify_rest_output(output):
             raise PartitionError(
                 f"rest binary {binary} ran {total} tests but is pinned as "
                 "testless in REST_ZERO_TEST_PIN; delete the pin")
+    if expected is not None:
+        ran = {(rest_binary_stem(binary), src)
+               for src, binary, _lines in sections if src is not None}
+        for stem, src in sorted(expected):
+            if (stem, src) not in ran:
+                raise PartitionError(
+                    f"rest never ran target {src} ({stem}): no Running section")
 
 
 def run_capture(command, env=None, capture_stderr=False):
@@ -335,13 +393,14 @@ def run_partition(spec, command, runner=run_capture, metadata=cargo_metadata,
     kind, shard, shards = parse_partition(spec)
     env = coverage_env(command, spec)
     if kind == "rest":
+        meta = metadata(command)
         status, output = runner(
-            narrowed(command, rest_selection(metadata(command))), env,
+            narrowed(command, rest_selection(meta)), env,
             capture_stderr=True,
         )
         if status != 0:
             return status  # cargo or a test already failed the partition
-        verify_rest_output(output)
+        verify_rest_output(output, rest_expected_targets(meta))
         return status
     names = list_tests(command, env, runner)
     assigned, loads = plan(names, shards, weights or load_weights())
@@ -503,25 +562,50 @@ def _expect_error(function, *args):
 
 def _fake_metadata(extra=()):
     targets = [
-        {"name": "p11scope", "kind": ["lib"], "test": True},
-        {"name": "p11scope", "kind": ["bin"], "test": True},
-        {"name": "example", "kind": ["example"], "test": False},
-        {"name": SHARDED_TARGET, "kind": ["test"], "test": True},
-        {"name": "zeta", "kind": ["test"], "test": True},
-        {"name": "alpha", "kind": ["test"], "test": True},
-        {"name": "untested", "kind": ["test"], "test": False},
-        {"name": "build-script-build", "kind": ["custom-build"], "test": False},
+        {"name": "p11scope", "kind": ["lib"], "test": True,
+         "src_path": "/fake/src/lib.rs"},
+        {"name": "p11scope", "kind": ["bin"], "test": True,
+         "src_path": "/fake/src/main.rs"},
+        {"name": "example", "kind": ["example"], "test": False,
+         "src_path": "/fake/examples/example.rs"},
+        {"name": SHARDED_TARGET, "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/artifact_contracts.rs"},
+        {"name": "zeta", "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/zeta.rs"},
+        {"name": "alpha", "kind": ["test"], "test": True,
+         "src_path": "/fake/tests/alpha.rs"},
+        {"name": "untested", "kind": ["test"], "test": False,
+         "src_path": "/fake/tests/untested.rs"},
+        {"name": "build-script-build", "kind": ["custom-build"], "test": False,
+         "src_path": "/fake/build.rs"},
     ]
     return {
         "workspace_members": ["root", "member"],
         "packages": [
-            {"id": "root", "name": "p11scope", "targets": targets},
+            {"id": "root", "name": "p11scope", "targets": targets,
+             "manifest_path": "/fake/Cargo.toml"},
             {"id": "member", "name": "member",
-             "targets": [{"name": "alpha", "kind": ["test"], "test": True}, *extra]},
+             "targets": [{"name": "alpha", "kind": ["test"], "test": True,
+                          "src_path": "/fake/member/tests/alpha.rs"}, *extra],
+             "manifest_path": "/fake/member/Cargo.toml"},
             {"id": "dep", "name": "dep",
-             "targets": [{"name": "outside", "kind": ["test"], "test": True}]},
+             "targets": [{"name": "outside", "kind": ["test"], "test": True,
+                          "src_path": "/fake/dep/tests/outside.rs"}],
+             "manifest_path": "/fake/dep/Cargo.toml"},
         ],
     }
+
+
+def _full_rest_sections(extra=()):
+    """Every fake rest target healthy: lib, pinned-zero bin, example, alpha, zeta."""
+    return [
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
+        ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 2, 0)),
+        ("zeta-1a2b3c4d5e6f7894", "tests/zeta.rs", (2, 0, 0, 0)),
+        *extra,
+    ]
 
 
 class _FakeLibtest:
@@ -571,7 +655,7 @@ class _FakeRest:
                 lines.append(f"     {binary}")
             elif src is None:
                 lines.append(f"     Running target/debug/deps/{binary}")
-            elif src.startswith("tests/") or src.startswith("benches/"):
+            elif src.startswith(("tests/", "benches/")):
                 lines.append(f"     Running {src} (target/debug/deps/{binary})")
             else:
                 lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
@@ -683,9 +767,7 @@ def self_test():
 
     def rest_ok(command, env, capture_stderr=False):
         seen.append((command, env, capture_stderr))
-        _, output = _FakeRest([
-            ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (5, 0, 0, 0)),
-        ])(command, env)
+        _, output = _FakeRest(_full_rest_sections())(command, env)
         return 0, output
 
     status = run_partition("rest", cov, runner=rest_ok,
@@ -704,12 +786,17 @@ def self_test():
     # must print a libtest summary with total > 0, else the partition fails
     # naming the binary. The exit status rule stays: a failing run fails
     # without summary verification.
-    healthy = _FakeRest([
-        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
-        ("alpha-1a2b3c4d5e6f7891", "tests/alpha.rs", (3, 0, 2, 0)),
-    ])
+    healthy = _FakeRest(_full_rest_sections())
     assert run_partition("rest", gate, runner=healthy,
                          metadata=lambda c: _fake_metadata()) == 0
+    # The expected set is exactly the runnable rest targets: the sharded
+    # target, the test=false integration target, the build script and the
+    # non-member package stay out, while the test=false example stays in.
+    assert rest_expected_targets(_fake_metadata()) == {
+        ("p11scope", "src/lib.rs"), ("p11scope", "src/main.rs"),
+        ("example", "examples/example.rs"), ("alpha", "tests/alpha.rs"),
+        ("zeta", "tests/zeta.rs"),
+    }
     zero = _FakeRest([
         ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
         ("zeta-1a2b3c4d5e6f7892", "tests/zeta.rs", (0, 0, 0, 0)),
@@ -747,17 +834,15 @@ def self_test():
         assert "bare-1a2b3c4d5e6f7893" in str(error), error
     else:
         raise AssertionError("a bare-form zero-test binary went unnoticed")
-    bare_healthy = _FakeRest([
+    bare_healthy = _FakeRest(_full_rest_sections([
         ("bare-1a2b3c4d5e6f7893", None, (2, 0, 0, 0)),
-    ])
+    ]))
     assert run_partition("rest", gate, runner=bare_healthy,
                          metadata=lambda c: _fake_metadata()) == 0
     # The p11scope bin is CLI dispatch only (src/main.rs holds no tests),
     # so its total-0 summary is pinned, not proved: any other zero-test
     # binary still fails, and a nonzero bin fails the pin as stale.
-    pinned_zero = _FakeRest([
-        ("p11scope-1a2b3c4d5e6f7890", "src/main.rs", (0, 0, 0, 0)),
-    ])
+    pinned_zero = _FakeRest(_full_rest_sections())
     assert run_partition("rest", gate, runner=pinned_zero,
                          metadata=lambda c: _fake_metadata()) == 0
     pinned_nonzero = _FakeRest([
@@ -772,10 +857,9 @@ def self_test():
         raise AssertionError("a stale zero-test pin went unnoticed")
     # A Doc-tests section is its own proof: its summary must not stand in
     # for the lib's, and a zero doctest run fails naming the doctests.
-    doctest_healthy = _FakeRest([
-        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+    doctest_healthy = _FakeRest(_full_rest_sections([
         ("Doc-tests p11scope", None, (4, 0, 0, 0)),
-    ])
+    ]))
     assert run_partition("rest", gate, runner=doctest_healthy,
                          metadata=lambda c: _fake_metadata()) == 0
     doctest_zero = _FakeRest([

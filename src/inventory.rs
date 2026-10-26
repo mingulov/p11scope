@@ -3331,10 +3331,14 @@ impl ClassicDriver<'_> {
         }
     }
 
-    /// The second stop (sigint2) for a begun Joint finish: abandon
+    /// Escalate a begun Joint finish to the typed exit: abandon
     /// where admitted, hold the lane for exit, keep the first error.
     /// Anything else (no lane, a legacy lane, already held) is a no-op.
-    fn escalate_joint_finish(&mut self) {
+    /// Each caller names its own trigger: the second operator signal
+    /// passes "second stop during joint finish", the settle bound
+    /// passes its own cause, so the held gap never names a signal
+    /// that never happened.
+    fn escalate_joint_finish(&mut self, cause: &str) {
         if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
             return;
         }
@@ -3350,18 +3354,13 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        let error = Self::hold_joint_lane_for_exit(
-            lane,
-            &mut *self.coordinator,
-            "second stop during joint finish",
-            &mut warn,
-            None,
-        );
+        let error =
+            Self::hold_joint_lane_for_exit(lane, &mut *self.coordinator, cause, &mut warn, None);
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
             self.coordinator.note_scope_gap(
                 "joint finish held for exit".to_string(),
-                "second stop during joint finish".to_string(),
+                cause.to_string(),
             );
         }
         self.joint_finish = JointFinishDriver::Abandoned;
@@ -4744,7 +4743,7 @@ impl ClassicDriver<'_> {
             if matches!(self.joint_finish, JointFinishDriver::Published) && self.semantic.is_some()
             {
                 if self.second_signal.is_some_and(|signal| signal()) {
-                    self.escalate_joint_finish();
+                    self.escalate_joint_finish("second stop during joint finish");
                     return;
                 }
                 let elapsed = started.elapsed();
@@ -5181,7 +5180,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // A second stop escalates a begun-but-unfinished Joint finish
         // to the typed exit instead of re-running the stop path.
         if self.stop_requested && !matches!(self.joint_finish, JointFinishDriver::NotBegun) {
-            self.escalate_joint_finish();
+            self.escalate_joint_finish("second stop during joint finish");
             return;
         }
         let first_stop = !self.stop_requested;
@@ -5272,7 +5271,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             if self.second_signal.is_some_and(|signal| signal())
                 && !matches!(self.joint_finish, JointFinishDriver::NotBegun)
             {
-                self.escalate_joint_finish();
+                self.escalate_joint_finish("second stop during joint finish");
                 return;
             }
             if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
@@ -5299,27 +5298,32 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     /// before the native retirement. The pre-retirement settle runs on
     /// the 10 ms cadence; a second operator signal escalates instead
     /// of stepping further: the run is leaving, so the finish is held
-    /// for exit rather than reaped. An explicit wall bound (the
-    /// machine's Audited no-progress timeout) escalates the same way
-    /// even when the machine never latches, so a wedged finish always
-    /// ends finitely without an operator. Unbegun, published,
-    /// abandoned and legacy lanes are untouched: the post-retirement
-    /// hook and the terminal consume own those.
+    /// for exit rather than reaped. An explicit wall backstop (twice
+    /// the machine's Audited no-progress timeout plus a margin)
+    /// escalates with its own cause even when the machine never
+    /// latches, so a wedged finish always ends finitely without an
+    /// operator. The machine's own trip fires first on a true stall;
+    /// the settle only backstops finishes that keep progressing yet
+    /// never complete. Unbegun, published, abandoned and legacy lanes
+    /// are untouched: the post-retirement hook and the terminal
+    /// consume own those.
     fn settle_joint_finish(&mut self) {
         self.settle_joint_finish_with_bound(
-            crate::inventory_semantics::JOINT_FINISH_NO_PROGRESS_TIMEOUT,
+            crate::inventory_semantics::JOINT_FINISH_SETTLE_TIMEOUT,
         );
     }
 }
 
 impl ClassicDriver<'_> {
     /// The settle above with an explicit wall bound (tests pose a
-    /// short one; production passes the machine's Audited no-progress
-    /// timeout). At the bound the finish abandons with the existing
-    /// no-progress gap, exactly like the second-signal arm. The
-    /// Polling step returns only Stayed or Abandoned, so no
-    /// wound-down arm belongs here: the terminal consume reaps a
-    /// Published lane through its own hook.
+    /// short one; production passes the settle backstop). At the
+    /// bound the finish abandons with its own settle-bound gap,
+    /// worded as the total time it measures (never "without
+    /// progress", which only the machine's stall clock may claim),
+    /// and escalates with its own cause. The Polling step returns
+    /// only Stayed or Abandoned, so no wound-down arm belongs here:
+    /// the terminal consume reaps a Published lane through its own
+    /// hook.
     fn settle_joint_finish_with_bound(&mut self, bound: Duration) {
         let start = Instant::now();
         let mut polls = 0u64;
@@ -5327,19 +5331,19 @@ impl ClassicDriver<'_> {
             && self.semantic.as_ref().is_some_and(Self::is_joint_lane)
         {
             if self.second_signal.is_some_and(|signal| signal()) {
-                self.escalate_joint_finish();
+                self.escalate_joint_finish("second stop during joint finish");
                 return;
             }
             if start.elapsed() >= bound {
                 self.coordinator.note_scope_gap(
-                    "joint finish made no progress".to_string(),
+                    "joint finish settle bound reached".to_string(),
                     format!(
-                        "{}s without progress across {} settle polls; abandoning the finish for exit",
+                        "finish did not complete within {}s across {} settle polls; abandoning the finish for exit",
                         start.elapsed().as_secs(),
                         polls,
                     ),
                 );
-                self.escalate_joint_finish();
+                self.escalate_joint_finish("joint finish settle bound reached");
                 return;
             }
             let started = Instant::now();

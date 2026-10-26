@@ -73,6 +73,16 @@ const H0_NO_PROGRESS_BOUND: u32 = 16;
 pub(crate) const JOINT_FINISH_NO_PROGRESS_TIMEOUT: Duration =
     Duration::from_millis(10 * (JOINT_FINISH_NO_PROGRESS_LIMIT as u64));
 
+// Wall-time backstop for the driver's Joint Finish settle loop: twice
+// the machine's Audited no-progress timeout plus a margin, so a
+// consecutively stalled finish always trips the machine's correctly
+// named bound first (the next settle step then abandons via the latch)
+// and the settle bound only fires on finishes that keep making
+// progress yet never complete. The settle measures total time, never
+// progress, so its gap is worded as total time with its own cause.
+pub(crate) const JOINT_FINISH_SETTLE_TIMEOUT: Duration =
+    Duration::from_millis(10 * (JOINT_FINISH_NO_PROGRESS_LIMIT as u64) * 2 + 1000);
+
 pub(crate) struct JointWorkBudget {
     pub(crate) remaining_actions: usize,
     pub(crate) deadline: Instant,

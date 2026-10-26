@@ -26,8 +26,8 @@ pub(crate) use machine::JointMachineIo;
 #[cfg(test)]
 pub(crate) use machine::StagingDetail;
 pub(crate) use machine::{
-    JOINT_FINISH_NO_PROGRESS_TIMEOUT, JointCommitRefusal, JointServiceMode, JointServiceProgress,
-    JointWorkBudget, LiveJointMachine,
+    JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
+    JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
 };
 
 /// One original negative or completed witness in the SAME paid allocation.

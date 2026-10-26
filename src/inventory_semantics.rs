@@ -9,8 +9,8 @@ pub(crate) mod selected;
 #[allow(unused_imports)]
 // Private Session service types; the ordinary driver remains inactive.
 pub(crate) use joint::{
-    JOINT_FINISH_NO_PROGRESS_TIMEOUT, JointCommitRefusal, JointServiceMode, JointServiceProgress,
-    JointWorkBudget,
+    JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
+    JointServiceMode, JointServiceProgress, JointWorkBudget,
 };
 pub(crate) use joint::{
     JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,

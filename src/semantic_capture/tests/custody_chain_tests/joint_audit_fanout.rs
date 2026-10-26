@@ -18742,3 +18742,108 @@ fn joint_machine_h0_idle_merge_refuses_within_bound() {
         "the refused original stays in AwaitH0 for disposal"
     );
 }
+
+/// An honest slow drain must never trip the no-progress guard: scans
+/// refused for a while (jobs still inside their deadline) and then
+/// accepted before the deadline must publish. Refused-scan passes are
+/// honest waits, not idle.
+#[test]
+fn joint_machine_h0_slow_drain_with_transient_refusal_publishes() {
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 1);
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    for pass in 0..20 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                panic!("must not publish while every scan refuses (pass {pass})");
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => {
+                panic!(
+                    "a transient refusal inside its deadline must not trip the guard: \
+                     {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = None;
+    for pass in 0..50 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => return,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => {
+                panic!(
+                    "must publish after scans accept: {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    panic!(
+        "must publish after a transient refusal, still {:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+    );
+}
+
+/// A truly stuck waiter set (awaiting with no job, no retained hold and
+/// no future deadline) must still be bounded: the guard expires the
+/// waiters as unobserved and publishes the transaction with its joined
+/// outcomes kept, instead of refusing the lane or yielding forever.
+#[test]
+fn joint_machine_h0_true_stall_without_job_expires_and_publishes() {
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 1);
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    for _ in 0..8 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                panic!("must not publish while scans refuse");
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                if fixture.machine.diagnostic_snapshot_for_test().0 == "AwaitH0" {
+                    break;
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "must reach AwaitH0 before injecting the stall: {reason:?} at {:?}",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "AwaitH0",
+        "the stall is injected in AwaitH0",
+    );
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        assert!(
+            !held.capture.awaiting.is_empty(),
+            "the injected stall needs awaiting tokens",
+        );
+        held.capture.jobs.clear();
+        held.capture.retained.clear();
+    }
+    for pass in 0..50 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => return,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => {
+                panic!(
+                    "a true stall must expire and publish, not refuse: \
+                     {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    panic!(
+        "a true stall must publish within a bound, still {:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+    );
+}

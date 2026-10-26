@@ -12864,8 +12864,10 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 //   `GPL-3.0-or-later` elsewhere.
 //
 // Documented exemptions (each pinned below so it cannot silently rot):
-// test-input C fixtures remain headerless, and generated third-party source
-// trees remain untracked. Internal plans and agent guides live outside the
+// test-input C fixtures remain headerless, `include!`d Rust files carry
+// the `//` form with their include site pinned (E0753 rejects `//!`
+// across `include!`), and generated third-party source trees remain
+// untracked. Internal plans and agent guides live outside the
 // public repository and need no source-tree license exemptions.
 
 // Test-input C fixtures: each is consumed by the test named
@@ -12902,6 +12904,21 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
 ];
 
+// Rust files joined through `include!` cannot carry the `//!`
+// inner-doc header: rustc E0753 rejects it across the macro
+// boundary (the comment cannot annotate the enclosing module).
+// Each listed file must carry the `//` form on line 1 instead,
+// and each entry pins its exact `include!` site, checked below,
+// so the exemption cannot silently rot or spread.
+const LICENSE_RUST_INCLUDE_FILES: &[(&str, &str, &str)] = &[
+    // (exempt file, include-site file, exact `include!` snippet).
+    (
+        "src/inventory_joint_cells_tests.rs",
+        "src/inventory.rs",
+        "include!(\"inventory_joint_cells_tests.rs\")",
+    ),
+];
+
 // Pre-relicense markers. Spelled via concat! so this very file (which the
 // scan below reads) never contains them contiguously.
 const LICENSE_REMOVED_TEXTS: &[&str] = &[concat!("LICENSE-", "MIT"), concat!("LICENSE-", "APACHE")];
@@ -12934,6 +12951,12 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
         return Some("/* SPDX-License-Identifier: GPL-3.0-or-later */");
     }
     if path.ends_with(".rs") {
+        if LICENSE_RUST_INCLUDE_FILES
+            .iter()
+            .any(|(file, _, _)| *file == path)
+        {
+            return Some("// SPDX-License-Identifier: GPL-3.0-or-later");
+        }
         if path.starts_with("crates/ebpf/src/") {
             return Some("//! SPDX-License-Identifier: GPL-2.0-only");
         }
@@ -13283,6 +13306,26 @@ fn license_headers_cover_every_tracked_source_file() {
         assert!(
             !first.contains("SPDX-License-Identifier"),
             "exempt fixture {fixture} gained a header; move it in scope"
+        );
+    }
+
+    // Every exempt `include!`d Rust file is still tracked (a stale
+    // entry fails), still `//`-headed (a real module file moves back
+    // in scope), and still really included from its named site (a
+    // moved include drops the exemption).
+    for (file, site, snippet) in LICENSE_RUST_INCLUDE_FILES {
+        assert!(
+            tracked.iter().any(|path| path == file),
+            "exempt include file {file} is no longer tracked; drop its exemption"
+        );
+        let first = read(file).lines().next().unwrap_or("").to_string();
+        assert_eq!(
+            first, "// SPDX-License-Identifier: GPL-3.0-or-later",
+            "exempt include file {file} must carry the `//` header on line 1"
+        );
+        assert!(
+            read(site).contains(snippet),
+            "exempt include file {file} is no longer included from {site}; drop its exemption"
         );
     }
 

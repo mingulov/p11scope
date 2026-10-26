@@ -7,8 +7,8 @@
 //! P11SCOPE_ENTRY_PAIRED_DEFAULT_TARGET_DIR and
 //! P11SCOPE_ENTRY_PAIRED_UNSAFE_TARGET_DIR to those target dirs; run
 //! this test with `--ignored --exact --nocapture`. The suite takes about
-//! 75 minutes single-CPU on the 1.2-1.5 MB objects, so it never joins the
-//! ordinary gate; its progress streams while it runs. Every input fails
+//! 2 hours (measured 6,915 s on the current objects), so it never joins
+//! the ordinary gate; its progress streams while it runs. Every input fails
 //! closed: an unset variable, a missing or ambiguous object, a non-ELF
 //! file, or two identical objects refuses instead of running a partial
 //! suite.
@@ -147,7 +147,7 @@ fn paired_default_and_unsafe_objects_satisfy_the_entry_contract() {
     assert!(status.success(), "paired entry suite failed: {stderr}");
     assert!(
         stderr.contains(&format!("Ran {EXPECTED_TESTS} tests")),
-        "zero selection: {stderr}"
+        "expected {EXPECTED_TESTS} tests: {stderr}"
     );
-    assert!(!stderr.contains("skipped"), "skipped proof: {stderr}");
+    assert!(!stderr.contains("(skipped="), "skipped proof: {stderr}");
 }

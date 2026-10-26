@@ -981,7 +981,7 @@
     {
       "file": "tests/entry_object_paired.rs",
       "path": "paired_default_and_unsafe_objects_satisfy_the_entry_contract",
-      "reason": "needs default and unsafe-unvalidated-metadata target dirs from the paired-build lane; static object analysis, no BPF load; run by hand, about 75 minutes",
+      "reason": "needs default and unsafe-unvalidated-metadata target dirs from the paired-build lane; static object analysis, no BPF load; run by hand, about 2 hours (measured 6,915 s on the current objects)",
       "cell": "live-kernel"
     },
     {

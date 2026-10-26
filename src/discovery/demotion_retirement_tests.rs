@@ -5461,3 +5461,105 @@ fn steady_caller_exit_before_any_pass_classifies_it_discloses_only_the_tail() {
         last.1
     );
 }
+
+/// The wait that keeps commit lag from failing count authority waits
+/// only for the queuing projection's own publication. A module the
+/// committed registry knows is judged at once; one it still does not
+/// know after a later publication fails authority, and so does one
+/// queued outside a projection.
+#[test]
+fn demotion_retirement_projected_observation_waits_only_for_its_own_publication() {
+    use super::count_eligibility::CountOwnership;
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let known = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .modules()
+        .find(|module| module.paths.iter().any(|path| path.ends_with("b.so")))
+        .unwrap()
+        .key
+        .clone();
+    let unknown = ModuleKey::physical(253, 7, 999_999, Some("sha-unstaged".into()), "");
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry
+            .module_id_for(&unknown)
+            .is_none()
+    );
+    let fresh = |scene: &Scene| {
+        let coordinator = &scene.native.scene.coordinator;
+        let mut ownership = CountOwnership::new(coordinator.registry.limits());
+        assert!(ownership.register_pair(caller, object));
+        ownership.invalidate_memberships(coordinator.attach_set.count_revision());
+        ownership.begin_catalog_pass();
+        ownership
+    };
+    let complete = |scene: &Scene| {
+        Some(crate::inspect_system::CompleteMemberScan::scripted(
+            scene.generation.clone(),
+            300,
+            301,
+        ))
+    };
+
+    let mut ownership = fresh(&scene);
+    let published = scene.native.scene.coordinator.registry.published_revision();
+    assert!(ownership.queue_projected_observation(
+        caller,
+        vec![known],
+        complete(&scene),
+        published
+    ));
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(caller),
+        301,
+        "known: judged at once"
+    );
+    assert_eq!(ownership.caller_authority_failure(caller), 0);
+
+    let mut ownership = fresh(&scene);
+    assert!(ownership.queue_projected_observation(
+        caller,
+        vec![unknown.clone()],
+        complete(&scene),
+        published
+    ));
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(caller),
+        0,
+        "nothing accepted while waiting"
+    );
+    assert_eq!(
+        ownership.caller_authority_failure(caller),
+        0,
+        "the projection's own commit lag is not failed authority"
+    );
+    scene.native.scene.coordinator.registry.publish();
+    assert!(scene.native.scene.coordinator.registry.published_revision() > published);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(caller), 0);
+    assert_ne!(
+        ownership.caller_authority_failure(caller),
+        0,
+        "still unknown after a later publication: authority fails"
+    );
+
+    let mut ownership = fresh(&scene);
+    assert!(ownership.queue_observation(caller, vec![unknown], complete(&scene)));
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(caller), 0);
+    assert_ne!(
+        ownership.caller_authority_failure(caller),
+        0,
+        "unknown outside a projection: authority fails at once"
+    );
+}

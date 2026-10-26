@@ -153,6 +153,10 @@ struct Observation {
     cursor: usize,
     equal: bool,
     authoritative: bool,
+    /// The registry publication current when the projection that staged
+    /// this observation's mappings queued it; `None` when the queue site
+    /// staged no projection of its own.
+    published: Option<u64>,
 }
 struct CleanupObservation {
     modules: Vec<ModuleKey>,
@@ -398,6 +402,29 @@ impl CountOwnership {
         modules: Vec<ModuleKey>,
         complete: Option<CompleteMemberScan>,
     ) -> bool {
+        self.queue(caller, modules, complete, None)
+    }
+    /// A catalog projection's observation: its module mappings are staged
+    /// in the registry, unpublished, and `published` is the registry
+    /// publication current at queue time. A module the committed registry
+    /// does not know yet is judged only after a later publication, which
+    /// carries this projection: commit lag is never failed authority.
+    pub(super) fn queue_projected_observation(
+        &mut self,
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        complete: Option<CompleteMemberScan>,
+        published: u64,
+    ) -> bool {
+        self.queue(caller, modules, complete, Some(published))
+    }
+    fn queue(
+        &mut self,
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        complete: Option<CompleteMemberScan>,
+        published: Option<u64>,
+    ) -> bool {
         if !self.callers.contains_key(&caller) && self.callers.len() >= self.limits.max_callers {
             return false;
         }
@@ -457,6 +484,7 @@ impl CountOwnership {
             cursor: 0,
             equal,
             authoritative: true,
+            published,
         };
         let discarded = if slot.processing.is_some() {
             slot.waiting.replace(observation)
@@ -877,14 +905,30 @@ impl CountOwnership {
             if observation.cursor < observation.modules.len() {
                 budget.spend(2);
                 let key = &observation.modules[observation.cursor];
+                let id = registry.module_id_for(key);
+                if id.is_none()
+                    && observation
+                        .published
+                        .is_some_and(|published| registry.published_revision() <= published)
+                {
+                    // The projection that queued this observation staged
+                    // this module's mapping and has not published yet: the
+                    // committed registry cannot judge a module first noted
+                    // by that same projection. Wait for the publication —
+                    // the caller stays deferred, nothing is accepted — and
+                    // judge it then; a module still unknown after it fails
+                    // authority below. Commit lag is not an authority
+                    // failure: recording it would revoke ordinary origin
+                    // for every later pair of this caller.
+                    continue;
+                }
                 observation.authoritative &= matches!(
                     key,
                     ModuleKey::Physical {
                         sha256: Some(_),
                         ..
                     }
-                ) && registry
-                    .module_id_for(key)
+                ) && id
                     .and_then(|id| registry.module(id))
                     .is_some_and(|record| record.admission == AdmissionState::Admitted);
                 observation.equal &= slot
@@ -1146,6 +1190,12 @@ impl CountOwnership {
         self.index
             .as_ref()
             .map_or(0, |index| index.last_authority_failure)
+    }
+    #[cfg(test)]
+    pub(super) fn caller_authority_failure(&self, caller: CallerId) -> u64 {
+        self.callers
+            .get(&caller)
+            .map_or(0, |slot| slot.last_authority_failure)
     }
     #[cfg(test)]
     pub(super) fn newest_accepted_post(&self, caller: CallerId) -> u64 {

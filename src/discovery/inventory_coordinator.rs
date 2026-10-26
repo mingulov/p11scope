@@ -3323,10 +3323,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         && receipt.finished_ns() > receipt.started_ns()
                 })
                 .cloned();
-            if !self.count_ownership.queue_observation(
+            // This projection's mappings are staged above, unpublished: the
+            // observation is judged against the publication that carries
+            // them, never against the committed snapshot before it.
+            if !self.count_ownership.queue_projected_observation(
                 caller,
                 shown.into_iter().collect(),
                 complete_scan,
+                self.registry.published_revision(),
             ) {
                 self.registry.record_gap(RegistryGap { caller: Some(caller), module: None, pid: Some(process.pid), subject: "current count ownership storage refused".into(), reason: "the bounded ownership observation could not be retained; historical evidence remains, current count eligibility is unknown".into(), budget: Some(BudgetRefusal { resource: "inventory_count_observations", limit: self.registry.limits().max_edges, requested: self.registry.limits().max_edges.saturating_add(1) }) });
             }

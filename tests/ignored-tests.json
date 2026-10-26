@@ -637,6 +637,12 @@
       "cell": "helper"
     },
     {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale",
+      "reason": "scale: system-population graph sizing, time measured not gated (R-40); run by exact selector at V2 and L",
+      "cell": "performance"
+    },
+    {
       "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
       "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
@@ -755,6 +761,42 @@
       "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_subvolume_collision_backend_parity",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; actual kernel/userspace parity",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity",
+      "reason": "root Btrfs disk TMPDIR, worker CLONE_FILES unshare and eligible BTF/task_vma identity; actual live-thread parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_thread_mapping_helper",
+      "reason": "private D4 thread fixture entrypoint; invoked only by its owning parity test with an owned socket/configuration",
+      "cell": "helper"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity",
+      "reason": "root x86-64 LP64 Btrfs disk TMPDIR, literal private-files clone and eligible BTF/task_vma identity; actual backend parity",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper",
+      "reason": "private D4 literal-clone fixture entrypoint; requires its owning parity test socket/configuration",
+      "cell": "helper"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity",
+      "reason": "root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required zombie-leader positive baseline",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper",
+      "reason": "private D4 zombie fixture entrypoint; requires owning socket and source configuration",
+      "cell": "helper"
     },
     {
       "file": "src/events/runtime_tests.rs",
@@ -1018,6 +1060,54 @@
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
       "reason": "6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures, a cgroup v2 hierarchy, and authorized native Multi staging as root: Engine-driven cgroup growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven system growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven Multi stop prints no one-at-a-time detach estimate",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: a second stop signal abandons a Singles counter detach promptly with the typed interruption",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven timestamps growth to 8192, then an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+      "reason": "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven latency growth to 8192, then an atomic over-ceiling refusal",
       "cell": "privileged"
     },
     {

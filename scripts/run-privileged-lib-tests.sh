@@ -394,6 +394,15 @@ metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_
 attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel
 attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels
 metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64
+# Engine-driven counter growth and stop cells (cgroup/system scopes, timing
+# modes, Singles/Multi stop estimates): root with prebuilt growth fixtures.
+metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64
+metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64
+metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64
+metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
+metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -449,6 +458,13 @@ SKIP_REASONS=(
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"
 "6.1 E2BIG lane: proves the verifier-budget refusal maps before lifecycle without activating; run exact --ignored as root on the 6.1 verifier-budget host"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a cgroup v2 hierarchy, proven kernel Multi PID filtering and separately admitted Engine-driven cgroup growth to 8192 plus an atomic over-ceiling refusal"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven system growth to 8192 plus an atomic over-ceiling refusal"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and a separately admitted Engine-driven Multi stop that prints no one-at-a-time detach estimate"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles staging; a second stop signal abandons the counter detach with the typed interruption"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven timestamps growth to 8192 plus an atomic over-ceiling refusal"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven latency growth to 8192 plus an atomic over-ceiling refusal"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -471,17 +487,16 @@ attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_p
 
 # Counter-build curation (checker-enforced, never executed by this
 # script): the ignored integration tests that exist only in dedicated
-# counter builds. COUNTER_BANK_PROOF_TESTS members run with
-# P11SCOPE_COUNTER_BANK_PROOF=1, COUNTER_ARTIFACTS_TESTS members with
-# P11SCOPE_COUNTER_ARTIFACTS=1, each in its own build with --ignored
-# --exact (the BTF/map/program-load cell needs root; the checker cells
-# are static object analysis). Selectors are `file:path` like
-# INTEGRATION_TESTS.
+# counter builds. COUNTER_ARTIFACTS_TESTS members run with
+# P11SCOPE_COUNTER_ARTIFACTS=1 in their own build with --ignored --exact
+# (static object analysis). Selectors are `file:path` like
+# INTEGRATION_TESTS. COUNTER_BANK_PROOF_TESTS is empty: the counter bank
+# objects are built and embedded by default, its route and mutation cells
+# run in the ordinary suite and the BTF/map/program-load cell is curated
+# in INTEGRATION_TESTS.
 # shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
 COUNTER_BANK_PROOF_TESTS=(
-tests/object_producer_activation.rs:counter_bank_proof_has_exact_routes_and_start_ownership
-tests/object_producer_activation.rs:counter_bank_proof_mutations_are_causally_rejected
-tests/object_producer_activation.rs:counter_bank_proof_btf_maps_and_programs_load
+# (none: no ignored test needs a separate counter bank build)
 )
 # shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
 COUNTER_ARTIFACTS_TESTS=(

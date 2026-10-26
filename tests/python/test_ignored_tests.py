@@ -65,6 +65,7 @@ INTEGRATION_EXPECTED = [
     "tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs",
     "tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_population",
     "tests/inventory_identity.rs:kernel_identity_positive_cell_rejects_refusal",
+    "tests/object_producer_activation.rs:counter_bank_btf_maps_and_programs_load",
     "tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
 ]
 
@@ -514,14 +515,14 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=101",
+            "DEFAULT_TESTS=117",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=13",
-            "SKIP_TESTS=34",
+            "SKIP_TESTS=60",
             "WIDE_DETAILED_2112_TESTS=9",
-            "COUNTER_BANK_PROOF_TESTS=3",
+            "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
-            "INTEGRATION_TESTS=6",
+            "INTEGRATION_TESTS=7",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -629,16 +630,19 @@ class IgnoredTestsTests(unittest.TestCase):
                 ["d4_btrfs_scan_backends_match_exact_fixture_population",
                  "kernel_identity_positive_cell_rejects_refusal"])
             write_fake_integration_binary(
+                deps, "object_producer_activation",
+                ["counter_bank_btf_maps_and_programs_load"])
+            write_fake_integration_binary(
                 deps, "run_abandon_report",
                 ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (6)", result.stdout)
+        self.assertIn("integration (7)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (6 entries)", result.stdout)
+                      "test per entry (7 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

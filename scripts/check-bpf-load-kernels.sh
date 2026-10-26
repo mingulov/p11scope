@@ -14,33 +14,50 @@
 # without any flag. Exits 0 only when every kernel passes; a timeout, a
 # missing count or a nonzero report is FAIL.
 #
-# Per kernel two throwaway guests run one command each under the probe:
-# `doctor` (Detailed object, probe-K.jsonl) and a bounded
+# Per kernel five throwaway guests run one command each under the probe:
+# `doctor` (Detailed object, probe-K.jsonl), a bounded
 # `inventory --system --capture native` (Inventory object,
-# inventory-probe-K.jsonl). Two runs because virtme carries --exec
-# base64 on the kernel command line (2048 bytes); one combined command
-# overflows it and the guest then silently never runs. Before each
-# command, the guest stages its kernel's /boot/config from the
-# virtme-ng cache (the kernel round's cells-guest.sh pattern), so the
-# instance hooks load the way they do on ordinary hosts instead of
-# refusing on unverifiable LTO status. The inventory run raises the
-# guest descriptor limit first (the guest hard limit is 4096, below the
-# 4163 a 4096-endpoint Singles session needs) and is bounded by
-# `timeout -s INT`, passing on rc 0 (one pass finished) or rc 124
-# (bounded stop); any other exit, or a crash marker in its log, is FAIL.
+# inventory-probe-K.jsonl), and one bounded `profile --system --mode
+# metrics --counter-mode <mode>` per mode (that mode's counter bank
+# object, counter-<mode>-probe-K.jsonl). Separate guests because virtme
+# carries --exec base64 on the kernel command line (2048 bytes); one
+# combined command overflows it and the guest then silently never runs.
+# Separate counter runs per mode because probe rows key programs by root
+# name only while all three bank objects export the same
+# p11_counter_bank_entry/p11_counter_bank_return roots: one combined run
+# would collide in by_root. Before each command, the guest stages its
+# kernel's /boot/config from the virtme-ng cache (the kernel round's
+# cells-guest.sh pattern), so the instance hooks load the way they do on
+# ordinary hosts instead of refusing on unverifiable LTO status. The
+# inventory run raises the guest descriptor limit first (the guest hard
+# limit is 4096, below the 4163 a 4096-endpoint Singles session needs)
+# and is bounded by `timeout -s INT`, passing on rc 0 (one pass
+# finished) or rc 124 (bounded stop); any other exit, or a crash marker
+# in its log, is FAIL. Each counter run likewise raises the descriptor
+# limit and is bounded by `timeout -s INT` past its own --duration 5s.
 #
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
 # defaults, p11_image_query, 4 instance hooks), scored against their
 # per-kernel per-object budgets, and the 12 Inventory programs the
 # system inventory loads, scored against their own per-kernel
 # per-object budgets. Both sides fail on a refused load, a missing
-# probe row, or a count over budget. Known gaps, not gated:
+# probe row, or a count over budget. Per counter mode the 2 bank
+# roots the profile run loads, scored per object (counter-<mode>) for
+# loaded + stats + 5% headroom on kernels that load them; numeric
+# per-kernel bank budgets stay unpinned until a measured gate run
+# supplies processed counts (a separate budgets file with its own kernel
+# set, since the main file's shape pin requires one kernel set for every
+# program). 5.15 refuses before loading (no bpf_loop) and 6.1 refuses at
+# load (verifier E2BIG); both keep the specified
+# counter-mode-unavailable-on-kernel refusal, and the gate passes those
+# kernels only when the observer log names it. Known gaps, not gated:
 # p11_selected_bootstrap (loads only for a promoted live process, which
 # needs a provider mapped in the guest), the dormant
 # p11_selected_cgroup_migrate (present in the object, no load call
 # site), the lazily loaded p11_inventory_image_baseline iterator (no
-# provider in the guest loads it), and the counter-bank programs
-# (absent from the default build; --counter-mode is unwired).
+# provider in the guest loads it), and the bank lifecycle roots
+# (sched_process_exec/sched_process_exit: present in the bank objects,
+# loaded by no production path).
 set -eu
 
 BUDGETS=""
@@ -241,6 +258,92 @@ for KERNEL in "$@"; do
             FAILED=1
         fi
     fi
+    for MODE in counts timestamps latency; do
+        C_PROBE_JSON="$OUTDIR/counter-$MODE-probe-$KERNEL.jsonl"
+        C_TXT="$OUTDIR/counter-$MODE-$KERNEL.txt"
+        C_VNG_LOG="$OUTDIR/vng-counter-$MODE-$KERNEL.log"
+        rm -f "$C_PROBE_JSON" "$C_TXT" "$C_VNG_LOG"
+        EXEC_C="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --system --mode metrics --counter-mode $MODE --duration 5s 9>$(q "counter-$MODE-probe-$KERNEL.jsonl") >$(q "counter-$MODE-$KERNEL.txt") 2>&1; echo counter-rc=\$?; echo guest-release=\$(uname -r)"
+        if [ "${#EXEC_C}" -gt 950 ]; then
+            echo "# error: counter guest command exceeds the kernel-cmdline budget on $KERNEL"
+            FAILED=1
+            continue
+        fi
+        if ! timeout -k 30 300 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+            --rwdir "$OUTDIR" --exec "$EXEC_C" < /dev/null >"$C_VNG_LOG" 2>&1; then
+            echo "# error: vng counter-$MODE run failed or timed out on $KERNEL (see $C_VNG_LOG)"
+            FAILED=1
+            continue
+        fi
+        if ! grep -q '^counter-rc=' "$C_VNG_LOG"; then
+            echo "# error: no counter exit line on $KERNEL (see $C_VNG_LOG)"
+            FAILED=1
+            continue
+        fi
+        if ! grep -Eq '^(staged-boot-config|boot-config-present)-' "$C_VNG_LOG"; then
+            echo "# error: kernel config not staged for counter-$MODE on $KERNEL (see $C_VNG_LOG)"
+            FAILED=1
+            continue
+        fi
+        C_RELEASE=$(grep '^guest-release=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
+        case "$C_RELEASE" in
+            "${KERNEL#v}"|"${KERNEL#v}-"*)
+                echo "# counter-$MODE guest release $C_RELEASE (expected $KERNEL)"
+                ;;
+            *)
+                echo "# error: counter-$MODE guest booted $C_RELEASE, expected $KERNEL"
+                FAILED=1
+                continue
+                ;;
+        esac
+        C_RC=$(grep '^counter-rc=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
+        case "$KERNEL" in
+            v5.15.*|v6.1.*)
+                # The specified refusal: the observer names the token, and
+                # the probe file holds refusal rows (6.1 E2BIG at load) or
+                # the bare summary (5.15 refuses before loading). A behavior
+                # flip (loads where none were specified) names no token and
+                # FAILs here, so new loads need new budgets before they pass.
+                if [ ! -f "$C_TXT" ] || ! grep -q 'counter-mode-unavailable-on-kernel' "$C_TXT"; then
+                    echo "# error: counter-$MODE on $KERNEL left no specified refusal (see $C_TXT)"
+                    FAILED=1
+                    continue
+                fi
+                if [ ! -f "$C_PROBE_JSON" ] || ! grep -q -E '"record": ?"probe-summary"' "$C_PROBE_JSON"; then
+                    echo "# error: counter-$MODE probe never finished on $KERNEL (see $C_VNG_LOG)"
+                    FAILED=1
+                    continue
+                fi
+                REFUSED=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" | wc -l)
+                echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED)"
+                ;;
+            *)
+                case "$C_RC" in
+                    0)
+                        echo "# counter-$MODE rc=0 on $KERNEL"
+                        ;;
+                    *)
+                        echo "# error: counter-$MODE profile exited rc=$C_RC on $KERNEL (see $C_TXT)"
+                        FAILED=1
+                        continue
+                        ;;
+                esac
+                if [ ! -f "$C_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
+                    echo "# error: counter-$MODE profile crashed or left no log on $KERNEL (see $C_VNG_LOG)"
+                    FAILED=1
+                    continue
+                fi
+                # No budgets file yet: numeric bank budgets stay unpinned
+                # until a measured run supplies processed counts, so the
+                # gate is loaded + stats + 5% headroom under this mode's
+                # object name (the three bank objects share root names).
+                if ! python3 -I "$REPORT" --object "counter-$MODE" --kernel "$KERNEL" \
+                    --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
+                    FAILED=1
+                fi
+                ;;
+        esac
+    done
 done
 
 if [ "$FAILED" -ne 0 ]; then

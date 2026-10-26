@@ -3931,7 +3931,10 @@ impl ClassicDriver<'_> {
     /// Disclose a promotion lane that never joined its wind-down: no
     /// ticks follow the stop, so the lane is held for exit at drop
     /// and this gap — recorded before the final commit — publishes
-    /// that. Callers run it once per stop path.
+    /// that. A Joint winding that never disclosed also discloses its
+    /// stop counts here, like every other hold; a lane that already
+    /// disclosed (joined, held, or a legacy lane disclosed at
+    /// wind-down) stays quiet. Callers run it once per stop path.
     fn record_unjoined_winding_gap(&mut self) {
         let joint = self.retiring.as_ref().and_then(|retiring| {
             retiring
@@ -3951,6 +3954,49 @@ impl ClassicDriver<'_> {
                 "stop during a legacy wind-down; the lane is held for exit".to_string()
             },
         );
+        // The drop hold stays silent, so the stop path is an
+        // undisclosed winding's only disclosure: readable counts go
+        // through the shared helper before the final commit, while
+        // unreadable counts name a gap instead of printing invented
+        // zeros.
+        let undisclosed = self.retiring.as_ref().and_then(|retiring| {
+            retiring.winding.as_ref().filter(|winding| {
+                winding.joint
+                    && winding.lane.is_some()
+                    && !winding.joined
+                    && !matches!(winding.finish, JointFinishDriver::Abandoned)
+            })
+        });
+        let Some(undisclosed) = undisclosed else {
+            return;
+        };
+        if !undisclosed.lane.as_ref().is_some_and(|lane| lane.is_live()) {
+            self.coordinator.note_scope_gap(
+                "winding lane key-operation counts unknown".to_string(),
+                "stop held the winding lane with its counts unreadable; \
+                 its key-operation counts after the promotion began are unknown"
+                    .to_string(),
+            );
+            return;
+        }
+        let counts = {
+            let retiring = self
+                .retiring
+                .as_ref()
+                .expect("undisclosed winding checked above");
+            let lane = retiring
+                .winding
+                .as_ref()
+                .expect("undisclosed winding checked above")
+                .lane
+                .as_ref()
+                .expect("undisclosed winding checked above");
+            SemanticStopCounts::read(lane, &mut *self.coordinator)
+        };
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
+        disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
     }
 
     /// Bind the dashboard's promotion control to this run's capture
@@ -4134,7 +4180,7 @@ impl Drop for ClassicDriver<'_> {
     /// promotion lane still winding down is held for exit the same
     /// way: no ticks follow the stop, so the detach would otherwise
     /// drop unjoined mid-cleanup; the stop path already recorded its
-    /// gap before the final commit.
+    /// gap and stop counts before the final commit.
     fn drop(&mut self) {
         if let Some(retiring) = self.retiring.as_mut()
             && let Some(winding) = retiring.winding.as_mut()

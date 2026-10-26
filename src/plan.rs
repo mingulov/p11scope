@@ -6011,12 +6011,10 @@ mod tests {
         detailed.deactivate(1);
         let budget = crate::capacity::CounterBudget::new(8192).unwrap();
         let converted = detailed.with_counters_policy(budget).unwrap();
-        assert!(
-            matches!(
-                converted.admission_policy(),
-                AdmissionPolicy::Counters(budget) if budget.endpoint_limit() == 8192
-            )
-        );
+        assert!(matches!(
+            converted.admission_policy(),
+            AdmissionPolicy::Counters(budget) if budget.endpoint_limit() == 8192
+        ));
         assert_eq!(converted.slots, detailed.slots);
         assert_eq!(converted.modules, detailed.modules);
         for index in 0..3 {

@@ -367,6 +367,11 @@ metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_gro
 discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity
 discovery::sweep_attribution::tests::d4_thread_mapping_helper
 metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
+metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64
+metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64
 discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity
@@ -423,6 +428,11 @@ SKIP_REASONS=(
 "needs root/proc access, Btrfs disk TMPDIR and eligible task_vma/BTF; explicit live nonleader/shared-and-private FD-table parity with owned re-exec helpers, separately admitted exact ignored run"
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "needs qualified Multi513 pilot, the default prebuilt libtest with embedded V2 objects and growth provider/workload inputs; separately admitted 8192-endpoint FD/memory/native qualification with unchanged ledger/N+1/cleanup/deadline assertions, preserving required Singles coverage"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven first-512 native Multi staging"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven growth to 8192 plus an atomic over-ceiling refusal with the prefix intact"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a high hard RLIMIT_NOFILE and separately admitted Engine-driven Multi staging from a soft-1024 start"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a high hard RLIMIT_NOFILE and authorized native BPF for the bypassed-preparation FD-exhaustion twin"
+"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven Multi staging for live and terminal collection"
 "needs root/proc access, Btrfs disk TMPDIR, x86-64 raw clone support and eligible task_vma/BTF; actual CLONE_THREAD without CLONE_FILES attribution parity requires a separately admitted exact ignored run"
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"

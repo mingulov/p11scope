@@ -944,6 +944,36 @@
     },
     {
       "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, proven kernel Multi PID filtering, and authorized Engine-driven first-512 native Multi staging",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized Engine-driven growth to 8192 plus an atomic over-ceiling refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, a high hard RLIMIT_NOFILE, and authorized Engine-driven Multi staging from a soft-1024 start",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures, a high hard RLIMIT_NOFILE, and authorized native BPF for the bypassed-preparation FD-exhaustion twin",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized Engine-driven Multi staging for live and terminal collection",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
       "reason": "requires an explicitly granted native map-only BPF lane; no attach/program load",
       "cell": "privileged"

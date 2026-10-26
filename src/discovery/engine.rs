@@ -1,6 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Initial and incremental provider discovery ownership.
 
+use crate::attach::counter_banks::{
+    BankPublication, BankRefusal, BankShapeCause, CounterSpec, check_counter_endpoints_fit,
+};
 #[cfg(feature = "h6-reexec-diagnostic")]
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
@@ -9,9 +12,6 @@ use crate::attach::{
     DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome,
     RetainedInputMeasure, RetainedRetirementInput, RetirementPoll, RetirementProgress,
     RetirementTicket, Scope, Session,
-};
-use crate::attach::counter_banks::{
-    BankPublication, BankRefusal, BankShapeCause, CounterSpec, check_counter_endpoints_fit,
 };
 use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
@@ -27087,11 +27087,7 @@ impl Engine {
 
     /// Memory preflight for a counter start: the requested endpoint count
     /// must fit the kernel-map ceiling before any Session exists.
-    fn preflight_counter_start(
-        &self,
-        mode: CounterMode,
-        requested_endpoints: usize,
-    ) -> Result<()> {
+    fn preflight_counter_start(&self, mode: CounterMode, requested_endpoints: usize) -> Result<()> {
         let cpus = self.counter_preflight_cpus();
         check_counter_endpoints_fit(mode, cpus, requested_endpoints)
             .map_err(|refusal| anyhow!("{refusal}"))
@@ -27127,6 +27123,56 @@ impl Engine {
         self.views = views;
         self.plan = plan;
         self.pinned = pinned;
+    }
+
+    /// Test-only counter growth step through the production apply path:
+    /// builds the candidate for these fresh slots and applies it. Returns
+    /// completions, static failures, and the cumulative counter PARTIAL
+    /// reasons.
+    #[cfg(test)]
+    pub(crate) fn apply_counter_growth_for_test(
+        &mut self,
+        session: &mut Session,
+        plan: plan::AttachPlan,
+        new: Vec<plan::Slot>,
+        pinned: PinnedObjects,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        let candidate = LiveCandidate {
+            pinned,
+            modules: Vec::new(),
+            plan,
+            delta: plan::AttachDelta {
+                new,
+                replace: Vec::new(),
+                retire: Vec::new(),
+            },
+            views: BTreeSet::new(),
+            corroboration: Vec::new(),
+            manifest_fallbacks: Vec::new(),
+            selection_claims: BTreeMap::new(),
+            selection_tables: BTreeMap::new(),
+            selection_admission: None,
+            manifest_selection_admissions: Vec::new(),
+            manifest_inventory_slots: BTreeMap::new(),
+            loader_plan_proof: None,
+            exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
+        };
+        let mut additions_allowed = true;
+        let outcome =
+            self.apply_candidate(session, candidate, &mut additions_allowed, false, &[])?;
+        let partials = self
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject.contains("counter"))
+            .map(|skip| skip.reason.clone())
+            .collect();
+        Ok((
+            outcome.static_completions.len(),
+            outcome.static_failures.len(),
+            partials,
+        ))
     }
 
     fn start_session_with(
@@ -27940,11 +27986,11 @@ pub(crate) mod session_fixture {
             let _ = (objects, reserve);
             self.staged_counter_calls.push(plan.slots.len());
             let publication =
-                self.counter_stage_script.pop_front().unwrap_or(
-                    BankPublication::Refused(BankRefusal::Shape(
+                self.counter_stage_script
+                    .pop_front()
+                    .unwrap_or(BankPublication::Refused(BankRefusal::Shape(
                         BankShapeCause::StagedWithoutBanks,
-                    )),
-                );
+                    )));
             // Mirror real staging: publication consumes the scripted
             // extent; refusals leave the plan untouched.
             if let BankPublication::Published { extent, .. } = publication {

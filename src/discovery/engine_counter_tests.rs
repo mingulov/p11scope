@@ -3,9 +3,7 @@
 
 use super::session_fixture::ScriptedSession;
 use super::*;
-use crate::attach::counter_banks::{
-    BankExtent, BankPublication, BankRefusal,
-};
+use crate::attach::counter_banks::{BankExtent, BankPublication, BankRefusal};
 use crate::attach::{BackendSelection, CapturePolicy};
 use crate::discovery::identity::PinnedObjectId;
 use p11scope_ebpf_common::CounterMode;
@@ -42,7 +40,9 @@ fn detailed_plan(count: u32) -> plan::AttachPlan {
 
 fn detailed_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     plan::AttachPlan::from_slots_with_policy(
-        (0..count).map(|index| counter_slot(index, object)).collect(),
+        (0..count)
+            .map(|index| counter_slot(index, object))
+            .collect(),
         plan::AdmissionPolicy::Detailed,
     )
     .unwrap()
@@ -50,10 +50,10 @@ fn detailed_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
 
 fn counters_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     plan::AttachPlan::from_slots_with_policy(
-        (0..count).map(|index| counter_slot(index, object)).collect(),
-        plan::AdmissionPolicy::Counters(
-            crate::capacity::CounterBudget::new(8192).unwrap(),
-        ),
+        (0..count)
+            .map(|index| counter_slot(index, object))
+            .collect(),
+        plan::AdmissionPolicy::Counters(crate::capacity::CounterBudget::new(8192).unwrap()),
     )
     .unwrap()
 }
@@ -84,10 +84,13 @@ fn counter_spec_for_startup_routes_policy() {
         CounterMode::Timestamps,
         CounterMode::Latency,
     ] {
-        let spec =
-            Engine::counter_spec_for_startup(CapturePolicy::Counter(mode), 8, engine.counter_reserver())
-                .unwrap()
-                .expect("counter policy builds a spec");
+        let spec = Engine::counter_spec_for_startup(
+            CapturePolicy::Counter(mode),
+            8,
+            engine.counter_reserver(),
+        )
+        .unwrap()
+        .expect("counter policy builds a spec");
         assert_eq!(spec.mode(), mode);
     }
     assert_eq!(
@@ -115,8 +118,7 @@ fn counter_preflight_refuses_before_session_start_with_zero_links() {
     };
     let text = format!("{error:#}");
     assert!(text.starts_with("counter-memory-limit:"), "{text}");
-    let fixed =
-        crate::attach::counter_banks::counter_fixed_map_bytes(490).unwrap();
+    let fixed = crate::attach::counter_banks::counter_fixed_map_bytes(490).unwrap();
     let per_bank =
         crate::attach::counter_banks::counter_bank_map_bytes(CounterMode::Latency, 490).unwrap();
     for word in [
@@ -193,11 +195,11 @@ fn counter_pool_covers_terminal_keepalive_and_read() {
         graph_before
     );
     let counter_before = engine.counter_pool.snapshot().charged_bytes;
-    let _hold = engine.collected_graph_reserver().reserve(1024 * 1024).unwrap();
-    assert_eq!(
-        engine.counter_pool.snapshot().charged_bytes,
-        counter_before
-    );
+    let _hold = engine
+        .collected_graph_reserver()
+        .reserve(1024 * 1024)
+        .unwrap();
+    assert_eq!(engine.counter_pool.snapshot().charged_bytes, counter_before);
 }
 
 fn growth_candidate(
@@ -239,10 +241,12 @@ fn counter_growth_stages_fresh_tail_through_apply() {
         .expect("staged prefix");
     let mut session = ScriptedSession::default();
     session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
-    session.counter_stage_script.push_back(BankPublication::Published {
-        transaction: 1,
-        extent: BankExtent { first: 2, end: 3 },
-    });
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Published {
+            transaction: 1,
+            extent: BankExtent { first: 2, end: 3 },
+        });
     let mut plan = counters_plan_on(3, object);
     plan.adopt_counter_consumed(2).expect("staged prefix");
     let new = vec![plan.slots[2].clone()];
@@ -278,13 +282,13 @@ fn counter_growth_refusal_partials_with_plan_intact() {
         .expect("staged prefix");
     let mut session = ScriptedSession::default();
     session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
-    session.counter_stage_script.push_back(BankPublication::Refused(
-        BankRefusal::BudgetExhausted {
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Refused(BankRefusal::BudgetExhausted {
             resource: "counter-memory-limit",
             needed: 1,
             available: 0,
-        },
-    ));
+        }));
     let mut plan = counters_plan_on(3, object);
     plan.adopt_counter_consumed(2).expect("staged prefix");
     let new = vec![plan.slots[2].clone()];
@@ -358,9 +362,11 @@ fn counter_growth_without_fresh_tail_stages_nothing() {
     );
     assert!(outcome.static_completions.is_empty());
     assert!(
-        !engine.counters.object_skips.iter().any(|skip| {
-            skip.subject.contains("counter") || skip.reason.contains("counter")
-        }),
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.subject.contains("counter") || skip.reason.contains("counter") }),
         "a no-op stages no PARTIAL"
     );
 }

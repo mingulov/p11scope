@@ -4410,6 +4410,494 @@ mod tests {
         native_growth_population_with_backend(8192, crate::attach::AttachBackend::Multi);
     }
 
+    /// Growth-fixture parts for Engine-driven counter cells: the same
+    /// provider, workload, pins and slots the direct-session harness uses,
+    /// but no Session (the Engine builds it through the start chain).
+    struct EngineCounterFixture {
+        provider: std::path::PathBuf,
+        digest: String,
+        object: crate::discovery::identity::PinnedObjectId,
+        fixture: GrowthDriver,
+        pins: crate::discovery::identity::PinnedObjects,
+        slots: Vec<Slot>,
+        extra: Slot,
+    }
+
+    fn engine_counter_fixture() -> EngineCounterFixture {
+        use sha2::Digest;
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::PathBuf;
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        let provider = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
+                .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
+        );
+        let workload = PathBuf::from(
+            std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD")
+                .expect("prebuild counter-bank-growth.c's LP64 dlopen/pthread driver"),
+        );
+        let mut file = std::fs::File::open(&provider).unwrap();
+        let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
+        assert_eq!(elf.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
+        let wanted: Vec<_> = (0..GROWTH_ENDPOINTS)
+            .map(|i| format!("counter_bank_growth_e{i:04x}"))
+            .collect();
+        let borrowed: Vec<_> = wanted.iter().map(String::as_str).collect();
+        let mut index = elf.exports_matching(&borrowed).unwrap();
+        index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(index.len(), GROWTH_ENDPOINTS);
+        let mut offsets = Vec::with_capacity(GROWTH_ENDPOINTS);
+        for ((name, offset), wanted) in index.iter().zip(&wanted) {
+            assert_eq!(name, wanted);
+            assert!(elf.is_executable_offset(*offset));
+            offsets.push(*offset);
+        }
+        let mut unique = offsets.clone();
+        unique.sort_unstable();
+        assert!(
+            unique.windows(2).all(|pair| pair[0] != pair[1]),
+            "8192 real distinct physical endpoints are required"
+        );
+        let extra_offset = elf
+            .defined_symbol("endpoint_body")
+            .unwrap()
+            .expect("provider's actual endpoint_body FUNC")
+            .file_offset;
+        assert!(elf.is_executable_offset(extra_offset));
+        assert!(unique.binary_search(&extra_offset).is_err());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(&bytes));
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(&provider, None, 1, &digest);
+        let object = pins.pinned().next().unwrap().id;
+        let selected = file.metadata().unwrap();
+        let pinned = pins.file_for(object).unwrap().metadata().unwrap();
+        assert_eq!(
+            (selected.dev(), selected.ino()),
+            (pinned.dev(), pinned.ino())
+        );
+        let slots: Vec<_> = offsets
+            .into_iter()
+            .enumerate()
+            .map(|(i, offset)| {
+                let mut target = slot(i as u32, 0);
+                target.object = object;
+                target.object_path = provider.to_string_lossy().into_owned();
+                target.file_offset = offset;
+                target.names = vec![wanted[i].clone()];
+                target.aliased = false;
+                target
+            })
+            .collect();
+        let mut extra = slots[0].clone();
+        extra.file_offset = extra_offset;
+        extra.names = vec!["endpoint_body".into()];
+        let fixture = GrowthDriver::spawn(&workload, &provider);
+        EngineCounterFixture {
+            provider,
+            digest,
+            object,
+            fixture,
+            pins,
+            slots,
+            extra,
+        }
+    }
+
+    /// A second pin set over the same provider file for growth candidates;
+    /// the assigned ID must match the fixture's, or slots would dangle.
+    fn repin_counter_fixture(
+        parts: &EngineCounterFixture,
+    ) -> crate::discovery::identity::PinnedObjects {
+        let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+            &parts.provider,
+            None,
+            1,
+            &parts.digest,
+        );
+        assert_eq!(pins.pinned().next().unwrap().id, parts.object);
+        pins
+    }
+
+    fn engine_over_counter_fixture(
+        parts: &mut EngineCounterFixture,
+        slots: Vec<Slot>,
+    ) -> crate::discovery::engine::Engine {
+        let mut engine = crate::discovery::engine::Engine::empty_for_test();
+        let pid = parts.fixture.child.id();
+        let view =
+            crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid).unwrap();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            slots,
+            crate::plan::AdmissionPolicy::Detailed,
+        )
+        .unwrap();
+        let pins = std::mem::replace(
+            &mut parts.pins,
+            crate::discovery::identity::PinnedObjects::empty(),
+        );
+        engine.inject_counter_start_state_for_test(
+            crate::attach::Scope::Pid(pid),
+            vec![view],
+            plan,
+            pins,
+        );
+        engine
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven first-512 Counts staging"]
+    fn counter_engine_stages_first_512_counts_multi_lp64() {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        assert_native_growth_backend(&session, crate::attach::AttachBackend::Multi, true);
+        let budgets = session.counter_budgets(0).unwrap();
+        assert_eq!(budgets.endpoints.published, 512);
+        // Finite stop on Multi: an unbounded stop would hang the bounded cell.
+        drop(session);
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven growth to 8192, then an atomic over-ceiling refusal"]
+    fn counter_engine_growth_over_ceiling_refuses_atomically_lp64() {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        // Grow to the 8192 endpoint ceiling through the production apply path.
+        let full = parts.slots.clone();
+        let fresh = full[512..].to_vec();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            full,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (7680, 0));
+        assert!(
+            partials.is_empty(),
+            "clean growth marks no PARTIAL: {partials:?}"
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192
+        );
+        // One endpoint past the ceiling refuses atomically. Validated plan
+        // constructors cap at 8192, so the twin hand-extends the plan to
+        // reach the staging gate — the same gate production hits for memory
+        // over-ceiling on larger hosts (unreachable for counts at this
+        // host's CPU count, where the ceiling is the full 8192).
+        let mut past = parts.slots.clone();
+        let mut last = parts.extra.clone();
+        last.index = 8192;
+        past.push(last);
+        let fresh = past[8192..].to_vec();
+        let mut plan = crate::plan::AttachPlan::from_slots_with_policy(
+            past[..8192].to_vec(),
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        plan.slots.push(past[8192].clone());
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(partials.len(), 1);
+        assert!(
+            partials[0].contains("PlanBudgetMismatch"),
+            "refusal carries the honest budget token: {}",
+            partials[0]
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192,
+            "the published prefix stays intact"
+        );
+        // The intact prefix stays readable through the collection path.
+        let mut collection = crate::metrics::CaptureCollection::new(Some(
+            crate::metrics::CounterCaptureInputs::new(8192, 65536, engine.counter_reserver()),
+        ));
+        let snapshot = collection
+            .fresh(&mut session, engine.plan(), engine.pinned(), true)
+            .unwrap();
+        assert_eq!(snapshot.reports().len(), 8192);
+        drop(session);
+        drop(engine);
+    }
+
+    const SOFT1024_CHILD: &str = "P11SCOPE_A27_SOFT1024_CHILD";
+
+    fn soft_nofile() -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized rlimit value; no change.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur
+    }
+
+    fn hard_nofile() -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized rlimit value; no change.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_max
+    }
+
+    fn set_soft_nofile(soft: u64) {
+        let hard = hard_nofile();
+        let limit = libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: hard,
+        };
+        // SAFETY: lowering the soft limit never exceeds the hard limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    }
+
+    /// Runs `body` in a forked-off test child with a bounded watchdog, so a
+    /// hung stage cannot hang the campaign. The child re-executes this exact
+    /// test with `SOFT1024_CHILD` set and returns after `body`.
+    fn soft1024_cell(cell: &str, test: &str, deadline_secs: u64, body: impl FnOnce()) {
+        if let Some(requested) = std::env::var_os(SOFT1024_CHILD) {
+            if requested == cell {
+                body();
+            }
+            return;
+        }
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(deadline_secs);
+        let mut child = Reaped(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .env(SOFT1024_CHILD, cell)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "soft-1024 cell {cell} failed: {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let pid = child.0.id();
+                child.0.kill().unwrap();
+                let status = child.0.wait().unwrap();
+                panic!(
+                    "soft-1024 watchdog expired: {cell}, owned_pid={pid}, \
+                     elapsed={:?}, killed=true reaped=true status={status}",
+                    start.elapsed()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures, authorized native Multi staging as root, and a high hard RLIMIT_NOFILE: soft-1024 start raises through the Engine path"]
+    fn counter_start_raises_nofile_from_soft_1024_lp64() {
+        const TEST: &str =
+            "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64";
+        let hard = hard_nofile();
+        assert!(
+            hard >= growth_fd_soft_floor(512),
+            "the raise proves nothing without a high hard limit, got {hard}"
+        );
+        soft1024_cell("raise", TEST, 180, || {
+            assert_eq!(hard_nofile(), hard);
+            set_soft_nofile(1024);
+            assert_eq!(soft_nofile(), 1024);
+            let mut parts = engine_counter_fixture();
+            let first = parts.slots[..512].to_vec();
+            let mut engine = engine_over_counter_fixture(&mut parts, first);
+            assert_eq!(
+                soft_nofile(),
+                1024,
+                "nothing raised before the Engine start"
+            );
+            let session = engine
+                .start_session(
+                    crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                    None,
+                    crate::attach::BackendSelection::Multi,
+                )
+                .unwrap();
+            // The raise happened inside the Engine start, before the first
+            // staged link; this cell never runs capture tracking, so
+            // Tracker::for_producer cannot have raised it.
+            let raised = soft_nofile();
+            assert!(
+                raised > 1024,
+                "the Engine start raised the soft limit, got {raised}"
+            );
+            assert_eq!(session.counter_budgets(0).unwrap().endpoints.published, 512);
+            drop(session);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native BPF as root: soft-1024 direct preparation without the raise hits FD exhaustion"]
+    fn counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64() {
+        use crate::attach::counter_banks::{BankPublication, BankRefusal, BankReservation};
+        const TEST: &str = "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64";
+        let hard = hard_nofile();
+        assert!(
+            hard >= growth_fd_soft_floor(512),
+            "the bypass proves nothing without a high hard limit, got {hard}"
+        );
+        soft1024_cell("bypass", TEST, 180, || {
+            set_soft_nofile(1024);
+            assert_eq!(soft_nofile(), 1024);
+            let parts = engine_counter_fixture();
+            // Direct preparation bypasses the start chain raise.
+            let pool = SemanticResourcePool::reference_limit(2 * 1024 * 1024 * 1024);
+            let cpus = aya::util::nr_cpus().unwrap();
+            let base = BankReservation {
+                retained_bytes: 128 * 1024 * 1024,
+                transient_bytes: 64 * 1024 * 1024,
+                metadata_bytes: 32 * 1024 * 1024,
+                file_descriptors: cpus.checked_mul(4).unwrap() + 512,
+            };
+            let artifact = std::fs::read(std::path::Path::new(env!("OUT_DIR")).join(format!(
+                "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
+                CounterMode::Counts.name()
+            )))
+            .unwrap();
+            let scope = crate::attach::Scope::Pid(parts.fixture.child.id());
+            let mut session =
+                Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver()).unwrap();
+            let mut history = crate::plan::AttachPlan::from_slots_with_policy(
+                parts.slots[..512].to_vec(),
+                crate::plan::AdmissionPolicy::Counters(
+                    crate::capacity::CounterBudget::new(8192).unwrap(),
+                ),
+            )
+            .unwrap();
+            let stage = stage_envelope_for_range(
+                CounterMode::Counts,
+                cpus,
+                &history.slots,
+                provider_copy_charge(&parts.pins, &history.slots),
+                true,
+            );
+            match session.stage_counter_banks(&mut history, &parts.pins, stage, &pool.reserver()) {
+                BankPublication::Refused(BankRefusal::BudgetExhausted {
+                    resource,
+                    needed,
+                    available,
+                }) => {
+                    assert_eq!(resource, "file descriptors");
+                    assert!(needed >= 1026, "first-512 FD demand, got {needed}");
+                    assert_eq!(available, 1024);
+                }
+                other => panic!("bypassed stage must hit FD exhaustion, got {other:?}"),
+            }
+            assert_eq!(
+                history.counter_consumed_end(),
+                0,
+                "FD refusal stages nothing"
+            );
+            drop(session);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: counter collection reads live and terminal rows"]
+    fn counter_collection_reads_live_and_terminal_lp64() {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        // Legacy never consulted: this session attached zero Detailed
+        // links (counter starts skip slot attach), so the Detailed maps
+        // the legacy read needs do not exist on this object.
+        assert!(crate::metrics::read(&session, engine.plan()).is_err());
+        let mut collection = crate::metrics::CaptureCollection::new(Some(
+            crate::metrics::CounterCaptureInputs::new(8192, 65536, engine.counter_reserver()),
+        ));
+        parts.fixture.command("START");
+        parts.fixture.expect("HELD 0");
+        let live = collection
+            .fresh(&mut session, engine.plan(), engine.pinned(), true)
+            .unwrap();
+        let reports = live.reports();
+        assert_eq!(reports.len(), 512);
+        let row = reports
+            .iter()
+            .find(|row| row.file_offset == parts.slots[0].file_offset)
+            .unwrap();
+        assert!(row.in_flight >= 1, "held call visible live: {row:?}");
+        let _ = live.kernel_evidence();
+        parts.fixture.command("RELEASE");
+        parts.fixture.expect("RELEASED 0 0000000000000204");
+        let terminal = collection
+            .terminal(&mut session, engine.plan(), engine.pinned(), true)
+            .unwrap();
+        let reports = terminal.reports();
+        assert_eq!(reports.len(), 512);
+        let row = reports
+            .iter()
+            .find(|row| row.file_offset == parts.slots[0].file_offset)
+            .unwrap();
+        assert!(row.calls >= 1, "released call completed: {row:?}");
+        let _ = terminal.kernel_evidence();
+        drop(session);
+        drop(engine);
+    }
+
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
     fn counter_bank_session_boundary_511_512_timestamps_growth_lp64() {

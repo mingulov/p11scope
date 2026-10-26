@@ -122,7 +122,10 @@ impl CounterSpec {
 
     /// Production preparation: the embedded object for the spec mode with
     /// the real kernel probe and the real CPU count.
-    pub(super) fn prepare(&self, backend: super::AttachBackend) -> Result<CounterPreparation<'static>> {
+    pub(super) fn prepare(
+        &self,
+        backend: super::AttachBackend,
+    ) -> Result<CounterPreparation<'static>> {
         self.prepare_with_probe_and_cpus(backend, super::kernel_bpf_loop_probe, None)
     }
 
@@ -3341,11 +3344,7 @@ impl Session {
         // prefix from the directory high-water before consuming the tail.
         if plan.counter_consumed_end() == 0 {
             let high_water = directory.allocated_high_water();
-            if high_water != 0
-                && plan
-                    .adopt_counter_consumed(high_water as u32)
-                    .is_err()
-            {
+            if high_water != 0 && plan.adopt_counter_consumed(high_water as u32).is_err() {
                 return BankPublication::Refused(BankRefusal::Topology);
             }
         }
@@ -9619,9 +9618,8 @@ pub(crate) mod tests {
         use super::super::AttachBackend;
         let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
         let cpus = aya::util::nr_cpus().expect("possible CPUs");
-        let spec =
-            super::CounterSpec::for_production(CounterMode::Counts, cpus, pool.reserver())
-                .expect("spec sizes");
+        let spec = super::CounterSpec::for_production(CounterMode::Counts, cpus, pool.reserver())
+            .expect("spec sizes");
         match spec.prepare(AttachBackend::Singles) {
             Ok(prepared) => {
                 assert_eq!(
@@ -9769,11 +9767,7 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let mut directory = prepared
-            .banks
-            .directory
-            .lock()
-            .expect("directory lock");
+        let mut directory = prepared.banks.directory.lock().expect("directory lock");
         assert!(matches!(
             directory.stage_with(&mut io, &mut history, envelope, &pool.reserver()),
             super::BankPublication::Published { extent, .. }

@@ -10303,6 +10303,503 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_fork_child_birth_after_parent_h3_void_respects_fence() {
+        use crate::semantics_objects::{Birth, FieldState, KeyLabel, Lifetime, ViewOrigin};
+        use p11scope_ebpf_common::event_type;
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, OBJECT_ACTION_CREATE};
+
+        // The parent seals a create plus an RSA-2048 label read, then the
+        // lane voids on H3 loss. Child C is forked before the void, child
+        // A at the void ordinal, child B after it (all fork-without-exec:
+        // fresh cookie, parent exec id). No child birth may name a cut
+        // below the void, and no child publish may carry the voided
+        // parent label: inherited session and object words join as
+        // first-observed unknowns in the child's own domain.
+        const INHERITED_KEY: u64 = 0x9090_9090_9090_9090;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let getattr = function_id("C_GetAttributeValue");
+        let sign_init = function_id("C_SignInit");
+        let init_capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        let query_capture = capture::MECHANISM_NONE | capture::OUTPUT_NULL;
+
+        // Ordinals 1-2: the parent creates the object the children inherit.
+        let p_begin = begin_bytes(1, 1, create, 0);
+        let p_end = end_bytes(&p_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        scene.ingest(&p_begin);
+        scene.ingest(&p_end);
+        // Ordinal 3: fork record sighting pre-void child C.
+        let child_c = ImageIdentity {
+            task_cookie: COOKIE + 7,
+            exec_id: EXEC,
+        };
+        let mut fork_c = ordinary_for(&p_begin, 0);
+        fork_c.event_type = event_type::FORK;
+        fork_c.child_image = child_c;
+        assert_eq!(
+            scene.ingest_ordinary(fork_c),
+            JournalDisposition::OrdinaryCounted
+        );
+        // Ordinals 4-5: the parent establishes RSA-2048 on the object.
+        let p_get = begin_bytes_shaped(
+            1,
+            2,
+            getattr,
+            0,
+            (COOKIE, EXEC),
+            SESSION,
+            0,
+            query_capture,
+            Some((INHERITED_KEY, 1)),
+            None,
+            FLAGS,
+        );
+        let p_get_end = end_bytes_getattr(
+            &p_get,
+            0,
+            ENTRY_NS + 55,
+            &[(1, 1, 3), (2, 1, 0), (5, 1, 2048)],
+        );
+        scene.ingest(&p_get);
+        assert_eq!(scene.ingest(&p_get_end), JournalDisposition::EndStaged);
+        // Admit and seal the parent history before the void.
+        let JournalRecord::End(create_return) =
+            decode_journal_record(&p_end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let admitted_create = scene
+            .fixture
+            .admit_original_event("C_CreateObject", create_return.payload_base().event);
+        let parent_proof = scene.adapter.attest_key(&admitted_create).unwrap();
+        let JournalRecord::End(get_return) =
+            decode_journal_record(&p_get_end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let admitted_get = scene
+            .fixture
+            .admit_original_event("C_GetAttributeValue", get_return.payload_base().event);
+        scene.adapter.attest_key(&admitted_get).unwrap();
+        let parent_seal = scene
+            .seal(&scene.bootstrap(parent_proof, 0))
+            .expect("parent seals before the void");
+        assert_eq!(parent_seal.prefix.settled().len(), 2);
+        let parent_view = parent_seal
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::Created { object, .. } => Some(*object),
+                _ => None,
+            })
+            .expect("parent create effect");
+        {
+            let projection = scene.model.project();
+            let view = projection.object(parent_view).expect("parent view");
+            assert_eq!(view.label, Some(KeyLabel::Rsa { modulus_bits: 2048 }));
+            assert_eq!(view.lifetime, Lifetime::Live);
+        }
+        // Ordinal 6: fork record sighting child A at the void ordinal.
+        let child_a = ImageIdentity {
+            task_cookie: COOKIE + 9,
+            exec_id: EXEC,
+        };
+        let mut fork_a = ordinary_for(&p_begin, 0);
+        fork_a.event_type = event_type::FORK;
+        fork_a.child_image = child_a;
+        assert_eq!(
+            scene.ingest_ordinary(fork_a),
+            JournalDisposition::OrdinaryCounted
+        );
+        assert_eq!(scene.adapter.consumed_through, 6);
+        // H3 loss voids at 6 with the parent key present.
+        let void_bootstrap = scene.bootstrap(parent_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &void_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&void_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(failure.h3_voided, Some(6));
+        // The voided parent label stays in the model, retired: the
+        // children's unknowns below prove non-inheritance, not absence.
+        {
+            let projection = scene.model.project();
+            let view = projection.object(parent_view).expect("voided parent view");
+            assert_eq!(view.lifetime, Lifetime::Retired(ObjectGap::OutcomeLost));
+            assert_eq!(view.label, Some(KeyLabel::Rsa { modulus_bits: 2048 }));
+        }
+        // Ordinal 7: fork record sighting post-void child B.
+        let child_b = ImageIdentity {
+            task_cookie: COOKIE + 11,
+            exec_id: EXEC,
+        };
+        let mut fork_b = ordinary_for(&p_begin, 0);
+        fork_b.event_type = event_type::FORK;
+        fork_b.child_image = child_b;
+        assert_eq!(
+            scene.ingest_ordinary(fork_b),
+            JournalDisposition::OrdinaryCounted
+        );
+        // Each child signs once with the inherited session and key words.
+        let sign_call = |thread: u64, image: ImageIdentity, ts: u64| {
+            let begin = begin_bytes_shaped(
+                thread,
+                1,
+                sign_init,
+                0,
+                (image.task_cookie, image.exec_id),
+                SESSION,
+                1,
+                init_capture,
+                Some((INHERITED_KEY, 1)),
+                None,
+                FLAGS,
+            );
+            let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ts);
+            (begin, end)
+        };
+        let (a_begin, a_end) = sign_call(2, child_a, ENTRY_NS + 60);
+        scene.ingest(&a_begin);
+        assert_eq!(scene.ingest(&a_end), JournalDisposition::EndStaged);
+        let (b_begin, b_end) = sign_call(3, child_b, ENTRY_NS + 70);
+        scene.ingest(&b_begin);
+        assert_eq!(scene.ingest(&b_end), JournalDisposition::EndStaged);
+        let (c_begin, c_end) = sign_call(4, child_c, ENTRY_NS + 80);
+        scene.ingest(&c_begin);
+        assert_eq!(scene.ingest(&c_end), JournalDisposition::EndStaged);
+        // All three child keys bind only after the void.
+        let mut fa = AttestationFixture::new(child_a);
+        let a_proof = scene.admit_other_end(&mut fa, "C_SignInit", &a_end);
+        let mut fb = AttestationFixture::new(child_b);
+        let b_proof = scene.admit_other_end(&mut fb, "C_SignInit", &b_end);
+        let mut fc = AttestationFixture::new(child_c);
+        let c_proof = scene.admit_other_end(&mut fc, "C_SignInit", &c_end);
+        let attest = |scene: &Scene, proof: JournalDomainProof, birth: BirthKind, cut: u64| {
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, birth, cut, scene.closure_generation()),
+            )
+        };
+        // Below the fence every child birth refuses, both kinds, at the
+        // cut and at the boundary just under it.
+        for (proof, who) in [(a_proof, "A"), (b_proof, "B"), (c_proof, "C")] {
+            for birth in [BirthKind::ExecMarker, BirthKind::AbsenceAppearance] {
+                assert_eq!(
+                    attest(&scene, proof, birth, 0),
+                    Err(BirthRefusal::BelowVoidFence),
+                    "{who} cut 0 {birth:?}"
+                );
+                assert_eq!(
+                    attest(&scene, proof, birth, 5),
+                    Err(BirthRefusal::BelowVoidFence),
+                    "{who} cut 5 {birth:?}"
+                );
+            }
+        }
+        // At the fence the kind rules still apply on top of it.
+        assert_eq!(
+            attest(&scene, a_proof, BirthKind::ExecMarker, 6),
+            Err(BirthRefusal::NoveltyBroken),
+            "A sighted at its cut"
+        );
+        assert_eq!(
+            attest(&scene, b_proof, BirthKind::AbsenceAppearance, 6),
+            Err(BirthRefusal::AbsenceUnproven),
+            "B unseen at its cut"
+        );
+        assert_eq!(
+            attest(&scene, b_proof, BirthKind::AbsenceAppearance, 7),
+            Err(BirthRefusal::AbsenceUnproven),
+            "B fork inheritance is affecting"
+        );
+        assert_eq!(
+            attest(&scene, c_proof, BirthKind::ExecMarker, 6),
+            Err(BirthRefusal::NoveltyBroken),
+            "C fenced past is still a past"
+        );
+        // Scripted receipts bypassing attestation still refuse at seal.
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        for (proof, birth, who) in [
+            (a_proof, BirthKind::ExecMarker, "A exec"),
+            (b_proof, BirthKind::ExecMarker, "B exec"),
+            (a_proof, BirthKind::AbsenceAppearance, "A absence"),
+            (b_proof, BirthKind::AbsenceAppearance, "B absence"),
+        ] {
+            let scripted = BootstrapReceipt::scripted(proof, birth, 0, scene.closure_generation());
+            let refused = scene
+                .seal_explicit(
+                    &audit,
+                    &scripted,
+                    frontier,
+                    SessionBirthEvidence::scripted_for_receipt(&scripted),
+                )
+                .expect_err("seal below the fence refuses");
+            assert_eq!(refused.gap, JournalGap::BootstrapMismatch, "{who}");
+        }
+        // C's absence cut 5 passes birth verification (a pre-void fork is
+        // fenced history) but the seal refuses it below the fence.
+        let scripted = BootstrapReceipt::scripted(
+            c_proof,
+            BirthKind::AbsenceAppearance,
+            5,
+            scene.closure_generation(),
+        );
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &scripted,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&scripted),
+            )
+            .expect_err("seal below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        // Sound resumptions at the fence attest and seal one settled call
+        // each, strictly above the void.
+        let a_receipt = attest(&scene, a_proof, BirthKind::AbsenceAppearance, 6)
+            .expect("A absence at the fence attests");
+        let b_receipt =
+            attest(&scene, b_proof, BirthKind::ExecMarker, 6).expect("B exec at the fence attests");
+        let c_receipt = attest(&scene, c_proof, BirthKind::AbsenceAppearance, 6)
+            .expect("C absence at the fence attests");
+        let a_seal = scene.seal(&a_receipt).expect("A seals");
+        let b_seal = scene.seal(&b_receipt).expect("B seals");
+        let c_seal = scene.seal(&c_receipt).expect("C seals");
+        for (seal, begin_cut, who) in [(&a_seal, 8, "A"), (&b_seal, 10, "B"), (&c_seal, 12, "C")] {
+            assert_eq!(seal.prefix.settled().len(), 1, "{who}");
+            assert_eq!(seal.prefix.settled()[0].begin_cut, begin_cut, "{who}");
+            assert_eq!(seal.prefix.settled()[0].function, sign_init, "{who}");
+            assert_eq!(seal.prefix.birth_cut(), 6, "{who}");
+            assert_eq!(seal.prefix.bootstrap_cut(), Some(7), "{who}");
+        }
+        // Each child joins the inherited words as a fresh session and a
+        // fresh view: the published key use carries no inherited label.
+        let mut child_views = Vec::new();
+        for (seal, who) in [(&a_seal, "A"), (&b_seal, "B"), (&c_seal, "C")] {
+            assert!(
+                seal.effects
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, ObjectEffect::SessionFirstObserved { .. })),
+                "{who} fresh session"
+            );
+            let first = seal
+                .effects
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    ObjectEffect::FirstObserved { object, .. } => Some(*object),
+                    _ => None,
+                })
+                .expect("fresh child view");
+            assert_ne!(first, parent_view, "{who} view is not the parent view");
+            let joined = seal
+                .effects
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    ObjectEffect::Referenced {
+                        object,
+                        key_use,
+                        label,
+                        metadata,
+                        ..
+                    } if *object == first => Some((*key_use, *label, *metadata)),
+                    _ => None,
+                })
+                .expect("child key use");
+            assert!(joined.0, "{who} key use");
+            assert_eq!(joined.1, None, "{who} no inherited label");
+            assert_eq!(
+                joined.2.established_count(),
+                0,
+                "{who} no inherited metadata"
+            );
+            assert_eq!(joined.2.requested_count(), 0, "{who} nothing requested");
+            child_views.push((first, who));
+        }
+        assert_ne!(child_views[0].0, child_views[1].0);
+        assert_ne!(child_views[0].0, child_views[2].0);
+        assert_ne!(child_views[1].0, child_views[2].0);
+        {
+            let projection = scene.model.project();
+            for (id, who) in &child_views {
+                let view = projection.object(*id).expect("child view");
+                assert_eq!(view.origin, ViewOrigin::FirstObserved, "{who}");
+                assert_eq!(view.birth, Birth::Unknown, "{who}");
+                assert_eq!(view.label, None, "{who}");
+                for kind in [
+                    SafeAttributeKind::Class,
+                    SafeAttributeKind::KeyType,
+                    SafeAttributeKind::Token,
+                    SafeAttributeKind::ValueLen,
+                    SafeAttributeKind::ModulusBits,
+                    SafeAttributeKind::EcParams,
+                ] {
+                    assert_eq!(
+                        view.established.field(kind),
+                        FieldState::Unknown,
+                        "{who} {kind:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn object_journal_fork_exec_child_birth_after_parent_h3_void_respects_fence() {
+        use p11scope_ebpf_common::event_type;
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_ACCESS, OBJECT_ACTION_CREATE};
+
+        // Fork plus exec: the fork record names the pre-exec image while
+        // the child's calls arrive under the post-exec image, which has
+        // no fork sighting of its own. Below-fence births refuse; exec
+        // birth at the fence resumes without the voided parent history.
+        // The post-exec image uses a distinct cookie: the attestation
+        // fixture's legacy observation hard-codes exec 0, and every
+        // journal/model key uses the exact (cookie, exec) pair, so a
+        // distinct pair exercises the identical paths.
+        const INHERITED_KEY: u64 = 0x9090_9090_9090_9090;
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let sign_init = function_id("C_SignInit");
+        let p_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&p_begin);
+        scene.ingest(&end_bytes(&p_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        // Ordinal 3: fork record naming the pre-exec child image.
+        let pre_exec = ImageIdentity {
+            task_cookie: COOKIE + 13,
+            exec_id: EXEC,
+        };
+        let post_exec = ImageIdentity {
+            task_cookie: COOKIE + 14,
+            exec_id: EXEC,
+        };
+        let mut fork = ordinary_for(&p_begin, 0);
+        fork.event_type = event_type::FORK;
+        fork.child_image = pre_exec;
+        assert_eq!(
+            scene.ingest_ordinary(fork),
+            JournalDisposition::OrdinaryCounted
+        );
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        // Ordinals 4-5: the post-exec child signs with inherited words.
+        let begin = begin_bytes_shaped(
+            2,
+            1,
+            sign_init,
+            0,
+            (post_exec.task_cookie, post_exec.exec_id),
+            SESSION,
+            1,
+            capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            Some((INHERITED_KEY, 1)),
+            None,
+            FLAGS,
+        );
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 60);
+        scene.ingest(&begin);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        let mut fixture = AttestationFixture::new(post_exec);
+        let proof = scene.admit_other_end(&mut fixture, "C_SignInit", &end);
+        let attest = |scene: &Scene, birth: BirthKind, cut: u64| {
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, birth, cut, scene.closure_generation()),
+            )
+        };
+        assert_eq!(
+            attest(&scene, BirthKind::ExecMarker, 0),
+            Err(BirthRefusal::BelowVoidFence)
+        );
+        assert_eq!(
+            attest(&scene, BirthKind::AbsenceAppearance, 0),
+            Err(BirthRefusal::BelowVoidFence)
+        );
+        assert_eq!(
+            attest(&scene, BirthKind::AbsenceAppearance, 3),
+            Err(BirthRefusal::AbsenceUnproven),
+            "post-exec image unseen at the fence"
+        );
+        // A scripted receipt bypassing attestation still refuses at seal.
+        let scripted =
+            BootstrapReceipt::scripted(proof, BirthKind::ExecMarker, 0, scene.closure_generation());
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &scripted,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&scripted),
+            )
+            .expect_err("seal below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        // Exec birth at the fence resumes and seals without inheritance.
+        let receipt = attest(&scene, BirthKind::ExecMarker, 3).expect("exec at the fence attests");
+        let success = scene.seal(&receipt).expect("exec at the fence seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert_eq!(success.prefix.settled()[0].begin_cut, 4);
+        assert_eq!(success.prefix.birth_cut(), 3);
+        assert!(
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::FirstObserved { .. }))
+        );
+        let joined = success
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::Referenced {
+                    label, metadata, ..
+                } => Some((*label, *metadata)),
+                _ => None,
+            })
+            .expect("child key use");
+        assert_eq!(joined.0, None);
+        assert_eq!(joined.1.established_count(), 0);
+    }
+
+    #[test]
     fn object_journal_bootstrap_requires_birth_and_closure() {
         use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;

@@ -5315,6 +5315,151 @@ mod native_preparation_test {
     }
 }
 
+/// Upper bound for a user-visible native-preparation reason: far below the
+/// 16,384-byte `inventory diff` per-string limit.
+const NATIVE_PREPARATION_REASON_MAX_BYTES: usize = 1024;
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn truncate_to_char_boundary(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// The program a preparation context names, if any:
+/// `preparing Inventory: LoadProgram("NAME", MODE)` or
+/// `Inventory program NAME`. Bounded and line-local; never a log excerpt.
+fn program_name_in_preparation_context(context: &str) -> Option<String> {
+    for prefix in ["LoadProgram(\"", "Inventory program "] {
+        if let Some(rest) = context.split_once(prefix).map(|(_, rest)| rest) {
+            let end = rest
+                .find(|c: char| c == '"' || c.is_whitespace() || c.is_control())
+                .unwrap_or(rest.len());
+            let name = rest[..end].trim();
+            if !name.is_empty() && name.len() <= 128 {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Short errno name for a load refusal; unknown errnos stay numeric.
+fn load_refusal_errno_name(errno: i32) -> Option<&'static str> {
+    match errno {
+        libc::E2BIG => Some("E2BIG"),
+        libc::EACCES => Some("EACCES"),
+        libc::EINVAL => Some("EINVAL"),
+        libc::EPERM => Some("EPERM"),
+        libc::ENOSPC => Some("ENOSPC"),
+        libc::EAGAIN => Some("EAGAIN"),
+        libc::ENOMEM => Some("ENOMEM"),
+        libc::EBUSY => Some("EBUSY"),
+        libc::ENOENT => Some("ENOENT"),
+        _ => None,
+    }
+}
+
+/// The verifier's `processed N insns (limit M)` summary, scanned from the
+/// log tail where the kernel prints it. Pure parsing: the log itself is
+/// never copied into the reason.
+fn verifier_processed_counts(log: &str) -> Option<(u64, u64)> {
+    let rest = log.rfind("processed ").map(|at| &log[at + "processed ".len()..])?;
+    let processed: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    let limit_key = "insns (limit ";
+    let limit_rest = rest.find(limit_key).map(|at| &rest[at + limit_key.len()..])?;
+    let limit: u64 = limit_rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (processed > 0 && limit > 0).then_some((processed, limit))
+}
+
+/// Named summary of a BPF program-load refusal: the stage, program, errno,
+/// and processed count when known, plus a pointer at doctor. The raw log
+/// is never embedded; its withheld size is named instead.
+fn summarize_program_load_refusal(
+    error: &anyhow::Error,
+    program: Option<String>,
+    errno: Option<i32>,
+    log: &str,
+) -> String {
+    let stage =
+        truncate_to_char_boundary(error.to_string().lines().next().unwrap_or_default(), 256);
+    let program = program.as_deref().unwrap_or("unknown program");
+    let errno_text = match errno {
+        Some(errno) => match load_refusal_errno_name(errno) {
+            Some(name) => format!("{name} (os error {errno})"),
+            None => format!("os error {errno}"),
+        },
+        None => "unknown errno".to_string(),
+    };
+    let counts = verifier_processed_counts(log).map_or(String::new(), |(processed, limit)| {
+        format!("; verifier processed {processed} insns (limit {limit})")
+    });
+    let summary = format!(
+        "{stage}: program \"{program}\" refused: BPF_PROG_LOAD failed with {errno_text}{counts}; \
+         run `p11scope doctor` to diagnose this host ({} verifier-log bytes withheld)",
+        log.len()
+    );
+    truncate_to_char_boundary(&summary, NATIVE_PREPARATION_REASON_MAX_BYTES)
+}
+
+/// Bounded, named summary of a native-lane preparation failure for the
+/// user-visible gap reason, stderr line, and native-mode error.
+///
+/// A program-load refusal carries the kernel verifier's full log inside
+/// [`aya::programs::ProgramError::LoadError`]; formatting the chain with
+/// `{error:#}` once embedded a 267 KiB dump in the gap reason and broke
+/// `inventory diff`. This summary names the refusing program, the errno,
+/// and the processed count when the chain carries them, points at
+/// `p11scope doctor`, and never embeds the raw log. Short failures without
+/// a load refusal pass through verbatim.
+fn summarize_native_preparation_error(error: &anyhow::Error) -> String {
+    let mut program: Option<String> = None;
+    let mut refusal: Option<(Option<i32>, String)> = None;
+    for cause in error.chain() {
+        if let Some(load) = cause.downcast_ref::<aya::programs::ProgramError>() {
+            if let aya::programs::ProgramError::LoadError {
+                io_error,
+                verifier_log,
+            } = load
+            {
+                refusal
+                    .get_or_insert((io_error.raw_os_error(), verifier_log.to_string()));
+            }
+            continue;
+        }
+        if program.is_none() {
+            program = program_name_in_preparation_context(&cause.to_string());
+        }
+    }
+    match refusal {
+        Some((errno, log)) => summarize_program_load_refusal(error, program, errno, &log),
+        None => {
+            let full = format!("{error:#}");
+            if full.len() <= NATIVE_PREPARATION_REASON_MAX_BYTES {
+                full
+            } else {
+                let head = truncate_to_char_boundary(
+                    full.lines().next().unwrap_or_default(),
+                    NATIVE_PREPARATION_REASON_MAX_BYTES / 2,
+                );
+                format!(
+                    "{head} …({} bytes withheld; run `p11scope doctor` to diagnose this host)",
+                    full.len()
+                )
+            }
+        }
+    }
+}
+
 /// The preparation boundary permits testing its actual arguments and startup
 /// refusal without loading BPF. An active lane's later refusals stay native.
 fn open_native_lane_with(
@@ -5359,7 +5504,9 @@ fn open_native_lane_with(
         attach_backend,
     ) {
         Ok(capture) => capture,
-        Err(error) => return unavailable(coordinator, format!("{error:#}")),
+        Err(error) => {
+            return unavailable(coordinator, summarize_native_preparation_error(&error));
+        }
     };
     let backend = crate::inventory_capture::CaptureLane::<PidPin>::backend(&capture);
     let numbering = crate::pidns::numbering();

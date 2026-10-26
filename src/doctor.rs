@@ -216,6 +216,44 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
     checks
 }
 
+/// Name of the inventory-object load row: load-and-release through the
+/// real preparation path, never attached.
+const INVENTORY_PREFLIGHT_ROW: &str = "inventory program preflight";
+
+/// Load-and-release preflight of the embedded Inventory object:
+/// `inventory --system` needs it, and doctor once reported OK on kernels
+/// where it failed to load. The prepared object drops before return, so
+/// no program, link, or map survives the probe.
+fn inventory_preflight_check() -> Check {
+    let name = INVENTORY_PREFLIGHT_ROW.to_string();
+    let budget = match crate::capacity::inventory_endpoint_budget(None) {
+        Ok(budget) => budget,
+        Err(reason) => {
+            return Check {
+                name,
+                status: Status::Fail(reason),
+            };
+        }
+    };
+    match crate::attach::PreparedInventory::prepare(
+        crate::attach::Scope::Pid(std::process::id()),
+        budget,
+        crate::attach::AttachBackend::Singles,
+    ) {
+        Ok(prepared) => {
+            drop(prepared);
+            Check {
+                name,
+                status: Status::Ok("available".into()),
+            }
+        }
+        Err(error) => Check {
+            name,
+            status: Status::Fail(format_preflight_error(error.as_ref())),
+        },
+    }
+}
+
 fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
     let self_pid = std::process::id();
     let host = crate::attach::Session::preflight(&crate::attach::Scope::Pid(self_pid));
@@ -262,6 +300,7 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
     };
     vec![
         host_check,
+        inventory_preflight_check(),
         Check {
             name: "lifecycle preflight".into(),
             status: status(lifecycle),
@@ -1296,6 +1335,9 @@ fn status_detail(status: &Status) -> &str {
 fn is_capture_row(name: &str) -> bool {
     name == "BPF map create"
         || name == "host program preflight"
+        // `inventory --system` needs the Inventory object: its load row
+        // gates the exit code with the other capture rows.
+        || name == INVENTORY_PREFLIGHT_ROW
         // A flavor mismatch fails the object row, and no capture lane can
         // work then, so it gates the exit code with the other capture rows.
         || name == "object-attribute capture"
@@ -2548,10 +2590,11 @@ mod tests {
             &checks.iter().find(|c| c.name == name).unwrap().status
         }
         let checks = probe(None, None);
-        // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
-        // the cgroup version row, the uprobe-multi self-link row, the PID
-        // namespace row, and the object-attribute capture build row.
-        assert_eq!(checks.len(), 28, "{checks:?}");
+        // 13 host/target rows, eight §10.1 rows, four finite preflight rows
+        // (host, inventory, lifecycle, scope), the cgroup version row, the
+        // uprobe-multi self-link row, the PID namespace row, and the
+        // object-attribute capture build row.
+        assert_eq!(checks.len(), 29, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),

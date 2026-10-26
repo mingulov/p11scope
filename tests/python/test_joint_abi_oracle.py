@@ -348,11 +348,21 @@ unsigned long C_GetFunctionList(void **out) {
 ABI_HIBIT32_PROVIDER = """/* Test-only 32-bit high-bit stub: entries 0..1 return high-bit RVs. */
 #define _GNU_SOURCE
 #include <stddef.h>
+/* Width-dependent head like the tracked fixtures: function pointers
+ * follow CK_VERSION at the natural pointer alignment (offset 4 here).
+ * The LP64-only inline stubs keep reserved[6], which is offset 8 and
+ * correct on LP64. */
 typedef struct {
     unsigned char major, minor;
+#if __SIZEOF_POINTER__ == 8
     unsigned char reserved[6];
+#else
+    unsigned char reserved[2];
+#endif
     void *functions[104];
 } AbiHi32Table;
+_Static_assert(offsetof(AbiHi32Table, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
 int P11ScopeSlot68;
 static unsigned long hi32_bit31(void **out) {
     (void)out;
@@ -385,7 +395,7 @@ unsigned long C_GetFunctionList(void **out) {
 }
 """
 
-# Slot 0..67 dlsym names, copied from standard_names in
+# Slot 0..67 dlsym names, copied from dlsym_names in
 # tests/fixtures/abi-execution/abi-104.c; the mixed-identity twin below
 # exports these plus P11ScopeSlot69..103 as functions with the
 # P11ScopeSlot68 marker variable at slot 68.

@@ -10,7 +10,10 @@
  *   cond:NAME       NAME in migration, nesting, recursion, longjmp,
  *                   thread-exit, held-detach (cell cond-NAME)
  *   blocked         one completed call plus one entry-without-return row
- *                   (cond blocked, cell blocked-unreturned)
+ *                   for a call that really entered the provider and blocks
+ *                   there until the driver releases it (cond blocked, cell
+ *                   blocked-unreturned; needs P11SCOPE_FIXTURE_BLOCK_ENTERED
+ *                   and P11SCOPE_FIXTURE_BLOCK_RELEASE, refused without them)
  *   cell:TAG        entries 0..2 tagged with the opaque population label TAG
  *   rv64            entries 0..3, recording full-width return values
  *   entry           one call to entry ARG (0..103)
@@ -23,21 +26,24 @@
  * the cond workload tag and the cell population label; clocks are
  * CLOCK_MONOTONIC nanoseconds. Workers record their calls into private
  * result arrays and the main thread emits every row after joining, so the
- * ledger needs no locks. The blocked worker parks pre-return until after
- * the ack row is written, modelling a genuinely unreturned call inside the
- * capture window. The nesting/recursion modes genuinely nest driver frames
- * that each issue one real provider call inside their window.
+ * ledger needs no locks. The blocked worker issues one real provider
+ * call that blocks inside the provider entry until the driver releases it;
+ * the entry row is written only after the provider proves the entry, and
+ * the ack lands while the call is still unreturned. The
+ * nesting/recursion modes genuinely nest driver frames that each issue one
+ * real provider call inside their window.
  *
- * Entry names come from dlsym: when every one of the 104 known names
- * resolves to its table slot, rows carry verified names (proving actual
- * execution, not a macro count); when none resolves (a test-only stub
- * family provider), rows carry table[i] labels; a mix is refused as an
- * entry identity mismatch. Stub-only fixture: PROVIDER must export the
- * P11ScopeSlot68 marker; anything else is refused, because calling
- * unknown-signature entries through the one-pointer-argument TableEntry
- * would be undefined behaviour. Prints "READY pid=<pid>" after the table
- * is validated, then, when GO_FILE is given, waits for that path to appear
- * before emitting the ready row; SIGTERM/SIGINT interrupts the wait.
+ * Entry names come from dlsym: when every one of the 104 known provider
+ * symbols resolves to its table slot, rows carry verified names (the
+ * PKCS#11 3.2 standard name per ordinal, proving actual execution, not a
+ * macro count); when none resolves (a test-only stub family provider),
+ * rows carry table[i] labels; a mix is refused as an entry identity
+ * mismatch. Stub-only fixture: PROVIDER must export the P11ScopeSlot68
+ * marker; anything else is refused, because calling unknown-signature
+ * entries through the one-pointer-argument TableEntry would be undefined
+ * behaviour. Prints "READY pid=<pid>" after the table is validated, then,
+ * when GO_FILE is given, waits for that path to appear before emitting
+ * the ready row; SIGTERM/SIGINT interrupts the wait.
  * Exit 0 when every call returned CKR_OK, 1 when the ledger is complete but
  * some call did not, 2 on usage/setup/refusal failure. Builds LP64 and
  * ia32 (-m32) from this one source.
@@ -50,7 +56,6 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,23 +71,74 @@
 #define MAX_TOTAL_CALLS 100000
 
 /* Mirrors P11ScopeTable in tests/fixtures/live-discovery-provider.c:
- * CK_VERSION (2 bytes), 6 reserved bytes, 104 function pointers. */
+ * CK_VERSION (2 bytes) followed by the 104 function pointers at the
+ * natural pointer alignment (offset 8 on LP64, 4 on ILP32), per the OASIS
+ * CK_FUNCTION_LIST layout. */
 typedef struct {
     unsigned char major, minor;
+#if __SIZEOF_POINTER__ == 8
     unsigned char reserved[6];
+#else
+    unsigned char reserved[2];
+#endif
     void *functions[TABLE_SLOTS];
 } ProviderTable;
 
 _Static_assert(sizeof(unsigned long) == 4 || sizeof(unsigned long) == 8,
                "32-bit or 64-bit CK_ULONG only");
-_Static_assert(offsetof(ProviderTable, functions) == 8, "table layout");
+_Static_assert(offsetof(ProviderTable, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
 
 typedef unsigned long (*TableEntry)(void **);
 typedef unsigned long (*GetFunctionList)(void **);
 
-/* Slots 0..67 in PROVIDER_FUNCTIONS order; slots 68..103 are P11ScopeSlotN
- * spelled at runtime. dlsym verifies every name against its slot. */
-static const char *const standard_names[STANDARD_NAMES] = {
+/* Ledger labels: the PKCS#11 3.2 standard function name per ordinal, in
+ * OASIS header (CK_FUNCTION_LIST_3_2 field) order, hand-written here so
+ * the ledger speaks the standard vocabulary independent of the observer's
+ * catalog. Verified rows carry these; unverified rows carry table[i]. */
+static const char *const fn_labels[TABLE_SLOTS] = {
+    "C_Initialize", "C_Finalize", "C_GetInfo", "C_GetFunctionList",
+    "C_GetSlotList", "C_GetSlotInfo", "C_GetTokenInfo", "C_GetMechanismList",
+    "C_GetMechanismInfo", "C_InitToken", "C_InitPIN", "C_SetPIN",
+    "C_OpenSession", "C_CloseSession", "C_CloseAllSessions",
+    "C_GetSessionInfo", "C_GetOperationState", "C_SetOperationState",
+    "C_Login", "C_Logout", "C_CreateObject", "C_CopyObject",
+    "C_DestroyObject", "C_GetObjectSize", "C_GetAttributeValue",
+    "C_SetAttributeValue", "C_FindObjectsInit", "C_FindObjects",
+    "C_FindObjectsFinal", "C_EncryptInit", "C_Encrypt", "C_EncryptUpdate",
+    "C_EncryptFinal", "C_DecryptInit", "C_Decrypt", "C_DecryptUpdate",
+    "C_DecryptFinal", "C_DigestInit", "C_Digest", "C_DigestUpdate",
+    "C_DigestKey", "C_DigestFinal", "C_SignInit", "C_Sign", "C_SignUpdate",
+    "C_SignFinal", "C_SignRecoverInit", "C_SignRecover", "C_VerifyInit",
+    "C_Verify", "C_VerifyUpdate", "C_VerifyFinal", "C_VerifyRecoverInit",
+    "C_VerifyRecover", "C_DigestEncryptUpdate", "C_DecryptDigestUpdate",
+    "C_SignEncryptUpdate", "C_DecryptVerifyUpdate", "C_GenerateKey",
+    "C_GenerateKeyPair", "C_WrapKey", "C_UnwrapKey", "C_DeriveKey",
+    "C_SeedRandom", "C_GenerateRandom", "C_GetFunctionStatus",
+    "C_CancelFunction", "C_WaitForSlotEvent",
+    "C_GetInterfaceList", "C_GetInterface", "C_LoginUser", "C_SessionCancel",
+    "C_MessageEncryptInit", "C_EncryptMessage", "C_EncryptMessageBegin",
+    "C_EncryptMessageNext", "C_MessageEncryptFinal", "C_MessageDecryptInit",
+    "C_DecryptMessage", "C_DecryptMessageBegin", "C_DecryptMessageNext",
+    "C_MessageDecryptFinal", "C_MessageSignInit", "C_SignMessage",
+    "C_SignMessageBegin", "C_SignMessageNext", "C_MessageSignFinal",
+    "C_MessageVerifyInit", "C_VerifyMessage", "C_VerifyMessageBegin",
+    "C_VerifyMessageNext", "C_MessageVerifyFinal",
+    "C_EncapsulateKey", "C_DecapsulateKey", "C_VerifySignatureInit",
+    "C_VerifySignature", "C_VerifySignatureUpdate", "C_VerifySignatureFinal",
+    "C_GetSessionValidationFlags", "C_AsyncComplete", "C_AsyncGetID",
+    "C_AsyncJoin", "C_WrapKeyAuthenticated", "C_UnwrapKeyAuthenticated",
+};
+
+_Static_assert(sizeof(fn_labels) / sizeof(fn_labels[0]) == TABLE_SLOTS,
+               "one ledger label per table slot");
+
+/* Provider-symbol names for dlsym binding, in slot order: slots 0..67 in
+ * PROVIDER_FUNCTIONS order (slot 3 is the fixture-private P11ScopeSlot3
+ * stand-in); slots 68..103 are P11ScopeSlotN spelled at runtime. dlsym
+ * verifies every name against its slot. These bind the table entries to
+ * the provider's code; the ledger labels above name the slots. */
+static const char *const dlsym_names[STANDARD_NAMES] = {
     "C_Initialize", "C_Finalize", "C_GetInfo", "P11ScopeSlot3",
     "C_GetSlotList", "C_GetSlotInfo", "C_GetTokenInfo", "C_GetMechanismList",
     "C_GetMechanismInfo", "C_InitToken", "C_InitPIN", "C_SetPIN",
@@ -136,12 +192,6 @@ static int clock_ns(uint64_t *out_ns) {
     }
     *out_ns = (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
     return 0;
-}
-
-static void sleep_ms(long ms) {
-    struct timespec delay = {ms / 1000, (ms % 1000) * 1000000L};
-    while (nanosleep(&delay, &delay) != 0) {
-    }
 }
 
 static int wait_for_go(const char *path) {
@@ -214,11 +264,7 @@ static int valid_tag(const char *text) {
 
 static const char *fn_label(int index, char *fallback, size_t size) {
     if (out.names_verified) {
-        if (index < STANDARD_NAMES) {
-            return standard_names[index];
-        }
-        snprintf(fallback, size, "P11ScopeSlot%d", index);
-        return fallback;
+        return fn_labels[index];
     }
     snprintf(fallback, size, "table[%d]", index);
     return fallback;
@@ -555,74 +601,92 @@ static int run_held_detach(const char *provider) {
 }
 
 typedef struct {
-    _Atomic int entered;
-    _Atomic int release;
+    TableEntry entry;
     int tid;
     uint64_t t0;
-} BlockedState;
+    unsigned long rv;
+    int clock_failed;
+} BlockedCall;
 
 static void *run_blocked_worker(void *raw) {
-    BlockedState *state = raw;
+    BlockedCall *call = raw;
+    call->tid = (int)gettid();
     uint64_t t0 = 0;
     if (clock_ns(&t0) != 0) {
+        call->clock_failed = 1;
         return (void *)1;
     }
-    state->tid = (int)gettid();
-    state->t0 = t0;
-    atomic_store_explicit(&state->entered, 1, memory_order_release);
-    for (int waited = 0; waited < 30000; waited++) {
-        if (atomic_load_explicit(&state->release, memory_order_acquire) != 0) {
-            return NULL;
+    call->t0 = t0;
+    /* A real provider call: with the block handshake armed, the slot-10
+     * provider entry waits for the driver's release file before returning. */
+    call->rv = call->entry(NULL);
+    return NULL;
+}
+
+/* Bounded wait for a handshake path: 0 when it appears, 1 on timeout,
+ * -1 when the wait itself fails. */
+static int wait_for_path(const char *path, int tries) {
+    for (int i = 0; i < tries; i++) {
+        if (access(path, F_OK) == 0) {
+            return 0;
         }
-        usleep(1000);
+        if (errno != ENOENT) {
+            return -1;
+        }
+        usleep(10000);
     }
-    return (void *)1;
+    return access(path, F_OK) == 0 ? 0 : 1;
 }
 
 static int run_blocked(void) {
+    const char *entered = getenv("P11SCOPE_FIXTURE_BLOCK_ENTERED");
+    if (entered == NULL || entered[0] == '\0') {
+        fprintf(stderr, "abi-104: blocked mode needs "
+                        "P11SCOPE_FIXTURE_BLOCK_RELEASE and "
+                        "P11SCOPE_FIXTURE_BLOCK_ENTERED\n");
+        return -1;
+    }
     emit_call(9, "blocked", "blocked-unreturned");
     if (out.failed) {
         return -1;
     }
-    BlockedState state = {0};
+    BlockedCall call = {.entry = out.entries[10]};
     pthread_t worker;
-    if (pthread_create(&worker, NULL, run_blocked_worker, &state) != 0) {
+    if (pthread_create(&worker, NULL, run_blocked_worker, &call) != 0) {
         return -1;
     }
-    int entered = 0;
-    for (int waited = 0; waited < 10000; waited++) {
-        if (atomic_load_explicit(&state.entered, memory_order_acquire) != 0) {
-            entered = 1;
-            break;
+    /* The ledger row may only be written for a call that entered: the
+     * provider touches the entered path from inside the blocked entry,
+     * and the file is the cross-thread signal, like the GO gate. */
+    int seen = wait_for_path(entered, 3000);
+    if (seen != 0) {
+        if (seen > 0) {
+            fprintf(stderr, "abi-104: blocked call never entered the provider\n");
+        } else {
+            fprintf(stderr, "abi-104: cannot wait for provider entry\n");
         }
-        usleep(1000);
-    }
-    if (!entered) {
-        pthread_join(worker, NULL);
         return -1;
     }
-    /* The entry stays genuinely unreturned across a real delay. */
-    sleep_ms(50);
-    emit_thread(state.tid);
-    emit_entry_row(10, state.tid, state.t0, "blocked", "blocked-unreturned");
+    emit_thread(call.tid);
+    emit_entry_row(10, call.tid, call.t0, "blocked", "blocked-unreturned");
     if (out.failed) {
-        atomic_store_explicit(&state.release, 1, memory_order_release);
-        pthread_join(worker, NULL);
         return -1;
     }
     uint64_t done = 0;
     if (clock_ns(&done) != 0) {
-        atomic_store_explicit(&state.release, 1, memory_order_release);
-        pthread_join(worker, NULL);
         return -1;
     }
     emit_ack(done);
     if (fflush(out.ledger) != 0) {
         out.failed = 1;
+        return -1;
     }
-    atomic_store_explicit(&state.release, 1, memory_order_release);
+    /* The entry row and ack are durable while the call is still inside
+     * the provider; the driver releases it after the capture ends, so
+     * the return lands outside both the ledger and the capture windows. */
     void *status = NULL;
-    if (pthread_join(worker, &status) != 0 || status != NULL || out.failed) {
+    if (pthread_join(worker, &status) != 0 || status != NULL ||
+        call.clock_failed || call.rv != 0 || out.failed) {
         return -1;
     }
     return 0;
@@ -740,6 +804,17 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    if (mode == MODE_BLOCKED) {
+        const char *release = getenv("P11SCOPE_FIXTURE_BLOCK_RELEASE");
+        const char *entered = getenv("P11SCOPE_FIXTURE_BLOCK_ENTERED");
+        if (release == NULL || release[0] == '\0' ||
+            entered == NULL || entered[0] == '\0') {
+            fprintf(stderr, "abi-104: blocked mode needs "
+                            "P11SCOPE_FIXTURE_BLOCK_RELEASE and "
+                            "P11SCOPE_FIXTURE_BLOCK_ENTERED\n");
+            return 2;
+        }
+    }
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -773,7 +848,7 @@ int main(int argc, char **argv) {
         char want[32];
         const char *name = NULL;
         if (i < STANDARD_NAMES) {
-            name = standard_names[i];
+            name = dlsym_names[i];
         } else {
             snprintf(want, sizeof want, "P11ScopeSlot%d", i);
             name = want;

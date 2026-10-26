@@ -26,9 +26,18 @@
 
 typedef struct {
     unsigned char major, minor;
+#if __SIZEOF_POINTER__ == 8
     unsigned char reserved[6];
+#else
+    unsigned char reserved[2];
+#endif
     void *functions[TABLE_SLOTS];
 } Rv64Table;
+
+_Static_assert(offsetof(Rv64Table, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
+_Static_assert(sizeof(Rv64Table) == sizeof(void *) * 105,
+               "version plus 104 function pointers");
 
 typedef struct {
     char *pInterfaceName;

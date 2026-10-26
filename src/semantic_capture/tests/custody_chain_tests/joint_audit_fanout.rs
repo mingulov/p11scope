@@ -17683,3 +17683,265 @@ fn joint_machine_promotion_finish_ignores_shared_engine_backlog() {
         "the empty discovery drains nothing"
     );
 }
+/// The Binding reservation arithmetic pins: exact element sizes the pool
+/// charges multiply, the pool limit, and the pinned-toolchain `collect`
+/// growth law the per-receipt instance charge relies on. Any layout or
+/// toolchain drift must re-audit the reservation, never silently squeeze it.
+#[test]
+fn joint_machine_receipt_model_sizes_and_collect_growth() {
+    use std::mem::size_of;
+    assert_eq!(size_of::<crate::discovery::instances::InstanceId>(), 8);
+    assert_eq!(
+        size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
+        488
+    );
+    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
+    assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);
+    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 128);
+    assert_eq!(size_of::<crate::semantic_capture::Endpoint>(), 16);
+    assert_eq!(
+        size_of::<crate::semantics_edge::resources::ResourceLease>(),
+        16
+    );
+    assert_eq!(
+        crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING,
+        32
+    );
+    assert_eq!(
+        crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT,
+        64 * 1024 * 1024
+    );
+    assert_eq!(crate::discovery::instances::MAX_INSTANCES, 4_096);
+    assert_eq!(crate::discovery::instances::MAX_PENDING, 1_024);
+    assert_eq!(crate::inventory_semantics::MAX_LANE_NEGATIVES, 64);
+    // The exact `collect` shape `InstanceRouter::current_instances` uses to
+    // build a receipt's id list: filter_map over partition pairs. Capacity
+    // stays within twice the length plus one minimal allocation.
+    for len in 0..=4_096usize {
+        let partitions: Vec<(u64, Option<u64>)> =
+            (0..len as u64).map(|base| (base, Some(base))).collect();
+        let ids: Vec<u64> = partitions.iter().filter_map(|(_, id)| *id).collect();
+        assert_eq!(ids.len(), len);
+        assert!(
+            ids.capacity() <= 2 * len + 4,
+            "len={len} cap={} exceeds the pinned growth law",
+            ids.capacity()
+        );
+    }
+}
+
+/// A full H0 transaction at the widest system-scale spread must bind: 1,024
+/// pending call records (the most the collector holds) over 1,024 distinct
+/// caller partitions across five callers publish through the real collected
+/// machine within the shared 64 MiB semantic pool. Receipts are minted per
+/// partition, never per record, so this is the most receipts one Binding
+/// pass can accumulate.
+#[test]
+fn joint_machine_full_transaction_binds_at_system_partition_spread() {
+    const PARTITIONS: usize = crate::discovery::instances::MAX_PENDING;
+    let children = [
+        OwnedStoppedChild::new(),
+        OwnedStoppedChild::new(),
+        OwnedStoppedChild::new(),
+        OwnedStoppedChild::new(),
+    ];
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    let mut pids = vec![pid];
+    for (offset, child) in children.iter().enumerate() {
+        let caller_pid = child.id();
+        fixture.scene.real.bind(
+            caller_pid,
+            ImageIdentity {
+                task_cookie: 100 + offset as u64,
+                exec_id: 0,
+            },
+            0,
+        );
+        pids.push(caller_pid);
+    }
+    // One transaction holds at most RAW_CAPACITY wire pulls; the scripted
+    // ring reports a 4,096-byte window, so at most 511 wire records may be
+    // queued at any consumption cut. Feed the ring while the collector is
+    // backlogged, exactly as producers refill a live ring during a pass.
+    fixture.scene.drain.source_mut().bound = 4_096;
+    let mut pushed_calls = 0usize;
+    let push_call = |fixture: &mut MachineScene, index: usize| {
+        // One fresh caller image per record, round-robin over the callers:
+        // distinct (cookie, exec, slot) partitions, the widest spread one
+        // transaction can carry.
+        let record_pid = pids[index % pids.len()];
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .io
+            .targets
+            .get_mut(&record_pid)
+            .unwrap()
+            .1 = ImageIdentity {
+            task_cookie: 1_000 + index as u64,
+            exec_id: 0,
+        };
+        fixture
+            .scene
+            .push(record_pid, 0, "C_CreateObject", index as u64 + 1);
+    };
+    for index in 0..255 {
+        push_call(&mut fixture, index);
+        pushed_calls += 1;
+    }
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 510);
+    let limit = crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT;
+    let mut peak_charged = 0usize;
+    let mut max_current = 0usize;
+    let mut max_entries = 0usize;
+    let mut all_receipts_named = true;
+    let mut services = 0usize;
+    let mut pulls = 0usize;
+    let mut published = false;
+    for _ in 0..8192 {
+        let charged = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        peak_charged = peak_charged.max(charged);
+        if let Some(prepared) = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+        {
+            // Births consume the prepared receipts as they install, so the
+            // first prepared view holds the complete accumulated set.
+            max_current = max_current.max(prepared.current_receipts().len());
+            max_entries = max_entries.max(prepared.entry_count());
+            all_receipts_named &= prepared
+                .current_receipts()
+                .iter()
+                .all(|receipt| !receipt.instances().is_empty());
+        }
+        // Single-wire pulls while collecting keep the backlog true so all
+        // 1,024 calls accumulate into one transaction; wider budgets after.
+        let collecting = matches!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Idle" | "Collecting"
+        );
+        let work = if collecting { 1 } else { 1024 };
+        match fixture.service(work) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                services += 1;
+                published = true;
+                break;
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                services += 1;
+                if collecting {
+                    pulls += 1;
+                    if pulls % 2 == 1 && pushed_calls < PARTITIONS {
+                        push_call(&mut fixture, pushed_calls);
+                        pushed_calls += 1;
+                    }
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "a full 1,024-partition transaction must bind within the semantic pool: \
+                     refused {reason:?} at {:?} after {services} services, peak_charged={peak_charged}",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        pushed_calls, PARTITIONS,
+        "all 1,024 calls fed into the single transaction"
+    );
+    assert!(published, "the full transaction must publish");
+    let charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    peak_charged = peak_charged.max(charged);
+    eprintln!(
+        "machine_scale partitions={PARTITIONS} callers={} services={services} \
+         max_current={max_current} max_entries={max_entries} peak_charged={peak_charged} limit={limit}",
+        pids.len(),
+    );
+    assert!(
+        peak_charged < limit,
+        "peak {peak_charged} must stay under the shared semantic pool {limit}"
+    );
+    assert_eq!(
+        max_current, PARTITIONS,
+        "one current-partition receipt per distinct input partition"
+    );
+    assert_eq!(max_entries, PARTITIONS, "one admission per completed call");
+    assert!(
+        all_receipts_named,
+        "every minted receipt names its partition's instances"
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+}
+
+/// A genuinely exhausted pool still refuses at Binding with the named storage
+/// reason before any watched text is copied or custody moves. The
+/// partition-sized bound must never turn this into unbounded allocation.
+#[test]
+fn joint_machine_binding_precharge_still_refuses_an_exhausted_pool() {
+    let mut fixture = MachineScene::new(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    for _ in 0..16 {
+        fixture.service(1).unwrap();
+        if fixture.machine.report_preparation_pending_for_test() {
+            break;
+        }
+    }
+    assert!(fixture.machine.report_preparation_pending_for_test());
+    let identity = fixture
+        .machine
+        .retained_raw_for_test()
+        .unwrap()
+        .h0_identity();
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let snapshot = coordinator.registry().semantic_resource_snapshot();
+    let reserve = coordinator.registry().semantic_storage_reserver();
+    let hold = reserve
+        .reserve(snapshot.limit_bytes - snapshot.charged_bytes)
+        .unwrap();
+    let (result, allocations, _) = crate::test_alloc::count_allocs_during(|| fixture.service(1));
+    assert_eq!(result, Err(SemanticRefusal::ProviderStorage));
+    assert_eq!(
+        allocations, 0,
+        "the exhausted real pool refuses before any watched Entry copy"
+    );
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_identity()
+            == identity
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Binding",
+        "the refused original stays in Binding for disposal, never half-bound"
+    );
+    // The latch holds: a retry without disposal refuses identically.
+    assert_eq!(fixture.service(1), Err(SemanticRefusal::ProviderStorage));
+    drop(hold);
+}

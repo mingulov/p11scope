@@ -3307,13 +3307,29 @@ impl BankIo for NativeIo<'_> {
     }
 }
 
+/// Whether the error chain already carries a named `counter-mode-*`
+/// refusal (the old-kernel token, the build token, or a mapped
+/// verifier-budget refusal). Any chain link counts: intermediate
+/// context may wrap the token without renaming it.
+fn is_counter_mode_refusal(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("counter-mode-"))
+}
+
 /// Production counter-start error mapping for `start_on_backend`: a
 /// verifier-budget E2BIG becomes the named old-kernel token, and any
 /// `counter-mode-*` refusal returns without the generic environment
-/// hint (the token already names the cause). Every other error keeps
-/// the generic hint through the shared wrapper.
+/// hint (the token already names the cause; a CAP_BPF/kernel-floor
+/// hint would mislead a root user on a supported kernel). Every
+/// other error keeps the generic hint through the shared wrapper.
 pub(super) fn map_counter_start_error(error: anyhow::Error) -> anyhow::Error {
-    super::unsupported_environment_context(error)
+    let mapped = map_counter_verifier_budget_refusal(error);
+    if is_counter_mode_refusal(&mapped) {
+        mapped
+    } else {
+        super::unsupported_environment_context(mapped)
+    }
 }
 
 /// Maps a kernel verifier-budget rejection during counter preparation to

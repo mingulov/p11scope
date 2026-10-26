@@ -6075,7 +6075,13 @@ impl Session {
             selected,
             counter,
         )
-        .map_err(unsupported_environment_context)?;
+        .map_err(|error| {
+            if counter.is_some() {
+                counter_banks::map_counter_start_error(error)
+            } else {
+                unsupported_environment_context(error)
+            }
+        })?;
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
             crate::first_use_probe::DiscoveryStage::LifecycleActive,

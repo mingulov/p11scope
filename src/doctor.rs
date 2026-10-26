@@ -1289,6 +1289,9 @@ fn status_detail(status: &Status) -> &str {
 fn is_capture_row(name: &str) -> bool {
     name == "BPF map create"
         || name == "host program preflight"
+        // A flavor mismatch fails the object row, and no capture lane can
+        // work then, so it gates the exit code with the other capture rows.
+        || name == "object-attribute capture"
         || name.starts_with("uprobe attach")
 }
 

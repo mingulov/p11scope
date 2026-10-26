@@ -2995,6 +2995,7 @@ impl SemanticCapture {
         self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();
         let owned;
+        let is_collected = collected.is_some();
         let (records, status, mut positions, birth_cut) = match collected {
             Some(input) => (
                 input.records,
@@ -3122,10 +3123,15 @@ impl SemanticCapture {
             }
             let pid = (record.base.event.pid_tgid >> 32) as u32;
             let Some(pin) = io.target(pid) else {
-                // No binding pin yet: a task that provably started after
-                // the lane attached holds its first burst for the imminent
-                // binding; everything else sheds exactly as before (R-34).
-                if !self.retain_post_attach(io.now(), pid, image) {
+                // No binding pin yet: a live tick holds a provably
+                // post-attach task's first burst for the imminent
+                // binding; everything else sheds exactly as before
+                // (R-34). A collected transaction fixes its binding set
+                // at Binding, so no later pin can arrive for these
+                // records: they expire instead of waiting out the
+                // quantum for a bind that cannot land in time.
+                let hold = !is_collected && self.retain_post_attach(io.now(), pid, image);
+                if !hold {
                     self.expire(image, &mut report);
                 }
                 continue;

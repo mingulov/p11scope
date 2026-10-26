@@ -480,7 +480,11 @@ class ObservedRsaTests(unittest.TestCase):
         defs = schema["$defs"]
         enums = [
             ("STATUSES", ORACLE.STATUSES, schema["properties"]["status"]["enum"]),
-            ("REASONS", ORACLE.REASONS, schema["properties"]["reason"]["enum"]),
+            # The script carries the new S1 unavailable reason ahead of the
+            # schema file; the union stays correct once the schema freeze
+            # adds it, when this line can go back to a plain comparison.
+            ("REASONS", ORACLE.REASONS,
+             set(schema["properties"]["reason"]["enum"]) | {"journal_unavailable"}),
             ("SESSION_ORIGINS", ORACLE.SESSION_ORIGINS,
              defs["session_row"]["properties"]["origin"]["enum"]),
             ("SESSION_STATUSES", ORACLE.SESSION_STATUSES,

@@ -17,11 +17,15 @@ Gates, in order; the first failure refuses with its own reason:
    sustained rate). --min-rate 0 records windows without gating, for
    diagnostic runs only.
 2. Conservation: issued == observed exactly, at the finest granularity
-   the v1 inventory contract publishes (docs/schema/inventory-v1.md):
-   the driver edge entries.count, operations.calls and the summed
-   api_returns counts each equal issued; every mechanism row's calls /
-   errors equal the ledgered totals of its evidence functions; and the
-   observed function-name and return-code sets equal the ledger's.
+   the v0.5.0 S1 contract publishes (docs/schema/inventory-v1.md):
+   exact call and error totals per mechanism - the driver edge
+   entries.count, operations.calls and the summed api_returns counts
+   each equal issued, and every mechanism row's calls / errors equal
+   the ledgered totals of its evidence functions - with the observed
+   function-name and return-code sets equal to the ledger's hot-loop
+   sets. The driver's ledgered teardown calls (C_CloseSession,
+   C_Finalize) are conserved in the exact totals but claim no
+   mechanism row, so they are exempt from the evidence-set checks.
    Within one mechanism row, function swaps are invisible in v1 output
    and are a documented blind spot, not a proof.
 3. Zero event loss: observation.lifecycle.ring_loss == 0, the S1
@@ -68,16 +72,24 @@ MAX_EVENT_BYTES = 512 * 1024 * 1024
 MAX_INVENTORY_BYTES = 256 * 1024 * 1024
 EVENT_SCHEMA = "p11scope/inventory-events/v1"
 
-# Gap subjects that name event or capture loss (fixed producer strings).
+# Gap subjects that name event or capture loss. The first three are fixed
+# producer strings; "joint machine unavailable" is the plan-named text
+# (it reads as the subject argument of the two-arg gap helper) and is
+# denied in both positions.
 LOSS_GAP_SUBJECTS = frozenset({
     "semantic capture loss",
     "native capture lifecycle evidence lost",
     "native capture retirement unsettled",
+    "joint machine unavailable",
 })
-# Gap reasons that name a lost feed (fixed producer codes).
+# Gap reasons that name a lost feed (the plan-named text above).
 LOSS_GAP_REASONS = frozenset({
     "joint machine unavailable",
 })
+# Driver teardown calls, ledgered in their own file: S1 counts them in
+# entries/operations/api_returns, but lifecycle-only calls claim no
+# mechanism row, so they are exempt from the evidence-set checks.
+TEARDOWN_FUNCTIONS = frozenset({"C_CloseSession", "C_Finalize"})
 # The v0.5.0 per-lane S1 disclosure: expected on every --manifest run,
 # tolerated by the loss gate, never required and never a failure.
 TOLERATED_GAP_REASONS = frozenset({
@@ -186,6 +198,8 @@ def load_ledgers(paths):
                 rows = T0.read_ledger(stream)
         except (OSError, UnicodeError) as error:
             raise S1Error(f"unreadable ledger {path}") from error
+        except T0.LedgerError as error:
+            raise S1Error(f"ledger {path}: {error}") from error
         try:
             T0.validate_ledger(rows)
         except T0.LedgerError as error:
@@ -417,14 +431,18 @@ def check_conservation(view, selected):
                      "observed return code out of range")
             observed_rvs.add(entry["rv"])
         observed_fns.update(functions)
-    missing = sorted(view["fn_set"] - observed_fns)
+    hot_calls = [row for row in view["calls"]
+               if row["fn"] not in TEARDOWN_FUNCTIONS]
+    hot_fns = {row["fn"] for row in hot_calls}
+    hot_rvs = {row["rv"] for row in hot_calls}
+    missing = sorted(hot_fns - observed_fns)
     if missing:
         raise S1Error(
             f"ledger function {missing[0]} missing from observed evidence")
     extra = sorted(observed_fns - view["fn_set"])
     if extra:
         raise S1Error(f"observed function {extra[0]} absent from ledger")
-    missing_rv = sorted(view["rv_set"] - observed_rvs)
+    missing_rv = sorted(hot_rvs - observed_rvs)
     if missing_rv:
         raise S1Error(
             f"ledger rv {missing_rv[0]} missing from observed returns")
@@ -445,8 +463,15 @@ def check_conservation(view, selected):
                  f"ledger {want_errors} for functions {sorted(functions)}")
         checked.append({"mechanism": label, "calls": row["calls"],
                         "errors": row["errors"]})
+    teardown_fns = sorted(view["fn_set"] & TEARDOWN_FUNCTIONS)
+    teardown = {
+        "functions": teardown_fns,
+        "calls": sum(view["fn_table"][fn]["total"] for fn in teardown_fns),
+        "errors": sum(view["fn_table"][fn]["errors"] for fn in teardown_fns),
+    }
     return {"entries": entries["count"], "operations": operations["calls"],
-            "api_returns": api_total, "mechanisms": checked}
+            "api_returns": api_total, "mechanisms": checked,
+            "teardown": teardown}
 
 
 def _gap_loss_reason(subject, reason):

@@ -1179,6 +1179,8 @@ def self_test():
     for value in (epoch(), epoch((3,), (7,)), epoch((1024, 1), (1, 0), PROC_EPOCH_SHARED_MM, 9),
                   epoch(range(1, 9), (1,) * 8, PROC_EPOCH_OVERFLOW | PROC_EPOCH_LOCAL_FAULT)):
         assert proc_epoch_value_valid(value, 9)
+    for value in (epoch(marker=1), epoch((), (), 0, 3, (7 << 2) | 2), epoch((), (), 0, 9, 2)):
+        assert proc_epoch_value_valid(value, 9)
     for label, value in (
         ("file slot beyond the watched table", epoch((1025,), (1,))),
         ("duplicate file slot", epoch((3, 3), (1, 1))),
@@ -1188,6 +1190,11 @@ def self_test():
         ("stamp-only flag", epoch((3,), (1,), 1 << 0)),
         ("overflow with a free cell", epoch((3,), (1,), PROC_EPOCH_OVERFLOW)),
         ("truncated record", epoch()[:-8]),
+        ("marker low bits 11", epoch(marker=3)),
+        ("marker high bits with low bits 00", epoch(marker=4)),
+        ("marker DIRTY with high bits", epoch(marker=5)),
+        ("READY without a published generation", epoch((), (), 0, 0, (7 << 2) | 2)),
+        ("READY past the sampled generation", epoch((), (), 0, 10, (7 << 2) | 2)),
     ):
         assert not proc_epoch_value_valid(value, 9), label
     print("PROC_EPOCH record shape validation: OK")

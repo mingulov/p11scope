@@ -2028,7 +2028,7 @@ int main(void) {
 
     def test_epoch_acquisition_rejects_nonleaders_duplicates_and_invalid_values(self):
         for case in ("nonleader", "duplicate", "zero-pid", "zero-tid", "unknown-map",
-                     "short", "journal-word", "future-attach"):
+                     "short", "journal-word", "journal-word-high", "future-attach"):
             with self.subTest(case=case):
                 maps, records, arguments = self.reconciliation_fixture()
                 row = {"map_id": 111, "pid": 8801, "tid": 8801,
@@ -2044,12 +2044,32 @@ int main(void) {
                 elif case == "short":
                     row["value"] = bytes(151)
                 elif case == "journal-word":
-                    row["value"] = self.epoch_value(marker=1)
+                    row["value"] = self.epoch_value(marker=3)
+                elif case == "journal-word-high":
+                    row["value"] = self.epoch_value(marker=4)
                 elif case == "future-attach":
                     row["value"] = self.epoch_value(exec_gen=10)
                 extra = [row, dict(row)] if case == "duplicate" else [row]
                 with self.assertRaises(RuntimeError):
                     load_dumper().reconcile_task_storage(maps, records + extra, **arguments)
+
+    def test_epoch_acquisition_accepts_published_marker_words(self):
+        for marker, exec_gen in ((1, 0), ((7 << 2) | 2, 3), (2, 9)):
+            with self.subTest(marker=marker):
+                maps, records, arguments = self.reconciliation_fixture()
+                records.append({"map_id": 111, "pid": 8801, "tid": 8801,
+                                "value": self.epoch_value(marker=marker, exec_gen=exec_gen)})
+                bound = load_dumper().reconcile_task_storage(maps, records, **arguments)
+                self.assertEqual(set(bound), {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"})
+
+    def test_epoch_acquisition_rejects_invalid_marker_words(self):
+        for marker, exec_gen in ((3, 3), (4, 3), (5, 3), ((7 << 2) | 2, 0)):
+            with self.subTest(marker=marker, exec_gen=exec_gen):
+                maps, records, arguments = self.reconciliation_fixture()
+                records.append({"map_id": 111, "pid": 8801, "tid": 8801,
+                                "value": self.epoch_value(marker=marker, exec_gen=exec_gen)})
+                with self.assertRaises(RuntimeError):
+                    load_dumper().reconcile_task_storage(maps, records, **arguments)
 
     def test_epoch_generation_sample_requires_exact_map_and_complete_distinct_cells(self):
         for case in ("absent", "duplicate-id", "control-id", "name", "type", "key-size",
@@ -2087,7 +2107,7 @@ int main(void) {
                      "missing-count", "negative-count", "boolean-count", "oversized-count", "aggregate-count",
                      "zero-nonempty", "too-many", "digest", "size", "missing-map",
                      "wrong-type", "wrong-value-size", "missing-generation", "generation-key",
-                     "journal-word", "future-attach", "late-malformed-value"):
+                     "journal-word", "journal-word-high", "future-attach", "late-malformed-value"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 manifest, receipt, records, controls = self.fixture(root)
@@ -2095,8 +2115,9 @@ int main(void) {
                 values = [self.epoch_value((), (), 4, 0), self.epoch_value(exec_gen=7)]
                 if case == "empty":
                     values.clear()
-                elif case in ("journal-word", "future-attach", "late-malformed-value"):
-                    values[1] = {"journal-word": self.epoch_value(marker=1),
+                elif case in ("journal-word", "journal-word-high", "future-attach", "late-malformed-value"):
+                    values[1] = {"journal-word": self.epoch_value(marker=3),
+                                 "journal-word-high": self.epoch_value(marker=4),
                                  "future-attach": self.epoch_value(exec_gen=10),
                                  "late-malformed-value": self.epoch_value(flags=1)}[case]
                 records.extend({"map_id": 111, "pid": 8801 + index, "tid": 8801 + index,

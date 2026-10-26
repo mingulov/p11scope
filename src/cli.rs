@@ -1735,6 +1735,18 @@ mod tests {
     }
 
     #[test]
+    fn inventory_help_states_manifest_s1_scope_and_planned_key_operations() {
+        let help = HelpTopic::Inventory.text();
+        assert!(
+            help.contains(
+                "In this version it adds per-edge mechanisms and API results; \
+                 key operations are planned for 0.5.1."
+            ),
+            "{help}"
+        );
+    }
+
+    #[test]
     fn capture_needs_no_manifest_and_accepts_repeated_discovery_flags() {
         let Command::Profile(a) = parse(args(&[
             "profile",

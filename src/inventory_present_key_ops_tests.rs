@@ -240,6 +240,18 @@ fn key_ops_line_unavailable_names_reason() {
 }
 
 #[test]
+fn key_ops_line_journal_unavailable_names_planned_version() {
+    let presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: not reported by this version (planned for 0.5.1)",
+        "journal_unavailable names the planned version:\n{snapshot}"
+    );
+}
+
+#[test]
 fn key_ops_line_populated_counts_primary_once() {
     let mut observations = populated(3);
     observations.sessions.push(SessionRow {

@@ -18449,8 +18449,7 @@ mod seal_readiness_tests {
 
     /// The exact seal line, pinned as a literal: the wording is the
     /// contract with users and scripts, independent of the builder.
-    const SEAL_LINE: &str =
-        "p11scope: key-operation lane sealed; programs started from now on are covered";
+    const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.5.1)";
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(

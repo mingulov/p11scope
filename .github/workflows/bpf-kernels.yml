@@ -15,9 +15,13 @@ name: bpf-kernels
 # do not fit the 14 GB runner disk twice. Each bpf-load-kernels shard
 # downloads that artifact, boots its own kernel's guest with virtme-ng,
 # and runs scripts/check-bpf-load-kernels.sh for that one kernel.
-# Kernels come precompiled from the Ubuntu mainline repository: vng
-# downloads its kernel on first use into ~/.cache/virtme-ng/<version>/,
-# and each shard caches exactly that directory by kernel version.
+# Kernels come precompiled from the Ubuntu mainline repository: each
+# guest job downloads its kernel without booting (`vng --dry-run`),
+# verifies the debs against the pinned sums in
+# tests/fixtures/vng-kernel-sha256sums/, and caches exactly
+# ~/.cache/virtme-ng/<version>/ by kernel version. Re-record the sums
+# on every kernel or vng bump: sha256sum the amd64/*.deb files vng
+# keeps per version (image + modules, never headers).
 # kvm-probe is the Stage 0 canary (host KVM facts plus one timed guest
 # boot); bpf-load-host closes the gap that CI compares BPF objects but
 # never loads them on the runner kernel.
@@ -42,6 +46,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The kernel sums file checked below; no test runs here.
+          fetch-depth: 1
       - name: Host facts
         shell: bash
         run: |
@@ -95,6 +103,19 @@ jobs:
         with:
           path: ~/.cache/virtme-ng/v6.6.157
           key: vng-kernel-v6.6.157-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # vng downloads over bare HTTPS with no checksum, and a cache hit
+      # skips its fetch entirely, so the sums are checked here on every
+      # run: download without booting first (a no-op on a cache hit),
+      # then verify the exact deb set before the first boot. A mismatch
+      # fails the job naming the kernel.
+      - name: Verify the v6.6.157 download
+        shell: bash
+        run: |
+          vng --dry-run --run v6.6.157 >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/v6.6.157/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/v6.6.157.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: v6.6.157" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: v6.6.157 (re-record the sums)" >&2; exit 1; }
       - name: Boot one guest and time it
         shell: bash
         run: |
@@ -225,13 +246,26 @@ jobs:
           test -n "${ImageVersion:-}"
           echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
       # One cache entry per kernel (that kernel's Ubuntu mainline debs
-      # plus vng's extracted boot/lib trees, ~370-590 MB). vng downloads
-      # the kernel itself on a miss; a miss costs a download, never a
-      # build. Exact key only, no restore-keys (as in ci.yml).
+      # plus vng's extracted boot/lib trees, ~370-590 MB). A miss costs
+      # a download, never a build. Exact key only, no restore-keys (as
+      # in ci.yml).
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/virtme-ng/${{ matrix.kernel }}
           key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # vng downloads over bare HTTPS with no checksum, and a cache hit
+      # skips its fetch entirely, so the sums are checked here on every
+      # run: download without booting first (a no-op on a cache hit),
+      # then verify the exact deb set before the first boot. A mismatch
+      # fails the job naming the kernel.
+      - name: Verify the kernel download
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
       - name: Download the observer and probe
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -252,6 +286,8 @@ jobs:
             "$GITHUB_WORKSPACE/bpf-load-inputs/verifier-stats-probe.so" \
             "$GITHUB_WORKSPACE/bpf-load-out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
           test -s "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+          # Fail when the guest doctor exits nonzero, as the host job does.
+          grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -309,9 +345,15 @@ jobs:
           done
           grep 'host program preflight' "$OUT/doctor-host.txt" | head -1 || echo "no host program preflight line"
           SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
-          python3 -I scripts/bpf-load-report.py --kernel "host-$(uname -r)" \
+          # Stable kernel label: the future budgets file keys the host leg
+          # as `host` (guests use the vX.Y.Z matrix value). Never
+          # `host-$(uname -r)` here: the runner release changes under us
+          # and the report's exact-string budget lookup would fail every
+          # host root. The real release is recorded below for attribution.
+          python3 -I scripts/bpf-load-report.py --kernel host \
             --observer-sha256 "$SHA" "$OUT/probe-host.jsonl" 2>&1 | tee "$OUT/table-host.txt"
           test -s "$OUT/table-host.txt"
+          echo "# host-release: $(uname -r)" >>"$OUT/table-host.txt"
           test "$rc" -eq 0
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}

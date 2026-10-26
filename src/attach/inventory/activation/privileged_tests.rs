@@ -1,11 +1,18 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned, ignored live gates. The parent runs these serially with its BPF lane.
 use super::*;
+use crate::attach::inventory::capture::{
+    CapturePhase, CaptureScope, ExtendWindow, InventoryCapture, MULTI_LINK_MAX_SITES,
+    MULTI_LINK_MIN_SITES, ReadWindow, RetiredCapture, ScopeCustody, WitnessBatch, WitnessRow,
+};
 use crate::capacity::CallerBudget;
 use crate::discovery::identity::{bind_scanned_modules, pin_scanned_view_objects};
+use crate::discovery::inventory_attach_set::tests as inventory_fx;
+use crate::discovery::inventory_attach_set::{AbsorbOutcome, AttachVerdict, InventoryAttachSet};
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, scan_process_view,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedInterface, ScannedModule, scan_process_view,
 };
+use crate::plan::AdmissionScope;
 use crate::plan::Slot;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray, PerCpuHashMap};
@@ -5965,6 +5972,570 @@ fn t7_boundary_cell_gate(n: u32, cell: &'static str) -> Result<()> {
 #[ignore = "root-owned BPF lane; bounded physical Inventory sweep with envelope refusal branch"]
 fn privileged_t7_inventory_n8192_boundary_lp64() -> Result<()> {
     t7_boundary_cell_gate(8192, "inventory-t7-n8192-boundary")
+}
+
+/// N+1 inventory refusal on Multi (V5-20 scale cell): a real 8,193-endpoint
+/// system population — one 8,192-endpoint provider plus one 1-endpoint
+/// provider, both owned binaries with real symbols at distinct executable
+/// offsets — lowers through the production Shared-scope Inventory merge at
+/// the 8,192 policy budget. The merge admits the first provider whole and
+/// refuses the second whole with the named over-budget reason; the capture
+/// facade then attaches exactly the admitted 8,192 across uprobe-multi
+/// groups that partition the prefix, every one fires, the refused endpoint
+/// leaves no witness, and the stop releases every link and map.
+/// Profile-independent (Inventory N), so unlike the T7 sweep cells this
+/// runs on both profiles.
+#[test]
+#[ignore = "root-owned BPF lane; 8193-endpoint Multi population refuses the 8193rd whole and keeps the 8192 prefix"]
+fn privileged_inventory_multi_n8193_refuses_lp64() -> Result<()> {
+    inventory_multi_prefix_case(true)
+}
+
+/// Healthy twin of the N+1 cell: the same 8,192 endpoints on Multi with no
+/// over-budget module — nothing refused, every endpoint admitted and
+/// attached, all 8,192 entries witnessed, clean stop. The T7 n8192 sweep
+/// cell runs Singles through the global flavor and carries an
+/// envelope-refusal branch, so it asserts none of these Multi
+/// capture-facade facts.
+#[test]
+#[ignore = "root-owned BPF lane; 8192-endpoint Multi population admits every endpoint with no refusal"]
+fn privileged_inventory_multi_n8192_prefix_lp64() -> Result<()> {
+    inventory_multi_prefix_case(false)
+}
+
+/// The 8,192 Inventory policy budget both prefix cells run under: the real,
+/// tested system-scale limit (`MAX_INVENTORY_ENDPOINT_LIMIT`), never a
+/// lowered stand-in.
+const MULTI_PREFIX_BUDGET: u64 = 8192;
+
+/// Caller-pair budget for the prefix cells. Witness rows are per
+/// (caller image, object) pair — one caller on one provider object is one
+/// row — so the expected population is 1-2 rows. The budget stays loose at
+/// 8,192 on purpose: a tight budget would refuse a wrongly attached
+/// provider B's row with PairInsertFailure, and the B-absence proof below
+/// would pass by incapacity instead of by non-arrival.
+const MULTI_PREFIX_PAIRS: u64 = 8192;
+
+/// Backstop for the whole cell: every phase already carries its own
+/// deadline (extend/read windows, bounded read loop, bounded stop, 5 s
+/// caller line reads), so this only catches a hung phase, never a slow one.
+const MULTI_PREFIX_TOTAL_BUDGET: Duration = Duration::from_secs(1800);
+
+/// A prefix-cell population: the owned fixtures (kept alive: their
+/// tempdirs own the binaries the pins and links point at), the lowering
+/// pins, the merged plan, and the absorbed attach set with its outcome.
+struct MultiPrefixPopulation {
+    a: OwnedFixture,
+    b: Option<OwnedFixture>,
+    pins: PinnedObjects,
+    plan: AttachPlan,
+    set: InventoryAttachSet,
+    outcome: AbsorbOutcome,
+}
+
+fn multi_prefix_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
+}
+
+/// Reads until one full CALLER_USE sweep completes: clean health, no
+/// integrity row, no read failure, no unrecorded row, no sweep gap.
+fn multi_prefix_read_sweep(
+    capture: &mut InventoryCapture,
+) -> Result<(Vec<WitnessRow>, WitnessBatch)> {
+    let mut rows = Vec::new();
+    for _ in 0..64 {
+        let batch = capture.read_witnesses(
+            ReadWindow::new(16_384, Instant::now() + Duration::from_secs(120)).unwrap(),
+        );
+        ensure!(
+            batch.integrity.is_empty(),
+            "integrity rows: {:?}",
+            batch.integrity
+        );
+        ensure!(batch.read_failures.is_empty(), "{:?}", batch.read_failures);
+        ensure!(
+            batch.phase == CapturePhase::Prepared || batch.health.failures.is_empty(),
+            "{:?}",
+            batch.health
+        );
+        ensure!(
+            batch.health_regression.is_none(),
+            "{:?}",
+            batch.health_regression
+        );
+        ensure!(
+            batch.unrecorded_rows == 0 && !batch.sweep_gaps,
+            "sweep dropped rows: {batch:?}"
+        );
+        rows.extend(batch.rows.iter().cloned());
+        if batch.sweep_completed {
+            return Ok((rows, batch));
+        }
+    }
+    bail!("no CALLER_USE sweep completed in 64 quanta")
+}
+
+/// Bounded stop: service lifecycle records while retirement runs, then
+/// take the retired capture. Past 60 s this fails, never hangs.
+fn multi_prefix_stop(capture: InventoryCapture) -> Result<RetiredCapture> {
+    let mut retiring = capture.begin_stop();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let window = ReadWindow::new(16_384, Instant::now() + Duration::from_secs(120)).unwrap();
+        let service = retiring.service_discovery(window);
+        ensure!(service.failure.is_none(), "{service:?}");
+        if retiring.poll_completion(deadline)? {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "capture retirement deadline");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    retiring
+        .try_finish()
+        .map_err(|_| anyhow::anyhow!("completed retirement did not transfer"))
+}
+
+/// Builds the real population (8,192 owned endpoints, plus one more owned
+/// endpoint when `with_over_budget`), lowers it through the production
+/// Shared-scope Inventory merge at the 8,192 budget, and absorbs it into a
+/// fresh attach set. Asserts the admission contract: with the extra module
+/// the plan holds exactly 8,192 slots and refuses the 1-endpoint module
+/// whole with the exact named reason; without it nothing is refused.
+fn multi_prefix_population(with_over_budget: bool) -> Result<MultiPrefixPopulation> {
+    let fixture_start = Instant::now();
+    let a = OwnedFixture::build_n(false, 8192)?;
+    ensure!(
+        a.plan.slots.len() == 8192,
+        "fixture A carries {} endpoints, not 8192",
+        a.plan.slots.len()
+    );
+    let b = with_over_budget
+        .then(|| OwnedFixture::build_n(false, 1))
+        .transpose()?;
+    if let Some(b) = &b {
+        ensure!(
+            b.plan.slots.len() == 1,
+            "fixture B carries {} endpoints, not 1",
+            b.plan.slots.len()
+        );
+    }
+    eprintln!(
+        "MULTI_PREFIX_FIXTURE endpoints={} ms={}",
+        8192 + usize::from(with_over_budget),
+        fixture_start.elapsed().as_millis()
+    );
+    let mut files = vec![(a.path.as_path(), a.expected_sha256.as_str())];
+    if let Some(b) = &b {
+        files.push((b.path.as_path(), b.expected_sha256.as_str()));
+    }
+    let pins = inventory_fx::pass_pins(&files);
+    // The production lowering shape: Shared scope, scan evidence only. A is
+    // corroborated the way a real --system provider is — its scan decoded
+    // an exact-standard interface triple naming its table — so the GT-5
+    // value order admits it before the heuristic 1-endpoint module,
+    // deterministically (AdmissionClass order, not inode order).
+    let mut modules = Vec::new();
+    let a_offsets: Vec<u64> = a.plan.slots.iter().map(|slot| slot.file_offset).collect();
+    let mut a_module = inventory_fx::module(&pins, &a.path, &a_offsets);
+    a_module.scanned.interfaces.push(ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    });
+    modules.push(a_module);
+    if let Some(b) = &b {
+        let b_offsets: Vec<u64> = b.plan.slots.iter().map(|slot| slot.file_offset).collect();
+        modules.push(inventory_fx::module(&pins, &b.path, &b_offsets));
+    }
+    let budget = InventoryBudget::new(MULTI_PREFIX_BUDGET, 8 * MULTI_PREFIX_BUDGET)
+        .map_err(anyhow::Error::msg)?;
+    let plan_start = Instant::now();
+    let plan = crate::plan::build_from_sources_for_policy_scoped(
+        &modules,
+        &[],
+        &pins,
+        AdmissionPolicy::Inventory(budget),
+        AdmissionScope::Shared,
+    );
+    ensure!(
+        plan.slots.len() == 8192,
+        "the merge admitted {} slots, not the 8192 prefix",
+        plan.slots.len()
+    );
+    ensure!(
+        plan.modules.len() == 1 && plan.modules[0].path == a.path.to_str().unwrap(),
+        "the merge admitted {:?}, not provider A whole",
+        plan.modules
+            .iter()
+            .map(|module| &module.path)
+            .collect::<Vec<_>>()
+    );
+    ensure!(
+        plan.slots
+            .iter()
+            .all(|slot| slot.semantics == SlotSemantics::COUNT_ONLY),
+        "Inventory admits count-only"
+    );
+    let mut set = InventoryAttachSet::new(budget);
+    let outcome = set.absorb(&plan, &pins);
+    ensure!(
+        outcome.delta.endpoints.len() == 8192 && set.len() == 8192,
+        "the attach set holds {} endpoints, not the 8192 prefix",
+        set.len()
+    );
+    ensure!(
+        outcome.gaps.is_empty(),
+        "refusals live in module verdicts, not gaps: {:?}",
+        outcome.gaps
+    );
+    let verdict_of = |sha256: &str| {
+        outcome
+            .verdicts
+            .iter()
+            .find(|(key, _)| key.sha256 == sha256)
+            .map(|(_, verdict)| verdict)
+    };
+    match verdict_of(&a.expected_sha256) {
+        Some(AttachVerdict::Admitted { endpoints, reasons }) => {
+            ensure!(
+                *endpoints == 8192 && reasons.is_empty(),
+                "provider A verdict is not a clean 8192 admission: {endpoints} endpoints, {reasons:?}"
+            );
+        }
+        other => bail!("provider A has no clean admission verdict: {other:?}"),
+    }
+    if let Some(b) = &b {
+        ensure!(
+            plan.modules_skipped.len() == 1,
+            "the merge skipped {:?}, not exactly the 1-endpoint module",
+            plan.modules_skipped
+        );
+        let skipped = &plan.modules_skipped[0];
+        ensure!(
+            skipped.subject == b.path.to_str().unwrap(),
+            "the refused module is {}, not provider B",
+            skipped.subject
+        );
+        // The named over-budget reason the user sees: the Shared-scope
+        // whole-module refusal (plan::CapacityRefusal), verbatim. It flows
+        // into inventory JSON `modules[].admission.reasons[]` and profile
+        // JSON `evidence.modules_skipped[].reason`, with the text surfaces
+        // reading the refusal state and counts beside it.
+        let expected_reason = format!(
+            "module needs 1 more; only 8192 attach slots are available; 8192 are in use \
+             (8192 active, 0 retired; held by {} 8192); 2048 are reserved for providers \
+             with a corroborated function table \u{2014} refusing to attach a prefix; to \
+             capture one provider, name it with --module <path>",
+            a.path.to_str().unwrap(),
+        );
+        ensure!(
+            skipped.reason == expected_reason,
+            "wrong over-budget reason:\n got: {}\nwant: {}",
+            skipped.reason,
+            expected_reason
+        );
+        ensure!(
+            !crate::plan::is_growth_omission(&skipped.reason),
+            "a refused-whole module is not a growth omission"
+        );
+        ensure!(
+            crate::plan::whole_refusal_needed_count(&skipped.reason) == Some(1),
+            "the whole-refusal count does not parse as 1"
+        );
+        // The reason survives both user surfaces: no control byte can break
+        // a text line, and it JSON-round-trips byte-exact.
+        ensure!(
+            skipped
+                .reason
+                .bytes()
+                .all(|byte| byte >= 0x20 || byte == b'\n' || byte == b'\t'),
+            "the reason carries a control byte that breaks text rendering"
+        );
+        let json = serde_json::to_value(&skipped.reason).unwrap();
+        ensure!(
+            json.as_str() == Some(skipped.reason.as_str()),
+            "the reason does not JSON-round-trip"
+        );
+        match verdict_of(&b.expected_sha256) {
+            Some(AttachVerdict::Refused { reason }) => {
+                ensure!(
+                    *reason == expected_reason,
+                    "the attach-set verdict does not carry the named reason: {reason}"
+                );
+            }
+            other => bail!("provider B has no refusal verdict: {other:?}"),
+        }
+    } else {
+        ensure!(
+            plan.modules_skipped.is_empty(),
+            "the healthy twin refused {:?}",
+            plan.modules_skipped
+        );
+        ensure!(
+            outcome.verdicts.len() == 1,
+            "the healthy twin judged {:?}",
+            outcome.verdicts.keys().collect::<Vec<_>>()
+        );
+    }
+    eprintln!(
+        "MULTI_PREFIX_PLAN slots=8192 skipped={} ms={}",
+        plan.modules_skipped.len(),
+        plan_start.elapsed().as_millis()
+    );
+    Ok(MultiPrefixPopulation {
+        a,
+        b,
+        pins,
+        plan,
+        set,
+        outcome,
+    })
+}
+
+/// One prefix case: the population above, attached on Multi through the
+/// capture facade, every admitted endpoint called and witnessed, the
+/// refused endpoint (when present) proven absent from kernel state, and a
+/// bounded stop that releases every link and map.
+fn inventory_multi_prefix_case(with_over_budget: bool) -> Result<()> {
+    let total_start = Instant::now();
+    let cell = if with_over_budget { "n8193" } else { "n8192" };
+    let mut population = multi_prefix_population(with_over_budget)?;
+    let budget = population.set.budget();
+    let fds_before = multi_prefix_fd_count();
+    let prepare_start = Instant::now();
+    let mut capture = InventoryCapture::prepare(
+        CaptureScope::System,
+        budget,
+        crate::attach::inventory::capture::caller_budget(budget, MULTI_PREFIX_PAIRS)?,
+        AttachBackend::Multi,
+    )?;
+    ensure!(
+        capture.backend() == AttachBackend::Multi,
+        "the capture did not stay Multi"
+    );
+    let receipt = capture.extend(
+        std::mem::take(&mut population.outcome.delta),
+        &population.set,
+        ExtendWindow::new(8192, Instant::now() + Duration::from_secs(300)).unwrap(),
+    );
+    ensure!(
+        receipt.activated_roots,
+        "the first extend did not activate: {receipt:?}"
+    );
+    ensure!(
+        receipt.refused.is_none(),
+        "the 8192 prefix extend refused: {:?}",
+        receipt.refused
+    );
+    ensure!(
+        receipt.failed.is_empty(),
+        "prefix attach failures: {} (first: {:?})",
+        receipt.failed.len(),
+        receipt.failed.iter().take(3).collect::<Vec<_>>()
+    );
+    ensure!(
+        receipt.attached.len() == 8192,
+        "attached {} endpoints, not the 8192 prefix",
+        receipt.attached.len()
+    );
+    // Multi links are adaptive, 8..=96 sites each, so one provider object
+    // attaches as several immutable groups at 8,192 endpoints. The groups
+    // must partition the attached prefix: every attached endpoint in
+    // exactly one group, one link per group (no bisect: every site is a
+    // real executable offset), every group on provider A's object.
+    ensure!(
+        !receipt.groups.is_empty(),
+        "Multi attached no group for the 8192 prefix"
+    );
+    let group_object = receipt.groups[0].object;
+    let mut grouped: Vec<u32> = Vec::new();
+    let mut group_links = 0usize;
+    let mut smallest = usize::MAX;
+    let mut largest = 0usize;
+    for group in &receipt.groups {
+        ensure!(
+            group.links == 1,
+            "group {} split into {} links around refused sites",
+            group.serial,
+            group.links
+        );
+        ensure!(
+            group.object == group_object,
+            "the groups span more than one provider object"
+        );
+        ensure!(
+            (MULTI_LINK_MIN_SITES..=MULTI_LINK_MAX_SITES).contains(&group.members.len()),
+            "group {} carries {} sites, outside 8..=96",
+            group.serial,
+            group.members.len()
+        );
+        group_links += group.links;
+        smallest = smallest.min(group.members.len());
+        largest = largest.max(group.members.len());
+        grouped.extend(group.members.iter().map(|id| id.0));
+    }
+    grouped.sort_unstable();
+    let mut attached_ids: Vec<u32> = receipt
+        .attached
+        .iter()
+        .map(|endpoint| endpoint.id.0)
+        .collect();
+    attached_ids.sort_unstable();
+    ensure!(
+        grouped == attached_ids && attached_ids.len() == 8192,
+        "the {} Multi groups do not partition the attached 8192 ({} members)",
+        receipt.groups.len(),
+        grouped.len()
+    );
+    ensure!(
+        receipt.custody == Some(ScopeCustody::System),
+        "wrong scope custody: {:?}",
+        receipt.custody
+    );
+    ensure!(
+        capture.live_links() == 2 + group_links,
+        "two roots plus {} group links, not {} live links",
+        group_links,
+        capture.live_links()
+    );
+    eprintln!(
+        "MULTI_PREFIX_ATTACH cell={cell} attached=8192 groups={} group_sites={smallest}..={largest} links={} fds={}->{} prepare_ms={} attach_ns_total={} attach_ns_max={}",
+        receipt.groups.len(),
+        2 + group_links,
+        fds_before,
+        multi_prefix_fd_count(),
+        prepare_start.elapsed().as_millis(),
+        receipt.attach_ns_total,
+        receipt.attach_ns_max,
+    );
+    // The admitted prefix intact through real BPF: call every owned
+    // endpoint once. Witness rows are per (caller image, object) pair, so
+    // one caller on provider A is exactly one row — and its saturating
+    // entry count is the exact prefix total: 8,192 probe firings, no
+    // fewer (a silent drop), no more. Zeroed BPF evidence beside it proves
+    // no firing was dropped on the floor (bad cookie, failed insert).
+    let call_start = Instant::now();
+    let mut caller_a = population.a.spawn()?;
+    for id in 0..8192u32 {
+        caller_a.calls(id, 1)?;
+    }
+    let call_ms = call_start.elapsed().as_millis();
+    let read_start = Instant::now();
+    let (rows, batch) = multi_prefix_read_sweep(&mut capture)?;
+    let read_ms = read_start.elapsed().as_millis();
+    ensure!(
+        rows.len() == 1 && batch.seen_rows == 1,
+        "witnessed {} rows (seen {}), not the one (caller, provider A) row",
+        rows.len(),
+        batch.seen_rows
+    );
+    let row = &rows[0];
+    ensure!(
+        row.host_tgid == caller_a.child.id(),
+        "the witness row names another process"
+    );
+    ensure!(
+        row.domain == capture.domain(),
+        "the witness row carries another domain"
+    );
+    ensure!(
+        row.entry_count == 8192,
+        "the witness row counted {} entries, not the exact 8192 prefix",
+        row.entry_count
+    );
+    ensure!(
+        batch.counts.is_empty(),
+        "no count refresh is owed on first sight: {:?}",
+        batch.counts
+    );
+    ensure!(
+        batch
+            .health
+            .caller_evidence
+            .is_none_or(|cells| cells == [0, 0, 0, 0]),
+        "caller evidence is dirty: {:?}",
+        batch.health.caller_evidence
+    );
+    ensure!(
+        batch
+            .health
+            .usage_evidence
+            .is_none_or(|cells| cells == [0, 0, 0]),
+        "usage evidence is dirty: {:?}",
+        batch.health.usage_evidence
+    );
+    eprintln!(
+        "MULTI_PREFIX_WITNESS cell={cell} rows=1 entry_count=8192 call_ms={call_ms} read_ms={read_ms}"
+    );
+    // The 8,193rd endpoint is not attached anywhere: calling it opens no
+    // second row, advances no count, and dirties no evidence. The pair
+    // budget above is loose on purpose, so a wrongly attached provider B
+    // could land its row — this absence is non-arrival, not incapacity.
+    if let Some(b) = &population.b {
+        let mut caller_b = b.spawn()?;
+        caller_b.calls(0, 1)?;
+        let (extra_rows, extra_batch) = multi_prefix_read_sweep(&mut capture)?;
+        ensure!(
+            extra_rows.is_empty() && extra_batch.seen_rows == 1,
+            "the refused endpoint leaked {} witness rows",
+            extra_rows.len()
+        );
+        ensure!(
+            extra_batch.counts.is_empty(),
+            "the refused call advanced entry counts: {:?}",
+            extra_batch.counts
+        );
+        ensure!(
+            extra_batch
+                .health
+                .caller_evidence
+                .is_none_or(|cells| cells == [0, 0, 0, 0]),
+            "caller evidence is dirty after the refused call: {:?}",
+            extra_batch.health.caller_evidence
+        );
+        caller_b.finish()?;
+        eprintln!("MULTI_PREFIX_ABSENT cell={cell} refused_witness_rows=0");
+    }
+    caller_a.finish()?;
+    // The caller handles (child pipes, pidfd) are harness fds, not product
+    // kernel state: drop them before the stop so the release check below
+    // measures only what the capture held. (caller_b already dropped at
+    // its block end.)
+    drop(caller_a);
+    let live_before_stop = capture.live_links();
+    let stop_start = Instant::now();
+    let retired = multi_prefix_stop(capture)?;
+    let stop_ms = stop_start.elapsed().as_millis();
+    let cleanup = retired.cleanup();
+    ensure!(
+        cleanup.failures.is_empty() && cleanup.retained_links == 0,
+        "dirty stop: {cleanup:?}"
+    );
+    ensure!(
+        cleanup.closed == live_before_stop,
+        "the stop closed {} links, not the {} live ones",
+        cleanup.closed,
+        live_before_stop
+    );
+    let closed = cleanup.closed;
+    drop(retired);
+    let fds_after = multi_prefix_fd_count();
+    ensure!(
+        fds_after == fds_before,
+        "the stop leaked descriptors: {fds_before} -> {fds_after}"
+    );
+    let total_ms = total_start.elapsed().as_millis();
+    eprintln!(
+        "MULTI_PREFIX_STOP cell={cell} closed={closed} fds={fds_before}->{fds_after} stop_ms={stop_ms} total_ms={total_ms}"
+    );
+    ensure!(
+        total_start.elapsed() < MULTI_PREFIX_TOTAL_BUDGET,
+        "the cell overran its finite-time backstop"
+    );
+    Ok(())
 }
 
 #[cfg(not(feature = "wide-detailed-2112"))]

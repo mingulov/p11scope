@@ -318,6 +318,8 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_l
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64
+attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64
+attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64
 # G21 default-ring wrap needs 658 changing observed passes per paired run
 # (~22 min total) and the controller-verified prebuilt32-body fixture.
 # Required acceptance is scheduled explicitly, outside the default short lane.

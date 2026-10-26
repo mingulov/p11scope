@@ -401,6 +401,18 @@
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64",
+      "reason": "root-owned BPF lane; 8192-endpoint Multi population admits every endpoint with no refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64",
+      "reason": "root-owned BPF lane; 8193-endpoint Multi population refuses the 8193rd whole and keeps the 8192 prefix",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn",
       "reason": "root-owned BPF lane and external lifecycle ledger; explicit controlled worker/synchronous comparison",
       "cell": "privileged"

@@ -20,12 +20,26 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/bpf-load-report.py"
 DRIVER = ROOT / "scripts/check-bpf-load-kernels.sh"
 BUDGETS_FILE = ROOT / "tests/bpf-verifier-budgets.json"
+COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
 # plus the 7.0 guest the budgets also cover.
 EXPECTED_BUDGET_KERNELS = frozenset({
     "v5.15.221", "v6.1.188", "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+})
+# Counter banks load only where the verifier accepts them (6.6+); the old
+# kernels keep the specified refusal, so the counter file pins its own set.
+EXPECTED_COUNTER_BUDGET_KERNELS = frozenset({
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+})
+EXPECTED_COUNTER_BUDGET_PROGRAMS = frozenset({
+    "counter-counts/p11_counter_bank_entry",
+    "counter-counts/p11_counter_bank_return",
+    "counter-timestamps/p11_counter_bank_entry",
+    "counter-timestamps/p11_counter_bank_return",
+    "counter-latency/p11_counter_bank_entry",
+    "counter-latency/p11_counter_bank_return",
 })
 
 
@@ -88,6 +102,24 @@ def check_budgets_cap(path):
             assert budget * 100 <= ceiling, (
                 f"{program} {kernel}: budget {budget} exceeds "
                 f"limit {limit} x (1 - {headroom}/100)")
+
+
+def check_counter_budgets_shape(path):
+    """Counter banks pin their own kernel set and the six bank programs."""
+    document = json.loads(Path(path).read_text(encoding="ascii"))
+    programs = document["programs"]
+    assert set(programs) == EXPECTED_COUNTER_BUDGET_PROGRAMS, (
+        f"counter programs {sorted(programs)} differ from "
+        f"{sorted(EXPECTED_COUNTER_BUDGET_PROGRAMS)}")
+    kernel_sets = {name: frozenset(cells) for name, cells in programs.items()}
+    first, *rest = sorted(kernel_sets)
+    for name in rest:
+        assert kernel_sets[name] == kernel_sets[first], (
+            f"{name} kernels {sorted(kernel_sets[name])} differ from "
+            f"{first} {sorted(kernel_sets[first])}")
+    assert kernel_sets[first] == EXPECTED_COUNTER_BUDGET_KERNELS, (
+        f"counter budget kernels {sorted(kernel_sets[first])} differ from "
+        f"{sorted(EXPECTED_COUNTER_BUDGET_KERNELS)}")
 
 next_program_id = 100
 
@@ -300,6 +332,14 @@ class ReportTests(unittest.TestCase):
             except AssertionError as error:
                 self.fail(f"{path.name}: {error}")
 
+    def test_counter_budgets_file_gives_every_program_the_same_kernel_set(self):
+        self.assertTrue(COUNTER_BUDGETS_FILE.is_file(),
+                        "tests/counter-bpf-verifier-budgets.json is missing")
+        try:
+            check_counter_budgets_shape(COUNTER_BUDGETS_FILE)
+        except AssertionError as error:
+            self.fail(str(error))
+
     def test_object_namespaces_budget_lookup(self):
         loads = [load_row("p11_entry", processed=472892)]
         budgets = self.write_budgets({"detailed/p11_entry": {KERNEL: 800000}})
@@ -490,6 +530,63 @@ class ReportTests(unittest.TestCase):
         text = DRIVER.read_text(encoding="ascii")
         self.assertNotIn("unwired", text)
         self.assertIn("counter-<mode>-probe-", text)
+
+    def test_driver_scores_counter_loads_with_budgets(self):
+        # Numeric bank budgets close the missing-program and growth gaps:
+        # each mode scores against its counter object under the counter
+        # budgets file, so a silent drop or a sub-95% cost doubling fails.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn("COUNTER_BUDGETS", text)
+        self.assertIn("counter-bpf-verifier-budgets.json", text)
+        self.assertIn('--budgets "$COUNTER_BUDGETS"', text)
+        self.assertIn('--object "counter-$MODE"', text)
+
+    def test_driver_requires_at_load_refusal_rows_on_61(self):
+        # The 6.1 arm must prove the specified at-load E2BIG path ran:
+        # a before-load refusal or probe flake with zero refusal rows
+        # is not the specified behavior.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn("at-load refusal rows", text)
+
+    def test_driver_checks_old_kernel_counter_runs_for_crashes(self):
+        # Old-kernel refusal arms carry the same crash grep as the 6.6+
+        # arm and inventory: three sites (inventory, counter new, counter
+        # old) name the crash markers.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertGreaterEqual(
+            text.count("panicked at|traceback"), 3,
+            "counter old-kernel arms must grep for crashes",
+        )
+
+    def test_driver_refuses_counter_loads_where_refusal_is_specified(self):
+        # Two-sided token check: the observer naming the refusal token is
+        # not enough when a bank program loaded anyway.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('"loaded": ?true', text)
+
+    def test_driver_scores_counter_on_failure(self):
+        # A failed 6.6+ counter run still falls through to per-program
+        # scoring like inventory does, instead of `continue` past the
+        # detail exactly when it is needed.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        rc_idx = text.index("counter-$MODE profile exited rc=")
+        rc_case = text[rc_idx:text.index("esac", rc_idx)]
+        self.assertIn("FAILED=1", rc_case)
+        self.assertNotIn("continue", rc_case)
+        crash_idx = text.index("counter-$MODE profile crashed or left no log")
+        crash_block = text[crash_idx:text.index("fi", crash_idx)]
+        self.assertIn("FAILED=1", crash_block)
+        self.assertNotIn("continue", crash_block)
 
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked

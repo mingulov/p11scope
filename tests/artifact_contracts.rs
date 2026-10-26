@@ -4153,12 +4153,20 @@ PY
     command "$real_python" "$@"
 }
 . scripts/lib.sh
+# Bounded poll (200 x 50ms): the child below always exits (done file appears,
+# work dir is removed, or its own 200 x 50ms bound), so a slow host delays but
+# never hangs this capture behind the background launcher subshell's wait.
 if launch_user_recorded_process_group "$work/identity.json" "$work/child.log" \
-    sh -c '(sleep 0.2; : > "$1") & trap "printf killed; exit 9" TERM; while [ ! -e "$1" ]; do :; done; printf survived' \
+    sh -c '(sleep 0.2; : > "$1") & trap "printf killed; exit 9" TERM; n=0; while [ ! -e "$1" ] && [ -d "${1%/*}" ] && [ "$n" -lt 200 ]; do n=$((n + 1)); sleep 0.05; done; [ -e "$1" ] && printf survived' \
     sh "$work/done"; then
     exit 1
 fi
-sleep 0.3
+attempt=0
+while [ "$attempt" -lt 200 ]; do
+    grep -Fqx survived "$work/child.log" 2>/dev/null && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
 grep -Fqx survived "$work/child.log"
 "#,
         ])

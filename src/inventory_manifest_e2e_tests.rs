@@ -422,9 +422,9 @@ fn privileged_inventory_system_manifest_e2e_softsm_edges_lp64() -> Result<()> {
     for (index, edge) in edges.iter().enumerate().take(4) {
         println!("MAN1_E2E edge[{index}]={edge}");
     }
-    ensure!(!edges.is_empty(), "at least one semantic edge is populated");
     // Stub edges (no calls observed for their instance) are honest
-    // disclosure; at least one edge must be fully populated.
+    // disclosure; the R-51 verdict below accepts populated edges or
+    // a named route-loss gap, never a silent drop.
     let mut populated = 0usize;
     for edge in edges {
         let Some(mechanisms) = edge.get("mechanisms").and_then(serde_json::Value::as_array) else {

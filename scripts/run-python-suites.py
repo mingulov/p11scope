@@ -113,6 +113,7 @@ RUN = [
     ("test_release_notices.py", []),
     ("test_release_recipient.py", []),
     ("test_residual_gates.py", []),
+    ("test_s1_throughput_compare.py", []),
     ("test_schema_json.py", []),
     ("test_skip_reason_vocabulary.py", []),
     ("test_system_first_use_fixture.py", []),

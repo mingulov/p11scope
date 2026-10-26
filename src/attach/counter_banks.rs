@@ -987,7 +987,7 @@ const COUNTER_CHECK_ADOPT: &str = "counter plan cannot adopt the staged prefix";
 const COUNTER_CHECK_SIZING_CPUS: &str = "counter stage sizing saw zero CPUs";
 const COUNTER_CHECK_SESSION_STOPPED: &str = "counter session is stopping or detached";
 const COUNTER_CHECK_BACKEND: &str = "counter banks backend differs from the session backend";
-const COUNTER_CHECK_SCOPE: &str = "counter session scope is not one process";
+const COUNTER_CHECK_SCOPE: &str = "counter session scope is not one process or all processes";
 const COUNTER_CHECK_UNCHANGED: &str = "counter pinned provider changed";
 const COUNTER_CHECK_CPUS: &str = "counter CPU count changed since preparation";
 const COUNTER_CHECK_CONSUME_POLICY: &str = "counter extent plan is not a counter plan";
@@ -1146,13 +1146,15 @@ fn stage_requirements(
         .and_then(|n| n.checked_add(metadata.checked_mul(2)?))
         .and_then(|n| n.checked_add(cpus.checked_mul(4 * value_bytes)?))
         .ok_or(BankRefusal::Budget)?;
-    // NativeIo admits only OneProcess: Singles retains two BPF-link FDs
-    // per endpoint, with one transient perf FD during sequential attachment.
-    // Multi can bisect to the same two-leaf-per-endpoint maximum and needs
-    // no perf FD, so this same bound conservatively admits either backend.
-    // Provider owners share Arc<File>; observed_open already counts old maps,
-    // links and providers. Map bytes above still cover every possible CPU.
-    // A different scope needs its own FD fanout bound before admission.
+    // Singles retains two BPF-link FDs per endpoint, with one transient
+    // perf FD during sequential attachment. Multi can bisect to the same
+    // two-leaf-per-endpoint maximum and needs no perf FD, so this same
+    // bound conservatively admits either backend. Links are offset-based,
+    // so the count is scope-independent: cgroup/system sessions (pid-wide
+    // links, membership enforced by the in-BPF scope gate) share this
+    // bound. Provider owners share Arc<File>; observed_open already counts
+    // old maps, links and providers. Map bytes above still cover every
+    // possible CPU.
     // The caller reservation and readonly OS check remain independent; neither
     // atomically reserves FDs, and later EMFILE uses paid rollback/custody.
     let fds = fresh
@@ -2827,7 +2829,8 @@ fn observe_native_commit(
 /// in-BPF scope gate; link counts are offset-based and scope-independent).
 /// The diagnostic-only calling-process scope is never a session scope.
 fn counter_scope_admitted(scope: aya::programs::uprobe::UProbeScope) -> bool {
-    matches!(scope, aya::programs::uprobe::UProbeScope::OneProcess(_))
+    use aya::programs::uprobe::UProbeScope::{AllProcesses, OneProcess};
+    matches!(scope, OneProcess(_) | AllProcesses)
 }
 
 fn native_target_gate(
@@ -5652,7 +5655,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             native_target_gate(false, true, false, true, Some(2), 2),
-            Err("counter session scope is not one process")
+            Err("counter session scope is not one process or all processes")
         );
         assert_eq!(
             native_target_gate(false, true, true, false, Some(2), 2),

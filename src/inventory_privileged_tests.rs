@@ -5584,6 +5584,14 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     // gaps are audit rows, not domain state) and the single expected
     // scripted-view promotion refusal.
     let promotion_reason = disclosed_scope_reason(coordinator, "selected promotion refused")?;
+    let expected_reasons = [
+        crate::inventory_promotion::PromotionRefusal::StaleView.label(),
+        crate::inventory_promotion::PromotionRefusal::ManifestUnavailable.label(),
+    ];
+    ensure!(
+        expected_reasons.contains(&promotion_reason.as_str()),
+        "r16c-qb: unexpected promotion refusal reason {promotion_reason:?}, expected one of {expected_reasons:?}"
+    );
     assert_quiet_twins_except(
         coordinator,
         "r16c-qb",

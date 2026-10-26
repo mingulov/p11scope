@@ -5234,12 +5234,46 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // stop request above already ran it before native retirement).
         self.run_semantic_terminal_sequence();
     }
+
+    /// Drive a begun (Polling) Joint finish to terminal (Published,
+    /// wound down, or abandoned for exit) before the native
+    /// retirement. The pre-retirement settle runs on the 10 ms
+    /// cadence; a second operator signal escalates instead of
+    /// stepping further: the run is leaving, so the finish is held
+    /// for exit rather than reaped. Unbegun, published, abandoned
+    /// and legacy lanes are untouched: the post-retirement hook and
+    /// the terminal consume own those.
+    fn settle_joint_finish(&mut self) {
+        while matches!(self.joint_finish, JointFinishDriver::Polling)
+            && self.semantic.as_ref().is_some_and(Self::is_joint_lane)
+        {
+            if self.second_signal.is_some_and(|signal| signal()) {
+                self.escalate_joint_finish();
+                return;
+            }
+            let started = Instant::now();
+            let outcome = self.step_final_joint_finish_once();
+            if matches!(outcome, JointStepOutcome::WoundDown) {
+                self.complete_final_joint_lane();
+                return;
+            }
+            if !matches!(outcome, JointStepOutcome::Stayed)
+                || !matches!(self.joint_finish, JointFinishDriver::Polling)
+            {
+                return;
+            }
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_millis(10) {
+                std::thread::sleep(Duration::from_millis(10) - elapsed);
+            }
+        }
+    }
 }
 
 impl ClassicDriver<'_> {
     /// One begun-finish step (§8.3) with the seated summary snapshot:
     /// shared by the post-retirement hook and the pre-retirement
-    /// settle below.
+    /// settle above.
     fn step_final_joint_finish_once(&mut self) -> JointStepOutcome {
         #[cfg(test)]
         {
@@ -5257,32 +5291,6 @@ impl ClassicDriver<'_> {
             &mut warn,
             None,
         )
-    }
-
-    /// Drive a begun (Polling) Joint finish one step toward terminal
-    /// before the native retirement. The pre-retirement settle: the
-    /// loop calls this once per run with a native lane, after the
-    /// Retiring publish, before the lane stop dispatch. A second
-    /// operator signal escalates instead of stepping: the run is
-    /// leaving, so the finish is held for exit rather than reaped.
-    /// Unbegun, published, abandoned and legacy lanes are untouched:
-    /// the post-retirement hook and the terminal consume own those.
-    #[cfg(test)]
-    fn settle_joint_finish(&mut self) {
-        if !matches!(self.joint_finish, JointFinishDriver::Polling) {
-            return;
-        }
-        if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
-            return;
-        }
-        if self.second_signal.is_some_and(|signal| signal()) {
-            self.escalate_joint_finish();
-            return;
-        }
-        let outcome = self.step_final_joint_finish_once();
-        if matches!(outcome, JointStepOutcome::WoundDown) {
-            self.complete_final_joint_lane();
-        }
     }
 }
 

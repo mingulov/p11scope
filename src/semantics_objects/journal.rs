@@ -2831,7 +2831,21 @@ impl JournalAdapter {
             return Err(BirthCutRefusal::Foreign);
         }
         if self.stream_broken || self.invalidated || self.stopped {
-            return Err(BirthCutRefusal::Gap);
+            // OD33/R-50 (v0.5.0): an S1-only lane links no
+            // object-journal producer, so no Joint certification
+            // depends on this stream. The disposal that broke it
+            // already disclosed the loss; refusing every future
+            // quantum would strand the run for one discarded
+            // reservation. Re-sync the next quantum on a fresh
+            // stream instead. Linked lanes keep the fail-closed
+            // refusal, and a stopped adapter never re-syncs.
+            if !producers.journal_linked() && !self.stopped {
+                self.stream_broken = false;
+                self.invalidated = false;
+                self.stream_boundary = Some(cut.clone());
+            } else {
+                return Err(BirthCutRefusal::Gap);
+            }
         }
         match &self.stream_boundary {
             Some(boundary) if boundary.same_boundary(cut) => {}

@@ -1891,6 +1891,12 @@ pub(crate) trait PassDriver<Pin> {
     /// must fence before the (possibly slow) retirement runs. Called
     /// exactly once per run, before `Publish::Retiring`.
     fn on_stop_requested(&mut self) {}
+    /// The loop ended with a native lane and the Retiring publish
+    /// ran: drive a begun Joint finish (if any) to terminal before
+    /// the lane stop dispatch, while its receipts are fresh. Called
+    /// exactly once per run on this path; drivers without a Joint
+    /// finish ignore it.
+    fn settle_joint_finish(&mut self) {}
     /// The lane retired and staged its stop; the final commit runs
     /// next. A driver with its own terminal evidence finalizes it
     /// here, before that commit publishes.
@@ -3545,6 +3551,10 @@ where
         }
         error.get_or_insert(next);
     }
+    // A begun Joint finish settles before the (possibly slow) native
+    // retirement: its receipts are fresh here, and the lane must be
+    // terminal before the final commit and cleanup below.
+    driver.settle_joint_finish();
     let stopped = if error.is_some() {
         lane.stop_after_error(driver.host())
     } else if lane.passes == 0

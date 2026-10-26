@@ -556,6 +556,10 @@ class _FakeRest:
     def __init__(self, sections, status=0):
         # sections: [(binary, src, summary)] where summary is
         # (passed, failed, ignored, measured) or None for no summary.
+        # A ("Doc-tests <lib>", None, summary) section renders a doctest
+        # header. Header forms mirror real cargo 1.99.1 output: the
+        # three-token `unittests` form for lib/bin/example targets, the
+        # two-token form for integration tests and benches.
         self.sections, self.status = sections, status
         self.commands = []
 
@@ -563,8 +567,12 @@ class _FakeRest:
         self.commands.append((command, env, capture_stderr))
         lines = []
         for binary, src, summary in self.sections:
-            if src is None:
+            if src is None and binary.startswith("Doc-tests "):
+                lines.append(f"     {binary}")
+            elif src is None:
                 lines.append(f"     Running target/debug/deps/{binary}")
+            elif src.startswith("tests/") or src.startswith("benches/"):
+                lines.append(f"     Running {src} (target/debug/deps/{binary})")
             else:
                 lines.append(f"     Running unittests {src} (target/debug/deps/{binary})")
             lines.append("")
@@ -762,6 +770,40 @@ def self_test():
         assert "REST_ZERO_TEST_PIN" in str(error), error
     else:
         raise AssertionError("a stale zero-test pin went unnoticed")
+    # A Doc-tests section is its own proof: its summary must not stand in
+    # for the lib's, and a zero doctest run fails naming the doctests.
+    doctest_healthy = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("Doc-tests p11scope", None, (4, 0, 0, 0)),
+    ])
+    assert run_partition("rest", gate, runner=doctest_healthy,
+                         metadata=lambda c: _fake_metadata()) == 0
+    doctest_zero = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("Doc-tests p11scope", None, (0, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=doctest_zero,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "Doc-tests p11scope" in str(error), error
+    else:
+        raise AssertionError("a zero-test doctest run went unnoticed")
+    # A selected target cargo never runs leaves no section and must fail
+    # naming it, instead of passing silently.
+    skipped = _FakeRest([
+        ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
+        ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
+        ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
+        ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 0, 0)),
+    ])
+    try:
+        run_partition("rest", gate, runner=skipped,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "tests/zeta.rs" in str(error), error
+    else:
+        raise AssertionError("a selected target with no section went unnoticed")
     assert healthy.commands and healthy.commands[0][2] is True, \
         "rest must capture stderr so Running headers delimit binaries"
 

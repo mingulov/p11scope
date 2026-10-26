@@ -45,6 +45,11 @@ const RAW_CAPACITY: usize = 4_096;
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
+// Consecutive incomplete H0 merges without a single new outcome or receipt
+// before the lane names the stall. Honest drains append on every pass (each
+// tick resolves scans or expires waiters), so only a stuck waiter set with
+// an empty report can reach this; transient single-pass refusals reset it.
+const H0_NO_PROGRESS_BOUND: u32 = 16;
 
 pub(crate) struct JointWorkBudget {
     pub(crate) remaining_actions: usize,
@@ -335,6 +340,36 @@ struct Collected {
     /// A Requested demand already took its one fresh pull past a stale
     /// no-backlog poll, so the quiet case still binds after one pull.
     request_pulled: bool,
+    /// Consecutive H0 merges that added nothing while still incomplete.
+    /// Any merged outcome or receipt resets it; reaching the bound names
+    /// the stall instead of yielding without progress.
+    h0_idle_passes: u32,
+}
+
+impl Collected {
+    fn h0_accumulated(&self) -> Option<(usize, usize)> {
+        self.reports.as_ref().and_then(|reports| {
+            reports
+                .batch
+                .as_ref()
+                .map(|batch| (batch.outcomes.len(), batch.current.len()))
+        })
+    }
+
+    /// Count one incomplete merge toward the no-progress bound. Any newly
+    /// accumulated outcome or receipt resets the count; a merge that adds
+    /// nothing while still incomplete names the stall once the bound lands.
+    fn note_h0_merge(&mut self, before: Option<(usize, usize)>) -> Result<(), SemanticRefusal> {
+        if self.h0_accumulated() == before {
+            self.h0_idle_passes = self.h0_idle_passes.saturating_add(1);
+            if self.h0_idle_passes >= H0_NO_PROGRESS_BOUND {
+                return Err(SemanticRefusal::Unavailable);
+            }
+        } else {
+            self.h0_idle_passes = 0;
+        }
+        Ok(())
+    }
 }
 
 enum PendingQResolution {
@@ -1340,6 +1375,7 @@ impl LiveJointMachine {
                 Err(SemanticRefusal::ProviderStorage),
             );
         }
+        let before = original.h0_accumulated();
         let result = original
             .reports
             .as_mut()
@@ -1351,6 +1387,9 @@ impl LiveJointMachine {
         };
         drop(pending); // Dropped incoming buffers precede their exact lease refund.
         if !complete {
+            if let Err(reason) = original.note_h0_merge(before) {
+                return (Phase::AwaitH0(original), Err(reason));
+            }
             return (Phase::AwaitH0(original), Ok(Step::Yield));
         }
         let Some(batch) = original
@@ -1987,6 +2026,7 @@ impl LiveJointMachine {
                             poll,
                             reports: None,
                             request_pulled: false,
+                            h0_idle_passes: 0,
                         }),
                         Err(SemanticRefusal::Unavailable),
                     );
@@ -1999,6 +2039,7 @@ impl LiveJointMachine {
                         poll,
                         reports: None,
                         request_pulled: false,
+                        h0_idle_passes: 0,
                     }),
                     Ok(Step::Continue),
                 )
@@ -2126,6 +2167,7 @@ impl LiveJointMachine {
                 };
                 let batch = retain_on_refusal!(Phase::AwaitH0(original), ticked);
                 budget.spend(1);
+                let before = original.h0_accumulated();
                 let complete = match original
                     .reports
                     .as_mut()
@@ -2136,6 +2178,9 @@ impl LiveJointMachine {
                     Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
                 };
                 if !complete {
+                    if let Err(reason) = original.note_h0_merge(before) {
+                        return (Phase::AwaitH0(original), Err(reason));
+                    }
                     return (Phase::AwaitH0(original), Ok(Step::Yield));
                 }
                 let batch = original

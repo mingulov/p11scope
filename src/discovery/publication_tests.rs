@@ -4325,6 +4325,89 @@ fn f_e15_forged_exact_name_stays_count_only() {
     assert_count_only(&gi_engine);
 }
 
+/// True when `needle` occurs in `haystack` bounded on both sides by a
+/// character outside `alphabet` or by the string edge.
+fn contains_token(haystack: &str, needle: &str, alphabet: impl Fn(char) -> bool) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !alphabet(c));
+        let after_ok = haystack[start + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !alphabet(c));
+        before_ok && after_ok
+    })
+}
+
+/// True when `addr` leaks into `haystack`: its hex or decimal rendering
+/// appears as a standalone token. Hex is bounded by non-hexdigits and
+/// decimal by non-alphanumerics, so a short canary inside a longer run
+/// (a digest, another address, an identifier) is not mistaken for a
+/// leak, while a genuinely printed address — always standalone in
+/// structured output — still matches. Length-agnostic: short fixture
+/// addresses stay unambiguous without a length floor.
+fn canary_address_leaked(haystack: &str, addr: u64) -> bool {
+    let hex = format!("{addr:x}");
+    let dec = format!("{addr}");
+    contains_token(haystack, &hex, |c: char| c.is_ascii_hexdigit())
+        || contains_token(haystack, &dec, |c: char| c.is_ascii_alphanumeric())
+}
+
+#[test]
+fn canary_matcher_ignores_substrings_and_catches_standalone_leaks() {
+    // A short Fedora-style canary (7 hex digits) inside longer runs is
+    // not a leak ...
+    let short = 0x1234567u64;
+    let haystack = "digest 0001234567ff count 12345670 offset 0x12345678";
+    assert!(
+        !canary_address_leaked(haystack, short),
+        "a short canary inside longer runs stays quiet"
+    );
+    // ... but standalone in either rendering is.
+    assert!(canary_address_leaked(
+        &format!("table {short:x} end"),
+        short
+    ));
+    assert!(canary_address_leaked(&format!("table {short} end"), short));
+    assert!(canary_address_leaked(&format!("\"table\":{short}"), short));
+    assert!(canary_address_leaked(&format!("0x{short:x}"), short));
+}
+
+#[test]
+fn canary_matcher_stays_quiet_on_realistic_output_with_short_addresses() {
+    // Forced short addresses (Fedora prints fewer than 8 hex digits):
+    // realistic selection/slot output without a leak stays clean, and
+    // an injected leak in either rendering is caught.
+    let addrs = [0x1234567u64, 0xabcdefu64, 0x10000u64];
+    let selection = r#"{"providers":[{"coverage":"observed","count":17}],"tuples":[{"rv":0,"count":2}],"selection_truncated":false}"#;
+    let slots = r#"[Slot { index: 17, descriptor_index: 0, object: PinnedObjectId(3), object_path: "/owned-provider.so", file_offset: 128 }]"#;
+    for addr in addrs {
+        assert!(
+            !canary_address_leaked(selection, addr),
+            "selection clean for {addr:x}"
+        );
+        assert!(
+            !canary_address_leaked(slots, addr),
+            "slots clean for {addr:x}"
+        );
+        let hex_leak = format!(r#"{{"table":"{addr:x}"}}"#);
+        assert!(
+            canary_address_leaked(&hex_leak, addr),
+            "hex leak caught for {addr:x}"
+        );
+        let dec_leak = format!(r#"{{"table":{addr}}}"#);
+        assert!(
+            canary_address_leaked(&dec_leak, addr),
+            "decimal leak caught for {addr}"
+        );
+    }
+}
+
 /// Case 20 (Package F, E21): nothing a `C_GetInterface` publication
 /// admits exposes raw userspace pointers on a public surface — neither
 /// the selection projection nor the admitted slot inventory.
@@ -4375,33 +4458,27 @@ fn f_e21_gi_public_output_carries_no_raw_pointers() {
         slot_targets(&gi_engine).contains(&(path, offset)),
         "GI publication admits before privacy is assessed"
     );
-    let heap_hex = format!("{:x}", heap17.addr);
-    assert!(
-        heap_hex.len() >= 8,
-        "the canary address is long enough to be unambiguous"
-    );
     let selection_json =
         serde_json::to_string(&gi_engine.interface_selection()).expect("selection serializes");
     assert!(
-        !selection_json.contains(&heap_hex),
+        !canary_address_leaked(&selection_json, heap17.addr),
         "the selection projection carries no table address"
     );
     let slots_debug = format!("{:?}", gi_engine.plan().slots);
     assert!(
-        !slots_debug.contains(&heap_hex),
+        !canary_address_leaked(&slots_debug, heap17.addr),
         "the slot inventory carries no table address"
     );
     // Entry pointers stay private too: every printed entry address is
     // absent from both public surfaces.
     for (addr, _) in heap17.entries.iter().take(8) {
-        let entry_hex = format!("{addr:x}");
         assert!(
-            !selection_json.contains(&entry_hex),
-            "entry {entry_hex} stays out of the selection projection"
+            !canary_address_leaked(&selection_json, *addr),
+            "entry {addr:x} stays out of the selection projection"
         );
         assert!(
-            !slots_debug.contains(&entry_hex),
-            "entry {entry_hex} stays out of the slot inventory"
+            !canary_address_leaked(&slots_debug, *addr),
+            "entry {addr:x} stays out of the slot inventory"
         );
     }
 }

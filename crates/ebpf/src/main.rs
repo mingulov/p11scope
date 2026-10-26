@@ -1926,9 +1926,10 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
 fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
     // A failed custody settlement is capture loss: invalidate the audit
-    // before lifecycle bookkeeping, then continue mandatorily.
+    // before lifecycle bookkeeping, then continue mandatorily. Only 1 is
+    // failure; 2 (a healthy settle that abandoned a live START) is not.
     #[cfg(not(feature = "inventory-only"))]
-    if unsafe { p11_owner_cleanup() } != 0 {
+    if unsafe { p11_owner_cleanup() } == 1 {
         unsafe { p11_object_fault() };
     }
     #[cfg(feature = "inventory-only")]
@@ -1969,14 +1970,31 @@ pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
     rc
 }
 
+/// Cleanup outcome for a healthy settle that abandoned at least one live
+/// START (mirrors `P11_OWNER_CLEANUP_ABANDONED_START` in task_owner.h;
+/// pinned by test). Only 1 is failure.
+const OWNER_CLEANUP_ABANDONED_START: u32 = 2;
+
 #[inline(always)]
 fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
     // Retained original keys also cover fatal nonleader post-de_thread exit.
     // A failed custody settlement is capture loss: invalidate the audit
-    // before lifecycle bookkeeping, then continue mandatorily.
+    // before lifecycle bookkeeping, then continue mandatorily. Only 1 is
+    // failure; 2 (a healthy settle that abandoned a live START) is not.
     #[cfg(not(feature = "inventory-only"))]
-    if unsafe { p11_owner_cleanup() } != 0 {
+    let cleanup = unsafe { p11_owner_cleanup() };
+    #[cfg(not(feature = "inventory-only"))]
+    if cleanup == 1 {
         unsafe { p11_object_fault() };
+    }
+    // H8-D birth marker: a call that entered in scope but never returned,
+    // reclaimed here at thread exit, is an uncaptured call, so it dirties
+    // the leader row.
+    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+    if cleanup == OWNER_CLEANUP_ABANDONED_START {
+        unsafe {
+            p11_instance_scope_gap();
+        }
     }
     #[cfg(feature = "inventory-only")]
     let _ = unsafe { p11_owner_cleanup() };

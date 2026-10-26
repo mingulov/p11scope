@@ -51,6 +51,10 @@ _Static_assert(P11SCOPE_OWNER_SLOT_BOUND == 8192U, "bank owner bound must match 
 /* A subordinate object row contradicted its START (marker, descriptor,
  * binding or phase). Always set together with OWNER_BOOKKEEPING_FAILED. */
 #define OWNER_OBJECT_MISMATCH 4096ULL
+/* p11_owner_cleanup outcomes: 0 healthy, 1 failure, 2 a healthy settle
+ * that abandoned at least one live START at thread exit. Only 1 is
+ * failure; the exit root dirties the leader marker row on 2. */
+#define P11_OWNER_CLEANUP_ABANDONED_START 2U
 
 struct task_struct;
 struct thread_owner {

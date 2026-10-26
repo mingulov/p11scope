@@ -1030,8 +1030,11 @@ static long owner_cleanup_orphan_callback(u32 slot, void *opaque)
 /* Called ONLY by the mandatory current-task raw exec/exit hooks. The actual
  * atomic CAS0->0 is the linearization point, not a plain or cached load.
  * Returns 0 for healthy proven cleanup (or a healthy no-op) and 1 for
- * failure or unproven cleanup. Poison is never cleared and a failed
- * release is never masked: settling rows after poison still reports 1. */
+ * failure or unproven cleanup. A healthy settle that abandoned at least
+ * one live START returns P11_OWNER_CLEANUP_ABANDONED_START (2) instead
+ * of 0, so the exit root can dirty the leader marker row. Poison is
+ * never cleared and a failed release is never masked: settling rows
+ * after poison still reports 1. */
 __attribute__((noinline)) u32 p11_owner_cleanup(void)
 {
     struct owner_control *ctl = control();
@@ -1058,6 +1061,11 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
         return healthy(ctl) ? 0 : 1;
     if (!valid_owner(ctl, owner))
         return 1;
+    /* A live START count at entry means this cleanup abandons at least one
+     * entered-but-unreturned call; a healthy settle then reports 2, not 0.
+     * Snapshot, never a carried accumulator: no loop below writes it.
+     * Mismatched counts still fail (1) at the checks below. */
+    u32 live_starts = owner->start_count;
 #ifndef P11SCOPE_INVENTORY_ONLY
 #ifdef P11SCOPE_COUNTER_BANK_PROOF
     struct owner_cleanup_context context = {
@@ -1146,5 +1154,7 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
     }
     if (!release_empty(ctl, owner))
         return 1;
-    return healthy(ctl) ? 0 : 1;
+    if (!healthy(ctl))
+        return 1;
+    return live_starts ? P11_OWNER_CLEANUP_ABANDONED_START : 0;
 }

@@ -1774,6 +1774,18 @@ impl AttestedSemanticLane {
         )
     }
 
+    /// The retained Joint frame's scalar audit tags, if a machine holds
+    /// one: failure gap, H3 evidence, staged max, pending floor, active
+    /// result. Read-only; names the exact stuck audit on unpublished.
+    #[cfg(test)]
+    pub(crate) fn joint_audit_diagnostic_for_test(&self) -> Option<String> {
+        let live = self.live.as_deref()?;
+        let machine = live.joint_machine.as_ref()?;
+        machine
+            .diagnostic_audit_for_test()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+    }
+
     /// Whether this lane owns a Joint machine (§8.3).
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_machine(&self) -> bool {

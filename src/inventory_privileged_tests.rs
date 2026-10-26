@@ -4256,12 +4256,16 @@ fn service_to_published(
         }
         ensure!(
             polls < 600,
-            "{tag}: unpublished after 600 polls ({} ms)",
-            started.elapsed().as_millis()
+            "{tag}: unpublished after 600 polls ({} ms); stuck audit={:?} h3={:?}",
+            started.elapsed().as_millis(),
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
         );
         ensure!(
             started.elapsed() < Duration::from_secs(120),
-            "{tag}: unpublished after 120 s"
+            "{tag}: unpublished after 120 s; stuck audit={:?} h3={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
         );
     }
 }

@@ -40,7 +40,7 @@ jobs:
   # FAILs honestly when KVM is absent; nothing after the facts is a guess.
   kvm-probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Host facts
         shell: bash
@@ -74,13 +74,14 @@ jobs:
           test -r /dev/kvm
           test -w /dev/kvm
           ls -l /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 qemu-utils
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Install pinned virtme-ng
         shell: bash
         run: |
           pipx install "virtme-ng==$CI_VNG_VERSION"
-          test "$("$HOME/.local/bin/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
-          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
       # Cache keys (as in ci.yml): the runner image, so an image update
       # starts the kernel cache cold.
       - name: Cache keys
@@ -206,13 +207,14 @@ jobs:
           sudo chmod 0666 /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 qemu-utils
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Install pinned virtme-ng
         shell: bash
         run: |
           pipx install "virtme-ng==$CI_VNG_VERSION"
-          test "$("$HOME/.local/bin/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
-          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
       # Cache keys (as in ci.yml): the runner image, so an image update
       # starts the kernel cache cold.
       - name: Cache keys
@@ -242,6 +244,8 @@ jobs:
         shell: bash
         run: |
           (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
           mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
           scripts/check-bpf-load-kernels.sh \
             "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
@@ -280,6 +284,8 @@ jobs:
         shell: bash
         run: |
           (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
           mkdir -p "$GITHUB_WORKSPACE/bpf-load-host-out"
           OUT="$GITHUB_WORKSPACE/bpf-load-host-out"
           OBSERVER="$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"

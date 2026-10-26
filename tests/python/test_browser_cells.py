@@ -1045,8 +1045,8 @@ class BrowserCells(unittest.TestCase):
     def test_flow_server_complete_client_hello_then_silence_stalls(self):
         """Guard: a CertificateRequest followed by silence still stalls.
 
-        A real ClientHello goes out over a non-blocking socket whose
-        handshake is never driven again; the server must see the
+        A real TLS 1.3 ClientHello (built in memory) goes out over a plain
+        socket that never reads or answers; the server must see the
         finished first flight, emit CertificateRequest, and count the
         ensuing silence as a selection stall.
         """
@@ -1056,16 +1056,12 @@ class BrowserCells(unittest.TestCase):
         with tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
                                    client_ca=cert) as flow:
             flow.HANDSHAKE_TIMEOUT = 3.0
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            raw = socket.create_connection(("127.0.0.1", flow.port))
-            raw.setblocking(False)
-            peer = context.wrap_socket(raw, server_hostname="127.0.0.1",
-                                       do_handshake_on_connect=False)
+            # Send only the client's first flight and never read: a live
+            # non-blocking handshake can finish on loopback (empty client
+            # Certificate), which made this guard flaky.
+            peer = socket.create_connection(("127.0.0.1", flow.port))
             try:
-                with self.assertRaises((ssl.SSLWantReadError, ssl.SSLWantWriteError)):
-                    peer.do_handshake()
+                peer.sendall(self._client_hello_bytes())
                 deadline = time.monotonic() + 10
                 while (flow.selection_stalls + flow.abandoned
                        + flow.handshake_failures == 0

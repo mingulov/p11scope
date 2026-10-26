@@ -1910,9 +1910,11 @@ struct WindingLane {
     /// gone, so reaping again would fail closed — and retry the
     /// completion/retire tail with the retained proof.
     joined: bool,
-    /// A stop path already disclosed this winding: later stop calls
-    /// stay silent, and the join tail skips its own disclosure when
-    /// a stray tick reaps the handoff past the stop.
+    /// This winding's counts are already disclosed (by a stop path or
+    /// a winding exit hold): later stop calls stay silent, and the
+    /// join tail and the exit hold skip their own disclosure when a
+    /// stray tick steps the winding past the stop. The three winding
+    /// legs share the one once-gate.
     stop_disclosed: bool,
 }
 
@@ -2571,6 +2573,24 @@ fn disclose_semantic_stop(
     ));
 }
 
+/// Disclose a winding lane's stop counts unless a stop path already
+/// disclosed them: the join tail, the stop path and the exit hold
+/// share this one gate, so each winding discloses exactly once. The
+/// gate only reads the flag: the stop path arms it, and the exit hold
+/// arms the flag threaded to it, while the join tail deliberately
+/// never arms it (a later stop still owes its held-for-exit gap).
+fn disclose_stop_counts_once(
+    winding: &mut WindingLane,
+    counts: &SemanticStopCounts,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    warn: &mut WarnSink<'_>,
+) {
+    if winding.stop_disclosed {
+        return;
+    }
+    disclose_semantic_stop(counts, coordinator, warn);
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept
@@ -3068,14 +3088,18 @@ impl ClassicDriver<'_> {
     /// admitted (best-effort commit, whose failure is kept as its
     /// own gap; first error kept), then hold the whole lane. The
     /// disclosure runs before the abandon commit so its gap rides
-    /// that commit. Returns the first error: the disposition where
-    /// latched, else the trigger cause. Callers disclose the skips
-    /// (finished or unadmitted holds).
+    /// that commit. A winding hold threads its winding's disclosed
+    /// flag and joins the shared once-gate (silent past a stop,
+    /// arming when it discloses); a live-lane hold passes `None` and
+    /// always discloses. Returns the first error: the disposition
+    /// where latched, else the trigger cause. Callers disclose the
+    /// skips (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         cause: &str,
         warn: &mut WarnSink<'_>,
+        winding_disclosed: Option<&mut bool>,
     ) -> String {
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
@@ -3084,7 +3108,18 @@ impl ClassicDriver<'_> {
             .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
         let counts = SemanticStopCounts::read(&lane, coordinator);
-        disclose_semantic_stop(&counts, coordinator, warn);
+        match winding_disclosed {
+            // A stop path already disclosed this winding: stay silent.
+            Some(disclosed) if *disclosed => {}
+            // A winding hold discloses through the shared once-gate and
+            // arms it; a live lane always discloses, as before.
+            winding => {
+                disclose_semantic_stop(&counts, coordinator, warn);
+                if let Some(disclosed) = winding {
+                    *disclosed = true;
+                }
+            }
+        }
         if !lane.is_finished()
             && latched
             && let Ok(batch) = lane.abandon_finish_for_exit(coordinator, reason)
@@ -3120,7 +3155,14 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut display,
         };
-        Self::step_begun_joint_finish_with_warn(lane, finish, coordinator, first_error, &mut warn)
+        Self::step_begun_joint_finish_with_warn(
+            lane,
+            finish,
+            coordinator,
+            first_error,
+            &mut warn,
+            None,
+        )
     }
 
     /// Step a begun Joint finish once within the 10 ms /
@@ -3128,13 +3170,16 @@ impl ClassicDriver<'_> {
     /// disposition abandons through the finite stop, a finished lane
     /// resumes at Published, anything else stays for the latch to
     /// bound); Published polls only the wound-down (a refusal skips
-    /// the abandon per §6.4 and holds); Abandoned does nothing.
+    /// the abandon per §6.4 and holds); Abandoned does nothing. A
+    /// winding step threads its winding's disclosed flag to the exit
+    /// hold; a live-lane step passes `None`.
     fn step_begun_joint_finish_with_warn(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         first_error: &mut Option<String>,
         warn: &mut WarnSink<'_>,
+        winding_disclosed: Option<&mut bool>,
     ) -> JointStepOutcome {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3153,6 +3198,7 @@ impl ClassicDriver<'_> {
                             coordinator,
                             "joint finish disposition required",
                             warn,
+                            winding_disclosed,
                         );
                         first_error.get_or_insert(error);
                     }
@@ -3206,6 +3252,7 @@ impl ClassicDriver<'_> {
                                 coordinator,
                                 &cause,
                                 warn,
+                                winding_disclosed,
                             ));
                         }
                         *finish = JointFinishDriver::Abandoned;
@@ -3239,6 +3286,7 @@ impl ClassicDriver<'_> {
                     coordinator,
                     "joint finish disposition required",
                     &mut warn,
+                    None,
                 );
                 self.joint_first_error.get_or_insert(error);
                 self.joint_finish = JointFinishDriver::Abandoned;
@@ -3273,6 +3321,7 @@ impl ClassicDriver<'_> {
             &mut *self.coordinator,
             "second stop during joint finish",
             &mut warn,
+            None,
         );
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
@@ -3431,6 +3480,7 @@ impl ClassicDriver<'_> {
                     &mut *self.coordinator,
                     &mut self.joint_first_error,
                     &mut warn,
+                    Some(&mut winding.stop_disclosed),
                 )
             };
             if !matches!(outcome, JointStepOutcome::WoundDown) {
@@ -3480,12 +3530,12 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| !lane.is_finished())
                 {
                     winding.joined = true;
-                    if !winding.stop_disclosed {
-                        let mut warn = WarnSink {
-                            display: &mut self.display,
-                        };
-                        disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
-                    }
+                    // The join reads the shared once-gate but never arms
+                    // it: a later stop still owes its held-for-exit gap.
+                    let mut warn = WarnSink {
+                        display: &mut self.display,
+                    };
+                    disclose_stop_counts_once(winding, &counts, &mut *self.coordinator, &mut warn);
                 }
             }
             if let Some(session) = session {
@@ -3673,6 +3723,7 @@ impl ClassicDriver<'_> {
                             coordinator,
                             "joint finish disposition required",
                             warn,
+                            None,
                         );
                         first_error.get_or_insert(error);
                         *finish = JointFinishDriver::Abandoned;
@@ -3697,6 +3748,7 @@ impl ClassicDriver<'_> {
                     coordinator,
                     "joint finish disposition required",
                     warn,
+                    None,
                 );
                 first_error.get_or_insert(error);
                 if finished {
@@ -3774,6 +3826,7 @@ impl ClassicDriver<'_> {
             &mut *self.coordinator,
             &mut self.joint_first_error,
             &mut warn,
+            None,
         );
         if matches!(outcome, JointStepOutcome::WoundDown) {
             self.complete_final_joint_lane();
@@ -3890,6 +3943,7 @@ impl ClassicDriver<'_> {
                             &mut *self.coordinator,
                             "joint finish disposition required",
                             &mut warn,
+                            Some(&mut winding.stop_disclosed),
                         );
                         self.joint_first_error.get_or_insert(error);
                         winding.finish = JointFinishDriver::Abandoned;
@@ -3936,6 +3990,18 @@ impl ClassicDriver<'_> {
         self.retiring.as_ref().map(|retiring| retiring.domain)
     }
 
+    /// Arm the retiring winding's stop-disclosed flag: the winding was
+    /// checked above at every caller.
+    fn arm_winding_stop_disclosed(retiring: &mut Option<RetiringDomain>) {
+        retiring
+            .as_mut()
+            .expect("winding checked above")
+            .winding
+            .as_mut()
+            .expect("winding checked above")
+            .stop_disclosed = true;
+    }
+
     /// Disclose a promotion lane that never joined its wind-down: no
     /// ticks follow the stop, so the lane is held for exit at drop
     /// and this gap — recorded before the final commit — publishes
@@ -3943,7 +4009,10 @@ impl ClassicDriver<'_> {
     /// stop counts here, like every other hold; a lane that already
     /// disclosed (joined, held, or a legacy lane disclosed at
     /// wind-down) stays quiet. Once-only per winding: the disclosed
-    /// flag keeps every later call — from any stop path — silent.
+    /// flag keeps every later call — from any stop path — silent. The
+    /// flag arms after the counts leg uses the shared once-gate, so
+    /// the join tail, the stop path and the exit hold all disclose
+    /// through the one gate.
     fn record_unjoined_winding_gap(&mut self) {
         let joint = self.retiring.as_ref().and_then(|retiring| {
             retiring
@@ -3955,17 +4024,17 @@ impl ClassicDriver<'_> {
         let Some(joint) = joint else {
             return;
         };
-        let winding = self
+        if self
             .retiring
-            .as_mut()
+            .as_ref()
             .expect("winding checked above")
             .winding
-            .as_mut()
-            .expect("winding checked above");
-        if winding.stop_disclosed {
+            .as_ref()
+            .expect("winding checked above")
+            .stop_disclosed
+        {
             return;
         }
-        winding.stop_disclosed = true;
         self.coordinator.note_scope_gap(
             "promotion wind-down held for exit".to_string(),
             if joint {
@@ -3988,6 +4057,7 @@ impl ClassicDriver<'_> {
             })
         });
         let Some(undisclosed) = undisclosed else {
+            Self::arm_winding_stop_disclosed(&mut self.retiring);
             return;
         };
         if !undisclosed.lane.as_ref().is_some_and(|lane| lane.is_live()) {
@@ -3997,6 +4067,7 @@ impl ClassicDriver<'_> {
                  its key-operation counts after the promotion began are unknown"
                     .to_string(),
             );
+            Self::arm_winding_stop_disclosed(&mut self.retiring);
             return;
         }
         let counts = {
@@ -4016,7 +4087,17 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
+        {
+            let winding = self
+                .retiring
+                .as_mut()
+                .expect("undisclosed winding checked above")
+                .winding
+                .as_mut()
+                .expect("undisclosed winding checked above");
+            disclose_stop_counts_once(winding, &counts, &mut *self.coordinator, &mut warn);
+        }
+        Self::arm_winding_stop_disclosed(&mut self.retiring);
     }
 
     /// Bind the dashboard's promotion control to this run's capture
@@ -4876,6 +4957,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 &mut *self.coordinator,
                 &mut self.joint_first_error,
                 &mut warn,
+                None,
             );
             if matches!(outcome, JointStepOutcome::WoundDown) {
                 self.complete_final_joint_lane();
@@ -5107,6 +5189,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     &mut *self.coordinator,
                     &mut self.joint_first_error,
                     &mut warn,
+                    None,
                 );
                 if matches!(outcome, JointStepOutcome::WoundDown) {
                     self.complete_final_joint_lane();

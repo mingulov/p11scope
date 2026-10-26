@@ -888,6 +888,34 @@ def self_test():
         assert "tests/zeta.rs" in str(error), error
     else:
         raise AssertionError("a selected target with no section went unnoticed")
+    # An unrecognized header form fails closed naming the line: the
+    # unknown section's healthy summary must not merge into the
+    # previous section and mask its zero.
+    def unknown_header(command, env, unknown, capture_stderr=False):
+        head, tail = _full_rest_sections()[0], _full_rest_sections()[1:]
+        _, before = _FakeRest([(head[0], head[1], (0, 0, 0, 0))])(command, env)
+        _, after = _FakeRest(tail)(command, env)
+        return 0, before + unknown + after
+
+    for unknown in (
+        "     Running test suites for extra-stuff\n\n"
+        "running 3 tests\n"
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
+        "0 filtered out; finished in 0.01s\n",
+        "     Doc-tests extra-stuff 1.0\n\n"
+        "running 2 tests\n"
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+        "0 filtered out; finished in 0.01s\n",
+    ):
+        header = unknown.splitlines()[0].strip()
+        try:
+            run_partition("rest", gate,
+                          runner=lambda c, e, capture_stderr=False, u=unknown: unknown_header(c, e, u),
+                          metadata=lambda c: _fake_metadata())
+        except PartitionError as error:
+            assert header in str(error), error
+        else:
+            raise AssertionError(f"an unrecognized rest header went unnoticed: {header}")
     assert healthy.commands and healthy.commands[0][2] is True, \
         "rest must capture stderr so Running headers delimit binaries"
 

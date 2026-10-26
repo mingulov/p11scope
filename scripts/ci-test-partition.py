@@ -593,8 +593,8 @@ def _fake_metadata(extra=()):
             {"id": "root", "name": "p11scope", "targets": targets,
              "manifest_path": "/fake/Cargo.toml"},
             {"id": "member", "name": "member",
-             "targets": [{"name": "alpha", "kind": ["test"], "test": True,
-                          "src_path": "/fake/member/tests/alpha.rs"}, *extra],
+             "targets": [{"name": "beta", "kind": ["test"], "test": True,
+                          "src_path": "/fake/member/tests/beta.rs"}, *extra],
              "manifest_path": "/fake/member/Cargo.toml"},
             {"id": "dep", "name": "dep",
              "targets": [{"name": "outside", "kind": ["test"], "test": True,
@@ -605,12 +605,13 @@ def _fake_metadata(extra=()):
 
 
 def _full_rest_sections(extra=()):
-    """Every fake rest target healthy: lib, pinned-zero bin, example, alpha, zeta."""
+    """Every fake rest target healthy: lib, pinned-zero bin, example, alpha, member beta, zeta."""
     return [
         ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
         ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
         ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
         ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 2, 0)),
+        ("beta-1a2b3c4d5e6f7895", "tests/beta.rs", (3, 0, 0, 0)),
         ("zeta-1a2b3c4d5e6f7894", "tests/zeta.rs", (2, 0, 0, 0)),
         *extra,
     ]
@@ -708,7 +709,7 @@ def self_test():
     # rest: every workspace integration target with test = true but the sharded one.
     selection = rest_selection(_fake_metadata())
     assert selection == ["--lib", "--bins", "--examples", "--benches",
-                         "--test", "alpha", "--test", "zeta"], selection
+                         "--test", "alpha", "--test", "beta", "--test", "zeta"], selection
     assert narrowed(gate, selection) == gate[:-1] + selection
     _expect_error(rest_selection, {"workspace_members": [], "packages": []})
     _expect_error(rest_selection, _fake_metadata(
@@ -782,7 +783,7 @@ def self_test():
                            metadata=lambda c: _fake_metadata(), weights=table)
     assert status == 0 and len(seen) == 1
     assert seen[0][0] == narrowed(cov, ["--lib", "--bins", "--examples", "--benches",
-                                        "--test", "alpha", "--test", "zeta"])
+                                        "--test", "alpha", "--test", "beta", "--test", "zeta"])
     assert seen[0][1]["LLVM_PROFILE_FILE_NAME"] == "p11scope-rest-%p-%m.profraw"
     assert seen[0][2] is True
     fake = _FakeLibtest(listed)
@@ -888,6 +889,7 @@ def self_test():
         ("p11scope-1a2b3c4d5e6f7891", "src/main.rs", (0, 0, 0, 0)),
         ("example-1a2b3c4d5e6f7892", "examples/example.rs", (1, 0, 0, 0)),
         ("alpha-1a2b3c4d5e6f7893", "tests/alpha.rs", (3, 0, 0, 0)),
+        ("beta-1a2b3c4d5e6f7895", "tests/beta.rs", (3, 0, 0, 0)),
     ])
     try:
         run_partition("rest", gate, runner=skipped,

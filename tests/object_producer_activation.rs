@@ -2410,8 +2410,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            123186,
-            "34c632ad1f20264d4d6d22cc7b57eff9a9ab36224f782df7da7812b50c4f0111"
+            123229,
+            "69186a7f6dc1dee8d7c3b7fe72e942662982ae23b4f8e5b226657f06117e8bff"
         ),
         "stripped BPF dump must stay byte-identical"
     );

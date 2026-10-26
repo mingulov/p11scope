@@ -1973,6 +1973,7 @@ pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
 /// Cleanup outcome for a healthy settle that abandoned at least one live
 /// START (mirrors `P11_OWNER_CLEANUP_ABANDONED_START` in task_owner.h;
 /// pinned by test). Only 1 is failure.
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
 const OWNER_CLEANUP_ABANDONED_START: u32 = 2;
 
 #[inline(always)]

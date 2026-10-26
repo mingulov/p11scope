@@ -51,7 +51,7 @@ def population_diagnostic(error: BaseException) -> str | None:
 
 
 IMAGE_HASH_NAMES = ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS")
-OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS",)
+OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS", "JOURNAL_MARKER_CTL")
 # The frozen Task 2 D2 qualification surface: the seed fixture creates and
 # seeds exactly these three maps, and the reader serves it without PROC_EPOCH
 # (its iterator object then neither creates nor reads that map). Every owned
@@ -718,8 +718,15 @@ def proc_epoch_value_valid(raw, attach_generation):
     # writer), while native exec may only copy the existing generation.
     if words[-2] > attach_generation:
         return False
-    # journal_marker.c has no active producer callsites in this configuration.
-    if words[-1] != 0:
+    # Slice D birth marker: 0 is unpublished, 1 is DIRTY, and low
+    # bits 10 name a READY exec id. Anything else (low bits 11, a
+    # nonzero word with low bits 00, DIRTY with high bits) is not a
+    # marker word. A READY row must carry a published generation at
+    # or before the sampled one; the upper bound was checked above.
+    marker = words[-1]
+    if marker == 0 or marker == 1:
+        return True
+    if marker & 3 != 2 or words[-2] == 0:
         return False
     return True
 

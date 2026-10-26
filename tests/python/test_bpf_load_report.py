@@ -566,11 +566,13 @@ class ReportTests(unittest.TestCase):
 
     def test_driver_refuses_counter_loads_where_refusal_is_specified(self):
         # Two-sided token check: the observer naming the refusal token is
-        # not enough when a bank program loaded anyway.
+        # not enough when a bank program loaded anyway. Aya auxiliary
+        # probes always load, so only bank rows count.
         self.assertTrue(DRIVER.is_file(),
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('"loaded": ?true', text)
+        self.assertIn("grep 'p11_counter_bank'", text)
 
     def test_driver_scores_counter_on_failure(self):
         # A failed 6.6+ counter run still falls through to per-program

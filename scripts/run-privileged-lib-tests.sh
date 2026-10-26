@@ -488,6 +488,10 @@ SKIP_REASONS=(
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles staging; a second stop signal abandons the counter detach with the typed interruption"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven timestamps growth to 8192 plus an atomic over-ceiling refusal"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven latency growth to 8192 plus an atomic over-ceiling refusal"
+"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
+"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
+"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
+"needs root with no fixture (the owned child maps no provider); run the exact ignored test by hand as root with TMPDIR and CARGO_TARGET_TMPDIR as in the evidence run"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
 )
 
@@ -586,9 +590,21 @@ binary_has_ignored() {
     binary_ignored_list "$1" | grep -qxF "$2"
 }
 
+# Static skips pair each test with its reason by index. A length mismatch
+# would print wrong reasons and, under `set -u` inside a `| tee` pipeline,
+# fail only the forked subshell while the loop reports phantoms and exits 0.
+# Refuse loudly before any print or selection touches the arrays.
+check_skip_alignment() {
+    if [ "${#SKIP_TESTS[@]}" -ne "${#SKIP_REASONS[@]}" ]; then
+        echo "$PROG: SKIP_TESTS (${#SKIP_TESTS[@]}) and SKIP_REASONS (${#SKIP_REASONS[@]}) differ in length" >&2
+        return 1
+    fi
+}
+
 # Compare curation against the binary. Prints drift details to stderr and
 # returns 1 on any mismatch, so new tests cannot be silently dropped.
 check_curation() {
+    check_skip_alignment || return 1
     local bin=$1 workdir bin_list cur_list missing_bin missing_cur
     workdir=$(mktemp -d) || { echo "$PROG: cannot create temp dir" >&2; return 1; }
     bin_list=$workdir/bin.txt
@@ -691,6 +707,7 @@ list_mode() {
     [ $# -eq 1 ] || { usage >&2; return 2; }
     bin=$1
     [ -x "$bin" ] || { echo "$PROG: not an executable test binary: $bin" >&2; return 1; }
+    check_skip_alignment || return 1
     if [ "$wide" -eq 1 ]; then
         echo "wide-detailed-2112 (${#WIDE_DETAILED_2112_TESTS[@]})"
         printf '%s\n' "${WIDE_DETAILED_2112_TESTS[@]}"
@@ -1003,8 +1020,15 @@ main() {
     cd "$REPO_ROOT" || return 1
 
     # Static skips among the selection are recorded, never silently dropped.
+    # The `| tee` pipeline forks the expansion into a subshell where `set -u`
+    # cannot stop the loop, so a failed print must fail loudly here instead
+    # of counting phantoms toward a lying SUMMARY.
     for i in ${selected_skipped[@]+"${selected_skipped[@]}"}; do
         echo "SKIP ${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}" | tee -a "$results"
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "$PROG: static skip print failed for index $i" >&2
+            return 1
+        fi
         skipped=$((skipped + 1))
     done
 

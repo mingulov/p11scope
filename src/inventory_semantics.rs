@@ -6,13 +6,14 @@ mod joint;
 mod joint_cells;
 pub(crate) mod selected;
 
-pub(crate) use joint::{
-    JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
-};
 #[allow(unused_imports)]
 // Private Session service types; the ordinary driver remains inactive.
 pub(crate) use joint::{
-    JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget,
+    JOINT_FINISH_NO_PROGRESS_TIMEOUT, JointCommitRefusal, JointServiceMode, JointServiceProgress,
+    JointWorkBudget,
+};
+pub(crate) use joint::{
+    JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
 };
 #[cfg(test)]
 pub(crate) use joint::{

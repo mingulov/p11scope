@@ -404,6 +404,7 @@ fn drive<L: CaptureLane<PidPin>>(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -2595,6 +2596,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -3728,6 +3730,7 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -4705,6 +4708,7 @@ fn joint_finish_driver<'a>(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,

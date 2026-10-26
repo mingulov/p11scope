@@ -1186,6 +1186,17 @@ impl LiveJointMachine {
         matches!(self.state, RunState::DispositionRequired(_))
     }
 
+    /// The latched disposition refusal, if the machine latched one.
+    /// The commit-path hold names it in its stop gap so the trigger
+    /// stays diagnosable without a diagnostic build.
+    pub(crate) fn disposition_reason(&self) -> Option<SemanticRefusal> {
+        if let RunState::DispositionRequired(reason) = self.state {
+            Some(reason)
+        } else {
+            None
+        }
+    }
+
     /// Whether a Finish began and still owns its control.
     pub(crate) fn finish_begun(&self) -> bool {
         self.finish.is_some()
@@ -3748,6 +3759,18 @@ impl AttestedSemanticLane {
                     .as_ref()
                     .is_some_and(|machine| machine.finish_disposition_required())
             })
+    }
+
+    /// The machine's latched disposition refusal, if it latched one.
+    /// Reads only the machine latch (the commit-path trigger), never
+    /// the lane's Finish flag, so a Finish refusal cannot misname a
+    /// commit hold.
+    pub(crate) fn joint_disposition_reason(&self) -> Option<SemanticRefusal> {
+        self.live.as_deref().and_then(|live| {
+            live.joint_machine
+                .as_ref()
+                .and_then(|machine| machine.disposition_reason())
+        })
     }
 
     /// The recorded Audited no-progress trip, if the wall-time bound

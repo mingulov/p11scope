@@ -1389,6 +1389,7 @@ fn run_with_terminal_budget(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -2036,6 +2037,11 @@ struct ClassicDriver<'a> {
     /// `poll_commit` sets it on begin and clears it on publication;
     /// tests pose it directly.
     joint_commit_pending: bool,
+    /// The first Joint tick-service refusal, kept instead of dropped:
+    /// the machine owns its latch and retries, but the reason names
+    /// the lane's stop if the lane later holds with no latched reason
+    /// of its own. Never cleared; later refusals keep the first.
+    joint_tick_refusal: Option<crate::inventory_semantics::SemanticRefusal>,
     /// Storage-retryable commit refusals on the final lane's
     /// retained step (§8.3 item 7): ProviderStorage retries up to
     /// 100 hooks, mirroring the winding counter.
@@ -2107,6 +2113,7 @@ pub(crate) fn classic_semantic_tick_for_test(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -2167,6 +2174,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -2308,6 +2316,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -2401,6 +2410,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -3649,10 +3659,12 @@ impl ClassicDriver<'_> {
     /// path (production Joint lanes always carry their machine
     /// here; only substituted lanes arrive machineless, and the
     /// retained pump needs their progress-or-pend, never an error it
-    /// would resolve and re-raise forever). Other begin refusals
-    /// fail the call with no poll; an outstanding demand without the
-    /// flag repairs the flag and resumes polling. A refused poll
-    /// propagates: the retained consumer owns the outcome.
+    /// would resolve and re-raise forever). An outstanding demand
+    /// without the flag repairs the flag and resumes polling. A
+    /// refused begin (DispositionRequired) or a refused poll is a
+    /// semantic-lane stop, never a whole-capture failure: the lane is
+    /// held for exit, disclosed once, and the pass commits past it
+    /// and publishes, so later passes continue on the legacy path.
     fn poll_joint_commit_path(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
         use crate::inventory_semantics::JointCommitRefusal;
         if !self.joint_commit_pending {
@@ -3670,8 +3682,15 @@ impl ClassicDriver<'_> {
                 Err(JointCommitRefusal::OutstandingRequest) => {
                     self.joint_commit_pending = true;
                 }
-                Err(refusal) => {
-                    anyhow::bail!("joint commit begin refused: {refusal:?}");
+                Err(JointCommitRefusal::DispositionRequired) => {
+                    let reason = self
+                        .semantic
+                        .as_ref()
+                        .and_then(|lane| lane.joint_disposition_reason())
+                        .or(self.joint_tick_refusal)
+                        .map(|refusal| refusal.code())
+                        .unwrap_or("DispositionRequired");
+                    return self.hold_joint_commit_lane_and_publish(engine_changed, reason);
                 }
             }
         }
@@ -3692,8 +3711,44 @@ impl ClassicDriver<'_> {
                 Ok(PassCommitProgress::Published)
             }
             Ok(JointCommitProgress::Pending) => Ok(PassCommitProgress::Pending),
-            Err(reason) => Err(anyhow::anyhow!("joint commit poll refused: {reason}")),
+            Err(reason) => self.hold_joint_commit_lane_and_publish(engine_changed, reason.code()),
         }
+    }
+
+    /// Convert a semantic-lane Joint commit refusal into a held lane
+    /// plus a published pass: snapshot what was seated, hold the lane
+    /// for exit (its stop counts disclose once), clear the pending
+    /// commit, name the stop in its own gap, and commit the pass's
+    /// native evidence past the held lane. Later passes continue on
+    /// the legacy path. The hold's first error is dropped on purpose:
+    /// the gap carries the disclosure, and `joint_first_error` stays
+    /// for the finish path, so a continued run never surfaces this
+    /// stale refusal as a later retained error. A broad commit
+    /// failure still fails the call.
+    fn hold_joint_commit_lane_and_publish(
+        &mut self,
+        engine_changed: bool,
+        reason: &str,
+    ) -> Result<PassCommitProgress> {
+        self.snapshot_seated_summary();
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
+        let lane = self.semantic.take().expect("a joint lane is seated");
+        Self::hold_joint_lane_for_exit(
+            lane,
+            &mut *self.coordinator,
+            "joint commit disposition required",
+            &mut warn,
+            None,
+        );
+        self.joint_commit_pending = false;
+        self.coordinator.note_scope_gap(
+            "semantic lane stopped".to_string(),
+            format!("{reason}; broad inventory continues"),
+        );
+        self.commit(engine_changed)?;
+        Ok(PassCommitProgress::Published)
     }
 
     /// One NotBegun promotion step (item 7): poll the pending commit.
@@ -5029,12 +5084,17 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
             if let Some(lane) = semantic.as_mut() {
                 // The machine owns its latch and retries; a refused
-                // hook simply services again on the next tick.
-                let _ = lane.service_joint(
+                // hook simply services again on the next tick. The
+                // first refusal is kept instead of dropped: it names
+                // the lane's stop if the lane later holds with no
+                // latched reason of its own.
+                if let Err(reason) = lane.service_joint(
                     coordinator,
                     crate::inventory_semantics::JointServiceMode::Running,
                     &mut budget,
-                );
+                ) {
+                    self.joint_tick_refusal.get_or_insert(reason);
+                }
             }
             return;
         }
@@ -5235,15 +5295,34 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         self.run_semantic_terminal_sequence();
     }
 
-    /// Drive a begun (Polling) Joint finish to terminal (Published,
-    /// wound down, or abandoned for exit) before the native
-    /// retirement. The pre-retirement settle runs on the 10 ms
-    /// cadence; a second operator signal escalates instead of
-    /// stepping further: the run is leaving, so the finish is held
-    /// for exit rather than reaped. Unbegun, published, abandoned
-    /// and legacy lanes are untouched: the post-retirement hook and
-    /// the terminal consume own those.
+    /// Drive a begun (Polling) Joint finish to Published or Abandoned
+    /// before the native retirement. The pre-retirement settle runs on
+    /// the 10 ms cadence; a second operator signal escalates instead
+    /// of stepping further: the run is leaving, so the finish is held
+    /// for exit rather than reaped. An explicit wall bound (the
+    /// machine's Audited no-progress timeout) escalates the same way
+    /// even when the machine never latches, so a wedged finish always
+    /// ends finitely without an operator. Unbegun, published,
+    /// abandoned and legacy lanes are untouched: the post-retirement
+    /// hook and the terminal consume own those.
     fn settle_joint_finish(&mut self) {
+        self.settle_joint_finish_with_bound(
+            crate::inventory_semantics::JOINT_FINISH_NO_PROGRESS_TIMEOUT,
+        );
+    }
+}
+
+impl ClassicDriver<'_> {
+    /// The settle above with an explicit wall bound (tests pose a
+    /// short one; production passes the machine's Audited no-progress
+    /// timeout). At the bound the finish abandons with the existing
+    /// no-progress gap, exactly like the second-signal arm. The
+    /// Polling step returns only Stayed or Abandoned, so no
+    /// wound-down arm belongs here: the terminal consume reaps a
+    /// Published lane through its own hook.
+    fn settle_joint_finish_with_bound(&mut self, bound: Duration) {
+        let start = Instant::now();
+        let mut polls = 0u64;
         while matches!(self.joint_finish, JointFinishDriver::Polling)
             && self.semantic.as_ref().is_some_and(Self::is_joint_lane)
         {
@@ -5251,12 +5330,21 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 self.escalate_joint_finish();
                 return;
             }
-            let started = Instant::now();
-            let outcome = self.step_final_joint_finish_once();
-            if matches!(outcome, JointStepOutcome::WoundDown) {
-                self.complete_final_joint_lane();
+            if start.elapsed() >= bound {
+                self.coordinator.note_scope_gap(
+                    "joint finish made no progress".to_string(),
+                    format!(
+                        "{}s without progress across {} settle polls; abandoning the finish for exit",
+                        start.elapsed().as_secs(),
+                        polls,
+                    ),
+                );
+                self.escalate_joint_finish();
                 return;
             }
+            let started = Instant::now();
+            let outcome = self.step_final_joint_finish_once();
+            polls += 1;
             if !matches!(outcome, JointStepOutcome::Stayed)
                 || !matches!(self.joint_finish, JointFinishDriver::Polling)
             {
@@ -5268,9 +5356,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             }
         }
     }
-}
 
-impl ClassicDriver<'_> {
     /// One begun-finish step (§8.3) with the seated summary snapshot:
     /// shared by the post-retirement hook and the pre-retirement
     /// settle above.
@@ -6347,6 +6433,7 @@ fn run_dashboard(
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
+        joint_tick_refusal: None,
         joint_commit_retries: 0,
         #[cfg(test)]
         terminal_seq_calls: 0,
@@ -10879,6 +10966,7 @@ mod tests {
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,
+                joint_tick_refusal: None,
                 joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,
@@ -10990,6 +11078,7 @@ mod tests {
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,
+                joint_tick_refusal: None,
                 joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,
@@ -11435,10 +11524,10 @@ mod tests {
             driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
             driver.joint_commit_pending = true;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, _) = retained_run_of(outcome);
             assert!(driver.suspended, "retention suspends the driver");
             assert_eq!(
@@ -11475,10 +11564,10 @@ mod tests {
             driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, _) = retained_run_of(outcome);
             driver.joint_finish = JointFinishDriver::NotBegun;
             let mut budget = budget();
@@ -11505,10 +11594,10 @@ mod tests {
             driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, _) = retained_run_of(outcome);
             let mut budget = budget();
             for step in 1..=3 {
@@ -11545,10 +11634,10 @@ mod tests {
             driver.semantic = Some(joint_lane(io, true));
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, _) = retained_run_of(outcome);
             driver.joint_finish = JointFinishDriver::Published;
             let mut budget = budget();
@@ -11667,10 +11756,10 @@ mod tests {
                 driver.semantic = Some(lane);
                 driver.joint_finish = JointFinishDriver::Polling;
                 let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                    &mut driver,
+                    crate::inventory_capture::ZeroPassCause::OperatorStop,
+                    None,
+                );
                 let (mut run, _) = retained_run_of(outcome);
                 if !joint {
                     driver.joint_finish = JointFinishDriver::NotBegun;
@@ -11763,10 +11852,10 @@ mod tests {
             driver.display = None;
             driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             assert!(
                 outcome.retained.is_none(),
                 "no pending publication means no retention"
@@ -11940,10 +12029,10 @@ mod tests {
             driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, error) = retained_run_of(outcome);
             run.block = Some(RetainedBlock::Publication);
             let outcome = ClassicOutcome {
@@ -11980,10 +12069,10 @@ mod tests {
             driver.semantic = Some(joint_lane(io, true));
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             driver.joint_finish = JointFinishDriver::Published;
             let (mut run, error) = retained_run_of(outcome);
             run.block = Some(RetainedBlock::Publication);
@@ -12036,10 +12125,10 @@ mod tests {
             driver.semantic = Some(lane);
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = super::tests::retain_with_cause(
-            &mut driver,
-            crate::inventory_capture::ZeroPassCause::OperatorStop,
-            None,
-        );
+                &mut driver,
+                crate::inventory_capture::ZeroPassCause::OperatorStop,
+                None,
+            );
             let (mut run, error) = retained_run_of(outcome);
             run.block = Some(RetainedBlock::Publication);
             let outcome = ClassicOutcome {
@@ -13828,6 +13917,7 @@ mod promotion_driver_tests {
             joint_first_error: None,
             suspended: false,
             joint_commit_pending: false,
+            joint_tick_refusal: None,
             joint_commit_retries: 0,
             #[cfg(test)]
             terminal_seq_calls: 0,
@@ -16245,11 +16335,11 @@ mod promotion_driver_tests {
 
     #[test]
     fn settle_joint_finish_bound_abandons_never_latching_finish() {
-        // RED (unbounded here; run under `timeout`): a begun finish
-        // whose polls never latch (sticky Pending, no disposition)
-        // must still end within an explicit wall bound. The fix drives
-        // this through a short test bound; this pin runs the production
-        // settle, which never returns until the bound lands.
+        // A begun finish whose polls never latch (sticky Pending, no
+        // disposition) still ends within an explicit wall bound: at
+        // the bound it abandons with the existing no-progress gap,
+        // like the second-signal arm. The short test bound stands in
+        // for the production Audited no-progress timeout.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
@@ -16257,13 +16347,30 @@ mod promotion_driver_tests {
         lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
         driver.semantic = Some(lane);
         driver.joint_finish = JointFinishDriver::Polling;
-        driver.settle_joint_finish();
+        let started = Instant::now();
+        driver.settle_joint_finish_with_bound(Duration::from_millis(120));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the settle ends within the bound"
+        );
         assert_eq!(
             driver.joint_finish,
             JointFinishDriver::Abandoned,
             "the bound abandons a never-latching finish"
         );
         assert!(driver.semantic.is_none(), "the held lane leaves the driver");
+        driver.commit(false).expect("the stop commit runs");
+        let stalled = committed_gaps_by_subject(&mut driver, "joint finish made no progress");
+        assert_eq!(stalled.len(), 1, "the bound discloses the wedge");
+        assert!(
+            stalled[0]
+                .1
+                .contains("settle polls; abandoning the finish for exit"),
+            "the gap names the settle bound: {:?}",
+            stalled[0].1
+        );
+        let held = committed_gaps_by_subject(&mut driver, "joint finish held for exit");
+        assert_eq!(held.len(), 1, "the escalation discloses the hold");
     }
 
     #[test]
@@ -19062,6 +19169,7 @@ mod promotion_driver_tests {
             joint_first_error: None,
             suspended: false,
             joint_commit_pending: false,
+            joint_tick_refusal: None,
             joint_commit_retries: 0,
             #[cfg(test)]
             terminal_seq_calls: 0,

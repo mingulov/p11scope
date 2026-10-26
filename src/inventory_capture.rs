@@ -1891,11 +1891,12 @@ pub(crate) trait PassDriver<Pin> {
     /// must fence before the (possibly slow) retirement runs. Called
     /// exactly once per run, before `Publish::Retiring`.
     fn on_stop_requested(&mut self) {}
-    /// The loop ended with a native lane and the Retiring publish
-    /// ran: drive a begun Joint finish (if any) to terminal before
-    /// the lane stop dispatch, while its receipts are fresh. Called
-    /// exactly once per run on this path; drivers without a Joint
-    /// finish ignore it.
+    /// The loop ended (stop, deadline, cancellation or error): drive
+    /// a begun Joint finish (if any) to terminal while its receipts
+    /// are fresh — before the lane stop dispatch on the native-lane
+    /// path, before the terminal commit on the scan-fallback path.
+    /// Called exactly once per run, on exactly one of the two paths;
+    /// drivers without a Joint finish ignore it.
     fn settle_joint_finish(&mut self) {}
     /// The lane retired and staged its stop; the final commit runs
     /// next. A driver with its own terminal evidence finalizes it
@@ -3507,11 +3508,19 @@ where
             .note_scope_gap(ZERO_PASS_GAP_SUBJECT.into(), zero.gap_reason());
     }
     let Some(lane) = lane else {
+        // The stop above may have begun a Joint finish beside the
+        // (absent) native lane: drive it exactly like the native-lane
+        // path below, while its receipts are fresh. A settle was owed
+        // exactly when a publication pends here; its terminal evidence
+        // must commit like the failure and zero-pass gaps, or the
+        // final view would silently drop the hold it discloses.
+        let settle_owed = driver.publication_pending();
+        driver.settle_joint_finish();
         // Publish the failure gap (or the zero-pass diagnostic gap)
         // without repeating the failed scan/pass. A failed publication
         // commit must not turn the informational diagnostic into a run
         // failure: exit 0 is preserved.
-        if error.is_some() || zero_pass.is_some() {
+        if error.is_some() || zero_pass.is_some() || settle_owed {
             let _ = driver.commit(false);
         }
         if zero_pass.is_some() {

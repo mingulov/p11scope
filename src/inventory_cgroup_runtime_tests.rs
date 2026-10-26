@@ -61,6 +61,7 @@ impl<'a> ObservedDriver<'a> {
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,
+                joint_tick_refusal: None,
                 joint_commit_retries: 0,
                 #[cfg(test)]
                 terminal_seq_calls: 0,

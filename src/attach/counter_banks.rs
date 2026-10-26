@@ -3343,8 +3343,8 @@ fn counter_load_refusal(error: &anyhow::Error) -> String {
 /// aya loads programs explicitly after the object loads.
 pub(crate) fn counter_object_preflight(mode: CounterMode) -> Result<(), String> {
     // A doctor-owned pool funds preparation exactly like the capture
-    // pool; reference pools charge without allocating.
-    let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+    // pool; the pool charges without allocating.
+    let pool = SemanticResourcePool::with_limit(1024 * 1024 * 1024);
     let cpus = aya::util::nr_cpus()
         .map_err(|(_, error)| format!("counter object load failed ({error})"))?;
     let spec = CounterSpec::for_production(mode, cpus, pool.reserver())

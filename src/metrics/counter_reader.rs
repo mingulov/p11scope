@@ -5121,6 +5121,98 @@ mod tests {
         drop(engine);
     }
 
+    /// Engine-driven growth for one timing mode on Multi: stage the first
+    /// 512, grow to the 8192 ceiling through the production apply path,
+    /// then refuse one past the ceiling atomically with the prefix intact.
+    /// At most 88 CPUs every mode affords the full 8192 ceiling.
+    fn engine_timing_growth_cell(mode: CounterMode, marker: &str) {
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(mode),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .unwrap();
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            512
+        );
+        let full = parts.slots.clone();
+        let fresh = full[512..].to_vec();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            full,
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!((completed, failed), (7680, 0));
+        assert!(
+            partials.is_empty(),
+            "clean growth marks no PARTIAL: {partials:?}"
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192
+        );
+        let mut past = parts.slots.clone();
+        let mut last = parts.extra.clone();
+        last.index = 8192;
+        past.push(last);
+        let fresh = past[8192..].to_vec();
+        let mut plan = crate::plan::AttachPlan::from_slots_with_policy(
+            past[..8192].to_vec(),
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        plan.slots.push(past[8192].clone());
+        let (completed, failed, partials) = engine
+            .apply_counter_growth_for_test(&mut session, plan, fresh, repin_counter_fixture(&parts))
+            .unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(partials.len(), 1);
+        assert!(
+            partials[0].contains("PlanBudgetMismatch"),
+            "refusal carries the honest budget token: {}",
+            partials[0]
+        );
+        assert_eq!(
+            session.counter_budgets(0).unwrap().endpoints.published,
+            8192,
+            "the published prefix stays intact"
+        );
+        eprintln!("{marker}");
+        drop(session);
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven timestamps growth to 8192, then an atomic over-ceiling refusal"]
+    fn counter_engine_growth_timestamps_multi_lp64() {
+        engine_timing_growth_cell(
+            CounterMode::Timestamps,
+            "COUNTER_ENGINE_TIMESTAMPS_GROWTH published=8192 over_ceiling_partials=1",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven latency growth to 8192, then an atomic over-ceiling refusal"]
+    fn counter_engine_growth_latency_multi_lp64() {
+        engine_timing_growth_cell(
+            CounterMode::Latency,
+            "COUNTER_ENGINE_LATENCY_GROWTH published=8192 over_ceiling_partials=1",
+        );
+    }
+
     const SOFT1024_CHILD: &str = "P11SCOPE_A27_SOFT1024_CHILD";
     /// Marker the re-executed child prints after `body()` returns. The
     /// parent requires this line plus libtest's `1 passed`, so a child

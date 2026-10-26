@@ -27108,6 +27108,14 @@ impl Engine {
             .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))
     }
 
+    /// Counter start budget: the affordable endpoint ceiling for the mode
+    /// at these CPUs, from the existing preparation sizing (never a
+    /// hand-written constant).
+    fn counter_start_budget(mode: CounterMode, cpus: usize) -> Result<CounterBudget> {
+        let _ = (mode, cpus);
+        CounterBudget::new(8192).map_err(|refusal| anyhow!("{refusal}"))
+    }
+
     /// CPU count behind the counter preflight: the test seam when set,
     /// otherwise the host topology.
     fn counter_preflight_cpus(&self) -> usize {
@@ -27279,7 +27287,10 @@ impl Engine {
             self.counter_reserver(),
         )?;
         if counter.is_some() {
-            let budget = CounterBudget::new(8192).map_err(|refusal| anyhow!("{refusal}"))?;
+            let mode = policy
+                .counter_mode()
+                .expect("counter spec implies counter policy");
+            let budget = Self::counter_start_budget(mode, self.counter_preflight_cpus())?;
             self.plan = self
                 .plan
                 .with_counters_policy(budget)

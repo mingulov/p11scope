@@ -101,6 +101,27 @@ fn counter_spec_for_startup_routes_policy() {
 }
 
 #[test]
+fn counter_start_budget_follows_the_affordable_ceiling_per_mode() {
+    // The start budget is the preparation's affordable ceiling, never a
+    // hand-written constant: latency drops below 8192 past 88 CPUs while
+    // counts holds the full ceiling, and an unaffordable geometry refuses.
+    for (mode, cpus, ceiling) in [
+        (CounterMode::Counts, 12, 8192u64),
+        (CounterMode::Timestamps, 12, 8192),
+        (CounterMode::Latency, 12, 8192),
+        (CounterMode::Latency, 88, 8192),
+        (CounterMode::Latency, 89, 7680),
+    ] {
+        let budget = Engine::counter_start_budget(mode, cpus).unwrap();
+        assert_eq!(budget.endpoint_limit(), ceiling, "{mode:?} at P={cpus}");
+    }
+    assert!(
+        Engine::counter_start_budget(CounterMode::Latency, 490).is_err(),
+        "an unaffordable geometry refuses its budget"
+    );
+}
+
+#[test]
 fn counter_preflight_refuses_before_session_start_with_zero_links() {
     let mut engine = Engine::empty_for_test();
     engine.plan = detailed_plan(1);

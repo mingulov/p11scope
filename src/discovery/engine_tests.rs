@@ -49811,18 +49811,13 @@ fn collected_graph_charge_covers_requested_heap() {
     engine
         .pending_retirements
         .extend((0..VIEWS).map(ProcessViewId));
-    let (drained, heap) = crate::test_alloc::requested_peak_during(|| {
-        for _ in 0..20_000 {
-            let outcome = engine
-                .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-                .unwrap();
-            if !outcome.pending {
-                return true;
-            }
-        }
-        false
+    // The drive waits on the async worker close instead of racing it
+    // with a fixed count; every assertion below is unchanged.
+    let (_, heap) = crate::test_alloc::requested_peak_during(|| {
+        drive_graph_until(&mut engine, &mut session, |_, _, outcome| {
+            !outcome.pending
+        });
     });
-    assert!(drained, "the twin graph drains");
     assert!(engine.pending_retirements.is_empty());
     assert_eq!(engine.collected_graphs_created, 1);
     assert!(engine.collected_graph_refused().is_none());

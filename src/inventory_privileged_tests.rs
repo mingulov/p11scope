@@ -6590,6 +6590,62 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
                 .all(|record| record.caller != caller_s),
         "S never holds a feed, Joint or otherwise: no binding, no edge"
     );
+    // Each transaction Binding sweeps at most 4 consecutive (caller,
+    // object) pairs past the persistent refresh cursor
+    // (src/discovery/inventory_coordinator/semantics.rs:1301 `for _ in 0..4`),
+    // and q1, q2 and q3 sweep once each, so S's refusal floor follows from
+    // this cell's actual pair count: full coverage while the universe fits
+    // the limit, rotation coverage beyond it. The probe below runs the real
+    // sweep (same function, same always-true charge as the Binding path) to
+    // measure the universe instead of assuming it; a new fixture pair then
+    // lowers the floor instead of failing opaquely. Probing advances the
+    // persistent cursor, which is nil while the universe fits the limit
+    // (every sweep covers all pairs) and harmless beyond it (no later
+    // assert depends on sweep order). The universe is stable across q1-q3:
+    // no process exits or spawns between them.
+    let mut pairs = BTreeSet::new();
+    for probe in 0..8usize {
+        let attempts = coordinator.semantic_refresh_attempts(&lane, None, |_| true);
+        let mut fresh = false;
+        for attempt in &attempts {
+            let objects: Vec<_> = lane
+                .subset()
+                .required()
+                .iter()
+                .filter(|(object, slots)| {
+                    slots.first().copied() == Some(attempt.slot)
+                        && attempt.module.as_ref().is_none_or(|module| {
+                            lane.subset().proves_provider_module(**object, module)
+                        })
+                })
+                .map(|(object, _)| *object)
+                .collect();
+            ensure!(
+                objects.len() == 1,
+                "r16b-q3: the swept refresh pair inverts to one object: {:?}",
+                attempt.caller
+            );
+            fresh |= pairs.insert((attempt.caller, objects[0]));
+        }
+        if !fresh {
+            break;
+        }
+        ensure!(
+            probe + 1 < 8,
+            "r16b-q3: the refresh pair universe keeps growing past the probe cap: {pairs:?}"
+        );
+    }
+    let pair_count = pairs.len();
+    ensure!(
+        pairs.iter().any(|(caller, _)| *caller == caller_s),
+        "r16b-q3: S's own pair is swept: {pairs:?}"
+    );
+    let bindings = 3u64;
+    let s_floor: u64 = if pair_count <= 4 {
+        bindings
+    } else {
+        (4 * bindings) / pair_count as u64
+    };
     let s_refusals = count_disclosed_gaps(
         &coordinator,
         "semantic admission refused",
@@ -6597,8 +6653,9 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         Some(caller_s),
     );
     ensure!(
-        s_refusals >= 3,
-        "r16b-q3: the pre-attach sibling's admission refusals stay disclosed: {s_refusals}"
+        s_refusals >= s_floor,
+        "r16b-q3: the pre-attach sibling's admission refusals stay disclosed: \
+         {s_refusals} over {pair_count} pairs (floor {s_floor}): {pairs:?}"
     );
     ensure!(
         coordinator.registry().joint_feeds() == feeds_q2,
@@ -6669,14 +6726,15 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
                 subject: "semantic admission refused",
                 reason: "semantic_unavailable:no_receipt",
                 caller: Some(caller_s),
-                min: 3,
+                min: s_floor,
                 max: None,
             },
         ],
     )?;
     eprintln!(
         "JOINT_R16 r16b-q3 polls={q3_polls} revision={revision} feeds={} receipts={} \
-         unknown_key={unknown_before}->{unknown_after} s_refusals={s_refusals}",
+         unknown_key={unknown_before}->{unknown_after} s_refusals={s_refusals} \
+         pairs={pair_count} floor={s_floor}",
         coordinator.registry().joint_feeds(),
         receipts.len(),
     );

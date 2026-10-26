@@ -767,6 +767,11 @@ pub(crate) struct JournalAdapter {
     /// voiding twice. Monotone; H0's allocator ascends, so each new
     /// loss lies above it.
     h3_voided_below: u64,
+    /// Consumption upper bound of explicitly voided history
+    /// (inclusive): births naming a cut below it refuse, so a key
+    /// created after a void cannot certify the voided interval.
+    /// Monotone; every fence-voiding seal advances it.
+    voided_through: u64,
     /// Last sealed checked-fault epoch: the cumulative chain. Each
     /// seal's collection must open at this epoch and the seal-time
     /// re-read must still show the audited one; a move anywhere in
@@ -819,6 +824,7 @@ impl JournalAdapter {
             claim_counts: 0,
             last_audit_failure: None,
             h3_voided_below: 0,
+            voided_through: 0,
             last_fault: None,
             drain_pins: BTreeMap::new(),
             invalidated: false,
@@ -2650,6 +2656,10 @@ pub(crate) enum BirthRefusal {
     /// The seal reports the same refusal when fresh evidence moved
     /// since attestation.
     EvidenceMismatch,
+    /// The birth cut is below explicitly voided history: the
+    /// claimed-complete interval includes loss, so the birth refuses
+    /// even when its key did not exist at the void.
+    BelowVoidFence,
 }
 
 /// Session-observed native evidence behind a birth claim: the image
@@ -3086,7 +3096,11 @@ impl BootstrapReceipt {
             .keys
             .get(&grant.proof.key)
             .map(|state| state.void_fence)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(adapter.voided_through);
+        if grant.birth_cut < fenced_through {
+            return Err(BirthRefusal::BelowVoidFence);
+        }
         adapter.verify_birth(
             &grant.proof,
             grant.birth,
@@ -4300,6 +4314,10 @@ impl JournalAdapter {
                     .effects
                     .extend(self.fence_void(model, self.consumed_through).effects);
                 self.void_staged();
+                // The voided consumption interval binds future keys too:
+                // births naming a cut below it refuse even when their key
+                // did not exist at the void.
+                self.voided_through = self.voided_through.max(self.consumed_through);
                 if gap == JournalGap::H3Loss {
                     // Forgive the voided H0 interval: re-presented
                     // barriers at or below it wait for clean
@@ -4459,12 +4477,14 @@ impl JournalAdapter {
         };
         // Re-verify the birth with fresh Session evidence against
         // current retained truth: moved native evidence or a chain break
-        // between attestation and seal still refuses.
+        // between attestation and seal still refuses. The fence is the
+        // same global-aware fence attestation used, so the two agree.
+        let fenced_through = state.void_fence.max(self.voided_through);
         if let Err(refusal) = self.verify_birth(
             &bootstrap.proof(),
             bootstrap.birth(),
             bootstrap.birth_cut(),
-            state.void_fence,
+            fenced_through,
             &fresh,
             self.closure_generation,
         ) {
@@ -4502,8 +4522,9 @@ impl JournalAdapter {
         // Resumption below the void fence refuses: a fresh birth names
         // the fence it resumes at. At the fence is sound (the fenced
         // interval is explicitly lost, and conversion covers strictly
-        // above the cut).
-        if bootstrap.birth_cut() < state.void_fence {
+        // above the cut). The fence covers keys created after the void
+        // as well as the keys the void fenced directly.
+        if bootstrap.birth_cut() < fenced_through {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Unclaimed staged history barriers every seal past it: an
@@ -10223,7 +10244,7 @@ pub(crate) mod tests {
         let mut x_fixture = AttestationFixture::new(x_image);
         let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
         // An exec-marker birth below the fence refuses at attestation.
-        assert!(
+        assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
                 &SessionBirthGrant::scripted(
@@ -10232,9 +10253,8 @@ pub(crate) mod tests {
                     0,
                     scene.closure_generation()
                 )
-            )
-            .is_err(),
-            "exec birth below the void refuses"
+            ),
+            Err(BirthRefusal::BelowVoidFence)
         );
         // The seal refuses the same cut even when attestation is bypassed.
         let scripted = BootstrapReceipt::scripted(
@@ -10255,7 +10275,7 @@ pub(crate) mod tests {
             .expect_err("seal below the fence refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
         // Absence below the fence refuses as well.
-        assert!(
+        assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
                 &SessionBirthGrant::scripted(
@@ -10264,9 +10284,8 @@ pub(crate) mod tests {
                     0,
                     scene.closure_generation()
                 )
-            )
-            .is_err(),
-            "absence birth below the void refuses"
+            ),
+            Err(BirthRefusal::BelowVoidFence)
         );
         // Absence exactly at the fence resumes and seals the new history.
         let resume = BootstrapReceipt::attest(

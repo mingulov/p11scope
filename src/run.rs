@@ -2395,11 +2395,12 @@ fn counter_inputs_for_capture(
     policy: CapturePolicy,
     engine: &Engine,
 ) -> Option<metrics::CounterCaptureInputs> {
-    policy.counter_mode()?;
+    let mode = policy.counter_mode()?;
     let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy() else {
         return None;
     };
     Some(metrics::CounterCaptureInputs::new(
+        mode,
         budget.endpoint_limit() as usize,
         crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
         engine.counter_reserver(),

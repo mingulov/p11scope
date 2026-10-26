@@ -3,7 +3,7 @@
 
 use super::counter_collector::{
     CounterCellDelta, CounterCollector, CounterHealth, CounterIssue, CounterLimits,
-    CounterObservation, CounterRead, ReadStage, ReadWindow, tree_bytes,
+    CounterObservation, CounterRead, ReadReservation, ReadStage, ReadWindow, tree_bytes,
 };
 use super::{KernelEvidence, SlotReport};
 use crate::discovery::identity::PinnedObjects;
@@ -138,14 +138,22 @@ impl CounterFailure {
 
 /// Admission/capture ownership supplies these limits and this existing pool.
 /// There is deliberately no default pool or Session-derived budget here.
+/// The requested mode identifies an empty capture that never reads banks.
 pub(crate) struct CounterCaptureInputs {
+    mode: CounterMode,
     limits: CounterLimits,
     reserve: SemanticResourceReserver,
 }
 
 impl CounterCaptureInputs {
-    pub(crate) fn new(rows: usize, rv_keys: usize, reserve: SemanticResourceReserver) -> Self {
+    pub(crate) fn new(
+        mode: CounterMode,
+        rows: usize,
+        rv_keys: usize,
+        reserve: SemanticResourceReserver,
+    ) -> Self {
         Self {
+            mode,
             limits: CounterLimits { rows, rv_keys },
             reserve,
         }
@@ -231,9 +239,11 @@ impl CaptureSnapshot {
     /// A failed new attempt never substitutes its mode/generation/window.
     pub(crate) fn counter_collection(&self) -> Option<serde_json::Value> {
         let snapshot = self.counter()?;
+        let mode = snapshot.mode()?;
+        let generation = snapshot.generation()?;
         Some(serde_json::json!({
-            "mode": snapshot.mode().expect("accepted mode").name(),
-            "generation": snapshot.generation().expect("accepted generation"),
+            "mode": mode.name(),
+            "generation": generation,
             "read_window": snapshot.window().map(|window| serde_json::json!({
                 "started_ns": window.started_ns, "finished_ns": window.finished_ns,
             })),
@@ -248,14 +258,16 @@ impl CaptureSnapshot {
 
     pub(crate) fn counter_summary(&self) -> Option<String> {
         let snapshot = self.counter()?;
+        let mode = snapshot.mode()?;
+        let generation = snapshot.generation()?;
         let status = snapshot.failure().map_or_else(
             || "fresh".to_owned(),
             |failure| format!("stale ({})", failure.name()),
         );
         Some(format!(
             "Counter collection: {}; generation {}; last read {}{}\n",
-            snapshot.mode().expect("accepted mode").name(),
-            snapshot.generation().expect("accepted generation"),
+            mode.name(),
+            generation,
             status,
             if snapshot.discontinuity() {
                 "; generation changed"
@@ -286,7 +298,8 @@ pub(crate) struct CaptureCollection {
 impl CaptureCollection {
     pub(crate) fn new(inputs: Option<CounterCaptureInputs>) -> Self {
         Self {
-            counter: inputs.map(|inputs| CounterCapture::new(inputs.limits, inputs.reserve)),
+            counter: inputs
+                .map(|inputs| CounterCapture::new(inputs.mode, inputs.limits, inputs.reserve)),
         }
     }
 
@@ -393,6 +406,53 @@ impl CaptureCollection {
                     };
                     anyhow::bail!("prepared counter collection unavailable ({failure})");
                 }
+                // Zero endpoints with a healthy binding is a normal capture:
+                // nothing to count, nothing stale. Bypass banks and the
+                // collector; later growth still starts from no baseline.
+                if plan.slots.is_empty() && matches!(&binding, Ok(Some(_))) {
+                    let counter = self.counter.as_mut().expect("owner inputs checked above");
+                    let mode = counter.mode;
+                    let discontinuity = counter.discontinuity;
+                    let reserve = counter.collector.reserver();
+                    let generation = std::num::NonZeroU64::new(1).expect("nonzero generation");
+                    let kernel = KernelEvidence::default();
+                    let reservation = ReadReservation::reserve(0, 0, reserve)
+                        .map_err(|_| anyhow::anyhow!("counter collection unavailable (read_budget)"))?;
+                    let read = CounterRead::new(
+                        generation,
+                        mode,
+                        None,
+                        Ok(Vec::new()),
+                        CounterHealth::default(),
+                        kernel,
+                        reservation,
+                    )
+                    .map_err(|stage| {
+                        anyhow::anyhow!(
+                            "counter collection unavailable ({})",
+                            CounterFailure::Read(stage).name()
+                        )
+                    })?;
+                    let (reports, storage) = stage_projection(plan, pins, &read, reserve)
+                        .map_err(|failure| {
+                            anyhow::anyhow!(
+                                "counter collection unavailable ({})",
+                                failure.name()
+                            )
+                        })?;
+                    let snapshot = CounterSnapshot {
+                        data: Some(Arc::new(Projection {
+                            source: read,
+                            reports,
+                            observation: CounterObservation::Initial,
+                            _storage: storage,
+                        })),
+                        failure: None,
+                        attempted_kernel: Some(kernel),
+                        discontinuity,
+                    };
+                    return CaptureSnapshot::from_counter(snapshot);
+                }
                 let counter = self.counter.as_mut().expect("owner inputs checked above");
                 let snapshot =
                     counter.fresh_with(plan, pins, |plan, pins, limits, reserve| match binding {
@@ -432,7 +492,9 @@ impl CaptureCollection {
 
 /// One collector per capture. No projection is reconstructed from a retained
 /// baseline and an unrelated newer plan, including on acquisition failure.
+/// The requested mode identifies an empty capture that never reads banks.
 pub(super) struct CounterCapture {
+    mode: CounterMode,
     collector: CounterCollector,
     limits: CounterLimits,
     last: Option<Arc<Projection>>,
@@ -440,8 +502,13 @@ pub(super) struct CounterCapture {
 }
 
 impl CounterCapture {
-    pub(super) fn new(limits: CounterLimits, reserve: SemanticResourceReserver) -> Self {
+    pub(super) fn new(
+        mode: CounterMode,
+        limits: CounterLimits,
+        reserve: SemanticResourceReserver,
+    ) -> Self {
         Self {
+            mode,
             collector: CounterCollector::new(limits, reserve),
             limits,
             last: None,
@@ -881,6 +948,7 @@ pub(super) mod tests {
                 plan,
                 pins,
                 collection: CaptureCollection::new(Some(CounterCaptureInputs::new(
+                    CounterMode::Counts,
                     LIMITS.rows,
                     LIMITS.rv_keys,
                     pool.reserver(),
@@ -1142,7 +1210,7 @@ pub(super) mod tests {
             CounterMode::Latency,
         ] {
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
-            let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+            let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
             let snapshot = capture.fresh_with(
                 &plan,
                 &pins,
@@ -1185,7 +1253,7 @@ pub(super) mod tests {
             CounterMode::Latency,
         ] {
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
-            let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+            let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
             let snapshot = capture.fresh_with(
                 &plan,
                 &pins,
@@ -1235,7 +1303,7 @@ pub(super) mod tests {
         plan.deactivate(0);
         plan.deactivate(1);
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
-        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
         let published = |positions: &[(u32, u64)], reserve: &SemanticResourceReserver| {
             let reservation =
                 ReadReservation::reserve(positions.len(), positions.len(), reserve).unwrap();
@@ -1317,7 +1385,7 @@ pub(super) mod tests {
             foreign_plan.target_object_of(&foreign_plan.slots[0])
         );
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
-        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
         let old = capture.fresh_with(&old_plan, &old_pins, |plan, _, _, reserve| {
             Ok(read(plan, CounterMode::Counts, 1, 5, reserve))
         });
@@ -1356,7 +1424,7 @@ pub(super) mod tests {
     fn projection_refusal_does_not_advance_the_actual_collector_baseline() {
         let (_file, plan, pins) = fixture();
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
-        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
         let first = capture.fresh_with(&plan, &pins, |plan, _, _, reserve| {
             Ok(read(plan, CounterMode::Latency, 1, 5, reserve))
         });
@@ -1382,7 +1450,7 @@ pub(super) mod tests {
         let (_file, plan, pins) = fixture();
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
         let baseline = pool.snapshot().charged_bytes;
-        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
         drop(capture.fresh_with(&plan, &pins, |plan, _, _, reserve| {
             Ok(read(plan, CounterMode::Counts, 1, 5, reserve))
         }));
@@ -1410,7 +1478,7 @@ pub(super) mod tests {
         let (_file, plan, pins) = fixture();
         let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
         let baseline = pool.snapshot().charged_bytes;
-        let mut capture = CounterCapture::new(LIMITS, pool.reserver());
+        let mut capture = CounterCapture::new(CounterMode::Counts, LIMITS, pool.reserver());
         let snapshot =
             capture.fresh_with(&plan, &pins, |_, _, _, _| Err(ReadStage::KernelEvidence));
         assert!(!snapshot.is_fresh());
@@ -1445,6 +1513,7 @@ pub(super) mod tests {
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
             let baseline = pool.snapshot().charged_bytes;
             let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                mode,
                 LIMITS.rows,
                 LIMITS.rv_keys,
                 pool.reserver(),
@@ -1513,6 +1582,7 @@ pub(super) mod tests {
             let pins = PinnedObjects::empty();
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
             let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                CounterMode::Counts,
                 LIMITS.rows,
                 LIMITS.rv_keys,
                 pool.reserver(),
@@ -1536,6 +1606,7 @@ pub(super) mod tests {
             assert!(!plan.slots.is_empty());
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
             let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                CounterMode::Counts,
                 LIMITS.rows,
                 LIMITS.rv_keys,
                 pool.reserver(),
@@ -1559,6 +1630,7 @@ pub(super) mod tests {
             let pins = PinnedObjects::empty();
             let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
             let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                CounterMode::Counts,
                 LIMITS.rows,
                 LIMITS.rv_keys,
                 pool.reserver(),

@@ -4804,7 +4804,7 @@ mod tests {
         );
         // The intact prefix stays readable through the collection path.
         let mut collection = crate::metrics::CaptureCollection::new(Some(
-            crate::metrics::CounterCaptureInputs::new(8192, 65536, engine.counter_reserver()),
+            crate::metrics::CounterCaptureInputs::new(CounterMode::Counts, 8192, 65536, engine.counter_reserver()),
         ));
         let snapshot = collection
             .fresh(&session, engine.plan(), engine.pinned(), true)
@@ -5692,7 +5692,7 @@ mod tests {
         // the legacy read needs do not exist on this object.
         assert!(crate::metrics::read(&session, engine.plan()).is_err());
         let mut collection = crate::metrics::CaptureCollection::new(Some(
-            crate::metrics::CounterCaptureInputs::new(8192, 65536, engine.counter_reserver()),
+            crate::metrics::CounterCaptureInputs::new(CounterMode::Counts, 8192, 65536, engine.counter_reserver()),
         ));
         parts.fixture.command("START");
         parts.fixture.expect("HELD 0");

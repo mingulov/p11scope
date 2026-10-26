@@ -5,7 +5,7 @@ use super::{BpfLoopVerdict, CapturePolicy, Scope, Session};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
 use crate::plan::{AttachKey, AttachPlan, Slot};
 use crate::semantics_edge::resources::{
-    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourcePool, SemanticResourceReserver,
 };
 use anyhow::{Context, Result, ensure};
 use aya::Ebpf;
@@ -3333,28 +3333,53 @@ fn counter_load_refusal(error: &anyhow::Error) -> String {
     }
 }
 
-/// Doctor load preflight for one counter object: loads the embedded
-/// object with the production loader and releases it without
-/// attaching anything, so the doctor counter line reports the kernel
-/// verifier's real verdict. Omitted builds refuse at the build gate
-/// before any load.
+/// Doctor load preflight for one counter object: runs the production
+/// preparation for the mode (spec envelope, kernel gates, object load,
+/// program loads) and releases it without attaching anything, so the
+/// doctor counter line reports the kernel verifier's real verdict.
+/// Named counter refusals from the gates are real verdicts; only the
+/// verifier's own E2BIG from the load proves a load refusal, and any
+/// other failure is unproven. Map creation alone would prove nothing:
+/// aya loads programs explicitly after the object loads.
 pub(crate) fn counter_object_preflight(mode: CounterMode) -> Result<(), String> {
-    check_counter_build(
-        env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
-        env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
-    )?;
-    let host = super::host_btf::shared()
-        .map_err(|error| format!("counter object load failed ({error})"))?;
+    // A doctor-owned pool funds preparation exactly like the capture
+    // pool; reference pools charge without allocating.
+    let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+    let cpus = aya::util::nr_cpus()
+        .map_err(|(_, error)| format!("counter object load failed ({error})"))?;
+    let spec = CounterSpec::for_production(mode, cpus, pool.reserver())
+        .map_err(|refusal| format!("counter object load failed ({refusal:?})"))?;
+    // System-like backend selection (the primary counter path), the
+    // same functional probe production uses.
+    let backend = super::select_session_backend(
+        super::BackendSelection::Auto,
+        false,
+        super::multi_functional_probe,
+        super::kernel_multi_pid_filter,
+    )
+    .map_err(|error| counter_load_refusal(&error))?
+    .backend;
+    let prepared = spec.prepare(backend).map_err(|error| {
+        let text = format!("{error:#}");
+        if text.starts_with("counter-mode-") || text.starts_with("counter-memory-limit") {
+            text.lines().next().unwrap_or(&text).to_string()
+        } else {
+            counter_load_refusal(&error)
+        }
+    })?;
     let scope = Scope::Pid(std::process::id());
-    super::load_capture_object_bytes_with_images(
-        host.btf(),
-        crate::run::resolve_ring_bytes(None),
-        super::discovery_ring_bytes(&scope),
-        CapturePolicy::Counter(mode).wants_instance_hooks(),
-        counter_object_for_mode(mode),
+    super::Session::prepare_inner_unlinked_with_object(
+        &scope,
+        CapturePolicy::Counter(mode),
+        None,
+        None,
+        None,
+        backend,
+        None,
+        Some(prepared),
     )
     .map(|_| ())
-    .map_err(|error| counter_load_refusal(&anyhow::Error::new(error)))
+    .map_err(|error| counter_load_refusal(&error))
 }
 
 /// Whether the error chain already carries a named `counter-mode-*`

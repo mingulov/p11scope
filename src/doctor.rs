@@ -1758,20 +1758,22 @@ pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> S
 }
 
 /// Counter-mode line with load-preflight verdicts (one per mode,
-/// `Ok(())` when the object loads and releases). A proven old-kernel
-/// token replaces the availability sentence; an unproven load failure
-/// (privilege, unexpected errors) keeps it, since only the verifier's
-/// own E2BIG proves unavailability.
+/// `Ok(())` when the object loads and releases). A proven named
+/// refusal (the old-kernel token or the memory-limit preflight)
+/// replaces the availability sentence; an unproven load failure
+/// (privilege, unexpected errors) keeps it, since only a proven
+/// refusal shows unavailability.
 pub(crate) fn counter_modes_footer_with_preflight(
     verdict: &crate::attach::BpfLoopVerdict,
     preflight: Option<&[(p11scope_ebpf_common::CounterMode, Result<(), String>)]>,
 ) -> String {
     if let (crate::attach::BpfLoopVerdict::Available, Some(loads)) = (verdict, preflight) {
         if cfg!(p11scope_counter_objects) {
-            if let Some((_, Err(refusal))) = loads
-                .iter()
-                .find(|(_, result)| result.as_ref().is_err_and(|s| s.starts_with("counter-mode-")))
-            {
+            if let Some((_, Err(refusal))) = loads.iter().find(|(_, result)| {
+                result.as_ref().is_err_and(|s| {
+                    s.starts_with("counter-mode-") || s.starts_with("counter-memory-limit")
+                })
+            }) {
                 return format!("counter modes: {refusal}\n");
             }
             if loads.iter().all(|(_, result)| result.is_ok()) {
@@ -3480,6 +3482,22 @@ mod tests {
         if cfg!(p11scope_counter_objects) {
             assert!(
                 line.starts_with("counter modes: counter-mode-unavailable-on-kernel:"),
+                "{line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // A proven memory-limit refusal replaces the sentence too.
+        let capped = loads([
+            Err("counter-memory-limit: mode latency P 256 fixed 1 bytes per-bank 2 bytes affordable ceiling 3 endpoints (requested 4)".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&capped));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counter-memory-limit:"),
                 "{line:?}"
             );
             assert_eq!(line.lines().count(), 1, "{line:?}");

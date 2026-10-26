@@ -702,6 +702,15 @@ fn build_variant_with_proof(
     }
     append_flag("-C");
     append_flag("link-arg=--export=DISCOVERY_STATE");
+    // The crate release profile optimizes for size, which the Detailed
+    // object needs for its FULL-capture verifier budget; the same shape
+    // doubles the inventory `interface_list_worker` states past the 1M
+    // 5.15/6.1 limit. Both inventory flavors restore level 3, the setting
+    // their worker verified under before the profile change.
+    if inventory {
+        append_flag("-C");
+        append_flag("opt-level=3");
+    }
     // Counter bank objects are identical across FULL, P0 and unsafe builds:
     // counter flavors never take the stub or unsafe features.
     if !inventory

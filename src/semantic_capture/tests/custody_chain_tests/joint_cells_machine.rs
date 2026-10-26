@@ -1083,6 +1083,37 @@ fn joint_machine_h8_present_s1only_batch_publishes() {
         .filter_map(|record| record.api_returns)
         .sum();
     assert_eq!(api, 16, "all sixteen S1-only calls stage their S1 facts");
+    let mut staged = 0u64;
+    for record in scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+    {
+        staged += 1;
+        // Two observed `C_SignInit` calls start two operations and the
+        // two `C_SignFinal` calls complete them; nothing is orphaned.
+        // Exact counts: an invented start or completion would fail
+        // here.
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.started()),
+            Some(2),
+            "the staged edge starts exactly its two observed calls"
+        );
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.completed()),
+            Some(2),
+            "the staged edge completes exactly its two observed calls"
+        );
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.orphans()),
+            Some(0),
+            "the staged edge stages no orphans"
+        );
+    }
+    assert_eq!(staged, 2, "the batch stages one edge per file");
 }
 
 /// The live R16 case: ordinary EVENTS rows with NO journal rows (the
@@ -1147,6 +1178,37 @@ fn joint_machine_h8_absent_s1only_batch_publishes() {
         .filter_map(|record| record.api_returns)
         .sum();
     assert_eq!(api, 8, "all eight S1-only calls stage their S1 facts");
+    let mut staged = 0u64;
+    for record in scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+    {
+        staged += 1;
+        // Eight observed `C_SignInit` calls start eight operations;
+        // nothing finalizes, so nothing completes and nothing is
+        // orphaned. Exact counts: an invented start or completion
+        // would fail here.
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.started()),
+            Some(8),
+            "the staged edge starts exactly the eight observed calls"
+        );
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.completed()),
+            Some(0),
+            "the staged edge completes nothing without a final call"
+        );
+        assert_eq!(
+            record.semantics.as_ref().map(|edge| edge.orphans()),
+            Some(0),
+            "the staged edge stages no orphans"
+        );
+    }
+    assert_eq!(staged, 1, "the batch stages one edge");
 }
 
 /// Staging names its refusal: with journal rows present but the H8

@@ -16101,6 +16101,131 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_stop_during_winding_reversed_order_discloses_once() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A bare lane stop before the stop request discloses the
+        // winding lane; the later stop request must not disclose it
+        // again: the stop disclosure stays once-only from any stop
+        // path, in any order.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), true);
+            let counts = scripted_nonzero_stop_counts();
+            lane.set_scripted_stop_counts_for_test(Some(counts));
+            lane.note_shed_calls(7);
+            driver.semantic = Some(lane);
+            install_promotion_for_wind_down(&mut driver);
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            assert!(
+                take_warned_for_test().is_empty(),
+                "no disclosure at wind-down start"
+            );
+            driver.on_lane_stopped();
+            assert_eq!(
+                take_warned_for_test(),
+                vec![expected_stop_line()],
+                "the bare lane stop discloses the winding lane once"
+            );
+            driver.on_stop_requested();
+            assert!(
+                take_warned_for_test().is_empty(),
+                "the stop request discloses nothing more"
+            );
+            driver
+                .coordinator
+                .commit_batch(false)
+                .expect("the final commit runs");
+            let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+            assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+            assert_eq!(
+                scans[0].1,
+                crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                    .expect("nonzero refusals name a reason"),
+                "the gap carries the winding lane's per-reason counts"
+            );
+            let held = committed_gaps_by_subject(&mut driver, "promotion wind-down held for exit");
+            assert_eq!(held.len(), 1, "the held-for-exit gap records once");
+            // A further lane stop discloses nothing more; the driver
+            // drops below with the winding held.
+            driver.on_lane_stopped();
+            assert!(
+                take_warned_for_test().is_empty(),
+                "the winding lane discloses exactly once"
+            );
+        }
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the drop hold stays silent"
+        );
+    }
+
+    #[test]
+    fn joint_stop_during_winding_tick_after_stop_discloses_once() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A tick after the stop still reaps the winding join, but the
+        // join must not disclose the lane again: the stop already
+        // did. Production never ticks past the stop; the disclosed
+        // flag keeps even a stray tick silent.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure at wind-down start"
+        );
+        driver.on_stop_requested();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the stop discloses the winding lane once"
+        );
+        // The seal drains before the completion, as in production.
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the stray tick discloses nothing more for the stopped winding"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the winding lane's per-reason counts"
+        );
+        let held = committed_gaps_by_subject(&mut driver, "promotion wind-down held for exit");
+        assert_eq!(held.len(), 1, "the held-for-exit gap records once");
+    }
+
+    #[test]
     fn joint_stop_during_winding_after_join_discloses_nothing_more() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.

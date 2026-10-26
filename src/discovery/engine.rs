@@ -559,6 +559,11 @@ pub struct Engine {
     ended_pid_retirement: Option<PendingEndedPidRetirement>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
+    /// When the expected-target-exit wait armed (wall clock): bounds the
+    /// `profile --pid` wait for draining retirement cleanup, so a cleanup
+    /// that stays queued ends the capture with a named PARTIAL reason
+    /// instead of holding it open until Ctrl-C. `None` until armed.
+    expected_target_exit_since: Option<std::time::Instant>,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     // Kernel lifecycle timestamps only, bounded by pending retained views.
     // None means at least one pending EXIT has unknown ordering.
@@ -3611,6 +3616,22 @@ pub(crate) const GRAPH_STRIDE: usize = 64;
 /// closed rather than hanging the stop. The trip outcome is the existing
 /// disclosed incomplete stop, never a silent one.
 const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wall-time bound on the expected-target-exit wait: after the named
+/// target's exit is proven and the latch arms
+/// (`arm_expected_target_exit`), the capture ends when pending retirement
+/// cleanup drains — but a cleanup that stays queued (a conservative
+/// candidate that never applies, loader ids that never drain) must not
+/// hold a `profile --pid` capture open until Ctrl-C. When the armed wait
+/// observes no all-clear for this long, the latch trips with a named
+/// PARTIAL reason and keeps the calls collected so far. Mirrors
+/// `JOINT_FINISH_NO_PROGRESS_TIMEOUT`: the same 6 s value, kept equal so
+/// every terminal no-progress wait in the stop path ends on the one
+/// established wedge horizon instead of inventing a second magic number.
+/// Engine-local because the joint constant lives behind private inventory
+/// modules this file cannot name.
+const EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(6);
 
 /// Fixed accounting limit for the Engine's dedicated collected-graph pool.
 /// Measured system-scale peak is 211,743,432 bytes (~202 MiB), which sits
@@ -9546,6 +9567,7 @@ impl Engine {
             ended_pid_retirement: None,
             expected_target_exit_pending: None,
             expected_target_exit: false,
+            expected_target_exit_since: None,
             pending_leader_exit_views: BTreeSet::new(),
             pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
@@ -18386,6 +18408,7 @@ impl Engine {
     fn arm_expected_target_exit(&mut self, view: ProcessViewId) {
         if matches!(self.scope, Scope::Pid(_)) {
             self.expected_target_exit_pending = Some(view);
+            self.expected_target_exit_since = Some(std::time::Instant::now());
         }
     }
 

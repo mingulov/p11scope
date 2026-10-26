@@ -4069,6 +4069,189 @@ fn armed_expected_exit_without_views_is_not_a_lost_generation() {
     assert!(engine.views.is_empty());
 }
 
+/// `profile --pid` without `--duration` ends after its target exits even
+/// when a retirement cleanup stays queued: once the armed wait runs past
+/// the no-progress bound, the latch trips with a named PARTIAL reason and
+/// keeps everything collected so far.
+#[test]
+fn stuck_cleanup_after_target_exit_ends_with_named_partial() {
+    let (mut engine, _context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    // Settle the ExpectedRemoval the way process_discovery_records does:
+    // the view is gone and its intent consumed, the arm records the
+    // proven exit — but the loader ids stay queued past the bound.
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.expected_target_exit_pending = Some(view);
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    assert!(!engine.expected_target_exit());
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the latch must still be blocked for this repro"
+    );
+    let skips_before = engine.counters.object_skips.clone();
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the trip tick succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the profile pass ends once the bound expires: {:?}",
+        engine.counters.object_skips
+    );
+    // The trip adds exactly one named PARTIAL reason and drops nothing.
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_before.len() + 1,
+        "one trip reason, nothing dropped or invented: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.counters.object_skips[..skips_before.len()],
+        skips_before[..],
+        "collected skips are kept: {:?}",
+        engine.counters.object_skips
+    );
+    let trip = engine.counters.object_skips.last().expect("the trip reason");
+    assert_eq!(trip.subject, "live discovery transaction");
+    assert!(
+        trip.reason.contains("cleanup was still pending"),
+        "the reason names the pending cleanup: {:?}",
+        trip.reason
+    );
+    assert!(
+        trip.reason
+            .contains("the capture ends with the calls collected so far"),
+        "the reason keeps the collected calls: {:?}",
+        trip.reason
+    );
+    // Ending the wait neither drains nor forgets the queued cleanup.
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the queued cleanup is untouched by the trip"
+    );
+}
+
+/// Twin: a cleanup that drains before the bound ends the ordinary way,
+/// with no PARTIAL mark.
+#[test]
+fn cleanup_that_clears_in_time_ends_without_partial() {
+    let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.expected_target_exit_pending = Some(view);
+    engine.expected_target_exit_since = Some(std::time::Instant::now());
+    assert!(!engine.expected_target_exit());
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a settled named exit is the expected end, not a lost generation");
+    assert!(
+        !engine.expected_target_exit(),
+        "a fresh wait does not trip the bound"
+    );
+    engine
+        .loader_registry
+        .tombstone(context)
+        .expect("tombstoning the drained loader context");
+    engine
+        .loader_registry
+        .remove(context)
+        .expect("draining the loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the draining batch succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the latch completes once drainage finishes"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "no trip reason on the ordinary path: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: the owned `run` settlement latches at once despite stuck pending
+/// state, with no trip reason — the bound never marks the `run` path.
+#[test]
+fn owned_target_reaped_latches_despite_stuck_cleanup() {
+    let (mut engine, _context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.expected_target_exit_pending = Some(view);
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine.note_owned_target_reaped();
+    assert!(
+        engine.expected_target_exit(),
+        "settlement latches without waiting on the drain"
+    );
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the post-settlement tick succeeds");
+    assert!(engine.expected_target_exit());
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "the bound never marks the owned path: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: a target that has not exited never arms the wait, so the bound
+/// can never end its capture — not even with a stale clock behind it.
+#[test]
+fn unarmed_target_alive_is_never_ended_by_the_bound() {
+    let (mut engine, _owner) = Engine::retiring_loader_context(std::process::id());
+    assert!(engine.expected_target_exit_pending.is_none());
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("ticks succeed while the target lives");
+    assert!(
+        !engine.expected_target_exit(),
+        "no arm, no latch: the live target is untouched"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "no trip reason without the arm: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Twin: without the arm, empty views stay a loud failure — the yield
 /// above covers only a settled expected removal, never a disappearance
 /// nothing explains.

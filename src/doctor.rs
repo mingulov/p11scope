@@ -1741,7 +1741,7 @@ pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> S
     match verdict {
         crate::attach::BpfLoopVerdict::Available => {
             if cfg!(p11scope_counter_objects) {
-                "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181))\n"
+                "counter modes: available (counts, timestamps, latency; subject to the kernel verifier accepting the counter programs; the kernel provides bpf_loop (helper 181))\n"
                     .to_string()
             } else {
                 "counter modes: not enabled in this build (the kernel provides bpf_loop (helper 181))\n"

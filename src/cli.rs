@@ -427,7 +427,7 @@ no cgroup path. Aggregate across the selected scope; counts are not per applicat
 Inventory usage entries and trace completed events have separate attribution rules.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
-Omit --counter-mode to keep existing metrics behavior. Selections refuse with a named reason on kernels without bpf_loop (helper 181), on builds without counter objects, and past the mode's endpoint ceiling.
+Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop (helper 181), on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
@@ -3743,8 +3743,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 7139);
-        assert_eq!(hash, 0x0a7e6bc71efaad75);
+        assert_eq!(USAGE.len(), 7210);
+        assert_eq!(hash, 0x8615a171ea1f168b);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

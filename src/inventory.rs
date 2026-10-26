@@ -3757,9 +3757,11 @@ impl ClassicDriver<'_> {
     /// notes the failure and takes the finite stop. Never retires directly.
     /// One NotBegun §8.3 step over an explicit lane slot (§6.1,
     /// §6.3): poll the pending commit — stay while it pends, begin
-    /// once it publishes — or fail the finish through I2 on a
-    /// non-retryable refusal. The winding and final-lane retained
-    /// steps share it; callers count polls and begins.
+    /// once it publishes. A non-retryable refusal on a running
+    /// commit converts like the Poll path (hold, named stop gap, no
+    /// run error); only a finished lane's refusal fails the finish
+    /// through I2. The winding and final-lane retained steps share
+    /// it; callers count polls and begins.
     fn step_not_begun_joint_finish(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
@@ -3814,28 +3816,48 @@ impl ClassicDriver<'_> {
             }
             Outcome::Fail(reason) => {
                 let finished = match lane.as_mut() {
-                    Some(inner) => {
-                        inner.note_joint_finish_failure(reason);
-                        inner.is_finished()
-                    }
+                    Some(inner) => inner.is_finished(),
                     None => return NotBegunStep::Idle,
                 };
-                let live = lane.take().expect("a failed lane holds");
-                let error = Self::hold_joint_lane_for_exit(
-                    live,
-                    coordinator,
-                    "joint finish disposition required",
-                    warn,
-                    None,
-                );
-                first_error.get_or_insert(error);
+                // A finished lane's refusal latches a finish failure
+                // and keeps the finite-stop verdict. A running-commit
+                // refusal converts exactly like the Poll path (F2,
+                // ruling E1): hold, name the stop, publish past it —
+                // no latched finish failure, no run error. The gap
+                // carries the disclosure, so whichever cursor sees
+                // the refusal first, the run ends the same way.
                 if finished {
-                    let reason = coordinator
+                    if let Some(inner) = lane.as_mut() {
+                        inner.note_joint_finish_failure(reason);
+                    }
+                    let live = lane.take().expect("a failed lane holds");
+                    let error = Self::hold_joint_lane_for_exit(
+                        live,
+                        coordinator,
+                        "joint finish disposition required",
+                        warn,
+                        None,
+                    );
+                    first_error.get_or_insert(error);
+                    let held = coordinator
                         .collected_graph_refused()
                         .unwrap_or("joint finish disposition required");
                     coordinator.note_scope_gap(
                         "joint finish held for exit".to_string(),
-                        reason.to_string(),
+                        held.to_string(),
+                    );
+                } else {
+                    let live = lane.take().expect("a failed lane holds");
+                    Self::hold_joint_lane_for_exit(
+                        live,
+                        coordinator,
+                        "joint commit disposition required",
+                        warn,
+                        None,
+                    );
+                    coordinator.note_scope_gap(
+                        "semantic lane stopped".to_string(),
+                        format!("{}; broad inventory continues", reason.code()),
                     );
                 }
                 *finish = JointFinishDriver::Abandoned;
@@ -3854,6 +3876,10 @@ impl ClassicDriver<'_> {
         }
         if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
             if self.joint_commit_pending {
+                // Snapshot before the step: a converting refusal
+                // holds the lane, and the final report serves the
+                // snapshot past the handoff, like the Poll path.
+                self.snapshot_seated_summary();
                 let mut warn = WarnSink {
                     display: &mut self.display,
                 };
@@ -3875,6 +3901,11 @@ impl ClassicDriver<'_> {
                         }
                     }
                     NotBegunStep::Stepped => {
+                        // A converting refusal held the lane: the
+                        // commit pends nothing further, like F2.
+                        if self.semantic.is_none() {
+                            self.joint_commit_pending = false;
+                        }
                         #[cfg(test)]
                         {
                             self.joint_commit_polls += 1;

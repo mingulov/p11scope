@@ -13,13 +13,15 @@
  *   MODE b        SoftHSM script: READY, wait --go, run the fixed call
  *                   script, print CALLS + DONE.
  *   MODE exec     exec producer: gen 0 maps the provider, READY, waits
- *                   --go, runs the mini probe (GEN0DONE, never CALLS),
- *                   prints EXEC and execs itself with --gen 1; gen 1 maps
- *                   again (fresh image), READY, waits --trig, runs the mini
- *                   probe (TRIGDONE), waits --late, runs the b script, DONE.
- *                   The two probes are observed pre/post-exec calls, so the
- *                   native binder sees the ended image and its later image
- *                   in one domain and mints the exec successor.
+ *                   --go, runs the mini probe (GEN0DONE, never CALLS: its
+ *                   image is retired at conversion, so it sheds), prints
+ *                   EXEC and execs itself with --gen 1; gen 1 maps again
+ *                   (fresh image), READY, waits --trig, runs the mini
+ *                   probe (TRIGDONE, tallied: its current image stages),
+ *                   waits --late, runs the b script, DONE. The two probes
+ *                   are observed pre/post-exec calls, so the native binder
+ *                   sees the ended image and its later image in one domain
+ *                   and mints the exec successor.
  *   MODE absent   absence subject: maps --module only, runs Initialize +
  *                   one GetSlotList + Finalize (so it is admitted), never
  *                   maps the subset's other provider, DONE. The observer
@@ -408,12 +410,14 @@ static int run_soft_script(void **f, int iters)
     return bad;
 }
 
-/* A three-call probe (Initialize/GetSlotList/Finalize) that never touches
- * the CALLS ledger: gen 0 binds its native image with it before EXEC, and
- * gen 1 proves its later image with it after READY, so one native domain
- * sees both and the observer mints the exec successor. Prints one TAGDONE
+/* A three-call probe (Initialize/GetSlotList/Finalize): gen 0 binds its
+ * native image with it before EXEC, and gen 1 proves its later image with
+ * it after READY, so one native domain sees both and the observer mints
+ * the exec successor. When ledger is set the three calls tally into the
+ * CALLS ledger (gen 1: its current image stages); otherwise they stay
+ * out (gen 0: its retired image sheds at conversion). Prints one TAGDONE
  * line. Returns nonzero if any call failed. */
-static int run_mini_probe(void **f, const char *tag)
+static int run_mini_probe(void **f, const char *tag, int ledger)
 {
     CK_RV rv;
     CK_SLOT_ID slots[16];
@@ -423,11 +427,17 @@ static int run_mini_probe(void **f, const char *tag)
     memset(&args, 0, sizeof(args));
     rv = ((CK_RV(*)(void *))f[I_Initialize])(&args);
     bad |= (rv != 0);
+    if (ledger)
+        tally(I_Initialize, rv);
     rv = ((CK_RV(*)(unsigned char, CK_SLOT_ID *, CK_ULONG *))f[I_GetSlotList])(1, slots,
                                                                               &count);
     bad |= (rv != 0);
+    if (ledger)
+        tally(I_GetSlotList, rv);
     rv = ((CK_RV(*)(void *))f[I_Finalize])(NULL);
     bad |= (rv != 0);
+    if (ledger)
+        tally(I_Finalize, rv);
     printf("%s cell=%s pid=%d gen=%d status=%s\n", tag, cell, getpid(), gen,
            bad ? "fail" : "ok");
     fflush(stdout);
@@ -575,7 +585,7 @@ int main(int argc, char **argv)
             fflush(stdout);
             wait_for_file(go, "go gate never opened");
             f = function_table(dl);
-            if (run_mini_probe(f, "GEN0DONE"))
+            if (run_mini_probe(f, "GEN0DONE", 0))
                 die("gen 0 probe failed");
             printf("EXEC cell=%s pid=%d gen=0 next=1\n", cell, getpid());
             fflush(stdout);
@@ -595,8 +605,8 @@ int main(int argc, char **argv)
         }
         /* Post-exec image: fresh mapping; the trigger probe proves the
          * later image (the binder mints the successor), then the late
-         * gate releases the b script. The probe never touches CALLS:
-         * e_total counts the b script only. */
+         * gate releases the b script. The probe tallies: e_total counts
+         * the b script plus these three staged calls. */
         if (!late) {
             fprintf(stderr, "mode exec gen 1 needs --late\n");
             return 2;
@@ -611,7 +621,7 @@ int main(int argc, char **argv)
         printf("READY cell=%s pid=%d exe=%s\n", cell, getpid(), self_exe);
         fflush(stdout);
         wait_for_file(trig, "trig gate never opened");
-        if (run_mini_probe(f, "TRIGDONE"))
+        if (run_mini_probe(f, "TRIGDONE", 1))
             die("gen 1 probe failed");
         wait_for_file(late, "late gate never opened");
         {

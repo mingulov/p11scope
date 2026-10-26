@@ -4600,6 +4600,24 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         .to_str()
         .context("soft-copy path")?
         .to_string();
+    // The lane attaches before A/B spawn: a Joint birth needs a
+    // post-attach watched-mapping change, and pre-attach processes can
+    // only ever be S1-only.
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "joint-r16-held.dr37.json",
+    )?;
+    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
     let process_a = workload.spawn(
         "a",
         &[
@@ -4623,22 +4641,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         ],
         &[],
     )?;
-    let mut coordinator =
-        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
     drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
-    let manifest_soft = provider_joint_manifest(
-        workload.workload.dir.path(),
-        &workload.soft_copy,
-        JOINT_SOFT_FUNCTIONS,
-        "joint-r16-soft.dr37.json",
-    )?;
-    let manifest_held = provider_joint_manifest(
-        workload.workload.dir.path(),
-        &workload.held,
-        &["C_SignInit", "C_Sign"],
-        "joint-r16-held.dr37.json",
-    )?;
-    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
     let revision_before = coordinator.registry().published_revision();
     std::fs::write(&go, b"")?;
     process_a.wait_for("HELD ", Duration::from_secs(30))?;
@@ -4719,6 +4722,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         edge_b_q1.is_ok(),
         edge_a_q1.is_ok(),
     );
+    ensure_joint_birth_refusal(&coordinator, "r16-q1")?;
 
     // Release A's return into q2.
     std::fs::OpenOptions::new().write(true).open(&release)?;
@@ -4853,6 +4857,17 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         .to_str()
         .context("soft-copy path")?
         .to_string();
+    // The lane attaches before PA/PB spawn: a Joint birth needs a
+    // post-attach watched-mapping change, and pre-attach processes can
+    // only ever be S1-only.
+    let mut coordinator = system_joint_coordinator(std::slice::from_ref(&workload.soft_copy))?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "joint-r16-soft.dr37.json",
+    )?;
+    let mut lane_a = start_joint_lane(&mut coordinator, vec![manifest_soft.clone()])?;
     let process_a = workload.spawn(
         "pa",
         &[
@@ -4867,21 +4882,14 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         ],
         &[],
     )?;
-    let mut coordinator = system_joint_coordinator(std::slice::from_ref(&workload.soft_copy))?;
     drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
-    let manifest_soft = provider_joint_manifest(
-        workload.workload.dir.path(),
-        &workload.soft_copy,
-        JOINT_SOFT_FUNCTIONS,
-        "joint-r16-soft.dr37.json",
-    )?;
-    let mut lane_a = start_joint_lane(&mut coordinator, vec![manifest_soft.clone()])?;
     let domain_a = lane_a.domain();
     std::fs::write(&go_a, b"")?;
     process_a.wait_for("DONE ", Duration::from_secs(60))?;
     let (_, a_total, a_bad) = ledger_calls(&process_a.out)?;
     ensure!(a_bad == 0 && a_total > 0, "A ran its script");
     let qa_polls = service_to_published(&mut lane_a, &mut coordinator, true, "r16c-qa")?;
+    ensure_joint_birth_refusal(&coordinator, "r16c-qa")?;
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "soft-copy.so")?;
     ensure!(
         edge_a.api_returns == Some(a_total) && edge_a.reduced == a_total,
@@ -5211,6 +5219,37 @@ fn has_gap(coordinator: &InventoryCoordinator<OsProcessSource>, subject: &str) -
         .any(|gap| gap.subject == subject)
 }
 
+/// Reasons of the retained-S1 birth disclosures. Until the
+/// object-journal marker lands, every observed-call birth discloses
+/// its native refusal here instead of installing a Joint feed.
+fn joint_birth_gap_reasons(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
+    coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.clone())
+        .collect()
+}
+
+/// Pin the disclosed birth refusal after a publish. The marker is
+/// unwired, so observed-call births must disclose RowUnreadable; the
+/// cells' Joint assertions below fail until the marker lands and flips
+/// this pin.
+fn ensure_joint_birth_refusal(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+) -> Result<()> {
+    let gaps = joint_birth_gap_reasons(coordinator);
+    eprintln!("JOINT_R16 {tag}-births gaps={gaps:?}");
+    ensure!(
+        gaps.iter()
+            .any(|reason| reason == "joint_birth_native_RowUnreadable"),
+        "{tag}: observed-call births disclose the unwired marker"
+    );
+    Ok(())
+}
+
 /// The semantic-edge census: (pid, module path) pairs. Owner pids resolve
 /// through the adapter records (live and retired); unknown callers print
 /// numerically.
@@ -5256,9 +5295,12 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         // SAFETY: a valid NUL-terminated path.
         ensure!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0, "mkfifo");
     }
-    // S's gate opens before attach (its entries are genuinely pre-attach).
-    // E's own go/trig gates open under the native exec drive, before the
-    // semantic lane attaches; C's, H's and E-post's gates open after.
+    // S spawns before attach (its entries are genuinely pre-attach)
+    // and stays S1-only. E's gen 0 spawns before attach too, but E-post
+    // is born after attach by the covered exec, and C/H spawn after the
+    // lane attaches, so all three are Joint-birth eligible. E's own
+    // go/trig gates open under the native exec drive; C's, H's and
+    // E-post's gates open after.
     let go = workload.path("go");
     let go_arg = go.to_str().context("go path")?.to_string();
     let go_e = workload.path("go-e");
@@ -5295,13 +5337,6 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         ],
         &[],
     )?;
-    let process_c = workload.spawn(
-        "c",
-        &[
-            "absent", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--hold",
-        ],
-        &[],
-    )?;
     let process_s = workload.spawn(
         "s",
         &[
@@ -5314,22 +5349,6 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             &go_s_arg,
             "--release",
             release_s.to_str().context("release-s path")?,
-            "--hold",
-        ],
-        &[],
-    )?;
-    let process_h = workload.spawn(
-        "h",
-        &[
-            "a",
-            "--cell",
-            "H",
-            "--module",
-            &held_arg,
-            "--go",
-            &go_arg,
-            "--release",
-            release_h.to_str().context("release-h path")?,
             "--hold",
         ],
         &[],
@@ -5351,6 +5370,34 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         &workload.held,
         &["C_SignInit", "C_Sign"],
         "joint-r16-held.dr37.json",
+    )?;
+    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let attach_ns = monotonic_ns();
+    // C and H spawn after the lane attaches, so their mappings and
+    // calls are Joint-birth eligible. E-post is born after attach by
+    // the covered exec below.
+    let process_c = workload.spawn(
+        "c",
+        &[
+            "absent", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--hold",
+        ],
+        &[],
+    )?;
+    let process_h = workload.spawn(
+        "h",
+        &[
+            "a",
+            "--cell",
+            "H",
+            "--module",
+            &held_arg,
+            "--go",
+            &go_arg,
+            "--release",
+            release_h.to_str().context("release-h path")?,
+            "--hold",
+        ],
+        &[],
     )?;
     // One native drive spans mapping and the exec: run_classic gates the
     // coordinator when the drive ends, so a second drive's passes would
@@ -5424,13 +5471,13 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     );
     ensure!(
         has_mapped_edge(&coordinator, process_e.pid()),
-        "the exec successor maps before attach"
+        "the exec successor maps in the spanning drive"
     );
-    let mut lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
-    let attach_ns = monotonic_ns();
 
-    // E-post, C and H run under the attached lane: E-post's b script is
-    // its only observed Joint input (both probes predate the attach).
+    // E-post, C and H run under the attached lane. Both probes ran after
+    // attach too: gen 0's sheds (its image is retired at conversion)
+    // while gen 1's stages, so the ledger counts the b script plus the
+    // gen 1 probe.
     std::fs::write(&go, b"")?;
     std::fs::write(&late_e, b"")?;
     process_e.wait_for("DONE ", Duration::from_secs(60))?;
@@ -5479,6 +5526,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
          census={:?}",
         joint_edge_census(&coordinator),
     );
+    ensure_joint_birth_refusal(&coordinator, "r16b-q1")?;
 
     // Release H into q2; S stays held on its own FIFO.
     std::fs::OpenOptions::new().write(true).open(&release_h)?;

@@ -3264,6 +3264,92 @@ fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
     Ok(())
 }
 
+/// Birth marker abandoned-call twin: a provider call held inside the
+/// provider while its thread is cancelled dirties at thread exit, with no
+/// other call in between. The same held call released normally leaves
+/// READY. The process keeps running throughout; the private cgroup is
+/// removed at the end.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_abandoned_call_at_thread_exit_dirties() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("abandoned")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let published = journal_marker::ready_word(exec);
+    // Healthy twin: hold and release in scope; the word never moves.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    let unheld = target.command(b'u')?;
+    ensure!(unheld.starts_with("UNHELD"), "{unheld}");
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == published,
+        "a returned call must not mark"
+    );
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    // The call under test: hold in scope, then cancel the holding thread.
+    // The process keeps running; thread exit reclaims the live START.
+    let held = target.command(b'b')?;
+    ensure!(held == "HELD", "{held}");
+    let cancelled = target.command(b'K')?;
+    ensure!(cancelled.starts_with("CANCELLED"), "{cancelled}");
+    let marked = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&marked) == journal_marker::MARKER_DIRTY,
+        "a call abandoned at thread exit must dirty: {}",
+        marker_summary(&marked)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "the abandoned call charged nothing: {control:?}"
+    );
+    // The abandoned call emitted no completion, and the ledger shows the
+    // held call as the only one between the hold and the cancel: only the
+    // thread-exit path can have marked it.
+    let stray = pump_rounds(&mut harness, &target, 10)?;
+    ensure!(stray.is_empty(), "the abandoned call must emit no call");
+    let ledger = &target.ledger;
+    ensure!(
+        ledger.len() >= 2
+            && ledger[ledger.len() - 2] == "HELD"
+            && ledger[ledger.len() - 1].starts_with("CANCELLED"),
+        "no other call ran between the hold and the cancel"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_ABANDONED_CALL exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
 /// Task 1d overhead gate: the mapping hooks attach for profile sessions
 /// but stay down for metrics (aggregate-only) sessions, whose attach still
 /// succeeds with every slot unmapped (`NO_FILE`: no stamp can ever route).

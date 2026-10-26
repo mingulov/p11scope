@@ -1042,7 +1042,7 @@ class JournalMarkerInventoryTests(unittest.TestCase):
 class JournalMarkerCallSiteTests(unittest.TestCase):
     """H8-D birth marker call sites: every defined Detailed root that can
     birth or gap must call its marker global. Core roots (entry, return,
-    exec) must exist; unsafe-only roots (ia32 entry, template
+    exec, exit) must exist; unsafe-only roots (ia32 entry, template
     continuation) must call when defined."""
 
     ROOTS = (
@@ -1051,6 +1051,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
         ("p11_return", "uretprobe", "p11_instance_scope_gap"),
         ("p11_entry_template_second", "uprobe", "p11_instance_scope_gap"),
         ("sched_process_exec", "raw_tp/sched_process_exec", "p11_instance_exec_birth"),
+        ("sched_process_exit", "raw_tp/sched_process_exit", "p11_instance_scope_gap"),
     )
 
     @classmethod
@@ -1062,7 +1063,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
         """Compile roots that call (or drop) their marker global.
 
         wired: root names that call; roots: names to emit (default all
-        five); markers: emit the two marker globals. Each body is
+        six); markers: emit the two marker globals. Each body is
         textually distinct so the optimizer cannot merge two roots.
         """
         roots = [root for root in self.ROOTS if roots is None or root[0] in roots]
@@ -1098,6 +1099,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
             "p11_return": "{ unsigned r = MARKER(); return (int)(r | 256); }",
             "p11_entry_template_second": "{ unsigned r = MARKER(); return (int)(r ^ 512); }",
             "sched_process_exec": "return (int)MARKER();",
+            "sched_process_exit": "{ unsigned r = MARKER(); return (int)(r & 1023); }",
         }
         for index, (root, section, marker) in enumerate(roots):
             if root in wired:
@@ -1121,19 +1123,19 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
         return checker.validate_marker_call_sites(checker.Elf(obj.read_bytes()))
 
     def test_marker_calls_healthy_diagnostic(self):
-        """Healthy twin: all five roots wired validates."""
+        """Healthy twin: all six roots wired validates."""
         self.check_calls(
             "marker-calls-healthy",
             {root for root, _, _ in self.ROOTS},
         )
 
     def test_marker_calls_healthy_default(self):
-        """Healthy twin: the three core roots wired validates when the
+        """Healthy twin: the four core roots wired validates when the
         unsafe-only roots are absent."""
         self.check_calls(
             "marker-calls-default",
-            {"p11_entry", "p11_return", "sched_process_exec"},
-            roots={"p11_entry", "p11_return", "sched_process_exec"},
+            {"p11_entry", "p11_return", "sched_process_exec", "sched_process_exit"},
+            roots={"p11_entry", "p11_return", "sched_process_exec", "sched_process_exit"},
         )
 
     def test_marker_calls_without_markers_skipped(self):
@@ -1148,7 +1150,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
             self.check_calls(
                 "marker-calls-drop-entry",
                 {"p11_entry_ia32", "p11_return", "p11_entry_template_second",
-                 "sched_process_exec"},
+                 "sched_process_exec", "sched_process_exit"},
             )
 
     def test_marker_call_dropped_from_ia32_entry_refused(self):
@@ -1159,7 +1161,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
             self.check_calls(
                 "marker-calls-drop-ia32",
                 {"p11_entry", "p11_return", "p11_entry_template_second",
-                 "sched_process_exec"},
+                 "sched_process_exec", "sched_process_exit"},
             )
 
     def test_marker_call_dropped_from_return_refused(self):
@@ -1170,7 +1172,7 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
             self.check_calls(
                 "marker-calls-drop-return",
                 {"p11_entry", "p11_entry_ia32", "p11_entry_template_second",
-                 "sched_process_exec"},
+                 "sched_process_exec", "sched_process_exit"},
             )
 
     def test_marker_call_dropped_from_template_continuation_refused(self):
@@ -1181,7 +1183,8 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
         ):
             self.check_calls(
                 "marker-calls-drop-second",
-                {"p11_entry", "p11_entry_ia32", "p11_return", "sched_process_exec"},
+                {"p11_entry", "p11_entry_ia32", "p11_return", "sched_process_exec",
+                 "sched_process_exit"},
             )
 
     def test_marker_call_dropped_from_exec_refused(self):
@@ -1192,7 +1195,18 @@ class JournalMarkerCallSiteTests(unittest.TestCase):
             self.check_calls(
                 "marker-calls-drop-exec",
                 {"p11_entry", "p11_entry_ia32", "p11_return",
-                 "p11_entry_template_second"},
+                 "p11_entry_template_second", "sched_process_exit"},
+            )
+
+    def test_marker_call_dropped_from_exit_refused(self):
+        """Named mutant: exit without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed sched_process_exit must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-exit",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template_second", "sched_process_exec"},
             )
 
 

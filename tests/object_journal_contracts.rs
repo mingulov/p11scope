@@ -1098,6 +1098,38 @@ fn object_journal_marker_cap_matches_native() {
     );
 }
 
+/// Abandoned-call signal: the native cleanup outcome and the exit root's
+/// copy are one number, so a later renumbering is a single small commit.
+/// 2 means a healthy settle abandoned at least one live START; only 1 is
+/// failure.
+#[test]
+fn object_journal_cleanup_abandoned_code_matches_native() {
+    let header = std::fs::read_to_string("crates/ebpf/native/task_owner.h")
+        .expect("read native owner header");
+    let define = "#define P11_OWNER_CLEANUP_ABANDONED_START";
+    let line = header
+        .lines()
+        .find(|line| line.starts_with(define))
+        .expect("native abandoned-start code define");
+    let literal = line[define.len()..].trim().trim_end_matches('U').trim();
+    let native: u32 = literal.parse().expect("native code parses");
+    let source =
+        std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let binding = "const OWNER_CLEANUP_ABANDONED_START: u32 = ";
+    let line = source
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(binding))
+        .expect("exit root abandoned-start code");
+    let literal = line[binding.len()..].trim().trim_end_matches(';').trim();
+    let bound: u32 = literal.parse().expect("bound code parses");
+    assert_eq!(
+        native, bound,
+        "native and exit-root abandoned-start codes must match"
+    );
+    assert_eq!(bound, 2, "the abandoned-start code is 2 (only 1 fails)");
+}
+
 /// H8-D birth marker wiring: only the Detailed object carries the
 /// control map and the two marker globals; inventory and counter
 /// objects carry neither; no built object carries a transaction

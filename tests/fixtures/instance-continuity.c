@@ -11,6 +11,7 @@
  *       C  call it through the dlmopen sibling, tag 0x71000000 + gen
  *       b  hold one C_GetSlotInfo inside the provider        -> HELD
  *       u  release the held call                             -> UNHELD gen rv
+ *       K  cancel the held call's thread (no return)         -> CANCELLED gen
  *       r  reload: dlclose then dlopen (gen += 1)        -> RELOAD gen old new
  *       d  dlmopen(LM_ID_NEWLM) a sibling copy           -> SIBLING base
  *       m  mmap+munmap an unrelated file                 -> UNRELATED
@@ -657,6 +658,26 @@ static int cmd_mode(const char *provider)
             held_call_disarm = NULL;
             held_call_entry = held_call_release = -1;
             printf("UNHELD %u %lu\n", gen, held_call.rv);
+            break;
+        }
+        case 'K': {
+            /* Cancel the 'b' call's thread while it is blocked inside
+             * C_GetSlotInfo: the call entered in scope and never
+             * returns, so thread exit must reclaim its START. The
+             * process keeps running. */
+            void *result = NULL;
+            if (!held_call_active)
+                die("no held call");
+            if (pthread_cancel(held_call_thread) != 0)
+                die("held-call cancel");
+            pthread_join(held_call_thread, &result);
+            if (result != PTHREAD_CANCELED)
+                die("held-call cancel join");
+            held_call_active = 0;
+            held_call_disarm();
+            held_call_disarm = NULL;
+            held_call_entry = held_call_release = -1;
+            printf("CANCELLED %u\n", gen);
             break;
         }
         case 'r': {

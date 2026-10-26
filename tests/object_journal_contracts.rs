@@ -1130,6 +1130,51 @@ fn object_journal_cleanup_abandoned_code_matches_native() {
     assert_eq!(bound, 2, "the abandoned-start code is 2 (only 1 fails)");
 }
 
+/// H8-D marker build gate: the native unit, the instance-epoch define and
+/// the two global exports share one predicate, so a future Detailed bank
+/// object cannot half-link the marker (unit without exports, or the
+/// reverse).
+#[test]
+fn object_journal_marker_build_uses_one_gate() {
+    let build = std::fs::read_to_string("build.rs").expect("read build script");
+    let lines: Vec<&str> = build.lines().collect();
+    let binding = "let journal_marker = ";
+    let predicates: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.trim_start().starts_with(binding))
+        .collect();
+    assert_eq!(
+        predicates.len(),
+        1,
+        "the marker build must share one predicate"
+    );
+    assert!(
+        predicates[0].contains("BpfFlavor::Detailed")
+            && predicates[0].contains("!bank_proof"),
+        "the shared gate must select Detailed non-bank builds: {}",
+        predicates[0]
+    );
+    for anchor in [
+        "selected_native_units.push(\"journal_marker\")",
+        "\"-DP11SCOPE_JOURNAL_MARKER\"",
+        "\"link-arg=--export=p11_instance_scope_gap\"",
+    ] {
+        let at = lines
+            .iter()
+            .position(|line| line.contains(anchor))
+            .unwrap_or_else(|| panic!("marker build site is missing: {anchor}"));
+        let guard = lines[at.saturating_sub(8)..at]
+            .iter()
+            .rev()
+            .find(|line| line.trim_start().starts_with("if "))
+            .unwrap_or_else(|| panic!("marker build site has no gate: {anchor}"));
+        assert!(
+            guard.contains("journal_marker") && !guard.contains("matches!"),
+            "marker build site must use the shared gate: {anchor} under {guard}"
+        );
+    }
+}
+
 /// H8-D birth marker wiring: only the Detailed object carries the
 /// control map and the two marker globals; inventory and counter
 /// objects carry neither; no built object carries a transaction

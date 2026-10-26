@@ -113,7 +113,7 @@ for KERNEL in "$@"; do
     fi
     GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
     case "$GUEST_RELEASE" in
-        "${KERNEL#v}"*)
+        "${KERNEL#v}"|"${KERNEL#v}-"*)
             echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
             ;;
         *)

@@ -453,6 +453,44 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(match.group(1), f"{value:016x}")
         self.assertEqual(match.group(1), EXPECTED_BPF_LOOP_PROBE_FNV)
 
+    def test_driver_runs_one_counter_command_per_mode(self):
+        # Per-mode guests: probe rows key programs by root name only while
+        # all three bank objects export the same two roots, so one combined
+        # run would collide in by_root. Real guest runs prove the loads;
+        # this pins the per-mode command and probe file against revert.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn("profile --system --mode metrics --counter-mode", text)
+        self.assertIn("counter-$MODE-probe-", text)
+
+    def test_driver_scores_counter_loads_per_object(self):
+        # Each mode's probe file is scored under its own object name, so
+        # the shared root names never mix counts across modes.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('--object "counter-$MODE"', text)
+
+    def test_driver_expects_the_named_counter_refusal_on_old_kernels(self):
+        # 5.15 refuses before loading (no bpf_loop), 6.1 refuses at load
+        # (verifier E2BIG); both keep the specified refusal token, and the
+        # gate passes those kernels only when the observer names it.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn("counter-mode-unavailable-on-kernel", text)
+        self.assertIn("v5.15.*|v6.1.*)", text)
+
+    def test_driver_comment_no_longer_calls_counter_mode_unwired(self):
+        # Activation wired --counter-mode; the comment must describe the
+        # post-activation gate (per-mode probe files) instead.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertNotIn("unwired", text)
+        self.assertIn("counter-<mode>-probe-", text)
+
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
 # against src/attach.rs by the fingerprint test above.

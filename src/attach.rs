@@ -16049,12 +16049,17 @@ mod tests {
     #[test]
     fn session_flavor_feeds_grouping_and_evidence() {
         fn contract(source: &str) -> std::result::Result<(), String> {
-            for signature in [
-                "pub(crate) fn attach_targets(",
-                "fn attach_targets_multi(",
-                "fn rebuild_affected_groups(",
+            // Methods close indented, so each window ends at the next
+            // method's signature instead of a column-zero brace.
+            for (signature, end) in [
+                ("pub(crate) fn attach_targets(", "fn attach_targets_multi("),
+                ("fn attach_targets_multi(", "fn rebuild_affected_groups("),
+                (
+                    "fn rebuild_affected_groups(",
+                    "pub(crate) fn begin_owned_producer_detach(",
+                ),
             ] {
-                let grouped = pin_body(source, signature, "\n}\n")?;
+                let grouped = pin_body(source, signature, end)?;
                 if !grouped.contains("self.embedded_flavor.unsafe_present") {
                     return Err(format!("{signature} must pass the session's flavor"));
                 }
@@ -16064,7 +16069,11 @@ mod tests {
                     return Err(format!("{signature} must not re-read the global cache"));
                 }
             }
-            let evidence = pin_body(source, "pub(crate) fn object_capture_evidence(", "\n}\n")?;
+            let evidence = pin_body(
+                source,
+                "pub(crate) fn object_capture_evidence(",
+                "pub(crate) fn scope_filter(",
+            )?;
             if !evidence.contains("self.embedded_flavor.stubbed") {
                 return Err("output evidence must read the session's flavor".to_string());
             }

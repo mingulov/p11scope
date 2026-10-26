@@ -3307,6 +3307,15 @@ impl BankIo for NativeIo<'_> {
     }
 }
 
+/// Production counter-start error mapping for `start_on_backend`: a
+/// verifier-budget E2BIG becomes the named old-kernel token, and any
+/// `counter-mode-*` refusal returns without the generic environment
+/// hint (the token already names the cause). Every other error keeps
+/// the generic hint through the shared wrapper.
+pub(super) fn map_counter_start_error(error: anyhow::Error) -> anyhow::Error {
+    super::unsupported_environment_context(error)
+}
+
 /// Maps a kernel verifier-budget rejection during counter preparation to
 /// the named counter-mode refusal. Only a genuine BPF_PROG_LOAD E2BIG (the
 /// program is too complex for this kernel's verifier) is rewritten, with a
@@ -10133,6 +10142,80 @@ pub(crate) mod tests {
             !format!("{after:#}").contains("counter-mode-unavailable-on-kernel"),
             "ENOSPC must not take the kernel-specific token: {after:#}"
         );
+    }
+
+    #[test]
+    fn counter_start_error_maps_e2big_load_chain_to_the_named_refusal() {
+        // The 6.1 production shape: aya's load error (E2BIG source, long
+        // verifier log) under a loader context, as start_on_backend sees
+        // it. The token replaces the whole chain; neither generic hint
+        // may survive.
+        let loaded = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new("verifier-line\n".repeat(9000)),
+        })
+        .context("loading function_list_return");
+        let mapped = super::map_counter_start_error(loaded);
+        let text = format!("{mapped:#}");
+        assert!(
+            text.starts_with("counter-mode-unavailable-on-kernel:"),
+            "{text}"
+        );
+        assert!(!text.contains("p11scope bug"), "{text}");
+        assert!(!text.contains("CAP_BPF"), "{text}");
+        assert!(!text.contains("verifier-line"), "{text}");
+    }
+
+    #[test]
+    fn counter_start_error_passes_named_refusals_through_unwrapped() {
+        // The old-kernel token and the build token pass through with no
+        // generic hint; a wrapped token keeps the token and gains no
+        // hint; anything else keeps the generic hint.
+        for token in [
+            "counter-mode-unavailable-on-kernel: the kernel loads BPF programs but rejects the bpf_loop (helper 181) probe (test); counter bank objects need Linux 5.17+",
+            "counter-mode-unavailable-in-build: this build omits counter objects",
+        ] {
+            let mapped = super::map_counter_start_error(anyhow::anyhow!("{token}"));
+            assert_eq!(format!("{mapped:#}"), token);
+        }
+        let wrapped = anyhow::anyhow!(
+            "counter-mode-unavailable-on-kernel: the kernel loads BPF programs but rejects the bpf_loop (helper 181) probe (test)"
+        )
+        .context("preparing counter banks");
+        let text = format!("{:#}", super::map_counter_start_error(wrapped));
+        assert!(
+            text.contains("counter-mode-unavailable-on-kernel:"),
+            "{text}"
+        );
+        assert!(!text.contains("CAP_BPF"), "{text}");
+        assert!(!text.contains("p11scope bug"), "{text}");
+        let other = super::map_counter_start_error(anyhow::anyhow!("some other failure"));
+        let text = format!("{other:#}");
+        assert!(text.contains("some other failure"), "{text}");
+        assert!(text.contains("CAP_BPF"), "{text}");
+    }
+
+    #[test]
+    fn counter_budget_token_applies_only_to_real_e2big() {
+        // ENOSPC (an exhausted verifier log buffer, never the
+        // instruction budget) keeps its errno and never becomes the
+        // old-kernel token, at the mapping and at the start seam alike:
+        // both read the shared E2BIG-only budget errno predicate.
+        let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
+        let mapped = super::map_counter_verifier_budget_refusal(loaded.context("loading p11_return"));
+        let text = format!("{mapped:#}");
+        assert!(!text.contains("counter-mode-unavailable-on-kernel"), "{text}");
+        assert!(
+            mapped.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.raw_os_error() == Some(libc::ENOSPC))),
+            "{text}"
+        );
+        let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
+        let started = super::map_counter_start_error(loaded.context("loading p11_return"));
+        let text = format!("{started:#}");
+        assert!(!text.contains("counter-mode-unavailable-on-kernel"), "{text}");
+        assert!(text.contains("CAP_BPF"), "{text}");
     }
 
     /// The C producer's bucket index must equal the shared `bucket_of` over

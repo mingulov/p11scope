@@ -116,12 +116,13 @@ impl RequestedTracker {
     fn insert(&mut self, pointer: usize, bytes: usize) {
         let start = Self::start(pointer);
         let mut available = None;
+        let mut collision = None;
         for offset in 0..TRACKED_BLOCK_LIMIT {
             let index = (start + offset) & (TRACKED_BLOCK_LIMIT - 1);
             let block = self.blocks[index];
             if block.state == 1 && block.pointer == pointer {
-                self.result.incomplete = true;
-                return;
+                collision = Some(index);
+                break;
             }
             if block.state != 1 && available.is_none() {
                 available = Some(index);
@@ -129,6 +130,16 @@ impl RequestedTracker {
             if block.state == 0 {
                 break;
             }
+        }
+        // One pointer is never live twice: a re-inserted pointer proves
+        // its old entry stale (its free was missed off-thread), so retire
+        // the stale charge and reuse its slot. Any peak recorded while
+        // the stale entry was live only over-counts.
+        if let Some(index) = collision {
+            let stale = self.blocks[index].bytes;
+            self.result.live_bytes = self.result.live_bytes.saturating_sub(stale);
+            self.result.live_blocks = self.result.live_blocks.saturating_sub(1);
+            available = Some(index);
         }
         let Some(index) = available else {
             self.result.incomplete = true;

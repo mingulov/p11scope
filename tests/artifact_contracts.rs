@@ -1144,11 +1144,24 @@ fn assert_live_discovery_host_contract(
         require_contract_marker(scope, marker, contract)?;
     }
 
+    // Counter captures start through the Engine's sibling `Session::start_counter`
+    // constructor, selected inside the same Engine-owned closure as the single
+    // `Session::start` call. Both funnel into `start_with_selected` with the
+    // same owned-child capability, so the Engine still owns exactly one start
+    // route per Session kind and one owned-child capability caller. Any
+    // additional route of either spelling, in any file, fails this contract.
     if main.contains("Session::start(")
+        || main.contains("Session::start_counter(")
         || run.contains("Session::start(")
+        || run.contains("Session::start_counter(")
         || engine.matches("Session::start(").count() != 1
+        || engine.matches("Session::start_counter(").count() != 1
         || engine
-            .matches("Session::start(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                )")
+            .matches("Session::start(\n                        plan,\n                        scope,\n                        pinned,\n                        policy,\n                        pause_generation.take(),\n                        ring_bytes,\n                        owned_child,\n                        backend,\n                    )")
+            .count()
+            != 1
+        || engine
+            .matches("Session::start_counter(\n                        plan,\n                        scope,\n                        pinned,\n                        policy,\n                        pause_generation.take(),\n                        ring_bytes,\n                        owned_child,\n                        backend,\n                        spec,\n                    )")
             .count()
             != 1
         || engine
@@ -1191,7 +1204,7 @@ fn assert_live_discovery_host_contract(
     }
     for (marker, contract) in [
         (
-            "let object_has_unsafe = cfg!(feature = \"unsafe-unvalidated-metadata\");",
+            "let object_has_unsafe = flavor.unsafe_present;",
             "object-feature inventory selection",
         ),
         (
@@ -6608,6 +6621,50 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         )
         .is_err(),
         "policy-map metadata must be validated before publication"
+    );
+    let second_start_route = engine.replacen(
+        "                    Session::start(\n",
+        "                    Session::start(\n                    Session::start(\n",
+        1,
+    );
+    assert_ne!(
+        engine, second_start_route,
+        "second start-route mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &events,
+            &hooks,
+            &second_start_route,
+            &main,
+            &run,
+        )
+        .unwrap_err(),
+        "Engine must own one shared Session::start route and one owned-child capability caller"
+    );
+    let escaped_counter_route = main.replacen(
+        "fn main() {",
+        "fn main() {\n    let _ = Session::start_counter(",
+        1,
+    );
+    assert_ne!(
+        main, escaped_counter_route,
+        "escaped counter-route mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &escaped_counter_route,
+            &run,
+        )
+        .unwrap_err(),
+        "Engine must own one shared Session::start route and one owned-child capability caller"
     );
 }
 

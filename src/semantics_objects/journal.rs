@@ -12308,6 +12308,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_session_exec_birth_recheck_withdraws_after_latch_or_cap() {
+        // M6: an accepted birth is withdrawn at the next take: the
+        // production recheck path re-runs the observation against
+        // current native rows, so a latch tripped (or the cap spent)
+        // after the first take refuses the second. Every row below
+        // is natively published; only the take count advances.
+        use crate::attach::{BirthObservationRefusal, ExecBirthSource};
+        use crate::semantics_objects::journal::BirthEvidenceSource;
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let (ready_row, control, _) =
+            publisher.publish_stamped(&["0", "1"], scene.closure_generation());
+        let mut first = ExecBirthSource::over(
+            NativeBirthRows {
+                row: ready_row,
+                control,
+            },
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        );
+        first.take_birth_evidence().expect("below-cap birth takes");
+        // The latch trips natively after the take (an admit/exec
+        // mismatch); the same process re-taken refuses.
+        let (_, latched, latched_wins) = publisher.publish(&["0", "1", "0", "1"]);
+        assert_eq!(latched_wins, 0, "mismatch admits nothing");
+        assert_eq!(latched.failed, 1, "mismatch trips the latch natively");
+        let mut retake = ExecBirthSource::over(
+            NativeBirthRows {
+                row: ready_row,
+                control: latched,
+            },
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        );
+        assert_eq!(
+            retake.take_birth_evidence(),
+            Err(BirthObservationRefusal::LatchTripped)
+        );
+        // Spending the cap natively after the take refuses the same way.
+        let (_, spent, _) = publisher.publish(&["0", "16384"]);
+        let mut capped = ExecBirthSource::over(
+            NativeBirthRows {
+                row: ready_row,
+                control: spent,
+            },
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        );
+        assert_eq!(
+            capped.take_birth_evidence(),
+            Err(BirthObservationRefusal::SpentExhausted)
+        );
+    }
+
+    #[test]
     fn object_journal_session_absence_birth_seals_on_quiet_history() {
         // Same native-positive selector now exercises actual collected H0,
         // the earlier genuine absence/cut and one retained witness.

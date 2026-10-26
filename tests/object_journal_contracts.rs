@@ -1092,3 +1092,119 @@ fn object_journal_marker_cap_matches_native() {
         "native and Rust marker caps must match"
     );
 }
+
+/// H8-D birth marker wiring: only the Detailed object carries the
+/// control map and the two marker globals; inventory and counter
+/// objects carry neither; no built object carries a transaction
+/// symbol (a linked transaction leaf would add its map or a
+/// `p11_journal_*` function). Counter objects are checked when this
+/// build produced them; every class present checks a nonzero
+/// object count, so the test cannot pass with an empty selection.
+#[test]
+fn object_journal_marker_wired_detailed_only() {
+    const MARKER_MAP: &str = "JOURNAL_MARKER_CTL";
+    const MARKER_GLOBALS: [&str; 2] = ["p11_instance_exec_birth", "p11_instance_scope_gap"];
+    const TRANSACTION_SYMBOLS: [&str; 4] = [
+        "JOURNAL_START",
+        "journal_thread",
+        "journal_sequence",
+        "object_journal",
+    ];
+    let counter_requested = match option_env!("P11SCOPE_COUNTER_ARTIFACTS") {
+        None | Some("0") => false,
+        Some("1") => true,
+        other => panic!("malformed private counter artifact request {other:?}"),
+    };
+    assert_eq!(
+        counter_requested,
+        match env!("P11SCOPE_COUNTER_ARTIFACTS_ENABLED") {
+            "0" => false,
+            "1" => true,
+            other => panic!("invalid private counter artifact selection {other:?}"),
+        },
+        "the emitted counter set must follow this compilation"
+    );
+    let mut counter_bodies = Vec::new();
+    if counter_requested {
+        for name in [
+            "p11scope-ebpf-counter-counts",
+            "p11scope-ebpf-counter-timestamps",
+            "p11scope-ebpf-counter-latency",
+        ] {
+            let path = std::path::Path::new(env!("OUT_DIR"))
+                .join("counter-artifacts")
+                .join(name);
+            counter_bodies.push(std::fs::read(&path).unwrap());
+        }
+    }
+    let detailed: Vec<(&str, &[u8])> = vec![("p11scope-ebpf", p11scope::EBPF_OBJECT)];
+    let inventory: Vec<(&str, &[u8])> = vec![
+        ("p11scope-ebpf-inventory", p11scope::EBPF_INVENTORY_OBJECT),
+        (
+            "p11scope-ebpf-inventory-callers",
+            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
+        ),
+    ];
+    let counter: Vec<(&str, &[u8])> = counter_bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| {
+            (
+                [
+                    "p11scope-ebpf-counter-counts",
+                    "p11scope-ebpf-counter-timestamps",
+                    "p11scope-ebpf-counter-latency",
+                ][index],
+                body.as_slice(),
+            )
+        })
+        .collect();
+    assert_eq!(detailed.len(), 1, "the Detailed class checks one object");
+    assert_eq!(inventory.len(), 2, "the inventory class checks two objects");
+    assert_eq!(
+        counter.len(),
+        if counter_requested { 3 } else { 0 },
+        "the counter class checks every built counter object"
+    );
+    for (class, objects, wired) in [
+        ("detailed", detailed.as_slice(), true),
+        ("inventory", inventory.as_slice(), false),
+        ("counter", counter.as_slice(), false),
+    ] {
+        for (name, bytes) in objects {
+            let object = aya_obj::Object::parse(bytes).expect("parse built object");
+            assert_eq!(
+                object.maps.contains_key(MARKER_MAP),
+                wired,
+                "{class} {name} marker map"
+            );
+            for global in MARKER_GLOBALS {
+                assert_eq!(
+                    object
+                        .functions
+                        .values()
+                        .any(|function| function.name == global),
+                    wired,
+                    "{class} {name} {global}"
+                );
+            }
+            let symbols: Vec<&str> = object
+                .maps
+                .keys()
+                .map(String::as_str)
+                .chain(
+                    object
+                        .functions
+                        .values()
+                        .map(|function| function.name.as_str()),
+                )
+                .collect();
+            for symbol in TRANSACTION_SYMBOLS {
+                assert!(
+                    !symbols.iter().any(|candidate| candidate.contains(symbol)),
+                    "{class} {name} carries transaction symbol {symbol}"
+                );
+            }
+        }
+    }
+}

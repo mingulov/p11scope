@@ -18,7 +18,7 @@
 //!   record through a pidfd, global/fault/sticky cells, image cookie) and the
 //!   hook programs' run/miss statistics.
 
-use super::{BPF_MAP_LOOKUP_ELEM, BpfMapElementAttr, bpf_map_element_syscall};
+use super::{BPF_MAP_LOOKUP_ELEM, BpfMapElementAttr, StaticRoots, bpf_map_element_syscall};
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
 use crate::discovery::instances::MappedFileIdentity;
 use crate::plan::Slot;
@@ -29,7 +29,8 @@ use aya::programs::fexit::FExitLinkId;
 use aya::programs::{FEntry, FExit};
 use aya::{Btf, Ebpf};
 use p11scope_ebpf_common::{
-    InstanceCalib, InstanceCounters, InstanceFileKey, InstanceRecord, instance,
+    InstanceCalib, InstanceCounters, InstanceFileKey, InstanceRecord, JournalAdmissionControl,
+    instance,
 };
 use p11scope_manifest::maps::ObjectKey;
 use std::collections::BTreeMap;
@@ -1167,6 +1168,16 @@ fn marker_row_or_refuse(
     row: Option<InstanceRecord>,
 ) -> std::result::Result<InstanceRecord, BirthRowError> {
     row.ok_or(BirthRowError::Unreadable)
+}
+
+/// Pure control-row verdict behind `prepare_marker_control` (stub:
+/// every verdict refuses until the freeze lands).
+fn marker_control_verdict(
+    _present: bool,
+    _roots: StaticRoots,
+    _readback: Option<JournalAdmissionControl>,
+) -> Result<()> {
+    bail!("marker control verdict unimplemented")
 }
 
 #[allow(dead_code)] // As above.
@@ -2318,6 +2329,68 @@ mod tests {
                 "{other:?} must not disable the hooks"
             );
         }
+    }
+
+    #[test]
+    fn marker_control_detailed_zero_readback_accepts() {
+        // H8-D: a Detailed session starts only over a zeroed
+        // control row; the freeze then seals it before any link.
+        let control = p11scope_ebpf_common::JournalAdmissionControl {
+            spent: 0,
+            failed: 0,
+        };
+        super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+            .expect("zero readback accepts");
+    }
+
+    #[test]
+    fn marker_control_detailed_spent_readback_refuses() {
+        // H8-D: a spent permit before links means the control
+        // moved early; the session refuses instead of starting.
+        let control = p11scope_ebpf_common::JournalAdmissionControl {
+            spent: 1,
+            failed: 0,
+        };
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn marker_control_detailed_latched_readback_refuses() {
+        // H8-D: a tripped latch before links refuses the session.
+        let control = p11scope_ebpf_common::JournalAdmissionControl {
+            spent: 0,
+            failed: 1,
+        };
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn marker_control_detailed_absent_map_refuses() {
+        // H8-D: a Detailed object without the map is a stale
+        // build; the session refuses instead of running blind.
+        assert!(super::marker_control_verdict(false, super::StaticRoots::Detailed, None).is_err());
+    }
+
+    #[test]
+    fn marker_control_counter_present_refuses() {
+        // H8-D: counter bank objects must not carry the marker
+        // map; a session over one refuses.
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::CounterBanks, None).is_err()
+        );
+    }
+
+    #[test]
+    fn marker_control_counter_absent_accepts() {
+        // H8-D: the healthy counter twin of the refusal above.
+        super::marker_control_verdict(false, super::StaticRoots::CounterBanks, None)
+            .expect("counter banks without the map accept");
     }
 
     #[test]

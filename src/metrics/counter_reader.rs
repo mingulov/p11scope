@@ -4736,8 +4736,10 @@ mod tests {
     const SOFT1024_DONE_MARKER: &str = "P11SCOPE_SOFT1024_CHILD_DONE";
 
     /// The exact bytes the re-executed child prints after `body()` returns.
+    /// The leading newline ends libtest's `--nocapture` progress line, so
+    /// the marker stands on its own line for the parent's exact match.
     fn soft1024_child_marker_line(cell: &str) -> String {
-        format!("{SOFT1024_DONE_MARKER} {cell}\n")
+        format!("\n{SOFT1024_DONE_MARKER} {cell}\n")
     }
 
     fn soft_nofile() -> u64 {

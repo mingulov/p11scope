@@ -40,7 +40,7 @@ DEFAULT_MIN_HEADROOM_PERCENT = 5.0
 # Expected bpf_loop (helper 181) functional-probe shape: `call 181; exit`
 # (src/attach.rs BPF_LOOP_PROBE_INSNS), plain kprobe type, never attached.
 # doctor runs it for the counter-modes footer; 5.15 refuses the unknown
-# helper (EINVAL) and 6.1 refuses the uninitialized registers (EACCES).
+# helper (EINVAL) and 6.1 and later refuse the uninitialized registers (EACCES).
 # Both are expected product behavior, reported as EXPECTED. The fingerprint
 # is pinned against the source bytes by the gate suite; any drift in shape
 # or errno fails like any other refused load.

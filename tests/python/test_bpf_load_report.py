@@ -365,7 +365,7 @@ class ReportTests(unittest.TestCase):
 
     def bpf_loop_probe_row(self, errno):
         # The controller-allowlisted functional probe shape: `call 181;
-        # exit`, kprobe type, refused (5.15 EINVAL, 6.1 EACCES).
+        # exit`, kprobe type, refused (5.15 EINVAL, 6.1 and later EACCES).
         row = load_row("unresolved", loaded=False, errno=errno,
                        stats_present=False, processed=0)
         row.update({"program_type": 2, "insn_count": 2,

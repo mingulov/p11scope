@@ -3774,15 +3774,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // stages, so a repeated refresh is free and several reads per
         // commit stay sound.
         for (key, caller, module, endpoint, object, count, staged_abs, staged_ns) in recheck {
-            // Once current retirement authority is involved, its exact guards and
-            // immutable fence decide growth in the single reconciliation slice.
-            if self
-                .recoveries
-                .get(&key)
-                .is_some_and(|recovery| recovery.blocked || recovery.deferred_count)
-            {
-                continue;
-            }
             let admitted = self.update_modules_for_endpoint(endpoint, object);
             let confirmed = match &admitted {
                 Ok(modules) => {
@@ -3807,6 +3798,46 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Err(()) => false,
             };
             if confirmed {
+                // Once current retirement authority is involved, its exact
+                // guards and immutable fence decide growth in the single
+                // reconciliation slice. Sticky deferral alone is not
+                // involvement — but the excuse needs the pair's own origin
+                // to be current: a stale-rooted read must fence, never
+                // borrow current summary state for ordinary authority. In
+                // a lane whose ownership never resolves, every advance
+                // defers, and that permanent deferral must not veto this
+                // present-tense proof for a current pair — otherwise every
+                // rowless refresh stalls and later discloses as
+                // owner-unproven. A genuine block still skips.
+                let held = match self.recoveries.get(&key) {
+                    Some(recovery) if recovery.blocked => true,
+                    Some(recovery) if !recovery.deferred_count => false,
+                    Some(recovery) if self.retirement_exit_clean(key, recovery) => {
+                        // A clean exit freezes the pair's history: its
+                        // origin was current at death, so post-death
+                        // summary churn must not veto the terminal read's
+                        // present-tense proof. Carrier disagreement,
+                        // blocks and armed retirement already exclude a
+                        // clean exit above and keep the cancel path.
+                        false
+                    }
+                    Some(recovery) => {
+                        let ownership = self.count_ownership.ordinary_view(caller, key.object);
+                        let changed = matches!(
+                            ownership.candidate,
+                            Some(CurrentCandidates::Sole { module, .. })
+                            if self.registry.module_id_for(module) != Some(recovery.carrier)
+                        );
+                        Self::retirement_armed(recovery)
+                            || recovery.ordinary_checkpoint == 0
+                            || recovery.ordinary_checkpoint != ownership.sequence
+                            || changed
+                    }
+                    None => false,
+                };
+                if held {
+                    continue;
+                }
                 // Only an advance past the absolute staged so far stages
                 // (round 4, re-place): growth stages rebased past the
                 // staged absolute and the publication accumulates it
@@ -3842,6 +3873,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         *base_since = count.anchor_ns;
                     }
                 }
+                continue;
+            }
+            // An unproven read demotes only when retirement is not
+            // deferring it: an early demote would bypass the fence that
+            // keeps the first advance for the transition owner.
+            if self
+                .recoveries
+                .get(&key)
+                .is_some_and(|recovery| recovery.blocked || recovery.deferred_count)
+            {
                 continue;
             }
             let modules = admitted.unwrap_or_default();
@@ -3912,6 +3953,56 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Constant indexed work for this actual update only: normalize at most
     /// three receipt tags before capturing the current receipt's first advance.
+    /// A retired-with-proven-exit caller whose pair was never disowned is
+    /// not a retirement boundary: its terminal growth is pre-exit history
+    /// on a sole-continuous owner, and the pair stays Bound so the
+    /// ordinary confirmed arm can stage it. Anything else (armed
+    /// retirement, a blocked recovery, a disagreeing carrier, an unproven
+    /// origin, an exec transition, reuse or loss) keeps the conservative
+    /// cancel path. Sticky lifetime deferral is not consulted: in the
+    /// scan lane the candidate is always Unknown, so every lifetime
+    /// advance defers.
+    fn retirement_exit_clean(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        // Note: deferred_count is sticky from life (in the scan lane the
+        // candidate is always Unknown, so every advance defers) and must
+        // not veto a clean exit. Genuine sharing still blocks through
+        // `blocked`, an armed transition still cancels through `armed`,
+        // a carrier disagreement still cancels below, and the terminal
+        // read still needs the ordinary confirmed-arm proof (admitted ==
+        // edged == cached) to place.
+        if recovery.ordinary_checkpoint == 0 || recovery.blocked || Self::retirement_armed(recovery)
+        {
+            return false;
+        }
+        let ownership = self
+            .count_ownership
+            .ordinary_view(recovery.caller, key.object);
+        let changed = matches!(
+            ownership.candidate,
+            Some(CurrentCandidates::Sole { module, .. })
+            if self.registry.module_id_for(module) != Some(recovery.carrier)
+        );
+        !changed
+            && self.adapter.record(recovery.caller).is_some_and(|record| {
+                record.retired
+                    && record.lifecycle
+                        == crate::discovery::caller_registry::CallerLifecycle::Exited
+            })
+    }
+
+    /// Whether the retirement authority holds live state for this pair: an
+    /// epoch (armed or pending), a fence, or a refused receipt. Sticky
+    /// `deferred_count` alone is not arming, nor are tagged reads (saved
+    /// advances stay inert until an epoch consumes them): in a lane whose
+    /// ownership never resolves, every advance defers and tags, and that
+    /// permanent deferral must not veto present-tense ordinary proof.
+    fn retirement_armed(recovery: &PairRecovery) -> bool {
+        recovery.epoch.is_some()
+            || recovery.epoch_pending
+            || recovery.fence.is_some()
+            || recovery.receipt_refused
+    }
+
     fn remember_retirement_advance(&mut self, key: PairKey, count: PairCount, advanced: bool) {
         let Some(recovery) = self.recoveries.get(&key) else {
             return;
@@ -4848,8 +4939,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             .is_some_and(|(_, pin)| self.adapter.source().still_the_same(pin))
                 })
                 .cloned();
+            // A clean exit excuses only the liveness leg: the caller's death
+            // ends observation, it does not unprove the sole owner. Refusals,
+            // domain loss and capture loss still cancel.
+            let exit_clean = self.retirement_exit_clean(key, &recovery);
             let canceled = recovery.receipt_refused
-                || live.is_none()
+                || (live.is_none() && !exit_clean)
                 || !self.binder.domain_active(key.image.domain())
                 || self.capture.as_ref().is_some_and(|capture| {
                     capture.stopped
@@ -4895,7 +4990,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 } else {
                     DiagnosticReason::OwnershipUnknown
                 };
-                if !self.count_ownership.deferred(recovery.caller, key.object)
+                // A clean exit excuses this cancel too: the caller's death
+                // ends observation, it does not unprove the sole owner,
+                // and the pair stays Bound so the terminal read can still
+                // place through the ordinary confirmed-arm proof. Any
+                // genuine recovery (epoch, block, refusal) still cancels
+                // above; an unprovable terminal read simply does not place.
+                if !exit_clean
+                    && !self.count_ownership.deferred(recovery.caller, key.object)
                     && (recovery.blocked || recovery.deferred_count || recovery.epoch.is_some())
                 {
                     self.cancel_retirement_candidate(key, &mut recovery, held, reason);

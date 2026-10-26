@@ -643,6 +643,29 @@ impl CountOwnership {
             view.startup = true;
             return view;
         }
+        // A newly registered summary has no completed owner yet, so its
+        // first result cannot contradict any earlier one. When the slot and
+        // the membership index are clean, the origin sequence is the initial
+        // sequence even though scan evidence already flows and the bounded
+        // index may still be building: any later invalidation (a non-sole
+        // result, a failure, a carrier change) still revokes continuity
+        // through the sequence. Without this, every pair whose first count
+        // stages after catalog observations exist takes checkpoint 0 and can
+        // never count ordinarily, so steady sole growth is fenced.
+        let initial_fresh = summary.ordinary_sequence == 1
+            && summary.result_caller_epoch.is_none()
+            && !summary.finished;
+        if initial_fresh
+            && self.pass.is_some()
+            && slot.is_some_and(|slot| slot.live && slot.last_authority_failure == 0)
+            && index.is_none_or(|index| {
+                !index.refused && !index.unknown && index.last_authority_failure == 0
+            })
+        {
+            view.sequence = 1;
+            view.origin_after = slot.map(|slot| slot.newest_accepted_post);
+            return view;
+        }
         let Some(slot) = slot.filter(|slot| {
             slot.live
                 && slot.valid

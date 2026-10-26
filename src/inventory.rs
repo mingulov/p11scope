@@ -16246,6 +16246,106 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_stop_during_winding_disposition_tick_after_stop_discloses_once() {
+        use crate::inventory_semantics::SemanticRefusal;
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A disposition latched on the winding lane before the stop, then
+        // a stray tick past the stop: the tick's exit hold must not
+        // disclose the lane's counts again — the stop already did.
+        // Production never ticks past the stop; the disclosed flag keeps
+        // even a stray tick silent on the hold path too.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        let counts = scripted_nonzero_stop_counts();
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver.semantic = Some(lane);
+        install_promotion_for_wind_down(&mut driver);
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        assert!(
+            take_warned_for_test().is_empty(),
+            "no disclosure at wind-down start"
+        );
+        assert_eq!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Polling,
+            "the scripted begin leaves the winding finish polling"
+        );
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        driver.on_stop_requested();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the stop discloses the winding lane once"
+        );
+        driver.on_tick();
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the stray tick discloses nothing more for the stopped winding"
+        );
+        assert_eq!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .finish,
+            JointFinishDriver::Abandoned,
+            "the stray tick holds the winding lane for exit"
+        );
+        assert!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .lane
+                .is_none(),
+            "the hold takes the winding lane"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one scan-refusal gap");
+        assert_eq!(
+            scans[0].1,
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts.refusal_counts)
+                .expect("nonzero refusals name a reason"),
+            "the gap carries the winding lane's per-reason counts"
+        );
+        let held = committed_gaps_by_subject(&mut driver, "promotion wind-down held for exit");
+        assert_eq!(held.len(), 1, "the held-for-exit gap records once");
+    }
+
+    #[test]
     fn joint_stop_during_winding_after_join_discloses_nothing_more() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.

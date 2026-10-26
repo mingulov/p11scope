@@ -19,6 +19,12 @@ against budget keys of that form, and the budgeted-but-missing check is
 scoped to ``NAME/`` keys, so two BPF objects sharing program names (the
 Detailed and Inventory objects share ten) are gated from separate probe
 files without mixing their counts.
+
+One refused shape is expected, never a failure: the 2-instruction
+``bpf_loop`` (helper 181) capability probe that ``doctor`` runs for its
+counter-modes footer. It is allowlisted by exact shape (fingerprint and
+program type) and reported as ``EXPECTED``; any other refused load
+still fails.
 """
 
 import argparse
@@ -30,6 +36,18 @@ sys.dont_write_bytecode = True
 
 DEFAULT_LIMIT = 1000000
 DEFAULT_MIN_HEADROOM_PERCENT = 5.0
+
+# Expected bpf_loop (helper 181) functional-probe shape: `call 181; exit`
+# (src/attach.rs BPF_LOOP_PROBE_INSNS), plain kprobe type, never attached.
+# doctor runs it for the counter-modes footer; 5.15 refuses the unknown
+# helper (EINVAL) and 6.1 refuses the uninitialized registers (EACCES).
+# Both are expected product behavior, reported as EXPECTED. The fingerprint
+# is pinned against the source bytes by the gate suite; any drift in shape
+# or errno fails like any other refused load.
+BPF_LOOP_PROBE_FNV1A64 = "27ef27a73ecc6270"
+BPF_LOOP_PROBE_PROGRAM_TYPE = 2  # BPF_PROG_TYPE_KPROBE, linux/bpf.h.
+BPF_LOOP_PROBE_INSN_COUNT = 2
+BPF_LOOP_PROBE_EXPECTED_ERRNOS = frozenset({22, 13})  # EINVAL, EACCES.
 
 
 class ReportError(RuntimeError):
@@ -94,9 +112,28 @@ def checked_load(row):
         raise ReportError(f"{root}: stats_present is not a boolean")
     if type(processed) is not int or type(limit) is not int:
         raise ReportError(f"{root}: processed/limit are not integers")
+    program_type = row.get("program_type")
+    insn_count = row.get("insn_count")
+    fingerprint = row.get("relocated_fnv1a64")
     return {"root": root, "loaded": loaded, "errno": row["errno"],
             "stats": stats, "processed": processed, "limit": limit,
-            "auxiliary": row.get("auxiliary")}
+            "auxiliary": row.get("auxiliary"),
+            "program_type": program_type if type(program_type) is int else None,
+            "insn_count": insn_count if type(insn_count) is int else None,
+            "fingerprint": fingerprint if type(fingerprint) is str else None}
+
+
+def is_expected_bpf_loop_probe(entries):
+    """True only when every entry is the exact allowlisted probe refusal."""
+    if not entries:
+        return False
+    return all(entry["root"] == "unresolved"
+               and entry["loaded"] is False
+               and entry["program_type"] == BPF_LOOP_PROBE_PROGRAM_TYPE
+               and entry["insn_count"] == BPF_LOOP_PROBE_INSN_COUNT
+               and entry["fingerprint"] == BPF_LOOP_PROBE_FNV1A64
+               and entry["errno"] in BPF_LOOP_PROBE_EXPECTED_ERRNOS
+               for entry in entries)
 
 
 def read_budgets(path):
@@ -153,7 +190,11 @@ def evaluate(loads, kernel, budgets, object_name=None):
                        detail=f"bad count processed={processed} limit={row['limit']}")
         elif any(not entry["loaded"] for entry in entries):
             errnos = sorted({entry["errno"] for entry in entries if not entry["loaded"]})
-            row.update(status="FAIL", detail=f"refused errno={errnos[0]}")
+            if is_expected_bpf_loop_probe(entries):
+                row.update(status="EXPECTED",
+                           detail=f"expected bpf_loop probe refusal errno={errnos[0]}")
+            else:
+                row.update(status="FAIL", detail=f"refused errno={errnos[0]}")
         elif any(not entry["stats"] for entry in entries):
             row.update(status="FAIL",
                        detail=f"no verifier stats on {kernel}")
@@ -189,7 +230,8 @@ def headroom_text(row):
 
 
 def format_table(rows, kernel, observer_sha256, errors):
-    failed = bool(errors) or any(row["status"] != "PASS" for row in rows)
+    failed = (bool(errors)
+              or any(row["status"] not in ("PASS", "EXPECTED") for row in rows))
     if not rows and not errors:
         errors = [f"no probe rows on {kernel}"]
         failed = True
@@ -238,7 +280,8 @@ def main(argv=None):
         except ReportError as error:
             errors.append(str(error))
     sys.stdout.write(format_table(rows, args.kernel, args.observer_sha256, errors))
-    failed = bool(errors) or any(row["status"] != "PASS" for row in rows)
+    failed = (bool(errors)
+              or any(row["status"] not in ("PASS", "EXPECTED") for row in rows))
     return 1 if failed else 0
 
 

@@ -32,12 +32,9 @@
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
 # defaults, p11_image_query, 4 instance hooks), scored against their
 # per-kernel per-object budgets, and the 12 Inventory programs the
-# system inventory loads, load-gated (loaded + stats + 5% headroom)
-# but not growth-budgeted: the Inventory object does not load on
-# 5.15/6.1 (interface_list_worker exceeds the old verifier budget),
-# so no 6-kernel budget column exists to pin. Pinning the 12 Inventory
-# budgets is the follow-up once that product bug is fixed; until then
-# the 5.15/6.1 refusal rows stay visible FAILs. Known gaps, not gated:
+# system inventory loads, scored against their own per-kernel
+# per-object budgets. Both sides fail on a refused load, a missing
+# probe row, or a count over budget. Known gaps, not gated:
 # p11_selected_bootstrap (loads only for a promoted live process, which
 # needs a provider mapped in the guest), the dormant
 # p11_selected_cgroup_migrate (present in the object, no load call
@@ -233,12 +230,16 @@ for KERNEL in "$@"; do
             FAILED=1
         fi
     fi
-    # The inventory side takes no budgets file: until the 5.15/6.1
-    # verifier bug is fixed there is no 6-kernel column to pin, and
-    # passing the file would fail every loaded row as unbudgeted.
-    if ! python3 -I "$REPORT" --object inventory --kernel "$KERNEL" \
-        --observer-sha256 "$OBSERVER_SHA" "$INV_PROBE_JSON"; then
-        FAILED=1
+    if [ -n "$BUDGETS" ]; then
+        if ! python3 -I "$REPORT" --budgets "$BUDGETS" --object inventory --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$INV_PROBE_JSON"; then
+            FAILED=1
+        fi
+    else
+        if ! python3 -I "$REPORT" --object inventory --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$INV_PROBE_JSON"; then
+            FAILED=1
+        fi
     fi
 done
 

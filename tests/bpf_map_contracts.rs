@@ -172,7 +172,7 @@ fn native_bpf_map_decoder_contracts() {
 }
 
 /// H8-D birth marker twins: the freeze and call-site checks run here so
-/// CI pins all eighteen without a live object.
+/// CI pins all twenty-one without a live object.
 #[test]
 fn embedded_birth_marker_twins_are_driven() {
     let cases = [
@@ -194,6 +194,9 @@ fn embedded_birth_marker_twins_are_driven() {
         "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_continuation_refused",
         "JournalMarkerCallSiteTests.test_marker_call_dropped_from_exec_refused",
         "JournalMarkerCallSiteTests.test_marker_call_dropped_from_exit_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_types_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_pair_refused",
     ];
     let output = Command::new("python3")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -207,6 +210,6 @@ fn embedded_birth_marker_twins_are_driven() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.status.success(), "birth marker twins: {report}");
-    assert!(report.contains("Ran 18 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 21 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped marker proof: {report}");
 }

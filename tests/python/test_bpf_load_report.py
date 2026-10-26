@@ -584,7 +584,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("FAILED=1", rc_case)
         self.assertNotIn("continue", rc_case)
         crash_idx = text.index("counter-$MODE profile crashed or left no log")
-        crash_block = text[crash_idx:text.index("fi", crash_idx)]
+        crash_end = text.index("\n                fi", crash_idx)
+        crash_block = text[crash_idx:crash_end]
         self.assertIn("FAILED=1", crash_block)
         self.assertNotIn("continue", crash_block)
 

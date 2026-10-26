@@ -3,7 +3,7 @@
 # Load the real observer's BPF programs inside throwaway vng guests and
 # report every program's verifier cost per kernel.
 #
-# Usage: check-bpf-load-kernels.sh [--budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]
+# Usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]
 #
 # OBSERVER is the prebuilt observer under test, PROBE the verifier-stats
 # probe built by `measure-verifier-headroom.py build`, OUTDIR a directory
@@ -11,8 +11,10 @@
 # Default kernels: v5.15.221 v6.1.188 v6.6.157 v6.12.111 v6.18.58.
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json
 # when that file exists, so a budgeted program with no probe row FAILs
-# without any flag. Exits 0 only when every kernel passes; a timeout, a
-# missing count or a nonzero report is FAIL.
+# without any flag. --counter-budgets defaults to the checked-in
+# tests/counter-bpf-verifier-budgets.json the same way. Exits 0 only when
+# every kernel passes; a timeout, a missing count or a nonzero report
+# is FAIL.
 #
 # Per kernel five throwaway guests run one command each under the probe:
 # `doctor` (Detailed object, probe-K.jsonl), a bounded
@@ -42,15 +44,15 @@
 # system inventory loads, scored against their own per-kernel
 # per-object budgets. Both sides fail on a refused load, a missing
 # probe row, or a count over budget. Per counter mode the 2 bank
-# roots the profile run loads, scored per object (counter-<mode>) for
-# loaded + stats + 5% headroom on kernels that load them; numeric
-# per-kernel bank budgets stay unpinned until a measured gate run
-# supplies processed counts (a separate budgets file with its own kernel
-# set, since the main file's shape pin requires one kernel set for every
-# program). 5.15 refuses before loading (no bpf_loop) and 6.1 refuses at
-# load (verifier E2BIG); both keep the specified
-# counter-mode-unavailable-on-kernel refusal, and the gate passes those
-# kernels only when the observer log names it. Known gaps, not gated:
+# roots the profile run loads, scored per object (counter-<mode>) against
+# the numeric per-kernel bank budgets in
+# tests/counter-bpf-verifier-budgets.json (a separate file with its own
+# kernel set, since the main file's shape pin requires one kernel set
+# for every program), so a missing program or growth FAILs. 5.15 refuses
+# before loading (no bpf_loop) and 6.1 refuses at load (verifier E2BIG);
+# both keep the specified counter-mode-unavailable-on-kernel refusal, and
+# the gate passes those kernels only when the observer log names it and
+# no bank program loaded. Known gaps, not gated:
 # p11_selected_bootstrap (loads only for a promoted live process, which
 # needs a provider mapped in the guest), the dormant
 # p11_selected_cgroup_migrate (present in the object, no load call
@@ -61,6 +63,7 @@
 set -eu
 
 BUDGETS=""
+COUNTER_BUDGETS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --budgets)
@@ -70,6 +73,15 @@ while [ $# -gt 0 ]; do
             ;;
         --budgets=*)
             BUDGETS="${1#--budgets=}"
+            shift
+            ;;
+        --counter-budgets)
+            [ $# -ge 2 ] || { echo "missing value for --counter-budgets" >&2; exit 2; }
+            COUNTER_BUDGETS="$2"
+            shift 2
+            ;;
+        --counter-budgets=*)
+            COUNTER_BUDGETS="${1#--counter-budgets=}"
             shift
             ;;
         --)
@@ -86,7 +98,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ $# -lt 3 ]; then
-    echo "usage: check-bpf-load-kernels.sh [--budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]" >&2
+    echo "usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]" >&2
     exit 2
 fi
 OBSERVER=$1
@@ -101,6 +113,9 @@ REPORT="$SCRIPT_DIR/bpf-load-report.py"
 if [ -z "$BUDGETS" ] && [ -f "$SCRIPT_DIR/../tests/bpf-verifier-budgets.json" ]; then
     BUDGETS="$SCRIPT_DIR/../tests/bpf-verifier-budgets.json"
 fi
+if [ -z "$COUNTER_BUDGETS" ] && [ -f "$SCRIPT_DIR/../tests/counter-bpf-verifier-budgets.json" ]; then
+    COUNTER_BUDGETS="$SCRIPT_DIR/../tests/counter-bpf-verifier-budgets.json"
+fi
 
 [ -f "$OBSERVER" ] || { echo "observer not found: $OBSERVER" >&2; exit 2; }
 [ -f "$PROBE" ] || { echo "probe not found: $PROBE" >&2; exit 2; }
@@ -110,12 +125,21 @@ if [ -n "$BUDGETS" ] && [ ! -f "$BUDGETS" ]; then
     echo "budgets not found: $BUDGETS" >&2
     exit 2
 fi
+if [ -n "$COUNTER_BUDGETS" ] && [ ! -f "$COUNTER_BUDGETS" ]; then
+    echo "counter budgets not found: $COUNTER_BUDGETS" >&2
+    exit 2
+fi
 command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 2; }
 
 OBSERVER_SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
 echo "# observer: $OBSERVER"
 echo "# observer-sha256: $OBSERVER_SHA"
 echo "# probe: $PROBE"
+if [ -n "$COUNTER_BUDGETS" ]; then
+    echo "# counter-budgets: $COUNTER_BUDGETS"
+else
+    echo "# counter-budgets: none (gate is loaded + stats + 5% headroom)"
+fi
 if [ -n "$BUDGETS" ]; then
     echo "# budgets: $BUDGETS"
 else
@@ -309,15 +333,38 @@ for KERNEL in "$@"; do
                     FAILED=1
                     continue
                 fi
+                if grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
+                    echo "# error: counter-$MODE profile crashed on $KERNEL (see $C_TXT)"
+                    FAILED=1
+                    continue
+                fi
                 if [ ! -f "$C_PROBE_JSON" ] || ! grep -q -E '"record": ?"probe-summary"' "$C_PROBE_JSON"; then
                     echo "# error: counter-$MODE probe never finished on $KERNEL (see $C_VNG_LOG)"
                     FAILED=1
                     continue
                 fi
+                if grep -q -E '"loaded": ?true' "$C_PROBE_JSON"; then
+                    echo "# error: counter-$MODE on $KERNEL loaded where refusal was specified (see $C_PROBE_JSON)"
+                    FAILED=1
+                    continue
+                fi
                 REFUSED=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" | wc -l)
+                case "$KERNEL" in
+                    v6.1.*)
+                        if [ "$REFUSED" -eq 0 ]; then
+                            echo "# error: counter-$MODE on $KERNEL left no at-load refusal rows (expected E2BIG)"
+                            FAILED=1
+                            continue
+                        fi
+                        ;;
+                esac
                 echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED)"
                 ;;
             *)
+                # A failed counter run still falls through to per-program
+                # scoring like inventory does: the probe rows name the
+                # refused program. Only infrastructure failures above skip
+                # the mode; a wrong-kernel guest never reaches scoring.
                 case "$C_RC" in
                     0)
                         echo "# counter-$MODE rc=0 on $KERNEL"
@@ -325,21 +372,23 @@ for KERNEL in "$@"; do
                     *)
                         echo "# error: counter-$MODE profile exited rc=$C_RC on $KERNEL (see $C_TXT)"
                         FAILED=1
-                        continue
                         ;;
                 esac
                 if [ ! -f "$C_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
                     echo "# error: counter-$MODE profile crashed or left no log on $KERNEL (see $C_VNG_LOG)"
                     FAILED=1
-                    continue
                 fi
-                # No budgets file yet: numeric bank budgets stay unpinned
-                # until a measured run supplies processed counts, so the
-                # gate is loaded + stats + 5% headroom under this mode's
-                # object name (the three bank objects share root names).
-                if ! python3 -I "$REPORT" --object "counter-$MODE" --kernel "$KERNEL" \
-                    --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
-                    FAILED=1
+                if [ -n "$COUNTER_BUDGETS" ]; then
+                    # No word splitting: the budgets path stays quoted in its own arm.
+                    if ! python3 -I "$REPORT" --budgets "$COUNTER_BUDGETS" --object "counter-$MODE" --kernel "$KERNEL" \
+                        --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
+                        FAILED=1
+                    fi
+                else
+                    if ! python3 -I "$REPORT" --object "counter-$MODE" --kernel "$KERNEL" \
+                        --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
+                        FAILED=1
+                    fi
                 fi
                 ;;
         esac

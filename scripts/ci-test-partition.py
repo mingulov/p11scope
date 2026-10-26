@@ -806,6 +806,24 @@ def self_test():
         ("example", "examples/example.rs"), ("alpha", "tests/alpha.rs"),
         ("beta", "tests/beta.rs"), ("zeta", "tests/zeta.rs"),
     }
+    # Benches run under `--benches` even with `test = false`, so a
+    # test=false bench is expected like the test=false example above;
+    # test=false lib/bin targets never run under the rest selection.
+    with_bench = _fake_metadata([{
+        "name": "criterion-bench", "kind": ["bench"], "test": False,
+        "src_path": "/fake/member/benches/criterion-bench.rs",
+    }])
+    assert ("criterion_bench", "benches/criterion-bench.rs") in \
+        rest_expected_targets(with_bench)
+    not_built = _fake_metadata([
+        {"name": "member-lib", "kind": ["lib"], "test": False,
+         "src_path": "/fake/member/src/lib.rs"},
+        {"name": "member-bin", "kind": ["bin"], "test": False,
+         "src_path": "/fake/member/src/main.rs"},
+    ])
+    selected = rest_expected_targets(not_built)
+    assert ("member_lib", "src/lib.rs") not in selected
+    assert ("member_bin", "src/main.rs") not in selected
     zero = _FakeRest([
         ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
         ("zeta-1a2b3c4d5e6f7892", "tests/zeta.rs", (0, 0, 0, 0)),

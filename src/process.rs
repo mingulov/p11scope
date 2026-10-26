@@ -1373,6 +1373,50 @@ fn pidfd_ready(fd: &OwnedFd) -> io::Result<bool> {
 }
 
 fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
+    pidfd_poll_retry_with(timeout_ms, std::time::Instant::now, |timeout| {
+        poll_pidfd_once(fd, timeout)
+    })
+}
+
+/// Retries an interrupted pidfd readiness poll, preserving the caller's
+/// timeout: a non-blocking probe (0) and an infinite wait (negative)
+/// retry the same timeout, while a finite wait retries against a
+/// deadline, so signals can never stretch it into an infinite one.
+/// Only `Interrupted` retries; any other failure propagates unchanged.
+fn pidfd_poll_retry_with(
+    timeout_ms: i32,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut poll: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    if timeout_ms <= 0 {
+        loop {
+            match poll(timeout_ms) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+    let start = now();
+    let deadline = start
+        .checked_add(std::time::Duration::from_millis(timeout_ms as u64))
+        .unwrap_or(start);
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let remaining_ms = remaining
+            .as_millis()
+            .max(1)
+            .min(u128::from(i32::MAX as u32)) as i32;
+        match poll(remaining_ms) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn poll_pidfd_once(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
     let mut pollfd = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
@@ -1520,6 +1564,7 @@ pub(crate) fn stat_flags_from_stat_text(stat: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::os::unix::process::CommandExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
@@ -1816,6 +1861,81 @@ mod tests {
     fn timeout_zero_exit_probes_without_signals_report_a_live_child() {
         let (pin, _child) = live_pin_and_child();
         assert_eq!(pin.original_exited(), Ok(false));
+    }
+
+    /// Scripted twin of the live probe test: interrupted non-blocking
+    /// polls retry with the same timeout until one succeeds.
+    #[test]
+    fn pidfd_poll_retries_interrupted_probes_until_one_succeeds() {
+        let scripted = RefCell::new(VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Ok(false),
+        ]));
+        let seen = RefCell::new(Vec::new());
+        let ready = pidfd_poll_retry_with(0, Instant::now, |timeout| {
+            seen.borrow_mut().push(timeout);
+            scripted.borrow_mut().pop_front().expect("a scripted poll")
+        })
+        .expect("retries end in the scripted result");
+        assert!(!ready);
+        assert_eq!(*seen.borrow(), vec![0, 0, 0]);
+    }
+
+    /// A finite wait under constant interruption still ends at its
+    /// deadline: signals retry, they never stretch the wait into an
+    /// infinite one.
+    #[test]
+    fn pidfd_poll_stops_retrying_a_finite_wait_at_its_deadline() {
+        let start = Instant::now();
+        let ticks = Cell::new(0u32);
+        let seen = RefCell::new(Vec::new());
+        let ready = pidfd_poll_retry_with(
+            500,
+            || {
+                let tick = ticks.get();
+                ticks.set(tick + 1);
+                start + Duration::from_millis(u64::from(tick) * 100)
+            },
+            |timeout| {
+                seen.borrow_mut().push(timeout);
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            },
+        )
+        .expect("an expired deadline is a timeout, not an error");
+        assert!(!ready);
+        let seen = seen.borrow();
+        assert!(
+            seen.len() <= 7,
+            "retries stop at the deadline: {} polls",
+            seen.len()
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair[1] <= pair[0]),
+            "remaining timeouts never grow: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|timeout| *timeout > 0),
+            "a live deadline always polls positively: {seen:?}"
+        );
+    }
+
+    /// Only interruption retries: any other poll failure propagates with
+    /// its kind intact, after the interruptions before it.
+    #[test]
+    fn pidfd_poll_propagates_non_interrupt_errors_unchanged() {
+        let scripted = RefCell::new(VecDeque::from([
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        ]));
+        let calls = Cell::new(0u32);
+        let error = pidfd_poll_retry_with(0, Instant::now, |_| {
+            calls.set(calls.get() + 1);
+            scripted.borrow_mut().pop_front().expect("a scripted poll")
+        })
+        .expect_err("a non-interrupt failure must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.get(), 2);
     }
 
     /// Mutation caught: classifying a changed `/proc` start time as an exit

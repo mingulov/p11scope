@@ -522,7 +522,30 @@ fn collected_budgets(
             .checked_add(partitions.checked_mul(OWNED_ALLOCATION_PADDING)?)?
             .checked_add(partitions.checked_mul(watched_bound)?)
     })()?;
-    let nested_limit = tick_nested.checked_add(stashed_nested)?;
+    // The binder runs after the reservation measured the stash and leaves
+    // up to REFRESHES_PER_BIND receipts there, each within
+    // nested_per_receipt by the merge-time per-receipt check. Reserve four
+    // full per-receipt allowances so any four post-reservation receipts
+    // fit regardless of id overlap with the tick scans.
+    let binder_margin = REFRESHES_PER_BIND.checked_mul(nested_per_receipt)?;
+    // Outcome-owned invalidation id lists merge into the same accumulator
+    // with no receipt of their own, so they need their own bounded term:
+    // at most one id list per merged outcome (merged outcomes are capped
+    // at MAX_INSTANCES by the count checks), the lists together name at
+    // most MAX_INSTANCES distinct minted ids (observation losses name
+    // evicted keys, prior-id invalidations name live keys, disjoint
+    // within the mint budget), each collected with the pinned growth law.
+    let outcome_nested = (|| {
+        MAX_INSTANCES
+            .checked_mul(2)?
+            .checked_add(MAX_INSTANCES.checked_mul(4)?)?
+            .checked_mul(size_of::<InstanceId>())?
+            .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
+    })()?;
+    let nested_limit = tick_nested
+        .checked_add(stashed_nested)?
+        .checked_add(binder_margin)?
+        .checked_add(outcome_nested)?;
     // Both the accumulator and the current callback's original buffers
     // coexist. Each Current keeps its actual IDs/watched-file allocation.
     // Empty-input retries resolve those same jobs, never add interests.
@@ -715,12 +738,20 @@ impl CollectedReports {
     fn merge(&mut self, mut incoming: SemanticBatch) -> Result<bool, SemanticRefusal> {
         let batch = self.batch.as_mut().expect("not staged until H0 finishes");
         // The cumulative nested check mirrors the count checks: measure the
-        // incoming receipts' exact bytes first. An unmeasurable receipt, an
-        // overflowing sum, or a total past the prepaid limit refuses before
-        // any field moves; the retained incoming batch keeps its diagnosis.
-        let incoming_nested: Option<usize> =
-            incoming.current.iter().try_fold(0usize, |sum, receipt| {
+        // incoming receipts' and outcomes' exact bytes first. An
+        // unmeasurable entry, an overflowing sum, or a total past the
+        // prepaid limit refuses before any field moves; the retained
+        // incoming batch keeps its diagnosis.
+        let incoming_nested: Option<usize> = incoming
+            .current
+            .iter()
+            .try_fold(0usize, |sum, receipt| {
                 sum.checked_add(receipt.owned_storage_bytes()?)
+            })
+            .and_then(|sum| {
+                incoming.outcomes.iter().try_fold(sum, |sum, outcome| {
+                    sum.checked_add(outcome.owned_storage_bytes()?)
+                })
             });
         let nested_total = incoming_nested.and_then(|nested| self.nested_used.checked_add(nested));
         let fits = incoming.domain == batch.domain
@@ -775,9 +806,16 @@ impl CollectedReports {
         let batch = self.batch.as_mut().ok_or(SemanticRefusal::Unavailable)?;
         let outcomes = batch.outcomes.len().checked_add(incoming.outcomes().len());
         let current = batch.current.len().checked_add(incoming.current().len());
-        let incoming_nested: Option<usize> =
-            incoming.current().iter().try_fold(0usize, |sum, receipt| {
+        let incoming_nested: Option<usize> = incoming
+            .current()
+            .iter()
+            .try_fold(0usize, |sum, receipt| {
                 sum.checked_add(receipt.owned_storage_bytes()?)
+            })
+            .and_then(|sum| {
+                incoming.outcomes().iter().try_fold(sum, |sum, outcome| {
+                    sum.checked_add(outcome.owned_storage_bytes()?)
+                })
             });
         let nested_total = incoming_nested.and_then(|nested| self.nested_used.checked_add(nested));
         if self.refused.is_some()
@@ -3775,6 +3813,16 @@ mod binding_reservation_tests {
         let budgets =
             collected_budgets(PARTITIONS, 0, 0, watched_bound).expect("saturated budgets");
         assert_eq!(budgets.receipt_limit, PARTITIONS + REFRESHES_PER_BIND);
+        // The margin term is load-bearing and exact: varying only the
+        // watched bound must move the production nested limit by one
+        // watched copy per tick receipt plus exactly four per-receipt
+        // allowances for the post-reservation binder receipts.
+        let shifted =
+            collected_budgets(PARTITIONS, 0, 0, watched_bound + 1_000).expect("shifted budgets");
+        assert_eq!(
+            shifted.nested_limit - budgets.nested_limit,
+            (PARTITIONS + REFRESHES_PER_BIND) * 1_000
+        );
         let measured: usize = receipts
             .iter()
             .map(|receipt| receipt.owned_storage_bytes().expect("a measurable receipt"))

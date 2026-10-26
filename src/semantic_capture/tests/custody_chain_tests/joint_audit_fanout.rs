@@ -18277,17 +18277,39 @@ fn joint_machine_collected_pinless_post_attach_expires_not_stalls() {
     // Separate the lane-attach stamp from the child starts by far more
     // than the tick granularity, so retention is deterministic.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let children: Vec<OwnedStoppedChild> = (0..CALLERS).map(|_| OwnedStoppedChild::new()).collect();
-    let mut pids = Vec::with_capacity(CALLERS);
-    for (offset, child) in children.iter().enumerate() {
-        let caller_pid = child.id();
+    let bound_children: Vec<OwnedStoppedChild> =
+        (0..CALLERS).map(|_| OwnedStoppedChild::new()).collect();
+    for (offset, child) in bound_children.iter().enumerate() {
         fixture.scene.real.bind(
-            caller_pid,
+            child.id(),
             ImageIdentity {
                 task_cookie: 200 + offset as u64,
                 exec_id: 0,
             },
             0,
+        );
+    }
+    // Record callers stay unmapped and unbound (the binder never reaches
+    // them); their push-only targets carry the BPF-tagged images and are
+    // removed before the first H0 tick. Bound callers keep their targets
+    // for the binder refreshes and later birth checks.
+    let record_children: Vec<OwnedStoppedChild> =
+        (0..CALLERS).map(|_| OwnedStoppedChild::new()).collect();
+    let mut pids = Vec::with_capacity(CALLERS);
+    for child in record_children.iter() {
+        let caller_pid = child.id();
+        let dummy_pin = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()]
+            .0
+            .clone();
+        fixture.scene.real.h0.0.borrow_mut().io.targets.insert(
+            caller_pid,
+            (
+                dummy_pin,
+                ImageIdentity {
+                    task_cookie: 300,
+                    exec_id: 0,
+                },
+            ),
         );
         pids.push(caller_pid);
     }
@@ -18325,11 +18347,14 @@ fn joint_machine_collected_pinless_post_attach_expires_not_stalls() {
         let phase = fixture.machine.diagnostic_snapshot_for_test().0;
         let collecting = matches!(phase, "Idle" | "Collecting");
         // Step Binding with a unit budget so it lands in AwaitH0 without
-        // ticking; the targets drop after the binder's refreshes (which
-        // need them) and before the first H0 tick (which must not see
-        // them), like a production tick over unreached callers.
+        // ticking; the record-only targets drop after the binder's
+        // refreshes and before the first H0 tick, like a production tick
+        // over unreached callers. Bound targets stay for birth checks.
         if phase == "AwaitH0" && !targets_cleared {
-            fixture.scene.real.h0.0.borrow_mut().io.targets.clear();
+            let mut held = fixture.scene.real.h0.0.borrow_mut();
+            for pid in pids.iter() {
+                held.io.targets.remove(pid);
+            }
             targets_cleared = true;
         }
         let work = if collecting || phase == "Binding" {
@@ -18362,7 +18387,7 @@ fn joint_machine_collected_pinless_post_attach_expires_not_stalls() {
         }
     }
     assert_eq!(pushed_calls, RECORDS, "all calls fed");
-    assert!(targets_cleared, "targets dropped before H0 ticks");
+    assert!(targets_cleared, "record targets dropped before H0 ticks");
     assert!(
         published,
         "the pin-less transaction must publish after expiry, not stall in {:?}",

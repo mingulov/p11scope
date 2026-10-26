@@ -375,6 +375,15 @@ class SoakOracleTest(unittest.TestCase):
         for gate in self.oracle.GATES:
             self.assert_gate(verdict, gate, False)
 
+    def test_red_missing_report_is_hang_verdict(self):
+        hung = mutate_copy(self.green, "leg-noreport",
+                           lambda target: (target / "report.json").unlink())
+        verdict = self.evaluate(hung)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        for gate in self.oracle.GATES:
+            self.assert_gate(verdict, gate, False)
+        self.assertIn("report.json", verdict["gates"]["finite_stop"]["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -570,17 +570,22 @@ if [ "$SAMPLER_EXIT" -eq 0 ]; then
 fi
 SAMPLER_PID=
 
-# A nonzero observer exit with a report is still a measurement (the rc
-# is recorded and the finite-stop gate judges it); a missing report is
-# a harness failure and the run refuses before the oracle.
+# A missing report is judged, not refused: a hung observer that never
+# wrote one is exactly what the finite-stop gate must fail, with the
+# remaining gates red as unjudgeable. The stderr tail aids diagnosis.
 if [ ! -f "$WORK/report.json" ]; then
-    echo "observer exit=$OBS_RC wrote no report:" >&2
-    cat "$WORK/observer.stderr" >&2
-    exit 1
+    echo "observer exit=$OBS_RC wrote no report; the oracle judges the hang:" >&2
+    tail -5 "$WORK/observer.stderr" >&2
 fi
 if [ "$MODE" = live ] && [ "$IS_ROOT" -eq 0 ]; then
-    reclaim_root_output "$WORK/report.json" "$WORK/resources.tsv" \
-        "$WORK/observer.stdout" "$WORK/observer.stderr"
+    reclaim_list=
+    for reclaim_file in "$WORK/report.json" "$WORK/resources.tsv" \
+        "$WORK/observer.stdout" "$WORK/observer.stderr"; do
+        [ -f "$reclaim_file" ] || continue
+        reclaim_list="$reclaim_list $reclaim_file"
+    done
+    # shellcheck disable=SC2086
+    [ -z "$reclaim_list" ] || reclaim_root_output $reclaim_list
 fi
 
 export WORK CELL TEST_ID KERNEL_PROFILE MODE HORIZON REQUIRE_DURATION

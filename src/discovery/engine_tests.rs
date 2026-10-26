@@ -36761,6 +36761,7 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
     );
     // Each side builds its fixture in its own tempdir; normalize those
     // paths so the comparison covers subjects and reasons, not temp names.
+    // The no-table reason quotes the module's own path in its discover hint.
     fn normalized(skips: &[Skipped]) -> Vec<(String, String)> {
         skips
             .iter()
@@ -36771,7 +36772,8 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
                     .next_back()
                     .unwrap_or(&skip.subject)
                     .to_string();
-                (subject, skip.reason.clone())
+                let reason = skip.reason.replace(skip.subject.as_str(), &subject);
+                (subject, reason)
             })
             .collect()
     }

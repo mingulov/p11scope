@@ -2549,6 +2549,22 @@ mod tests {
         assert!(rendered.contains("BPF program is too large"), "{rendered}");
     }
 
+    /// Log-exhaustion twin at the doctor seam: an ENOSPC budget refusal
+    /// routes to the budget row and names ENOSPC, never E2BIG.
+    #[test]
+    fn preflight_budget_refusal_names_log_exhaustion() {
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+            verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(rendered.contains("verifier budget refused"), "{rendered}");
+        assert!(rendered.contains("ENOSPC"), "{rendered}");
+        assert!(!rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(rendered.contains("truncated verifier dump"), "{rendered}");
+    }
+
     #[test]
     fn wrapped_program_load_error_keeps_named_context_and_bounded_verifier_log() {
         let error = ProgramError::LoadError {

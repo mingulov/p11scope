@@ -10116,6 +10116,24 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn counter_verifier_budget_refusal_keeps_log_exhaustion_untouched() {
+        // ENOSPC (verifier log exhaustion) classifies as a budget refusal
+        // only at the attach/doctor seam; the counter mapping rewrites
+        // E2BIG alone, so an ENOSPC chain passes through with its errno
+        // intact instead of taking the kernel-specific token.
+        let untouched: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
+        let untouched = untouched.context("loading function_list_return");
+        let before = format!("{untouched:#}");
+        assert!(before.contains("os error 28"), "{before}");
+        let after = map_counter_verifier_budget_refusal(untouched);
+        assert_eq!(format!("{after:#}"), before);
+        assert!(
+            !format!("{after:#}").contains("counter-mode-unavailable-on-kernel"),
+            "ENOSPC must not take the kernel-specific token: {after:#}"
+        );
+    }
+
     /// The C producer's bucket index must equal the shared `bucket_of` over
     /// the full equality boundary set, in both timing modes.
     #[test]

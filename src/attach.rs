@@ -11911,6 +11911,36 @@ mod tests {
     }
 
     #[test]
+    fn budget_hint_names_e2big_for_complexity_refusals() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new("Processed 1000001 insn".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(!rendered.contains("ENOSPC"), "{rendered}");
+    }
+
+    #[test]
+    fn log_exhaustion_hint_names_enospc_not_e2big() {
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                verifier_log: aya_obj::VerifierLog::new("truncated verifier dump".to_string()),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(rendered.contains("ENOSPC"), "{rendered}");
+        assert!(!rendered.contains("(E2BIG)"), "{rendered}");
+        assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
+    }
+
+    #[test]
     fn permission_refusal_keeps_unsupported_environment_hint() {
         let error = unsupported_environment_context(
             anyhow::Error::new(aya::programs::ProgramError::LoadError {
@@ -16863,13 +16893,14 @@ mod tests {
         assert!(!super::is_verifier_budget_errno(None));
     }
 
-    /// Log-exhaustion twin: a too-complex program whose verbose verifier
-    /// log fills the load buffer surfaces as ENOSPC instead of E2BIG
-    /// (observed on 5.15); it classifies as the same budget refusal.
-    /// Genuine non-budget errnos — including EAGAIN — still stay out.
+    /// Errno split: ENOSPC (log exhaustion) is NOT the verifier-budget
+    /// errno — the counter mapping rewrites E2BIG alone — it classifies
+    /// as a budget refusal only at the attach/doctor seam
+    /// (`is_verifier_budget_refusal`). Genuine non-budget errnos —
+    /// including EAGAIN — stay out everywhere.
     #[test]
-    fn verifier_budget_errno_includes_log_exhaustion() {
-        assert!(super::is_verifier_budget_errno(Some(libc::ENOSPC)));
+    fn verifier_budget_errno_excludes_log_exhaustion() {
+        assert!(!super::is_verifier_budget_errno(Some(libc::ENOSPC)));
         for errno in [
             libc::EINVAL,
             libc::EACCES,

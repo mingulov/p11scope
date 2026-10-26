@@ -13516,6 +13516,36 @@ mod tests {
                 "{mode:?}: refusal names the mode: {text}"
             );
         }
+        // Fallback when neither the policy nor preparation pins a mode.
+        let (_fixture, pins, first, _, _) = counter_banks::tests::growth_provider_fixture();
+        let slots = vec![first.clone()];
+        let mut ia32: BTreeMap<_, _> = slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.index,
+                    (
+                        pins.attach_path_for(slot.object).unwrap(),
+                        pins.abi_for(slot.object).unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        ia32.get_mut(&first.index).unwrap().1 = ElfAbi::Ilp32;
+        let error = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::AggregateOnly,
+            false,
+            &ia32,
+            StaticRoots::CounterBanks,
+            None,
+        )
+        .expect_err("fallback must refuse grouping");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("private counter grouping requires an LP64"),
+            "fallback names counter: {text}"
+        );
     }
 
     #[test]

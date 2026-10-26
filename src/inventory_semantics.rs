@@ -714,6 +714,15 @@ pub(crate) enum FinishSite {
 /// The counter is never reset; the 100th refusal latches the disposition.
 pub(crate) const JOINT_FINISH_STORAGE_RETRIES: u16 = 100;
 
+/// Bound on consecutive no-progress Audited polls inside one Joint Finish:
+/// polls that spend no budget action and publish nothing. Spending,
+/// publication and non-finish visits reset the counter; the 600th
+/// consecutive stall records a named gap and refuses, so a wedged
+/// finish ends finitely through the disposition hold instead of
+/// polling Pending forever. Matches the cells' established wedge
+/// threshold; legitimate stalls are handfuls of polls.
+pub(crate) const JOINT_FINISH_NO_PROGRESS_LIMIT: u32 = 600;
+
 /// Grant half of the Finish Q guard (machine `drive_finish`): the Q's
 /// retained grant, or the machine's first genuine Raw-minted grant after a
 /// grant-less observation. STOP may precede the first Joint admission, so a

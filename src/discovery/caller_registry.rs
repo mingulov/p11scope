@@ -3248,6 +3248,20 @@ impl CallerRegistry {
         self.staged.push(Mutation::RecordGap { gap });
     }
 
+    /// Staged (subject, reason) gap pairs awaiting the next commit, in
+    /// stage order. For twins whose disclosure cannot commit yet (an
+    /// unfinished publication stands in front of it).
+    #[cfg(test)]
+    pub(crate) fn staged_scope_gaps_for_test(&self) -> Vec<(String, String)> {
+        self.staged
+            .iter()
+            .filter_map(|staged| match staged {
+                Mutation::RecordGap { gap } => Some((gap.subject.clone(), gap.reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stage one gap for the module `key` names, resolving the ID at
     /// publication (F3-04): `record_gap` resolves eagerly against the
     /// committed snapshot, which misses a first-discovered module whose

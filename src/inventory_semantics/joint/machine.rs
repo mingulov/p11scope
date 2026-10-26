@@ -18,8 +18,9 @@ use crate::events::{DiscoveryDomain, DispatchPoll};
 #[cfg(test)]
 use crate::inventory_semantics::FinishSite;
 use crate::inventory_semantics::{
-    AttestedSemanticLane, JOINT_FINISH_STORAGE_RETRIES, LaneDrainOutcome, LaneNegative,
-    MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal, finish_grant_admissible,
+    AttestedSemanticLane, JOINT_FINISH_NO_PROGRESS_LIMIT, JOINT_FINISH_STORAGE_RETRIES,
+    LaneDrainOutcome, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch, SemanticRefusal,
+    finish_grant_admissible,
 };
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
@@ -800,6 +801,10 @@ pub(crate) struct LiveJointMachine {
     /// reset: retryable refusals occur only in the Finish tail, so the cap
     /// bounds the tail. The 100th latches the disposition.
     finish_storage_retries: u16,
+    /// Consecutive no-progress Audited polls inside this Finish. Any
+    /// spending, publication or non-finish visit resets it; the 600th
+    /// consecutive stall refuses with a named gap.
+    finish_no_progress_polls: u32,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -868,6 +873,7 @@ impl LiveJointMachine {
             finish_completed: None,
             finish_receipt: None,
             finish_storage_retries: 0,
+            finish_no_progress_polls: 0,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -2704,11 +2710,15 @@ impl LiveJointMachine {
                         }
                     })
                 };
-                if before == budget.remaining_actions {
+                // No-progress signal for the finish bound, measured before
+                // the yield below forces its own action spend.
+                let progressed = budget.remaining_actions != before;
+                if !progressed {
                     budget.spend(1);
                 }
                 match result {
                     Ok(Ok(JointCommitProgress::Published(receipt))) => {
+                        self.finish_no_progress_polls = 0;
                         if final_original {
                             self.finish_receipt = Some(receipt);
                         }
@@ -2724,14 +2734,46 @@ impl LiveJointMachine {
                         }
                         (Phase::Idle, Ok(Step::Published))
                     }
-                    Ok(Ok(JointCommitProgress::Pending)) => (
-                        Phase::Audited {
-                            frame,
-                            identity,
-                            base,
-                        },
-                        Ok(Step::Yield),
-                    ),
+                    Ok(Ok(JointCommitProgress::Pending)) => {
+                        // Finish-scoped no-progress bound: a wedged audit
+                        // spends nothing and publishes nothing, forever.
+                        // Spending, publication and non-finish visits reset
+                        // the count; the bound records a named gap and
+                        // refuses, keeping the retained frame and its audit
+                        // tags for the disposition hold and diagnosis.
+                        if q.is_some() && !progressed {
+                            self.finish_no_progress_polls =
+                                self.finish_no_progress_polls.saturating_add(1);
+                            if self.finish_no_progress_polls >= JOINT_FINISH_NO_PROGRESS_LIMIT {
+                                coordinator.note_scope_gap(
+                                    "joint finish made no progress".to_string(),
+                                    format!(
+                                        "{} consecutive finish polls without progress in Audited; \
+                                         abandoning the finish for exit",
+                                        JOINT_FINISH_NO_PROGRESS_LIMIT,
+                                    ),
+                                );
+                                return (
+                                    Phase::Audited {
+                                        frame,
+                                        identity,
+                                        base,
+                                    },
+                                    Err(SemanticRefusal::Unavailable),
+                                );
+                            }
+                        } else {
+                            self.finish_no_progress_polls = 0;
+                        }
+                        (
+                            Phase::Audited {
+                                frame,
+                                identity,
+                                base,
+                            },
+                            Ok(Step::Yield),
+                        )
+                    }
                     Ok(Err(_)) => (
                         Phase::Audited {
                             frame,

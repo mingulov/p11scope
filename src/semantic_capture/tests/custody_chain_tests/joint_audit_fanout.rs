@@ -2266,21 +2266,25 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
                 audited_polls, 600,
                 "the bound fires on exactly the 600th no-progress poll"
             );
+            // The wedged publication stands in front of the commit (as
+            // with every mid-publication error), so the gap stages but
+            // cannot commit here; the staged pair is the disclosure the
+            // next commit carries.
             let gaps: Vec<_> = fixture
                 .scene
                 .real
                 .scene
                 .coordinator
                 .registry()
-                .gaps()
-                .iter()
-                .filter(|gap| gap.subject == "joint finish made no progress")
+                .staged_scope_gaps_for_test()
+                .into_iter()
+                .filter(|(subject, _)| subject == "joint finish made no progress")
                 .collect();
             assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
             assert!(
-                gaps[0].reason.contains("600"),
+                gaps[0].1.contains("600"),
                 "the gap names the bound: {}",
-                gaps[0].reason
+                gaps[0].1
             );
             let audit = fixture.machine.diagnostic_audit_for_test();
             assert!(

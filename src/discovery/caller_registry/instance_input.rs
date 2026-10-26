@@ -2322,13 +2322,22 @@ impl CallerRegistry {
             .values()
             .map(|record| &record.feed)
             .collect();
-        crate::key_operation_projection::producer::commit_with_journal_linked(
-            revision,
-            &stagings,
-            projection,
-            &self.joint_keyuse,
-            linked,
-        )
+        if linked {
+            crate::key_operation_projection::producer::commit(
+                revision,
+                &stagings,
+                projection,
+                &self.joint_keyuse,
+            )
+        } else {
+            crate::key_operation_projection::producer::commit_with_journal_linked(
+                revision,
+                &stagings,
+                projection,
+                &self.joint_keyuse,
+                false,
+            )
+        }
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));

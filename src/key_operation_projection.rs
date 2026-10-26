@@ -790,8 +790,9 @@ pub(crate) mod producer {
     /// unknown-key S1 facts, never a refusal); with no Joint feed
     /// the reason names the loss. Rows aggregate per-operation
     /// reducer state into frozen aggregate rows; budgets measure.
-    /// Linked by default (the 0.5.1 world the committed suites model);
-    /// lanes pass their latched linkage explicitly.
+    /// The linked entry (the 0.5.1 world the committed suites model);
+    /// lanes commit here when linked, else through
+    /// `commit_with_journal_linked`.
     pub(crate) fn commit(
         revision: u64,
         stagings: &[&JointStaging],

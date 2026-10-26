@@ -4396,6 +4396,29 @@ fn count_disclosed_gaps(
         .fold(0u64, |total, repeats| total.saturating_add(repeats))
 }
 
+/// The single disclosed reason for a caller-less scope-gap subject:
+/// exactly one published row must carry the subject, else the
+/// disclosure is missing or ambiguous and no exemption can pin it.
+fn disclosed_scope_reason(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    subject: &str,
+) -> Result<String> {
+    let mut reasons = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == subject)
+        .map(|gap| gap.reason.clone())
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+    ensure!(
+        reasons.len() == 1,
+        "{subject}: expected one disclosed reason, found {reasons:?}"
+    );
+    Ok(reasons.pop().expect("one reason checked"))
+}
+
 /// One disclosed gap population exempted from the quiet check: an exact
 /// subject/reason/caller triple with a minimum and an optional maximum.
 /// The exemption asserts the population first (never vacuous), then the
@@ -5431,8 +5454,8 @@ mod joint_ledger_parse_tests {
     //! here rather than trusted implicitly.
     use super::{
         JOINT_SOFT_FUNCTIONS, QuietExemption, assert_quiet_twins_except, count_disclosed_gaps,
-        exactness_diagnosis, ledger_calls, ledger_semantic_split, ledger_stamp,
-        system_joint_coordinator,
+        disclosed_scope_reason, exactness_diagnosis, ledger_calls, ledger_semantic_split,
+        ledger_stamp, system_joint_coordinator,
     };
     use std::collections::BTreeMap;
 
@@ -5720,6 +5743,75 @@ mod joint_ledger_parse_tests {
         );
         assert!(lines.contains("fn=C_Sign entered=2 semantic"), "{lines}");
         assert!(lines.contains("h3 takes="), "{lines}");
+        Ok(())
+    }
+
+    /// The scope-reason reader demands exactly one published row for
+    /// the subject: a missing or ambiguous disclosure fails instead
+    /// of silently picking a reason.
+    #[test]
+    fn scope_reason_demands_one_disclosed_row() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let mut coordinator = system_joint_coordinator(&[])?;
+        assert!(disclosed_scope_reason(&coordinator, "selected promotion refused").is_err());
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "selected promotion refused".into(),
+            reason: "view expired".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        assert_eq!(
+            disclosed_scope_reason(&coordinator, "selected promotion refused")?,
+            "view expired"
+        );
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: Some(CallerId(3)),
+            module: None,
+            pid: None,
+            subject: "selected promotion refused".into(),
+            reason: "manifest unavailable".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        assert!(disclosed_scope_reason(&coordinator, "selected promotion refused").is_err());
+        Ok(())
+    }
+
+    /// A caller-less scope gap (the promotion refusal) is exempted by
+    /// its exact triple like any disclosed population: missing fails,
+    /// present skips.
+    #[test]
+    fn quiet_exemption_excuses_callerless_scope_gap() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::RegistryGap;
+        let mut coordinator = system_joint_coordinator(&[])?;
+        let exemption = QuietExemption {
+            subject: "selected promotion refused",
+            reason: "view expired",
+            caller: None,
+            min: 1,
+            max: Some(1),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_err());
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "selected promotion refused".into(),
+            reason: "view expired".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        let exemption = QuietExemption {
+            subject: "selected promotion refused",
+            reason: "view expired",
+            caller: None,
+            min: 1,
+            max: Some(1),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_ok());
         Ok(())
     }
 }

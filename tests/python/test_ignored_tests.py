@@ -244,7 +244,7 @@ class IgnoredTestsTests(unittest.TestCase):
                            ["sites"])
         self.assertIn(f"all {inventoried} inventoried site(s) match",
                       result.stdout)
-        self.assertIn("privileged, wide-feature and integration "
+        self.assertIn("privileged, feature-owner and integration "
                       "curation verified", result.stdout)
 
     def test_an_extra_ignored_test_fails(self):

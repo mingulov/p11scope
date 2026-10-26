@@ -705,7 +705,7 @@ def main(argv):
               f"{count} inventoried site(s)")
         return 1
     print(f"ignored-tests: all {count} inventoried site(s) match the sources; "
-          "privileged, wide-feature and integration curation verified")
+          "privileged, feature-owner and integration curation verified")
     return 0
 
 

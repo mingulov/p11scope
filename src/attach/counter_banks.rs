@@ -10291,9 +10291,13 @@ pub(crate) mod tests {
         // old-kernel token, at the mapping and at the start seam alike:
         // both read the shared E2BIG-only budget errno predicate.
         let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
-        let mapped = super::map_counter_verifier_budget_refusal(loaded.context("loading p11_return"));
+        let mapped =
+            super::map_counter_verifier_budget_refusal(loaded.context("loading p11_return"));
         let text = format!("{mapped:#}");
-        assert!(!text.contains("counter-mode-unavailable-on-kernel"), "{text}");
+        assert!(
+            !text.contains("counter-mode-unavailable-on-kernel"),
+            "{text}"
+        );
         assert!(
             mapped.chain().any(|cause| cause
                 .downcast_ref::<std::io::Error>()
@@ -10303,7 +10307,10 @@ pub(crate) mod tests {
         let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
         let started = super::map_counter_start_error(loaded.context("loading p11_return"));
         let text = format!("{started:#}");
-        assert!(!text.contains("counter-mode-unavailable-on-kernel"), "{text}");
+        assert!(
+            !text.contains("counter-mode-unavailable-on-kernel"),
+            "{text}"
+        );
         assert!(text.contains("CAP_BPF"), "{text}");
     }
 

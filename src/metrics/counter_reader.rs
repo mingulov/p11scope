@@ -6107,8 +6107,7 @@ mod tests {
         // --counter-mode must reach the same verdict and kernel
         // control evidence (the counter verdict is the plain verdict).
         let twin_id = id.wrapping_add(1);
-        let twin_out = std::env::temp_dir()
-            .join(format!("p11scope-counter-run-{twin_id}.json"));
+        let twin_out = std::env::temp_dir().join(format!("p11scope-counter-run-{twin_id}.json"));
         let _twin_cleanup = RemoveReportOnDrop(twin_out.clone());
         let twin_marker = counter_cli_run_marker_path(twin_id);
         let _twin_marker_cleanup = RemoveReportOnDrop(twin_marker.clone());
@@ -6140,13 +6139,11 @@ mod tests {
         let twin: serde_json::Value = serde_json::from_str(&twin_text).expect("valid twin JSON");
         assert_eq!(twin["schema"], "p11scope/observed-profile/v3-metrics");
         assert_eq!(
-            document["evidence"]["completeness"],
-            twin["evidence"]["completeness"],
+            document["evidence"]["completeness"], twin["evidence"]["completeness"],
             "counter and plain runs must agree on completeness"
         );
         assert_eq!(
-            document["evidence"]["kernel_control"],
-            twin["evidence"]["kernel_control"],
+            document["evidence"]["kernel_control"], twin["evidence"]["kernel_control"],
             "counter and plain runs must agree on kernel control"
         );
         eprintln!("COUNTER_CLI_RUN child=0 functions=0 status=fresh");

@@ -374,6 +374,7 @@ impl CaptureCollection {
     // session's collection generation and a kernel-evidence source feed
     // the zero-endpoint bypass, which publishes no bank rows but must
     // still report measured kernel evidence under the real generation.
+    #[allow(clippy::too_many_arguments)]
     fn fresh_with<B>(
         &mut self,
         plan: &AttachPlan,
@@ -481,6 +482,7 @@ impl CaptureCollection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn terminal_with<B>(
         &mut self,
         plan: &AttachPlan,
@@ -500,8 +502,10 @@ impl CaptureCollection {
     ) -> anyhow::Result<CaptureSnapshot> {
         // Always acquire, observe and project again. An Ok read with a folded
         // row issue, health refusal or collector failure is not a settled read.
-        self.fresh_with(plan, pins, profile, binding, acquire, legacy, generation, kernel)?
-            .require_terminal()
+        self.fresh_with(
+            plan, pins, profile, binding, acquire, legacy, generation, kernel,
+        )?
+        .require_terminal()
     }
 }
 

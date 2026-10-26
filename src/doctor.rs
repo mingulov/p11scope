@@ -1767,19 +1767,19 @@ pub(crate) fn counter_modes_footer_with_preflight(
     verdict: &crate::attach::BpfLoopVerdict,
     preflight: Option<&[(p11scope_ebpf_common::CounterMode, Result<(), String>)]>,
 ) -> String {
-    if let (crate::attach::BpfLoopVerdict::Available, Some(loads)) = (verdict, preflight) {
-        if cfg!(p11scope_counter_objects) {
-            if let Some((_, Err(refusal))) = loads.iter().find(|(_, result)| {
-                result.as_ref().is_err_and(|s| {
-                    s.starts_with("counter-mode-") || s.starts_with("counter-memory-limit")
-                })
-            }) {
-                return format!("counter modes: {refusal}\n");
-            }
-            if loads.iter().all(|(_, result)| result.is_ok()) {
-                return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
-                    .to_string();
-            }
+    if let (crate::attach::BpfLoopVerdict::Available, Some(loads)) = (verdict, preflight)
+        && cfg!(p11scope_counter_objects)
+    {
+        if let Some((_, Err(refusal))) = loads.iter().find(|(_, result)| {
+            result.as_ref().is_err_and(|s| {
+                s.starts_with("counter-mode-") || s.starts_with("counter-memory-limit")
+            })
+        }) {
+            return format!("counter modes: {refusal}\n");
+        }
+        if loads.iter().all(|(_, result)| result.is_ok()) {
+            return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
+                .to_string();
         }
     }
     counter_modes_footer(verdict)
@@ -1813,7 +1813,12 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Resul
             p11scope_ebpf_common::CounterMode::Timestamps,
             p11scope_ebpf_common::CounterMode::Latency,
         ]
-        .map(|mode| (mode, crate::attach::counter_banks::counter_object_preflight(mode)));
+        .map(|mode| {
+            (
+                mode,
+                crate::attach::counter_banks::counter_object_preflight(mode),
+            )
+        });
         Some(loads.as_slice())
     } else {
         None
@@ -3477,8 +3482,7 @@ mod tests {
             Ok(()),
             Ok(()),
         ]);
-        let line =
-            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&refused));
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&refused));
         if cfg!(p11scope_counter_objects) {
             assert!(
                 line.starts_with("counter modes: counter-mode-unavailable-on-kernel:"),

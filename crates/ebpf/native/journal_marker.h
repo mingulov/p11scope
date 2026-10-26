@@ -9,8 +9,8 @@
  *   0                  unpublished (fresh storage)
  *   1                  DIRTY (scope gap: unusable, sticks)
  *   (exec << 2) | 2    READY naming exec
- * Anything else (low bits 3, or low bits 0 with high bits set) is
- * invalid and fails closed.
+ * Anything else (low bits 3, low bits 0 with high bits set, or
+ * low bits 01 with high bits set) is invalid and fails closed.
  *
  * Publication races only the scope-gap dirtier (exec is per-task
  * serial): a single CAS from the observed usable word fails closed on

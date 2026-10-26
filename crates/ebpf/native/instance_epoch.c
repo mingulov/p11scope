@@ -558,9 +558,11 @@ static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
  * READY(self_exec_id) on the leader's PROC_EPOCH row after closure.
  * p11_instance_exec stays unchanged and runs first; this only marks.
  * Returns 1 when the marker is READY for this exec, 0 when gated,
- * sticky-DIRTY, or latched. Failures latch the control row and never
- * raise the fault: no provider body runs at the exec root, and a fault
- * there would wreck S1 continuity for the whole session. */
+ * sticky-DIRTY, latched, or left rowless by a task-storage NULL.
+ * Failures latch the control row and never raise the fault: no
+ * provider body runs at the exec root, and a fault there would wreck
+ * S1 continuity for the whole session. A storage NULL is not a
+ * failure: no row means no READY, which can never birth. */
 __attribute__((noinline)) u32 p11_instance_exec_birth(void)
 {
     struct task_struct___p11inst *current = inst_current_task();
@@ -573,6 +575,7 @@ __attribute__((noinline)) u32 p11_instance_exec_birth(void)
     u64 gen;
     u64 word;
     u64 exec;
+    int reserved = 0;
 
     attach = inst_map_lookup(&INSTANCE_GEN, &key);
     if (!attach)
@@ -596,23 +599,29 @@ __attribute__((noinline)) u32 p11_instance_exec_birth(void)
             return 0;
         rec = inst_storage_get(&PROC_EPOCH, leader, 0, 1);
         if (!rec) {
-            marker_latch(ctl);
+            /* A task-storage NULL (spurious 5.15 busy or a real
+             * failure) means no row, hence no READY and no birth:
+             * return with no latch, no refund and no fault, and
+             * without touching the storage-null continuity count. */
             return 0;
         }
-    } else {
-        if (*(volatile u64 *)&rec->flags & INST_RECORD_SHARED_MM)
-            goto latch;
-        word = *(volatile u64 *)&rec->journal_bootstrap;
-        if (word == P11_JOURNAL_MARKER_UNPUBLISHED) {
-            if (!p11_journal_marker_reserve(ctl))
-                return 0;
-        } else if (word == P11_JOURNAL_MARKER_DIRTY) {
-            return 0;
-        } else if ((word & P11_JOURNAL_MARKER_STATE_MASK) != P11_JOURNAL_MARKER_READY_STATE) {
-            goto latch;
-        }
-        /* READY(old): republish below without charging. */
+        /* A CREATE after a spurious lookup NULL may return an
+         * existing row: the checks below apply to it with the
+         * reservation held, so it is never charged again. */
+        reserved = 1;
     }
+    if (*(volatile u64 *)&rec->flags & INST_RECORD_SHARED_MM)
+        goto latch;
+    word = *(volatile u64 *)&rec->journal_bootstrap;
+    if (word == P11_JOURNAL_MARKER_UNPUBLISHED) {
+        if (!reserved && !p11_journal_marker_reserve(ctl))
+            return 0;
+    } else if (word == P11_JOURNAL_MARKER_DIRTY) {
+        return 0;
+    } else if ((word & P11_JOURNAL_MARKER_STATE_MASK) != P11_JOURNAL_MARKER_READY_STATE) {
+        goto latch;
+    }
+    /* READY(old): republish below without charging. */
     exec = INST_MARKER_EXEC_ID(leader);
     if (exec >= (1ULL << 62))
         goto latch;

@@ -2017,6 +2017,208 @@ fn joint_machine_collected_finish_preserves_last_return_before_stopped() {
     );
 }
 
+/// A stop after a quiet period must not strand a row that landed
+/// since the last idle pull: the finish's first advance takes a fresh
+/// pull like a requested Running commit, so the landed row is
+/// collected and its effects publish before the finish completes.
+#[test]
+fn joint_machine_finish_collects_row_landed_after_idle_poll() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish idle-prefix Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    // Three idle services against the empty drain, as between live
+    // commit batches: quiet, publishing nothing, leaving Collecting
+    // on its stale no-backlog poll.
+    for _ in 0..3 {
+        let progress = fixture.service(1024).unwrap();
+        assert_eq!(progress, JointServiceProgress::Pending);
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision,
+        "idle service publishes nothing"
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Collecting"
+    );
+    // The row lands after the last idle pull; the stop begins the finish.
+    fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut published = false;
+    let mut errored = None;
+    for _ in 0..512 {
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Published(_)) => {
+                published = true;
+                break;
+            }
+            Ok(JointCommitProgress::Pending) => {}
+            Err(reason) => {
+                errored = Some(reason);
+                break;
+            }
+        }
+    }
+    assert!(
+        published,
+        "the finish publishes within its bound; stuck at snapshot={:?} audit={:?} errored={errored:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+        fixture.machine.diagnostic_audit_for_test(),
+    );
+    assert_eq!(
+        fixture.scene.drain.source_mut().remaining(),
+        0,
+        "the finish collects the row that landed before its begin"
+    );
+    assert_eq!(
+        fixture.reduced(),
+        [3],
+        "the landed row's effects publish before the finish completes"
+    );
+}
+
+/// The same stranded-row shape through a requested commit's fresh
+/// pull: one service after the begin sets the pulled flag and pulls
+/// empty; a row landing before the next service must still be
+/// collected by the finish the stop begins, not bound over.
+#[test]
+fn joint_machine_finish_collects_row_after_requested_pull() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish requested-prefix Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    fixture.machine.begin_commit(false).unwrap();
+    // One service: the requested demand takes its fresh pull past the
+    // idle-era poll and yields on the empty drain.
+    assert_eq!(
+        fixture.service(1024).unwrap(),
+        JointServiceProgress::Pending
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Collecting"
+    );
+    // The row lands after that pull; the stop begins the finish.
+    fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut published = false;
+    let mut errored = None;
+    for _ in 0..512 {
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Published(_)) => {
+                published = true;
+                break;
+            }
+            Ok(JointCommitProgress::Pending) => {}
+            Err(reason) => {
+                errored = Some(reason);
+                break;
+            }
+        }
+    }
+    assert!(
+        published,
+        "the finish publishes within its bound; stuck at snapshot={:?} audit={:?} errored={errored:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+        fixture.machine.diagnostic_audit_for_test(),
+    );
+    assert_eq!(
+        fixture.scene.drain.source_mut().remaining(),
+        0,
+        "the finish collects the row that landed after the requested pull"
+    );
+    assert_eq!(
+        fixture.reduced(),
+        [3],
+        "the landed row's effects publish before the finish completes"
+    );
+}
+
+/// The quiet finish keeps its fast path: with nothing landed since
+/// the last idle pull, the finish still completes through the empty
+/// stop shortcut, costing at most one extra pull.
+#[test]
+fn joint_machine_finish_without_landed_row_publishes() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish quiet-prefix Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    for _ in 0..3 {
+        let progress = fixture.service(1024).unwrap();
+        assert_eq!(progress, JointServiceProgress::Pending);
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Collecting"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut polls = 0usize;
+    let mut saw_stop_ready = false;
+    let mut published = false;
+    for _ in 0..512 {
+        polls += 1;
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(_) => {
+                published = true;
+                break;
+            }
+            JointCommitProgress::Pending => {
+                saw_stop_ready |= fixture.machine.finish_stop_ready_for_test();
+            }
+        }
+    }
+    // The quiet finish measured 14 polls before the fresh-pull guard;
+    // the guard adds at most one pull, so 16 keeps one slack.
+    const QUIET_FINISH_POLL_BOUND: usize = 16;
+    eprintln!("finish_quiet polls={polls}");
+    assert!(published, "the quiet finish publishes within its bound");
+    assert!(
+        saw_stop_ready,
+        "the quiet finish still takes the empty stop shortcut"
+    );
+    assert!(
+        polls <= QUIET_FINISH_POLL_BOUND,
+        "the quiet finish costs at most one extra pull: {polls} polls"
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    assert_eq!(
+        fixture.reduced(),
+        [2],
+        "the quiet finish publishes no new effects"
+    );
+    assert!(fixture.scene.real.lane.is_finished());
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

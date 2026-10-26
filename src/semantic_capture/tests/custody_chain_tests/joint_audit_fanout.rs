@@ -620,6 +620,25 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         Ok(())
     }
 
+    fn expire_collected_h0_for_guard(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        let mut owned = self.h0.0.borrow_mut();
+        let HeldH0 { capture, .. } = &mut *owned;
+        let mut report = TickReport::default();
+        capture
+            .expire_collected_remaining_for_guard(raw, &mut report)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        SemanticBatch::from_tick_report(
+            self.producers.native_domain(),
+            report,
+            Vec::new(),
+            now_ns(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)] // Substitute native rows beneath the actual original consumer.
     fn consume_birth(
         &mut self,
@@ -18701,45 +18720,68 @@ fn joint_machine_collected_pinless_post_attach_expires_not_stalls() {
     assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
 }
 
-/// An H0 merge that cannot complete must never yield forever: a scan leaf
-/// that refuses every job leaves awaiting stuck with no outcomes, so each
-/// pass makes no progress. The lane must name the stall within a bounded
-/// number of passes instead of yielding without end.
+/// A persistently refused scan is an honest deadline wait, not a stall:
+/// refused-scan passes never trip the no-progress guard. The transaction
+/// stays in AwaitH0 past the old 16-pass bound and publishes at the job
+/// deadline with the waiter disclosed as unobserved. (Replaces the
+/// refuse-within-bound expectation per the controller ruling.)
 #[test]
-fn joint_machine_h0_idle_merge_refuses_within_bound() {
+fn joint_machine_h0_persistent_refusal_publishes_at_deadline() {
     let mut fixture = MachineScene::new(1);
     let pid = std::process::id();
     fixture.scene.push(pid, 0, "C_CreateObject", 1);
     fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
-    let mut services = 0usize;
-    let outcome = loop {
-        if services >= 50 {
-            panic!(
-                "a persistently refused scan must refuse within 50 passes, \
-                 still {:?} after {services}",
-                fixture.machine.diagnostic_snapshot_for_test(),
-            );
-        }
+    for pass in 0..20 {
         match fixture.service(1024) {
             Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
-                panic!("a refused scan cannot publish");
+                panic!("must not publish before the deadline (pass {pass})");
             }
             Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
-                services += 1;
+                assert_eq!(
+                    fixture.machine.h0_guard_trip_for_test(),
+                    None,
+                    "refused passes must never trip the guard (pass {pass})",
+                );
             }
-            Err(reason) => break (reason, services + 1),
+            Err(reason) => {
+                panic!(
+                    "a refused scan inside its deadline must not refuse: \
+                     {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
         }
-    };
-    assert_eq!(outcome.0, SemanticRefusal::Unavailable);
-    assert!(
-        outcome.1 <= 30,
-        "refusal within a bounded number of passes, took {}",
-        outcome.1
-    );
+    }
     assert_eq!(
         fixture.machine.diagnostic_snapshot_for_test().0,
         "AwaitH0",
-        "the refused original stays in AwaitH0 for disposal"
+        "the deadline wait stays in AwaitH0",
+    );
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .advance_now(std::time::Duration::from_secs(3));
+    for pass in 0..50 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => return,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => {
+                panic!(
+                    "must publish at the deadline with shed disclosure: \
+                     {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    panic!(
+        "must publish at the deadline, still {:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
     );
 }
 
@@ -18829,14 +18871,50 @@ fn joint_machine_h0_true_stall_without_job_expires_and_publishes() {
         held.capture.jobs.clear();
         held.capture.retained.clear();
     }
+    let mut saw_trip = false;
+    for pass in 0..50 {
+        match fixture.service(1) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                assert!(
+                    saw_trip,
+                    "publishing a true stall must record the guard trip cause",
+                );
+                return;
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                if fixture.machine.h0_guard_trip_for_test().is_some() {
+                    saw_trip = true;
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "a true stall must expire and publish, not refuse: \
+                     {reason:?} at {:?} after {pass} passes",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+        if saw_trip && fixture.machine.diagnostic_snapshot_for_test().0 == "Preparing" {
+            assert_eq!(
+                fixture.machine.h0_guard_trip_for_test(),
+                Some("h0_no_progress_no_job_no_hold_expired"),
+                "the trip names its specific cause",
+            );
+            break;
+        }
+    }
+    assert!(
+        saw_trip,
+        "a true stall must trip the guard, still {:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+    );
     for pass in 0..50 {
         match fixture.service(1024) {
             Ok(crate::inventory_semantics::JointServiceProgress::Published) => return,
             Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
             Err(reason) => {
                 panic!(
-                    "a true stall must expire and publish, not refuse: \
-                     {reason:?} at {:?} after {pass} passes",
+                    "must publish after the guard trip: {reason:?} at {:?} after {pass} passes",
                     fixture.machine.diagnostic_snapshot_for_test(),
                 );
             }

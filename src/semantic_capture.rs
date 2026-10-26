@@ -860,6 +860,13 @@ pub(crate) struct TickReport {
     pub(crate) scans: usize,
     pub(crate) observations: Vec<ObserveOutcome>,
     pub(crate) scan_refusals: Vec<ImageQueryRefusal>,
+    /// Guard signals for the Joint no-progress tripwire: scans attempted
+    /// for awaited keys this tick (joined-refresh scans excluded), whether
+    /// any job for an awaited key still has a future deadline, and whether
+    /// any retained hold for an awaited image is inside its horizon.
+    pub(crate) pending_scans: usize,
+    pub(crate) awaited_jobs_pending: bool,
+    pub(crate) awaited_hold_pending: bool,
     /// H3 disposition inputs (H8): every position below the watermark
     /// was allocated by this tick or earlier; the awaiting floor is the
     /// minimum route-waiting position; the shed floor is the minimum
@@ -2257,6 +2264,80 @@ impl SemanticCapture {
         )
     }
 
+    /// Expire every remaining collected waiter for the no-progress guard's
+    /// true stall (no job, no hold, no deadline, no scan): the same disclosed
+    /// `unobserved` shed as the deadline expiry, keeping already-joined
+    /// outcomes. Only the owning capture's waiters for this quantum expire;
+    /// the quantum's disposition advances to not-pending. No ring poll, scan,
+    /// fault or Stop occurs.
+    pub(crate) fn expire_collected_remaining_for_guard(
+        &mut self,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        report: &mut TickReport,
+    ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        quantum.validate_pending_h0_owner(CollectedH0Owner(self.identity), self.next_token)?;
+        if self.stopped {
+            return Err(RawQuantumRefusal::Stopped);
+        }
+        if self.awaiting.len() > MAX_PENDING {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        if report.outcomes.capacity() != 0
+            || report.current.capacity() != 0
+            || report.observations.capacity() != 0
+            || report.scan_refusals.capacity() != 0
+            || report.allocated_below != 0
+            || report.awaiting_floor.is_some()
+            || report.shed_floor.is_some()
+            || report.exhausted
+        {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        let count = self.awaiting.len();
+        if count == 0 {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        report
+            .outcomes
+            .try_reserve_exact(count)
+            .map_err(|_| RawQuantumRefusal::Allocation)?;
+        if images.capacity() != count || report.outcomes.capacity() != count {
+            return Err(RawQuantumRefusal::Allocation);
+        }
+        for waiting in self.awaiting.values() {
+            let image = waiting.record.base.event.image;
+            images.push((image.task_cookie, image.exec_id));
+        }
+        images.sort_unstable();
+        images.dedup();
+        let domain = self.router.domain();
+        let awaiting = &mut self.awaiting;
+        self.router
+            .expire_images_into(&images, &mut |token, route| {
+                if let Some(waiting) = awaiting.remove(&token) {
+                    Self::emit_in_domain(
+                        domain,
+                        Some(token),
+                        waiting.record,
+                        waiting.endpoint,
+                        route,
+                        waiting.collected_origin,
+                        report,
+                    );
+                }
+            });
+        self.jobs.clear();
+        self.stamp_disposition(report);
+        self.note_collected_disposition(quantum, report)
+            .map_err(|_| RawQuantumRefusal::DispositionMismatch)?;
+        Ok(())
+    }
+
     pub(crate) fn apply_physical_gaps_collected(
         &mut self,
         session: &mut Session,
@@ -3520,6 +3601,24 @@ impl SemanticCapture {
             self.expire(image, &mut report);
             self.retained.remove(&(image.task_cookie, image.exec_id));
         }
+        report.pending_scans = attempted_keys.len();
+        let now = io.now();
+        report.awaited_jobs_pending = self.jobs.iter().any(|job| {
+            now < job.deadline
+                && self
+                    .awaiting
+                    .values()
+                    .any(|waiting| Self::pending_key(waiting) == job.key())
+        });
+        report.awaited_hold_pending = self.awaiting.values().any(|waiting| {
+            let image = waiting.record.base.event.image;
+            self.retained
+                .get(&(image.task_cookie, image.exec_id))
+                .is_some_and(|(_, at)| {
+                    now.checked_duration_since(*at)
+                        .is_none_or(|age| age <= RETAINED_IMAGE_HORIZON)
+                })
+        });
         #[cfg(test)]
         {
             self.last_tick_scans_for_test = report.scans;

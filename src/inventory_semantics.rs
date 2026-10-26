@@ -304,6 +304,11 @@ pub(crate) struct SemanticBatch {
     awaiting_floor: Option<u64>,
     shed_floor: Option<u64>,
     exhausted: bool,
+    /// Guard signals carried from the tick report: scans attempted for
+    /// awaited keys, and whether any awaited job or hold is still pending.
+    pending_scans: usize,
+    awaited_jobs_pending: bool,
+    awaited_hold_pending: bool,
 }
 
 /// Lane negatives per batch: one cut barrier plus bounded collection
@@ -380,6 +385,9 @@ impl SemanticBatch {
         let awaiting_floor = report.awaiting_floor();
         let shed_floor = report.shed_floor();
         let exhausted = report.exhausted();
+        let pending_scans = report.pending_scans;
+        let awaited_jobs_pending = report.awaited_jobs_pending;
+        let awaited_hold_pending = report.awaited_hold_pending;
         let (outcomes, current) = report.into_parts();
         if outcomes.len() > crate::discovery::instances::MAX_INSTANCES
             || current.len() > crate::discovery::instances::MAX_INSTANCES
@@ -396,6 +404,9 @@ impl SemanticBatch {
             awaiting_floor,
             shed_floor,
             exhausted,
+            pending_scans,
+            awaited_jobs_pending,
+            awaited_hold_pending,
         })
     }
 
@@ -426,6 +437,17 @@ impl SemanticBatch {
     }
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
+    }
+
+    /// Guard signals for the Joint no-progress tripwire.
+    pub(crate) fn pending_scans(&self) -> usize {
+        self.pending_scans
+    }
+    pub(crate) fn awaited_jobs_pending(&self) -> bool {
+        self.awaited_jobs_pending
+    }
+    pub(crate) fn awaited_hold_pending(&self) -> bool {
+        self.awaited_hold_pending
     }
 
     /// Minimum outcome position without consuming: the unpublished
@@ -1807,6 +1829,14 @@ impl AttestedSemanticLane {
         )
     }
 
+    /// Test-only no-progress guard trip cause for the current transaction,
+    /// if the bound expired a true stall.
+    #[cfg(test)]
+    pub(crate) fn joint_guard_trip_for_test(&self) -> Option<&'static str> {
+        let live = self.live.as_deref()?;
+        live.joint_machine.as_ref()?.h0_guard_trip_for_test()
+    }
+
     /// Whether this lane owns a Joint machine (§8.3).
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_machine(&self) -> bool {
@@ -2253,6 +2283,36 @@ impl AttestedSemanticLane {
         live.continuity_cuts = live.capture.continuity_cuts();
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
+        let counted = unjoined_shed_counts(report.outcomes());
+        match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {
+            Ok(batch) => Ok(batch),
+            Err(_) => {
+                self.stash_oversized_shed(counted);
+                Err(SemanticRefusal::Unavailable)
+            }
+        }
+    }
+
+    /// Expire the Joint no-progress guard's true stall: every remaining
+    /// collected waiter becomes disclosed `unobserved`, keeping the
+    /// already-joined outcomes for publication. The lane must be live and
+    /// unfinished; gating does not block the expiry itself.
+    pub(crate) fn expire_joint_h0_stall_for_guard(
+        &mut self,
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        let live = self
+            .live
+            .as_deref_mut()
+            .ok_or(SemanticRefusal::Unavailable)?;
+        if live.finished {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        let mut report = TickReport::default();
+        live.capture
+            .expire_collected_remaining_for_guard(raw, &mut report)
+            .map_err(|_| SemanticRefusal::Unavailable)?;
+        live.continuity_cuts = live.capture.continuity_cuts();
         let counted = unjoined_shed_counts(report.outcomes());
         match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {
             Ok(batch) => Ok(batch),

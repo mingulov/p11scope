@@ -4183,10 +4183,11 @@ fn joint_drive_line(
     let staging = staging.map_or_else(|| "-".to_string(), |detail| detail.to_string());
     let stuck = lane.joint_stuck_diagnostic_for_test();
     let stuck = stuck.as_deref().unwrap_or("-");
+    let trip = lane.joint_guard_trip_for_test().unwrap_or("-");
     eprintln!(
         "JOINT_R16 {tag} step={step} live={} gated={} finished={} ticks={ticks} \
          phase={phase} demand={demand} work={work} base={base} staging={staging} \
-         revision={} feeds={} stuck={stuck}",
+         revision={} feeds={} stuck={stuck} trip={trip}",
         u8::from(live),
         u8::from(gated),
         u8::from(finished),
@@ -4262,10 +4263,15 @@ fn service_to_published(
             );
             return Ok(polls);
         }
+        let scan_bound =
+            crate::semantic_capture::TickLimits::default().pending_for + Duration::from_secs(3);
         ensure!(
-            polls < 600,
-            "{tag}: unpublished after 600 polls ({} ms); stuck audit={:?} h3={:?} waiters={:?}",
+            started.elapsed() < scan_bound,
+            "{tag}: unpublished after {} polls ({} ms, bound {} ms); \
+             stuck audit={:?} h3={:?} waiters={:?}",
+            polls,
             started.elapsed().as_millis(),
+            scan_bound.as_millis(),
             lane.joint_audit_diagnostic_for_test(),
             coordinator.reference_h3_audit_state(),
             lane.joint_stuck_diagnostic_for_test(),

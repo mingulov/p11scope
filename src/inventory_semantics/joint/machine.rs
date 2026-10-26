@@ -46,10 +46,15 @@ const RAW_CAPACITY: usize = 4_096;
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
-// Consecutive incomplete H0 merges without a single new outcome or receipt
-// before the lane names the stall. Honest drains append on every pass (each
-// tick resolves scans or expires waiters), so only a stuck waiter set with
-// an empty report can reach this; transient single-pass refusals reset it.
+// Consecutive true no-job stalls before the guard expires the stuck
+// waiters as unobserved and publishes with the joined outcomes kept.
+// A pass counts only when it appends no outcome or receipt AND attempts
+// no scan for an awaited key AND no job for an awaited key has a future
+// deadline AND no retained hold is inside its horizon. Refused-scan
+// passes never count: a scan attempted (even if refused), a future
+// deadline, a hold inside its horizon, or any appended outcome or
+// receipt resets the count, so honest slow drains and deadline waits
+// can never trip it.
 const H0_NO_PROGRESS_BOUND: u32 = 16;
 
 pub(crate) struct JointWorkBudget {
@@ -267,6 +272,15 @@ pub(crate) trait JointMachineIo {
     ) -> Result<(), SemanticRefusal> {
         Err(SemanticRefusal::Unavailable)
     }
+    /// Expire the no-progress guard's true stall through the owning Capture.
+    /// Fail closed unless the same H0 owner supplies the operation.
+    fn expire_collected_h0_for_guard(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
     fn prepare_publication(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -342,10 +356,14 @@ struct Collected {
     /// A Requested demand already took its one fresh pull past a stale
     /// no-backlog poll, so the quiet case still binds after one pull.
     request_pulled: bool,
-    /// Consecutive H0 merges that added nothing while still incomplete.
-    /// Any merged outcome or receipt resets it; reaching the bound names
-    /// the stall instead of yielding without progress.
+    /// Consecutive true no-job stalls: incomplete merges that appended no
+    /// outcome or receipt, attempted no scan for an awaited key, and saw
+    /// no future-deadline job or in-horizon hold. Any progress, scan,
+    /// future deadline or hold resets it; reaching the bound expires the
+    /// stuck waiters as unobserved and publishes with joined outcomes kept.
     h0_idle_passes: u32,
+    /// The guard trip cause, set when the bound expires the stall.
+    h0_guard_trip: Option<&'static str>,
 }
 
 impl Collected {
@@ -358,19 +376,30 @@ impl Collected {
         })
     }
 
-    /// Count one incomplete merge toward the no-progress bound. Any newly
-    /// accumulated outcome or receipt resets the count; a merge that adds
-    /// nothing while still incomplete names the stall once the bound lands.
-    fn note_h0_merge(&mut self, before: Option<(usize, usize)>) -> Result<(), SemanticRefusal> {
-        if self.h0_accumulated() == before {
-            self.h0_idle_passes = self.h0_idle_passes.saturating_add(1);
-            if self.h0_idle_passes >= H0_NO_PROGRESS_BOUND {
-                return Err(SemanticRefusal::Unavailable);
-            }
-        } else {
+    /// Count one incomplete merge toward the no-progress bound. Returns
+    /// true when the bound trips a true no-job stall. Any newly
+    /// accumulated outcome or receipt resets the count, as does any scan
+    /// attempted for an awaited key (even if refused), any job for an
+    /// awaited key with a future deadline, or any retained hold inside
+    /// its horizon — so only a waiter set with no job, no hold, no
+    /// deadline and no scan can trip.
+    fn note_h0_merge(
+        &mut self,
+        before: Option<(usize, usize)>,
+        pending_scans: usize,
+        has_future_job: bool,
+        has_hold: bool,
+    ) -> bool {
+        if self.h0_accumulated() != before {
             self.h0_idle_passes = 0;
+            return false;
         }
-        Ok(())
+        if pending_scans > 0 || has_future_job || has_hold {
+            self.h0_idle_passes = 0;
+            return false;
+        }
+        self.h0_idle_passes = self.h0_idle_passes.saturating_add(1);
+        self.h0_idle_passes >= H0_NO_PROGRESS_BOUND
     }
 }
 
@@ -661,6 +690,9 @@ impl CollectedReports {
                 awaiting_floor: None,
                 shed_floor: None,
                 exhausted: false,
+                pending_scans: 0,
+                awaited_jobs_pending: false,
+                awaited_hold_pending: false,
             }),
             refused: None,
             receipt_limit: budgets.receipt_limit,
@@ -1533,8 +1565,19 @@ impl LiveJointMachine {
         };
         drop(pending); // Dropped incoming buffers precede their exact lease refund.
         if !complete {
-            if let Err(reason) = original.note_h0_merge(before) {
-                return (Phase::AwaitH0(original), Err(reason));
+            // The increment path is unreachable-in-practice: a PendingQ merge
+            // with anything pending always appends (the Q resolve expires all
+            // quantum waiters into outcomes), so reaching here needs an empty
+            // yet incomplete pending report, i.e. origin-less awaitings, which
+            // collected ticks cannot produce (unpositioned records never enter
+            // awaiting; the machine is single-flight with empty awaiting at
+            // transaction start). Sixteen via PendingQ alone is structurally
+            // impossible (one merge per PendingQ phase, then leave). Keep the
+            // note call: its reset on a progressing PendingQ merge matters to
+            // the shared count. On the unreachable trip, never refuse the
+            // lane; AwaitH0's ticks or its own guard trip expire and publish.
+            if original.note_h0_merge(before, 0, false, false) {
+                original.h0_guard_trip = Some("h0_no_progress_no_job_no_hold_expired");
             }
             return (Phase::AwaitH0(original), Ok(Step::Yield));
         }
@@ -1787,6 +1830,28 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn staging_detail_for_test(&self) -> Option<StagingDetail> {
         self.staging_detail
+    }
+
+    /// The no-progress guard trip cause for the current transaction, if the
+    /// bound expired a true stall (waiters disclosed as unobserved, joined
+    /// outcomes kept, transaction published).
+    #[cfg(test)]
+    pub(crate) fn h0_guard_trip_for_test(&self) -> Option<&'static str> {
+        match self.phase.as_ref()? {
+            Phase::Collecting(value)
+            | Phase::Binding(value)
+            | Phase::AwaitH0(value)
+            | Phase::Preparing(value)
+            | Phase::PreparationAttempted(value)
+            | Phase::FinishStopReady(value)
+            | Phase::PreparingAdmissions(value)
+            | Phase::Ingesting(value)
+            | Phase::StagingNegative(value) => value.h0_guard_trip,
+            Phase::PendingQ { original, .. }
+            | Phase::FinishStopReport { original, .. }
+            | Phase::BindingKeys { original, .. } => original.h0_guard_trip,
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -2173,6 +2238,7 @@ impl LiveJointMachine {
                             reports: None,
                             request_pulled: false,
                             h0_idle_passes: 0,
+                            h0_guard_trip: None,
                         }),
                         Err(SemanticRefusal::Unavailable),
                     );
@@ -2186,6 +2252,7 @@ impl LiveJointMachine {
                         reports: None,
                         request_pulled: false,
                         h0_idle_passes: 0,
+                        h0_guard_trip: None,
                     }),
                     Ok(Step::Continue),
                 )
@@ -2312,6 +2379,9 @@ impl LiveJointMachine {
                 let batch = retain_on_refusal!(Phase::AwaitH0(original), ticked);
                 budget.spend(1);
                 let before = original.h0_accumulated();
+                let pending_scans = batch.pending_scans();
+                let has_future_job = batch.awaited_jobs_pending();
+                let has_hold = batch.awaited_hold_pending();
                 let complete = match original
                     .reports
                     .as_mut()
@@ -2322,8 +2392,36 @@ impl LiveJointMachine {
                     Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
                 };
                 if !complete {
-                    if let Err(reason) = original.note_h0_merge(before) {
-                        return (Phase::AwaitH0(original), Err(reason));
+                    if original.note_h0_merge(before, pending_scans, has_future_job, has_hold) {
+                        original.h0_guard_trip = Some("h0_no_progress_no_job_no_hold_expired");
+                        let expired =
+                            match io.expire_collected_h0_for_guard(lane, &mut original.raw) {
+                                Ok(expired) => expired,
+                                Err(reason) => {
+                                    return (Phase::AwaitH0(original), Err(reason));
+                                }
+                            };
+                        let complete = match original
+                            .reports
+                            .as_mut()
+                            .expect("prepaid before New")
+                            .merge(expired)
+                        {
+                            Ok(complete) => complete,
+                            Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
+                        };
+                        if !complete {
+                            return (Phase::AwaitH0(original), Err(SemanticRefusal::Unavailable));
+                        }
+                        let batch = original
+                            .reports
+                            .as_mut()
+                            .expect("same reports")
+                            .batch
+                            .take()
+                            .expect("stage once");
+                        coordinator.stage_semantic_batch(batch);
+                        return (Phase::Preparing(original), Ok(Step::Continue));
                     }
                     return (Phase::AwaitH0(original), Ok(Step::Yield));
                 }
@@ -3241,6 +3339,15 @@ impl JointMachineIo for SessionMachineIo {
                 report,
             )
             .map_err(|_| SemanticRefusal::Unavailable)
+    }
+
+    fn expire_collected_h0_for_guard(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.live(lane)?;
+        lane.expire_joint_h0_stall_for_guard(raw)
     }
 
     fn prepare_publication(

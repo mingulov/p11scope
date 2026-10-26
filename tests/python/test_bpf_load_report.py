@@ -415,6 +415,21 @@ class ReportTests(unittest.TestCase):
             self.assertIn("unresolved", result.stdout)
             self.assertNotIn("EXPECTED", result.stdout)
 
+    def test_probe_shaped_refusal_under_a_real_root_still_fails(self):
+        # The allowlist binds the probe shape to root "unresolved": the
+        # same refused shape under a real root fails like any other
+        # refused load instead of hiding as EXPECTED. The healthy
+        # companion uses another root so the refused group holds the
+        # probe shape alone.
+        variant = self.bpf_loop_probe_row(22)
+        variant["root"] = "p11_entry"
+        loads = [variant, load_row("p11_return", processed=472892)]
+        result = self.run_report(self.write_loads("probe.jsonl", loads))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("p11_entry", result.stdout)
+        self.assertNotIn("EXPECTED", result.stdout)
+
     def test_probe_fingerprint_matches_the_attached_source_bytes(self):
         # The allowlisted fingerprint is the FNV-1a 64 of the exact
         # BPF_LOOP_PROBE_INSNS bytes in src/attach.rs, not a magic string:

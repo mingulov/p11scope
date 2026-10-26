@@ -681,8 +681,44 @@ def _check_s1_application(application_rows, application):
     return split, per_function
 
 
+def _check_s1_zero_count_edge(edge):
+    """Empty edges must be quiet: allowed mechanism ids, zero counts."""
+    rows = edge.get("mechanisms")
+    if rows is None:
+        rows = []
+    _require(type(rows) is list, "unexpected mechanisms shape")
+    allowed = {spec["id"] for spec in S1_MECHANISMS}
+    for row in rows:
+        checked = _check_mechanism_row(row)
+        if checked[0] not in allowed:
+            raise OracleRefusal(
+                f"unexpected S1 mechanism 0x{checked[0]:x}")
+        _require(checked[3] == 0,
+                 f"S1 zero-count edge carries mechanism calls {checked[3]}"
+                 f" != expected 0")
+        _require(row["errors"] == 0,
+                 f"S1 zero-count edge carries mechanism errors"
+                 f" {row['errors']} != expected 0")
+    operations = edge.get("operations")
+    if operations is None:
+        return
+    counters, active = _check_s1_operations_row(operations)
+    for name, value in counters.items():
+        _require(value == 0,
+                 f"S1 zero-count edge carries operations {name} {value}"
+                 f" != expected 0")
+    _require(active == 0,
+             f"S1 zero-count edge carries active operations {active}"
+             f" != expected 0")
+
+
 def _check_s1_edge_counts(edges):
-    """Sum entry counts; counted edges must be loss-free and S1-observed."""
+    """Sum entry counts; counted edges must be loss-free and S1-observed.
+
+    Zero-count edges contribute nothing but must still be empty: their
+    mechanism rows keep the allowed ids with zero calls/errors, and any
+    present operations row must be all zero.
+    """
     total = 0
     counted = []
     for edge in edges:
@@ -693,6 +729,7 @@ def _check_s1_edge_counts(edges):
         count = entries["count"]
         total += count
         if count == 0:
+            _check_s1_zero_count_edge(edge)
             continue
         coverage = entries.get("coverage")
         _require(type(coverage) is dict, "unexpected S1 coverage shape")

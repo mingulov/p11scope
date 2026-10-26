@@ -1203,3 +1203,133 @@ fn joint_machine_staging_refusal_names_its_sub_exit() {
     );
     assert_eq!(detail.to_string(), format!("stage_next:Admission@{stage}"));
 }
+
+/// Push one bare CALL row (the live H8-absent shape: no journal
+/// BEGIN/END enters the drain, so ingest opens no H8 entry).
+fn push_bare_call(scene: &mut MachineScene, pid: u32, name: &str, seq: u64) {
+    use p11scope_ebpf_common::object_journal::JournalRecord;
+    let descriptors = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+    let (_, end) = scene.scene.encoded(pid, 0, name, seq);
+    let payload =
+        match p11scope_ebpf_common::object_journal::decode_journal_record(&end, &descriptors) {
+            Some(JournalRecord::End(end)) => end.payload_base(),
+            other => panic!("the shaped END decodes: {other:?}"),
+        };
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(crate::events::record_bytes(&payload));
+}
+
+/// The live R16 cell-1 case: a published q1 (H8-absent S1-only batch,
+/// every birth refused, zero Joint feeds) followed by an empty q2 with
+/// Requested demand (the fixture is quiet, the cell still begins a
+/// commit). The empty follow-up must publish (or refuse loudly), never
+/// wedge in Audited/Bound with Pending forever.
+#[test]
+fn joint_machine_empty_followup_transaction_publishes() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    for seq in 1..=8u64 {
+        push_bare_call(&mut scene, pid, "C_SignInit", seq);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("empty-followup-q1", None);
+    let revision_q1 = scene.scene.real.scene.coordinator.registry().published_revision();
+    let JointCommitProgress::Published(_) = scene.poll_commit(0).unwrap() else {
+        panic!("q1 publishes exactly once");
+    };
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().published_revision(),
+        revision_q1,
+        "the poll takes the q1 receipt without a second publication"
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "zero Joint feeds, like live"
+    );
+    // The live q2: nothing new in the drain, engine unchanged, but the
+    // cell begins a commit anyway.
+    assert_eq!(scene.scene.drain.source_mut().remaining(), 0);
+    scene.machine.begin_commit(false).unwrap();
+    scene.published_labeled("empty-followup-q2", None);
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().published_revision(),
+        revision_q1 + 1,
+        "the empty follow-up publishes exactly one more revision"
+    );
+}
+
+/// The live R16 cell-1 drive, faithfully: q1 publishes B's completed
+/// calls plus A's SignInit while A's Sign is still held (no row for
+/// it yet); the cell idles the machine three times (fresh polls, empty
+/// drain); then A's END lands and the cell begins q2. q2 must collect
+/// the landed END and publish exactly once more, never strand the row
+/// and never wedge in Audited/Bound.
+#[test]
+fn joint_machine_followup_collects_row_landed_after_idle_poll() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    for seq in 1..=8u64 {
+        push_bare_call(&mut scene, pid, "C_SignInit", seq);
+    }
+    push_bare_call(&mut scene, pid, "C_SignInit", 9);
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("landed-after-idle-q1", None);
+    let JointCommitProgress::Published(_) = scene.poll_commit(0).unwrap() else {
+        panic!("q1 publishes exactly once");
+    };
+    let revision_q1 = scene.scene.real.scene.coordinator.registry().published_revision();
+    assert_eq!(scene.scene.drain.source_mut().remaining(), 0);
+    // The cell's three idle services: fresh polls against an empty
+    // drain, publishing nothing.
+    for _ in 0..3 {
+        let progress = scene.service(1024).unwrap();
+        assert_eq!(progress, JointServiceProgress::Pending);
+    }
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().published_revision(),
+        revision_q1,
+        "idle service publishes nothing"
+    );
+    assert_eq!(phase_of(&scene), "Collecting");
+    // A's END lands after the last idle poll, then the cell begins q2.
+    push_bare_call(&mut scene, pid, "C_SignFinal", 10);
+    scene.machine.begin_commit(false).unwrap();
+    let mut published = None;
+    for _ in 0..600 {
+        let progress = scene.service(1024).unwrap();
+        if matches!(progress, JointServiceProgress::Published) {
+            published = Some(());
+            break;
+        }
+        if matches!(
+            scene.poll_commit(1024).unwrap(),
+            JointCommitProgress::Published(_)
+        ) {
+            published = Some(());
+            break;
+        }
+    }
+    assert!(
+        published.is_some(),
+        "q2 publishes within its bound; stuck at snapshot={:?} audit={:?}",
+        scene.machine.diagnostic_snapshot_for_test(),
+        scene.machine.diagnostic_audit_for_test(),
+    );
+    assert_eq!(
+        scene.scene.drain.source_mut().remaining(),
+        0,
+        "q2 collects the row that landed before its begin"
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().published_revision(),
+        revision_q1 + 1,
+        "q2 publishes exactly one more revision"
+    );
+}

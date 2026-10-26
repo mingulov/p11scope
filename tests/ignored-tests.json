@@ -208,6 +208,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
       "cell": "privileged"

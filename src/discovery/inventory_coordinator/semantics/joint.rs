@@ -1380,7 +1380,8 @@ mod tests {
         assert!(registry.staged_scope_gaps_for_test().is_empty());
     }
 
-    /// The Births phase consults the unlinked guard before any birth
+    /// The Births phase consults the unlinked guard after the admission
+    /// preamble (whose refusals stand unchanged) and before any birth
     /// work: no grant staged, no marker word read (the consume closure
     /// never runs), no per-birth gap. The stray-grant backstop in
     /// `apply_instance` covers any grant that still arrives.
@@ -1409,6 +1410,20 @@ mod tests {
             assert!(
                 guard < work,
                 "the guard runs before any birth work ({anchor})"
+            );
+        }
+        for anchor in [
+            "validate_owner",
+            "ForeignCapture",
+            "births_decided",
+            "claim_cursor",
+        ] {
+            let admitted = body
+                .find(anchor)
+                .unwrap_or_else(|| panic!("admission anchor present: {anchor}"));
+            assert!(
+                admitted < guard,
+                "the guard runs after the admission preamble ({anchor})"
             );
         }
     }

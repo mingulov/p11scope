@@ -18263,3 +18263,152 @@ fn joint_machine_shared_partitions_mint_one_receipt_each() {
     );
     assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
 }
+
+/// Collected H0 must expire pin-less calls instead of retaining them for a
+/// binding that cannot arrive mid-transaction. Five hundred pending records
+/// from post-attach callers without scan targets stall AwaitH0 on the
+/// retaining code (no progress, no refusal, work 505/0); after the fix they
+/// expire as unobserved and the transaction publishes.
+#[test]
+fn joint_machine_collected_pinless_post_attach_expires_not_stalls() {
+    const RECORDS: usize = 505;
+    const CALLERS: usize = 4;
+    let mut fixture = MachineScene::new(1);
+    // Separate the lane-attach stamp from the child starts by far more
+    // than the tick granularity, so retention is deterministic.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let children: Vec<OwnedStoppedChild> = (0..CALLERS).map(|_| OwnedStoppedChild::new()).collect();
+    let mut pids = Vec::with_capacity(CALLERS);
+    for (offset, child) in children.iter().enumerate() {
+        let caller_pid = child.id();
+        fixture.scene.real.bind(
+            caller_pid,
+            ImageIdentity {
+                task_cookie: 200 + offset as u64,
+                exec_id: 0,
+            },
+            0,
+        );
+        pids.push(caller_pid);
+    }
+    fixture.scene.drain.source_mut().bound = 4_096;
+    let mut pushed_calls = 0usize;
+    let push_call = |fixture: &mut MachineScene, index: usize| {
+        let record_pid = pids[index % pids.len()];
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .io
+            .targets
+            .get_mut(&record_pid)
+            .unwrap()
+            .1 = ImageIdentity {
+            task_cookie: 2_000 + index as u64,
+            exec_id: 0,
+        };
+        fixture
+            .scene
+            .push(record_pid, 0, "C_CreateObject", index as u64 + 1);
+    };
+    for index in 0..255 {
+        push_call(&mut fixture, index);
+        pushed_calls += 1;
+    }
+    let mut targets_cleared = false;
+    let mut services = 0usize;
+    let mut pulls = 0usize;
+    let mut published = false;
+    for _ in 0..2048 {
+        let phase = fixture.machine.diagnostic_snapshot_for_test().0;
+        let collecting = matches!(phase, "Idle" | "Collecting");
+        // Step Binding with a unit budget so it lands in AwaitH0 without
+        // ticking; the targets drop after the binder's refreshes (which
+        // need them) and before the first H0 tick (which must not see
+        // them), like a production tick over unreached callers.
+        if phase == "AwaitH0" && !targets_cleared {
+            fixture.scene.real.h0.0.borrow_mut().io.targets.clear();
+            targets_cleared = true;
+        }
+        let work = if collecting || phase == "Binding" {
+            1
+        } else {
+            1024
+        };
+        match fixture.service(work) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                services += 1;
+                if collecting {
+                    pulls += 1;
+                    if pulls % 2 == 1 && pushed_calls < RECORDS {
+                        push_call(&mut fixture, pushed_calls);
+                        pushed_calls += 1;
+                    }
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "pin-less post-attach calls must expire, not refuse: \
+                     {reason:?} at {:?} after {services} services",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    assert_eq!(pushed_calls, RECORDS, "all calls fed");
+    assert!(targets_cleared, "targets dropped before H0 ticks");
+    assert!(
+        published,
+        "the pin-less transaction must publish after expiry, not stall in {:?}",
+        fixture.machine.diagnostic_snapshot_for_test(),
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+}
+
+/// An H0 merge that cannot complete must never yield forever: a scan leaf
+/// that refuses every job leaves awaiting stuck with no outcomes, so each
+/// pass makes no progress. The lane must name the stall within a bounded
+/// number of passes instead of yielding without end.
+#[test]
+fn joint_machine_h0_idle_merge_refuses_within_bound() {
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 1);
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    let mut services = 0usize;
+    let outcome = loop {
+        if services >= 50 {
+            panic!(
+                "a persistently refused scan must refuse within 50 passes, \
+                 still {:?} after {services}",
+                fixture.machine.diagnostic_snapshot_for_test(),
+            );
+        }
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                panic!("a refused scan cannot publish");
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                services += 1;
+            }
+            Err(reason) => break (reason, services + 1),
+        }
+    };
+    assert_eq!(outcome.0, SemanticRefusal::Unavailable);
+    assert!(
+        outcome.1 <= 30,
+        "refusal within a bounded number of passes, took {}",
+        outcome.1
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "AwaitH0",
+        "the refused original stays in AwaitH0 for disposal"
+    );
+}

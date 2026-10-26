@@ -3871,25 +3871,15 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
-    // H8-D birth marker: the outlined return halves report a lost
-    // in-scope call with a nonzero code instead of calling the leaf (a
-    // call there would deepen return's 512-byte chain); the root dirties
-    // the leader row here at root depth. Each result is consumed by its
-    // own compare, so no cross-branch slot grows the root frame.
+    // H8-D birth marker: the outlined return halves gap the leader row
+    // in place at their own lost-call arms (a 12-byte global frame at
+    // depth 3, inside the 512-byte chain). No lost code crosses to the
+    // root: the 6.1/5.15 verifiers explore the pre-marker tail shape.
     if unsafe { (*start).object_required } == 0 {
-        if ordinary_return(ctx, &key, start, flags, layout) != 0 {
-            #[cfg(not(feature = "counter-broad"))]
-            unsafe {
-                p11_instance_scope_gap();
-            }
-        }
-    } else if object_return(ctx, &key, start, flags, layout) != 0 {
-        #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
-        }
+        ordinary_return(ctx, &key, start, flags, layout)
+    } else {
+        object_return(ctx, &key, start, flags, layout)
     }
-    0
 }
 
 #[cfg(not(feature = "inventory-only"))]
@@ -4023,13 +4013,6 @@ fn capture_return_facts(
     }
 }
 
-/// H8-D birth marker: the outlined return halves report a lost
-/// in-scope call (identity mismatch, ring loss) with this code. The
-/// root dirties the leader row at root depth; the helpers never call
-/// the leaf themselves, keeping return's 512-byte chain intact.
-#[cfg(not(feature = "inventory-only"))]
-const RETURN_CALL_LOST: u32 = 1;
-
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn ordinary_return(
@@ -4058,7 +4041,13 @@ fn ordinary_return(
         || !image_pair_matches(start.image, image)
     {
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        return RETURN_CALL_LOST;
+        // H8-D birth marker: an identity-mismatched return loses the
+        // completion, so it gaps here in place at depth 3.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
+        return 0;
     }
     let facts = capture_return_facts(ctx, &start, flags, layout, accounting);
     match EVENTS.reserve::<EventRecord>(0) {
@@ -4078,7 +4067,13 @@ fn ordinary_return(
         }
         None => {
             bump_evidence(EVIDENCE_RING_LOSS);
-            RETURN_CALL_LOST
+            // H8-D birth marker: a ring-loss return loses the
+            // completion. The gap runs here in place.
+            #[cfg(not(feature = "counter-broad"))]
+            unsafe {
+                p11_instance_scope_gap();
+            }
+            0
         }
     }
 }
@@ -4156,14 +4151,23 @@ fn object_return(
     let descriptor = cookie_descriptor(cookie_of(ctx));
     let rv = accounting.rv;
     let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
-        // The fault below already refuses births; report loss only when
-        // the START removal settles.
+        // The fault below already refuses births; gap only when the
+        // START removal settles. The gap runs here in place; the root
+        // stays a plain tail dispatch for the 6.1/5.15 verifiers.
         let failed = owned_start_remove(&key, true).is_err();
         if failed {
             unsafe { p11_object_fault() };
         }
         bump_evidence(EVIDENCE_RING_LOSS);
-        return if failed { 0 } else { RETURN_CALL_LOST };
+        // H8-D birth marker: a ring-loss return whose START removal
+        // settled loses the completion, so it gaps here in place.
+        #[cfg(not(feature = "counter-broad"))]
+        if !failed {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        return 0;
     };
     // H7-E1: populate in place under ownership with the base event
     // and its continuity landing in the reserved record FIRST, then

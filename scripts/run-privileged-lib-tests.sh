@@ -108,6 +108,14 @@ attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
+# Birth marker cells: live exec/fork/scope-gap marker words and admission
+# counts through the session's instance maps.
+attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
+attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
+attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
+attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
+attach::instance_tests::privileged_journal_marker_out_of_scope_call_dirties_once
+attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 # H6 observer mapping interactions: owned idle target and genuine external
 # mutation control; distinguish ordinary scans from System identity anchors.
 attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance

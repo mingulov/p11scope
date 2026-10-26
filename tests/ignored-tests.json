@@ -190,6 +190,42 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_out_of_scope_call_dirties_once",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
       "cell": "privileged"

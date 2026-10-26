@@ -3768,7 +3768,8 @@ mod tests {
             "--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.",
             "counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.",
             "Omit --counter-mode to keep existing metrics behavior.",
-            "refuse with a named reason on kernels without bpf_loop (helper 181)",
+            "can refuse with a named reason, including on kernels without bpf_loop (helper 181)",
+            "where the kernel verifier rejects the counter programs",
         ] {
             assert!(
                 USAGE.contains(statement),
@@ -3778,6 +3779,14 @@ mod tests {
         assert!(
             !USAGE.contains("counter-mode-unwired"),
             "help still states the removed refusal"
+        );
+        // The refusal list is non-exhaustive: the old exhaustive sentence
+        // also overclaimed by omitting the verifier refusal.
+        assert!(
+            !USAGE.contains(
+                "Selections refuse with a named reason on kernels without bpf_loop (helper 181), on builds without counter objects, and past the mode's endpoint ceiling."
+            ),
+            "help still states the exhaustive refusal list"
         );
         assert!(
             USAGE.contains("[--counter-mode counts|timestamps|latency]"),

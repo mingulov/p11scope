@@ -5734,6 +5734,23 @@ mod tests {
         }
     }
 
+    /// Row-0 liveness predicate for the CLI cells' `-o` JSON: the held call
+    /// spans live nanoseconds, so cumulative total and max are both nonzero.
+    /// A bare `total >= max` passes on all-zero timing and would hide a BPF
+    /// clock or collection zeroing on this path.
+    fn held_timing_is_live(total: u64, max: u64) -> bool {
+        total >= max
+    }
+
+    #[test]
+    fn held_timing_predicate_rejects_all_zero_timing() {
+        assert!(!held_timing_is_live(0, 0));
+        assert!(!held_timing_is_live(5, 0));
+        assert!(!held_timing_is_live(0, 5));
+        assert!(held_timing_is_live(1, 1));
+        assert!(held_timing_is_live(9, 4));
+    }
+
     /// CLI-shaped counter capture for one mode: real parsed argv → the real
     /// `capture_policy` → the injected Engine over the counter fixture →
     /// the real session start → the real profile loop to `-o` JSON, whose
@@ -5909,6 +5926,16 @@ mod tests {
                     let total = latency["total"].as_u64().unwrap();
                     let max = latency["max"].as_u64().unwrap();
                     assert!(total >= max, "row {index}");
+                    // Row 0 was held from START to RELEASE across several
+                    // fixture round-trips: it provably spans live
+                    // nanoseconds, so both values are nonzero (mirrors
+                    // `assert_held_timing` through the `-o` JSON path).
+                    if index == 0 {
+                        assert!(
+                            held_timing_is_live(total, max),
+                            "row 0 held call carries live timing"
+                        );
+                    }
                 }
                 CounterMode::Latency => {
                     let latency = &function["latency_ns"];
@@ -5916,6 +5943,16 @@ mod tests {
                     let total = latency["total"].as_u64().unwrap();
                     let max = latency["max"].as_u64().unwrap();
                     assert!(total >= max, "row {index}");
+                    // Row 0 was held from START to RELEASE across several
+                    // fixture round-trips: it provably spans live
+                    // nanoseconds, so both values are nonzero (mirrors
+                    // `assert_held_timing` through the `-o` JSON path).
+                    if index == 0 {
+                        assert!(
+                            held_timing_is_live(total, max),
+                            "row 0 held call carries live timing"
+                        );
+                    }
                     for quantile in ["p50", "p95", "p99"] {
                         let percentile = latency[quantile]
                             .as_u64()
@@ -5953,6 +5990,79 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode latency to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_latency_matches_workload_ledger_lp64() {
         counter_cli_capture_cell(CounterMode::Latency);
+    }
+
+    /// CLI-shaped counter `run`: real parsed argv → the real owned-child run
+    /// to `-o` JSON. The owned workload maps no provider, so the capture
+    /// attaches to zero endpoints; the run-specific delta under test is the
+    /// owned child through session preparation with a Counter policy, which
+    /// the profile cells never drive. The child proves it ran (marker plus
+    /// exact exit status) and the document proves the counter measurement
+    /// ran (counts collection, fresh, no functions).
+    #[test]
+    #[ignore = "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON"]
+    fn counter_cli_run_counts_with_owned_child_lp64() {
+        let mode = CounterMode::Counts;
+        let id = std::process::id();
+        let out_path = std::env::temp_dir().join(format!("p11scope-counter-run-{id}.json"));
+        let _cleanup = RemoveReportOnDrop(out_path.clone());
+        let marker_path = std::env::temp_dir().join(format!("p11scope-counter-run-{id}.marker"));
+        let _marker_cleanup = RemoveReportOnDrop(marker_path.clone());
+        let out_text = out_path.to_string_lossy().into_owned();
+        let marker_text = marker_path.to_string_lossy().into_owned();
+        let script = format!("printf ran > '{marker_text}'");
+        let argv = [
+            "run",
+            "--mode",
+            "metrics",
+            "--counter-mode",
+            mode.name(),
+            "--attach-backend",
+            "multi",
+            "-o",
+            out_text.as_str(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script.as_str(),
+        ];
+        let Ok(crate::cli::Command::Run(run_args)) = crate::cli::parse(argv) else {
+            panic!("counter run argv must parse as an owned run");
+        };
+        assert_eq!(run_args.counter_mode, Some(mode));
+        assert!(run_args.metrics);
+        assert_eq!(
+            run_args.attach_backend,
+            crate::attach::BackendSelection::Multi
+        );
+        let policy = crate::run::capture_policy(
+            run_args.kind,
+            run_args.metrics,
+            run_args.unsafe_requested,
+            run_args.counter_mode,
+        )
+        .expect("counter run argv builds its policy");
+        assert_eq!(policy, crate::attach::CapturePolicy::Counter(mode));
+        let outcome = crate::run::run_owned(&run_args).expect("owned counter run completes");
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert!(!outcome.child_still_running);
+        assert!(marker_path.is_file(), "the observed command never ran");
+        let text = std::fs::read_to_string(&out_path).expect("-o report exists");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(document["schema"], "p11scope/observed-profile/v3-metrics");
+        assert_eq!(document["lane"], "metrics");
+        assert_eq!(document["capture"]["mode"], "metrics");
+        assert_eq!(document["capture"]["scope"], "pid");
+        let collection = &document["evidence"]["counter_collection"];
+        assert_eq!(collection["mode"], mode.name());
+        assert_eq!(collection["status"], "fresh");
+        assert_eq!(collection["health"]["saturated"], false);
+        assert_eq!(collection["health"]["contended"], false);
+        assert_eq!(collection["discontinuity"], false);
+        assert!(collection["failure"].is_null());
+        let functions = document["functions"].as_array().expect("functions array");
+        assert!(functions.is_empty(), "zero endpoints, zero functions");
+        eprintln!("COUNTER_CLI_RUN child=0 functions=0 status=fresh");
     }
 
     #[test]

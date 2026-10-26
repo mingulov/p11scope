@@ -1141,6 +1141,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+      "reason": "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON",
+      "cell": "privileged"
+    },
+    {
       "file": "src/process.rs",
       "path": "process::tests::pidfd_denial::pidfd_denial_helper",
       "reason": "private seccomp helper; invoked by real_pidfd_denial_preserves_proc_identity_without_signal_authority",

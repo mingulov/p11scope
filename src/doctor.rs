@@ -3392,6 +3392,12 @@ mod tests {
             for mode in ["counts", "timestamps", "latency"] {
                 assert!(line.contains(mode), "{line:?}");
             }
+            // The Available line scopes the claim: the kernel verifier
+            // still has to accept the counter programs (6.1 rejects them).
+            assert!(
+                line.contains("subject to the kernel verifier accepting the counter programs"),
+                "{line:?}"
+            );
         }
     }
 }

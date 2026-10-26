@@ -13430,6 +13430,67 @@ mod tests {
         );
     }
 
+    /// The ia32 twin of counter grouping: a Counter policy with bank roots
+    /// and an ia32 (Ilp32) slot refuses at the LP64 guard — past the earlier
+    /// policy-mismatch arm — naming the mode. The Lp64 twin is accepted.
+    /// All three modes reach this guard through the public CLI.
+    #[test]
+    fn counter_grouping_refuses_ia32_slots_per_mode_with_lp64_twin() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let (_fixture, pins, first, _, _) = counter_banks::tests::growth_provider_fixture();
+            let slots = vec![first.clone()];
+            let targets: BTreeMap<_, _> = slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            pins.attach_path_for(slot.object).unwrap(),
+                            pins.abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let accepted = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &targets,
+                StaticRoots::CounterBanks,
+                Some(mode),
+            );
+            assert!(accepted.is_ok(), "{mode:?} Lp64 twin groups");
+            let mut ia32 = targets.clone();
+            ia32.get_mut(&first.index).unwrap().1 = ElfAbi::Ilp32;
+            let error = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &ia32,
+                StaticRoots::CounterBanks,
+                Some(mode),
+            )
+            .expect_err("ia32 slot must refuse grouping");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("requires an LP64 retained-FD attach path"),
+                "{mode:?}: {text}"
+            );
+            assert!(
+                text.contains(mode.name()),
+                "{mode:?}: refusal names the mode: {text}"
+            );
+            assert!(
+                !text.contains("fixed aggregate-only roots"),
+                "{mode:?}: past the policy-mismatch arm: {text}"
+            );
+        }
+    }
+
     #[test]
     fn counter_bank_multi_append_and_late_failure_preserve_old_groups() {
         for refusal in [None, Some(libc::EOPNOTSUPP), Some(libc::EMFILE)] {

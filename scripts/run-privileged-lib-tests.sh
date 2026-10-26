@@ -422,6 +422,7 @@ metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
 metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
 metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
 metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale

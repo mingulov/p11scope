@@ -601,25 +601,37 @@ class S1ReportGateTests(unittest.TestCase):
 
 
 class BlockedS1PinTests(unittest.TestCase):
+    BLOCKED_CAUSES = {"interface_selection", "in_flight_at_end"}
+
     def blocked_report(self, driver, in_flight_at_end):
-        return build_evidence(
+        """Blocked-shaped evidence: one open call, zero loader hits (the
+        capture ends before the workload exits), no live window."""
+        report = build_evidence(
             driver, [function_row(9, "C_InitToken", 1,
                                   {"0000000000000000": 1}),
                      function_row(10, "C_InitPIN", 0, {}, in_flight=1)],
             extra={"in_flight_at_end": in_flight_at_end})
+        evidence = report["evidence"]
+        evidence["loader_discovery"]["hits"] = 0
+        evidence["loader_discovery"]["dlopen_timing"]["unproven"] = 0
+        evidence["unprotected_live_windows"] = 0
+        EVIDENCE.settle_fixture_verdict(report)
+        evidence["completeness"] = \
+            EVIDENCE.expected_terminal_completeness(evidence)
+        return report
 
     def test_blocked_in_flight_pin_accepted(self):
         driver = require_driver(self)
         require_evidence(self)
         report = self.blocked_report(driver, 1)
-        self.assertIn("in_flight_at_end",
-                      report["evidence"]["gap_classes"]["observation"]["causes"])
+        self.assertEqual(set(report["evidence"]["gap_classes"]
+                             ["observation"]["causes"]),
+                         self.BLOCKED_CAUSES)
         diagnostics = driver.check_s1_report(
             report, PIN, expected_in_flight_at_end=1,
-            extra_observation_causes={"in_flight_at_end"})
+            expected_observation_causes=set(self.BLOCKED_CAUSES))
         self.assertEqual(set(diagnostics["observation_causes"]),
-                         set(driver.PINNED_OBSERVATION_CAUSES)
-                         | {"in_flight_at_end"})
+                         self.BLOCKED_CAUSES)
 
     def test_blocked_in_flight_refused_by_default(self):
         driver = require_driver(self)
@@ -635,12 +647,12 @@ class BlockedS1PinTests(unittest.TestCase):
         with self.assertRaisesRegex(driver.DriverRefusal, "in_flight_at_end"):
             driver.check_s1_report(
                 report, PIN, expected_in_flight_at_end=1,
-                extra_observation_causes={"in_flight_at_end"})
+                expected_observation_causes=set(self.BLOCKED_CAUSES))
         report = self.blocked_report(driver, 0)
         with self.assertRaisesRegex(driver.DriverRefusal, "in_flight_at_end"):
             driver.check_s1_report(
                 report, PIN, expected_in_flight_at_end=1,
-                extra_observation_causes={"in_flight_at_end"})
+                expected_observation_causes=set(self.BLOCKED_CAUSES))
 
     def test_blocked_unpinned_cause_refused(self):
         driver = require_driver(self)

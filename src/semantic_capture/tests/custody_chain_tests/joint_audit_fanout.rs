@@ -17945,3 +17945,123 @@ fn joint_machine_binding_precharge_still_refuses_an_exhausted_pool() {
     assert_eq!(fixture.service(1), Err(SemanticRefusal::ProviderStorage));
     drop(hold);
 }
+
+/// The common spread: 1,024 records sharing 64 caller partitions still mint
+/// one receipt per partition, not per record. The reservation must size by
+/// the 64 partitions; the records-times bound refuses this shape too.
+#[test]
+fn joint_machine_shared_partitions_mint_one_receipt_each() {
+    const RECORDS: usize = 1_024;
+    const PARTITIONS: usize = 64;
+    let children = [OwnedStoppedChild::new(), OwnedStoppedChild::new()];
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    let mut pids = vec![pid];
+    for (offset, child) in children.iter().enumerate() {
+        let caller_pid = child.id();
+        fixture.scene.real.bind(
+            caller_pid,
+            ImageIdentity {
+                task_cookie: 100 + offset as u64,
+                exec_id: 0,
+            },
+            0,
+        );
+        pids.push(caller_pid);
+    }
+    fixture.scene.drain.source_mut().bound = 4_096;
+    let mut pushed_calls = 0usize;
+    let push_call = |fixture: &mut MachineScene, index: usize| {
+        // Sixteen records share each caller image; the image stays with
+        // one caller so no exec churn retires anything mid-pass.
+        let partition = index % PARTITIONS;
+        let record_pid = pids[partition % pids.len()];
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .io
+            .targets
+            .get_mut(&record_pid)
+            .unwrap()
+            .1 = ImageIdentity {
+            task_cookie: 1_000 + partition as u64,
+            exec_id: 0,
+        };
+        fixture
+            .scene
+            .push(record_pid, 0, "C_CreateObject", index as u64 + 1);
+    };
+    for index in 0..255 {
+        push_call(&mut fixture, index);
+        pushed_calls += 1;
+    }
+    let limit = crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT;
+    let mut peak_charged = 0usize;
+    let mut max_current = 0usize;
+    let mut pulls = 0usize;
+    let mut published = false;
+    for _ in 0..8192 {
+        let charged = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        peak_charged = peak_charged.max(charged);
+        if let Some(prepared) = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+        {
+            max_current = max_current.max(prepared.current_receipts().len());
+        }
+        let collecting = matches!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Idle" | "Collecting"
+        );
+        let work = if collecting { 1 } else { 1024 };
+        match fixture.service(work) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                if collecting {
+                    pulls += 1;
+                    if pulls % 2 == 1 && pushed_calls < RECORDS {
+                        push_call(&mut fixture, pushed_calls);
+                        pushed_calls += 1;
+                    }
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "1,024 records over 64 partitions must bind: refused {reason:?} at {:?}",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    assert_eq!(pushed_calls, RECORDS);
+    assert!(published, "the shared-partition transaction must publish");
+    eprintln!(
+        "machine_shared records={RECORDS} partitions={PARTITIONS} max_current={max_current} \
+         peak_charged={peak_charged} limit={limit}"
+    );
+    assert!(
+        peak_charged < limit,
+        "peak {peak_charged} must stay under the shared semantic pool {limit}"
+    );
+    assert_eq!(
+        max_current, PARTITIONS,
+        "one receipt per distinct partition, not per record"
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+}

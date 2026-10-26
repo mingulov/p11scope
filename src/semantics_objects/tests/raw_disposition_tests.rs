@@ -378,3 +378,114 @@ fn joint_unlocalizable_raw_loss_never_becomes_an_empty_prefix() {
     assert_eq!(owner.adapter.consumed_through_for_test(), 0);
     assert_eq!(owner.ledger().census(), 0);
 }
+
+#[test]
+fn joint_unlinked_broken_stream_resyncs_next_collect() {
+    // man-1 Cause 1: one failed quantum (malformed input stands in for
+    // the live single-discard quantum) breaks the adapter stream; an
+    // S1-only (unlinked) lane must re-sync the next quantum on a fresh
+    // stream instead of refusing Gap forever and stranding the run.
+    let events = EventsDomain::test_standin(0xd15c);
+    let retained =
+        SessionDrainProducers::test_pair_unlinked(NativeDomainId::mint(), events.clone());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let mut drain =
+        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+    let raw = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    )
+    .unwrap();
+    assert_eq!(raw.audit.malformed_delta, 1);
+    raw.dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
+        .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
+    assert!(
+        owner.adapter.invalidated && owner.adapter.stream_broken,
+        "the failed disposal breaks the stream"
+    );
+    // The next tick's Idle collect on the same unlinked lane re-syncs.
+    let mut drain =
+        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+    let next = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    );
+    assert!(
+        next.is_ok(),
+        "an unlinked lane re-syncs after a break: {:?}",
+        next.err()
+    );
+    assert!(
+        !(owner.adapter.invalidated || owner.adapter.stream_broken),
+        "the re-sync clears the broken stream"
+    );
+}
+
+#[test]
+fn joint_linked_broken_stream_keeps_gap_refusal() {
+    // Healthy twin: a journal-linked lane keeps the fail-closed Gap
+    // refusal after a stream break; only S1-only lanes re-sync.
+    let events = EventsDomain::test_standin(0x61a9);
+    let retained = producers(&events);
+    assert!(retained.journal_linked());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let mut drain =
+        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+    let raw = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    )
+    .unwrap();
+    raw.dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
+        .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
+    assert!(
+        owner.adapter.invalidated && owner.adapter.stream_broken,
+        "the failed disposal breaks the stream"
+    );
+    let mut drain =
+        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+    let next = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    );
+    let err = next.err();
+    assert!(
+        matches!(
+            err,
+            Some(RawQuantumRefusal::Cut(
+                crate::semantics_objects::journal::BirthCutRefusal::Gap
+            ))
+        ),
+        "a linked lane still refuses Gap after a break: {err:?}"
+    );
+    assert!(
+        owner.adapter.invalidated && owner.adapter.stream_broken,
+        "the break stays fail-closed for linked lanes"
+    );
+}

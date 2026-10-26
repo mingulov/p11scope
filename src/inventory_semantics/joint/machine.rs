@@ -3843,7 +3843,11 @@ impl AttestedSemanticLane {
             self.finish_poll_calls += 1;
         }
         #[cfg(test)]
-        if let Some(scripted) = self.scripted_finish_poll {
+        if let Some(scripted) = self
+            .scripted_finish_poll_queue
+            .pop_front()
+            .or(self.scripted_finish_poll)
+        {
             // A scripted error latches like a pre-machine refusal on
             // unfinished lanes; scripted progress runs latch-free.
             if let Err(reason) = &scripted

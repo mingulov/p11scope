@@ -858,6 +858,17 @@ pub(crate) struct AttestedSemanticLane {
             SemanticRefusal,
         >,
     >,
+    /// Tests-only scripted Finish poll sequence: when non-empty,
+    /// each poll pops its head without a live machine, ahead of the
+    /// sticky `scripted_finish_poll`. Multi-step finish tests script
+    /// Pending-then-Published here.
+    #[cfg(test)]
+    scripted_finish_poll_queue: std::collections::VecDeque<
+        Result<
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress,
+            SemanticRefusal,
+        >,
+    >,
     /// Tests-only count of `poll_joint_finish` calls: contract 5a
     /// pins zero polls past Published.
     #[cfg(test)]
@@ -1343,6 +1354,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             scripted_finish_poll: None,
             #[cfg(test)]
+            scripted_finish_poll_queue: std::collections::VecDeque::new(),
+            #[cfg(test)]
             finish_poll_calls: 0,
             #[cfg(test)]
             scripted_stop_counts: None,
@@ -1484,6 +1497,8 @@ impl AttestedSemanticLane {
             scripted_finish_begin: None,
             #[cfg(test)]
             scripted_finish_poll: None,
+            #[cfg(test)]
+            scripted_finish_poll_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
             finish_poll_calls: 0,
             #[cfg(test)]
@@ -1942,6 +1957,21 @@ impl AttestedSemanticLane {
         >,
     ) {
         self.scripted_finish_poll = outcome;
+    }
+
+    /// Script a Finish poll sequence: each poll pops its head without
+    /// a live machine, ahead of the sticky scripted outcome.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_finish_poll_queue_for_test(
+        &mut self,
+        outcomes: Vec<
+            Result<
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress,
+                SemanticRefusal,
+            >,
+        >,
+    ) {
+        self.scripted_finish_poll_queue = outcomes.into();
     }
 
     /// How many `poll_joint_finish` calls this lane served.

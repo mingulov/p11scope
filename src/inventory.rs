@@ -5223,22 +5223,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 self.joint_finish,
                 JointFinishDriver::Polling | JointFinishDriver::Published
             ) {
-                #[cfg(test)]
-                {
-                    self.joint_step_calls += 1;
-                }
-                self.snapshot_seated_summary();
-                let mut warn = WarnSink {
-                    display: &mut self.display,
-                };
-                let outcome = Self::step_begun_joint_finish_with_warn(
-                    &mut self.semantic,
-                    &mut self.joint_finish,
-                    &mut *self.coordinator,
-                    &mut self.joint_first_error,
-                    &mut warn,
-                    None,
-                );
+                let outcome = self.step_final_joint_finish_once();
                 if matches!(outcome, JointStepOutcome::WoundDown) {
                     self.complete_final_joint_lane();
                 }
@@ -5248,6 +5233,56 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // Safety net for the same terminal sequence (a no-op once the
         // stop request above already ran it before native retirement).
         self.run_semantic_terminal_sequence();
+    }
+}
+
+impl ClassicDriver<'_> {
+    /// One begun-finish step (§8.3) with the seated summary snapshot:
+    /// shared by the post-retirement hook and the pre-retirement
+    /// settle below.
+    fn step_final_joint_finish_once(&mut self) -> JointStepOutcome {
+        #[cfg(test)]
+        {
+            self.joint_step_calls += 1;
+        }
+        self.snapshot_seated_summary();
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
+        Self::step_begun_joint_finish_with_warn(
+            &mut self.semantic,
+            &mut self.joint_finish,
+            &mut *self.coordinator,
+            &mut self.joint_first_error,
+            &mut warn,
+            None,
+        )
+    }
+
+    /// Drive a begun (Polling) Joint finish one step toward terminal
+    /// before the native retirement. The pre-retirement settle: the
+    /// loop calls this once per run with a native lane, after the
+    /// Retiring publish, before the lane stop dispatch. A second
+    /// operator signal escalates instead of stepping: the run is
+    /// leaving, so the finish is held for exit rather than reaped.
+    /// Unbegun, published, abandoned and legacy lanes are untouched:
+    /// the post-retirement hook and the terminal consume own those.
+    #[cfg(test)]
+    fn settle_joint_finish(&mut self) {
+        if !matches!(self.joint_finish, JointFinishDriver::Polling) {
+            return;
+        }
+        if !self.semantic.as_ref().is_some_and(Self::is_joint_lane) {
+            return;
+        }
+        if self.second_signal.is_some_and(|signal| signal()) {
+            self.escalate_joint_finish();
+            return;
+        }
+        let outcome = self.step_final_joint_finish_once();
+        if matches!(outcome, JointStepOutcome::WoundDown) {
+            self.complete_final_joint_lane();
+        }
     }
 }
 
@@ -15721,6 +15756,141 @@ mod promotion_driver_tests {
             1,
             "the poll ran once through the lane"
         );
+    }
+
+    #[test]
+    fn settle_joint_finish_completes_multi_poll_finish() {
+        // man-1 Cause 2: a begun finish needing two polls (Pending
+        // then Published, the live shape) must reach Published: the
+        // classic stop path runs no post-loop hooks, so the
+        // pre-retirement settle drives every step itself.
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_queue_for_test(vec![
+            Ok(JointCommitProgress::Pending),
+            Ok(JointCommitProgress::Published(BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            })),
+        ]);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.settle_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "the settle drives every scripted poll to Published"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .finish_poll_calls_for_test(),
+            2,
+            "both polls ran through the lane"
+        );
+    }
+
+    #[test]
+    fn settle_joint_finish_single_poll_completes() {
+        // Healthy twin: a finish that publishes on its first poll
+        // settles in one step, like the post-retirement hook.
+        use crate::discovery::engine::inventory_coordinator::BatchReceipt;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Published(
+            BatchReceipt {
+                engine_facts: 0,
+                engine_published: 0,
+                registry_facts: 0,
+                registry_published: 0,
+                registry_applied: 0,
+            },
+        ))));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.settle_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Published,
+            "one poll publishes"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane")
+                .finish_poll_calls_for_test(),
+            1,
+            "the poll ran once through the lane"
+        );
+    }
+
+    #[test]
+    fn settle_joint_finish_escalates_on_second_signal() {
+        // Healthy twin: a second operator signal holds the begun
+        // finish for exit instead of stepping it: the run is leaving.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.second_signal = Some(&|| true);
+        driver.settle_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the second signal holds the finish for exit"
+        );
+        assert!(driver.semantic.is_none(), "the held lane leaves the driver");
+    }
+
+    #[test]
+    fn settle_joint_finish_ignores_unbegun_and_legacyless() {
+        // Healthy twin: unbegun finishes and drivers without a Joint
+        // lane are untouched; the post-retirement hook owns those.
+        {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+            driver.joint_finish = JointFinishDriver::NotBegun;
+            driver.settle_joint_finish();
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::NotBegun,
+                "an unbegun finish stays unbegun"
+            );
+            assert_eq!(
+                driver.joint_step_calls, 0,
+                "nothing steps an unbegun finish"
+            );
+        }
+        {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            driver.semantic = None;
+            driver.joint_finish = JointFinishDriver::Polling;
+            driver.settle_joint_finish();
+            assert_eq!(
+                driver.joint_finish,
+                JointFinishDriver::Polling,
+                "no lane means no finish to settle"
+            );
+            assert_eq!(driver.joint_step_calls, 0, "nothing steps without a lane");
+        }
     }
 
     /// Nonzero live-derived stop counts for the disclosure twins: the

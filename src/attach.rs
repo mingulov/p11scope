@@ -5141,13 +5141,18 @@ pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
 
 /// Whether a raw errno is the kernel verifier's budget refusal: E2BIG is
 /// what BPF_PROG_LOAD returns when the program exceeds the complexity
-/// limit. Every other errno keeps its own meaning.
+/// limit, and ENOSPC is what it returns when verbose verification
+/// logging fills the load log buffer first (observed on 5.15 for an
+/// over-budget worker: the same refusal surfaces as ENOSPC with a
+/// truncated log instead of E2BIG with the full log). Every other errno
+/// keeps its own meaning.
 pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
-    errno == Some(libc::E2BIG)
+    matches!(errno, Some(libc::E2BIG | libc::ENOSPC))
 }
 
 /// Load-refusal detector for doctor/diagnostics: true only for a genuine
-/// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD).
+/// BPF program-load refusal on verifier budget (E2BIG from BPF_PROG_LOAD,
+/// or ENOSPC when the verifier log fills before the complexity limit).
 /// Permission, map-policy, identity and malformed-object failures — and
 /// every non-load error — return false and keep their own errors.
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
@@ -5602,8 +5607,9 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// one, so every early failure gets an actionable hint appended, naming
 /// the concrete things to check instead of leaving a bare syscall error
 /// for the operator to diagnose alone. A verifier-budget refusal (E2BIG
-/// from a program load) is the one exception: it gets the verifier hint,
-/// since privileges are not the cause.
+/// from a program load, or ENOSPC when the verifier log fills first) is
+/// the one exception: it gets the verifier hint, since privileges are
+/// not the cause.
 pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
 lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
@@ -16835,9 +16841,10 @@ mod tests {
         assert!(!reason.contains("emit "), "{reason}");
     }
 
-    /// Load-refusal detector matrix: only the E2BIG budget errno
-    /// classifies; every other errno — and a missing errno — stays a
-    /// loud unrelated failure.
+    /// Load-refusal detector matrix: the E2BIG budget errno classifies;
+    /// every other errno here — and a missing errno — stays a loud
+    /// unrelated failure. The ENOSPC log-exhaustion twin lives beside
+    /// this.
     #[test]
     fn verifier_budget_errno_matrix() {
         assert!(super::is_verifier_budget_errno(Some(libc::E2BIG)));
@@ -16955,7 +16962,7 @@ mod tests {
                         .expect("a real LoadError carries the BPF_PROG_LOAD errno");
                     assert_eq!(
                         super::is_verifier_budget_refusal(&error),
-                        errno == libc::E2BIG,
+                        errno == libc::E2BIG || errno == libc::ENOSPC,
                         "classifier must agree with errno {errno} in both directions"
                     );
                     println!("FULL p11_entry refused: errno={errno}");

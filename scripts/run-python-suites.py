@@ -49,6 +49,7 @@ INVOCATION_MARKERS = (
 
 # (file, extra args). A file may appear more than once with different args.
 RUN = [
+    ("test_abi_execution_qualification.py", []),
     ("test_automatic_exec_oracle.py", []),
     ("test_automatic_exec_system_disclosures.py", []),
     ("test_automatic_initial_readiness.py", []),

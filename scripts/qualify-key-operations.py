@@ -630,6 +630,13 @@ def _check_s1_section(section):
         raise OracleRefusal(f"observation gap {first['subject']}/{first['reason']}"
                             f" repeats {first['repeats']}")
     _require(gaps["suppressed"] == 0, "suppressed observation gaps")
+    _require(not checked["rows"], "S1 mode needs no key-operation rows")
+    _require(not checked["unknown"],
+             "S1 mode needs no unknown key-operation rows")
+    # Objects always ride with a session row (shape validation refuses a
+    # dangling object), so one message covers both lists.
+    _require(len(section["sessions"]) == 0 and len(section["objects"]) == 0,
+             "S1 mode needs no session rows")
 
 
 def _s1_application_tallies(application_rows):
@@ -726,6 +733,7 @@ def _check_s1_operations_row(operations):
         value = evidence.get(name)
         _require(_u64(value), f"S1 operations evidence {name} is not a counter")
         _require(value == 0, f"S1 operations evidence {name} is {value}, expected 0")
+    _keys(evidence, OPERATION_EVIDENCE_KEYS)
     return counters, active_total
 
 

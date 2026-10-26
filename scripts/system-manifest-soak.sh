@@ -132,6 +132,8 @@ SAMPLER_PID=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
 OBSERVER_RECEIPT=
+STAGE=
+MANIFEST_TMP=
 P11SCOPE_RECEIPT_HELPER="$PWD/scripts/system-scope-receipt.py"
 export P11SCOPE_RECEIPT_HELPER
 . scripts/system-scope-owned.sh
@@ -154,6 +156,12 @@ cleanup() {
     if [ -n "$OBSERVER_PID" ] && [ -n "$OBSERVER_STARTTIME" ] &&
        ! owned_finish "$OBSERVER_PID" "$OBSERVER_STARTTIME" "$OBSERVER_RECEIPT" 0; then
         echo "observer teardown failed; left unreaped" >&2
+    fi
+    if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+        rm -rf "$STAGE" || echo "stage $STAGE left behind" >&2
+    fi
+    if [ -n "$MANIFEST_TMP" ] && [ -f "$MANIFEST_TMP" ]; then
+        rm -f "$MANIFEST_TMP" || echo "manifest tmp $MANIFEST_TMP left behind" >&2
     fi
     exit "$status"
 }
@@ -243,10 +251,19 @@ NCPU=$(nproc)
 
 # Every run gets a private provider inode used only by the owned
 # workloads, so ambient host calls can never charge the ledger join.
-mkdir -p "$WORK/provider"
-chmod 700 "$WORK/provider"
-MODULE="$WORK/provider/libsofthsm2-owned.so"
-rm -f "$MODULE"
+# As root the copy lives in a world-traversable stage dir: discover
+# drops to nobody when run as root (provider code runs unprivileged
+# by design), so a 0700 root dir would deny it the module.
+if [ "$MODE" = live ] && [ "$IS_ROOT" -eq 1 ]; then
+    STAGE=$(mktemp -d /tmp/manifest-soak-stage.XXXXXX)
+    chmod 0755 "$STAGE"
+    MODULE="$STAGE/libsofthsm2-owned.so"
+else
+    mkdir -p "$WORK/provider"
+    chmod 700 "$WORK/provider"
+    MODULE="$WORK/provider/libsofthsm2-owned.so"
+    rm -f "$MODULE"
+fi
 install -m 0555 "$SOURCE_MODULE" "$MODULE"
 
 echo "=== build ==="
@@ -292,7 +309,20 @@ softhsm2-util --init-token --free --label manifest-soak --so-pin 1234 --pin 1234
 
 echo "=== discover ==="
 if [ "$MODE" = live ]; then
-    "$DISCOVER_COPY" --module "$MODULE" -o "$WORK/manifest.json"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        # The dropped discover identity cannot write into 0700 root
+        # dirs: land the manifest in the sticky /tmp under a unique
+        # name, then install it privately. The manifest file itself is
+        # always checked: discover can report an error yet exit 0.
+        MANIFEST_TMP=$(mktemp /tmp/manifest-soak-manifest.XXXXXX.json)
+        "$DISCOVER_COPY" --module "$MODULE" -o "$MANIFEST_TMP"
+        [ -f "$MANIFEST_TMP" ] || refuse "discover wrote no manifest"
+        install -m 0444 "$MANIFEST_TMP" "$WORK/manifest.json"
+        rm -f "$MANIFEST_TMP"
+    else
+        "$DISCOVER_COPY" --module "$MODULE" -o "$WORK/manifest.json"
+        [ -f "$WORK/manifest.json" ] || refuse "discover wrote no manifest"
+    fi
 else
     cat > "$WORK/manifest.json" <<EOF
 {"schema": "manifest-soak-dry-run-manifest/v1", "module": "$MODULE", "note": "shape stand-in; the stub checks existence only"}

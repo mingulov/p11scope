@@ -1346,6 +1346,19 @@ def expected_s1(rows_a, rows_b):
     return {"calls": calls, "returns": returns, "categories": categories}
 
 
+#: Pinned S1 tallies for the fixed ``interleave`` fixture (ops=3),
+#: counted by hand from SIGN4/MSG3 — not by the oracle. A shared skip
+#: (or a corrupted builder) moves the oracle and ``expected_s1``
+#: together but never these literals.
+INTERLEAVE_S1_PIN = {
+    "calls": 21,
+    "returns": {"table[40]": {0: 6}, "table[41]": {0: 9},
+                "table[42]": {0: 6}},
+    "categories": {"sign": {"calls": 12, "errors": 0},
+                   "message_sign": {"calls": 9, "errors": 0}},
+}
+
+
 class S1Twins(unittest.TestCase):
     def test_s1_healthy_pair_passes(self):
         oracle = require_s1(self)
@@ -1534,6 +1547,20 @@ class S1Twins(unittest.TestCase):
         want = expected_s1(rows_a, rows_b)
         self.assertEqual(result["returns"], want["returns"])
         self.assertIn("table[9]", result["returns"])
+
+    def test_s1_pinned_tallies_interleave(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "interleave")
+        terminal = [row for rows in (rows_a, rows_b) for row in rows
+                    if row.get("kind") == "call"
+                    and row.get("phase") == "terminal"]
+        self.assertEqual(len(terminal), 6)
+        result = oracle.compare_s1(rows_a, rows_b, s1_section())
+        mirror = expected_s1(rows_a, rows_b)
+        for key in ("calls", "returns", "categories"):
+            with self.subTest(key=key):
+                self.assertEqual(result[key], INTERLEAVE_S1_PIN[key])
+                self.assertEqual(mirror[key], INTERLEAVE_S1_PIN[key])
 
     def test_s1_pair_shape_still_required(self):
         oracle = require_s1(self)

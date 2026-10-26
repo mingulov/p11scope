@@ -875,6 +875,10 @@ def compare_s1(rows_a, rows_b, snapshot, events=None):
     the optional stream must carry no H9 rows, no denied
     gap_recorded text, and gaps_suppressed 0. The reported S1
     returns/categories are the ledgers' per-call tallies.
+    Scope: the canned positive half is faithful reporting from the
+    ledger; observer-equality is proven by qualify-key-operations.py
+    --s1, s1-throughput-compare.py, and the converted live S1 cells,
+    not here.
     """
     first = validate_ledger(rows_a, "ledger A")
     second = validate_ledger(rows_b, "ledger B")

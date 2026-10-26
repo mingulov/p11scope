@@ -1909,6 +1909,37 @@ def expected_s1(rows_a, rows_b):
     return {"calls": calls, "returns": returns, "mechanisms": mechanisms}
 
 
+#: Pinned S1 tallies for the fixed ``poll_msg`` fixture (ops=2),
+#: counted by hand from plan_poll_owner/plan_message_challenger — not
+#: by the oracle. A shared skip (or a corrupted builder) moves the
+#: oracle and ``expected_s1`` together but never these literals.
+POLL_MSG_S1_PIN = {
+    "calls": 15,
+    "returns": {"async_begin": {0: 4},
+                "async_poll": {PENDING: 4, 0: 2},
+                "async_status": {PENDING: 1},
+                "async_wait": {TOO_SMALL: 2, 0: 2}},
+    "mechanisms": {"poll": {"calls": 9, "errors": 5},
+                   "message": {"calls": 6, "errors": 2}},
+}
+
+#: Pinned S1 tallies for the fixed ``cancel`` fixture (ops=2),
+#: counted by hand from plan_poll_owner/plan_cancel_challenger. The
+#: pin covers the teardown call (async_finalize), so a shared
+#: teardown skip fails here even though the mirrored twins stay green.
+CANCEL_S1_PIN = {
+    "calls": 18,
+    "returns": {"async_begin": {0: 4},
+                "async_poll": {PENDING: 7, 0: 3},
+                "async_status": {PENDING: 1},
+                "async_begin_fail": {BAD: 1},
+                "async_cancel": {0: 1},
+                "async_finalize": {0: 1}},
+    "mechanisms": {"poll": {"calls": 9, "errors": 5},
+                   "cancel": {"calls": 9, "errors": 4}},
+}
+
+
 class S1Twins(unittest.TestCase):
     def test_s1_healthy_pair_passes(self):
         oracle = require_s1(self)
@@ -2142,6 +2173,33 @@ class S1Twins(unittest.TestCase):
         want = expected_s1(rows_a, rows_b)
         self.assertEqual(result["returns"], want["returns"])
         self.assertIn("async_wait", result["returns"])
+
+    def test_s1_pinned_tallies_poll_msg(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section())
+        mirror = expected_s1(rows_a, rows_b)
+        for key in ("calls", "returns", "mechanisms"):
+            with self.subTest(key=key):
+                self.assertEqual(result[key], POLL_MSG_S1_PIN[key])
+                self.assertEqual(mirror[key], POLL_MSG_S1_PIN[key])
+
+    def test_s1_pinned_tallies_cancel_counts_teardown(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "cancel")
+        teardown = [row for rows in (rows_a, rows_b) for row in rows
+                    if row.get("kind") == "call"
+                    and row.get("phase") == "teardown"]
+        self.assertEqual(len(teardown), 1)
+        self.assertEqual(teardown[0]["fn"], "async_finalize")
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section())
+        mirror = expected_s1(rows_a, rows_b)
+        for key in ("calls", "returns", "mechanisms"):
+            with self.subTest(key=key):
+                self.assertEqual(result[key], CANCEL_S1_PIN[key])
+                self.assertEqual(mirror[key], CANCEL_S1_PIN[key])
 
     def test_s1_collision_still_required(self):
         oracle = require_s1(self)

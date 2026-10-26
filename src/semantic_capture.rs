@@ -1324,6 +1324,16 @@ pub(crate) struct SemanticCapture {
     exhausted: bool,
     stopped: bool,
     continuity_cuts: u64,
+    /// Last tick's scan count and refusals, for the stuck-transaction
+    /// diagnostic only. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    last_tick_scans_for_test: usize,
+    #[cfg(test)]
+    last_tick_refusals_for_test: Vec<ImageQueryRefusal>,
+    /// Last scan refusal per awaited (cookie, exec, file) key, for the
+    /// stuck-transaction diagnostic only. Test-visible.
+    #[cfg(test)]
+    last_refusal_by_key_for_test: BTreeMap<(u64, u64, u32), ImageQueryRefusal>,
 }
 
 pub(crate) type PendingH3Original<'a> = (
@@ -1401,6 +1411,12 @@ impl SemanticCapture {
             exhausted: false,
             stopped: false,
             continuity_cuts: 0,
+            #[cfg(test)]
+            last_tick_scans_for_test: 0,
+            #[cfg(test)]
+            last_tick_refusals_for_test: Vec::new(),
+            #[cfg(test)]
+            last_refusal_by_key_for_test: BTreeMap::new(),
         })
     }
     pub(crate) fn router(&self) -> &InstanceRouter {
@@ -2470,6 +2486,110 @@ impl SemanticCapture {
         })
     }
 
+    /// Test-only stuck-transaction diagnostic: awaiting tokens grouped by
+    /// (pin present, job present, job deadline remaining, last scan
+    /// refusal, binding present/current, retained hold inside its horizon),
+    /// plus the last tick's scan count and refusals. Counts only; no pids,
+    /// paths or argument values.
+    #[cfg(test)]
+    pub(crate) fn stuck_waiters_for_test(&self, now: std::time::Instant) -> String {
+        use std::collections::BTreeMap;
+        fn refusal_name(refusal: &ImageQueryRefusal) -> &'static str {
+            match refusal {
+                ImageQueryRefusal::Policy => "Policy",
+                ImageQueryRefusal::Coverage => "Coverage",
+                ImageQueryRefusal::Custody => "Custody",
+                ImageQueryRefusal::Deadline => "Deadline",
+                ImageQueryRefusal::Capacity => "Capacity",
+                ImageQueryRefusal::Exhausted => "Exhausted",
+                ImageQueryRefusal::Stream => "Stream",
+                ImageQueryRefusal::Unknown => "Unknown",
+                ImageQueryRefusal::Unstable => "Unstable",
+                ImageQueryRefusal::Empty => "Empty",
+                ImageQueryRefusal::Fence => "Fence",
+                ImageQueryRefusal::Present => "Present",
+            }
+        }
+        let mut groups: BTreeMap<(bool, bool, Option<u64>, &'static str, bool, bool, bool), usize> =
+            BTreeMap::new();
+        for waiting in self.awaiting.values() {
+            let key = Self::pending_key(waiting);
+            let image = waiting.record.base.event.image;
+            let job = self.jobs.iter().find(|job| job.key() == key);
+            let job_present = job.is_some();
+            let remaining_ms = job.map(|job| {
+                job.deadline
+                    .checked_duration_since(now)
+                    .map(|left| left.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0)
+            });
+            let last_refusal = self
+                .last_refusal_by_key_for_test
+                .get(&key)
+                .map(refusal_name)
+                .unwrap_or("none");
+            let binding = self.bindings.get(&image.task_cookie);
+            let binding_present = binding.is_some();
+            let binding_current = binding.is_some_and(|binding| binding.current);
+            // A pin is present when a job or a binding still holds its Arc;
+            // pin-less waiters have neither.
+            let pin_present = job_present || binding_present;
+            let retained_hold = self
+                .retained
+                .get(&(image.task_cookie, image.exec_id))
+                .is_some_and(|(_, at)| {
+                    now.checked_duration_since(*at)
+                        .is_none_or(|age| age <= RETAINED_IMAGE_HORIZON)
+                });
+            *groups
+                .entry((
+                    pin_present,
+                    job_present,
+                    remaining_ms,
+                    last_refusal,
+                    binding_present,
+                    binding_current,
+                    retained_hold,
+                ))
+                .or_default() += 1;
+        }
+        let mut refusal_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for refusal in self.last_tick_refusals_for_test.iter() {
+            *refusal_counts.entry(refusal_name(refusal)).or_default() += 1;
+        }
+        let groups_text = groups
+            .iter()
+            .map(
+                |((pin, job, remaining, refusal, bind, current, hold), count)| {
+                    format!(
+                        "pin={} job={} rem={} ref={} bind={} cur={} hold={}:n={}",
+                        u8::from(*pin),
+                        u8::from(*job),
+                        remaining.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms")),
+                        refusal,
+                        u8::from(*bind),
+                        u8::from(*current),
+                        u8::from(*hold),
+                        count,
+                    )
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(",");
+        let refusals_text = refusal_counts
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "awaiting={} scans={} refusals=[{}] groups=[{}]",
+            self.awaiting.len(),
+            self.last_tick_scans_for_test,
+            refusals_text,
+            groups_text,
+        )
+    }
+
     fn refresh_with_inner(
         &mut self,
         io: &mut impl CaptureIo,
@@ -2826,10 +2946,16 @@ impl SemanticCapture {
             || fence != self.router.fence()
         {
             report.scan_refusals.push(ImageQueryRefusal::Fence);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Fence);
             return;
         }
         if io.endpoint(job.slot) != Some(job.endpoint) {
             report.scan_refusals.push(ImageQueryRefusal::Custody);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Custody);
             return;
         }
         if let Some(existing) = self.bindings.get(&job.image.task_cookie) {
@@ -2839,6 +2965,9 @@ impl SemanticCapture {
                 || !existing.current
             {
                 report.scan_refusals.push(ImageQueryRefusal::Custody);
+                #[cfg(test)]
+                self.last_refusal_by_key_for_test
+                    .insert(job.key(), ImageQueryRefusal::Custody);
                 return;
             }
         } else if self.bindings.len() >= self.limits.bindings {
@@ -3264,6 +3393,8 @@ impl SemanticCapture {
                                 .note_proven_absence(job.image, job.endpoint.file_slot);
                         }
                         report.scan_refusals.push(refusal);
+                        #[cfg(test)]
+                        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
                     }
                 }
             }
@@ -3343,6 +3474,9 @@ impl SemanticCapture {
             }
             if io.now() >= attempt_deadline {
                 report.scan_refusals.push(ImageQueryRefusal::Deadline);
+                #[cfg(test)]
+                self.last_refusal_by_key_for_test
+                    .insert(job.key(), ImageQueryRefusal::Deadline);
             } else if healthy {
                 match result {
                     Ok(proof) => self.accept_scan(io, proof, &job, fence, &mut report),
@@ -3355,6 +3489,8 @@ impl SemanticCapture {
                                 .note_proven_absence(job.image, job.endpoint.file_slot);
                         }
                         report.scan_refusals.push(refusal);
+                        #[cfg(test)]
+                        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
                     }
                 }
             }
@@ -3383,6 +3519,11 @@ impl SemanticCapture {
         for image in over_horizon {
             self.expire(image, &mut report);
             self.retained.remove(&(image.task_cookie, image.exec_id));
+        }
+        #[cfg(test)]
+        {
+            self.last_tick_scans_for_test = report.scans;
+            self.last_tick_refusals_for_test = report.scan_refusals.clone();
         }
         Ok(report)
     }

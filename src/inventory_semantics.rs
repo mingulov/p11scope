@@ -1795,6 +1795,18 @@ impl AttestedSemanticLane {
             .map(|diagnostic| format!("{diagnostic:?}"))
     }
 
+    /// Test-only stuck-transaction diagnostic for the live root cells:
+    /// the capture's awaiting groups plus the last tick's scans and
+    /// refusals. Counts only; no pids, paths or argument values.
+    #[cfg(test)]
+    pub(crate) fn joint_stuck_diagnostic_for_test(&self) -> Option<String> {
+        let live = self.live.as_deref()?;
+        Some(
+            live.capture
+                .stuck_waiters_for_test(std::time::Instant::now()),
+        )
+    }
+
     /// Whether this lane owns a Joint machine (§8.3).
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     pub(crate) fn has_joint_machine(&self) -> bool {

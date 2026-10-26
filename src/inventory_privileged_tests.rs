@@ -4181,10 +4181,12 @@ fn joint_drive_line(
         |(attempted, pending)| format!("{attempted}/{pending}"),
     );
     let staging = staging.map_or_else(|| "-".to_string(), |detail| detail.to_string());
+    let stuck = lane.joint_stuck_diagnostic_for_test();
+    let stuck = stuck.as_deref().unwrap_or("-");
     eprintln!(
         "JOINT_R16 {tag} step={step} live={} gated={} finished={} ticks={ticks} \
          phase={phase} demand={demand} work={work} base={base} staging={staging} \
-         revision={} feeds={}",
+         revision={} feeds={} stuck={stuck}",
         u8::from(live),
         u8::from(gated),
         u8::from(finished),
@@ -4228,7 +4230,10 @@ fn service_to_published(
         lane.service_joint(&mut *coordinator, JointServiceMode::Running, &mut budget)
             .map_err(|reason| {
                 joint_drive_line(lane, coordinator, tag, "service-FAILED");
-                anyhow::anyhow!("{tag}: service refused: {reason}")
+                anyhow::anyhow!(
+                    "{tag}: service refused: {reason} waiters={:?}",
+                    lane.joint_stuck_diagnostic_for_test(),
+                )
             })?;
         let mut budget = JointWorkBudget {
             remaining_actions: 1024,
@@ -4239,7 +4244,10 @@ fn service_to_published(
             .poll_joint_commit(&mut *coordinator, &mut budget)
             .map_err(|reason| {
                 joint_drive_line(lane, coordinator, tag, "poll-FAILED");
-                anyhow::anyhow!("{tag}: commit poll refused: {reason}")
+                anyhow::anyhow!(
+                    "{tag}: commit poll refused: {reason} waiters={:?}",
+                    lane.joint_stuck_diagnostic_for_test(),
+                )
             })?;
         polls += 1;
         if matches!(
@@ -4256,16 +4264,18 @@ fn service_to_published(
         }
         ensure!(
             polls < 600,
-            "{tag}: unpublished after 600 polls ({} ms); stuck audit={:?} h3={:?}",
+            "{tag}: unpublished after 600 polls ({} ms); stuck audit={:?} h3={:?} waiters={:?}",
             started.elapsed().as_millis(),
             lane.joint_audit_diagnostic_for_test(),
             coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
         );
         ensure!(
             started.elapsed() < Duration::from_secs(120),
-            "{tag}: unpublished after 120 s; stuck audit={:?} h3={:?}",
+            "{tag}: unpublished after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
             lane.joint_audit_diagnostic_for_test(),
             coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
         );
     }
 }

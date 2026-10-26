@@ -4171,6 +4171,22 @@ fn commit_semantic_finish(
         .map(|_| ())
 }
 
+/// The stderr line a sealed semantic lane starts with: from now on,
+/// newly started programs are covered. Startup only: the seal runs
+/// before the display opens, so the classic sink is correct on both
+/// paths. A promotion seals its new lane silently (its install and
+/// end already disclose through gaps); only the run's first seal
+/// readies users and scripts.
+const SEMANTIC_SEAL_LINE: &str =
+    "p11scope: key-operation lane sealed; programs started from now on are covered";
+
+/// Note the lane seal once, through the classic stderr sink.
+fn note_semantic_lane_sealed() {
+    inventory_diagnostic(SEMANTIC_SEAL_LINE);
+    #[cfg(test)]
+    record_sealed_for_test(SEMANTIC_SEAL_LINE);
+}
+
 /// Optional lane startup: no manifests means no Detailed Session, maps,
 /// links or cursor. A refused live startup keeps the shell lane for
 /// its honest `unavailable` summary; broad Inventory runs either way.
@@ -4205,7 +4221,10 @@ fn start_semantic_lane(
         }
     };
     match seal_start_live(attach_subset, convert_subset, scope, backend) {
-        Ok(lane) => Some(lane),
+        Ok(lane) => {
+            note_semantic_lane_sealed();
+            Some(lane)
+        }
         Err(refusal) => {
             coordinator.note_scope_gap(
                 "semantic lane unavailable".into(),

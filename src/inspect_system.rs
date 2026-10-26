@@ -750,8 +750,6 @@ fn retirement_scan_allows_absence(
     before: (Option<&'static str>, (u64, u64)),
     after: (Option<&'static str>, (u64, u64)),
 ) -> bool {
-    const NO_TABLE_SUFFIX: &str =
-        "; a table built at run time in .bss or on the heap is outside the memory scan's reach";
     hints.is_empty()
         && matches!(outcome, ScanOutcome::Scanned { .. })
         && pin_skips.is_empty()
@@ -759,9 +757,10 @@ fn retirement_scan_allows_absence(
         && after.0.is_none()
         && before.1 == after.1
         && outcome.skipped().iter().all(|skip| {
-            skip.reason
-                .strip_prefix(crate::discovery::scan::NO_TABLE_FOUND_MARKER)
-                == Some(NO_TABLE_SUFFIX)
+            // With no hints the scan emits the unhinted no-table reason for
+            // the skipped path, action suffix included; anything else is a
+            // real gap, never an allowed absence.
+            skip.reason == crate::discovery::scan::no_table_found_reason(&skip.subject, false)
         })
 }
 

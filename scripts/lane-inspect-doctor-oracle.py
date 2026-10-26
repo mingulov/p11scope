@@ -13,6 +13,15 @@ import json
 import sys
 
 
+def tableless_reason(path):
+    """Expected no-table skip reason for one module path (scan.rs builder)."""
+    return (
+        "no function table was found in its file-backed data; a table built at run time "
+        "in .bss or on the heap is outside the memory scan's reach; to observe it, run "
+        f"p11scope-discover --module {path} -o <manifest.json> and pass --manifest <manifest.json>"
+    )
+
+
 def oracle(document, doctor):
     assert document["schema"] == "p11scope/inspect/v1", document["schema"]
     paths = [module["path"] for module in document["modules"]]
@@ -31,7 +40,7 @@ def oracle(document, doctor):
         ]:
             tableless = {
                 "subject": provider["path"],
-                "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
+                "reason": tableless_reason(provider["path"]),
             }
             tableless_skips = [skip for skip in document.get("skipped", []) if skip == tableless]
             if provider["tables"]:
@@ -90,7 +99,12 @@ SCANNED_TABLELESS = {
     "skipped": [
         {
             "subject": "/usr/lib64/pkcs11/libsofthsm2.so",
-            "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
+            "reason": (
+                "no function table was found in its file-backed data; a table built at run time "
+                "in .bss or on the heap is outside the memory scan's reach; to observe it, run "
+                "p11scope-discover --module /usr/lib64/pkcs11/libsofthsm2.so -o <manifest.json> "
+                "and pass --manifest <manifest.json>"
+            ),
         }
     ],
 }

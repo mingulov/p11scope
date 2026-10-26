@@ -653,7 +653,9 @@ for member in spec:
         subject = member["hint"] + (".FOREIGN.so" if mode == "foreign-diagnostic" else "")
         err.write("p11scope: discovery: other: discovery skipped " + subject + " — matched a "
                   "--module hint; no function table was found in its file-backed data; a table "
-                  "built at run time is outside the memory scan's reach\n")
+                  "built at run time in .bss or on the heap is outside the memory scan's reach; "
+                  "to observe it, run p11scope-discover --module " + subject + " -o <manifest.json> "
+                  "and pass --manifest <manifest.json>\n")
 err.write("p11scope: capturing: 2 probe(s) attached; stop with Ctrl-C\n")
 err.flush()
 if mode == "exit-after-ready":

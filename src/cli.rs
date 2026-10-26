@@ -402,7 +402,7 @@ usage:
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
@@ -450,7 +450,7 @@ examples (4242 is an example PID, not a detected target):
   p11scope profile --pid 4242 --duration 30s -o profile.json
   p11scope profile --system --mode metrics --duration 30s -o metrics.json
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -469,7 +469,7 @@ const TRACE_HELP: &str = "usage:
 example (4242 is an example PID, not a detected target):
   p11scope trace --pid 4242 --duration 10s --max-events 1000
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -490,7 +490,7 @@ const RUN_HELP: &str = "usage:
 example (replace the example program path with your command):
   p11scope run --trace -- /absolute/path/to/program
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -509,7 +509,7 @@ const INSPECT_HELP: &str = "usage:
 example (4242 is an example PID, not a detected target):
   p11scope inspect --pid 4242 --json
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
 Choose --pid or --system. --json preserves the same discovery facts for scripts.
@@ -3670,18 +3670,29 @@ mod tests {
                 "{argv:?}"
             );
         }
-        // Scoped guidance carries its own example and no helper workflow.
+        // Scoped guidance carries its own example. Capture helps name the
+        // offline helper for providers that build their table at run time;
+        // doctor (no capture) names no helper workflow.
         for topic in [
             HelpTopic::Profile,
             HelpTopic::Trace,
             HelpTopic::Run,
             HelpTopic::Inspect,
-            HelpTopic::Doctor,
         ] {
             let text = topic.text();
             assert!(text.contains("example"), "{topic:?}");
-            assert!(!text.contains("p11scope-discover"), "{topic:?}");
+            assert!(
+                text.contains(
+                    "Providers that build the table at run time need a manifest: run \
+                     p11scope-discover --module <provider.so> -o <manifest.json> and pass \
+                     --manifest <manifest.json>."
+                ),
+                "{topic:?}"
+            );
         }
+        let doctor = HelpTopic::Doctor.text();
+        assert!(doctor.contains("example"), "Doctor");
+        assert!(!doctor.contains("p11scope-discover"), "Doctor");
     }
 
     #[test]
@@ -3718,8 +3729,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 6677);
-        assert_eq!(hash, 0xae14707a193f1c16);
+        assert_eq!(USAGE.len(), 6888);
+        assert_eq!(hash, 0x44572964ae81e261);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

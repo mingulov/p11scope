@@ -4892,9 +4892,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
     }];
     let empty_scan = |path: &str| Skipped {
         subject: path.into(),
-        reason: "no function table was found in its file-backed data; a table built at \
-                     run time in .bss or on the heap is outside the memory scan's reach"
-            .into(),
+        reason: crate::discovery::scan::no_table_found_reason(path, false),
     };
     let attached = empty_scan("/opt/p11.so");
     let never_attached = empty_scan("/opt/other.so");

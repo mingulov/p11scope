@@ -59,6 +59,21 @@ pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
 /// matches these markers — the push sites below must keep using them.
 pub(crate) const NO_TABLE_FOUND_MARKER: &str =
     "no function table was found in its file-backed data";
+/// Skip reason for a module whose table the memory scan cannot see: the
+/// fixed diagnosis plus the action that observes such a provider. One
+/// line; `module_path` is the skipped module's own path.
+pub(crate) fn no_table_found_reason(module_path: &str, hinted: bool) -> String {
+    let named = if hinted {
+        "matched a --module hint; "
+    } else {
+        ""
+    };
+    format!(
+        "{named}{NO_TABLE_FOUND_MARKER}; a table built at run time in .bss or on the heap is \
+         outside the memory scan's reach; to observe it, run p11scope-discover --module \
+         {module_path} -o <manifest.json> and pass --manifest <manifest.json>"
+    )
+}
 pub(crate) const HINT_NOT_MAPPED_REASON: &str = "not mapped in the target";
 pub(crate) const NO_ABSOLUTE_PATHNAME_REASON: &str = "no absolute pathname in /proc/<pid>/maps";
 pub(crate) const MAPS_CEILING_REASON: &str =
@@ -4376,18 +4391,9 @@ fn scan_view_examined_mode(
         // `capture.modules[]` as a module the capture observed. Without this the
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
         if module.tables.is_empty() && !io_exhausted && !budget.scan_stopped() {
-            let named = if hinted {
-                "matched a --module hint; "
-            } else {
-                ""
-            };
             skipped.push(Skipped {
                 subject: module.path.clone(),
-                reason: format!(
-                    "{named}{NO_TABLE_FOUND_MARKER}; a table \
-                     built at run time in .bss or on the heap is outside the memory \
-                     scan's reach"
-                ),
+                reason: no_table_found_reason(&module.path, hinted),
             });
         }
         modules.push(module);
@@ -8229,6 +8235,30 @@ mod tests {
     /// Every bounded/incomplete outcome — ceilings, stops, refusals, partial
     /// reads — truncates, and unknown future reasons fail closed.
     #[test]
+    fn no_table_skip_reason_ends_with_the_discover_action() {
+        assert_eq!(
+            no_table_found_reason("/usr/lib64/pkcs11/libsofthsm2.so", false),
+            "no function table was found in its file-backed data; a table built at run time in \
+             .bss or on the heap is outside the memory scan's reach; to observe it, run \
+             p11scope-discover --module /usr/lib64/pkcs11/libsofthsm2.so -o <manifest.json> and \
+             pass --manifest <manifest.json>"
+        );
+        let hinted = no_table_found_reason("/opt/p11.so", true);
+        assert!(
+            hinted.starts_with("matched a --module hint; "),
+            "{hinted:?} must keep the hint prefix"
+        );
+        assert!(
+            hinted.ends_with(
+                "; to observe it, run p11scope-discover --module /opt/p11.so -o <manifest.json> \
+                 and pass --manifest <manifest.json>"
+            ),
+            "{hinted:?} must end with the action naming its own path"
+        );
+        assert!(!hinted.contains('\n'), "{hinted:?} must stay one line");
+    }
+
+    #[test]
     fn scan_skip_truncation_classifier_marks_only_verified_absence_benign() {
         let mut budget = CaptureWorkBudget::default();
         let table_reason = budget.table_exhaustion_reason().unwrap();
@@ -8262,11 +8292,11 @@ mod tests {
                 "{reason:?} must truncate the scan it came from"
             );
         }
+        let plain = no_table_found_reason("/opt/p11.so", false);
+        let hinted = no_table_found_reason("/opt/p11.so", true);
         let benign = [
-            "no function table was found in its file-backed data; a table built at run time \
-             in .bss or on the heap is outside the memory scan's reach",
-            "matched a --module hint; no function table was found in its file-backed data; a \
-             table built at run time in .bss or on the heap is outside the memory scan's reach",
+            plain.as_str(),
+            hinted.as_str(),
             "not mapped in the target",
             "no absolute pathname in /proc/<pid>/maps",
             "ambiguous \\012 pathname",

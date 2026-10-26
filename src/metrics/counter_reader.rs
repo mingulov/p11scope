@@ -4804,7 +4804,12 @@ mod tests {
         );
         // The intact prefix stays readable through the collection path.
         let mut collection = crate::metrics::CaptureCollection::new(Some(
-            crate::metrics::CounterCaptureInputs::new(CounterMode::Counts, 8192, 65536, engine.counter_reserver()),
+            crate::metrics::CounterCaptureInputs::new(
+                CounterMode::Counts,
+                8192,
+                65536,
+                engine.counter_reserver(),
+            ),
         ));
         let snapshot = collection
             .fresh(&session, engine.plan(), engine.pinned(), true)
@@ -5692,7 +5697,12 @@ mod tests {
         // the legacy read needs do not exist on this object.
         assert!(crate::metrics::read(&session, engine.plan()).is_err());
         let mut collection = crate::metrics::CaptureCollection::new(Some(
-            crate::metrics::CounterCaptureInputs::new(CounterMode::Counts, 8192, 65536, engine.counter_reserver()),
+            crate::metrics::CounterCaptureInputs::new(
+                CounterMode::Counts,
+                8192,
+                65536,
+                engine.counter_reserver(),
+            ),
         ));
         parts.fixture.command("START");
         parts.fixture.expect("HELD 0");
@@ -5997,7 +6007,8 @@ mod tests {
     /// cells (CARGO_TARGET_TMPDIR), never under a root-owned TMPDIR.
     fn counter_cli_run_marker_path(id: u32) -> std::path::PathBuf {
         std::path::PathBuf::from(
-            std::env::var_os("CARGO_TARGET_TMPDIR").expect("CARGO_TARGET_TMPDIR for owned-child marker"),
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .expect("CARGO_TARGET_TMPDIR for owned-child marker"),
         )
         .join(format!("p11scope-counter-run-{id}.marker"))
     }

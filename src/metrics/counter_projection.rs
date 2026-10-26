@@ -416,8 +416,9 @@ impl CaptureCollection {
                     let reserve = counter.collector.reserver();
                     let generation = std::num::NonZeroU64::new(1).expect("nonzero generation");
                     let kernel = KernelEvidence::default();
-                    let reservation = ReadReservation::reserve(0, 0, reserve)
-                        .map_err(|_| anyhow::anyhow!("counter collection unavailable (read_budget)"))?;
+                    let reservation = ReadReservation::reserve(0, 0, reserve).map_err(|_| {
+                        anyhow::anyhow!("counter collection unavailable (read_budget)")
+                    })?;
                     let read = CounterRead::new(
                         generation,
                         mode,
@@ -433,12 +434,9 @@ impl CaptureCollection {
                             CounterFailure::Read(stage).name()
                         )
                     })?;
-                    let (reports, storage) = stage_projection(plan, pins, &read, reserve)
-                        .map_err(|failure| {
-                            anyhow::anyhow!(
-                                "counter collection unavailable ({})",
-                                failure.name()
-                            )
+                    let (reports, storage) =
+                        stage_projection(plan, pins, &read, reserve).map_err(|failure| {
+                            anyhow::anyhow!("counter collection unavailable ({})", failure.name())
                         })?;
                     let snapshot = CounterSnapshot {
                         data: Some(Arc::new(Projection {
@@ -1549,7 +1547,9 @@ pub(super) mod tests {
                 .expect("unstaged empty counter terminal succeeds");
             assert_eq!(calls.get(), 0, "empty bypasses bank reads");
             assert!(terminal.reports().is_empty());
-            let metadata = terminal.counter_collection().expect("empty carries collection");
+            let metadata = terminal
+                .counter_collection()
+                .expect("empty carries collection");
             assert_eq!(metadata["mode"], mode.name());
             assert_eq!(metadata["status"], "fresh");
             assert!(metadata["failure"].is_null());

@@ -56,6 +56,7 @@ RUN = [
     ("test_bpf_kernels_contract.py", []),
     ("test_bpf_load_report.py", []),
     ("test_bpf_noninterference.py", []),
+    ("test_browser_cells.py", []),
     ("test_cargo_wrapper.py", []),
     ("test_e16_oracle.py", []),
     ("test_first_use_oracle.py", []),

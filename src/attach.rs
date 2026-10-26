@@ -5168,13 +5168,11 @@ pub(crate) fn verifier_budget_refusal_errno_name(
     error: &aya::programs::ProgramError,
 ) -> Option<&'static str> {
     match error {
-        aya::programs::ProgramError::LoadError { io_error, .. } => {
-            match io_error.raw_os_error() {
-                Some(libc::E2BIG) => Some("E2BIG"),
-                Some(libc::ENOSPC) => Some("ENOSPC"),
-                _ => None,
-            }
-        }
+        aya::programs::ProgramError::LoadError { io_error, .. } => match io_error.raw_os_error() {
+            Some(libc::E2BIG) => Some("E2BIG"),
+            Some(libc::ENOSPC) => Some("ENOSPC"),
+            _ => None,
+        },
         _ => None,
     }
 }

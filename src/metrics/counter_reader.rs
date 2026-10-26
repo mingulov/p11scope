@@ -5992,6 +5992,33 @@ mod tests {
         counter_cli_capture_cell(CounterMode::Latency);
     }
 
+    /// Marker the owned child writes: must live where the
+    /// privilege-dropped child can create it, like the other owned-run
+    /// cells (CARGO_TARGET_TMPDIR), never under a root-owned TMPDIR.
+    fn counter_cli_run_marker_path(id: u32) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("p11scope-counter-run-{id}.marker"))
+    }
+
+    #[test]
+    fn counter_cli_run_marker_is_owned_child_writable() {
+        let id = 424242;
+        let path = counter_cli_run_marker_path(id);
+        assert!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&id.to_string())),
+            "marker stays pid-unique: {}",
+            path.display()
+        );
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR").expect("test tmpdir");
+        assert_eq!(
+            path.parent(),
+            Some(std::path::Path::new(&base)),
+            "marker must live in the owned-child-writable target tmpdir, not {}",
+            std::env::temp_dir().display()
+        );
+    }
+
     /// CLI-shaped counter `run`: real parsed argv → the real owned-child run
     /// to `-o` JSON. The owned workload maps no provider, so the capture
     /// attaches to zero endpoints; the run-specific delta under test is the

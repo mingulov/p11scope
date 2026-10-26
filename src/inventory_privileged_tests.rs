@@ -4344,15 +4344,6 @@ fn joint_edge_snapshot(
     })
 }
 
-/// The quiet-path loss twins: no loss-ish gap, no lossy edge, no
-/// loss-ish reason on any edge, no H3 pending. Prints the H3 takes.
-fn assert_quiet_twins(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
-    tag: &str,
-) -> Result<()> {
-    assert_quiet_twins_except(coordinator, tag, &[])
-}
-
 /// Split a CALLS ledger's entered calls into the semantically admitted
 /// population (`api_returns`/`reduced`) and the count-only population.
 /// Conversion refuses COUNT_ONLY slots, so the observer's exact semantic
@@ -5178,15 +5169,54 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     let domain_a = lane_a.domain();
     std::fs::write(&go_a, b"")?;
     process_a.wait_for("DONE ", Duration::from_secs(60))?;
-    let (_, a_total, a_bad) = ledger_calls(&process_a.out)?;
+    let (a_by_fn, a_total, a_bad) = ledger_calls(&process_a.out)?;
     ensure!(a_bad == 0 && a_total > 0, "A ran its script");
+    // qa: A publishes its useful calls. The ledger's count-only calls
+    // (C_Initialize, C_GetSlotList) are counted but refused from
+    // semantic conversion by design, each refusal disclosed;
+    // `api_returns`/`reduced` cover the semantic side only, never the
+    // raw entered total.
     let qa_polls = service_to_published(&mut lane_a, &mut coordinator, true, "r16c-qa")?;
     ensure_joint_birth_refusal(&coordinator, "r16c-qa")?;
+    let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "soft-copy.so")?;
+    let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
+        if !ok {
+            for line in exactness_diagnosis(&coordinator, pid, module, by_fn) {
+                eprintln!("JOINT_R16 r16c-qa-diag {line}");
+            }
+        }
+    };
+    diagnose(
+        edge_a.api_returns == Some(a_semantic),
+        process_a.pid(),
+        "soft-copy.so",
+        &a_by_fn,
+    );
     ensure!(
-        edge_a.api_returns == Some(a_total) && edge_a.reduced == a_total,
-        "A is exact: {:?}/{} vs {a_total}",
-        edge_a.api_returns,
+        edge_a.api_returns == Some(a_semantic),
+        "A is exact: {:?} vs semantic {a_semantic} (entered {a_total}, count-only {a_count_only})",
+        edge_a.api_returns
+    );
+    let caller_a = caller_of(&coordinator, process_a.pid())?;
+    ensure!(
+        count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a)
+        ) == a_count_only,
+        "A's count-only calls are disclosed as slot refusals: {a_count_only}"
+    );
+    diagnose(
+        edge_a.reduced == a_semantic,
+        process_a.pid(),
+        "soft-copy.so",
+        &a_by_fn,
+    );
+    ensure!(
+        edge_a.reduced == a_semantic,
+        "A reduces exactly: {} vs {a_semantic}",
         edge_a.reduced
     );
     ensure!(
@@ -5214,7 +5244,6 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         super::promotion_driver_tests::driver_with_display(&mut coordinator, held_display.display);
     driver.semantic = Some(lane_a);
     driver.completion_source = Some(Box::new(crate::attach::NativeCompletionMinter::new()));
-    let caller_a = caller_of(driver.coordinator, process_a.pid())?;
     let module_a = module_of(driver.coordinator, "soft-copy.so")?;
     driver.installed_promotion = Some(InstalledPromotion {
         capture: CaptureId::new(41),
@@ -5383,14 +5412,47 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     let mut lane_b = start_joint_lane(&mut *coordinator, vec![manifest_soft_b])?;
     std::fs::write(&go_b, b"")?;
     process_b.wait_for("DONE ", Duration::from_secs(60))?;
-    let (_, b_total, b_bad) = ledger_calls(&process_b.out)?;
+    let (b_by_fn, b_total, b_bad) = ledger_calls(&process_b.out)?;
     ensure!(b_bad == 0 && b_total > 0, "B ran its script");
     let qb_polls = service_to_published(&mut lane_b, &mut *coordinator, false, "r16c-qb")?;
+    let (b_semantic, b_count_only) = ledger_semantic_split(&b_by_fn);
     let edge_b = joint_edge_snapshot(coordinator, process_b.pid(), "soft-copy.so")?;
+    let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
+        if !ok {
+            for line in exactness_diagnosis(coordinator, pid, module, by_fn) {
+                eprintln!("JOINT_R16 r16c-qb-diag {line}");
+            }
+        }
+    };
+    diagnose(
+        edge_b.api_returns == Some(b_semantic),
+        process_b.pid(),
+        "soft-copy.so",
+        &b_by_fn,
+    );
     ensure!(
-        edge_b.api_returns == Some(b_total) && edge_b.reduced == b_total,
-        "B is exact: {:?}/{} vs {b_total}",
-        edge_b.api_returns,
+        edge_b.api_returns == Some(b_semantic),
+        "B is exact: {:?} vs semantic {b_semantic} (entered {b_total}, count-only {b_count_only})",
+        edge_b.api_returns
+    );
+    ensure!(
+        count_disclosed_gaps(
+            coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b)
+        ) == b_count_only,
+        "B's count-only calls are disclosed as slot refusals: {b_count_only}"
+    );
+    diagnose(
+        edge_b.reduced == b_semantic,
+        process_b.pid(),
+        "soft-copy.so",
+        &b_by_fn,
+    );
+    ensure!(
+        edge_b.reduced == b_semantic,
+        "B reduces exactly: {} vs {b_semantic}",
         edge_b.reduced
     );
     ensure!(
@@ -5423,9 +5485,41 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         observations.status,
         observations.reason
     );
-    assert_quiet_twins(coordinator, "r16c-qb")?;
+    // The quiet twins excuse exactly the disclosed populations: both
+    // callers' count-only slot refusals (A's rows survive its retire;
+    // gaps are audit rows, not domain state) and the single expected
+    // scripted-view promotion refusal.
+    let promotion_reason = disclosed_scope_reason(coordinator, "selected promotion refused")?;
+    assert_quiet_twins_except(
+        coordinator,
+        "r16c-qb",
+        &[
+            QuietExemption {
+                subject: "semantic input refused",
+                reason: "slot",
+                caller: Some(caller_a),
+                min: a_count_only,
+                max: Some(a_count_only),
+            },
+            QuietExemption {
+                subject: "semantic input refused",
+                reason: "slot",
+                caller: Some(caller_b),
+                min: b_count_only,
+                max: Some(b_count_only),
+            },
+            QuietExemption {
+                subject: "selected promotion refused",
+                reason: &promotion_reason,
+                caller: None,
+                min: 1,
+                max: Some(1),
+            },
+        ],
+    )?;
     eprintln!(
-        "JOINT_R16 r16c-qb polls={qb_polls} revision={revision} b_api={:?}",
+        "JOINT_R16 r16c-qb polls={qb_polls} revision={revision} b_api={:?} \
+         promotion_refusal={promotion_reason:?}",
         edge_b.api_returns
     );
 

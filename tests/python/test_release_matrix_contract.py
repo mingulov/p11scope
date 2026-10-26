@@ -716,6 +716,124 @@ class MatrixContract(unittest.TestCase):
         self.assertIsNone(contract["expected_osrelease"])
         self.assertFalse((stage / "inputs/boot-config").exists())
 
+    def test_618_prepare_binds_osrelease(self):
+        stage, result = self.prepare_guest_attempt("618 stage", "6.18.58")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        self.assertEqual(contract["lane"], "6.18.58")
+        self.assertEqual(contract["expected_osrelease"], "6.18.58")
+        self.assertEqual(contract["guest_boot_config"]["osrelease"], "6.18.58")
+
+    def test_fedora_prepare_stages_no_boot_config(self):
+        stage, result = self.prepare_guest_attempt("fedora stage", "fedora-7.2.9",
+                                                  "fedora-7.2.9")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contract = json.loads((stage / "contract.json").read_text())
+        self.assertEqual(contract["lane"], "fedora-7.2.9")
+        self.assertIsNone(contract["guest_boot_config"])
+        self.assertIsNone(contract["expected_osrelease"])
+        self.assertFalse((stage / "inputs/boot-config").exists())
+
+    def test_fedora_prepare_refuses_foreign_kernel(self):
+        stage, result = self.prepare_guest_attempt("fedora mismatch", "fedora-7.2.9",
+                                                  "host")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fedora lane requires fedora kernel", result.stdout)
+
+    def test_fedora_launch_refuses_with_procedure_pointer(self):
+        stage, prepared = self.prepare_guest_attempt("fedora launch", "fedora-7.2.9",
+                                                    "fedora-7.2.9")
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        result = command(sys.executable, "-I", str(CHECKER), "--launch-guest", str(stage),
+                         "--contract", str(stage / "contract.json"),
+                         "--kernel", "fedora-7.2.9")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("live-cell procedure", result.stdout)
+
+    def test_fedora_guest_inner_refuses_with_procedure_pointer(self):
+        stage, prepared = self.prepare_guest_attempt("fedora inner", "fedora-7.2.9",
+                                                    "fedora-7.2.9")
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        result = command(sys.executable, "-I", str(CHECKER), "--run-guest-inner", str(stage),
+                         "--contract", str(stage / "contract.json"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("live-cell procedure", result.stdout)
+
+    def test_fedora_stage_refuses_guest_disk(self):
+        stage, prepared = self.prepare_guest_attempt("fedora disk", "fedora-7.2.9",
+                                                    "fedora-7.2.9")
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        contract_path = stage / "contract.json"
+        contract = json.loads(contract_path.read_text())
+        contract["guest_disk"] = {"path": str(self.base / "disk"), "uuid": "0" * 32}
+        contract_path.write_text(json.dumps(contract))
+        result = command(sys.executable, "-I", str(CHECKER), "--seal", str(stage),
+                         "--contract", str(contract_path), "--guest-exit", "0")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fedora lane cannot use a guest disk", result.stdout)
+
+    def judged_stage(self, name, lane, kernel, uname):
+        """A sealed healthy stage on any lane; returns the stage path."""
+        stage = self.base / name
+        result = command(sys.executable, "-I", str(CHECKER), "--prepare", str(stage),
+                         "--lane", lane, "--kernel", kernel, "--bin-dir", str(self.bins),
+                         "--binary-list", str(self.listing), "--curation", str(self.curation),
+                         "--bpfmulti-list", str(self.bm_list),
+                         "--candidate-receipt", str(self.candidate),
+                         "--lib-test", LIB_A, "--lib-test", LIB_B)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run_id = json.loads((stage / "contract.json").read_text())["run_id"]
+
+        def write(name, text):
+            path = stage / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        def log(name, text, process, rc):
+            write(name, text + f"{process}_exit={rc}\nmatrix_run={run_id}\n")
+
+        write("uname.txt", uname + "\n")
+        log("version.log", "p11scope 0.4.0\n", "version", 0)
+        log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
+        log("qual.log", "SUMMARY pass=10 fail=0 nonqualifying=3\n", "qual", 2)
+        write("cells/results.jsonl", "".join(
+            json.dumps({"cell": name, "pass": qualification != "nonqualifying",
+                        "detail": "controlled assertion", "qualification": qualification}) + "\n"
+            for name, qualification in PUBLIC.items()))
+        log("inv-native.log", "qualified owned inventory\n", "inv_native", 0)
+        log("inv-scan.log", "valid scan plumbing, nonqualifying\n", "inv_scan", 2)
+        log("pidflt.log", f"running 1 test\ntest {PID_TEST} ... ok\nPIDFLT_PROBE own=2 other=0 proves=true\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", "pidflt", 0)
+        write("run/results.txt", f"# selectors: {LIB_A} {LIB_B}\nPASS {LIB_A} rc=0 seconds=1 :: test result: ok. 1 passed\nPASS {LIB_B} rc=0 seconds=1 :: test result: ok. 1 passed\nSUMMARY pass=2 fail=0 skipped=0\n")
+        for name in (LIB_A, LIB_B):
+            write("run/logs/" + name.split("::")[-1] + ".log", f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+        log("priv.log", "SUMMARY pass=2 fail=0 skipped=0\n", "priv", 0)
+        for scope, mechanism, scope_filter in (("pid", "uprobe-multi", "kernel-pid+bpf"), ("sys", "uprobe-multi", None)):
+            write("backend/inv-" + scope + ".json", json.dumps({"observation": {"attach": {
+                "mechanism": mechanism, "scope_filter": scope_filter, "fallback": None}}}))
+            log("backend/inv-" + scope + ".stderr", "", "inv_" + scope, 0)
+        sealed = command(sys.executable, "-I", str(CHECKER), "--seal", str(stage),
+                         "--contract", str(stage / "contract.json"), "--guest-exit", "0")
+        self.assertEqual(sealed.returncode, 0, sealed.stdout + sealed.stderr)
+        return stage
+
+    def test_fedora_judge_accepts_fedora_uname(self):
+        stage = self.judged_stage("fedora judged", "fedora-7.2.9", "fedora-7.2.9",
+                                 "7.2.9-fedora-controlled")
+        result = command(sys.executable, "-I", str(CHECKER), "--judge", str(stage),
+                         "--contract", str(stage / "contract.json"))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict["lane"], "fedora-7.2.9")
+        self.assertEqual(verdict["qualification"], "nonqualifying")
+
+    def test_guest_judge_still_refuses_wrong_uname(self):
+        stage = self.judged_stage("guest judged", "6.1.188", str(self.kernel),
+                                 "7.2.9-fedora-controlled")
+        result = command(sys.executable, "-I", str(CHECKER), "--judge", str(stage),
+                         "--contract", str(stage / "contract.json"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("wrong executed kernel osrelease", result.stdout)
+
     def test_cached_kernel_tag_binds_its_actual_osrelease(self):
         home = self.base / "owned kernel cache"
         boot = home / ".cache/virtme-ng/v6.1.188/amd64/boot"; boot.mkdir(parents=True)
@@ -2876,6 +2994,78 @@ class Registration(unittest.TestCase):
     def test_empty_selection_is_rejected(self):
         result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lib-test", "")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+
+class MatrixLaneRegistration(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="matrix-lanes-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def test_contract_registers_both_lanes(self):
+        self.assertEqual(CHECKER_MOD["LANES"],
+                         ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic",
+                          "6.12.111", "6.18.58", "7.2.6", "host",
+                          "fedora-7.2.9"))
+        lanes = CHECKER_MOD["D4_LANES"]
+        self.assertEqual(lanes["D4:overlay-6.8+"],
+                         ("6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6",
+                          "host", "fedora-7.2.9"))
+        self.assertEqual(lanes["D4:ext4-inode-reuse"],
+                         ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111",
+                          "6.18.58", "7.2.6", "host", "fedora-7.2.9"))
+
+    def test_plan_accepts_both_lanes_with_full_selection(self):
+        for lane in ("6.18.58", "fedora-7.2.9"):
+            with self.subTest(lane=lane):
+                result = command(sys.executable, "-I", str(CHECKER), "--plan",
+                                 "--lane", lane)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertIn(lane, plan["lanes"])
+                execution = plan["execution"]
+                self.assertEqual(execution["lane"], lane)
+                self.assertIn(LIB_A, execution["lib_tests"])
+
+    def test_dry_run_defaults_gain_618_without_fedora(self):
+        result = command(str(RUNNER), "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kernels (8):", result.stdout)
+        self.assertIn("v6.18.58 tag=v6.18.58", result.stdout)
+        self.assertNotIn("tag=fedora", result.stdout)
+
+    def test_resolve_kernel_maps_new_names(self):
+        for spec, resolved in (("fedora", "fedora-7.2.9"),
+                               ("fedora-7.2.9", "fedora-7.2.9"),
+                               ("6.18", "v6.18.58"),
+                               ("6.18.58", "v6.18.58"),
+                               ("v6.18.58", "v6.18.58")):
+            with self.subTest(spec=spec):
+                result = command(str(RUNNER), "--dry-run", "--kernels", spec)
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+                self.assertIn(f"{resolved} tag={resolved}", result.stdout)
+
+    def test_run_one_refuses_fedora_lane(self):
+        import shlex
+        stages, outputs = self.base / "stages", self.base / "outputs"
+        stages.mkdir()
+        outputs.mkdir()
+        body = RUNNER.read_text().split("run_one() {", 1)[1].split("\noverall=", 1)[0]
+        words = {"CHECKER": CHECKER, "REPO": ROOT, "STAGE_REV": stages,
+                 "OUT_REV": outputs}
+        script = "set -uo pipefail\n" + "".join(
+            key + "=" + shlex.quote(str(value)) + "\n"
+            for key, value in words.items())
+        script += "run_one() {" + body + "\nrun_one fedora-7.2.9\n"
+        result = subprocess.run(["bash", "-c", script], cwd=ROOT,
+                                env=os.environ.copy(), text=True,
+                                capture_output=True, timeout=20)
+        retain_command(["bash", "-c", "run_one fedora-7.2.9"], result)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("live-cell procedure", result.stderr)
+        self.assertFalse((stages / "fedora-7.2.9").exists())
+        self.assertFalse((outputs / "fedora-7.2.9").exists())
 
 
 def check_d4_ready_pair(pair, cells, lanes, lanes_all, runnable):

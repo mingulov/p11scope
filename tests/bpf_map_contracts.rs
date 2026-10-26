@@ -170,3 +170,42 @@ fn native_bpf_map_decoder_contracts() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// H8-D birth marker twins: the freeze and call-site checks run here so
+/// CI pins all seventeen without a live object.
+#[test]
+fn embedded_birth_marker_twins_are_driven() {
+    let cases = [
+        "JournalMarkerInventoryTests.test_detailed_freeze_accepts_marker",
+        "JournalMarkerInventoryTests.test_detailed_without_marker_map_refused",
+        "JournalMarkerInventoryTests.test_inventory_with_marker_map_refused",
+        "JournalMarkerInventoryTests.test_inventory_with_marker_symbols_refused",
+        "JournalMarkerInventoryTests.test_marker_value_size_8_refused",
+        "JournalMarkerInventoryTests.test_missing_marker_global_refused",
+        "JournalMarkerInventoryTests.test_marker_helper_boundary",
+        "JournalMarkerInventoryTests.test_marker_helper_boundary_refuses_user_read",
+        "JournalMarkerInventoryTests.test_marker_single_global_refused",
+        "JournalMarkerCallSiteTests.test_marker_calls_healthy_diagnostic",
+        "JournalMarkerCallSiteTests.test_marker_calls_healthy_default",
+        "JournalMarkerCallSiteTests.test_marker_calls_without_markers_skipped",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_entry_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_ia32_entry_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_return_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_template_continuation_refused",
+        "JournalMarkerCallSiteTests.test_marker_call_dropped_from_exec_refused",
+    ];
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "tests/python/test_bpf_map_defs.py"])
+        .args(cases)
+        .output()
+        .expect("run birth marker twins");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "birth marker twins: {report}");
+    assert!(report.contains("Ran 17 tests"), "zero selection: {report}");
+    assert!(!report.contains("skipped"), "skipped marker proof: {report}");
+}

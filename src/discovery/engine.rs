@@ -8838,7 +8838,10 @@ fn counter_staging_refusal_text(publication: &BankPublication, check: Option<&st
 /// Finite counter growth refusal text: the publication token plus the
 /// failing check when the refusal named one. Unnamed refusals keep their
 /// exact historical token text.
-fn counter_growth_refusal_text(publication: &BankPublication, check: Option<&str>) -> String {
+pub(crate) fn counter_growth_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
     match check {
         Some(check) => format!("{publication:?} ({check})"),
         None => format!("{publication:?}"),

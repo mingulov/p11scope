@@ -3548,6 +3548,47 @@ mod tests {
     }
 
     #[test]
+    fn counter_growth_refusal_text_renders_endpoint_ceiling_in_plain_words() {
+        use crate::attach::counter_banks::{BankPublication, BankRefusal};
+        use crate::discovery::engine::counter_growth_refusal_text;
+        // The over-ceiling growth refusal carries the requested and ceiling
+        // counts; the user sees plain words with the numbers, never the
+        // Debug token.
+        let ceiling = BankPublication::Refused(BankRefusal::BudgetExhausted {
+            resource: "counter endpoints",
+            needed: 8193,
+            available: 8192,
+        });
+        assert_eq!(
+            counter_growth_refusal_text(&ceiling, None),
+            "8193 endpoints exceed the 8192 counter ceiling"
+        );
+        assert_eq!(
+            counter_growth_refusal_text(
+                &ceiling,
+                Some("counter plan budget differs from the staged budget")
+            ),
+            "8193 endpoints exceed the 8192 counter ceiling \
+             (counter plan budget differs from the staged budget)"
+        );
+        // Every other refusal keeps its exact historical token text.
+        let memory = BankPublication::Refused(BankRefusal::BudgetExhausted {
+            resource: "counter-memory-limit",
+            needed: 1,
+            available: 0,
+        });
+        assert_eq!(
+            counter_growth_refusal_text(&memory, None),
+            format!("{memory:?}")
+        );
+        let topology = BankPublication::Refused(BankRefusal::Topology);
+        assert_eq!(
+            counter_growth_refusal_text(&topology, Some("counter pinned provider changed")),
+            "Refused(Topology) (counter pinned provider changed)"
+        );
+    }
+
+    #[test]
     fn counter_terminal_transient_matches_reader() {
         use crate::attach::counter_banks::counter_read_transient_bytes;
         for mode in [

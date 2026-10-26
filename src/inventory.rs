@@ -2636,6 +2636,7 @@ impl ClassicDriver<'_> {
     /// driver construction (classic or dashboard, never both), a
     /// promoted lane at install. Success makes the lane Joint; refusal
     /// keeps the legacy one-sided path with one disclosure gap.
+    /// In v0.5.0 (R-50) the bound machine installs no key-operation feed: the lane stays S1-only with one `joint_journal_unavailable` disclosure.
     fn initialize_joint_lane(&mut self) {
         let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
         let Some(lane) = semantic.as_mut() else {

@@ -322,10 +322,12 @@ echo "=== discover ==="
 if [ "$MODE" = live ]; then
     if [ "$IS_ROOT" -eq 1 ]; then
         # The dropped discover identity cannot write into 0700 root
-        # dirs: land the manifest in the sticky /tmp under a unique
-        # name, then install it privately. The manifest file itself is
-        # always checked: discover can report an error yet exit 0.
-        MANIFEST_TMP=$(mktemp /tmp/manifest-soak-manifest.XXXXXX.json)
+        # dirs: it creates the manifest in the sticky /tmp under a
+        # unique name (pid + nanoseconds; never pre-created, or the
+        # sticky ownership check would deny the dropped writer), then
+        # the vehicle installs it privately. The manifest file itself
+        # is always checked: discover can report an error yet exit 0.
+        MANIFEST_TMP=/tmp/manifest-soak-manifest.$$.$(mono_ns).json
         env -u SOFTHSM2_CONF "$DISCOVER_COPY" --module "$MODULE" -o "$MANIFEST_TMP"
         [ -f "$MANIFEST_TMP" ] || refuse "discover wrote no manifest"
         install -m 0444 "$MANIFEST_TMP" "$WORK/manifest.json"

@@ -390,6 +390,138 @@ fn counter_growth_attach_outcome_reports_scripted_check() {
     );
 }
 
+/// Owning module for injected counter slots: one heuristic table over the
+/// given slots, bound to the given pins. Mirrors the counter-reader
+/// fixture's module; both pin the production invariant (the plan's keys
+/// are re-observable from owning modules) without running discovery.
+fn owning_module_for_test(
+    provider: &std::path::Path,
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: crate::discovery::identity::PinnedObjectId,
+    slots: &[crate::plan::Slot],
+) -> crate::discovery::identity::ReconciledModule {
+    use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+    let key = pins.summary(object).unwrap().key;
+    // The loader-arming rebuild re-binds this module against the pins, and
+    // the bind key includes the mount namespace. `real_scan_pin` records a
+    // synthetic `{device: 1, inode: minor}` namespace, so the module must
+    // reproduce it exactly or the bind drops the module.
+    let mount_namespace = crate::process::MountNamespaceId {
+        device: 1,
+        inode: key.device.minor,
+    };
+    let path = provider.display().to_string();
+    let entries = slots
+        .iter()
+        .map(|slot| ScannedEntry {
+            name: "C_Sign",
+            object: key,
+            object_path: path.clone(),
+            file_offset: slot.file_offset,
+        })
+        .collect::<Vec<_>>();
+    crate::discovery::identity::ReconciledModule {
+        scanned: ScannedModule {
+            mapped_identity: None,
+            view: crate::process::ProcessViewId(0),
+            mount_namespace,
+            key,
+            double_loaded: false,
+            path,
+            decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".to_string()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries,
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+                file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
+            }],
+            interfaces: vec![],
+        },
+        object,
+        entry_objects: vec![vec![object; slots.len()]],
+        exports: Default::default(),
+    }
+}
+
+#[test]
+fn counter_start_state_with_owning_modules_survives_loader_arming() {
+    // The a2-7a root shape, pinned: an injected counter plan whose slots no
+    // module owns is retired wholesale by the first loader-arming rebuild,
+    // and staging the all-inactive plan refuses Topology. With owning
+    // modules, arming stages the full retained plan and adopts it
+    // active, consumed, and in order (growth staging matches keys by index).
+    use crate::discovery::identity::test_fixture as fixture;
+    let mut engine = Engine::empty_for_test();
+    let pid = std::process::id();
+    let view = crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let pins = fixture::real_scan_pin(&exe, None, 1, &"ab".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let plan = counters_plan_on(8, object);
+    let modules = vec![owning_module_for_test(&exe, &pins, object, &plan.slots)];
+    engine.inject_counter_start_state_for_test(
+        crate::attach::Scope::Pid(pid),
+        vec![view],
+        plan,
+        pins,
+        modules,
+    );
+    engine.begin_start_capture_attempt().unwrap();
+    let mut session = ScriptedSession::default();
+    session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Published {
+            transaction: 1,
+            extent: BankExtent { first: 0, end: 8 },
+        });
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    let fatal = engine.arm_initial_views(&mut session, &mut additions_allowed, &mut pending_views);
+    assert!(fatal.is_none(), "loader arming must not fail: {fatal:?}");
+    assert_eq!(
+        session.staged_counter_calls,
+        vec![8],
+        "arming must stage the full retained plan"
+    );
+    assert_eq!(engine.plan.slots.len(), 8);
+    assert_eq!(
+        engine.plan.counter_consumed_end(),
+        8,
+        "the staged plan must be adopted consumed"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        8,
+        "owned endpoints must survive the arming rebuild"
+    );
+    for (index, slot) in engine.plan.slots.iter().enumerate() {
+        assert_eq!(slot.index as usize, index);
+        assert_eq!(slot.file_offset, 4096 + index as u64);
+    }
+}
+
+#[test]
+#[should_panic(expected = "has no owning module entry")]
+fn counter_start_state_rejects_plan_without_owning_modules() {
+    let mut engine = Engine::empty_for_test();
+    let (pins, object) = counter_pins();
+    let plan = counters_plan_on(2, object);
+    engine.inject_counter_start_state_for_test(
+        crate::attach::Scope::Pid(std::process::id()),
+        Vec::new(),
+        plan,
+        pins,
+        Vec::new(),
+    );
+}
+
 #[test]
 fn counter_growth_without_fresh_tail_stages_nothing() {
     let mut engine = Engine::empty_for_test();

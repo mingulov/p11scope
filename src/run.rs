@@ -12086,6 +12086,7 @@ mod tests {
             Vec::new(),
             plan,
             crate::discovery::identity::PinnedObjects::empty(),
+            Vec::new(),
         );
         // Counter policy + Counters plan -> bounded inputs from the budget.
         let inputs = counter_inputs_for_capture(
@@ -12109,6 +12110,7 @@ mod tests {
             Vec::new(),
             crate::plan::AttachPlan::from_slots(vec![]),
             crate::discovery::identity::PinnedObjects::empty(),
+            Vec::new(),
         );
         assert!(
             counter_inputs_for_capture(

@@ -4525,6 +4525,66 @@ mod tests {
         pins
     }
 
+    /// Owning module for injected counter slots, mirroring what discovery
+    /// would have scanned: one heuristic table over the fixture endpoints,
+    /// bound to the fixture pins. The Engine rebuilds its plan from these
+    /// modules during loader arming; without them the rebuild retires every
+    /// injected slot and staging refuses Topology on the all-inactive plan.
+    fn counter_module_for_slots(
+        provider: &std::path::Path,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: crate::discovery::identity::PinnedObjectId,
+        slots: &[Slot],
+    ) -> crate::discovery::identity::ReconciledModule {
+        use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+        let key = pins.summary(object).unwrap().key;
+        // The loader-arming rebuild re-binds this module against the pins,
+        // and the bind key includes the mount namespace. `real_scan_pin`
+        // records a synthetic `{device: 1, inode: minor}` namespace, so the
+        // module must reproduce it exactly or the bind drops the module.
+        let mount_namespace = crate::process::MountNamespaceId {
+            device: 1,
+            inode: key.device.minor,
+        };
+        let path = provider.display().to_string();
+        let entries = slots
+            .iter()
+            .map(|slot| ScannedEntry {
+                name: "C_Sign",
+                object: key,
+                object_path: path.clone(),
+                file_offset: slot.file_offset,
+            })
+            .collect::<Vec<_>>();
+        crate::discovery::identity::ReconciledModule {
+            scanned: ScannedModule {
+                mapped_identity: None,
+                view: crate::process::ProcessViewId(0),
+                mount_namespace,
+                key,
+                double_loaded: false,
+                path,
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".to_string()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
+                }],
+                interfaces: vec![],
+            },
+            object,
+            entry_objects: vec![vec![object; slots.len()]],
+            exports: Default::default(),
+        }
+    }
+
     fn engine_over_counter_fixture(
         parts: &mut EngineCounterFixture,
         slots: Vec<Slot>,
@@ -4533,6 +4593,12 @@ mod tests {
         let pid = parts.fixture.child.id();
         let view =
             crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid).unwrap();
+        let modules = vec![counter_module_for_slots(
+            &parts.provider,
+            &parts.pins,
+            parts.object,
+            &slots,
+        )];
         let plan = crate::plan::AttachPlan::from_slots_with_policy(
             slots,
             crate::plan::AdmissionPolicy::Detailed,
@@ -4547,6 +4613,7 @@ mod tests {
             vec![view],
             plan,
             pins,
+            modules,
         );
         engine
     }
@@ -4755,7 +4822,13 @@ mod tests {
         let deadline = start + std::time::Duration::from_secs(deadline_secs);
         let mut child = Reaped(
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--ignored", "--test-threads=1", "--nocapture"])
+                .args([
+                    "--exact",
+                    test,
+                    "--ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
                 .env(SOFT1024_CHILD, cell)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -4827,14 +4900,14 @@ mod tests {
             test result: ok. 0 passed; 0 failed; 1 ignored; finished in 0.00s\n";
         assert!(!soft1024_child_output_ok("raise", true, filtered));
         // A failed child never passes, even with marker and count.
-        let failed = "P11SCOPE_SOFT1024_CHILD_DONE raise\ntest result: FAILED. 0 passed; 1 failed\n";
+        let failed =
+            "P11SCOPE_SOFT1024_CHILD_DONE raise\ntest result: FAILED. 0 passed; 1 failed\n";
         assert!(!soft1024_child_output_ok("raise", false, failed));
         // Marker without the passed count, and count without the marker.
         let uncounted = "P11SCOPE_SOFT1024_CHILD_DONE raise\n\
             test result: ok. 0 passed; 0 failed; 1 ignored\n";
         assert!(!soft1024_child_output_ok("raise", true, uncounted));
-        let unmarked =
-            "test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.01s\n";
+        let unmarked = "test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.01s\n";
         assert!(!soft1024_child_output_ok("raise", true, unmarked));
         // Another cell's marker does not satisfy this cell.
         let foreign = "P11SCOPE_SOFT1024_CHILD_DONE bypass\n\

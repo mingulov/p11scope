@@ -27145,20 +27145,59 @@ impl Engine {
     }
 
     /// Test-only state injection for Engine-driven counter cells: a
-    /// discovery-shaped Engine (scope, views, plan, pins) without running
-    /// discovery. Production builds discovery through `discover_plan`.
+    /// discovery-shaped Engine (scope, views, plan, pins, modules) without
+    /// running discovery. Production builds discovery through
+    /// `discover_plan`, which derives the plan FROM the modules; the seam
+    /// enforces the same invariant: every plan key must be re-observable
+    /// from an owning module entry, or the first loader-arming rebuild
+    /// legitimately retires it and counter staging refuses Topology on the
+    /// all-inactive plan.
     #[cfg(test)]
     pub(crate) fn inject_counter_start_state_for_test(
         &mut self,
         scope: Scope,
         views: Vec<ProcessView>,
-        plan: plan::AttachPlan,
+        mut plan: plan::AttachPlan,
         pinned: PinnedObjects,
+        modules: Vec<ReconciledModule>,
     ) {
+        let owned: BTreeSet<(PinnedObjectId, u64)> = modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .scanned
+                    .tables
+                    .iter()
+                    .zip(module.entry_objects.iter())
+                    .flat_map(|(table, ids)| {
+                        table
+                            .entries
+                            .iter()
+                            .zip(ids.iter())
+                            .map(|(entry, object)| (*object, entry.file_offset))
+                    })
+            })
+            .collect();
+        for slot in &plan.slots {
+            assert!(
+                owned.contains(&(slot.object, slot.file_offset)),
+                "injected counter plan slot {} ({:?}@0x{:x}) has no owning module entry; \
+                 loader arming would retire it",
+                slot.index,
+                slot.object,
+                slot.file_offset
+            );
+        }
+        // Discovery allocates stable module IDs during admission; the seam
+        // must too, or capture-facts publication cannot resolve them.
+        self.capture_facts
+            .bind_plan_module_ids(&mut plan, &modules, &self.manifests, &pinned)
+            .expect("injected counter modules bind stable module IDs");
         self.scope = scope;
         self.views = views;
         self.plan = plan;
         self.pinned = pinned;
+        self.modules = modules;
     }
 
     /// Test-only counter growth step through the production apply path:

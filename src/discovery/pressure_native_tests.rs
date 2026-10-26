@@ -1941,6 +1941,42 @@ fn pressure_257th_loader_arm_through_real_path_is_a_named_gap() {
         "{WHAT}: the 257th arm names the capacity: {:?}",
         engine.counters.object_skips
     );
+    // Engine->render seam pin: the skip the engine actually produced must
+    // match the render allowlist byte-exactly and project to the named
+    // public reason and text line. Wording drift at the producing literal
+    // or a formatting change on the arm path fails here, not silently.
+    let found = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| {
+            skip.subject == "live loader arming"
+                && skip
+                    .reason
+                    .contains("loader context capacity 256 is exhausted")
+        })
+        .expect("the 257th arm names the capacity");
+    assert_eq!(
+        found.reason, "loader context capacity 256 is exhausted",
+        "{WHAT}: the produced reason matches the render allowlist exactly"
+    );
+    let projected = crate::render::capture_skipped_out(found);
+    assert_eq!(
+        projected.name, "discovery subject",
+        "{WHAT}: the produced skip projects to the discovery name"
+    );
+    assert_eq!(
+        projected.reason, "loader context capacity 256 is exhausted",
+        "{WHAT}: the produced skip projects to the named reason"
+    );
+    let mut ev = crate::render::tests::evidence();
+    ev.skipped = vec![projected];
+    ev.verdict();
+    let text = crate::render::scope_summary("pid", &[], &ev);
+    assert!(
+        text.contains("loader context capacity 256 is exhausted: 1"),
+        "{WHAT}: the text line names the limit: {text}"
+    );
     assert_eq!(
         engine.loader_discovery().strategies.unavailable,
         1,
@@ -2393,6 +2429,49 @@ fn cgroup_move_out_guard_returns_pid_to_parent_on_drop() {
     std::fs::remove_file(&dest).unwrap();
 }
 
+/// Panic-path twin of the move-out guard: a real panic unwinding through an
+/// armed guard still runs the move-out write (the file carries the pid
+/// afterwards), while a disarmed guard stays silent under the same panic.
+/// The unwind must be caught — the guard's drop never panics itself.
+#[test]
+fn cgroup_move_out_guard_moves_pid_out_while_unwinding() {
+    let dest = std::env::temp_dir().join(format!(
+        "p11scope-guard-panic-{}-cgroup.procs",
+        std::process::id()
+    ));
+    std::fs::write(&dest, b"").unwrap();
+    let pid = std::process::id();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = CgroupMoveOutGuard::arm(pid, dest.clone());
+        panic!("boom");
+    }));
+    assert!(
+        caught.is_err(),
+        "the panic must unwind through the armed guard"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dest).unwrap(),
+        pid.to_string(),
+        "unwinding through the guard runs the move-out write"
+    );
+    std::fs::write(&dest, b"").unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = CgroupMoveOutGuard::arm(pid, dest.clone());
+        guard.disarm();
+        panic!("boom");
+    }));
+    assert!(
+        caught.is_err(),
+        "the panic must unwind through the disarmed guard"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dest).unwrap(),
+        "",
+        "a disarmed guard writes nothing while unwinding"
+    );
+    std::fs::remove_file(&dest).unwrap();
+}
+
 /// OD34 release-path cell 3.6 (loader half), corrected routing: 257 genuine
 /// provider loads on a real kernel. Views gate loader arms, and the view
 /// table holds 256, so the overflow strands at the VIEW gate: the 257th
@@ -2610,6 +2689,68 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
         }),
         "{WHAT}: the view-capacity gap reaches the published plan: {:?}",
         engine.plan.skipped
+    );
+    // Engine->render seam pin: the skip the engine actually produced must
+    // carry the full structural sentence and project to the normalized
+    // named reason and text line. Drift in the engine sentence fails here.
+    let full_view_reason = format!(
+        "capture process-view capacity {MAX_SCAN_PIDS} was exhausted; remaining generations were not scanned"
+    );
+    for (label, found) in [
+        (
+            "counters",
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .find(|skip| {
+                    skip.subject == "process view" && skip.reason.contains(&view_gap_reason)
+                })
+                .expect("the overflow names the view capacity in the counters"),
+        ),
+        (
+            "plan",
+            engine
+                .plan
+                .skipped
+                .iter()
+                .find(|skip| {
+                    skip.subject == "process view" && skip.reason.contains(&view_gap_reason)
+                })
+                .expect("the view-capacity gap reaches the published plan"),
+        ),
+    ] {
+        assert_eq!(
+            found.reason, full_view_reason,
+            "{WHAT}: the produced {label} reason matches the render allowlist exactly"
+        );
+        let projected = crate::render::capture_skipped_out(found);
+        assert_eq!(
+            projected.name, "discovery subject",
+            "{WHAT}: the produced {label} skip projects to the discovery name"
+        );
+        assert_eq!(
+            projected.reason,
+            "capture process-view capacity was exhausted; remaining generations were not scanned",
+            "{WHAT}: the produced {label} skip projects to the named reason"
+        );
+    }
+    let text = {
+        let mut ev = crate::render::tests::evidence();
+        ev.skipped = engine
+            .plan
+            .skipped
+            .iter()
+            .map(crate::render::capture_skipped_out)
+            .collect();
+        ev.verdict();
+        crate::render::scope_summary("pid", &[], &ev)
+    };
+    assert!(
+        text.contains(
+            "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
+        ),
+        "{WHAT}: the text line names the limit: {text}"
     );
     // Nothing silently dropped: every owned pid is still viewed or queued.
     let accounted = accounted_owned(&engine);

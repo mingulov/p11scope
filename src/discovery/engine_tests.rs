@@ -9556,6 +9556,42 @@ fn owned_prearm_at_256_contexts_names_the_capacity_gap() {
         "the capacity refusal must be a named skip: {:?}",
         engine.counters.object_skips
     );
+    // Engine->render seam pin: the skip the engine actually produced must
+    // match the render allowlist byte-exactly and project to the named
+    // public reason and text line. Wording drift at the producing literal
+    // or a formatting change on the prearm path fails here, not silently.
+    let found = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| {
+            skip.subject == "owned initial-set discovery"
+                && skip
+                    .reason
+                    .contains("loader context capacity 256 is exhausted")
+        })
+        .expect("the capacity refusal must be a named skip");
+    assert_eq!(
+        found.reason, "loader context capacity 256 is exhausted",
+        "the produced reason matches the render allowlist exactly"
+    );
+    let projected = render::capture_skipped_out(found);
+    assert_eq!(
+        projected.name, "discovery subject",
+        "the produced skip projects to the discovery name"
+    );
+    assert_eq!(
+        projected.reason, "loader context capacity 256 is exhausted",
+        "the produced skip projects to the named reason"
+    );
+    let mut ev = render::tests::evidence();
+    ev.skipped = vec![projected];
+    ev.verdict();
+    let text = render::scope_summary("pid", &[], &ev);
+    assert!(
+        text.contains("loader context capacity 256 is exhausted: 1"),
+        "the text line names the limit: {text}"
+    );
 }
 
 #[test]

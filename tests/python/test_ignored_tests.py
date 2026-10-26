@@ -515,9 +515,9 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=117",
+            "DEFAULT_TESTS=118",
             "ALTERNATIVE_TESTS=2",
-            "LONG_TESTS=13",
+            "LONG_TESTS=14",
             "SKIP_TESTS=61",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",

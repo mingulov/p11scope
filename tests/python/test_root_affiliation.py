@@ -71,6 +71,10 @@ def hook_contract(main, identity):
     inventory_at = exit_body.index(inventory)
     if not (read_at < fault_at < gap_at < inventory_at):
         raise AssertionError("exit must order cleanup read, fault arm, gap arm, then inventory arm")
+    spans = [(read_at, read), (fault_at, fault), (gap_at, gap), (inventory_at, inventory)]
+    for (a_at, a), (b_at, _) in zip(spans, spans[1:]):
+        if re.sub(r"//[^\n]*", "", exit_body[a_at + len(a):b_at]).strip():
+            raise AssertionError("exit prologue arms must be contiguous (comments only between them)")
     if exit_body.count("p11_instance_scope_gap") != 1:
         raise AssertionError("exit must gap the abandoned START exactly once")
     if exit_body.count("OWNER_CLEANUP_ABANDONED_START") != 1:
@@ -143,6 +147,8 @@ class RootAffiliationTests(unittest.TestCase):
                          '    }\n')
         gap_moved = exit_body.replace(gap_block, "", 1).replace(
             leader_filter, leader_filter + gap_block + "\n", 1)
+        leader_hoisted = exit_body.replace(leader_filter, "", 1).replace(
+            gap_block, leader_filter + gap_block, 1)
         changed_exits = [
             exit_body.replace(root_block, ""),
             exit_body.replace(gap_block, gap_block.replace(
@@ -151,6 +157,8 @@ class RootAffiliationTests(unittest.TestCase):
             exit_body.replace("if cleanup == OWNER_CLEANUP_ABANDONED_START {",
                               "if cleanup == 1 {", 1),
             gap_moved,
+            leader_hoisted,
+            exit_body.replace(gap_block, gap_block + "\n    return 0;", 1),
             exit_body.replace(gap_block, gap_block.split("\n", 1)[1], 1),
             exit_body.replace(root_block, "if false { " + root_block + " }"),
             exit_body.replace(owner, "if false { " + owner, 1)

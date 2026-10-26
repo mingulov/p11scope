@@ -544,6 +544,71 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
                 "{root} must settle cleanup before {marker}"
             );
         }
+        // Only comments may sit between the read, fault, gap and inventory
+        // arms: any inserted statement (an early return, a shadowed outcome,
+        // a hoisted filter) would reorder lifecycle teardown unseen.
+        let contiguous = |text: &str| -> Option<()> {
+            let read_block = "#[cfg(not(feature = \"inventory-only\"))]\n    let cleanup = unsafe { p11_owner_cleanup() };";
+            let read_at = text.find(read_block)?;
+            let read_end = read_at + read_block.len();
+            let fault_open = "#[cfg(not(feature = \"inventory-only\"))]\n    if cleanup == 1 {";
+            let fault_at = read_end + text[read_end..].find(fault_open)?;
+            let fault_end = fault_at + text[fault_at..].find("\n    }\n")? + "\n    }".len();
+            let gap_open = "#[cfg(not(any(feature = \"inventory-only\", feature = \"counter-broad\")))]\n    if cleanup == OWNER_CLEANUP_ABANDONED_START {";
+            let gap_at = fault_end + text[fault_end..].find(gap_open)?;
+            let gap_end = gap_at + text[gap_at..].find("\n    }\n")? + "\n    }".len();
+            let inventory_block =
+                "#[cfg(feature = \"inventory-only\")]\n    let _ = unsafe { p11_owner_cleanup() };";
+            let inventory_at = gap_end + text[gap_end..].find(inventory_block)?;
+            for region in [
+                &text[read_end..fault_at],
+                &text[fault_end..gap_at],
+                &text[gap_end..inventory_at],
+            ] {
+                let stripped: Vec<&str> = region
+                    .lines()
+                    .map(|line| match line.find("//") {
+                        Some(at) => &line[..at],
+                        None => line,
+                    })
+                    .collect();
+                if !stripped.join("\n").trim().is_empty() {
+                    return None;
+                }
+            }
+            Some(())
+        };
+        assert!(
+            contiguous(body).is_some(),
+            "{root} exit prologue arms must be contiguous (comments only between them)"
+        );
+        // Mutant control: an early return slipped between the gap arm and
+        // the inventory arm keeps every pin above (guards, sites, order),
+        // so only the contiguity rule above catches it.
+        let holed = body.replacen(
+            "#[cfg(feature = \"inventory-only\")]",
+            "    return 0;\n    #[cfg(feature = \"inventory-only\")]",
+            1,
+        );
+        assert_ne!(holed, body, "early-return mutant must change the exit body");
+        assert!(
+            holed.contains(fault_guard) && holed.contains(gap_guard),
+            "early-return mutant must keep the fault and gap guards"
+        );
+        let holed_gap = holed
+            .find("p11_instance_scope_gap()")
+            .expect("mutant keeps the gap site");
+        let holed_root = holed
+            .find("p11_root_current_exit()")
+            .expect("mutant keeps the root exit");
+        assert!(
+            holed_gap < holed_root,
+            "early-return mutant must keep the settle-before-exit order"
+        );
+        assert!(
+            contiguous(&holed).is_none(),
+            "early-return mutant must be caught by the contiguity rule"
+        );
     }
 }
 

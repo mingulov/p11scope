@@ -9386,4 +9386,243 @@ pub(crate) mod tests {
         );
         assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
+
+    #[test]
+    fn counter_spec_prepares_requested_mode() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            // Disabled builds refuse at the build gate (twin below); the
+            // healthy path needs embedded objects.
+            return;
+        }
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
+            assert!(!super::counter_object_for_mode(mode).is_empty());
+            let spec =
+                super::CounterSpec::for_production(mode, 8, pool.reserver()).expect("spec sizes");
+            let prepared = spec
+                .prepare_with_probe_and_cpus(
+                    AttachBackend::Singles,
+                    || BpfLoopVerdict::Available,
+                    Some(8),
+                )
+                .expect("spec prepares");
+            assert_eq!(prepared.banks.geometry_mode(), mode);
+            assert!(
+                pool.snapshot().charged_bytes > baseline,
+                "{mode:?}: preparation holds terminal, keepalive and scratch"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_spec_production_prepare_matches_probe_and_build() {
+        use super::super::AttachBackend;
+        let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+        let cpus = aya::util::nr_cpus().expect("possible CPUs");
+        let spec =
+            super::CounterSpec::for_production(CounterMode::Counts, cpus, pool.reserver())
+                .expect("spec sizes");
+        match spec.prepare(AttachBackend::Singles) {
+            Ok(prepared) => {
+                assert_eq!(
+                    env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+                    "1",
+                    "success needs embedded objects"
+                );
+                assert_eq!(prepared.banks.geometry_mode(), CounterMode::Counts);
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("counter-mode-unavailable-in-build")
+                        || text.starts_with("counter-mode-unavailable-on-kernel:"),
+                    "production prepare refuses only at the build or kernel gate: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counter_spec_refuses_when_objects_disabled() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1" {
+            assert_eq!(
+                env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+                "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+            );
+            return;
+        }
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let baseline = pool.snapshot().charged_bytes;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let spec =
+                super::CounterSpec::for_production(mode, 8, pool.reserver()).expect("spec sizes");
+            let Err(error) = spec.prepare_with_probe_and_cpus(
+                AttachBackend::Singles,
+                || BpfLoopVerdict::Available,
+                Some(8),
+            ) else {
+                panic!("{mode:?}: disabled builds must refuse preparation");
+            };
+            assert!(
+                format!("{error:#}").contains("counter-mode-unavailable-in-build"),
+                "{mode:?}: {error:#}"
+            );
+        }
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline,
+            "build refusal charges nothing and attaches zero links (no session)"
+        );
+    }
+
+    #[test]
+    fn counter_spec_prepare_validates_envelope() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let zero = BankReservation {
+            retained_bytes: 0,
+            transient_bytes: 0,
+            metadata_bytes: 0,
+            file_descriptors: 0,
+        };
+        let spec = super::CounterSpec::new(CounterMode::Counts, zero, pool.reserver());
+        let Err(error) = spec.prepare_with_probe_and_cpus(
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+            Some(8),
+        ) else {
+            panic!("a zero envelope must refuse");
+        };
+        let text = format!("{error:#}");
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1" {
+            assert!(text.contains("invalid counter reservation"), "{text}");
+        } else {
+            assert!(text.contains("counter-mode-unavailable-in-build"), "{text}");
+        }
+    }
+
+    #[test]
+    fn counter_budgets_view_reports_all_legs() {
+        use super::super::{AttachBackend, BpfLoopVerdict};
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            return;
+        }
+        let pool = SemanticResourcePool::reference_limit(1024 * 1024 * 1024);
+        let spec = super::CounterSpec::for_production(CounterMode::Counts, 8, pool.reserver())
+            .expect("spec sizes");
+        let prepared = spec
+            .prepare_with_probe_and_cpus(
+                AttachBackend::Singles,
+                || BpfLoopVerdict::Available,
+                Some(8),
+            )
+            .expect("spec prepares");
+        let view = prepared.banks.budgets(0).expect("budgets");
+        assert_eq!(view.endpoints.published, 0);
+        assert_eq!(view.endpoints.holes, 0);
+        assert_eq!(view.endpoints.ceiling, 8192);
+        assert_eq!(view.rv_keys.used, 0);
+        assert_eq!(view.rv_keys.limit, 65536);
+        assert_eq!(view.start.limit, 16384);
+        assert_eq!(view.fd.projected, 1);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized rlimit value; no change.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert_eq!(
+            view.fd.soft,
+            (limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur)
+        );
+        assert_eq!(
+            view.memory.charged,
+            super::counter_fixed_map_bytes(8).unwrap()
+        );
+        assert!(
+            view.memory.charged <= view.memory.limit,
+            "charged must stay within the kernel-map cap"
+        );
+        // A staged 512-endpoint plan projects the 1,026-FD first stage.
+        let mut history = plan(512);
+        let mut io = GrowthIo::new(&pool);
+        io.cpus = 8;
+        let envelope = super::estimate_counter_stage_reservation(
+            CounterMode::Counts,
+            16,
+            512,
+            &history.slots,
+            0,
+            512,
+            0,
+            8,
+            1,
+            0,
+            None,
+        )
+        .unwrap();
+        let mut directory = prepared
+            .banks
+            .directory
+            .lock()
+            .expect("directory lock");
+        assert!(matches!(
+            directory.stage_with(&mut io, &mut history, envelope, &pool.reserver()),
+            super::BankPublication::Published { extent, .. }
+                if extent.first == 0 && extent.end == 512
+        ));
+        drop(directory);
+        let staged = prepared.banks.budgets(0).expect("staged budgets");
+        assert_eq!(staged.endpoints.published, 512);
+        assert_eq!(staged.fd.projected, 1026);
+        assert!(staged.memory.charged <= staged.memory.limit);
+    }
+
+    #[test]
+    fn counter_rv_key_pool_matches_geometry() {
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let geometry = super::BankGeometry::checked(mode, 16, 512).unwrap();
+            assert_eq!(geometry.rv_keys(), super::COUNTER_RV_KEY_POOL);
+        }
+    }
+
+    #[test]
+    fn counter_stage_envelope_funds_first_512_fds() {
+        let history = plan(512);
+        let envelope = super::estimate_counter_stage_reservation(
+            CounterMode::Counts,
+            16,
+            512,
+            &history.slots,
+            0,
+            512,
+            0,
+            12,
+            1,
+            0,
+            Some((0, 0)),
+        )
+        .unwrap();
+        // 512 endpoints times two link FDs, plus one bank and one transient:
+        // the soft-1024 failure twin's `needed >= 1026` floor.
+        assert_eq!(envelope.file_descriptors, 1026);
+    }
 }

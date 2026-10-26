@@ -10,6 +10,10 @@ use crate::attach::{
     RetainedInputMeasure, RetainedRetirementInput, RetirementPoll, RetirementProgress,
     RetirementTicket, Scope, Session,
 };
+use crate::attach::counter_banks::{
+    BankPublication, BankRefusal, BankShapeCause, CounterSpec, check_counter_endpoints_fit,
+};
+use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
@@ -46,7 +50,7 @@ use crate::semantics_edge::resources::{
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_ebpf_common::{
-    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    CounterMode, DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
@@ -397,6 +401,14 @@ pub struct Engine {
     /// preflight, installed backing). One pool per Engine, so per capture;
     /// the graph never charges the registry pool.
     collected_graph_pool: SemanticResourcePool,
+    /// Dedicated accounting pool for counter captures (terminal hold,
+    /// keepalive, stages, reads). One pool per Engine, so per capture;
+    /// counter captures never charge the graph, registry or test pools.
+    counter_pool: SemanticResourcePool,
+    /// Test-only CPU count for the counter preflight seam. Production
+    /// always reads the host topology.
+    #[cfg(test)]
+    counter_cpus_override: Option<usize>,
     /// Installed backing of the last completed graph (T4b Install step 4).
     #[allow(dead_code)] // Consumed by T4b.
     graph_backing: Option<Box<GraphBacking>>,
@@ -2789,6 +2801,17 @@ pub(crate) trait EngineSession {
         targets: &[plan::Slot],
         objects: &PinnedObjects,
     ) -> Result<TargetAttachResult>;
+    /// Counter growth staging for this candidate plan. Sessions without
+    /// banks refuse; scripted sessions record and replay.
+    fn stage_counter_growth(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> BankPublication {
+        let _ = (plan, objects, reserve);
+        BankPublication::Refused(BankRefusal::Shape(BankShapeCause::StagedWithoutBanks))
+    }
     fn replace_targets(
         &mut self,
         plan: &mut plan::AttachPlan,
@@ -3052,6 +3075,15 @@ impl EngineSession for Session {
         objects: &PinnedObjects,
     ) -> Result<TargetAttachResult> {
         Session::attach_targets(self, targets, objects)
+    }
+
+    fn stage_counter_growth(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        objects: &PinnedObjects,
+        reserve: &SemanticResourceReserver,
+    ) -> BankPublication {
+        Session::stage_counter_growth(self, plan, objects, reserve)
     }
 
     fn replace_targets(
@@ -3574,6 +3606,12 @@ const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duratio
 /// in the 192–288 MiB band and therefore selects 384 MiB (recorded with
 /// the T4c-2 sizing numbers).
 const COLLECTED_GRAPH_POOL_BYTES: usize = 384 * 1024 * 1024;
+
+/// Fixed accounting limit for the Engine's dedicated counter pool. It funds
+/// one capture's terminal hold, keepalive, stages and reads under the same
+/// envelope the growth cells prove at 512 MiB; the sizing test pins the
+/// terminal, envelope and read legs at the host CPU count.
+pub(crate) const COUNTER_POOL_BYTES: usize = 512 * 1024 * 1024;
 
 /// Shared floor for synthetic test PIDs: above the 64-bit PID_MAX_LIMIT
 /// (4,194,304), so no real process ID can ever collide with the fake
@@ -8777,6 +8815,32 @@ fn candidate_admission(
     }
 }
 
+/// Maps a counter staging outcome onto the attach result shape: published
+/// extents complete, refusals fail carrying their token. A plan with no
+/// fresh tail is a no-op.
+fn counter_growth_attach_outcome(
+    session: &mut dyn EngineSession,
+    plan: &mut plan::AttachPlan,
+    objects: &PinnedObjects,
+    reserve: &SemanticResourceReserver,
+) -> Result<TargetAttachResult> {
+    if plan.counter_consumed_end() as usize == plan.slots.len() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    match session.stage_counter_growth(plan, objects, reserve) {
+        BankPublication::Published { extent, .. } => {
+            let stamped = crate::attach::monotonic_ns();
+            Ok((
+                Vec::new(),
+                (extent.first..extent.end)
+                    .map(|index| (index, stamped))
+                    .collect(),
+            ))
+        }
+        publication => Err(anyhow!("counter bank growth refused: {publication:?}")),
+    }
+}
+
 fn block_unperformed_static(
     candidate_plan: &mut plan::AttachPlan,
     delta: &plan::AttachDelta,
@@ -9354,6 +9418,9 @@ impl Engine {
             collected_graph_requested: false,
             collected_graph: None,
             collected_graph_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
+            counter_pool: SemanticResourcePool::with_limit(COUNTER_POOL_BYTES),
+            #[cfg(test)]
+            counter_cpus_override: None,
             graph_backing: None,
             retired_files: None,
             collected_graph_refusal: None,
@@ -12935,10 +13002,23 @@ impl Engine {
                     [Some(candidate.delta.new.len() as u64), None, None, None],
                 )
             });
+            let counter_growth = session.capture_policy().counter_mode().is_some();
             let attach_targets_start = crate::attach::monotonic_ns();
+            let counter_reserve = counter_growth.then(|| self.counter_reserver());
             let attach = generation_checked_mutation(
                 || process_views_are_current(&self.views, extra_views, &candidate_views),
-                || session.attach_targets(&candidate.delta.new, &candidate.pinned),
+                || {
+                    if let Some(reserve) = counter_reserve.as_ref() {
+                        counter_growth_attach_outcome(
+                            session,
+                            &mut candidate.plan,
+                            &candidate.pinned,
+                            reserve,
+                        )
+                    } else {
+                        session.attach_targets(&candidate.delta.new, &candidate.pinned)
+                    }
+                },
             );
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
@@ -12967,7 +13047,33 @@ impl Engine {
             };
             generation_lost |= attach_stale;
             new_targets_attached = attach.is_some();
-            if let Some(attach) = attach {
+            if counter_growth {
+                // Counter growth stages the candidate plan append-only.
+                // Refusals deactivate the fresh tail for withdrawal and
+                // report PARTIAL with the refusal token; the published
+                // prefix and its plan extent stay intact.
+                match attach {
+                    None => {
+                        new_targets_attached = false;
+                    }
+                    Some(Ok((_, completed))) => {
+                        outcome.record_completions(&candidate.delta.new, &timing_owners, completed);
+                    }
+                    Some(Err(error)) => {
+                        for slot in &candidate.delta.new {
+                            outcome
+                                .static_failures
+                                .extend(slot_timing_keys(slot, &timing_owners));
+                            candidate.plan.deactivate(slot.index);
+                        }
+                        self.mark_partial(
+                            "live counter growth",
+                            &format!("counter bank growth refused: {error:#}"),
+                        );
+                        new_targets_attached = false;
+                    }
+                }
+            } else if let Some(attach) = attach {
                 match attach {
                     Ok((failed, completed)) => {
                         outcome.record_completions(&candidate.delta.new, &timing_owners, completed);
@@ -22550,6 +22656,13 @@ impl Engine {
         self.collected_graph_pool.reserver()
     }
 
+    /// Reservation handle on the Engine's dedicated counter pool. Each
+    /// counter capture mints its preparation, stage and read reservers
+    /// here; no counter lease comes from another pool.
+    pub(crate) fn counter_reserver(&self) -> SemanticResourceReserver {
+        self.counter_pool.reserver()
+    }
+
     /// Closes up to `max` retired graph files (§1.8); `true` when the
     /// chain is empty. The retired-file debt lives beyond the graph on
     /// the Engine chain so no synchronous close joins a graph credit.
@@ -26940,6 +27053,76 @@ impl Engine {
         None
     }
 
+    /// Counter spec for this start: `None` for every non-counter policy,
+    /// a sized production spec for `Counter` modes. Sizing charges nothing;
+    /// preparation inside the start chain funds the charges.
+    fn counter_spec_for_startup(
+        policy: CapturePolicy,
+        cpus: usize,
+        reserve: SemanticResourceReserver,
+    ) -> Result<Option<CounterSpec>> {
+        let Some(mode) = policy.counter_mode() else {
+            return Ok(None);
+        };
+        CounterSpec::for_production(mode, cpus, reserve)
+            .map(Some)
+            .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))
+    }
+
+    /// CPU count behind the counter preflight: the test seam when set,
+    /// otherwise the host topology.
+    fn counter_preflight_cpus(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cpus) = self.counter_cpus_override {
+            return cpus;
+        }
+        aya::util::nr_cpus().unwrap_or(0)
+    }
+
+    /// Memory preflight for a counter start: the requested endpoint count
+    /// must fit the kernel-map ceiling before any Session exists.
+    fn preflight_counter_start(
+        &self,
+        mode: CounterMode,
+        requested_endpoints: usize,
+    ) -> Result<()> {
+        let cpus = self.counter_preflight_cpus();
+        check_counter_endpoints_fit(mode, cpus, requested_endpoints)
+            .map_err(|refusal| anyhow!("{refusal}"))
+    }
+
+    /// Initial bank staging for counter captures, beside Detailed initial
+    /// attach. Refusals fail the start; the attempt restore drops the
+    /// session and its links.
+    fn stage_counter_initial(&mut self, session: &mut Session) -> Result<()> {
+        if self.plan.counter_consumed_end() as usize == self.plan.slots.len() {
+            // Nothing fresh: an empty capture proceeds unstaged.
+            return Ok(());
+        }
+        let reserve = self.counter_reserver();
+        match session.stage_counter_growth(&mut self.plan, &self.pinned, &reserve) {
+            BankPublication::Published { .. } => Ok(()),
+            publication => Err(anyhow!("counter bank staging refused: {publication:?}")),
+        }
+    }
+
+    /// Test-only state injection for Engine-driven counter cells: a
+    /// discovery-shaped Engine (scope, views, plan, pins) without running
+    /// discovery. Production builds discovery through `discover_plan`.
+    #[cfg(test)]
+    pub(crate) fn inject_counter_start_state_for_test(
+        &mut self,
+        scope: Scope,
+        views: Vec<ProcessView>,
+        plan: plan::AttachPlan,
+        pinned: PinnedObjects,
+    ) {
+        self.scope = scope;
+        self.views = views;
+        self.plan = plan;
+        self.pinned = pinned;
+    }
+
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,
@@ -26948,23 +27131,55 @@ impl Engine {
         ring_bytes: Option<u32>,
         backend: BackendSelection,
     ) -> Result<Session> {
+        if let Some(mode) = policy.counter_mode() {
+            self.preflight_counter_start(mode, self.plan.slots.len())?;
+        }
         self.seed_initial_cgroup_views();
         let snapshot = self.begin_start_capture_attempt()?;
+        // Counter captures re-admit the discovery plan under the endpoint
+        // budget and prepare banks through the standard start chain; a
+        // failure below restores the pre-attempt plan.
+        let counter = Self::counter_spec_for_startup(
+            policy,
+            self.counter_preflight_cpus(),
+            self.counter_reserver(),
+        )?;
+        if counter.is_some() {
+            let budget = CounterBudget::new(8192).map_err(|refusal| anyhow!("{refusal}"))?;
+            self.plan = self
+                .plan
+                .with_counters_policy(budget)
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+        }
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
-                Session::start(
-                    plan,
-                    scope,
-                    pinned,
-                    policy,
-                    pause_generation.take(),
-                    ring_bytes,
-                    owned_child,
-                    backend,
-                )
+                if let Some(spec) = counter.as_ref() {
+                    Session::start_counter(
+                        plan,
+                        scope,
+                        pinned,
+                        policy,
+                        pause_generation.take(),
+                        ring_bytes,
+                        owned_child,
+                        backend,
+                        spec,
+                    )
+                } else {
+                    Session::start(
+                        plan,
+                        scope,
+                        pinned,
+                        policy,
+                        pause_generation.take(),
+                        ring_bytes,
+                        owned_child,
+                        backend,
+                    )
+                }
             }) {
                 Ok(session) => session,
                 Err(error) => {
@@ -27028,6 +27243,11 @@ impl Engine {
                     &mut pending_views,
                     &mut closure,
                 );
+                // Counter captures stage banks where Detailed flows attach
+                // initial exports (inert for counter policies).
+                if policy.counter_mode().is_some() {
+                    self.stage_counter_initial(&mut session)?;
+                }
                 // Stage what the export attach let accumulate; the first
                 // batch applies it in ring order (RB-2). Anything past the
                 // shared allowance waits in the ring for the next staging
@@ -27134,6 +27354,10 @@ pub(crate) mod session_fixture {
         fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
         pub(crate) attached_slots: Vec<usize>,
+        /// Counter growth staging calls, as plan slot counts at call time.
+        pub(crate) staged_counter_calls: Vec<usize>,
+        /// Scripted counter staging outcomes, replayed in order.
+        pub(crate) counter_stage_script: VecDeque<BankPublication>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
         dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
@@ -27699,6 +27923,28 @@ pub(crate) mod session_fixture {
                     .collect(),
                 Vec::new(),
             ))
+        }
+
+        fn stage_counter_growth(
+            &mut self,
+            plan: &mut plan::AttachPlan,
+            objects: &PinnedObjects,
+            reserve: &SemanticResourceReserver,
+        ) -> BankPublication {
+            let _ = (objects, reserve);
+            self.staged_counter_calls.push(plan.slots.len());
+            let publication =
+                self.counter_stage_script.pop_front().unwrap_or(
+                    BankPublication::Refused(BankRefusal::Shape(
+                        BankShapeCause::StagedWithoutBanks,
+                    )),
+                );
+            // Mirror real staging: publication consumes the scripted
+            // extent; refusals leave the plan untouched.
+            if let BankPublication::Published { extent, .. } = publication {
+                let _ = plan.consume_counter_extent(extent.first, extent.end);
+            }
+            publication
         }
 
         fn replace_targets(

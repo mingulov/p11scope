@@ -4,17 +4,17 @@
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::attach::counter_banks::{
-    BankExtent, BankPublication, BankRefusal, BankShapeCause,
+    BankExtent, BankPublication, BankRefusal,
 };
 use crate::attach::{BackendSelection, CapturePolicy};
 use crate::discovery::identity::PinnedObjectId;
 use p11scope_ebpf_common::CounterMode;
 
-fn counter_slot(index: u32) -> plan::Slot {
+fn counter_slot(index: u32, object: PinnedObjectId) -> plan::Slot {
     plan::Slot {
         index,
         descriptor_index: 0,
-        object: PinnedObjectId(7),
+        object,
         object_path: "/counter-provider.so".into(),
         file_offset: 0x1000 + u64::from(index),
         names: vec!["C_Sign".into()],
@@ -27,17 +27,34 @@ fn counter_slot(index: u32) -> plan::Slot {
     }
 }
 
+/// One pinned object plus its assigned ID, so active slots keep exact
+/// pinned identity through the candidate preflight.
+fn counter_pins() -> (PinnedObjects, PinnedObjectId) {
+    use crate::discovery::identity::test_fixture as fixture;
+    let pins = fixture::pin_set(&[(fixture::overlay(102), fixture::SHA, 0)], false);
+    let id = pins.pinned().next().expect("one pin").id;
+    (pins, id)
+}
+
 fn detailed_plan(count: u32) -> plan::AttachPlan {
+    detailed_plan_on(count, PinnedObjectId(7))
+}
+
+fn detailed_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     plan::AttachPlan::from_slots_with_policy(
-        (0..count).map(counter_slot).collect(),
+        (0..count).map(|index| counter_slot(index, object)).collect(),
         plan::AdmissionPolicy::Detailed,
     )
     .unwrap()
 }
 
 fn counters_plan(count: u32) -> plan::AttachPlan {
+    counters_plan_on(count, PinnedObjectId(7))
+}
+
+fn counters_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     plan::AttachPlan::from_slots_with_policy(
-        (0..count).map(counter_slot).collect(),
+        (0..count).map(|index| counter_slot(index, object)).collect(),
         plan::AdmissionPolicy::Counters(
             crate::capacity::CounterBudget::new(8192).unwrap(),
         ),
@@ -187,9 +204,13 @@ fn counter_pool_covers_terminal_keepalive_and_read() {
     );
 }
 
-fn growth_candidate(plan: plan::AttachPlan, new: Vec<plan::Slot>) -> LiveCandidate {
+fn growth_candidate(
+    plan: plan::AttachPlan,
+    new: Vec<plan::Slot>,
+    pinned: PinnedObjects,
+) -> LiveCandidate {
     LiveCandidate {
-        pinned: PinnedObjects::empty(),
+        pinned,
         modules: Vec::new(),
         plan,
         delta: plan::AttachDelta {
@@ -214,7 +235,8 @@ fn growth_candidate(plan: plan::AttachPlan, new: Vec<plan::Slot>) -> LiveCandida
 #[test]
 fn counter_growth_stages_fresh_tail_through_apply() {
     let mut engine = Engine::empty_for_test();
-    engine.plan = counters_plan(2);
+    let (pins, object) = counter_pins();
+    engine.plan = counters_plan_on(2, object);
     engine
         .plan
         .consume_counter_extent(0, 2)
@@ -225,9 +247,10 @@ fn counter_growth_stages_fresh_tail_through_apply() {
         transaction: 1,
         extent: BankExtent { first: 2, end: 3 },
     });
-    let plan = counters_plan(3);
+    let mut plan = counters_plan_on(3, object);
+    plan.adopt_counter_consumed(2).expect("staged prefix");
     let new = vec![plan.slots[2].clone()];
-    let candidate = growth_candidate(plan, new);
+    let candidate = growth_candidate(plan, new, pins);
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
@@ -240,12 +263,15 @@ fn counter_growth_stages_fresh_tail_through_apply() {
     assert_eq!(outcome.static_completions.len(), 1);
     assert!(outcome.static_failures.is_empty());
     assert!(additions_allowed);
+    assert_eq!(engine.plan.counter_consumed_end(), 3);
+    assert_eq!(engine.plan.slots.len(), 3);
 }
 
 #[test]
 fn counter_growth_refusal_partials_with_plan_intact() {
     let mut engine = Engine::empty_for_test();
-    engine.plan = counters_plan(2);
+    let (pins, object) = counter_pins();
+    engine.plan = counters_plan_on(2, object);
     engine
         .plan
         .consume_counter_extent(0, 2)
@@ -259,9 +285,10 @@ fn counter_growth_refusal_partials_with_plan_intact() {
             available: 0,
         },
     ));
-    let plan = counters_plan(3);
+    let mut plan = counters_plan_on(3, object);
+    plan.adopt_counter_consumed(2).expect("staged prefix");
     let new = vec![plan.slots[2].clone()];
-    let candidate = growth_candidate(plan, new);
+    let candidate = growth_candidate(plan, new, pins);
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
@@ -279,18 +306,23 @@ fn counter_growth_refusal_partials_with_plan_intact() {
         "refused growth reports PARTIAL honestly"
     );
     assert_eq!(engine.plan.counter_consumed_end(), 2);
-    assert_eq!(engine.plan.slots.len(), 3);
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "the refused tail withdraws, leaving the staged prefix"
+    );
 }
 
 #[test]
 fn detailed_candidates_skip_counter_staging() {
     let mut engine = Engine::empty_for_test();
-    engine.plan = detailed_plan(2);
+    let (pins, object) = counter_pins();
+    engine.plan = detailed_plan_on(2, object);
     let mut session = ScriptedSession::default();
     session.capture_policy = Some(CapturePolicy::Allowlisted);
-    let plan = detailed_plan(3);
+    let plan = detailed_plan_on(3, object);
     let new = vec![plan.slots[2].clone()];
-    let candidate = growth_candidate(plan, new);
+    let candidate = growth_candidate(plan, new, pins);
     let mut additions_allowed = true;
     engine
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
@@ -305,16 +337,17 @@ fn detailed_candidates_skip_counter_staging() {
 #[test]
 fn counter_growth_without_fresh_tail_stages_nothing() {
     let mut engine = Engine::empty_for_test();
-    engine.plan = counters_plan(2);
+    let (pins, object) = counter_pins();
+    engine.plan = counters_plan_on(2, object);
     engine
         .plan
         .consume_counter_extent(0, 2)
         .expect("staged prefix");
     let mut session = ScriptedSession::default();
     session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
-    let mut plan = counters_plan(2);
+    let mut plan = counters_plan_on(2, object);
     plan.consume_counter_extent(0, 2).expect("consumed");
-    let candidate = growth_candidate(plan, Vec::new());
+    let candidate = growth_candidate(plan, Vec::new(), pins);
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])

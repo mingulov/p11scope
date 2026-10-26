@@ -1167,6 +1167,34 @@ impl AttachPlan {
         self.admission_scope
     }
 
+    /// Re-admit this plan's exact slots under a counter budget, preserving
+    /// slots, activity, modules and evidence. The Engine converts its
+    /// discovery plan once when a counter capture starts; later rebuilds
+    /// preserve the policy.
+    pub(crate) fn with_counters_policy(
+        &self,
+        budget: crate::capacity::CounterBudget,
+    ) -> Result<Self, String> {
+        budget.validate_count(self.slots.len())?;
+        let mut next = self.clone();
+        next.admission_policy = AdmissionPolicy::Counters(budget);
+        Ok(next)
+    }
+
+    /// Restore the staged counter prefix on a freshly rebuilt plan, which
+    /// always starts unconsumed. The caller passes the committed staged
+    /// length (the directory high-water); lengths past the slots refuse.
+    pub(crate) fn adopt_counter_consumed(&mut self, consumed: u32) -> Result<(), String> {
+        if consumed as usize > self.slots.len() {
+            return Err(format!(
+                "counter staged prefix {consumed} exceeds {} plan slots",
+                self.slots.len()
+            ));
+        }
+        self.counter_consumed_end = consumed;
+        Ok(())
+    }
+
     /// Exclusive end of consumed counter history, independent of publication.
     #[cfg_attr(not(test), allow(dead_code))] // The counter staging adapter is a separate slice.
     pub(crate) const fn counter_consumed_end(&self) -> u32 {
@@ -6006,6 +6034,22 @@ mod tests {
             detailed.admission_policy(),
             AdmissionPolicy::Detailed
         ));
+    }
+
+    #[test]
+    fn counter_consumed_adoption_restores_staged_prefix() {
+        let rebuilt = object_plan(vec![
+            object_slot(0, &["C_SignInit"], 43),
+            object_slot(1, &["C_Sign"], 43),
+            object_slot(2, &["C_Verify"], 43),
+        ]);
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        let mut rebuilt = rebuilt.with_counters_policy(budget).unwrap();
+        assert_eq!(rebuilt.counter_consumed_end(), 0);
+        rebuilt.adopt_counter_consumed(2).unwrap();
+        assert_eq!(rebuilt.counter_consumed_end(), 2);
+        assert!(rebuilt.adopt_counter_consumed(4).is_err());
+        assert_eq!(rebuilt.counter_consumed_end(), 2);
     }
 
     #[test]

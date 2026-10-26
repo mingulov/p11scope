@@ -6,15 +6,10 @@ use p11scope::capacity::DetailedResources;
 use serde_json::json;
 use std::io::Write;
 
-fn run() -> Result<(), String> {
-    let compiled_profile = if cfg!(feature = "wide-detailed-2112") {
-        "wide-detailed-2112"
-    } else {
-        "default"
-    };
+fn parse_args(args: impl Iterator<Item = String>) -> Result<(Option<u64>, Option<String>), String> {
     let mut possible_cpus = None;
     let mut requested_profile = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--possible-cpus" if possible_cpus.is_none() => {
@@ -31,6 +26,16 @@ fn run() -> Result<(), String> {
             _ => return Err(format!("unknown or repeated argument: {argument}")),
         }
     }
+    Ok((possible_cpus, requested_profile))
+}
+
+fn run() -> Result<(), String> {
+    let compiled_profile = if cfg!(feature = "wide-detailed-2112") {
+        "wide-detailed-2112"
+    } else {
+        "default"
+    };
+    let (possible_cpus, requested_profile) = parse_args(std::env::args().skip(1))?;
     let requested_profile = requested_profile.ok_or("--profile is required")?;
     if requested_profile != compiled_profile {
         return Err(format!(
@@ -61,5 +66,35 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("detailed resources: {error}");
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn parse(words: &[&str]) -> Result<(Option<u64>, Option<String>), String> {
+        parse_args(words.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn parses_the_two_known_options() {
+        let (cpus, profile) =
+            parse(&["--possible-cpus", "8", "--profile", "default"]).expect("valid options parse");
+        assert_eq!((cpus, profile.as_deref()), (Some(8), Some("default")));
+    }
+
+    #[test]
+    fn rejects_unknown_repeated_and_malformed_options() {
+        for words in [
+            vec!["--bogus"],
+            vec!["--profile", "a", "--profile", "b"],
+            vec!["--possible-cpus", "8", "--possible-cpus", "9"],
+            vec!["--possible-cpus"],
+            vec!["--possible-cpus", "lots"],
+            vec!["--profile"],
+        ] {
+            assert!(parse(&words).is_err(), "accepted {words:?}");
+        }
     }
 }

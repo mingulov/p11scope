@@ -807,6 +807,11 @@ pub(crate) struct LiveJointMachine {
     // Armed one-shot fault for the latch tests (read at each site).
     #[cfg(test)]
     inject: Option<FinishSite>,
+    // Posed Audited stall for the no-progress twin: the arm skips its
+    // commit, spends nothing and stays Audited, the same observable as
+    // a live no-progress poll. Production never sets this.
+    #[cfg(test)]
+    pose_no_progress_poll: bool,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
 }
@@ -869,8 +874,18 @@ impl LiveJointMachine {
             refuse_pending_q_merge_once: false,
             #[cfg(test)]
             inject: None,
+            #[cfg(test)]
+            pose_no_progress_poll: false,
             _storage: storage,
         })
+    }
+
+    /// Pose (or clear) an Audited stall: while posed, finish polls skip
+    /// the commit and report Pending without spending, as a live
+    /// no-progress poll would.
+    #[cfg(test)]
+    pub(crate) fn pose_no_progress_poll_for_test(&mut self, on: bool) {
+        self.pose_no_progress_poll = on;
     }
 
     pub(crate) fn begin_commit(&mut self, engine_changed: bool) -> Result<(), JointCommitRefusal> {
@@ -2662,25 +2677,33 @@ impl LiveJointMachine {
             } => {
                 let before = budget.remaining_actions;
                 let final_original = self.finish_original == Some(identity);
-                let result = native_for_phase(io, lane, &self.births, q, |io| {
-                    if final_original {
-                        coordinator.commit_joint_finish_batch_with_io(
-                            io,
-                            &self.producers,
-                            &mut frame,
-                            &mut self.finish_disposed,
-                            &mut self.finish_completed,
-                            &mut budget.remaining_actions,
-                        )
-                    } else {
-                        coordinator.commit_joint_batch_with_io(
-                            io,
-                            &self.producers,
-                            &mut frame,
-                            &mut budget.remaining_actions,
-                        )
-                    }
-                });
+                #[cfg(test)]
+                let wedged = self.pose_no_progress_poll && q.is_some();
+                #[cfg(not(test))]
+                let wedged = false;
+                let result = if wedged {
+                    Ok(Ok(JointCommitProgress::Pending))
+                } else {
+                    native_for_phase(io, lane, &self.births, q, |io| {
+                        if final_original {
+                            coordinator.commit_joint_finish_batch_with_io(
+                                io,
+                                &self.producers,
+                                &mut frame,
+                                &mut self.finish_disposed,
+                                &mut self.finish_completed,
+                                &mut budget.remaining_actions,
+                            )
+                        } else {
+                            coordinator.commit_joint_batch_with_io(
+                                io,
+                                &self.producers,
+                                &mut frame,
+                                &mut budget.remaining_actions,
+                            )
+                        }
+                    })
+                };
                 if before == budget.remaining_actions {
                     budget.spend(1);
                 }

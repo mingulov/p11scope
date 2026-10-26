@@ -2219,6 +2219,105 @@ fn joint_machine_finish_without_landed_row_publishes() {
     assert!(fixture.scene.real.lane.is_finished());
 }
 
+/// A finish whose Audited polls stop making progress must end
+/// finitely: after the no-progress bound it bails with a named,
+/// disclosed refusal instead of polling Pending forever. The posed
+/// stall stands in for the live-only H3 veto (held scenes always
+/// resolve it): the counting, the bound, the gap and the kept tags
+/// are what this pins. The unposed control publishes normally.
+#[test]
+fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    for wedged in [true, false] {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+        fixture.published_labeled("Finish stall-prefix Init", None);
+        assert_eq!(fixture.reduced(), [2]);
+        fixture.scene.push(std::process::id(), 0, "C_SignFinal", 3);
+        fixture.enable_finish_fixture(Vec::new());
+        fixture.begin_finish().unwrap();
+        fixture.machine.pose_no_progress_poll_for_test(wedged);
+        let mut audited_polls = 0u64;
+        let mut outcome = None;
+        for _ in 0..700 {
+            if fixture.machine.diagnostic_snapshot_for_test().0 == "Audited" {
+                audited_polls += 1;
+            }
+            match fixture.poll_finish(1) {
+                Ok(JointCommitProgress::Published(_)) => {
+                    outcome = Some(Ok(()));
+                    break;
+                }
+                Ok(JointCommitProgress::Pending) => {}
+                Err(reason) => {
+                    outcome = Some(Err(reason));
+                    break;
+                }
+            }
+        }
+        if wedged {
+            assert_eq!(
+                outcome,
+                Some(Err(SemanticRefusal::Unavailable)),
+                "the stalled finish refuses instead of polling forever"
+            );
+            assert_eq!(
+                audited_polls, 600,
+                "the bound fires on exactly the 600th no-progress poll"
+            );
+            let gaps: Vec<_> = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == "joint finish made no progress")
+                .collect();
+            assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
+            assert!(
+                gaps[0].reason.contains("600"),
+                "the gap names the bound: {}",
+                gaps[0].reason
+            );
+            let audit = fixture.machine.diagnostic_audit_for_test();
+            assert!(
+                audit.is_some_and(|(_, h3, _, _, _)| h3 == "Clean"),
+                "the retained audit tags are kept: {audit:?}"
+            );
+            assert!(
+                fixture.machine.finish_disposition_required(),
+                "the refusal latches the finish disposition"
+            );
+            assert!(
+                fixture.machine.finish_begun(),
+                "the finish retains its control past the refusal"
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                Some(Ok(())),
+                "the unposed finish publishes within its bound"
+            );
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != "joint finish made no progress"),
+                "the healthy finish discloses no wedge gap"
+            );
+            assert!(fixture.scene.real.lane.is_finished());
+        }
+    }
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

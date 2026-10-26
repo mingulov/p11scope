@@ -3848,3 +3848,356 @@ mod object_tail_binding_tests {
         assert!(bound_object_tail("C_CreateObject", None).is_none());
     }
 }
+
+/// OD33/R-50: v0.5.0 links the object-journal producer into no BPF
+/// flavor, so no live run installs a key-operation (Joint) feed. An
+/// installed birth receipt on an unlinked attachment routes to S1Only
+/// (the backstop), the lane discloses once, S1 mechanisms and API
+/// returns stay exact, and `object_observations` reports
+/// `unavailable` with `journal_unavailable`.
+#[cfg(test)]
+mod journal_unavailable_tests {
+    use super::*;
+    use crate::discovery::caller_registry::RegistryLimits;
+    use crate::semantics_objects::journal::tests::AttestationFixture;
+    use crate::semantics_objects::journal::{
+        BirthKind, BootstrapReceipt, JournalAdapter, JournalLimits, SessionClosureGrant,
+    };
+
+    const PLAN_TEXT: &str =
+        "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results";
+    const MECHANISM: u64 = 0x40;
+    const RV_OK: u64 = 0;
+    const RV_SIGNATURE_INVALID: u64 = 0xc0;
+
+    struct UnlinkedScene {
+        registry: CallerRegistry,
+        domain: NativeDomainId,
+        caller: CallerId,
+        module: ModuleKey,
+        next_id: u32,
+        next_ordinal: u64,
+    }
+
+    impl UnlinkedScene {
+        fn new() -> Self {
+            let mut registry =
+                CallerRegistry::new(RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("limits"));
+            let domain = NativeDomainId::try_mint().expect("fresh domain");
+            let caller = CallerId(7);
+            let module = ModuleKey::Physical {
+                dev_major: 1,
+                dev_minor: 2,
+                ino: 3,
+                sha256: None,
+            };
+            registry.scripted_module_edge(module.clone(), caller);
+            Self {
+                registry,
+                domain,
+                caller,
+                module,
+                next_id: 0,
+                next_ordinal: 1,
+            }
+        }
+
+        fn key(&self, router: u64) -> InstanceKey {
+            InstanceKey::scripted(
+                self.domain,
+                ImageIdentity {
+                    task_cookie: 100 + router,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(router),
+                self.module.clone(),
+            )
+        }
+
+        fn register(&mut self, router: u64) -> (InstanceKey, RegistryInstanceId) {
+            let key = self.key(router);
+            let id = RegistryInstanceId::from_raw(self.next_id);
+            self.next_id += 1;
+            self.registry
+                .note_instance(AdmittedInstance::scripted(key.clone(), self.caller));
+            self.registry.publish();
+            assert!(
+                self.registry.feed_mode_for_test(id).is_some(),
+                "registration retains the instance"
+            );
+            (key, id)
+        }
+
+        fn observe(&mut self, key: &InstanceKey, facts: SemanticCall) {
+            let ordinal = self.next_ordinal;
+            self.next_ordinal += 1;
+            self.registry
+                .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                    key.clone(),
+                    self.caller,
+                    ordinal,
+                    facts,
+                ));
+        }
+    }
+
+    fn s1_call(function: &str, rv: u64, mechanism: u64) -> SemanticCall {
+        use p11scope_ebpf_common::capture;
+        SemanticCall {
+            function: function.into(),
+            rv,
+            session: 7,
+            mechanism,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ..SemanticCall::default()
+        }
+    }
+
+    /// One attested birth receipt, minted like the Joint scenes: real
+    /// fixture admission, real key attestation, scripted receipt.
+    fn birth_receipt() -> BootstrapReceipt {
+        let mut fixture = AttestationFixture::new(ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        });
+        let mut adapter = JournalAdapter::new(JournalLimits::policy());
+        let grant = SessionClosureGrant::observe(fixture.attachment());
+        let _ = adapter.install_closure_grant(&grant);
+        let admitted = fixture.admit_function("C_SignInit");
+        let proof = adapter.attest_key(&admitted).expect("key attests");
+        BootstrapReceipt::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            fixture.attachment().generation(),
+        )
+    }
+
+    fn edge_semantics(
+        scene: &UnlinkedScene,
+        id: RegistryInstanceId,
+    ) -> &crate::semantics_edge::EdgeSemantics {
+        scene
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("S1 materialized")
+    }
+
+    /// The installed birth receipt on an unlinked attachment selects no
+    /// Joint feed: the instance stays S1Only, S1 reduces directly, and
+    /// API returns and mechanisms are exact.
+    #[test]
+    fn joint_birth_on_unlinked_journal_installs_no_feed() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let receipt = birth_receipt();
+        let key = scene.key(1);
+        assert!(
+            scene.registry.install_joint_receipt(key.clone(), receipt),
+            "install fits the instance bound"
+        );
+        let (_, id) = scene.register(1);
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "no Joint feed on an unlinked journal"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        let calls = [
+            s1_call("C_SignInit", RV_OK, MECHANISM),
+            s1_call("C_Sign", RV_OK, MECHANISM),
+            s1_call("C_VerifyInit", RV_OK, MECHANISM),
+            s1_call("C_Verify", RV_SIGNATURE_INVALID, MECHANISM),
+        ];
+        let mut direct = EdgeSemantics::default();
+        for facts in &calls {
+            scene.observe(&key, facts.clone());
+            let origin = EffectOrigin::from(facts);
+            direct.observe_with_effects(facts, &origin, &mut NoSink);
+        }
+        scene.registry.publish();
+        let edge = edge_semantics(&scene, id);
+        assert_eq!(
+            (edge.calls(), direct.calls()),
+            (4, 4),
+            "S1 reduced directly, nothing staged"
+        );
+        assert_eq!(edge.completed(), direct.completed());
+        assert_eq!(edge.failed(), direct.failed());
+        assert_eq!(
+            edge.mechanisms().len(),
+            direct.mechanisms().len(),
+            "mechanisms exact"
+        );
+        for (mechanism, row) in direct.mechanisms() {
+            let kept = edge
+                .mechanisms()
+                .get(mechanism)
+                .expect("same mechanism row");
+            assert_eq!((kept.calls, kept.errors), (row.calls, row.errors));
+            assert_eq!(kept.returns, row.returns);
+        }
+        let record = scene
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained");
+        assert_eq!(record.api_returns, Some(4), "API returns exact");
+    }
+
+    /// Backstop twin: a stray grant on an unlinked attachment routes to
+    /// S1Only, counts, and discloses — and S1 calls still reduce.
+    #[test]
+    fn unlinked_stray_grant_backstop_routes_s1only() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let receipt = birth_receipt();
+        let key = scene.key(1);
+        assert!(scene.registry.install_joint_receipt(key.clone(), receipt));
+        let (_, id) = scene.register(1);
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only)
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        assert_eq!(scene.registry.joint_backstop_routed(), 1);
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        let record = scene
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained");
+        assert_eq!(
+            record.api_returns,
+            Some(1),
+            "the backstop never drops S1 calls"
+        );
+        assert_eq!(scene.registry.gaps().len(), 1);
+        assert_eq!(scene.registry.gaps()[0].reason, "joint_journal_unavailable");
+        assert_eq!(scene.registry.gaps()[0].subject, PLAN_TEXT);
+    }
+
+    /// The exp-h8-born shape (bare CALL rows, no journal seals) on an
+    /// unlinked lane publishes at once: one publish drains every staged
+    /// mutation, no Joint staging waits, S1 is exact, and the
+    /// observations are immediately available as unavailable.
+    #[test]
+    fn unlinked_journal_lane_publishes_without_waiting() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let receipt = birth_receipt();
+        let key = scene.key(1);
+        assert!(scene.registry.install_joint_receipt(key.clone(), receipt));
+        let (_, id) = scene.register(1);
+        for facts in [
+            s1_call("C_SignInit", RV_OK, MECHANISM),
+            s1_call("C_Sign", RV_OK, MECHANISM),
+            s1_call("C_SignInit", RV_OK, MECHANISM),
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        ] {
+            scene.observe(&key, facts);
+        }
+        let applied = scene.registry.publish();
+        assert!(applied > 0, "one publish drains the staged lane");
+        assert_eq!(
+            scene.registry.publish(),
+            0,
+            "nothing pends behind a second publish: no wedge"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        assert_eq!(edge_semantics(&scene, id).calls(), 4);
+        let observations = scene.registry.joint_observations(1);
+        assert_eq!(
+            observations.status,
+            crate::key_operation_projection::ObsStatus::Unavailable
+        );
+        assert_eq!(observations.reason, "journal_unavailable");
+    }
+
+    /// One thousand births on an unlinked lane: every stray routes
+    /// through the backstop counter, but the lane discloses once.
+    #[test]
+    fn unlinked_journal_discloses_once_per_lane() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let receipt = birth_receipt();
+        for router in 1..=1000u64 {
+            let key = scene.key(router);
+            assert!(scene.registry.install_joint_receipt(key.clone(), receipt));
+            let (_, id) = scene.register(router);
+            assert_eq!(
+                scene.registry.feed_mode_for_test(id),
+                Some(FeedMode::S1Only)
+            );
+        }
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        assert_eq!(scene.registry.joint_backstop_routed(), 1000);
+        // Publication drains a snapshot, so a trailing publish proves no
+        // further disclosure was staged behind the thousandth birth.
+        assert_eq!(scene.registry.publish(), 0, "no trailing disclosure");
+        assert_eq!(scene.registry.gaps().len(), 1, "exactly one gap");
+        assert_eq!(scene.registry.gaps()[0].reason, "joint_journal_unavailable");
+        assert_eq!(scene.registry.gaps()[0].subject, PLAN_TEXT);
+        assert_eq!(scene.registry.gap_repeats(), &[1], "disclosed once");
+    }
+
+    /// Healthy twin: the #[cfg(test)] seal stays journal-linked, and a
+    /// birth receipt on a linked attachment still selects Joint.
+    #[test]
+    fn linked_journal_test_seal_still_selects_joint() {
+        let fixture = AttestationFixture::new(ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        });
+        assert!(
+            fixture.attachment().journal_linked(),
+            "the test sealer stays journal-linked for 0.5.1 suites"
+        );
+        let mut scene = UnlinkedScene::new();
+        scene
+            .registry
+            .note_journal_linked(fixture.attachment().journal_linked());
+        let receipt = birth_receipt();
+        let key = scene.key(1);
+        assert!(scene.registry.install_joint_receipt(key.clone(), receipt));
+        let (_, id) = scene.register(1);
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::Joint),
+            "a linked attachment still selects Joint"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 1);
+    }
+
+    /// Without a linked journal the observations read unavailable with
+    /// `journal_unavailable`; linked without births keeps 0.5.1's
+    /// `bootstrap_unavailable`. Status stays unavailable either way.
+    #[test]
+    fn reason_is_journal_unavailable_without_linked_journal() {
+        use crate::key_operation_projection::{
+            ObjectObservations, ObsStatus, object_observations_json,
+        };
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let observations = scene.registry.joint_observations(7);
+        assert_eq!(observations.status, ObsStatus::Unavailable);
+        assert_eq!(observations.reason, "journal_unavailable");
+        assert!(observations.key_operations.is_empty());
+        let json = object_observations_json(&observations);
+        assert_eq!(json["status"], "unavailable");
+        assert_eq!(json["reason"], "journal_unavailable");
+        scene.registry.note_journal_linked(true);
+        let linked = scene.registry.joint_observations(8);
+        assert_eq!(linked.status, ObsStatus::Unavailable);
+        assert_eq!(
+            linked.reason, "bootstrap_unavailable",
+            "linked without births keeps its 0.5.1 meaning"
+        );
+        let _ = ObjectObservations::unavailable(0, "journal_unavailable");
+    }
+}

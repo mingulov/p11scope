@@ -12372,3 +12372,66 @@ fn joint_capture_owner_seal_replay_resource_refusal_disposes_head_keeps_joint() 
         "the refused replay grows nothing"
     );
 }
+
+/// OD33/R-50: `object_observations` on an attachment with no linked
+/// journal producer reports `unavailable` with the frozen reason
+/// `journal_unavailable`. The Rust table and the frozen schema enum
+/// carry it together (`key_operation_schema_contract` pins the sets
+/// equal); `bootstrap_unavailable` keeps its 0.5.1 meaning (journal
+/// linked, no birth yet).
+#[test]
+fn reason_enum_pins_journal_unavailable() {
+    assert!(
+        crate::key_operation_projection::REASON_LABELS.contains(&"journal_unavailable"),
+        "REASON_LABELS must carry journal_unavailable"
+    );
+    assert!(
+        crate::key_operation_projection::REASON_LABELS.contains(&"bootstrap_unavailable"),
+        "bootstrap_unavailable keeps its 0.5.1 meaning"
+    );
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let reasons: Vec<&str> = schema["properties"]["reason"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.contains(&"journal_unavailable"),
+        "frozen schema enum must carry journal_unavailable"
+    );
+    assert!(
+        reasons.contains(&"bootstrap_unavailable"),
+        "frozen schema enum keeps bootstrap_unavailable"
+    );
+}
+
+/// OD33/R-50: with no Joint feed and no linked journal producer, the
+/// producer mapping reports `unavailable` with `journal_unavailable`;
+/// linked without births keeps `bootstrap_unavailable`. Status stays
+/// unavailable either way; rows stay empty.
+#[test]
+fn producer_commit_without_linked_journal_reports_journal_unavailable() {
+    use crate::key_operation_projection::producer::commit_with_journal_linked;
+    let fresh = JointStaging::select_s1_only();
+    let empty_model = JointScene::new().model.project();
+    let empty_keyuse = KeyUseReducer::new();
+    let unlinked = commit_with_journal_linked(1, &[&fresh], &empty_model, &empty_keyuse, false);
+    assert_eq!(unlinked.status, ObsStatus::Unavailable);
+    assert_eq!(unlinked.reason, "journal_unavailable");
+    assert!(unlinked.key_operations.is_empty());
+    assert!(unlinked.unknown_key_operations.is_empty());
+    let linked = commit_with_journal_linked(2, &[&fresh], &empty_model, &empty_keyuse, true);
+    assert_eq!(linked.status, ObsStatus::Unavailable);
+    assert_eq!(
+        linked.reason, "bootstrap_unavailable",
+        "linked without births keeps its 0.5.1 meaning"
+    );
+}

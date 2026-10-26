@@ -1278,3 +1278,103 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         while prepared.stage_next(&mut self.registry, &mut state.seal_admission) {}
     }
 }
+
+/// OD33/R-50 wedge-guard decisions: the Joint birth path latches the
+/// lane's journal linkage from its drain producers and, unlinked,
+/// installs nothing — one disclosure, no marker read, no per-birth
+/// gap. Birth-to-grant mapping on linked lanes is covered by the
+/// Joint suites driving `prepare_joint_births` with linked producers.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::RegistryLimits;
+
+    fn unlinked_producers() -> SessionDrainProducers {
+        SessionDrainProducers::test_pair_unlinked(
+            NativeDomainId::mint(),
+            crate::events::EventsDomain::test_standin(0xc011),
+        )
+    }
+
+    fn linked_producers() -> SessionDrainProducers {
+        SessionDrainProducers::test_pair(
+            NativeDomainId::mint(),
+            crate::events::EventsDomain::test_standin(0xc011),
+        )
+    }
+
+    fn empty_registry() -> CallerRegistry {
+        CallerRegistry::new(RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("limits"))
+    }
+
+    #[test]
+    fn unlinked_producers_bar_joint_births() {
+        let mut registry = empty_registry();
+        let producers = unlinked_producers();
+        let disposition = refuse_unlinked_joint_births(&mut registry, &producers)
+            .expect("unlinked births bar at once");
+        assert_eq!(disposition.installed, 0, "no grant staged");
+        assert!(
+            !registry.journal_linked(),
+            "the lane latches its producers' linkage"
+        );
+        assert_eq!(
+            registry.staged_scope_gaps_for_test(),
+            [(
+                "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results"
+                    .to_string(),
+                "joint_journal_unavailable".to_string()
+            )],
+            "one lane disclosure"
+        );
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1);
+        assert_eq!(registry.gap_repeats(), &[1]);
+    }
+
+    #[test]
+    fn linked_producers_do_not_bar_joint_births() {
+        let mut registry = empty_registry();
+        let producers = linked_producers();
+        assert!(
+            refuse_unlinked_joint_births(&mut registry, &producers).is_none(),
+            "linked lanes run the birth path"
+        );
+        assert!(registry.journal_linked());
+        assert!(registry.staged_scope_gaps_for_test().is_empty());
+    }
+
+    /// The Births phase consults the unlinked guard before any birth
+    /// work: no grant staged, no marker word read (the consume closure
+    /// never runs), no per-birth gap. The stray-grant backstop in
+    /// `apply_instance` covers any grant that still arrives.
+    #[test]
+    fn prepare_joint_births_calls_the_unlinked_guard_first() {
+        let source = include_str!("joint.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn prepare_joint_births(")
+            .expect("Births phase present");
+        let end = production[start..]
+            .find("pub(crate) fn joint_absence_parts(")
+            .expect("next phase follows the Births phase");
+        let body = &production[start..start + end];
+        let guard = body
+            .find("refuse_unlinked_joint_births")
+            .expect("the Births phase consults the unlinked guard");
+        for anchor in [
+            "reserve_for_current",
+            "consume(candidate",
+            "disclose_s1_birth_refusal",
+        ] {
+            let work = body
+                .find(anchor)
+                .unwrap_or_else(|| panic!("birth-work anchor present: {anchor}"));
+            assert!(
+                guard < work,
+                "the guard runs before any birth work ({anchor})"
+            );
+        }
+    }
+}

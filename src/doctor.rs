@@ -2371,6 +2371,8 @@ mod tests {
     /// The doctor names the build's object-capture scope: enabled in
     /// FULL builds, a by-design warning in P0 (stub) builds that
     /// extra-strict qualification excuses (no host can clear it).
+    /// OD33/R-50: v0.5.0 reads attributes but reports key operations
+    /// only from 0.5.1, so the OK detail says so.
     #[test]
     fn object_capture_check_matches_build() {
         let check = object_capture_check();
@@ -2379,7 +2381,11 @@ mod tests {
         // agree with those same bytes.
         let available = !crate::attach::embedded_object_is_stubbed();
         match available {
-            true => assert!(matches!(check.status, Status::Ok(_)), "{check:?}"),
+            true => assert_eq!(
+                check.status,
+                Status::Ok("enabled (read only; key operations are reported from 0.5.1)".into()),
+                "{check:?}"
+            ),
             false => {
                 assert!(matches!(check.status, Status::Warn(_)), "{check:?}");
                 assert!(is_build_limit(&check), "{check:?}");

@@ -17616,4 +17616,63 @@ mod tests {
             }
         }
     }
+
+    /// OD33/R-50: v0.5.0 links the object-journal producer into no BPF
+    /// flavor, so the one production seal marks its attachment not
+    /// journal-linked. The sealed flag gates the Joint birth path (0.5.1
+    /// wires seal to lane); the live BPF seal needs privilege, so this
+    /// pins the sealed literal in the production sealer instead.
+    #[test]
+    fn production_seal_is_not_journal_linked() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn seal_attached_subset_native(")
+            .expect("production sealer present");
+        let end = production[start..]
+            .find("pub(crate) fn seal_attached_subset_with(")
+            .expect("test sealer follows the production sealer");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("journal_linked: false"),
+            "production seal must mark the attachment not journal-linked"
+        );
+        assert!(
+            !body.contains("journal_linked: true"),
+            "production seal must never mark the attachment journal-linked"
+        );
+    }
+
+    /// The #[cfg(test)] sealer marks its attachment journal-linked, so
+    /// the Joint unit suites keep exercising the linked 0.5.1 world.
+    #[test]
+    fn test_seal_is_journal_linked() {
+        let fixture = crate::semantics_objects::journal::tests::AttestationFixture::new(
+            p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+        );
+        assert!(
+            fixture.attachment().journal_linked(),
+            "the test sealer marks its attachment journal-linked"
+        );
+    }
+
+    /// `reseal_test_attachment` rebuilds through the test sealer, so a
+    /// resealed attachment keeps the test seal's linkage.
+    #[test]
+    fn reseal_routes_through_the_test_sealer() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn reseal_test_attachment(")
+            .expect("test resealer present");
+        let body = &production[start..];
+        let end = body.find("\n}").expect("test resealer ends");
+        assert!(
+            body[..end].contains("seal_test_attachment"),
+            "the test resealer rebuilds through the test sealer"
+        );
+    }
 }

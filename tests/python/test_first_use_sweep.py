@@ -278,14 +278,19 @@ class OracleFailureTests(unittest.TestCase):
 
 
 class ObserverArgvTests(unittest.TestCase):
-    def argv(self, sweep, mode="known-inode", delay_us=100):
+    def argv(self, sweep, mode="known-inode", delay_us=100, pause="never"):
         built = {"driver": Path("/tmp/build/first-use-driver"),
                  "providers": {"file": Path("/tmp/build/provider-file.so"),
                                "heap": Path("/tmp/build/provider-heap.so")}}
         return sweep.observer_argv(
             Path("/tmp/p11scope"), built["providers"]["file"], built,
             Path("/tmp/cell/ledger.jsonl"), Path("-"), Path("-"),
-            mode, delay_us, Path("/tmp/cell/trace.out"))
+            mode, delay_us, Path("/tmp/cell/trace.out"), pause)
+
+    def test_pause_policy_selects_the_observer_hold(self):
+        sweep = require_sweep(self)
+        argv = self.argv(sweep, pause="auto")
+        self.assertEqual(argv[argv.index("--pause") + 1], "auto")
 
     def test_owned_child_trace_with_raw_transient_window(self):
         sweep = require_sweep(self)

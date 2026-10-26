@@ -15,8 +15,10 @@ The observer invocation is identical for every cell except ``--module``:
 modes whose provider file exists before capture (known-inode, late-heap)
 name it; copy modes (equal-bytes-new-inode, unseen-provider) omit it, since
 the file the child maps does not exist until the fixture creates it. Every
-cell runs with ``--pause never`` so the delay knob measures the raw
-transient window; the ungated/prearmed arm is fixture-side only.
+cell runs with ``--pause never`` by default so the delay knob measures the
+raw transient window; ``--pause-policy auto`` reruns the same matrix as a
+control with the child held at each loader hit until probes attach. The
+ungated/prearmed arm is fixture-side only.
 
 The campaign verdict fails on any oracle failure, a gated cell counting
 positive, an arm mismatch, a copy mode without source identity, a timeout,
@@ -376,12 +378,12 @@ def compile_fixture(gcc, source, build_dir):
 
 
 def observer_argv(observer, provider, built, ledger, pub_gate, entry_gate,
-                  mode, delay_us, trace_path):
+                  mode, delay_us, trace_path, pause="never"):
     """The owned-child trace invocation for one sweep cell."""
     argv = [str(observer), "run", "--trace"]
     if mode in MODES_WITH_MODULE:
         argv += ["--module", str(provider)]
-    argv += ["--pause", "never", "-o", str(trace_path), "--",
+    argv += ["--pause", pause, "-o", str(trace_path), "--",
             str(built["driver"]), str(provider), str(ledger),
             str(pub_gate), str(entry_gate),
             "--mode", mode, "--delay-us", str(delay_us)]
@@ -402,7 +404,7 @@ def _read_ledger(ledger):
 
 
 def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
-             uid, gid, timeout_s):
+             uid, gid, timeout_s, pause="never"):
     """Run one sweep cell; return its campaign record (never a skip)."""
     label = cell_key(mode, delay_us, armed)
     try:
@@ -427,7 +429,8 @@ def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
             pub_gate = Path("-")
             entry_gate = Path("-")
         argv = observer_argv(observer, provider, built, ledger, pub_gate,
-                            entry_gate, mode, delay_us, trace_path)
+                            entry_gate, mode, delay_us, trace_path,
+                            pause)
         env = dict(os.environ)
         env["SUDO_UID"], env["SUDO_GID"] = str(uid), str(gid)
         try:
@@ -534,6 +537,8 @@ def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
                 "completeness": evidence.get("completeness"),
                 "final_drain": evidence.get("final_drain"),
                 "event_loss": evidence.get("event_loss"),
+                "pause": pause,
+                "evidence": evidence,
                 "extra_functions": extras,
                 "observer_argv": [str(part) for part in argv]}
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -612,6 +617,10 @@ def main(argv=None):
                         default=DEFAULT_CELL_TIMEOUT_S,
                         help="seconds bounding each cell "
                              f"(default {DEFAULT_CELL_TIMEOUT_S})")
+    parser.add_argument("--pause-policy", choices=("never", "auto"),
+                        default="never",
+                        help="observer pause policy for every cell "
+                             "(auto reruns the matrix as a held control)")
     parser.add_argument("--measure", default=str(DEFAULT_MEASURE),
                         help="measure-first-use.py oracle path")
     parser.add_argument("--fixture-source", default=str(DEFAULT_FIXTURE),
@@ -634,7 +643,7 @@ def main(argv=None):
                 ready["observer"], ready["measure"], built,
                 ready["out"] / f"cell-{mode}-{delay_us}us-{armed}",
                 mode, delay_us, armed, args.uid, args.gid,
-                args.cell_timeout)
+                args.cell_timeout, args.pause_policy)
             records.append(record)
             print(json.dumps({"cell": cell_key(mode, delay_us, armed),
                               "status": record["status"],

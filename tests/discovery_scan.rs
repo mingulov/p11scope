@@ -687,10 +687,12 @@ fn an_unhinted_object_the_tool_called_a_provider_says_when_it_yielded_no_table()
             .any(|m| m.path.ends_with("tableless.so") && m.tables.is_empty()),
         "the export makes it a module this capture reports: {modules:?}"
     );
-    let reasons: Vec<&str> = skipped
+    // The no-table reason quotes the module's own path in its discover
+    // hint; judge the wording around it, not the fixture directory name.
+    let reasons: Vec<String> = skipped
         .iter()
         .filter(|s| s.subject.ends_with("tableless.so"))
-        .map(|s| s.reason.as_str())
+        .map(|s| s.reason.replace(s.subject.as_str(), "<module>"))
         .collect();
     assert!(
         reasons.iter().any(|r| r.contains("no function table")),

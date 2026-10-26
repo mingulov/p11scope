@@ -21,6 +21,13 @@ as operations (all-zero rows of any category/role/unit/metadata are
 tolerated as idle and contribute nothing). Refusal diagnostics name only
 frozen labels and counts; unknown product strings are never echoed.
 
+With `--s1` (releases without a key-operation feed) the oracle instead
+checks the installed RSA ledger against `edges[]`: exact per-function
+results and the sign/verify/setup call split from the ledger's call rows,
+68 application calls through inventory entry counts, the operation
+aggregates, the CKM_SHA256_RSA_PKCS mechanism rows on the counted edges,
+and `object_observations` reading `unavailable`/`journal_unavailable`.
+
 Exit 0 prints the match summary as JSON; exit 1 leaves stdout empty and
 names the finite refusal cause on stderr.
 """
@@ -47,9 +54,9 @@ GAPS_CAPACITY = 256
 # and docs/schema/inventory-v1-object-observations.schema.json). A schema
 # revision edits these tables, not the logic below.
 STATUSES = ("populated", "partial", "stale", "unavailable")
-REASONS = ("none", "bootstrap_unavailable", "proof_refused_fallback", "authority_lost",
-           "row_budget_exhausted", "publication_budget_exhausted", "serialization_refused",
-           "sink_failed")
+REASONS = ("none", "bootstrap_unavailable", "journal_unavailable", "proof_refused_fallback",
+           "authority_lost", "row_budget_exhausted", "publication_budget_exhausted",
+           "serialization_refused", "sink_failed")
 SESSION_ORIGINS = ("opened", "first_observed")
 SESSION_STATUSES = ("live", "closed", "lost")
 OBJECT_ORIGINS = ("created", "first_observed")
@@ -132,6 +139,45 @@ EXPECTED_CALLS = {"C_Sign": 9, "C_SignUpdate": 9, "C_Verify": 12}
 EXPECTED_OPERATIONS = {"sign": {"completed": 10, "failed": 0},
                        "verify": {"completed": 10, "failed": 2}}
 EXPECTED_STARTED = {"sign": 10, "verify": 12}
+
+# S1 expectations for the same RSA cell: the 68-call workload read from the
+# S1 edge shapes (entries, operations, mechanisms) while object_observations
+# stays unavailable. Per-function results come from the ledger's own call
+# rows: C_Sign runs 9 times (8 OK, 1 BUFFER_TOO_SMALL retry probe), C_Verify
+# 12 times (10 OK, 2 SIGNATURE_INVALID). The 31/24/13 split counts workload
+# calls by operation category (operation 0 is setup). The edge numbers follow
+# the S1 reducer rules: operations.calls counts the 65 gated calls (68 minus
+# the 3 COUNT_ONLY setup calls), started counts the 22 OK inits plus the
+# GenerateKeyPair direct call, and mechanism 0x40 carries the 55 attributed
+# sign/verify calls with 3 errors.
+S1_STATUS = "unavailable"
+S1_REASON = "journal_unavailable"
+S1_CALL_SPLIT = {"sign": 31, "verify": 24, "setup": 13}
+S1_PER_FUNCTION = {"C_Sign": {0x0: 8, 0x150: 1},
+                   "C_Verify": {0x0: 10, 0xC0: 2}}
+S1_OPERATIONS = {"calls": 65, "started": 23, "completed": 21, "cancelled": 0,
+                 "failed": 2, "unknown": 0, "orphans": 0, "dropped": 0}
+S1_MECHANISMS = (
+    {"id": 0x0, "name": "CKM_RSA_PKCS_KEY_PAIR_GEN",
+     "operations": ("generate_key_pair",), "calls": 1, "errors": 0,
+     "functions": ("C_GenerateKeyPair",), "returns": {0x0: "CKR_OK"}},
+    {"id": CELL_MECHANISM, "name": CELL_MECHANISM_NAME,
+     "operations": CELL_MECHANISM_OPS, "calls": 55, "errors": 3,
+     "functions": ("C_Sign", "C_SignFinal", "C_SignInit", "C_SignUpdate",
+                   "C_Verify", "C_VerifyInit"),
+     "returns": {0x0: "CKR_OK", 0xC0: "CKR_SIGNATURE_INVALID",
+                 0x150: "CKR_BUFFER_TOO_SMALL"}},
+)
+OPERATION_KEYS = {"calls", "started", "completed", "cancelled", "failed",
+                  "unknown", "orphans", "dropped", "last_seen_ns", "active",
+                  "evidence"}
+OPERATION_EVIDENCE_KEYS = ("state_reconciliations", "session_cancel_ambiguities",
+                            "session_cancel_unknown_flags", "operation_state_imports",
+                            "auth_state_ambiguities", "semantic_capture_failures",
+                            "async_duplicates", "async_evictions", "unmatched_closes")
+ACTIVE_ROW_KEYS = {"category", "state", "count"}
+ACTIVE_STATES = ("initialized", "in_progress")
+COVERAGE_STATES = ("counted", "witnessed", "watched_no_use", "unknown")
 
 
 class OracleRefusal(ValueError):
@@ -561,15 +607,266 @@ def compare(application_rows, observer_doc):
             "observed": observed}
 
 
+def _dispatch_s1(doc):
+    _require(type(doc) is dict and doc.get("schema") == INVENTORY_SCHEMA,
+             "S1 mode needs the inventory envelope with edges")
+    section = doc.get("object_observations")
+    _require(type(section) is dict, "missing object observations")
+    _require("edges" in doc, "S1 mode needs edges")
+    _require(type(doc["edges"]) is list, "unexpected edges shape")
+    return section, doc["edges"]
+
+
+def _check_s1_section(section):
+    checked = check_section(section)
+    _require(checked["status"] == S1_STATUS,
+             f"S1 mode needs unavailable object observations, observed status"
+             f" {checked['status']} with reason {checked['reason']}")
+    _require(checked["reason"] == S1_REASON,
+             f"S1 mode needs reason {S1_REASON}, observed {checked['reason']}")
+    gaps = checked["gaps"]
+    if gaps["rows"]:
+        first = gaps["rows"][0]
+        raise OracleRefusal(f"observation gap {first['subject']}/{first['reason']}"
+                            f" repeats {first['repeats']}")
+    _require(gaps["suppressed"] == 0, "suppressed observation gaps")
+
+
+def _s1_application_tallies(application_rows):
+    """Derive the call split and per-function results from ledger call rows."""
+    categories = {}
+    for row in application_rows:
+        if row.get("kind") == "operation" and row.get("event") == "begin":
+            categories[row["operation"]] = row["category"]
+    split = {"sign": 0, "verify": 0, "setup": 0}
+    per_function = {name: {} for name in S1_PER_FUNCTION}
+    for row in application_rows:
+        if row.get("kind") != "call":
+            continue
+        split[categories.get(row.get("operation", 0), "setup")] += 1
+        if row["fn"] in per_function:
+            tally = per_function[row["fn"]]
+            tally[row["rv"]] = tally.get(row["rv"], 0) + 1
+    return split, per_function
+
+
+def _hex_results(tally):
+    return "{" + ", ".join(f"0x{rv:x}: {count}"
+                           for rv, count in sorted(tally.items())) + "}"
+
+
+def _check_s1_application(application_rows, application):
+    _require(application["api_calls"] == EXPECTED_API_CALLS
+             and application["operations"] == EXPECTED_OPERATIONS
+             and all(application["calls_by_function"].get(name) == count
+                     for name, count in EXPECTED_CALLS.items()),
+             "application workload is not the RSA cell")
+    split, per_function = _s1_application_tallies(application_rows)
+    _require(split == S1_CALL_SPLIT,
+             f"application call split sign/verify/setup"
+             f" {split['sign']}/{split['verify']}/{split['setup']}"
+             f" != expected 31/24/13")
+    for name, expected in S1_PER_FUNCTION.items():
+        tally = per_function[name]
+        _require(tally == expected,
+                 f"application {name} results {_hex_results(tally)}"
+                 f" != expected {_hex_results(expected)}")
+    return split, per_function
+
+
+def _check_s1_edge_counts(edges):
+    """Sum entry counts; counted edges must be loss-free and S1-observed."""
+    total = 0
+    counted = []
+    for edge in edges:
+        _require(type(edge) is dict, "unexpected S1 edge shape")
+        entries = edge.get("entries")
+        _require(type(entries) is dict and _u64(entries.get("count")),
+                 "unexpected S1 edge shape")
+        count = entries["count"]
+        total += count
+        if count == 0:
+            continue
+        coverage = entries.get("coverage")
+        _require(type(coverage) is dict, "unexpected S1 coverage shape")
+        state = coverage.get("state")
+        if state != "counted":
+            if type(state) is str and state in COVERAGE_STATES:
+                raise OracleRefusal(f"S1 edge with {count} entries reads"
+                                    f" {state}, not counted")
+            raise OracleRefusal("unexpected S1 coverage state")
+        _require(coverage.get("lossy") is False,
+                 f"S1 edge with {count} entries is lossy")
+        _require(edge.get("semantics") == "observed",
+                 "S1 edge semantics is not observed")
+        counted.append(edge)
+    _require(total == EXPECTED_API_CALLS,
+             f"S1 entries total {total} != expected {EXPECTED_API_CALLS}")
+    return total, counted
+
+
+def _check_s1_operations_row(operations):
+    _keys(operations, OPERATION_KEYS)
+    counters = {name: operations[name] for name in S1_OPERATIONS}
+    _require(all(_u64(value) for value in counters.values()),
+             "invalid S1 operations counters")
+    _require(_u64(operations["last_seen_ns"]), "invalid S1 operations recency")
+    active = operations["active"]
+    _require(type(active) is list, "unexpected S1 active shape")
+    active_total = 0
+    for row in active:
+        _keys(row, ACTIVE_ROW_KEYS)
+        _label(row["category"], CATEGORIES, "S1 active category")
+        _require(row["state"] in ACTIVE_STATES, "unexpected S1 active state")
+        _require(_u64(row["count"]), "invalid S1 active count")
+        active_total += row["count"]
+    evidence = operations["evidence"]
+    _require(type(evidence) is dict, "unexpected S1 operations evidence")
+    for name in OPERATION_EVIDENCE_KEYS:
+        value = evidence.get(name)
+        _require(_u64(value), f"S1 operations evidence {name} is not a counter")
+        _require(value == 0, f"S1 operations evidence {name} is {value}, expected 0")
+    return counters, active_total
+
+
+def _check_s1_operations(counted):
+    totals = dict.fromkeys(S1_OPERATIONS, 0)
+    active_total = 0
+    for edge in counted:
+        operations = edge.get("operations")
+        _require(type(operations) is dict,
+                 f"S1 edge with {edge['entries']['count']} entries"
+                 f" needs S1 operations")
+        counters, active = _check_s1_operations_row(operations)
+        for name in totals:
+            totals[name] += counters[name]
+        active_total += active
+    for name in ("cancelled", "unknown", "orphans", "dropped"):
+        _require(totals[name] == 0,
+                 f"S1 operations {name} {totals[name]} != expected 0")
+    for name in ("calls", "started", "completed", "failed"):
+        _require(totals[name] == S1_OPERATIONS[name],
+                 f"S1 operations {name} {totals[name]}"
+                 f" != expected {S1_OPERATIONS[name]}")
+    _require(active_total == 0,
+             f"S1 operations active {active_total} != expected 0")
+    return totals, active_total
+
+
+def _check_s1_mechanisms(counted):
+    wanted = {spec["id"]: spec for spec in S1_MECHANISMS}
+    aggregate = {spec["id"]: {"present": False, "calls": 0, "errors": 0,
+                              "operations": set(), "functions": set(),
+                              "returns": {}}
+                 for spec in S1_MECHANISMS}
+    for edge in counted:
+        rows = edge.get("mechanisms")
+        if rows is None:
+            rows = []
+        _require(type(rows) is list, "unexpected mechanisms shape")
+        ids = []
+        for row in rows:
+            mechanism, name, operations, calls, truncated = _check_mechanism_row(row)
+            ids.append(mechanism)
+            spec = wanted.get(mechanism)
+            if spec is None:
+                raise OracleRefusal(f"unexpected S1 mechanism 0x{mechanism:x}")
+            _require(name == spec["name"], "unexpected mechanism name")
+            _require(set(spec["operations"]) <= set(operations),
+                     f"mechanism {spec['name']} missing expected operations")
+            _require(truncated is False, "truncated mechanism provenance")
+            seen = aggregate[mechanism]
+            seen["present"] = True
+            seen["calls"] += calls
+            seen["errors"] += row["errors"]
+            seen["operations"] |= set(operations)
+            seen["functions"] |= set(row["evidence"]["functions"])
+            for entry in row["evidence"]["returns"]:
+                seen["returns"].setdefault(entry["rv"], set()).add(entry["name"])
+        _require(sorted(ids) == ids and len(set(ids)) == len(ids),
+                 "mechanism rows out of order")
+    observed = []
+    for spec in S1_MECHANISMS:
+        seen = aggregate[spec["id"]]
+        _require(seen["present"], f"missing expected mechanism {spec['name']}")
+        _require(seen["calls"] == spec["calls"] and seen["errors"] == spec["errors"],
+                 f"S1 mechanism {spec['name']} calls/errors"
+                 f" {seen['calls']}/{seen['errors']}"
+                 f" != expected {spec['calls']}/{spec['errors']}")
+        extra = seen["functions"] - set(spec["functions"])
+        _require(not extra,
+                 f"S1 mechanism {spec['name']} has {len(extra)}"
+                 f" unexpected S1 functions")
+        missing = set(spec["functions"]) - seen["functions"]
+        _require(not missing,
+                 f"S1 mechanism {spec['name']} misses expected functions"
+                 f" {sorted(missing)}")
+        seen_rv = set(seen["returns"])
+        for rv in sorted(seen_rv - set(spec["returns"])):
+            raise OracleRefusal(f"S1 mechanism {spec['name']}"
+                                f" has unexpected S1 return 0x{rv:x}")
+        missing_rv = set(spec["returns"]) - seen_rv
+        _require(not missing_rv,
+                 f"S1 mechanism {spec['name']} misses expected returns"
+                 f" {sorted(f'0x{rv:x}' for rv in missing_rv)}")
+        for rv, name in spec["returns"].items():
+            _require(seen["returns"][rv] == {name},
+                     f"S1 return 0x{rv:x} has unexpected name")
+        observed.append({"mechanism": spec["id"],
+                         "mechanism_hex": f"0x{spec['id']:x}",
+                         "name": spec["name"],
+                         "operations": sorted(seen["operations"]),
+                         "calls": seen["calls"], "errors": seen["errors"]})
+    return observed
+
+
+def compare_s1(application_rows, observer_doc):
+    """S1 mode: check the RSA ledger against edges[] without key operations.
+
+    Returns {"match": True, "mode": "s1", "application": ..., "observed": ...}
+    when the ledger's per-function results and call split equal the RSA cell
+    and the counted edges carry 68 entries, the expected operation aggregates
+    and the expected mechanism rows, with object_observations unavailable;
+    else raises OracleRefusal naming the finite cause.
+    """
+    section, edges = _dispatch_s1(observer_doc)
+    _check_s1_section(section)
+    try:
+        application = LEDGER.validate_ledger(application_rows)
+    except LEDGER.LedgerError as error:
+        raise OracleRefusal(f"application ledger refused: {error}") from None
+    split, per_function = _check_s1_application(application_rows, application)
+    total, counted = _check_s1_edge_counts(edges)
+    totals, active_total = _check_s1_operations(counted)
+    observed_mechanisms = _check_s1_mechanisms(counted)
+    return {"match": True, "mode": "s1",
+            "application": {"api_calls": application["api_calls"],
+                            "calls_by_function": application["calls_by_function"],
+                            "operations": application["operations"],
+                            "call_split": split,
+                            "per_function": {name: {f"0x{rv:x}": count
+                                                   for rv, count in sorted(tally.items())}
+                                             for name, tally in per_function.items()},
+                            "mechanism": CELL_MECHANISM_NAME},
+            "observed": {"entries": total,
+                         "operations": {**totals, "active": active_total},
+                         "mechanisms": observed_mechanisms}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--s1", action="store_true",
+                        help="S1 mode: check the RSA ledger against edges[]"
+                        " with object_observations unavailable"
+                        " (no key-operation feed)")
     parser.add_argument("application", help="application JSONL file")
     parser.add_argument("observer", help="observer inventory JSON file")
     args = parser.parse_args(argv)
     try:
         with open(args.application, encoding="utf-8") as stream:
             rows = LEDGER.read_ledger(stream)
-        result = compare(rows, read_observer_file(args.observer))
+        observer = read_observer_file(args.observer)
+        result = compare_s1(rows, observer) if args.s1 else compare(rows, observer)
     except (OracleRefusal, LEDGER.LedgerError, OSError, UnicodeError) as error:
         if isinstance(error, (OracleRefusal, LEDGER.LedgerError)):
             print(error, file=sys.stderr)

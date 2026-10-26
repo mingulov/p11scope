@@ -12,6 +12,12 @@ refused naming its targeted condition. Fixture `encoded_bytes` is
 illustrative, never asserted. No fixture, input, output or diagnostic here
 carries PIN, key, payload, handle or arbitrary bytes.
 
+The S1 mode (for releases without key operations) instead checks the
+installed RSA ledger against `edges[]`: exact per-function results,
+68 application calls through inventory entry counts, the
+CKM_SHA256_RSA_PKCS mechanism rows, and `object_observations` reading
+`unavailable`/`journal_unavailable`. Its twins are built in memory below.
+
 Run: python3 -I tests/python/test_observed_key_operations.py -v
 """
 
@@ -564,6 +570,494 @@ class ObservedRsaTests(unittest.TestCase):
                              ["maximum"], ORACLE.MAX_WORD)
             self.assertEqual(schema["properties"]["revision"]["maximum"],
                              ORACLE.MAX_WORD)
+
+
+# S1 twins: the installed RSA capture as v0.5.0 reports it (no key-operation
+# feed). Every number below is derived from the ledger workload
+# (test_key_operation_ledger.application_rows: 68 calls) and the S1 reducer
+# rules (src/semantics_edge.rs attribution, src/kinds.rs descriptors):
+# 68 entries on the edge; operations calls 65 (68 minus the 3 COUNT_ONLY
+# setup calls), started 23 (22 OK inits + the GenerateKeyPair direct call),
+# completed 21, failed 2; mechanism 0x40 with 55 attributed sign/verify
+# calls, 3 errors, 6 functions and returns {OK, SIGNATURE_INVALID,
+# BUFFER_TOO_SMALL}; mechanism 0x0 with the single keygen call.
+S1_RSA_FUNCTIONS = ("C_Sign", "C_SignFinal", "C_SignInit", "C_SignUpdate",
+                    "C_Verify", "C_VerifyInit")
+S1_RSA_RETURNS = ((0, "CKR_OK"), (0xC0, "CKR_SIGNATURE_INVALID"),
+                 (0x150, "CKR_BUFFER_TOO_SMALL"))
+S1_EVIDENCE_KEYS = ("state_reconciliations", "session_cancel_ambiguities",
+                    "session_cancel_unknown_flags", "operation_state_imports",
+                    "auth_state_ambiguities", "semantic_capture_failures",
+                    "async_duplicates", "async_evictions", "unmatched_closes")
+
+
+def s1_section(status="unavailable", reason="journal_unavailable"):
+    return {"version": 1, "revision": 7, "status": status, "reason": reason,
+            "sessions": [], "objects": [], "key_operations": [],
+            "unknown_key_operations": [],
+            "gaps": {"rows": [], "suppressed": 0},
+            "budgets": {
+                "key_rows": {"limit": 65536, "occupied": 0, "refused": 0},
+                "object_rows": {"limit": 65536, "occupied": 0, "refused": 0},
+                "unknown_rows": {"occupied": 0}, "encoded_bytes": 0,
+                "allocation_refused": False, "refusal_reason": "none"}}
+
+
+def s1_operations(calls=65, started=23, completed=21, cancelled=0, failed=2,
+                  unknown=0, orphans=0, dropped=0, active=None):
+    return {"calls": calls, "started": started, "completed": completed,
+            "cancelled": cancelled, "failed": failed, "unknown": unknown,
+            "orphans": orphans, "dropped": dropped, "last_seen_ns": 190,
+            "active": [] if active is None else active,
+            "evidence": {name: 0 for name in S1_EVIDENCE_KEYS}}
+
+
+def s1_rsa_row():
+    return mech_row(mechanism=0x40, name="CKM_SHA256_RSA_PKCS",
+                    operations=("sign", "verify"), calls=55, errors=3,
+                    functions=S1_RSA_FUNCTIONS, returns=S1_RSA_RETURNS)
+
+
+def s1_edge(count=68, mechanisms=None, operations=None,
+            semantics="observed", coverage=None):
+    if mechanisms is None:
+        mechanisms = [keygen_row(), s1_rsa_row()]
+    if operations is None:
+        operations = s1_operations()
+    if coverage is None:
+        coverage = {"state": "counted", "since_ns": 110, "until_ns": None,
+                    "first_ns": None, "lossy": False, "reason": None,
+                    "detail": None}
+    return {"caller": "c0", "module": "m0",
+            "mapping": {"state": "mapped", "reason": None,
+                        "first_seen_ns": 110, "last_seen_ns": 190,
+                        "interruptions": 0},
+            "entries": {"count": count, "saturated": False,
+                        "cap": 18446744073709551615, "first_seen_ns": 110,
+                        "last_seen_ns": 190, "in_flight": False,
+                        "observation": "observed", "coverage": coverage},
+            "semantics": semantics, "mechanisms": mechanisms,
+            "operations": operations}
+
+
+def s1_doc(section=None, edges=None):
+    if section is None:
+        section = s1_section()
+    if edges is None:
+        edges = [s1_edge()]
+    return {"schema": "p11scope/inventory/v1",
+            "object_observations": section, "edges": edges}
+
+
+def s1_rsa_mechanisms(doc):
+    return [row for edge in doc["edges"] for row in edge["mechanisms"]
+            if row["mechanism"] == 0x40]
+
+
+class S1ModeTests(unittest.TestCase):
+    maxDiff = 4096
+
+    def assert_s1_refused(self, rows, doc, tokens):
+        with self.assertRaises(ORACLE.OracleRefusal) as caught:
+            ORACLE.compare_s1(rows, doc)
+        message = str(caught.exception)
+        for token in tokens:
+            self.assertIn(token, message)
+
+    def test_s1_healthy_twin_passes(self):
+        result = ORACLE.compare_s1(APP_TESTS.application_rows(), s1_doc())
+        self.assertTrue(result.get("match"))
+        self.assertEqual(result.get("mode"), "s1")
+        application = result.get("application", {})
+        self.assertEqual(application.get("api_calls"), 68)
+        self.assertEqual(application.get("call_split"),
+                         {"sign": 31, "verify": 24, "setup": 13})
+        self.assertEqual(application.get("per_function"),
+                         {"C_Sign": {"0x0": 8, "0x150": 1},
+                          "C_Verify": {"0x0": 10, "0xc0": 2}})
+        self.assertEqual(application.get("mechanism"), "CKM_SHA256_RSA_PKCS")
+        seen = result.get("observed", {})
+        self.assertEqual(seen.get("entries"), 68)
+        self.assertEqual(seen.get("operations"),
+                         {"calls": 65, "started": 23, "completed": 21,
+                          "cancelled": 0, "failed": 2, "unknown": 0,
+                          "orphans": 0, "dropped": 0, "active": 0})
+        self.assertEqual(seen.get("mechanisms"),
+                         [{"mechanism": 0, "mechanism_hex": "0x0",
+                           "name": "CKM_RSA_PKCS_KEY_PAIR_GEN",
+                           "operations": ["generate_key_pair"],
+                           "calls": 1, "errors": 0},
+                          {"mechanism": 64, "mechanism_hex": "0x40",
+                           "name": "CKM_SHA256_RSA_PKCS",
+                           "operations": ["sign", "verify"],
+                           "calls": 55, "errors": 3}])
+        json.dumps(result)
+
+    def test_s1_reasons_carry_journal_unavailable(self):
+        self.assertIn("journal_unavailable", ORACLE.REASONS)
+
+    def test_s1_section_twins_are_refused(self):
+        clean = observed("clean.json")
+
+        def populated(doc):
+            doc["object_observations"] = clean
+
+        def bootstrap(doc):
+            doc["object_observations"]["reason"] = "bootstrap_unavailable"
+
+        def section_gap(doc):
+            doc["object_observations"]["gaps"]["rows"] = [
+                {"subject": "model", "reason": "loss", "repeats": 1}]
+
+        def suppressed_gap(doc):
+            doc["object_observations"]["gaps"]["suppressed"] = 1
+
+        def edges_missing(doc):
+            del doc["edges"]
+
+        def edges_not_list(doc):
+            doc["edges"] = {"count": 68}
+
+        def edges_empty(doc):
+            doc["edges"] = []
+
+        cases = [
+            ("object observations populated", populated,
+             ["needs unavailable", "populated"]),
+            ("bootstrap reason instead of journal", bootstrap,
+             ["needs reason journal_unavailable", "bootstrap_unavailable"]),
+            ("section gap row", section_gap, ["observation gap"]),
+            ("suppressed section gap", suppressed_gap,
+             ["suppressed observation gaps"]),
+            ("edges missing", edges_missing, ["needs edges"]),
+            ("edges not a list", edges_not_list, ["unexpected edges shape"]),
+            ("no edges", edges_empty,
+             ["entries total 0", "expected 68"]),
+        ]
+        for label, mutate, tokens in cases:
+            with self.subTest(label):
+                doc = s1_doc()
+                mutate(doc)
+                self.assert_s1_refused(APP_TESTS.application_rows(), doc,
+                                       tokens)
+
+    def test_s1_bare_section_is_refused(self):
+        self.assert_s1_refused(APP_TESTS.application_rows(), s1_section(),
+                               ["inventory envelope"])
+
+    def test_s1_edge_twins_are_refused(self):
+        def drop_sign_function(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            row["evidence"]["functions"].remove("C_Sign")
+
+        def wrong_return(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            entry = next(item for item in row["evidence"]["returns"]
+                         if item["rv"] == 0xC0)
+            entry.update(rv=0xC1, rv_hex="0xc1", name=None)
+
+        def drop_rsa_row(doc):
+            edge = doc["edges"][0]
+            edge["mechanisms"] = [row for row in edge["mechanisms"]
+                                  if row["mechanism"] != 0x40]
+
+        def drop_keygen_row(doc):
+            edge = doc["edges"][0]
+            edge["mechanisms"] = [row for row in edge["mechanisms"]
+                                  if row["mechanism"] != 0x0]
+
+        def total_off_by_one(doc):
+            doc["edges"][0]["entries"]["count"] = 67
+
+        def rsa_calls_short(doc):
+            s1_rsa_mechanisms(doc)[0]["calls"] = 54
+
+        def rsa_errors_short(doc):
+            s1_rsa_mechanisms(doc)[0]["errors"] = 2
+
+        def keygen_calls_wrong(doc):
+            doc["edges"][0]["mechanisms"][0]["calls"] = 2
+
+        def extra_mechanism(doc):
+            doc["edges"][0]["mechanisms"].append(
+                mech_row(mechanism=0x41, name="CKM_SHA1_RSA_PKCS",
+                         operations=("digest",), calls=1, errors=0,
+                         functions=("C_DigestInit",)))
+
+        def rsa_name_missing(doc):
+            s1_rsa_mechanisms(doc)[0]["name"] = None
+
+        def rsa_operations_short(doc):
+            s1_rsa_mechanisms(doc)[0]["operations"] = ["sign"]
+
+        def rsa_truncated(doc):
+            s1_rsa_mechanisms(doc)[0]["evidence"]["truncated"] = True
+
+        def extra_function(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            row["evidence"]["functions"].append("C_Encrypt")
+            row["evidence"]["functions"].sort()
+
+        def return_name_wrong(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            entry = next(item for item in row["evidence"]["returns"]
+                         if item["rv"] == 0xC0)
+            entry["name"] = "CKR_OK"
+
+        def return_missing(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            row["evidence"]["returns"] = [
+                item for item in row["evidence"]["returns"]
+                if item["rv"] != 0x150]
+
+        def mechanisms_null(doc):
+            doc["edges"][0]["mechanisms"] = None
+
+        def mechanisms_not_list(doc):
+            doc["edges"][0]["mechanisms"] = {"0x40": {}}
+
+        def operations_null(doc):
+            doc["edges"][0]["operations"] = None
+
+        def operations_short(doc):
+            doc["edges"][0]["operations"]["completed"] = 20
+
+        def operations_failed_short(doc):
+            doc["edges"][0]["operations"]["failed"] = 1
+
+        def operations_calls_short(doc):
+            doc["edges"][0]["operations"]["calls"] = 64
+
+        def operations_started_short(doc):
+            doc["edges"][0]["operations"]["started"] = 22
+
+        def operations_orphan(doc):
+            doc["edges"][0]["operations"]["orphans"] = 1
+
+        def operations_unknown(doc):
+            doc["edges"][0]["operations"]["unknown"] = 1
+
+        def operations_cancelled(doc):
+            doc["edges"][0]["operations"]["cancelled"] = 1
+
+        def operations_dropped(doc):
+            doc["edges"][0]["operations"]["dropped"] = 1
+
+        def operations_active(doc):
+            doc["edges"][0]["operations"]["active"] = [
+                {"category": "sign", "state": "in_progress", "count": 1}]
+
+        def operations_evidence(doc):
+            doc["edges"][0]["operations"]["evidence"][
+                "semantic_capture_failures"] = 1
+
+        def coverage_lossy(doc):
+            doc["edges"][0]["entries"]["coverage"]["lossy"] = True
+
+        def coverage_not_counted(doc):
+            doc["edges"][0]["entries"]["coverage"].update(
+                state="unknown", lossy=None, reason="loss",
+                detail="repeated fixture gap")
+
+        def semantics_withheld(doc):
+            doc["edges"][0]["semantics"] = \
+                "unknown (semantic capture withheld)"
+
+        def entries_missing(doc):
+            del doc["edges"][0]["entries"]
+
+        def coverage_missing(doc):
+            del doc["edges"][0]["entries"]["coverage"]
+
+        def coverage_state_bogus(doc):
+            doc["edges"][0]["entries"]["coverage"]["state"] = "BOGUS-STATE"
+
+        def mechanism_ids_out_of_order(doc):
+            edge = doc["edges"][0]
+            edge["mechanisms"] = list(reversed(edge["mechanisms"]))
+
+        def operations_active_bad_state(doc):
+            doc["edges"][0]["operations"]["active"] = [
+                {"category": "sign", "state": "BOGUS", "count": 1}]
+
+        def operations_evidence_missing_key(doc):
+            del doc["edges"][0]["operations"]["evidence"][
+                "semantic_capture_failures"]
+
+        cases = [
+            ("one sign result missing", drop_sign_function,
+             ["misses expected functions", "C_Sign"]),
+            ("wrong return code", wrong_return,
+             ["unexpected S1 return", "0xc1"]),
+            ("mechanism missing on the edge", drop_rsa_row,
+             ["missing expected mechanism", "CKM_SHA256_RSA_PKCS"]),
+            ("keygen mechanism missing", drop_keygen_row,
+             ["missing expected mechanism", "CKM_RSA_PKCS_KEY_PAIR_GEN"]),
+            ("call total off by one", total_off_by_one,
+             ["entries total 67", "expected 68"]),
+            ("mechanism calls short", rsa_calls_short,
+             ["calls/errors 54/3", "expected 55/3"]),
+            ("mechanism errors short", rsa_errors_short,
+             ["calls/errors 55/2", "expected 55/3"]),
+            ("keygen calls wrong", keygen_calls_wrong,
+             ["CKM_RSA_PKCS_KEY_PAIR_GEN", "expected 1/0"]),
+            ("extra mechanism row", extra_mechanism,
+             ["unexpected S1 mechanism", "0x41"]),
+            ("mechanism name mismatch", rsa_name_missing,
+             ["unexpected mechanism name"]),
+            ("mechanism operations short", rsa_operations_short,
+             ["missing expected operations"]),
+            ("truncated provenance", rsa_truncated, ["truncated"]),
+            ("extra function", extra_function, ["unexpected S1 functions"]),
+            ("return name wrong", return_name_wrong,
+             ["0xc0", "unexpected name"]),
+            ("return missing", return_missing,
+             ["misses expected returns", "0x150"]),
+            ("mechanisms null", mechanisms_null,
+             ["missing expected mechanism"]),
+            ("mechanisms not a list", mechanisms_not_list,
+             ["unexpected mechanisms shape"]),
+            ("operations null", operations_null, ["needs S1 operations"]),
+            ("operations completed short", operations_short,
+             ["S1 operations completed 20", "expected 21"]),
+            ("operations failed short", operations_failed_short,
+             ["S1 operations failed 1", "expected 2"]),
+            ("operations calls short", operations_calls_short,
+             ["S1 operations calls 64", "expected 65"]),
+            ("operations started short", operations_started_short,
+             ["S1 operations started 22", "expected 23"]),
+            ("operations orphan", operations_orphan,
+             ["S1 operations orphans 1"]),
+            ("operations unknown", operations_unknown,
+             ["S1 operations unknown 1"]),
+            ("operations cancelled", operations_cancelled,
+             ["S1 operations cancelled 1"]),
+            ("operations dropped", operations_dropped,
+             ["S1 operations dropped 1"]),
+            ("operations active", operations_active,
+             ["S1 operations active 1"]),
+            ("operations evidence", operations_evidence,
+             ["S1 operations evidence", "semantic_capture_failures"]),
+            ("coverage lossy", coverage_lossy, ["lossy"]),
+            ("coverage not counted", coverage_not_counted,
+             ["not counted", "unknown"]),
+            ("semantics withheld", semantics_withheld,
+             ["semantics is not observed"]),
+            ("entries missing", entries_missing,
+             ["unexpected S1 edge shape"]),
+            ("coverage missing", coverage_missing,
+             ["unexpected S1 coverage shape"]),
+            ("coverage state bogus", coverage_state_bogus,
+             ["unexpected S1 coverage state"]),
+            ("mechanism ids out of order", mechanism_ids_out_of_order,
+             ["mechanism rows out of order"]),
+            ("operations active bad state", operations_active_bad_state,
+             ["unexpected S1 active state"]),
+            ("operations evidence missing key",
+             operations_evidence_missing_key,
+             ["S1 operations evidence", "is not a counter"]),
+        ]
+        for label, mutate, tokens in cases:
+            with self.subTest(label):
+                doc = s1_doc()
+                mutate(doc)
+                self.assert_s1_refused(APP_TESTS.application_rows(), doc,
+                                       tokens)
+
+    def test_s1_refusals_never_echo_untrusted_strings(self):
+        def hostile_function(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            row["evidence"]["functions"].append("HOSTILE-FUNCTION-NAME")
+            row["evidence"]["functions"].sort()
+
+        def hostile_return_name(doc):
+            row = s1_rsa_mechanisms(doc)[0]
+            row["evidence"]["returns"][0]["name"] = "HOSTILE-RETURN-NAME"
+
+        def hostile_coverage(doc):
+            doc["edges"][0]["entries"]["coverage"]["state"] = "HOSTILE-STATE"
+
+        def hostile_semantics(doc):
+            doc["edges"][0]["semantics"] = "HOSTILE-SEMANTICS"
+
+        def hostile_active(doc):
+            doc["edges"][0]["operations"]["active"] = [
+                {"category": "sign", "state": "HOSTILE", "count": 1}]
+
+        cases = [
+            ("function", hostile_function, "HOSTILE-FUNCTION-NAME",
+             "unexpected S1 functions"),
+            ("return name", hostile_return_name, "HOSTILE-RETURN-NAME",
+             "unexpected name"),
+            ("coverage state", hostile_coverage, "HOSTILE-STATE",
+             "unexpected S1 coverage state"),
+            ("semantics", hostile_semantics, "HOSTILE-SEMANTICS",
+             "semantics is not observed"),
+            ("active state", hostile_active, "HOSTILE",
+             "unexpected S1 active state"),
+        ]
+        for label, mutate, secret, token in cases:
+            with self.subTest(label):
+                doc = s1_doc()
+                mutate(doc)
+                with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                    ORACLE.compare_s1(APP_TESTS.application_rows(), doc)
+                self.assertIn(token, str(caught.exception))
+                self.assertNotIn(secret, str(caught.exception))
+
+    def test_s1_application_twins_are_refused(self):
+        with self.subTest("ledger missing a sign result"):
+            rows = APP_TESTS.application_rows()
+            rows.remove(next(row for row in rows
+                             if row["kind"] == "call"
+                             and row["fn"] == "C_Sign"
+                             and row["phase"] == "terminal"))
+            self.assert_s1_refused(APP_TESTS.resequence(rows), s1_doc(),
+                                   ["application ledger refused"])
+        with self.subTest("ledger with a wrong return code"):
+            rows = APP_TESTS.application_rows()
+            row = next(row for row in rows
+                       if row["kind"] == "call" and row["fn"] == "C_Verify"
+                       and row["rv"] == 0)
+            row["rv"] = 0xC1
+            self.assert_s1_refused(rows, s1_doc(),
+                                   ["application ledger refused",
+                                    "unexpected application return value"])
+
+    def test_s1_cli_accepts_twin_and_refuses_mutations(self):
+        command = [sys.executable,
+                   str(ROOT / "scripts/qualify-key-operations.py"), "--s1"]
+        with tempfile.TemporaryDirectory(prefix="p11scope-s1-rsa-") as directory:
+            application = Path(directory, "application.jsonl")
+            application.write_text("".join(json.dumps(row) + "\n"
+                                           for row in APP_TESTS.application_rows()),
+                                   encoding="utf-8")
+            healthy = Path(directory, "healthy.json")
+            healthy.write_text(json.dumps(s1_doc()), encoding="utf-8")
+            result = subprocess.run(command + [str(application), str(healthy)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            passed = json.loads(result.stdout)
+            self.assertTrue(passed.get("match"))
+            self.assertEqual(passed.get("mode"), "s1")
+            twin = s1_doc()
+            twin["edges"][0]["entries"]["count"] = 67
+            observer = Path(directory, "twin.json")
+            observer.write_text(json.dumps(twin), encoding="utf-8")
+            result = subprocess.run(command + [str(application), str(observer)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("entries total", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            populated = s1_doc(section=observed("clean.json"))
+            observer.write_text(json.dumps(populated), encoding="utf-8")
+            result = subprocess.run(command + [str(application), str(observer)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("needs unavailable", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

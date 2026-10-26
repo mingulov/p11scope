@@ -518,7 +518,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "DEFAULT_TESTS=117",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=13",
-            "SKIP_TESTS=60",
+            "SKIP_TESTS=61",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

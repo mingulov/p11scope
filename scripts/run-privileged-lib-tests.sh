@@ -403,6 +403,9 @@ metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp6
 metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
 metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
 metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
+# Unprivileged system-population graph sizing: memory, drain and release
+# are hard gates, the stop time is measured and disclosed (R-40).
+discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -465,6 +468,7 @@ SKIP_REASONS=(
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles staging; a second stop signal abandons the counter detach with the typed interruption"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven timestamps growth to 8192 plus an atomic over-ceiling refusal"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven latency growth to 8192 plus an atomic over-ceiling refusal"
+"unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a

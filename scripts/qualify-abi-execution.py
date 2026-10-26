@@ -37,6 +37,13 @@ active rows must bind to the pinned provider bytes); (4)
 joint-abi-compare.py judges the saved ledger against the saved counts
 through its CLI, so any verdict replays byte-for-byte from the artifacts.
 
+The blocked cell instead proves in-flight accounting on a real call: the
+slot-10 provider entry waits for this driver's release file, the driver
+ends the capture with the call in flight only after the provider proves
+the entry, checks the stopped report saw it, and only then releases, so
+the S1 pin for that cell is exactly one in-flight call with its matching
+observation cause.
+
 Usage (as root; the observer refuses otherwise):
   python3 -I scripts/qualify-abi-execution.py --observer ./p11scope --out DIR
   python3 -I scripts/qualify-abi-execution.py --observer ./p11scope --out DIR \\
@@ -70,6 +77,7 @@ CAPTURING_TIMEOUT = 180
 FIXTURE_TIMEOUT = 180
 ORACLE_TIMEOUT = 120
 BUILD_TIMEOUT = 300
+BLOCKED_ENTER_TIMEOUT = 60
 MAX_CALLS = 200000
 MAX_WORD = (1 << 64) - 1
 
@@ -451,7 +459,9 @@ def _ownership(row):
         raise DriverRefusal("invalid module ownership identity")
 
 
-def check_s1_report(report, pin, *, verdict_module=None):
+def check_s1_report(report, pin, *, verdict_module=None,
+                    expected_in_flight_at_end=0,
+                    extra_observation_causes=frozenset()):
     """The S1 proof for a scan-only pid profile: loss-free and healthy,
     with the attach-late disclosure pinned.
 
@@ -461,6 +471,11 @@ def check_s1_report(report, pin, *, verdict_module=None):
     disclosure, pins the observation causes to the deterministic attach-late
     set, and requires a fully walked 104-function surface. The terminal
     verdict itself is recorded, never pinned.
+
+    The blocked cell designs one genuinely unreturned provider call, so it
+    pins in_flight_at_end to exactly 1 with the matching observation cause
+    instead of 0; every other cell pins 0 with no extra cause. Either way
+    the value is exact, never a floor.
     """
     verdict = verdict_module
     if verdict is None:
@@ -478,8 +493,13 @@ def check_s1_report(report, pin, *, verdict_module=None):
     if not isinstance(evidence, dict):
         raise DriverRefusal("missing capture evidence")
     for key in LOSS_COUNTERS:
+        if key == "in_flight_at_end":
+            continue
         if type(evidence.get(key)) is not int or evidence[key] != 0:
             raise DriverRefusal(f"loss or unknown {key}")
+    if (type(evidence.get("in_flight_at_end")) is not int
+            or evidence["in_flight_at_end"] != expected_in_flight_at_end):
+        raise DriverRefusal("loss or unknown in_flight_at_end")
     kernel = evidence.get("kernel_control", {})
     if (kernel.get("capture_halted") is not False
             or kernel.get("owner_poison") != []
@@ -496,8 +516,8 @@ def check_s1_report(report, pin, *, verdict_module=None):
     _terminal(evidence, verdict)
     observation = evidence.get("gap_classes", {}).get("observation", {})
     causes = observation.get("causes", [])
-    if (not isinstance(causes, list)
-            or set(causes) != PINNED_OBSERVATION_CAUSES):
+    expected_causes = PINNED_OBSERVATION_CAUSES | set(extra_observation_causes)
+    if (not isinstance(causes, list) or set(causes) != expected_causes):
         raise DriverRefusal("observation disclosure differs from the pinned "
                             "attach-late set")
     if observation.get("status") != "lossy":
@@ -622,6 +642,32 @@ def entry_detail(rows, counts):
     return {"entries": detail, "mismatched_entries": mismatched}
 
 
+def blocked_entry_in_flight(report):
+    """Prove the capture saw the blocked slot-10 entry still in flight.
+
+    Returns {"calls": ..., "in_flight": ...} for the ordinal-10 row, or
+    raises DriverRefusal when the row is missing or nothing is in flight.
+    The driver calls this after stopping the observer but before releasing
+    the provider, so the release is proven to follow the observation.
+    """
+    if type(report) is not dict or type(report.get("functions")) is not list:
+        raise DriverRefusal("report functions are not a list")
+    for position, row in enumerate(report["functions"]):
+        if type(row) is not dict or type(row.get("ordinals")) is not list:
+            raise DriverRefusal(f"function row {position} has no ordinals")
+        claimed = [item.get("ordinal") for item in row["ordinals"]
+                   if type(item) is dict]
+        if 10 not in claimed:
+            continue
+        calls, in_flight = row.get("calls"), row.get("in_flight")
+        if not _u64(calls) or not _u64(in_flight):
+            raise DriverRefusal("entry 10 counters invalid")
+        if in_flight < 1:
+            raise DriverRefusal("entry 10 has no call in flight")
+        return {"calls": calls, "in_flight": in_flight}
+    raise DriverRefusal("entry 10 has no observer row")
+
+
 def _terminate(proc, label):
     if proc.poll() is not None:
         return proc.returncode
@@ -657,8 +703,10 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
     stderr_path = cell_dir / "observer.stderr"
     profile_path = cell_dir / "profile.json"
     counts_path = cell_dir / "counts.jsonl"
+    entered_path = cell_dir / "entered"
+    release_path = cell_dir / "release"
     for path in (ledger_path, gate_path, wl_path, stderr_path, profile_path,
-                 counts_path):
+                 counts_path, entered_path, release_path):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -686,6 +734,9 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
     workload_ready = capture_ready = gate_released = False
     workload_env = dict(os.environ)
     workload_env["P11SCOPE_FIXTURE_QUIET"] = "1"
+    if cond == "blocked":
+        workload_env["P11SCOPE_FIXTURE_BLOCK_ENTERED"] = str(entered_path)
+        workload_env["P11SCOPE_FIXTURE_BLOCK_RELEASE"] = str(release_path)
     try:
         with open(wl_path, "w", encoding="utf-8") as wl_file:
             try:
@@ -724,6 +775,49 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
             result["reason"] = f"gate release failed: {error}"
             return result
         gate_released = True
+        if cond == "blocked":
+            # The provider blocks inside slot 10 until this driver releases
+            # it: wait for the provider's proof of entry, then end the
+            # capture with the call genuinely in flight, prove the stopped
+            # report saw it, and only then release. The return lands after
+            # the capture, so the S1 in-flight pin below is exact.
+            entered_seen = False
+            entered_deadline = time.monotonic() + BLOCKED_ENTER_TIMEOUT
+            while time.monotonic() < entered_deadline:
+                if entered_path.exists():
+                    entered_seen = True
+                    break
+                if workload.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if not entered_seen:
+                result["reason"] = "provider never entered the blocked call"
+                return result
+            result["entered_seen"] = True
+            observer_rc = _terminate(observer_proc, "observer")
+            if observer_rc is None:
+                result["reason"] = "observer would not stop while blocked"
+                return result
+            try:
+                with open(profile_path, encoding="utf-8") as stream:
+                    stopped_report = json.load(stream)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                result["reason"] = "profile report unreadable at release time"
+                return result
+            try:
+                result["capture_saw_entry"] = \
+                    blocked_entry_in_flight(stopped_report)
+            except DriverRefusal as error:
+                result["reason"] = \
+                    f"capture missed the blocked entry: {error}"
+                return result
+            try:
+                with open(release_path, "w", encoding="utf-8"):
+                    pass
+            except OSError as error:
+                result["reason"] = f"release failed: {error}"
+                return result
+            result["released"] = True
         try:
             workload_rc = workload.wait(timeout=FIXTURE_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -733,6 +827,8 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
         # rescanning a dead target until the duration backstop. SIGTERM is
         # a documented clean end; the exit-time loader hits are already in
         # the ring, and the S1 drain gate still has to prove the stop.
+        # (The blocked cell already stopped its capture above, with the
+        # call in flight; _terminate on the exited observer is a no-op.)
         observer_rc = _terminate(observer_proc, "observer")
         if observer_rc is None:
             result["reason"] = "observer would not stop after the workload exit"
@@ -790,7 +886,12 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
         result["reason"] = "profile report unreadable"
         return result
     try:
-        s1 = check_s1_report(report, pin)
+        if cond == "blocked":
+            s1 = check_s1_report(
+                report, pin, expected_in_flight_at_end=1,
+                extra_observation_causes={"in_flight_at_end"})
+        else:
+            s1 = check_s1_report(report, pin)
     except DriverRefusal as error:
         result["reason"] = f"S1 proof refused: {error}"
         return result

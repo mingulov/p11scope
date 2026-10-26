@@ -8826,27 +8826,12 @@ fn candidate_admission(
     }
 }
 
-/// Finite counter staging refusal text: the publication plus the failing
-/// check when the refusal named one. Bare variants keep their exact
-/// historical text when no check was recorded.
-pub(crate) fn counter_staging_refusal_text(
-    publication: &BankPublication,
-    check: Option<&str>,
-) -> String {
-    match check {
-        Some(check) => format!("counter bank staging refused: {publication:?} ({check})"),
-        None => format!("counter bank staging refused: {publication:?}"),
-    }
-}
-
-/// Finite counter growth refusal text: the endpoint-ceiling budget
+/// Shared counter bank refusal core: the endpoint-ceiling budget
 /// refusal renders in plain words with its counts; every other
 /// publication keeps the token plus the failing check when the refusal
 /// named one. Unnamed refusals keep their exact historical token text.
-pub(crate) fn counter_growth_refusal_text(
-    publication: &BankPublication,
-    check: Option<&str>,
-) -> String {
+/// Staging and growth share this arm so the two paths cannot diverge.
+fn counter_bank_refusal_core_text(publication: &BankPublication, check: Option<&str>) -> String {
     if let BankPublication::Refused(BankRefusal::BudgetExhausted {
         resource,
         needed,
@@ -8864,6 +8849,26 @@ pub(crate) fn counter_growth_refusal_text(
         Some(check) => format!("{publication:?} ({check})"),
         None => format!("{publication:?}"),
     }
+}
+
+/// Finite counter staging refusal text: the shared refusal core behind
+/// the staging prefix.
+pub(crate) fn counter_staging_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
+    format!(
+        "counter bank staging refused: {}",
+        counter_bank_refusal_core_text(publication, check)
+    )
+}
+
+/// Finite counter growth refusal text: the shared refusal core.
+pub(crate) fn counter_growth_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
+    counter_bank_refusal_core_text(publication, check)
 }
 
 /// Maps a counter staging outcome onto the attach result shape: published

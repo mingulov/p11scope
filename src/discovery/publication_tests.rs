@@ -4345,12 +4345,13 @@ fn contains_token(haystack: &str, needle: &str, alphabet: impl Fn(char) -> bool)
 }
 
 /// True when `addr` leaks into `haystack`: its hex or decimal rendering
-/// appears as a standalone token. Hex is bounded by non-hexdigits and
-/// decimal by non-alphanumerics, so a short canary inside a longer run
-/// (a digest, another address, an identifier) is not mistaken for a
-/// leak, while a genuinely printed address — always standalone in
-/// structured output — still matches. Length-agnostic: short fixture
-/// addresses stay unambiguous without a length floor.
+/// appears as a standalone token. Hex is bounded by non-hexdigits, so a
+/// short canary inside a longer hex run (a digest, another address) is
+/// not mistaken for a leak; decimal is bounded by non-alphanumerics, so
+/// it also stays quiet inside identifiers. A genuinely printed address —
+/// always standalone in structured output — still matches.
+/// Length-agnostic: short fixture addresses stay unambiguous without a
+/// length floor.
 fn canary_address_leaked(haystack: &str, addr: u64) -> bool {
     let hex = format!("{addr:x}");
     let dec = format!("{addr}");

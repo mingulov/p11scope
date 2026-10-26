@@ -106,11 +106,13 @@ class ReportTests(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="ascii")
         return path
 
-    def run_report(self, *jsonl, budgets=None):
+    def run_report(self, *jsonl, budgets=None, object_name=None):
         command = [sys.executable, "-I", str(SCRIPT), "--kernel", KERNEL,
                    "--observer-sha256", OBSERVER]
         if budgets is not None:
             command += ["--budgets", str(budgets)]
+        if object_name is not None:
+            command += ["--object", object_name]
         command += [str(path) for path in jsonl]
         return subprocess.run(command, capture_output=True, text=True, timeout=30)
 
@@ -246,6 +248,49 @@ class ReportTests(unittest.TestCase):
             check_budgets_shape(BUDGETS_FILE)
         except AssertionError as error:
             self.fail(str(error))
+
+    def test_object_namespaces_budget_lookup(self):
+        loads = [load_row("p11_entry", processed=472892)]
+        budgets = self.write_budgets({"detailed/p11_entry": {KERNEL: 800000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("detailed/p11_entry", result.stdout)
+
+    def test_object_scopes_missing_check_to_that_object(self):
+        loads = [load_row("p11_entry", processed=472892)]
+        budgets = self.write_budgets({"detailed/p11_entry": {KERNEL: 800000},
+                                      "inventory/p11_return": {KERNEL: 800000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="inventory")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("inventory/p11_return", result.stdout)
+
+    def test_object_distinguishes_shared_program_names(self):
+        loads = [load_row("interface_return", processed=900)]
+        budgets = self.write_budgets({"detailed/interface_return": {KERNEL: 1000},
+                                      "inventory/interface_return": {KERNEL: 500}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="inventory")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("900", result.stdout)
+        self.assertIn("500", result.stdout)
+
+    def test_object_requires_namespaced_budget_keys(self):
+        loads = [load_row("p11_entry", processed=472892)]
+        budgets = self.write_budgets({"p11_entry": {KERNEL: 800000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("detailed/p11_entry", result.stdout)
+        self.assertIn("no budget", result.stdout)
 
     def test_driver_anchors_guest_release_on_version_boundary(self):
         # The release check must accept the exact version or a `-`-suffixed

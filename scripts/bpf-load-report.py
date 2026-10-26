@@ -13,6 +13,12 @@ per-kernel budget (``{"limit": L, "min_headroom_percent": M, "programs":
 no row, or an observed root with no budget FAILs. Without it the gate is
 loaded + stats + 5% headroom. A repeated root (doctor loads twice) keeps
 its largest count. Auxiliary rows never supply coverage and are ignored.
+
+With ``--object NAME`` every observed root is scored as ``NAME/<root>``
+against budget keys of that form, and the budgeted-but-missing check is
+scoped to ``NAME/`` keys, so two BPF objects sharing program names (the
+Detailed and Inventory objects share ten) are gated from separate probe
+files without mixing their counts.
 """
 
 import argparse
@@ -118,8 +124,9 @@ def read_budgets(path):
             "programs": programs}
 
 
-def evaluate(loads, kernel, budgets):
+def evaluate(loads, kernel, budgets, object_name=None):
     """Rows keyed by root plus an overall verdict. Duplicates keep the max."""
+    prefix = f"{object_name}/" if object_name else ""
     by_root = {}
     for row in loads:
         parsed = checked_load(row)
@@ -127,7 +134,7 @@ def evaluate(loads, kernel, budgets):
             continue
         if parsed["root"] == "unresolved" and parsed["loaded"]:
             continue
-        by_root.setdefault(parsed["root"], []).append(parsed)
+        by_root.setdefault(prefix + parsed["root"], []).append(parsed)
     rows = []
     for root in sorted(by_root):
         entries = by_root[root]
@@ -165,6 +172,8 @@ def evaluate(loads, kernel, budgets):
         rows.append(row)
     if budgets is not None:
         for root in sorted(budgets["programs"]):
+            if prefix and not root.startswith(prefix):
+                continue
             if kernel in budgets["programs"][root] and root not in by_root:
                 rows.append({"root": root, "processed": None, "limit": None,
                              "budget": budgets["programs"][root][kernel],
@@ -202,6 +211,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--budgets", default=None,
                         help="pinned per-kernel budgets JSON (Task 2 file)")
+    parser.add_argument("--object", default=None,
+                        help="score roots as OBJECT/<root> against namespaced "
+                             "budget keys (one BPF object per probe file)")
     parser.add_argument("--kernel", required=True, help="guest kernel release")
     parser.add_argument("--observer-sha256", default="unknown",
                         help="sha256 of the observer that produced the rows")
@@ -222,7 +234,7 @@ def main(argv=None):
     rows = []
     if not errors:
         try:
-            rows = evaluate(loads, args.kernel, budgets)
+            rows = evaluate(loads, args.kernel, budgets, args.object)
         except ReportError as error:
             errors.append(str(error))
     sys.stdout.write(format_table(rows, args.kernel, args.observer_sha256, errors))

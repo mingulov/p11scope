@@ -29,6 +29,14 @@ EXPECTED_BUDGET_KERNELS = frozenset({
 })
 
 
+def budgets_files():
+    """Every checked-in verifier-budgets file the caps apply to."""
+    files = sorted(ROOT.glob("tests/*budgets*.json"))
+    assert BUDGETS_FILE in files, (
+        f"{BUDGETS_FILE.name} is missing from {sorted(path.name for path in files)}")
+    return files
+
+
 def check_budgets_shape(path):
     """Every budgeted program carries the same kernel set; a missing cell fails.
 
@@ -49,6 +57,37 @@ def check_budgets_shape(path):
     assert kernel_sets[first] == EXPECTED_BUDGET_KERNELS, (
         f"budget kernels {sorted(kernel_sets[first])} differ from "
         f"{sorted(EXPECTED_BUDGET_KERNELS)}")
+
+
+def check_budgets_cap(path):
+    """Every budget cell is a positive int within the file's own headroom cap.
+
+    Budgets are defined as measured-plus-margin capped at 95% of the
+    limit, but the gate checks measured headroom, not budget headroom,
+    so an over-cap cell would pass everywhere. This pin fails such a
+    file. The cap is limit x (1 - min_headroom_percent/100) read from
+    the same file, compared with exact integer arithmetic. Raises
+    AssertionError naming the offending cell.
+    """
+    document = json.loads(Path(path).read_text(encoding="ascii"))
+    limit = document["limit"]
+    headroom = document["min_headroom_percent"]
+    assert isinstance(limit, int) and not isinstance(limit, bool) and limit > 0, (
+        f"limit {limit!r} is not a positive int")
+    assert (isinstance(headroom, int) and not isinstance(headroom, bool)
+            and 0 <= headroom < 100), (
+        f"min_headroom_percent {headroom!r} is not a percent")
+    ceiling = limit * (100 - headroom)
+    for program in sorted(document["programs"]):
+        for kernel in sorted(document["programs"][program]):
+            budget = document["programs"][program][kernel]
+            assert isinstance(budget, int) and not isinstance(budget, bool), (
+                f"{program} {kernel}: budget {budget!r} is not an int")
+            assert budget > 0, (
+                f"{program} {kernel}: budget {budget} is not positive")
+            assert budget * 100 <= ceiling, (
+                f"{program} {kernel}: budget {budget} exceeds "
+                f"limit {limit} x (1 - {headroom}/100)")
 
 next_program_id = 100
 
@@ -249,6 +288,17 @@ class ReportTests(unittest.TestCase):
             check_budgets_shape(BUDGETS_FILE)
         except AssertionError as error:
             self.fail(str(error))
+
+    def test_budgets_cells_respect_the_headroom_cap(self):
+        try:
+            files = budgets_files()
+        except AssertionError as error:
+            self.fail(str(error))
+        for path in files:
+            try:
+                check_budgets_cap(path)
+            except AssertionError as error:
+                self.fail(f"{path.name}: {error}")
 
     def test_object_namespaces_budget_lookup(self):
         loads = [load_row("p11_entry", processed=472892)]

@@ -17696,6 +17696,141 @@ mod tests {
             !body.contains("journal_linked: true"),
             "production seal must never mark the attachment journal-linked"
         );
+        // The one production seal: this sealer holds one attachment
+        // construction, and the file holds exactly one more, inside the
+        // fenced test sealer. (The definition, impl headers and the
+        // resealer's destructuring `let` use other shapes.)
+        assert_eq!(
+            body.matches("= AttachedSemanticSet {").count(),
+            1,
+            "the production sealer builds the attachment once"
+        );
+        assert_eq!(
+            production.matches("= AttachedSemanticSet {").count(),
+            2,
+            "no second attachment construction may appear"
+        );
+        let fence = production
+            .find("#[cfg(test)]\npub(crate) fn seal_attached_subset_with(")
+            .expect("test sealer stays fenced");
+        let mut constructions = production.match_indices("= AttachedSemanticSet {");
+        let (first, _) = constructions
+            .next()
+            .expect("production construction present");
+        let (second, _) = constructions.next().expect("test construction present");
+        assert!(
+            first >= start && first < start + end,
+            "the first construction is the production seal"
+        );
+        assert!(
+            second > fence,
+            "the second construction is the fenced test seal"
+        );
+        // Neither attachment impl block builds `Self`: construction
+        // happens only in the two sealers above.
+        for (open, close, anchor) in [
+            (
+                "impl AttachedSemanticSet {",
+                "/// One Session's retained drain producers",
+                "fn journal_linked(",
+            ),
+            (
+                "impl AttachedSemanticSet {\n    fn validate_with(",
+                "/// An object table frozen against one attested receipt",
+                "fn validate_with(",
+            ),
+        ] {
+            let impl_start = production
+                .find(open)
+                .unwrap_or_else(|| panic!("{anchor} impl present"));
+            let impl_end = production[impl_start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("next item follows the {anchor} impl"));
+            let impl_body = &production[impl_start..impl_start + impl_end];
+            assert!(
+                impl_body.contains(anchor),
+                "impl slice covers the {anchor} impl"
+            );
+            assert!(
+                !impl_body.contains("Self {"),
+                "the {anchor} impl builds no attachment"
+            );
+        }
+    }
+
+    /// OD33/R-50: the only production `SessionDrainProducers`
+    /// constructor marks its producers not journal-linked. The live
+    /// guard reads this flag (via `AttestedSemanticLane::initialize_joint`
+    /// and `prepare_joint_births`), while the sealed attachment flag has
+    /// no production reader in v0.5.0 (0.5.1 wires seal to lane), so a
+    /// flipped literal here would install Joint feeds on wedged lanes.
+    /// `Session` retains no sealed attachment, so this literal cannot
+    /// derive from the seal without a wider change; pin it instead.
+    #[test]
+    fn production_drain_producers_are_not_journal_linked() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn drain_producers(")
+            .expect("production drain present");
+        let end = production[start..]
+            .find("pub fn event_drain(")
+            .expect("next drain follows the producers drain");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("journal_linked: false"),
+            "production producers must mark the lane not journal-linked"
+        );
+        assert!(
+            !body.contains("journal_linked: true"),
+            "production producers must never mark the lane journal-linked"
+        );
+        // The one production constructor: besides the struct definition
+        // and its impl header, the only `SessionDrainProducers {` site is
+        // this drain. The `Self`-form test pairs sit below, fenced.
+        assert!(
+            production.contains("pub(crate) struct SessionDrainProducers {"),
+            "producers definition present"
+        );
+        assert!(
+            production.contains("impl SessionDrainProducers {"),
+            "producers impl present"
+        );
+        assert!(
+            body.contains("SessionDrainProducers {"),
+            "the drain builds through the one production constructor"
+        );
+        assert_eq!(
+            production.matches("SessionDrainProducers {").count(),
+            3,
+            "no second production producers constructor may appear"
+        );
+        // Every `Self`-form constructor in the producers impl is fenced:
+        // one `#[cfg(test)]` per `Self` literal (the linked and unlinked
+        // test pairs, discounting their `-> Self` signatures). A
+        // production `Self` constructor would break the balance; a fenced
+        // test one keeps it.
+        let impl_start = production
+            .find("impl SessionDrainProducers {")
+            .expect("producers impl present");
+        let impl_end = production[impl_start..]
+            .find("/// Native-owned terminal completion")
+            .expect("next item follows the producers impl");
+        let impl_body = &production[impl_start..impl_start + impl_end];
+        assert!(
+            impl_body.contains("fn test_pair(") && impl_body.contains("fn test_pair_unlinked("),
+            "impl slice covers both test pairs"
+        );
+        let literals = impl_body.matches("Self {").count() - impl_body.matches("-> Self {").count();
+        assert_eq!(
+            literals,
+            impl_body.matches("#[cfg(test)]").count(),
+            "every Self-form producers constructor is test-fenced"
+        );
+        assert!(
+            literals >= 2,
+            "both test pairs still construct through Self"
+        );
     }
 
     /// The #[cfg(test)] sealer marks its attachment journal-linked, so

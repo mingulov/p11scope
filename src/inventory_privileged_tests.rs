@@ -5482,6 +5482,78 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     Ok(())
 }
 
+/// Tests-only viewed frame for a live promotion request: the scripted
+/// frame's presentation with the viewed capture and pair replaced by the
+/// live ones. `Promoter::request` verifies the viewed capture and the
+/// exact pair against the immutable frame, so a request about a live
+/// caller needs a frame that names it; queueing the raw scripted frame
+/// (capture 11, pair c3/m5) refuses `ForeignCapture`/`PairNotInView`.
+/// The row layout is unchanged (one edge); the render cache resets to
+/// the scripted default.
+fn promotion_view_for_live_pair_for_test(
+    capture: crate::inventory_promotion::CaptureId,
+    caller: crate::discovery::caller_registry::CallerId,
+    provider: crate::discovery::caller_registry::ModuleId,
+) -> std::sync::Arc<crate::inventory_promotion::PromotionView> {
+    let scripted = crate::inventory_promotion::lifecycle::scripted_promotion_view_for_test();
+    let mut presentation = (**scripted.presentation()).clone();
+    let edge = presentation
+        .edges
+        .first_mut()
+        .expect("the scripted frame carries one edge");
+    edge.caller = caller;
+    edge.module = provider;
+    presentation.render_index = Default::default();
+    std::sync::Arc::new(crate::inventory_promotion::PromotionView::new(
+        capture,
+        crate::inventory_promotion::ViewRevision::new(3),
+        std::sync::Arc::new(presentation),
+    ))
+}
+
+/// The rebound live-pair frame queues through the promoter's
+/// exact-pair verification, while the raw scripted frame still refuses
+/// outside its own capture and pair (the defense the privileged cell
+/// used to trip with `ForeignCapture`).
+#[test]
+fn live_pair_promotion_view_queues_through_verification() -> Result<()> {
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    use crate::inventory_promotion::{
+        CaptureId, Promoter, PromotionRequestError, lifecycle::scripted_promotion_view_for_test,
+    };
+
+    let mut promoter = Promoter::new();
+    assert!(promoter.enable(CaptureId::new(41)));
+    let view =
+        promotion_view_for_live_pair_for_test(CaptureId::new(41), CallerId(254), ModuleId(1));
+    promoter
+        .request(std::sync::Arc::clone(&view), CallerId(254), ModuleId(1))
+        .expect("the rebound frame queues");
+    assert!(promoter.take_request().is_some());
+
+    let mut foreign = Promoter::new();
+    assert!(foreign.enable(CaptureId::new(41)));
+    assert_eq!(
+        foreign.request(
+            scripted_promotion_view_for_test(),
+            CallerId(254),
+            ModuleId(1)
+        ),
+        Err(PromotionRequestError::ForeignCapture)
+    );
+    let mut unpaired = Promoter::new();
+    assert!(unpaired.enable(CaptureId::new(11)));
+    assert_eq!(
+        unpaired.request(
+            scripted_promotion_view_for_test(),
+            CallerId(254),
+            ModuleId(1)
+        ),
+        Err(PromotionRequestError::PairNotInView)
+    );
+    Ok(())
+}
+
 /// R1.6 cell 3: Joint promotion from A to B. A publishes its useful
 /// calls, then winds down through the production §8.6 driver: while A
 /// winds, B's queued promotion request is held (no preparation, no

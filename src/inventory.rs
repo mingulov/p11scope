@@ -16337,9 +16337,11 @@ mod promotion_driver_tests {
     fn settle_joint_finish_bound_abandons_never_latching_finish() {
         // A begun finish whose polls never latch (sticky Pending, no
         // disposition) still ends within an explicit wall bound: at
-        // the bound it abandons with the existing no-progress gap,
-        // like the second-signal arm. The short test bound stands in
-        // for the production Audited no-progress timeout.
+        // the bound it abandons with its own settle-bound gap (total
+        // time, never "without progress": the settle measures no
+        // progress) and its own held cause (never "second stop": no
+        // second signal happened). The short test bound stands in
+        // for the production settle backstop.
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
@@ -16359,18 +16361,36 @@ mod promotion_driver_tests {
             "the bound abandons a never-latching finish"
         );
         assert!(driver.semantic.is_none(), "the held lane leaves the driver");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish settle bound reached"),
+            "the bound keeps its own cause, not a second stop"
+        );
         driver.commit(false).expect("the stop commit runs");
-        let stalled = committed_gaps_by_subject(&mut driver, "joint finish made no progress");
+        let stalled =
+            committed_gaps_by_subject(&mut driver, "joint finish settle bound reached");
         assert_eq!(stalled.len(), 1, "the bound discloses the wedge");
         assert!(
-            stalled[0]
-                .1
-                .contains("settle polls; abandoning the finish for exit"),
-            "the gap names the settle bound: {:?}",
+            stalled[0].1.contains("did not complete within")
+                && stalled[0]
+                    .1
+                    .contains("settle polls; abandoning the finish for exit"),
+            "the gap words total time, never progress it never measured: {:?}",
             stalled[0].1
         );
         let held = committed_gaps_by_subject(&mut driver, "joint finish held for exit");
         assert_eq!(held.len(), 1, "the escalation discloses the hold");
+        assert_eq!(
+            held[0].1, "joint finish settle bound reached",
+            "the held gap names the bound cause, not a second stop"
+        );
+        let machine_trips =
+            committed_gaps_by_subject(&mut driver, "joint finish made no progress");
+        assert!(
+            machine_trips.is_empty(),
+            "the settle never borrows the machine trip's gap: {:?}",
+            machine_trips
+        );
     }
 
     #[test]

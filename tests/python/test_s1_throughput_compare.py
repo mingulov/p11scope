@@ -94,7 +94,7 @@ def uniform_ledger(count, per_s, pid=PID, tid=PID, start_ns=R0,
     step = 1_000_000_000 // per_s
     last = start_ns
     for seq in range(1, count + 1):
-        end = start_ns + (seq - 1) * step
+        end = start_ns + (seq - 1) * step + 1000
         rows.append({"kind": "call", "seq": seq, "fn": fns[(seq - 1) % len(fns)],
                      "rv": rv, "pid": pid, "tid": tid,
                      "t0": end - 500, "t1": end})
@@ -290,6 +290,25 @@ def healthy_triple(workdir, count=20000, per_s=FULL_RATE, pid=PID,
     return ledger_path, events_path, inventory_path
 
 
+def rewrite_events_for_edge(workdir, edge, last_t1, pid=PID):
+    """Rebuild the events file so its records embed the (mutated) edge.
+
+    Mutation twins change the snapshot edge; without this the
+    stream/snapshot divergence check would fire before the intended
+    gate. The final record count follows the edge's entries.count.
+    """
+    final = edge["entries"]["count"]
+    series = [(last_t1 + 1_000_000, final // 2),
+              (last_t1 + 2_000_000, final)]
+    write_jsonl(workdir / "events.jsonl", events_doc(edge, series, pid=pid))
+
+
+def ledger_last_t1(ledger_path):
+    with open(ledger_path, encoding="utf-8") as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
+    return max(row["t1"] for row in rows if row["kind"] == "call")
+
+
 class HealthyTwin(unittest.TestCase):
     def test_healthy_10k_passes_with_recorded_windows_and_latency(self):
         s1 = require_s1(self)
@@ -359,7 +378,7 @@ class RateGate(unittest.TestCase):
         self.assertIn("below minimum", str(ctx.exception))
 
     def test_partial_tail_never_fails(self):
-        ledger = uniform_ledger(10003, FULL_RATE, ack_ns=R0 + 1_000_200_500)
+        ledger = uniform_ledger(10003, FULL_RATE, ack_ns=R0 + 1_000_201_500)
         result = self.run_case(ledger)
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(len(result["windows"]), 1)
@@ -372,19 +391,31 @@ class RateGate(unittest.TestCase):
         self.assertIn("no full 1 s window", str(ctx.exception))
 
     def test_empty_run_fails(self):
+        s1 = require_s1(self)
         ledger = [{"kind": "ready", "pid": PID, "tid": PID, "t": R0,
                    "clock": "CLOCK_MONOTONIC", "unit": "ns"},
                   {"kind": "ack", "issued": 0, "t": R0 + 2_000_000_000}]
-        with self.assertRaises(ValueError) as ctx:
-            self.run_case(ledger, min_rate=0)
-        self.assertIn("no calls", str(ctx.exception))
+        with tempfile.TemporaryDirectory(prefix="s1tp-empty-") as tmp:
+            workdir = Path(tmp)
+            edge = driver_edge(0)
+            ledger_path = workdir / "ledger.jsonl"
+            events_path = workdir / "events.jsonl"
+            inventory_path = workdir / "inventory.json"
+            write_jsonl(ledger_path, ledger)
+            write_jsonl(events_path, events_doc(edge, []))
+            write_json(inventory_path,
+                       inventory_doc(edge, [semantic_row(edge, 0)]))
+            with self.assertRaises(ValueError) as ctx:
+                s1.compare([str(ledger_path)], [str(events_path)],
+                           str(inventory_path), 0)
+            self.assertIn("no calls", str(ctx.exception))
 
     def test_min_rate_zero_records_windows_without_gating(self):
         ledger = uniform_ledger(25, 21)
         result = self.run_case(ledger, min_rate=0)
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(len(result["windows"]), 1)
-        self.assertEqual(result["windows"][0]["count"], 22)
+        self.assertEqual(result["windows"][0]["count"], 21)
 
     def test_two_thread_ledgers_merge(self):
         s1 = require_s1(self)
@@ -453,6 +484,9 @@ class ConservationGate(unittest.TestCase):
                 inventory = json.load(stream)
             mutate(inventory)
             write_json(inventory_path, inventory)
+            if inventory["edges"]:
+                rewrite_events_for_edge(workdir, inventory["edges"][0],
+                                        ledger_last_t1(ledger_path))
             return s1.compare([str(ledger_path)], [str(events_path)],
                               str(inventory_path), 10)
 
@@ -572,6 +606,10 @@ class LossGate(unittest.TestCase):
                     inventory = json.load(stream)
                 mutate_inventory(inventory)
                 write_json(inventory_path, inventory)
+                if inventory["edges"]:
+                    rewrite_events_for_edge(
+                        workdir, inventory["edges"][0],
+                        ledger_last_t1(ledger_path))
             if mutate_events is not None:
                 with open(events_path, encoding="utf-8") as stream:
                     events = [json.loads(line) for line in stream

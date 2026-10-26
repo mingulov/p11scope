@@ -1008,6 +1008,7 @@ def prepare(args):
     require(args.kernel is not None, "prepare requires the actual selected --kernel")
     disk = guest_disk_input(args.guest_disk, args.guest_disk_uuid)
     require(args.lane != "host" or disk is None, "host lane cannot use a guest disk")
+    require(args.lane != FEDORA_LANE or disk is None, "fedora lane cannot use a guest disk")
     if args.lane in ("host", FEDORA_LANE):
         local = "host" if args.lane == "host" else "fedora"
         require(args.kernel == args.lane, f"{local} lane requires {local} kernel")

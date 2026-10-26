@@ -13662,6 +13662,115 @@ mod tests {
     }
 
     #[test]
+    fn retained_tick_commit_refusal_converts_like_poll() {
+        // Stop-time twin (Tick sees the refusal first): the deadline
+        // lands while a Joint commit is pending, the suspended tick's
+        // retained step polls the same commit and it refuses. The
+        // outcome must match the Poll path for the same event
+        // (controller ruling E1): hold, name the stop, publish past
+        // it, no run error — never exit 1 with a bare disposition.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.suspended = true;
+        driver.joint_commit_pending = true;
+        // The Tick cursor polls the pending commit first and refuses.
+        driver.on_tick();
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the commit refusal abandons the unbegun finish"
+        );
+        assert!(
+            !driver.joint_commit_pending,
+            "the held commit pends nothing"
+        );
+        assert!(
+            driver.joint_first_error.is_none(),
+            "a converted commit refusal keeps no run error"
+        );
+        // The Poll cursor then commits the legacy way past the held
+        // lane and publishes the staged stop gap.
+        let polled = driver.poll_commit(false);
+        assert!(
+            matches!(
+                polled,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the pass publishes past the held lane"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        assert_eq!(
+            stops[0].1, "semantic_unavailable; broad inventory continues",
+            "the gap names the commit refusal"
+        );
+        assert!(
+            driver.fold_retained_joint_error(None).is_none(),
+            "the retained run folds no error from the conversion"
+        );
+    }
+
+    #[test]
+    fn retained_poll_commit_refusal_converts_before_tick() {
+        // Stop-time twin (Poll sees the refusal first): the same
+        // deadline-during-pending-commit shape, but the Poll cursor
+        // polls before the suspended tick. The outcome must equal the
+        // Tick-first twin above: hold, one named stop gap, published
+        // pass, no retained error.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.suspended = true;
+        driver.joint_commit_pending = true;
+        // The Poll cursor polls the pending commit first and refuses.
+        let polled = driver.poll_commit(false);
+        assert!(
+            matches!(
+                polled,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a refused poll publishes the pass past the held lane"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        assert!(
+            !driver.joint_commit_pending,
+            "the held commit pends nothing"
+        );
+        // The suspended tick past the hold is a no-op.
+        driver.on_tick();
+        assert!(
+            driver.joint_first_error.is_none(),
+            "a converted commit refusal keeps no run error"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        assert_eq!(
+            stops[0].1, "semantic_unavailable; broad inventory continues",
+            "the gap names the commit refusal"
+        );
+        assert!(
+            driver.fold_retained_joint_error(None).is_none(),
+            "the retained run folds no error from the conversion"
+        );
+    }
+
+    #[test]
     fn joint_poll_commit_healthy_run_carries_no_semantic_stop_gap() {
         // Healthy twin: legacy commits and unbegun-Joint fallbacks
         // publish with no "semantic lane stopped" gap; the gap fires

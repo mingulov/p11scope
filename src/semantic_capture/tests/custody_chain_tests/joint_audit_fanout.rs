@@ -3864,6 +3864,209 @@ fn joint_machine_begin_only_request_publishes_original_negative() {
     assert!(fixture.native.rows.is_empty());
 }
 
+/// Sorted fingerprint of every published gap row with its repeat count.
+fn gap_fingerprint(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
+    let registry = coordinator.registry();
+    let mut rows: Vec<String> = registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .map(|(gap, repeats)| format!("{gap:?} x{repeats}"))
+        .collect();
+    rows.sort();
+    rows.push(format!("suppressed={}", registry.gaps_suppressed()));
+    rows
+}
+
+/// Sorted per-edge call facts: api returns, reduced, started, completed.
+fn edge_call_facts(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+) -> Vec<(Option<u64>, u64, Option<u64>, Option<u64>)> {
+    let mut facts: Vec<_> = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| {
+            (
+                record.api_returns,
+                record.feed.reduced(),
+                record.semantics.as_ref().map(|edge| edge.started()),
+                record.semantics.as_ref().map(|edge| edge.completed()),
+            )
+        })
+        .collect();
+    facts.sort();
+    facts
+}
+
+/// Demandless idle service with an empty drain publishes nothing: no
+/// revision, no H3 take, no replay, no gaps. The live first-birth
+/// cell's idle loop relies on this whenever no ambient records land.
+#[test]
+fn joint_machine_idle_service_without_records_publishes_nothing() {
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let h3 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    let reduced = fixture.reduced();
+    let edges = edge_call_facts(&fixture.scene.real.scene.coordinator);
+    let gaps = gap_fingerprint(&fixture.scene.real.scene.coordinator);
+    let claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test()
+        .0;
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    for _ in 0..3 {
+        let progress = fixture.service(64).unwrap();
+        assert_eq!(
+            progress,
+            crate::inventory_semantics::JointServiceProgress::Pending,
+            "an empty idle service never publishes"
+        );
+        let reduced_now = fixture.reduced();
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().published_revision(), revision);
+        assert_eq!(coordinator.reference_h3_audit_state(), h3);
+        assert_eq!(reduced_now, reduced);
+        assert_eq!(edge_call_facts(coordinator), edges);
+        assert_eq!(gap_fingerprint(coordinator), gaps);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            claims
+        );
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            roles
+        );
+    }
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+}
+
+/// Demandless idle service WITH new non-call (FORK lifecycle) records
+/// legally publishes exactly once: one revision, one H3 take, and zero
+/// call facts — no api/reduced/started/completed movement, no gaps.
+/// This is the live first-birth cell's idle publish: ambient task
+/// records collected without a demand are real new facts, not silence.
+#[test]
+fn joint_machine_idle_service_with_fork_records_publishes_without_call_facts() {
+    use p11scope_ebpf_common::{Event, event_type};
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let h3 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    let reduced = fixture.reduced();
+    let edges = edge_call_facts(&fixture.scene.real.scene.coordinator);
+    let gaps = gap_fingerprint(&fixture.scene.real.scene.coordinator);
+    let claims = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test()
+        .0;
+    let roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    for (index, child) in [1001u32, 1002].into_iter().enumerate() {
+        let fork = Event {
+            event_type: event_type::FORK,
+            pid_tgid: (u64::from(child) << 32) | u64::from(child),
+            session: u64::from(child),
+            ts_ns: 2_000_000 + index as u64,
+            ..Event::default()
+        };
+        fixture
+            .scene
+            .drain
+            .source_mut()
+            .push_record(crate::events::event_bytes(&fork));
+    }
+    let mut publishes = 0u32;
+    for _ in 0..512 {
+        let progress = fixture.service(1).unwrap();
+        if progress == crate::inventory_semantics::JointServiceProgress::Published {
+            publishes += 1;
+            break;
+        }
+    }
+    assert_eq!(
+        publishes, 1,
+        "two fork records publish exactly once without a demand"
+    );
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    let reduced_now = fixture.reduced();
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.registry().published_revision(),
+        revision + 1,
+        "the fork records publish one revision"
+    );
+    assert_eq!(
+        coordinator.reference_h3_audit_state(),
+        (h3.0 + 1, h3.1),
+        "one H3 take per publish, no new pending"
+    );
+    assert_eq!(reduced_now, reduced, "fork records replay nothing");
+    assert_eq!(edge_call_facts(coordinator), edges);
+    assert_eq!(gap_fingerprint(coordinator), gaps);
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        claims
+    );
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        roles
+    );
+}
+
 #[test]
 fn joint_machine_routes_first_birth_to_actual_registry() {
     let mut fixture = MachineScene::new(1);

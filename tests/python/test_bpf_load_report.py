@@ -8,6 +8,7 @@ root passes; the processed count of every root is printed either way.
 """
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -301,6 +302,96 @@ class ReportTests(unittest.TestCase):
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('"${KERNEL#v}"|"${KERNEL#v}-"*)', text)
+
+    def test_driver_scores_inventory_side_against_budgets(self):
+        # The 72 inventory budget cells exist (pinned by the budgets-shape
+        # test above); the driver must pass them on the inventory side so
+        # an inventory regression fails the gate. Real guest runs prove
+        # the scoring; this pins the wiring against revert.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('--budgets "$BUDGETS" --object inventory', text)
+
+    def bpf_loop_probe_row(self, errno):
+        # The controller-allowlisted functional probe shape: `call 181;
+        # exit`, kprobe type, refused (5.15 EINVAL, 6.1 EACCES).
+        row = load_row("unresolved", loaded=False, errno=errno,
+                       stats_present=False, processed=0)
+        row.update({"program_type": 2, "insn_count": 2,
+                    "relocated_fnv1a64": EXPECTED_BPF_LOOP_PROBE_FNV})
+        return row
+
+    def test_expected_bpf_loop_probe_refusal_passes(self):
+        for errno in (22, 13):
+            loads = [self.bpf_loop_probe_row(errno),
+                     load_row("p11_entry", processed=472892)]
+            result = self.run_report(self.write_loads("probe.jsonl", loads))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("result=PASS", result.stdout)
+            self.assertIn("EXPECTED", result.stdout)
+            self.assertIn("expected bpf_loop probe refusal", result.stdout)
+            self.assertIn(f"errno={errno}", result.stdout)
+
+    def test_expected_bpf_loop_probe_refusal_passes_namespaced(self):
+        loads = [self.bpf_loop_probe_row(22),
+                 load_row("p11_entry", processed=472892)]
+        budgets = self.write_budgets({"detailed/p11_entry": {KERNEL: 800000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("detailed/unresolved", result.stdout)
+        self.assertIn("EXPECTED", result.stdout)
+
+    def test_nearby_unresolved_refusals_still_fail(self):
+        # The allowlist is exact: any drift in fingerprint, program type,
+        # instruction count, or errno fails like any other refused load.
+        base = self.bpf_loop_probe_row(22)
+        variants = []
+        for key, value in (("relocated_fnv1a64", "27ef27a73ecc6271"),
+                           ("relocated_fnv1a64", "0" * 16),
+                           ("program_type", 5),
+                           ("insn_count", 3),
+                           ("errno", 7),
+                           ("errno", 1)):
+            variant = dict(base)
+            variant[key] = value
+            variants.append(variant)
+        for variant in variants:
+            loads = [variant, load_row("p11_entry", processed=472892)]
+            result = self.run_report(self.write_loads("probe.jsonl", loads))
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("result=FAIL", result.stdout)
+            self.assertIn("unresolved", result.stdout)
+            self.assertNotIn("EXPECTED", result.stdout)
+
+    def test_probe_fingerprint_matches_the_attached_source_bytes(self):
+        # The allowlisted fingerprint is the FNV-1a 64 of the exact
+        # BPF_LOOP_PROBE_INSNS bytes in src/attach.rs, not a magic string:
+        # recompute it from the source literal and require the report
+        # script to carry the same value.
+        source = (ROOT / "src" / "attach.rs").read_text(encoding="utf-8")
+        match = re.search(
+            r"BPF_LOOP_PROBE_INSNS[^=]*=\s*\[(.*?)\];", source, re.S)
+        self.assertIsNotNone(match, "BPF_LOOP_PROBE_INSNS literal not found")
+        raw = bytes(int(byte, 16)
+                    for byte in re.findall(r"0x([0-9a-fA-F]{2})", match.group(1)))
+        self.assertEqual(len(raw), 16, "probe is two instructions")
+        value = 14695981039346656037
+        for byte in raw:
+            value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+        script = SCRIPT.read_text(encoding="ascii")
+        match = re.search(
+            r"BPF_LOOP_PROBE_FNV1A64\s*=\s*\"([0-9a-f]{16})\"", script)
+        self.assertIsNotNone(
+            match, "report script carries no BPF_LOOP_PROBE_FNV1A64 pin")
+        self.assertEqual(match.group(1), f"{value:016x}")
+        self.assertEqual(match.group(1), EXPECTED_BPF_LOOP_PROBE_FNV)
+
+
+# The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
+# against src/attach.rs by the fingerprint test above.
+EXPECTED_BPF_LOOP_PROBE_FNV = "27ef27a73ecc6270"
 
 
 if __name__ == "__main__":

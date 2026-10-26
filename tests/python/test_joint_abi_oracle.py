@@ -192,6 +192,35 @@ def write_jsonl(path, rows):
             stream.write(json.dumps(row) + "\n")
 
 
+def wait_for_path(path, timeout_s):
+    """True once path exists, False on timeout. Bounded; never raises."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return path.exists()
+
+
+def wait_for_ledger_kind(path, kind, timeout_s):
+    """True once the ledger at path holds a row of the given kind."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with open(path, encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict) and row.get("kind") == kind:
+                        return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
 ABI_COUNTING_PROVIDER = """/* Test-only counting stub: every entry writes one byte to the witness. */
 #define _GNU_SOURCE
 #include <stddef.h>
@@ -1204,9 +1233,10 @@ unsigned long C_GetFunctionList(void **out) {
         self.assertEqual([call["entry"] for call in calls], list(range(104)))
         names = {call["entry"]: call["fn"] for call in calls}
         self.assertEqual(names[0], "C_Initialize")
+        self.assertEqual(names[3], "C_GetFunctionList")
         self.assertEqual(names[67], "C_WaitForSlotEvent")
-        self.assertEqual(names[68], "P11ScopeSlot68")
-        self.assertEqual(names[103], "P11ScopeSlot103")
+        self.assertEqual(names[68], "C_GetInterfaceList")
+        self.assertEqual(names[103], "C_UnwrapKeyAuthenticated")
         for call in calls:
             self.assertNotIn("table[", call["fn"])
             self.assertEqual(call["rv"], 0)
@@ -1253,9 +1283,10 @@ unsigned long C_GetFunctionList(void **out) {
             self.assertEqual([call["entry"] for call in calls], list(range(104)))
             names = {call["entry"]: call["fn"] for call in calls}
             self.assertEqual(names[0], "C_Initialize")
+            self.assertEqual(names[3], "C_GetFunctionList")
             self.assertEqual(names[67], "C_WaitForSlotEvent")
-            self.assertEqual(names[68], "P11ScopeSlot68")
-            self.assertEqual(names[103], "P11ScopeSlot103")
+            self.assertEqual(names[68], "C_GetInterfaceList")
+            self.assertEqual(names[103], "C_UnwrapKeyAuthenticated")
             for call in calls:
                 self.assertNotIn("table[", call["fn"])
                 self.assertEqual(call["rv"], 0)
@@ -1348,10 +1379,31 @@ unsigned long C_GetFunctionList(void **out) {
         with tempfile.TemporaryDirectory() as tmp:
             provider, fixture = self.build_pair(tmp)
             ledger = Path(tmp) / "ledger.jsonl"
-            completed = subprocess.run(
+            entered = Path(tmp) / "entered"
+            release = Path(tmp) / "release"
+            env = dict(os.environ, P11SCOPE_FIXTURE_QUIET="1",
+                       P11SCOPE_FIXTURE_BLOCK_ENTERED=str(entered),
+                       P11SCOPE_FIXTURE_BLOCK_RELEASE=str(release))
+            child = subprocess.Popen(
                 [str(fixture), str(provider), str(ledger), "", "blocked"],
-                capture_output=True, text=True, timeout=60)
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=env)
+            stderr = ""
+            try:
+                self.assertTrue(
+                    wait_for_path(entered, 15),
+                    "the blocked call never entered the provider")
+                self.assertTrue(
+                    wait_for_ledger_kind(ledger, "entry", 15),
+                    "the entry row never landed while the call was blocked")
+                self.assertFalse(release.exists())
+                release.touch()
+                _, stderr = child.communicate(timeout=30)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 0, stderr)
             with open(ledger, encoding="utf-8") as stream:
                 rows = oracle.read_ledger(stream)
             summary = oracle.validate_ledger(rows)
@@ -1362,6 +1414,19 @@ unsigned long C_GetFunctionList(void **out) {
             self.assertNotIn("rv", entries[0])
             result = oracle.compare_abi(rows, healthy_counts(rows))
             self.assertEqual((result["calls"], result["returns"]), (2, 1))
+
+    def test_fixture_blocked_without_handshake_refused(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, fixture = self.build_pair(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(fixture), str(provider), str(ledger), "", "blocked"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("blocked mode needs", completed.stderr)
+            self.assertNotIn("READY", completed.stdout)
+            self.assertFalse(ledger.exists())
 
     def test_fixture_cell_tag_round_trip(self):
         oracle = require_oracle(self)

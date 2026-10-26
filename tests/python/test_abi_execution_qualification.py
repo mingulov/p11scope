@@ -600,6 +600,80 @@ class S1ReportGateTests(unittest.TestCase):
             driver.check_s1_report(report, PIN)
 
 
+class BlockedS1PinTests(unittest.TestCase):
+    def blocked_report(self, driver, in_flight_at_end):
+        return build_evidence(
+            driver, [function_row(9, "C_InitToken", 1,
+                                  {"0000000000000000": 1}),
+                     function_row(10, "C_InitPIN", 0, {}, in_flight=1)],
+            extra={"in_flight_at_end": in_flight_at_end})
+
+    def test_blocked_in_flight_pin_accepted(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = self.blocked_report(driver, 1)
+        self.assertIn("in_flight_at_end",
+                      report["evidence"]["gap_classes"]["observation"]["causes"])
+        diagnostics = driver.check_s1_report(
+            report, PIN, expected_in_flight_at_end=1,
+            extra_observation_causes={"in_flight_at_end"})
+        self.assertEqual(set(diagnostics["observation_causes"]),
+                         set(driver.PINNED_OBSERVATION_CAUSES)
+                         | {"in_flight_at_end"})
+
+    def test_blocked_in_flight_refused_by_default(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = self.blocked_report(driver, 1)
+        with self.assertRaisesRegex(driver.DriverRefusal, "in_flight_at_end"):
+            driver.check_s1_report(report, PIN)
+
+    def test_blocked_in_flight_count_mismatch_refused(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = self.blocked_report(driver, 2)
+        with self.assertRaisesRegex(driver.DriverRefusal, "in_flight_at_end"):
+            driver.check_s1_report(
+                report, PIN, expected_in_flight_at_end=1,
+                extra_observation_causes={"in_flight_at_end"})
+        report = self.blocked_report(driver, 0)
+        with self.assertRaisesRegex(driver.DriverRefusal, "in_flight_at_end"):
+            driver.check_s1_report(
+                report, PIN, expected_in_flight_at_end=1,
+                extra_observation_causes={"in_flight_at_end"})
+
+    def test_blocked_unpinned_cause_refused(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = self.blocked_report(driver, 1)
+        with self.assertRaisesRegex(driver.DriverRefusal, "pinned"):
+            driver.check_s1_report(report, PIN, expected_in_flight_at_end=1)
+
+
+class BlockedEntryProofTests(unittest.TestCase):
+    def test_capture_saw_entry_found(self):
+        driver = require_driver(self)
+        report = {"functions": [
+            function_row(9, "C_InitToken", 1, {"0000000000000000": 1}),
+            function_row(10, "C_InitPIN", 0, {}, in_flight=1)]}
+        proof = driver.blocked_entry_in_flight(report)
+        self.assertEqual((proof["calls"], proof["in_flight"]), (0, 1))
+
+    def test_capture_missed_entry_refused(self):
+        driver = require_driver(self)
+        report = {"functions": [
+            function_row(10, "C_InitPIN", 0, {})]}
+        with self.assertRaisesRegex(driver.DriverRefusal, "in flight"):
+            driver.blocked_entry_in_flight(report)
+
+    def test_entry_row_missing_refused(self):
+        driver = require_driver(self)
+        report = {"functions": [
+            function_row(9, "C_InitToken", 1, {"0000000000000000": 1})]}
+        with self.assertRaisesRegex(driver.DriverRefusal, "entry 10"):
+            driver.blocked_entry_in_flight(report)
+
+
 class OracleSeamTests(unittest.TestCase):
     def test_healthy_ledger_judged_through_cli(self):
         driver = require_driver(self)

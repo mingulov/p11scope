@@ -813,15 +813,25 @@ link.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 
+- 2026-10-26 cold admission (qualified at the discovery seams): an
+  already-zombie thread-group leader with exactly one live survivor
+  admits as a caller with the survivor-served image and the leader
+  birth, and both identity backends then attribute its held mappings
+  exactly like the warm path. Two or more live survivors refuse by
+  name (never a pick); a fully dead group keeps the generic gone
+  refusal. Cold callers make no native-use claim (they stay unproven
+  for native binding). Live-capture enumeration of a group first met
+  after its leader died still needs its follow-up.
 - Development checkpoint: discovery can classify a zombie-leader group as
   exited even while a surviving thread runs, and omit that group from its
   membership result. `--system` remains a preview; an absent group does not
   prove that its provider use or surviving threads have ended. Complete
   live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
-  other threads keep running (a zombie leader) is never admitted as a
-  caller: it has no `callers[]` record and no edge, and its provider use
-  appears only as module-level `modules[].unbound_use` with the
+  other threads keep running (a zombie leader), and that the capture never
+  observed before the exit, is still not admitted as a caller: it has no
+  `callers[]` record and no edge, and its provider use appears only as
+  module-level `modules[].unbound_use` with the
   `used by an unidentified caller image` gap. An exec chain whose images
   exec within one pass likewise binds no image: its rows are unbound as
   `exec_after_admission`, `no_live_caller` or `before_admission`, and the
@@ -835,8 +845,8 @@ link.
   watch or positive claim is made for these processes.
 - Workaround: none for complete caller coverage. Module-level observations
   describe captured rows; they do not establish coverage of an omitted group.
-- Future work: retained live-member identity and zombie-leader admission;
-  outside this intermediate checkpoint.
+- Future work: live-capture enumeration of never-before-seen zombie
+  leaders; outside this intermediate checkpoint.
 
 ### Overlay xino/copy-up identity divergences (D-C7-2/D-C7-3)
 

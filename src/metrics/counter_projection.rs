@@ -13,6 +13,7 @@ use crate::semantics_edge::resources::{
 };
 use p11scope_ebpf_common::CounterMode;
 use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +352,8 @@ impl CaptureCollection {
                 binding,
                 super::counter_reader::read_bound,
                 legacy,
+                session.counter_collection_generation(),
+                || super::kernel_evidence(session),
             )
         } else {
             self.fresh_with(
@@ -360,12 +363,17 @@ impl CaptureCollection {
                 binding,
                 super::counter_reader::read_bound,
                 legacy,
+                session.counter_collection_generation(),
+                || super::kernel_evidence(session),
             )
         }
     }
 
     // I/O-only injection stays private. Production callers cannot supply an
-    // arbitrary retained read paired with a newly selected plan.
+    // arbitrary retained read paired with a newly selected plan. The
+    // session's collection generation and a kernel-evidence source feed
+    // the zero-endpoint bypass, which publishes no bank rows but must
+    // still report measured kernel evidence under the real generation.
     fn fresh_with<B>(
         &mut self,
         plan: &AttachPlan,
@@ -380,6 +388,8 @@ impl CaptureCollection {
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
         legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        _generation: NonZeroU64,
+        _kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
         match binding {
             Ok(None) => {
@@ -480,10 +490,12 @@ impl CaptureCollection {
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
         legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        generation: NonZeroU64,
+        kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
         // Always acquire, observe and project again. An Ok read with a folded
         // row issue, health refusal or collector failure is not a settled read.
-        self.fresh_with(plan, pins, profile, binding, acquire, legacy)?
+        self.fresh_with(plan, pins, profile, binding, acquire, legacy, generation, kernel)?
             .require_terminal()
     }
 }
@@ -934,6 +946,8 @@ pub(super) mod tests {
                     Ok(None::<()>),
                     |(), _, _, _, _| panic!("ordinary snapshot cannot acquire counters"),
                     || Ok((Vec::new(), KernelEvidence::default())),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
                 .unwrap()
         }
@@ -1061,6 +1075,8 @@ pub(super) mod tests {
                     Ok(Some(())),
                     acquire,
                     legacy,
+                    std::num::NonZeroU64::new(generation).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
             } else {
                 self.collection.fresh_with(
@@ -1070,6 +1086,8 @@ pub(super) mod tests {
                     Ok(Some(())),
                     acquire,
                     legacy,
+                    std::num::NonZeroU64::new(generation).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
             }
         }
@@ -1102,6 +1120,8 @@ pub(super) mod tests {
                 binding,
                 |(), _, _, _, _| panic!("absent owner inputs must refuse before native reads"),
                 || panic!("present or refused counters must not fall back to legacy"),
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
             );
             assert!(result.is_err());
         }
@@ -1116,6 +1136,8 @@ pub(super) mod tests {
                 Err::<Option<()>, _>(BankRefusal::Quarantined),
                 |(), _, _, _, _| panic!("refused binding cannot read"),
                 || panic!("refused binding cannot fall back"),
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
             )
             .unwrap();
         assert_eq!(stale.reports()[0].calls, 5);
@@ -1132,7 +1154,9 @@ pub(super) mod tests {
                     false,
                     Ok(None::<()>),
                     |(), _, _, _, _| panic!("no binding cannot read counters"),
-                    || panic!("a counter capture cannot switch to legacy")
+                    || panic!("a counter capture cannot switch to legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
                 .is_err()
         );
@@ -1160,6 +1184,8 @@ pub(super) mod tests {
                             },
                         ))
                     },
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
                 .unwrap();
             assert!(snapshot.counter_collection().is_none());
@@ -1528,6 +1554,8 @@ pub(super) mod tests {
                         Err(ReadStage::BankRouting)
                     },
                     || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
                 .expect("unstaged empty counter fresh succeeds");
             assert_eq!(calls.get(), 0, "empty bypasses bank reads");
@@ -1543,6 +1571,8 @@ pub(super) mod tests {
                         Err(ReadStage::BankRouting)
                     },
                     || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
                 )
                 .expect("unstaged empty counter terminal succeeds");
             assert_eq!(calls.get(), 0, "empty bypasses bank reads");
@@ -1596,6 +1626,8 @@ pub(super) mod tests {
                         Err::<Option<()>, _>(BankRefusal::Quarantined),
                         |(), _, _, _, _| panic!("quarantined must not read"),
                         || panic!("quarantined must not use legacy"),
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        || Ok(KernelEvidence::default()),
                     )
                     .is_err()
             );
@@ -1620,6 +1652,8 @@ pub(super) mod tests {
                         Ok(Some(())),
                         |(), _, _, _, _| Err(ReadStage::BankRouting),
                         || panic!("counter must not use legacy"),
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        || Ok(KernelEvidence::default()),
                     )
                     .is_err()
             );
@@ -1644,8 +1678,124 @@ pub(super) mod tests {
                         Ok(None::<()>),
                         |(), _, _, _, _| panic!("absent binding must not read"),
                         || panic!("counter capture cannot switch to legacy"),
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        || Ok(KernelEvidence::default()),
                     )
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn counter_empty_capture_reports_sourced_evidence_and_generation() {
+        use crate::metrics::KernelControl;
+        use p11scope_ebpf_common::OWNER_BAD_CONTROL;
+        // The bypass publishes no bank rows, but the kernel evidence it
+        // reports must come from the source (production reads the live
+        // control cells) under the session's real generation: refused
+        // identities and a poisoned owner reach kernel_evidence() and
+        // make the report PARTIAL, on both the live and terminal paths.
+        for terminal in [false, true] {
+            let plan = AttachPlan::from_slots_with_policy(
+                vec![],
+                AdmissionPolicy::counters(crate::capacity::CounterBudget::new(512).unwrap()),
+            )
+            .unwrap();
+            let pins = PinnedObjects::empty();
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                CounterMode::Counts,
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            let kernel = KernelEvidence {
+                ring_loss: 7,
+                control: KernelControl {
+                    identity_unavailable: 3,
+                    owner_poison: OWNER_BAD_CONTROL,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let snapshot = if terminal {
+                collection.terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| panic!("empty bypass reads no banks"),
+                    || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(2).unwrap(),
+                    || Ok(kernel),
+                )
+            } else {
+                collection.fresh_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| panic!("empty bypass reads no banks"),
+                    || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(2).unwrap(),
+                    || Ok(kernel),
+                )
+            }
+            .expect("sourced empty bypass succeeds");
+            assert_eq!(snapshot.kernel_evidence(), kernel);
+            assert_eq!(snapshot.counter_collection().unwrap()["generation"], 2);
+            let mut evidence = crate::render::tests::evidence();
+            evidence.kernel_control = snapshot.kernel_evidence().control.evidence();
+            evidence.verdict();
+            assert_eq!(evidence.completeness, "PARTIAL");
+        }
+    }
+
+    #[test]
+    fn counter_empty_capture_fails_when_kernel_evidence_is_unavailable() {
+        // A kernel-evidence read error fails the bypass with its own
+        // name instead of publishing default evidence, on both paths.
+        for terminal in [false, true] {
+            let plan = AttachPlan::from_slots_with_policy(
+                vec![],
+                AdmissionPolicy::counters(crate::capacity::CounterBudget::new(512).unwrap()),
+            )
+            .unwrap();
+            let pins = PinnedObjects::empty();
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                CounterMode::Counts,
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            let result = if terminal {
+                collection.terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| panic!("empty bypass reads no banks"),
+                    || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || anyhow::bail!("test EVIDENCE read failed"),
+                )
+            } else {
+                collection.fresh_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| panic!("empty bypass reads no banks"),
+                    || panic!("empty counter must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || anyhow::bail!("test EVIDENCE read failed"),
+                )
+            };
+            let error = result.expect_err("a kernel-evidence failure must fail");
+            assert!(
+                format!("{error:#}").contains("counter collection unavailable (kernel_evidence)"),
+                "{error:#}"
             );
         }
     }

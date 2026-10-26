@@ -2335,6 +2335,41 @@ impl Drop for OwnedCgroup {
     }
 }
 
+/// Returns one pid to the parent cgroup when dropped unless disarmed.
+/// Armed immediately after the test moves itself into the owned cgroup:
+/// a panic before the explicit move-out then still vacates the cgroup,
+/// so `OwnedCgroup::Drop` can remove the directory instead of littering
+/// a root-owned one. Best-effort and panic-free by construction (`Drop`
+/// ignores the write result); a `kill -9` of the harness still litters,
+/// by design of signals, and refuses loudly on the next run.
+struct CgroupMoveOutGuard {
+    pid: u32,
+    dest: PathBuf,
+    armed: bool,
+}
+
+impl CgroupMoveOutGuard {
+    fn arm(pid: u32, dest: PathBuf) -> Self {
+        Self {
+            pid,
+            dest,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CgroupMoveOutGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::write(&self.dest, self.pid.to_string());
+        }
+    }
+}
+
 /// A panic between the cgroup move-in and move-out must not strand the
 /// test thread in the owned cgroup (whose `remove_dir` would then fail,
 /// littering a root-owned dir). The guard moves the pid back to the
@@ -2442,6 +2477,9 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     // enumeration only ever sees the wave.
     let this = std::process::id();
     cgroup.move_in(this, WHAT);
+    // Armed before any fallible step: a panic below still vacates the
+    // cgroup, so the directory removes instead of littering root-owned.
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
     assert!(
         cgroup.members(WHAT).contains(&this),
         "{WHAT}: the test must spawn from inside the cgroup"
@@ -2452,6 +2490,7 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     assert_eq!(owned.len(), LOADS);
     std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
         .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
     assert_eq!(
         cgroup.members(WHAT),
         owned,

@@ -23,6 +23,13 @@ under the owner's key. Post-fence terminals are gapped (finalize/exec)
 with no completion preserved in either path. The S1Only section carries
 no key rows and no gaps; its unknown completed/cancelled/failed/active
 must equal the joint totals exactly (cross-run equality).
+
+With `--s1` (releases without a key-operation feed) the oracle instead
+proves the S1-active case: both sections read
+unavailable/journal_unavailable with no rows, no gap carries the denied
+joint-machine text in either position, every gaps_suppressed reads 0,
+and the reported S1 returns/mechanisms equal the fixture ledgers'
+per-call tallies. The Joint mode above stays for 0.5.1.
 """
 
 import argparse
@@ -60,6 +67,15 @@ STATUS_REASONS = {"none", "bootstrap_unavailable", "proof_refused_fallback",
                   "authority_lost", "row_budget_exhausted",
                   "publication_budget_exhausted", "serialization_refused",
                   "sink_failed"}
+# S1 marker (v0.5.0, no key-operation feed): the section reason the
+# Joint vocabulary never carries.
+S1_STATUS = "unavailable"
+S1_REASON = "journal_unavailable"
+S1_STATUS_REASONS = STATUS_REASONS | {S1_REASON}
+# The plan-named joint-machine gap text, denied as a gap subject or
+# reason in S1 mode (it reads as the subject argument of the two-arg
+# gap helper in production, so both positions are denied).
+S1_DENIED_GAP = "joint machine unavailable"
 KEY_COUNTERS = ("started", "completed", "failed", "cancelled", "unknown",
                 "active", "key_join_lost")
 UNKNOWN_COUNTERS = ("completed", "failed", "cancelled", "unknown", "active")
@@ -1091,8 +1107,159 @@ def compare_stream(events, collision, snapshot, view):
             "revision": last_revision}
 
 
+def validate_s1_section(document, tag):
+    """Validate the v0.5.0 S1 marker section; refuse any Joint evidence.
+
+    The section must read unavailable/journal_unavailable with no
+    session, object, key or unknown rows, no gap rows, and
+    gaps_suppressed 0. The denied joint-machine text fails in either
+    gap position before the shape and emptiness checks run, so a
+    denied gap names itself and a benign row fails as a leftover row.
+    """
+    _keys(document, {"version", "revision", "status", "reason", "sessions",
+                     "objects", "key_operations", "unknown_key_operations",
+                     "gaps", "budgets"})
+    _require(document["version"] == 1, f"{tag}: snapshot version mismatch")
+    _require(_integer(document["revision"]), f"{tag}: snapshot revision out of range")
+    _require(document["status"] in STATUSES, f"{tag}: snapshot status invalid")
+    _require(document["reason"] in S1_STATUS_REASONS,
+             f"{tag}: snapshot reason invalid")
+    _require(document["status"] == S1_STATUS
+             and document["reason"] == S1_REASON,
+             f"{tag}: snapshot status {document['status']}"
+             f" reason {document['reason']}:"
+             " want unavailable/journal_unavailable")
+    _require(type(document["sessions"]) is list and not document["sessions"]
+             and type(document["objects"]) is list and not document["objects"],
+             f"{tag}: S1 mode needs no session rows")
+    _require(type(document["key_operations"]) is list
+             and not document["key_operations"],
+             f"{tag}: S1 mode needs no key-operation rows")
+    _require(type(document["unknown_key_operations"]) is list
+             and not document["unknown_key_operations"],
+             f"{tag}: S1 mode needs no unknown key-operation rows")
+    gaps = document["gaps"]
+    _require(type(gaps) is dict, f"{tag}: snapshot gaps must be an object")
+    _keys(gaps, {"rows", "suppressed"})
+    _require(type(gaps["rows"]) is list, f"{tag}: snapshot gap rows must be a list")
+    _require(len(gaps["rows"]) <= 256, f"{tag}: snapshot gap rows exceed 256")
+    for position, row in enumerate(gaps["rows"]):
+        where = f"{tag} snapshot gap {position}"
+        if type(row) is dict:
+            for field in ("subject", "reason"):
+                if row.get(field) == S1_DENIED_GAP:
+                    raise LedgerError(
+                        f"{where} {field} carries the denied joint-machine text")
+        _require(type(row) is dict, f"{where} must be an object")
+        _keys(row, {"subject", "reason", "repeats"})
+        _require(row["subject"] in ("model", "key_operation"),
+                 f"{where}: subject invalid")
+        _require(type(row["reason"]) is str, f"{where}: reason invalid")
+        _require(_integer(row["repeats"]), f"{where}: repeats out of range")
+    _require(_integer(gaps["suppressed"]),
+             f"{tag}: snapshot gaps suppressed out of range")
+    _require(gaps["suppressed"] == 0,
+             f"{tag}: snapshot gaps suppressed"
+             f" {_shown(gaps['suppressed'])} hides dispositions")
+    _require(not gaps["rows"], f"{tag}: S1 mode needs no gap rows")
+    budgets = document["budgets"]
+    _require(type(budgets) is dict, f"{tag}: snapshot budgets must be an object")
+    _keys(budgets, {"key_rows", "object_rows", "unknown_rows", "encoded_bytes",
+                    "allocation_refused", "refusal_reason"})
+    _check_row_budget(budgets["key_rows"], f"{tag} snapshot key_rows budget")
+    _check_row_budget(budgets["object_rows"], f"{tag} snapshot object_rows budget")
+    _require(type(budgets["unknown_rows"]) is dict,
+             f"{tag}: snapshot unknown_rows budget must be an object")
+    _keys(budgets["unknown_rows"], {"occupied"})
+    _require(_integer(budgets["unknown_rows"]["occupied"]),
+             f"{tag}: snapshot unknown_rows budget occupied out of range")
+    _require(_integer(budgets["encoded_bytes"]),
+             f"{tag}: snapshot encoded_bytes out of range")
+    _require(budgets["allocation_refused"] is False,
+             f"{tag}: snapshot allocation_refused changed")
+    _require(budgets["refusal_reason"] == "none",
+             f"{tag}: snapshot refusal_reason changed")
+    return document
+
+
+def _deny_s1_stream_gaps(events, view):
+    """Refuse the denied joint-machine text in any gap_recorded row.
+
+    Malformed lines are left for compare_stream; only a well-formed
+    gap_recorded row carrying the text in either position fails here.
+    """
+    for position, line in enumerate(events):
+        if type(line) is not dict or line.get("kind") != "gap_recorded":
+            continue
+        event = line.get("event")
+        if type(event) is not dict:
+            continue
+        for field in ("subject", "reason"):
+            if event.get(field) == S1_DENIED_GAP:
+                raise LedgerError(
+                    f"{view} stream line {position} gap_recorded {field}"
+                    " carries the denied joint-machine text")
+
+
+def _s1_tallies(rows_a, rows_b):
+    """S1 returns/mechanisms from ledger call rows; every call counts.
+
+    Returns (calls, returns, mechanisms): per-function return tallies
+    over both ledgers and per-scenario-mechanism call/error totals.
+    Teardown and fenced calls are observed calls too, so they count;
+    errors are non-OK returns at S1 granularity.
+    """
+    returns, mechanisms, calls = {}, {}, 0
+    for rows in (rows_a, rows_b):
+        mechanism = rows[1]["mechanism"]
+        group = mechanisms.setdefault(mechanism, {"calls": 0, "errors": 0})
+        for row in rows:
+            if row.get("kind") != "call":
+                continue
+            calls += 1
+            tally = returns.setdefault(row["fn"], {})
+            tally[row["rv"]] = tally.get(row["rv"], 0) + 1
+            group["calls"] += 1
+            if row["rv"] != CKR_OK:
+                group["errors"] += 1
+    return calls, returns, mechanisms
+
+
+def compare_s1(rows_a, rows_b, joint_snapshot, s1only_snapshot,
+               joint_events=None, s1only_events=None):
+    """Prove the S1-active case for a validated collision ledger pair.
+
+    The ledgers must still collide (the fixture scenario is unchanged);
+    both sections must read unavailable/journal_unavailable with no
+    rows and no denied gap; the optional streams must carry no H9
+    rows, no denied gap_recorded text, and gaps_suppressed 0. The
+    reported S1 returns/mechanisms are the ledgers' per-call tallies.
+    """
+    first = validate_ledger(rows_a, "ledger A")
+    second = validate_ledger(rows_b, "ledger B")
+    collision = compare_collision(first, second)
+    calls, returns, mechanisms = _s1_tallies(rows_a, rows_b)
+    _require(calls > 0, "s1 needs at least one ledger call")
+    joint = validate_s1_section(joint_snapshot, "joint")
+    single = validate_s1_section(s1only_snapshot, "s1only")
+    result = {"mode": "s1", "processes": 2, "calls": calls,
+              "returns": returns, "mechanisms": mechanisms}
+    if joint_events is not None:
+        _deny_s1_stream_gaps(joint_events, "joint")
+        outcome = compare_stream(joint_events, collision, joint, "joint")
+        result["joint_events"] = outcome["events"]
+    if s1only_events is not None:
+        _deny_s1_stream_gaps(s1only_events, "s1only")
+        outcome = compare_stream(s1only_events, collision, single, "s1only")
+        result["s1only_events"] = outcome["events"]
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--s1", action="store_true",
+                        help="S1 mode: prove the S1-active case with both"
+                        " sections unavailable (no key-operation feed)")
     parser.add_argument("ledger_a", help="first process ledger JSONL file")
     parser.add_argument("ledger_b", help="second process ledger JSONL file")
     parser.add_argument("joint_snapshot",
@@ -1106,30 +1273,48 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         with open(args.ledger_a, encoding="utf-8") as stream:
-            first = validate_ledger(read_ledger(stream), "ledger A")
+            rows_a = read_ledger(stream)
         with open(args.ledger_b, encoding="utf-8") as stream:
-            second = validate_ledger(read_ledger(stream), "ledger B")
-        with open(args.joint_snapshot, encoding="utf-8") as stream:
-            joint = validate_snapshot(read_snapshot(stream.read()), "joint")
-        with open(args.s1only_snapshot, encoding="utf-8") as stream:
-            single = validate_snapshot(read_snapshot(stream.read()), "s1only")
-        collision = compare_collision(first, second)
-        result = {"processes": 2, "collided": len(collision["collided"]),
-                  "transfers": len(collision["transfers"]),
-                  "fenced": collision["fenced"]}
-        result.update(compare_joint(collision, joint))
-        result.update(compare_s1only(collision, single))
-        cross_totals(joint, single)
-        if args.joint_events is not None:
-            with open(args.joint_events, encoding="utf-8") as stream:
-                outcome = compare_stream(read_events(stream), collision,
-                                         joint, "joint")
-            result["joint_events"] = outcome["events"]
-        if args.s1only_events is not None:
-            with open(args.s1only_events, encoding="utf-8") as stream:
-                outcome = compare_stream(read_events(stream), collision,
-                                         single, "s1only")
-            result["s1only_events"] = outcome["events"]
+            rows_b = read_ledger(stream)
+        if args.s1:
+            with open(args.joint_snapshot, encoding="utf-8") as stream:
+                joint_doc = read_snapshot(stream.read())
+            with open(args.s1only_snapshot, encoding="utf-8") as stream:
+                single_doc = read_snapshot(stream.read())
+            joint_events = None
+            if args.joint_events is not None:
+                with open(args.joint_events, encoding="utf-8") as stream:
+                    joint_events = read_events(stream)
+            s1only_events = None
+            if args.s1only_events is not None:
+                with open(args.s1only_events, encoding="utf-8") as stream:
+                    s1only_events = read_events(stream)
+            result = compare_s1(rows_a, rows_b, joint_doc, single_doc,
+                                joint_events, s1only_events)
+        else:
+            first = validate_ledger(rows_a, "ledger A")
+            second = validate_ledger(rows_b, "ledger B")
+            with open(args.joint_snapshot, encoding="utf-8") as stream:
+                joint = validate_snapshot(read_snapshot(stream.read()), "joint")
+            with open(args.s1only_snapshot, encoding="utf-8") as stream:
+                single = validate_snapshot(read_snapshot(stream.read()), "s1only")
+            collision = compare_collision(first, second)
+            result = {"processes": 2, "collided": len(collision["collided"]),
+                      "transfers": len(collision["transfers"]),
+                      "fenced": collision["fenced"]}
+            result.update(compare_joint(collision, joint))
+            result.update(compare_s1only(collision, single))
+            cross_totals(joint, single)
+            if args.joint_events is not None:
+                with open(args.joint_events, encoding="utf-8") as stream:
+                    outcome = compare_stream(read_events(stream), collision,
+                                             joint, "joint")
+                result["joint_events"] = outcome["events"]
+            if args.s1only_events is not None:
+                with open(args.s1only_events, encoding="utf-8") as stream:
+                    outcome = compare_stream(read_events(stream), collision,
+                                             single, "s1only")
+                result["s1only_events"] = outcome["events"]
     except LedgerError as error:
         print(f"async refused: {error}", file=sys.stderr)
         return 1

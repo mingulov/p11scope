@@ -9739,7 +9739,12 @@ mod tests {
                 } else {
                     last_errno()
                 };
-                let mut report = [0i32; 66];
+                // The report fits the whole scan range (2 header slots plus
+                // every number 3..8192), so a crowded inherited table cannot
+                // truncate the listing and frame a live descriptor as closed.
+                const SCAN_FIRST: i32 = 3;
+                const SCAN_END: i32 = 8192;
+                let mut report = [0i32; 2 + (SCAN_END - SCAN_FIRST) as usize];
                 report[0] = install_errno;
                 let mut used = 2;
                 if install_errno == 0 {
@@ -9749,7 +9754,7 @@ mod tests {
                         Ok(()) => 0,
                         Err(errno) => errno,
                     };
-                    for fd in 3..8192 {
+                    for fd in SCAN_FIRST..SCAN_END {
                         let flags = libc::fcntl(fd, libc::F_GETFD);
                         if flags >= 0 && used < report.len() {
                             report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);

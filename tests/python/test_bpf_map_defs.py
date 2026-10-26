@@ -1039,6 +1039,163 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
 
 
+class JournalMarkerCallSiteTests(unittest.TestCase):
+    """H8-D birth marker call sites: every defined Detailed root that can
+    birth or gap must call its marker global. Core roots (entry, return,
+    exec) must exist; unsafe-only roots (ia32 entry, template
+    continuation) must call when defined."""
+
+    ROOTS = (
+        ("p11_entry", "uprobe", "p11_instance_scope_gap"),
+        ("p11_entry_ia32", "uprobe", "p11_instance_scope_gap"),
+        ("p11_return", "uretprobe", "p11_instance_scope_gap"),
+        ("p11_entry_template_second", "uprobe", "p11_instance_scope_gap"),
+        ("sched_process_exec", "raw_tp/sched_process_exec", "p11_instance_exec_birth"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="p11scope-marker-calls-")
+        cls.addClassCleanup(cls.temp.cleanup)
+
+    def calls_fixture(self, name, wired, roots=None, markers=True):
+        """Compile roots that call (or drop) their marker global.
+
+        wired: root names that call; roots: names to emit (default all
+        five); markers: emit the two marker globals. Each body is
+        textually distinct so the optimizer cannot merge two roots.
+        """
+        roots = [root for root in self.ROOTS if roots is None or root[0] in roots]
+        lines = [
+            '#define SEC(n) __attribute__((section(n), used))\n',
+            '#define LOOKUP(map, key) ((void *(*)(void *, void *))1)((map), (key))\n',
+            '#define STORAGE(map, task, value, flags) \\\n',
+            '    ((void *(*)(void *, void *, void *, unsigned long long))156)( \\\n',
+            '        (map), (task), (value), (flags))\n',
+            '#define CURRENT() ((void *(*)(void))158)()\n',
+            '#define BODY() \\\n',
+            '    unsigned key = 0; void *map = 0; \\\n',
+            '    void *found = LOOKUP(map, &key); \\\n',
+            '    void *task = CURRENT(); \\\n',
+            '    void *row = STORAGE(map, task, 0, 0); \\\n',
+            '    return (found != 0) + (task != 0) + (row != 0);\n',
+        ]
+        if markers:
+            lines += [
+                '__attribute__((noinline, used)) unsigned p11_instance_exec_birth(void)'
+                ' { BODY() }\n',
+                '__attribute__((noinline, used)) unsigned p11_instance_scope_gap(void)'
+                ' { BODY() }\n',
+            ]
+        else:
+            lines += [
+                'unsigned p11_instance_exec_birth(void);\n',
+                'unsigned p11_instance_scope_gap(void);\n',
+            ]
+        shapes = {
+            "p11_entry": "return (int)MARKER();",
+            "p11_entry_ia32": "{ unsigned r = MARKER(); return (int)(r & 255); }",
+            "p11_return": "{ unsigned r = MARKER(); return (int)(r | 256); }",
+            "p11_entry_template_second": "{ unsigned r = MARKER(); return (int)(r ^ 512); }",
+            "sched_process_exec": "return (int)MARKER();",
+        }
+        for index, (root, section, marker) in enumerate(roots):
+            if root in wired:
+                body = shapes[root].replace("MARKER()", f"{marker}()")
+            else:
+                body = f"{{ (void)ctx; return {100 + index}; }}"
+            lines.append(f'SEC("{section}") int {root}(void *ctx) {{ (void)ctx; {body} }}\n')
+        lines.append('char LICENSE[] SEC("license") = "GPL";\n')
+        source = Path(self.temp.name) / f"{name}.c"
+        obj = Path(self.temp.name) / f"{name}.o"
+        source.write_text("".join(lines))
+        subprocess.run(
+            ["clang-18", "-target", "bpfel", "-O2", "-c", str(source), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        return obj
+
+    def check_calls(self, name, wired, roots=None, markers=True):
+        obj = self.calls_fixture(name, wired, roots, markers)
+        return checker.validate_marker_call_sites(checker.Elf(obj.read_bytes()))
+
+    def test_marker_calls_healthy_diagnostic(self):
+        """Healthy twin: all five roots wired validates."""
+        self.check_calls(
+            "marker-calls-healthy",
+            {root for root, _, _ in self.ROOTS},
+        )
+
+    def test_marker_calls_healthy_default(self):
+        """Healthy twin: the three core roots wired validates when the
+        unsafe-only roots are absent."""
+        self.check_calls(
+            "marker-calls-default",
+            {"p11_entry", "p11_return", "sched_process_exec"},
+            roots={"p11_entry", "p11_return", "sched_process_exec"},
+        )
+
+    def test_marker_calls_without_markers_skipped(self):
+        """Healthy twin: an object without the globals skips the check."""
+        self.check_calls("marker-calls-skip", set(), markers=False)
+
+    def test_marker_call_dropped_from_entry_refused(self):
+        """Named mutant: entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-entry",
+                {"p11_entry_ia32", "p11_return", "p11_entry_template_second",
+                 "sched_process_exec"},
+            )
+
+    def test_marker_call_dropped_from_ia32_entry_refused(self):
+        """Named mutant: the ia32 entry without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_ia32 must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-ia32",
+                {"p11_entry", "p11_return", "p11_entry_template_second",
+                 "sched_process_exec"},
+            )
+
+    def test_marker_call_dropped_from_return_refused(self):
+        """Named mutant: return without its gap call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_return must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-return",
+                {"p11_entry", "p11_entry_ia32", "p11_entry_template_second",
+                 "sched_process_exec"},
+            )
+
+    def test_marker_call_dropped_from_template_continuation_refused(self):
+        """Named mutant: the template continuation without its gap call
+        is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed p11_entry_template_second must call p11_instance_scope_gap"
+        ):
+            self.check_calls(
+                "marker-calls-drop-second",
+                {"p11_entry", "p11_entry_ia32", "p11_return", "sched_process_exec"},
+            )
+
+    def test_marker_call_dropped_from_exec_refused(self):
+        """Named mutant: exec without its birth call is refused."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"Detailed sched_process_exec must call p11_instance_exec_birth"
+        ):
+            self.check_calls(
+                "marker-calls-drop-exec",
+                {"p11_entry", "p11_entry_ia32", "p11_return",
+                 "p11_entry_template_second"},
+            )
+
+
 class Ia32SpanProofTests(unittest.TestCase):
     def test_saved_sentinel_requires_proven_full_width_register_flow(self):
         def reader(saved, suffix, high=1):

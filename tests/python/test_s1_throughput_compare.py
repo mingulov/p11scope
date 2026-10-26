@@ -891,7 +891,7 @@ class DriverFixture(unittest.TestCase):
         self.assertTrue(DRIVER_SRC.exists(),
                         f"driver missing: {DRIVER_SRC}")
         driver = workdir / "gen-calls"
-        build_c(self, [DRIVER_SRC], driver, extra=["-ldl"])
+        build_c(self, [DRIVER_SRC], driver, extra=["-ldl", "-pthread"])
         return driver
 
     def build_stub(self, workdir):

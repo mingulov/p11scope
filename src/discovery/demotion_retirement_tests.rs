@@ -5221,3 +5221,243 @@ fn cnt1_terminal_growth_of_exited_sole_owner_attributes() {
         scene.owner_unproven_gaps()
     );
 }
+
+/// The production pass order for one steady `--pid` caller
+/// (`inventory_capture.rs`, `run_classic_finalizing`): read the pass
+/// clock, collect (the deep scan, while collection ticks drain and hold
+/// lifecycle quanta), apply the catalog, stage the held quanta, one
+/// service quantum and the witness read, commit, then service ticks
+/// between passes. Unlike the scenes above, nothing is admitted,
+/// projected or committed before the first pass: the first pass itself
+/// detects the caller and first projects its provider, and its
+/// reconcile runs before that pass commits. Every stamp comes from one
+/// clock, so a later pass's scan follows the earlier pass's reads.
+struct LiveOrder {
+    native: NativeScene,
+    a: std::path::PathBuf,
+    pins: crate::discovery::identity::PinnedObjects,
+    offsets: Vec<u64>,
+    generation: crate::inspect_system::MemberGeneration,
+    caller: Option<CallerId>,
+    /// After each pass: the edge count and the owner-unproven and
+    /// demoted-placement gaps recorded so far.
+    observed: Vec<(u64, Vec<String>)>,
+}
+
+impl LiveOrder {
+    /// Service ticks between passes (live runs about ten per second).
+    const TICKS: usize = 3;
+
+    fn new() -> Self {
+        use crate::discovery::caller_registry::ProcessSource;
+        let scene = CaptureScene::new(68);
+        scene.source.spawn(7, 500);
+        let generation = crate::inspect_system::MemberGeneration {
+            start_time: scene.source.start_time(7),
+            exe: scene.source.exe_identity(7),
+        };
+        let mut native = NativeScene::over(scene, 0);
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_current_binding_clock(query_clock);
+        native.answer(7, 500, 41);
+        let a = native.scene.path.clone();
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        Self {
+            native,
+            a,
+            pins,
+            offsets: fx::offsets(68),
+            generation,
+            caller: None,
+            observed: Vec::new(),
+        }
+    }
+
+    fn catalog(&self, started: u64, finished: u64) -> crate::inspect_system::Catalog {
+        let mut catalog = capture_catalog(&self.pins, &[&self.a], 7, Some(self.generation.clone()));
+        catalog.processes[0].complete_scan =
+            Some(crate::inspect_system::CompleteMemberScan::scripted(
+                self.generation.clone(),
+                started,
+                finished,
+            ));
+        let targets: Vec<(&std::path::Path, u64)> = self
+            .offsets
+            .iter()
+            .map(|offset| (self.a.as_path(), *offset))
+            .collect();
+        let modules = vec![fx::module_with_targets(&self.pins, &self.a, &targets)];
+        catalog.lowering = Some(crate::inspect_system::CatalogLowering {
+            plan: fx::lower_named(
+                &modules,
+                &self.pins,
+                crate::plan::AdmissionPolicy::Inventory(
+                    self.native.scene.coordinator.attach_set.budget(),
+                ),
+            ),
+            pins: fx::pass_pins(&[(&self.a, "sha-a")]),
+        });
+        catalog
+    }
+
+    fn drain(&mut self) {
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.native.drain();
+    }
+
+    fn read(&mut self, rows: Vec<WitnessRow>, counts: Vec<(u64, u64, usize, u64)>) {
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        self.native.counts_read(rows, counts);
+    }
+
+    fn commit(&mut self) {
+        self.native.scene.coordinator.commit_batch(false).unwrap();
+    }
+
+    /// One pass. `row` delivers the first-use witness row (read once,
+    /// like live); `count` is the refreshed absolute count, if any.
+    fn pass(&mut self, row: bool, count: Option<u64>) {
+        let now = self.native.stamps.tick();
+        let started = self.native.stamps.tick();
+        let finished = self.native.stamps.tick();
+        let held = self.native.stamps.drain(self.native.domain);
+        QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
+        let catalog = self.catalog(started, finished);
+        self.native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+            &mut self.native.cookies,
+            now + 1_000_000,
+            now,
+        );
+        self.caller = self.native.scene.coordinator.adapter.live_id(7);
+        self.native.stage(held);
+        self.drain();
+        let rows = if row {
+            let t0 = self.native.stamps.tick();
+            let mut row = self.native.row(41, 1, 7, t0, 0);
+            row.entry_count = 2_000;
+            vec![row]
+        } else {
+            Vec::new()
+        };
+        let counts = count.map_or_else(Vec::new, |count| vec![(41, 1, 0, count)]);
+        self.read(rows, counts);
+        self.commit();
+        self.note();
+        for _ in 0..Self::TICKS {
+            self.drain();
+        }
+    }
+
+    /// The finite stop after the target exited (the live runner's order:
+    /// the workload ends, then the observer is interrupted, with no pass
+    /// between): the stop drain, the terminal read (before coverage
+    /// ends), the post-stop refresh read and the domain's finish, then
+    /// the final commit.
+    fn stop_after_exit(&mut self, terminal: u64) {
+        self.native.scene.source.kill(7);
+        self.stop(terminal);
+    }
+
+    /// The same finite stop while the target still runs.
+    fn stop(&mut self, terminal: u64) {
+        self.native.scene.coordinator.stop();
+        self.drain();
+        self.read(Vec::new(), vec![(41, 1, 0, terminal)]);
+        let at = self.native.stamps.tick();
+        self.native.scene.coordinator.end_capture_coverage(at);
+        self.drain();
+        self.read(Vec::new(), vec![(41, 1, 0, terminal)]);
+        let domain = self.native.domain;
+        self.native.stage(NativeBatch::Finish { domain });
+        self.commit();
+        self.note();
+    }
+
+    fn note(&mut self) {
+        let edge = self.caller.map_or(0, |caller| {
+            self.native
+                .scene
+                .coordinator
+                .registry()
+                .edges_of(caller)
+                .next()
+                .map_or(0, |edge| edge.entry_count)
+        });
+        let gaps = self
+            .native
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.reason.contains("physical owner is not proven")
+                    || gap.subject == crate::discovery::caller_registry::DEMOTED_COUNT_PLACED
+            })
+            .map(|gap| format!("{}: {}", gap.subject, gap.reason))
+            .collect();
+        self.observed.push((edge, gaps));
+    }
+}
+
+/// The live quiet, first-use and counted passes before the stop.
+fn live_steady_passes() -> LiveOrder {
+    let mut scene = LiveOrder::new();
+    scene.pass(false, None);
+    scene.pass(false, None);
+    scene.pass(true, None);
+    for count in [427_579, 608_121, 815_289] {
+        scene.pass(false, Some(count));
+    }
+    scene
+}
+
+/// A steady single caller whose provider is first projected by the same
+/// pass that detects the caller: after first use every refresh lands
+/// exactly on its sole edge, and so does the terminal read at a stop
+/// while the target runs. Live passes, in order: two quiet passes (the
+/// gate is closed), the first-use row, then counted refreshes. No
+/// owner-unproven range and no demoted placement may appear anywhere.
+#[test]
+fn steady_caller_first_projected_with_its_provider_attributes_every_count() {
+    let mut scene = live_steady_passes();
+    scene.stop(1_027_812);
+    let expected: Vec<(u64, Vec<String>)> = [0, 0, 0, 427_579, 608_121, 815_289, 1_027_812]
+        .into_iter()
+        .map(|edge| (edge, Vec::new()))
+        .collect();
+    assert_eq!(
+        scene.observed, expected,
+        "per pass (edge count, owner-unproven and demoted-placement gaps)"
+    );
+}
+
+/// The same caller exits after its last counted pass and the capture
+/// stops before any pass classifies that exit. Every count up to the
+/// last pass lands exactly; the tail read after the death stays
+/// disclosed, never placed: no pass proved the exit, so the liveness
+/// cancel holds (under `--pid` the lost scope custody cancels as well).
+#[test]
+fn steady_caller_exit_before_any_pass_classifies_it_discloses_only_the_tail() {
+    let mut scene = live_steady_passes();
+    scene.stop_after_exit(1_027_812);
+    let (last, rest) = scene.observed.split_last().expect("stop observed");
+    let expected: Vec<(u64, Vec<String>)> = [0, 0, 0, 427_579, 608_121, 815_289]
+        .into_iter()
+        .map(|edge| (edge, Vec::new()))
+        .collect();
+    assert_eq!(rest, expected.as_slice(), "every pass before the stop");
+    assert_eq!(last.0, 815_289, "nothing past the last proven read lands");
+    assert_eq!(last.1.len(), 1, "one disclosed tail: {:?}", last.1);
+    assert!(
+        last.1[0].contains("physical owner is not proven")
+            && last.1[0].contains("(815289, 1027812]"),
+        "the tail is disclosed exactly: {:?}",
+        last.1
+    );
+}

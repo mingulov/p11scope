@@ -59,6 +59,32 @@ pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
 /// matches these markers — the push sites below must keep using them.
 pub(crate) const NO_TABLE_FOUND_MARKER: &str =
     "no function table was found in its file-backed data";
+/// Shell-quote a module path for the suggested discover command, so
+/// the line stays copy-pasteable when the path carries spaces or shell
+/// metacharacters. Paths of letters, digits, `/`, `_`, `-` and `.`
+/// pass through byte-identical; anything else is single-quoted with
+/// embedded quotes escaped.
+fn shell_quote_module_path(module_path: &str) -> String {
+    let safe = !module_path.is_empty()
+        && module_path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'));
+    if safe {
+        return module_path.to_string();
+    }
+    let mut quoted = String::with_capacity(module_path.len() + 2);
+    quoted.push('\'');
+    let mut first = true;
+    for part in module_path.split('\'') {
+        if !first {
+            quoted.push_str("'\\''");
+        }
+        first = false;
+        quoted.push_str(part);
+    }
+    quoted.push('\'');
+    quoted
+}
 /// Skip reason for a module whose table the memory scan cannot see: the
 /// fixed diagnosis plus the action that observes such a provider. One
 /// line; `module_path` is the skipped module's own path.
@@ -68,10 +94,11 @@ pub(crate) fn no_table_found_reason(module_path: &str, hinted: bool) -> String {
     } else {
         ""
     };
+    let quoted = shell_quote_module_path(module_path);
     format!(
         "{named}{NO_TABLE_FOUND_MARKER}; a table built at run time in .bss or on the heap is \
          outside the memory scan's reach; to observe it, run p11scope-discover --module \
-         {module_path} -o <manifest.json> and pass --manifest <manifest.json>"
+         {quoted} -o <manifest.json> and pass --manifest <manifest.json>"
     )
 }
 pub(crate) const HINT_NOT_MAPPED_REASON: &str = "not mapped in the target";

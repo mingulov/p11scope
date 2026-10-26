@@ -540,7 +540,7 @@ example (4242 is an example PID, not a detected target):
   p11scope inventory --cgroup <path> --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
   p11scope inventory --system --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 Choose exactly one of --pid, --cgroup, or --system; --cgroup includes descendants.
 Quiet cgroup usage remains unknown: endpoint samples do not prove continuous membership.
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.

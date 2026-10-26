@@ -968,6 +968,45 @@ pub(crate) enum BankRefusal {
     Quarantined,
 }
 
+/// Finite site names for bare `Topology` staging refusals. The refusal VALUE
+/// stays a bare `BankRefusal` (every existing match keeps working); the name
+/// travels alongside through the `_detailed` staging twins into the Session's
+/// last-check slot, so an Engine counter start can say WHICH check failed
+/// instead of reporting a bare `Topology`. Non-Topology refusals already
+/// name themselves (`Shape` causes, `BudgetExhausted` resources) and carry
+/// no check name.
+const COUNTER_CHECK_PLAN_BUDGET: &str = "counter plan budget differs from the staged budget";
+const COUNTER_CHECK_PLAN_CONSUMED: &str =
+    "counter plan consumed prefix differs from the staged length";
+const COUNTER_CHECK_PLAN_SHORTER: &str = "counter plan is shorter than the staged prefix";
+const COUNTER_CHECK_PLAN_INDEX: &str = "counter plan slot indices are not dense";
+const COUNTER_CHECK_PLAN_INACTIVE: &str = "counter plan has inactive fresh slots";
+const COUNTER_CHECK_PLAN_KEY: &str = "counter plan slot differs from the staged key";
+const COUNTER_CHECK_DUPLICATE: &str = "counter plan has duplicate physical endpoints";
+const COUNTER_CHECK_ADOPT: &str = "counter plan cannot adopt the staged prefix";
+const COUNTER_CHECK_SIZING_CPUS: &str = "counter stage sizing saw zero CPUs";
+const COUNTER_CHECK_SESSION_STOPPED: &str = "counter session is stopping or detached";
+const COUNTER_CHECK_BACKEND: &str = "counter banks backend differs from the session backend";
+const COUNTER_CHECK_SCOPE: &str = "counter session scope is not one process";
+const COUNTER_CHECK_UNCHANGED: &str = "counter pinned provider changed";
+const COUNTER_CHECK_CPUS: &str = "counter CPU count changed since preparation";
+const COUNTER_CHECK_CONSUME_POLICY: &str = "counter extent plan is not a counter plan";
+const COUNTER_CHECK_CONSUME_EXTENT: &str = "counter extent does not cover the fresh tail";
+const COUNTER_CHECK_CONSUME_FRONTIER: &str = "counter extent frontier moved";
+const COUNTER_CHECK_CONSUME_TOPOLOGY: &str = "counter extent has inactive or misindexed slots";
+
+/// Names a history-consumption refusal. Unreachable after `validate_plan`
+/// passes (it proves the same policy, extent, frontier and activity facts),
+/// so this only labels defense-in-depth.
+fn consume_check_name(error: crate::plan::CounterHistoryError) -> &'static str {
+    match error {
+        crate::plan::CounterHistoryError::Policy => COUNTER_CHECK_CONSUME_POLICY,
+        crate::plan::CounterHistoryError::Extent => COUNTER_CHECK_CONSUME_EXTENT,
+        crate::plan::CounterHistoryError::Frontier => COUNTER_CHECK_CONSUME_FRONTIER,
+        crate::plan::CounterHistoryError::Topology => COUNTER_CHECK_CONSUME_TOPOLOGY,
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitAck {
@@ -1383,6 +1422,11 @@ trait BankIo {
         fresh: BankExtent,
         old_capacity: usize,
     ) -> Result<(), BankRefusal>;
+    /// Check name for the last `validate_targets` call when it refused a
+    /// bare `Topology`, `None` otherwise. Fake IOs keep the default.
+    fn last_check(&self) -> Option<&'static str> {
+        None
+    }
     fn retain_charge(&mut self, charge: ResourceLease);
     fn allocate_bank(&mut self, bank: u32, all_slots: &[Slot]) -> Result<u32, BankRefusal>;
     fn insert_inner(&mut self, bank: u32, expected_id: u32) -> Result<(), BankRefusal>;
@@ -1614,27 +1658,48 @@ impl BankDirectory {
     }
 
     fn validate_plan(&self, plan: &AttachPlan) -> Result<(), BankRefusal> {
+        self.validate_plan_detailed(plan)
+            .map_err(|(refusal, _)| refusal)
+    }
+
+    /// `validate_plan` with the failing `Topology` check named. The arms run
+    /// in the original short-circuit order, so refusals are identical and
+    /// only gain a name.
+    fn validate_plan_detailed(
+        &self,
+        plan: &AttachPlan,
+    ) -> Result<(), (BankRefusal, Option<&'static str>)> {
         let crate::plan::AdmissionPolicy::Counters(budget) = plan.admission_policy() else {
-            return Err(BankRefusal::Shape(BankShapeCause::PlanNotCounters));
+            return Err((BankRefusal::Shape(BankShapeCause::PlanNotCounters), None));
         };
         if budget.validate_count(plan.slots.len()).is_err()
             || plan.slots.len() > self.geometry.limit() as usize
         {
-            return Err(BankRefusal::Shape(BankShapeCause::PlanBudgetMismatch));
+            return Err((BankRefusal::Shape(BankShapeCause::PlanBudgetMismatch), None));
         }
-        if self.budget.is_some_and(|old| old != budget)
-            || plan.counter_consumed_end() as usize != self.positions.len()
-            || plan.slots.len() < self.positions.len()
-            || plan.slots.iter().enumerate().any(|(index, slot)| {
-                slot.index as usize != index
-                    || (index >= self.positions.len() && !plan.is_active(slot.index))
-                    || self
-                        .positions
-                        .get(index)
-                        .is_some_and(|old| old.key != physical(slot))
-            })
-        {
-            return Err(BankRefusal::Topology);
+        if self.budget.is_some_and(|old| old != budget) {
+            return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_BUDGET)));
+        }
+        if plan.counter_consumed_end() as usize != self.positions.len() {
+            return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_CONSUMED)));
+        }
+        if plan.slots.len() < self.positions.len() {
+            return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_SHORTER)));
+        }
+        for (index, slot) in plan.slots.iter().enumerate() {
+            if slot.index as usize != index {
+                return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_INDEX)));
+            }
+            if index >= self.positions.len() && !plan.is_active(slot.index) {
+                return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_INACTIVE)));
+            }
+            if self
+                .positions
+                .get(index)
+                .is_some_and(|old| old.key != physical(slot))
+            {
+                return Err((BankRefusal::Topology, Some(COUNTER_CHECK_PLAN_KEY)));
+            }
         }
         Ok(())
     }
@@ -1701,10 +1766,37 @@ impl BankDirectory {
         reservation: BankReservation,
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
+        let mut check = None;
+        self.stage_with_checked(io, plan, reservation, reserve, &mut check)
+    }
+
+    /// `stage_with` with the failing `Topology` check named. Refusal values
+    /// are identical; only the name travels alongside.
+    fn stage_with_detailed(
+        &mut self,
+        io: &mut impl BankIo,
+        plan: &mut AttachPlan,
+        reservation: BankReservation,
+        reserve: &SemanticResourceReserver,
+    ) -> (BankPublication, Option<&'static str>) {
+        let mut check = None;
+        let publication = self.stage_with_checked(io, plan, reservation, reserve, &mut check);
+        (publication, check)
+    }
+
+    fn stage_with_checked(
+        &mut self,
+        io: &mut impl BankIo,
+        plan: &mut AttachPlan,
+        reservation: BankReservation,
+        reserve: &SemanticResourceReserver,
+        check: &mut Option<&'static str>,
+    ) -> BankPublication {
         if self.quarantined {
             return BankPublication::Refused(BankRefusal::Quarantined);
         }
-        if let Err(reason) = self.validate_plan(plan) {
+        if let Err((reason, failed)) = self.validate_plan_detailed(plan) {
+            *check = failed;
             return BankPublication::Refused(reason);
         }
         let first = self.allocated_high_water() as u32;
@@ -1775,6 +1867,7 @@ impl BankDirectory {
         }
         keys.sort_unstable();
         if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            *check = Some(COUNTER_CHECK_DUPLICATE);
             return BankPublication::Refused(BankRefusal::Topology);
         }
         let mut published = Vec::with_capacity(self.positions.len());
@@ -1782,6 +1875,9 @@ impl BankDirectory {
         if let Err(reason) =
             io.validate_targets(&plan.slots, &published, extent, self.positions.capacity())
         {
+            if reason == BankRefusal::Topology {
+                *check = io.last_check();
+            }
             return BankPublication::Refused(reason);
         }
         let slots = plan.slots[first as usize..end as usize].to_vec();
@@ -1807,7 +1903,8 @@ impl BankDirectory {
             self.quarantined = true;
             return BankPublication::Refused(BankRefusal::Quarantined);
         }
-        if plan.consume_counter_extent(first, end).is_err() {
+        if let Err(error) = plan.consume_counter_extent(first, end) {
+            *check = Some(consume_check_name(error));
             return BankPublication::Refused(BankRefusal::Topology);
         }
         // Once native work may start, this same plan and directory retain the
@@ -2721,6 +2818,36 @@ fn observe_native_commit(
     }
 }
 
+/// The native target gate behind `validate_targets`: session liveness,
+/// backend, scope, pin stability and CPU continuity, in short-circuit
+/// order. A free function so unit tests can pin every predicate without a
+/// Session; the refusal is always a bare `Topology`, named here.
+fn native_target_gate(
+    stopped: bool,
+    backend_ok: bool,
+    one_process: bool,
+    unchanged_ok: bool,
+    cpus_now: Option<usize>,
+    cpus_expected: usize,
+) -> Result<(), &'static str> {
+    if stopped {
+        return Err(COUNTER_CHECK_SESSION_STOPPED);
+    }
+    if !backend_ok {
+        return Err(COUNTER_CHECK_BACKEND);
+    }
+    if !one_process {
+        return Err(COUNTER_CHECK_SCOPE);
+    }
+    if !unchanged_ok {
+        return Err(COUNTER_CHECK_UNCHANGED);
+    }
+    if cpus_now != Some(cpus_expected) {
+        return Err(COUNTER_CHECK_CPUS);
+    }
+    Ok(())
+}
+
 struct NativeIo<'a> {
     session: &'a mut Session,
     objects: &'a PinnedObjects,
@@ -2728,38 +2855,44 @@ struct NativeIo<'a> {
     cpus: usize,
     geometry: BankGeometry,
     reservation: BankReservation,
+    last_check: Option<&'static str>,
 }
 
-impl BankIo for NativeIo<'_> {
-    fn possible_cpus(&self) -> usize {
-        self.cpus
-    }
-
-    fn validate_targets(
+impl NativeIo<'_> {
+    /// `validate_targets` with the failing `Topology` gate predicate named.
+    /// Non-Topology refusals carry no name.
+    fn validate_targets_detailed(
         &mut self,
         slots: &[Slot],
         published: &[u32],
         fresh: BankExtent,
         old_capacity: usize,
-    ) -> Result<(), BankRefusal> {
-        if self.session.mutation_stopped()
-            || self
-                .session
-                .counter_banks
-                .as_ref()
-                .is_none_or(|banks| banks.validate_backend(self.session.backend).is_err())
-            || !matches!(
-                self.session.uprobe_scope,
-                aya::programs::uprobe::UProbeScope::OneProcess(_)
-            )
-            || self.objects.check_unchanged() != Ok(true)
-            || aya::util::nr_cpus().ok() != Some(self.cpus)
-        {
-            return Err(BankRefusal::Topology);
+    ) -> Result<(), (BankRefusal, Option<&'static str>)> {
+        let stopped = self.session.mutation_stopped();
+        let backend_ok = self
+            .session
+            .counter_banks
+            .as_ref()
+            .is_some_and(|banks| banks.validate_backend(self.session.backend).is_ok());
+        let one_process = matches!(
+            self.session.uprobe_scope,
+            aya::programs::uprobe::UProbeScope::OneProcess(_)
+        );
+        let unchanged_ok = self.objects.check_unchanged() == Ok(true);
+        let cpus_now = aya::util::nr_cpus().ok();
+        if let Err(check) = native_target_gate(
+            stopped,
+            backend_ok,
+            one_process,
+            unchanged_ok,
+            cpus_now,
+            self.cpus,
+        ) {
+            return Err((BankRefusal::Topology, Some(check)));
         }
-        validate_maps(&self.session.ebpf, self.geometry)?;
+        validate_maps(&self.session.ebpf, self.geometry).map_err(|refusal| (refusal, None))?;
         if self.custody.charges.len() == self.custody.charges.capacity() {
-            return Err(BankRefusal::Budget);
+            return Err((BankRefusal::Budget, None));
         }
         let new_banks = (fresh.first / self.geometry.cells..=(fresh.end - 1) / self.geometry.cells)
             .filter(|&bank| self.custody.banks[bank as usize].is_none())
@@ -2782,7 +2915,7 @@ impl BankIo for NativeIo<'_> {
                         .checked_mul(4)?,
                 )
             })
-            .ok_or(BankRefusal::Budget)?;
+            .ok_or((BankRefusal::Budget, None))?;
         let (retained, transient, metadata, fds) = stage_requirements(
             self.geometry,
             slots,
@@ -2792,8 +2925,10 @@ impl BankIo for NativeIo<'_> {
             new_banks,
             provider_copies,
             16,
-        )?;
-        check_counter_stage_reservation(self.reservation, (retained, transient, metadata, fds))?;
+        )
+        .map_err(|refusal| (refusal, None))?;
+        check_counter_stage_reservation(self.reservation, (retained, transient, metadata, fds))
+            .map_err(|refusal| (refusal, None))?;
         if self.session.backend == super::AttachBackend::Multi {
             check_counter_multi_reservation(
                 self.reservation,
@@ -2801,10 +2936,34 @@ impl BankIo for NativeIo<'_> {
                 &slots[fresh.first as usize..fresh.end as usize],
                 self.session.links.len(),
                 self.session.links.capacity(),
-            )?;
+            )
+            .map_err(|refusal| (refusal, None))?;
         }
-        check_fd_headroom_with(fds, read_fd_snapshot)?;
+        check_fd_headroom_with(fds, read_fd_snapshot).map_err(|refusal| (refusal, None))?;
         validate_provider_union(slots, published, fresh, self.objects, self.custody, false)
+            .map_err(|refusal| (refusal, None))
+    }
+}
+
+impl BankIo for NativeIo<'_> {
+    fn possible_cpus(&self) -> usize {
+        self.cpus
+    }
+
+    fn validate_targets(
+        &mut self,
+        slots: &[Slot],
+        published: &[u32],
+        fresh: BankExtent,
+        old_capacity: usize,
+    ) -> Result<(), BankRefusal> {
+        let result = self.validate_targets_detailed(slots, published, fresh, old_capacity);
+        self.last_check = result.as_ref().err().and_then(|(_, check)| *check);
+        result.map_err(|(refusal, _)| refusal)
+    }
+
+    fn last_check(&self) -> Option<&'static str> {
+        self.last_check
     }
 
     fn retain_charge(&mut self, charge: ResourceLease) {
@@ -3273,6 +3432,13 @@ impl Session {
         Ok(session)
     }
 
+    /// Check name for the last staging call when it refused a bare
+    /// `Topology`, `None` otherwise. Lets an Engine counter start say which
+    /// check failed; refusal values are unchanged.
+    pub(crate) fn last_counter_stage_check(&self) -> Option<&'static str> {
+        self.last_counter_stage_check
+    }
+
     pub(crate) fn stage_counter_banks(
         &mut self,
         plan: &mut AttachPlan,
@@ -3280,6 +3446,7 @@ impl Session {
         reservation: BankReservation,
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
+        self.last_counter_stage_check = None;
         let Some(banks) = &self.counter_banks else {
             return BankPublication::Refused(BankRefusal::Shape(
                 BankShapeCause::StagedWithoutBanks,
@@ -3307,8 +3474,12 @@ impl Session {
             cpus,
             geometry,
             reservation,
+            last_check: None,
         };
-        directory.stage_with(&mut native, plan, reservation, reserve)
+        let (publication, check) =
+            directory.stage_with_detailed(&mut native, plan, reservation, reserve);
+        self.last_counter_stage_check = check;
+        publication
     }
 
     /// Engine-driven growth staging: size this extent's envelope from live
@@ -3322,6 +3493,7 @@ impl Session {
         objects: &PinnedObjects,
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
+        self.last_counter_stage_check = None;
         let Some(banks) = self.counter_banks.as_ref() else {
             return BankPublication::Refused(BankRefusal::Shape(
                 BankShapeCause::StagedWithoutBanks,
@@ -3345,6 +3517,8 @@ impl Session {
         if plan.counter_consumed_end() == 0 {
             let high_water = directory.allocated_high_water();
             if high_water != 0 && plan.adopt_counter_consumed(high_water as u32).is_err() {
+                drop(directory);
+                self.last_counter_stage_check = Some(COUNTER_CHECK_ADOPT);
                 return BankPublication::Refused(BankRefusal::Topology);
             }
         }
@@ -3411,7 +3585,14 @@ impl Session {
             multi_links,
         ) {
             Ok(reservation) => reservation,
-            Err(reason) => return BankPublication::Refused(reason),
+            Err(reason) => {
+                // Only the zero-CPU arm yields Topology; Shape and Budget
+                // refusals already name themselves.
+                if reason == BankRefusal::Topology {
+                    self.last_counter_stage_check = Some(COUNTER_CHECK_SIZING_CPUS);
+                }
+                return BankPublication::Refused(reason);
+            }
         };
         self.stage_counter_banks(plan, objects, reservation, reserve)
     }
@@ -4036,7 +4217,12 @@ pub(crate) mod tests {
         commit_wrong: bool,
         commit_unreadable: bool,
         attempted: BTreeSet<u64>,
+        last_check: Option<&'static str>,
     }
+
+    /// Check name for a scripted fake-IO `Topology` refusal. Real IOs name
+    /// real checks; the fake names its script so tests can pin the channel.
+    const COUNTER_CHECK_SCRIPTED_TARGETS: &str = "scripted target refusal";
 
     impl<'a> GrowthIo<'a> {
         fn new(pool: &'a SemanticResourcePool) -> Self {
@@ -4067,6 +4253,10 @@ pub(crate) mod tests {
             self.cpus
         }
 
+        fn last_check(&self) -> Option<&'static str> {
+            self.last_check
+        }
+
         fn validate_targets(
             &mut self,
             slots: &[Slot],
@@ -4076,8 +4266,12 @@ pub(crate) mod tests {
         ) -> Result<(), BankRefusal> {
             self.require_precharge();
             self.trace.push("validate");
+            self.last_check = None;
             assert!(published.iter().all(|slot| self.routes.contains_key(slot)));
             if let Some(reason) = self.target_refusal {
+                if reason == BankRefusal::Topology {
+                    self.last_check = Some(COUNTER_CHECK_SCRIPTED_TARGETS);
+                }
                 return Err(reason);
             }
             if let Some((required, snapshot)) = self.fd_preflight.take() {
@@ -5094,6 +5288,268 @@ pub(crate) mod tests {
             assert!(io.held.is_empty());
             assert_eq!(pool.snapshot().charged_bytes, charged);
         }
+    }
+
+    #[test]
+    fn counter_stage_check_names_inactive_fresh_slots() {
+        // The a2-7a root shape: loader arming retired every endpoint, so the
+        // Engine stages an all-inactive plan and the refusal must name it.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(2);
+        history.deactivate(0);
+        history.deactivate(1);
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("counter plan has inactive fresh slots"));
+        // The bare twin is unchanged: same value, no name in the value.
+        io.next_stage();
+        assert_eq!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Refused(BankRefusal::Topology)
+        );
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Refused(BankRefusal::Topology)
+        ));
+    }
+
+    #[test]
+    fn counter_stage_check_names_non_dense_indices() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
+        history.slots[0].index = 1;
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("counter plan slot indices are not dense"));
+    }
+
+    #[test]
+    fn counter_stage_check_names_duplicate_endpoints() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(2);
+        history.slots[1].object = history.slots[0].object;
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("counter plan has duplicate physical endpoints"));
+    }
+
+    #[test]
+    fn counter_stage_check_names_consumed_mismatch() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { .. }
+        ));
+        io.next_stage();
+        let mut fresh = plan(2);
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut fresh,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(
+            check,
+            Some("counter plan consumed prefix differs from the staged length")
+        );
+    }
+
+    #[test]
+    fn counter_stage_check_names_budget_mismatch() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { .. }
+        ));
+        io.next_stage();
+        let mut other = AttachPlan::from_slots_with_policy(
+            vec![slot(0, 1)],
+            crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(1024).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut other,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(
+            check,
+            Some("counter plan budget differs from the staged budget")
+        );
+    }
+
+    #[test]
+    fn counter_stage_check_names_key_mismatch() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        let mut history = plan(1);
+        assert!(matches!(
+            directory.stage_with(
+                &mut io,
+                &mut history,
+                growth_reservation(),
+                &pool.reserver()
+            ),
+            BankPublication::Published { .. }
+        ));
+        io.next_stage();
+        let mut other = AttachPlan::from_slots_with_policy(
+            vec![slot(0, 2)],
+            crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        other.consume_counter_extent(0, 1).unwrap();
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut other,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("counter plan slot differs from the staged key"));
+    }
+
+    #[test]
+    fn counter_stage_check_names_scripted_target_refusal() {
+        // The fake names its script so tests can pin the IO half of the
+        // check channel end to end.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_refusal = Some(BankRefusal::Topology);
+        let mut history = plan(1);
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
+        assert_eq!(check, Some("scripted target refusal"));
+    }
+
+    #[test]
+    fn counter_stage_check_stays_empty_without_topology() {
+        // Non-Topology refusals name themselves and carry no check name.
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut directory = BankDirectory::counts_growth_v2();
+        let mut io = GrowthIo::new(&pool);
+        io.target_refusal = Some(BankRefusal::Ownership);
+        let mut history = plan(1);
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut history,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(
+            publication,
+            BankPublication::Refused(BankRefusal::Ownership)
+        );
+        assert_eq!(check, None);
+        io.next_stage();
+        io.target_refusal = None;
+        let mut detailed = AttachPlan::from_slots(vec![slot(0, 1)]);
+        let (publication, check) = directory.stage_with_detailed(
+            &mut io,
+            &mut detailed,
+            growth_reservation(),
+            &pool.reserver(),
+        );
+        assert_eq!(
+            publication,
+            BankPublication::Refused(BankRefusal::Shape(BankShapeCause::PlanNotCounters))
+        );
+        assert_eq!(check, None);
+    }
+
+    #[test]
+    fn native_target_gate_names_each_predicate_in_order() {
+        // Each predicate names its own failure, the first failure wins,
+        // and a clear gate passes.
+        assert_eq!(
+            native_target_gate(true, true, true, true, Some(2), 2),
+            Err("counter session is stopping or detached")
+        );
+        assert_eq!(
+            native_target_gate(false, false, true, true, Some(2), 2),
+            Err("counter banks backend differs from the session backend")
+        );
+        assert_eq!(
+            native_target_gate(false, true, false, true, Some(2), 2),
+            Err("counter session scope is not one process")
+        );
+        assert_eq!(
+            native_target_gate(false, true, true, false, Some(2), 2),
+            Err("counter pinned provider changed")
+        );
+        assert_eq!(
+            native_target_gate(false, true, true, true, Some(3), 2),
+            Err("counter CPU count changed since preparation")
+        );
+        assert_eq!(
+            native_target_gate(true, false, false, false, None, 2),
+            Err("counter session is stopping or detached")
+        );
+        assert_eq!(
+            native_target_gate(false, true, true, true, Some(2), 2),
+            Ok(())
+        );
     }
 
     #[test]

@@ -2812,6 +2812,12 @@ pub(crate) trait EngineSession {
         let _ = (plan, objects, reserve);
         BankPublication::Refused(BankRefusal::Shape(BankShapeCause::StagedWithoutBanks))
     }
+    /// Check name for the last counter staging call when it refused a bare
+    /// `Topology`, `None` otherwise. Real sessions report the recorded
+    /// check; scripted sessions report their scripted name.
+    fn last_counter_stage_check(&self) -> Option<&'static str> {
+        None
+    }
     fn replace_targets(
         &mut self,
         plan: &mut plan::AttachPlan,
@@ -3084,6 +3090,10 @@ impl EngineSession for Session {
         reserve: &SemanticResourceReserver,
     ) -> BankPublication {
         Session::stage_counter_growth(self, plan, objects, reserve)
+    }
+
+    fn last_counter_stage_check(&self) -> Option<&'static str> {
+        Session::last_counter_stage_check(self)
     }
 
     fn replace_targets(
@@ -8815,6 +8825,26 @@ fn candidate_admission(
     }
 }
 
+/// Finite counter staging refusal text: the publication plus the failing
+/// check when the refusal named one. Bare variants keep their exact
+/// historical text when no check was recorded.
+fn counter_staging_refusal_text(publication: &BankPublication, check: Option<&str>) -> String {
+    match check {
+        Some(check) => format!("counter bank staging refused: {publication:?} ({check})"),
+        None => format!("counter bank staging refused: {publication:?}"),
+    }
+}
+
+/// Finite counter growth refusal text: the publication token plus the
+/// failing check when the refusal named one. Unnamed refusals keep their
+/// exact historical token text.
+fn counter_growth_refusal_text(publication: &BankPublication, check: Option<&str>) -> String {
+    match check {
+        Some(check) => format!("{publication:?} ({check})"),
+        None => format!("{publication:?}"),
+    }
+}
+
 /// Maps a counter staging outcome onto the attach result shape: published
 /// extents complete, refusals fail carrying their token. A plan with no
 /// fresh tail is a no-op.
@@ -8837,7 +8867,10 @@ fn counter_growth_attach_outcome(
                     .collect(),
             ))
         }
-        publication => Err(anyhow!("{publication:?}")),
+        publication => Err(anyhow!(
+            "{}",
+            counter_growth_refusal_text(&publication, session.last_counter_stage_check())
+        )),
     }
 }
 
@@ -27104,7 +27137,10 @@ impl Engine {
         let reserve = self.counter_reserver();
         match session.stage_counter_growth(&mut self.plan, &self.pinned, &reserve) {
             BankPublication::Published { .. } => Ok(()),
-            publication => Err(anyhow!("counter bank staging refused: {publication:?}")),
+            publication => Err(anyhow!(
+                "{}",
+                counter_staging_refusal_text(&publication, session.last_counter_stage_check())
+            )),
         }
     }
 
@@ -27410,6 +27446,9 @@ pub(crate) mod session_fixture {
         pub(crate) staged_counter_calls: Vec<usize>,
         /// Scripted counter staging outcomes, replayed in order.
         pub(crate) counter_stage_script: VecDeque<BankPublication>,
+        /// Scripted last staging check name, reported for scripted
+        /// `Topology` refusals so tests can pin the refusal text.
+        pub(crate) scripted_last_check: Option<&'static str>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
         dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
@@ -27997,6 +28036,10 @@ pub(crate) mod session_fixture {
                 let _ = plan.consume_counter_extent(extent.first, extent.end);
             }
             publication
+        }
+
+        fn last_counter_stage_check(&self) -> Option<&'static str> {
+            self.scripted_last_check
         }
 
         fn replace_targets(

@@ -1651,6 +1651,10 @@ pub struct Session {
     object_decode: Option<ObjectDecodeTable>,
     #[cfg(feature = "h6-reexec-diagnostic")]
     reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
+    /// Check name for the last counter staging call when it refused a bare
+    /// `Topology`, `None` otherwise. Lets an Engine counter start say which
+    /// check failed; refusal values are unchanged.
+    last_counter_stage_check: Option<&'static str>,
     /// Last: synchronous Aya links/maps/pins drop before the reservation.
     /// Every asynchronous transferred link also carries the same keepalive.
     counter_banks: Option<counter_banks::CounterBanks>,
@@ -6381,6 +6385,7 @@ impl Session {
                 object_decode: None,
                 #[cfg(feature = "h6-reexec-diagnostic")]
                 reexec_diagnostic: None,
+                last_counter_stage_check: None,
                 counter_banks: counter.map(|prepared| prepared.banks),
             },
             prepared_instance.expect("preparation established image program load result"),

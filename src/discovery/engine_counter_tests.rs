@@ -339,6 +339,58 @@ fn detailed_candidates_skip_counter_staging() {
 }
 
 #[test]
+fn counter_staging_refusal_text_names_check() {
+    let publication = BankPublication::Refused(BankRefusal::Topology);
+    assert_eq!(
+        counter_staging_refusal_text(&publication, Some("counter plan has inactive fresh slots")),
+        "counter bank staging refused: Refused(Topology) (counter plan has inactive fresh slots)"
+    );
+    assert_eq!(
+        counter_staging_refusal_text(&publication, None),
+        "counter bank staging refused: Refused(Topology)"
+    );
+    let shaped = BankPublication::Refused(BankRefusal::Shape(BankShapeCause::PlanNotCounters));
+    assert_eq!(
+        counter_staging_refusal_text(&shaped, None),
+        "counter bank staging refused: Refused(Shape(PlanNotCounters))"
+    );
+}
+
+#[test]
+fn counter_growth_refusal_text_names_check() {
+    let publication = BankPublication::Refused(BankRefusal::Topology);
+    assert_eq!(
+        counter_growth_refusal_text(&publication, Some("counter pinned provider changed")),
+        "Refused(Topology) (counter pinned provider changed)"
+    );
+    assert_eq!(
+        counter_growth_refusal_text(&publication, None),
+        "Refused(Topology)"
+    );
+}
+
+#[test]
+fn counter_growth_attach_outcome_reports_scripted_check() {
+    let (pins, object) = counter_pins();
+    let mut plan = counters_plan_on(2, object);
+    let pool = crate::semantics_edge::resources::SemanticResourcePool::reference_limit(1024 * 1024);
+    let mut session = ScriptedSession::default();
+    session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Refused(BankRefusal::Topology));
+    session.scripted_last_check = Some("counter plan has inactive fresh slots");
+    let error = counter_growth_attach_outcome(&mut session, &mut plan, &pins, &pool.reserver())
+        .expect_err("a scripted Topology refusal must fail the attach");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("Refused(Topology)")
+            && text.contains("counter plan has inactive fresh slots"),
+        "growth refusal must carry token and check: {text}"
+    );
+}
+
+#[test]
 fn counter_growth_without_fresh_tail_stages_nothing() {
     let mut engine = Engine::empty_for_test();
     let (pins, object) = counter_pins();

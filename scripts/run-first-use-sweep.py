@@ -9,7 +9,10 @@ caller plus the file-backed and heap-table provider builds), runs every
 child, judges the fixture ledger plus the parsed trace through
 scripts/measure-first-use.py, and writes the delay-indexed bound table
 (JSON plus a short markdown table) with exact missed-call and
-caller-attribution integers.
+caller-attribution integers. Per-cell sink stall milliseconds are
+recorded in the table (JSON and markdown) with the campaign maximum in
+the verdict line; stalls alone never fail a cell, while sink timeouts
+or dropped bytes do.
 
 The observer invocation is identical for every cell except ``--module``:
 modes whose provider file exists before capture (known-inode, late-heap)
@@ -192,8 +195,13 @@ def check_evidence(evidence):
                       f"{record.get('completeness')!r}")
     scheduling = record.get("scheduling")
     if isinstance(scheduling, dict):
-        for field in ("sink_stall_ms", "sink_timeouts",
-                      "sink_dropped_bytes"):
+        # sink_stall_ms stays ungated: it is backpressure timing, not
+        # loss. The sink waits for a slow reader inside its tick budget
+        # and sheds only through drop_pending, which always counts a
+        # timeout and the shed bytes (src/sink.rs) — so a stall with
+        # zero timeouts and zero dropped bytes loses nothing. Only the
+        # loss counters gate the cell.
+        for field in ("sink_timeouts", "sink_dropped_bytes"):
             if field not in scheduling:
                 continue
             value = scheduling[field]
@@ -358,24 +366,38 @@ def build_campaign(records, meta):
             if not 0 <= record["attributed_calls"] <= observed:
                 raise SweepError(f"cell {label} attributed outside "
                                  "observed")
+            stall = record.get("sink_stall_ms")
+            if stall is not None and (type(stall) is not int or stall < 0):
+                raise SweepError(f"cell {label} without an exact "
+                                 "sink_stall_ms integer")
         except SweepError as error:
             errors.append(str(error))
     bounds = {str(delay): 0 for delay in DELAYS_US}
+    max_stall_ms = None
     ordered = []
     if not errors:
         for key in sorted(by_key, key=repr):
             record = by_key[key]
             delay = str(record["delay_us"])
             bounds[delay] = max(bounds[delay], record["missed_calls"])
+            stall = record.get("sink_stall_ms")
+            if type(stall) is int:
+                max_stall_ms = (stall if max_stall_ms is None
+                                else max(max_stall_ms, stall))
             ordered.append(record)
     table = {"schema": SCHEMA, **meta, "cells": ordered, "bounds": bounds,
+             "max_sink_stall_ms": max_stall_ms,
              "verdict": "pass" if not errors else "fail", "errors": errors}
     return {"table": table, "markdown": render_markdown(ordered, bounds),
             "verdict": table["verdict"], "errors": errors}
 
 
 def render_markdown(cells, bounds):
-    """Short markdown table: per-cell missed/attributed plus delay bounds."""
+    """Short markdown table: per-cell missed/attributed, sink stall, bounds.
+
+    The stall block keeps ungated backpressure timing visible per cell;
+    only timeouts and dropped bytes gate the verdict.
+    """
     lines = ["| mode | arm | 0 us | 10 us | 100 us | 1000 us |",
              "| --- | --- | --- | --- | --- | --- |"]
     lookup = {(cell["mode"], cell["armed"], cell["delay_us"]): cell
@@ -388,6 +410,18 @@ def render_markdown(cells, bounds):
                 values.append("?" if cell is None else
                               f"{cell['missed_calls']}/"
                               f"{cell['attributed_calls']}")
+            lines.append(f"| {mode} | {armed} | {' | '.join(values)} |")
+    lines.append("| sink stall (ms) | arm | 0 us | 10 us | 100 us | 1000 us |")
+    for mode in sorted(MODES):
+        for armed in sorted(CAMPAIGN_ARMS):
+            values = []
+            for delay in DELAYS_US:
+                cell = lookup.get((mode, armed, delay))
+                if cell is None:
+                    values.append("?")
+                else:
+                    stall = cell.get("sink_stall_ms")
+                    values.append("?" if stall is None else str(stall))
             lines.append(f"| {mode} | {armed} | {' | '.join(values)} |")
     bound_values = " | ".join(str(bounds[str(delay)]) for delay in DELAYS_US)
     lines.append(f"| bound (max missed) | | {bound_values} |")
@@ -596,6 +630,9 @@ def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
             slot["count"] += 1
             slot["unknown"] += row["label"] is None
         evidence = file_parsed["evidence"][0]
+        scheduling = evidence.get("scheduling")
+        stall_ms = (scheduling.get("sink_stall_ms")
+                    if isinstance(scheduling, dict) else None)
         return {"mode": mode, "delay_us": delay_us, "armed": armed,
                 "status": "ok", "armed_ledger": verdict.get("armed"),
                 "body_calls": missed["body_calls"],
@@ -606,6 +643,7 @@ def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
                 "completeness": evidence.get("completeness"),
                 "final_drain": evidence.get("final_drain"),
                 "event_loss": evidence.get("event_loss"),
+                "sink_stall_ms": stall_ms,
                 "pause": pause,
                 "evidence": evidence,
                 "extra_functions": extras,
@@ -742,6 +780,8 @@ def main(argv=None):
         print(json.dumps({"verdict": result["verdict"],
                           "cells": len(records),
                           "bounds": result["table"]["bounds"],
+                          "max_sink_stall_ms":
+                              result["table"]["max_sink_stall_ms"],
                           "table": str(ready["out"] / "table.json")}),
               flush=True)
         return 0 if result["verdict"] == "pass" else 1

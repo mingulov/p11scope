@@ -44,6 +44,7 @@ printf 'directories.tokendir = %s\nobjectstore.backend = file\nlog.level = ERROR
     "$TOKENS" > "$SOFTHSM2_CONF"
 
 ITERATIONS=200
+SETTLE=${SETTLE_SECONDS:-30}
 FAILED=0
 ulimit -n 65536 2>/dev/null || true
 if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_UID:-}" ]; then
@@ -66,18 +67,18 @@ run_capture() {
         FAILED=1
         return 1
     fi
-    grep -h '^LEDGER ' "$log" | tail -1 || true
+    grep -h -E '^(SETTLED|LEDGER) ' "$log" | tail -2 || true
 }
 
 run_capture plain run --mode metrics -o "$OUTDIR/plain.json" -- \
-    "$WORKLOAD" "$MODULE" "$ITERATIONS" || true
+    "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE" || true
 if [ "$FAILED" -ne 0 ]; then
     echo "# error: plain run failed; refusing to compare"
     exit 1
 fi
 for mode in $MODES; do
     run_capture "counter-$mode" run --mode metrics --counter-mode "$mode" \
-        -o "$OUTDIR/counter-$mode.json" -- "$WORKLOAD" "$MODULE" "$ITERATIONS" || true
+        -o "$OUTDIR/counter-$mode.json" -- "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE" || true
     if [ ! -f "$OUTDIR/counter-$mode.json" ]; then
         echo "# error: counter-$mode left no report"
         FAILED=1

@@ -1,14 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Deterministic SoftHSM workload for counter-mode parity checks.
- * Usage: counter-softhsm-workload MODULE [ITERATIONS]
+ * Usage: counter-softhsm-workload MODULE [ITERATIONS [SETTLE_SECONDS]]
  *
- * Opens a real PKCS#11 module, initializes it, then calls slot and
- * info functions a fixed number of times: every run issues exactly
- * the same calls whatever token state the module has (zero slots is
- * fine; the hot calls need no token). Prints one LEDGER line per
- * called function with its call count to stdout. Exits nonzero when
- * the module cannot be opened, a needed symbol is missing, or a call
- * count is not the scripted one.
+ * Opens a real PKCS#11 module, waits for the observer to discover
+ * and attach (settle, default 30 s), then initializes it and calls
+ * slot and info functions a fixed number of times: every run issues
+ * exactly the same calls whatever token state the module has (zero
+ * slots is fine; the hot calls need no token). Calls start only
+ * after the settle so no run misses pre-attach calls. Prints one
+ * LEDGER line with per-function call counts to stdout. Exits nonzero
+ * when the module cannot be opened, a needed symbol is missing, or a
+ * call count is not the scripted one.
  *
  * Only dlsym'd entry points are used, so no PKCS#11 headers are
  * needed; output structs are oversized byte buffers the workload
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef unsigned long ck_ulong_t;
 typedef ck_ulong_t ck_rv_t;
@@ -52,13 +55,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "workload: LP64 only\n");
         return 3;
     }
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: %s MODULE [ITERATIONS]\n", argv[0]);
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: %s MODULE [ITERATIONS [SETTLE_SECONDS]]\n", argv[0]);
         return 2;
     }
-    long iterations = argc == 3 ? strtol(argv[2], NULL, 10) : 200;
+    long iterations = argc >= 3 ? strtol(argv[2], NULL, 10) : 200;
     if (iterations < 1 || iterations > 100000) {
         fprintf(stderr, "workload: bad iteration count\n");
+        return 2;
+    }
+    long settle = argc == 4 ? strtol(argv[3], NULL, 10) : 30;
+    if (settle < 0 || settle > 600) {
+        fprintf(stderr, "workload: bad settle delay\n");
         return 2;
     }
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -77,6 +85,16 @@ int main(int argc, char **argv)
     c_get_mechanism_info_t c_get_mechanism_info =
         need_symbol(handle, "C_GetMechanismInfo");
 
+    /* The module is mapped but no call is issued yet: the observer
+     * discovers and attaches during the settle, so every counted
+     * call below lands on attached probes in every run. */
+    if (settle > 0) {
+        unsigned left = (unsigned)settle;
+        while (left > 0)
+            left = sleep(left);
+    }
+    printf("SETTLED after %lds\n", settle);
+    fflush(stdout);
     ck_rv_t rv = c_initialize(NULL);
     if (rv != 0) {
         fprintf(stderr, "workload: C_Initialize failed: 0x%lx\n", rv);

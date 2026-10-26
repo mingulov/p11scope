@@ -259,8 +259,12 @@ def rest_expected_targets(metadata):
     """(binary stem, package-relative source) cargo must run for rest.
 
     Lib, bin and integration-test targets run only when their `test` flag
-    is set; examples and benches run under `--examples`/`--benches` even
-    with `test = false` (observed on cargo 1.99.1), so they are always
+    is set; rest selects tests by name but only names `test = true`
+    targets, so a `test = false` test is never selected and never runs.
+    Examples and benches run under `--examples`/`--benches` even with
+    `test = false` (observed on cargo 1.99.1: every workspace example
+    carries the default `test = false` and ran a section in the real
+    rest output; benches on a scratch project), so they are always
     expected. The sharded `artifact_contracts` target runs in the
     contracts partitions, never here.
     """
@@ -274,7 +278,7 @@ def rest_expected_targets(metadata):
             kind = tuple(target["kind"])
             if kind == ("test",) and target["name"] == SHARDED_TARGET:
                 continue
-            if kind in (("lib",), ("bin",), ("test",), ("bench",)) \
+            if kind in (("lib",), ("bin",), ("test",)) \
                     and not target.get("test", True):
                 continue
             if kind not in (("lib",), ("bin",), ("example",), ("bench",), ("test",)):

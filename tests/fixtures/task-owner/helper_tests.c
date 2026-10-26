@@ -1074,7 +1074,8 @@ static void object_seeded_start_failures(void)
     assert(!row(&START, &key) && !row(&OBJECT_START, &key));
     assert(deleted_side_seen && !memcmp(deleted_side, (unsigned char[432]){0}, 432));
     assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND - 1 && ctl.outstanding == 1);
-    assert(!ctl.poison && !p11_owner_cleanup());
+    assert(!ctl.poison
+           && p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
     assert(!ctl.outstanding && ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1);
     /* Failed START rollback retains its count, lease and teardown route. */
     reset(); object_setup(); key.pid_tgid = pid_tgid();
@@ -1300,7 +1301,8 @@ static void object_producer_owner_terminal_matrix(void)
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
-    assert(!p11_owner_cleanup() && ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START
+           && ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(!ctl.outstanding && !ctl.poison);
     /* Missing side row: invocation retired, refunded, poisoned. */
     reset(); object_setup();
@@ -1462,7 +1464,9 @@ static void object_producer_owner_terminal_matrix(void)
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
-    assert(!p11_owner_cleanup());
+    assert(row(&START, &key) && owners[0].start_count == 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+    assert(!row(&START, &key) && ctl.abandoned_start == 1);
     assert(!p11_owner_cleanup() && ctl.abandoned_start == 1);
     assert(!p11_object_side_get(&key, 23, 0) && !p11_object_side_get(&key, 23, 1));
     /* No cross-call reuse: a reinserted call starts from a zeroed row. */
@@ -1643,18 +1647,20 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     assert(!p11_owner_start_remove(&key, 1));
     assert(idle(0) && !ctl.outstanding);
     assert(!p11_owner_cleanup() && !ctl.poison);
-    /* Ordinary, object and mixed teardown settles with success. */
+    /* Ordinary, object and mixed teardown settles abandoning live STARTs. */
     reset(); object_setup();
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value));
     assert(!p11_owner_start_insert(&key, value));
-    assert(!p11_owner_cleanup());
+    assert(row(&START, &key) && owners[0].start_count == 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
     assert(!row(&START, &key) && !ctl.outstanding && ctl.abandoned_start == 1);
     reset(); object_setup();
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
-    assert(!p11_owner_cleanup());
+    assert(row(&START, &key) && owners[0].start_count == 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && ctl.abandoned_start == 1 && !ctl.poison);
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
@@ -1665,7 +1671,8 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
         memset(value, 0, sizeof(value)); object_write_start(value, 24);
         assert(!p11_owner_start_insert(&key, value));
         assert(!p11_owner_discovery_insert(&dkey, value, 1));
-        assert(!p11_owner_cleanup());
+        assert(row(&START, &key) && owners[0].start_count == 1);
+        assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
         assert(!row(&OBJECT_START, &key) && !row(&START, &key));
         assert(!ctl.outstanding && ctl.abandoned_start == 1);
         assert(ctl.abandoned_discovery == 1 && !ctl.poison);
@@ -1766,7 +1773,8 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     memset(row(&OBJECT_START, &key)->value + 32, 0xA5, 64);
     memset(row(&OBJECT_START, &key)->value + 96, 0x5A, 64);
     deleted_side_seen = 0;
-    assert(!p11_owner_cleanup());
+    assert(row(&START, &key) && owners[0].start_count == 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && ctl.abandoned_start == 1 && !ctl.poison);
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
@@ -2238,13 +2246,42 @@ static void object_owner_sweep_adjacent_lookup_preserves_custody(void)
         memset(value, 0, sizeof(value));
         assert(!p11_owner_start_insert(&live, value));
         deleted_side_seen = 0;
-        assert(!p11_owner_cleanup());
+        assert(row(&START, &live) && owners[0].start_count == 1);
+        assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
         assert(!row(&OBJECT_START, &key) && !row(&START, &live));
         assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
         assert(ctl.abandoned_start == 2);
         assert(!ctl.outstanding && !ctl.poison);
     }
     puts("object custody sweep adjacent passed");
+}
+
+static void object_producer_cleanup_idle_returns_zero(void)
+{
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    /* Idle owner with no live START settles exactly zero. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    assert(!ctl.outstanding && owners[0].start_count == 0);
+    assert(!row(&START, &key));
+    assert(p11_owner_cleanup() == 0);
+    assert(!ctl.outstanding && !ctl.poison && ctl.abandoned_start == 0);
+    assert(p11_owner_cleanup() == 0);
+    assert(ctl.abandoned_start == 0);
+    /* Discovery-only abandonment still settles zero: only live STARTs report 2. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    {
+        struct owner_discovery_key dkey = discovery_key(9, 1);
+        memset(value, 0, sizeof(value));
+        assert(!p11_owner_discovery_insert(&dkey, value, 1));
+        assert(owners[0].start_count == 0 && !row(&START, &key));
+        assert(ctl.outstanding == 1);
+        assert(p11_owner_cleanup() == 0);
+        assert(!ctl.outstanding && !ctl.poison);
+        assert(ctl.abandoned_start == 0 && ctl.abandoned_discovery == 1);
+    }
+    puts("object custody idle cleanup passed");
 }
 #endif
 #if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
@@ -2260,9 +2297,11 @@ static void counter_bank_owner_high_slot(void)
     assert(!row(&START, &outside));
     assert(!memcmp(&before, &owners[0], sizeof(before)));
     assert(ctl.outstanding == 1 && !ctl.poison);
-    assert(!p11_owner_cleanup());
+    assert(row(&START, &high) && owners[0].start_count == 1);
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
     assert(bank_loop_calls == 2 && !row(&START, &high));
     assert(ctl.abandoned_start == 1 && !ctl.outstanding && idle(0));
+    assert(owners[0].start_count == 0);
     assert(!p11_owner_cleanup());
     assert(bank_loop_calls == 2 && ctl.abandoned_start == 1);
 }
@@ -2463,6 +2502,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_seeded_start_construction")) object_seeded_start_construction();
         else if (!strcmp(argv[1], "object_aggregate_start_construction")) object_aggregate_start_construction();
         else if (!strcmp(argv[1], "object_seeded_start_failures")) object_seeded_start_failures();
+        else if (!strcmp(argv[1], "object_producer_cleanup_idle_returns_zero")) object_producer_cleanup_idle_returns_zero();
 #ifdef P11SCOPE_COUNTER_BANK_PROOF
         else if (!strcmp(argv[1], "counter_bank_owner_high_slot")) counter_bank_owner_high_slot();
         else if (!strcmp(argv[1], "counter_bank_owner_start_failures")) counter_bank_owner_start_failures();
@@ -2480,6 +2520,7 @@ int main(int argc, char **argv)
         object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();
         object_seeded_start_construction(); object_seeded_start_failures(); object_aggregate_start_construction();
+        object_producer_cleanup_idle_returns_zero();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

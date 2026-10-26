@@ -582,15 +582,38 @@ static void cleanup_preserves_words(void)
     EXPECT(p11_journal_next_sequence(&owners[0]) == 1, "sequence 1");
     key = (struct owner_start_key){pid_tgid(), 7, 0};
     EXPECT(!p11_owner_start_insert(&key, start_value), "START row inserts");
-    EXPECT(p11_owner_cleanup() == 0, "exec/exit cleanup settles");
+    EXPECT(owner_map_lookup(&START, &key) != NULL && owners[0].start_count == 1,
+           "live START held at cleanup");
+    EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+           "exec/exit cleanup settles abandoning live START");
+    EXPECT(ctl.abandoned_start == 1, "cleanup abandoned one live START");
     EXPECT(owner_map_lookup(&START, &key) == NULL, "cleanup removed the START row");
     EXPECT(owners[0].flags == 0 && owners[0].start_count == 0, "lease released by cleanup");
     EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,
            "cleanup preserves lifetime words");
     /* A second cleanup over the idle row is a no-op that keeps them. */
+    EXPECT(owners[0].start_count == 0 && owner_map_lookup(&START, &key) == NULL,
+           "no live START at idle cleanup");
     EXPECT(p11_owner_cleanup() == 0, "idle cleanup settles");
+    EXPECT(ctl.abandoned_start == 1, "idle cleanup abandons nothing new");
     EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,
            "idle cleanup preserves lifetime words");
+}
+
+static void cleanup_idle_returns_zero(void)
+{
+    struct owner_start_key key;
+    reset();
+    EXPECT(p11_owner_lease() == 1, "lease");
+    EXPECT(p11_journal_thread(&owners[0], &journal_ctl) == 1, "mint 1");
+    key = (struct owner_start_key){pid_tgid(), 7, 0};
+    EXPECT(owners[0].start_count == 0 && owner_map_lookup(&START, &key) == NULL,
+           "no live START held");
+    EXPECT(p11_owner_cleanup() == 0, "idle cleanup with no live START returns zero");
+    EXPECT(ctl.abandoned_start == 0, "idle cleanup abandons no START");
+    EXPECT(owners[0].journal_thread == 1, "idle cleanup preserves lifetime words");
+    EXPECT(p11_owner_cleanup() == 0, "repeated idle cleanup stays zero");
+    EXPECT(ctl.abandoned_start == 0, "repeated idle cleanup abandons nothing");
 }
 
 static void tid_reuse_mints_fresh(void)
@@ -2328,6 +2351,7 @@ int main(void)
     missed_lookup_preserves_idle_words();
     loader_row_mints_on_first_use();
     cleanup_preserves_words();
+    cleanup_idle_returns_zero();
     tid_reuse_mints_fresh();
     migration_keeps_row();
     wrap_fails_closed();

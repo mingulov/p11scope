@@ -311,11 +311,34 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
         "struct ReturnAccounting",
     );
+    // The outlined halves report a lost in-scope call with a nonzero code
+    // that the root turns into a marker gap at root depth, keeping return's
+    // 512-byte chain intact. The dispatcher still owns no lifetime: it only
+    // routes to the two halves and consumes each lost code by its own compare.
     assert!(
-        dispatch
-            .contains("if unsafe { (*start).object_required } == 0 {\n        ordinary_return(")
+        dispatch.contains(
+            "if unsafe { (*start).object_required } == 0 {\n        if ordinary_return(ctx, &key, start, flags, layout) != 0 {"
+        ),
+        "dispatcher must route ordinary calls and consume its lost code"
     );
-    assert!(dispatch.contains("} else {\n        object_return("));
+    assert!(
+        dispatch.contains("} else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        "dispatcher must route object calls and consume its lost code"
+    );
+    assert_eq!(
+        dispatch
+            .matches("ordinary_return(ctx, &key, start, flags, layout)")
+            .count(),
+        1,
+        "dispatcher must call ordinary_return exactly once with the live pointer"
+    );
+    assert_eq!(
+        dispatch
+            .matches("object_return(ctx, &key, start, flags, layout)")
+            .count(),
+        1,
+        "dispatcher must call object_return exactly once with the live pointer"
+    );
     for forbidden in [
         "EVENTS.reserve",
         "account_return(",
@@ -387,27 +410,20 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
     let object = embedded_object(directory.path());
     let report = run_object_checker(&object, "exec-exit-fault");
     println!("{report}");
-    // The fault fires on cleanup failure only, before lifecycle bookkeeping,
-    // and never returns early: lifecycle continuation is mandatory.
+    // Only cleanup outcome 1 is failure: 0 is a healthy settle with no live
+    // START, 2 is a healthy settle that abandoned at least one live START.
+    // Both roots fault only on 1, before lifecycle bookkeeping, and never
+    // return early. The exit root dirties the leader marker row on 2; the
+    // exec root leaves 2 silently healthy (the new image is a fresh prefix).
     let source =
         std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF lifecycle roots");
-    for (root, end, before) in [
-        (
-            "fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {",
-            "fn sched_process_exit_impl",
-            ["p11_instance_exec()", "scope_auth()"],
-        ),
-        (
-            "fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {",
-            "fn cookie_of<C>",
-            ["p11_root_current_exit()", "pid_tgid as u32 !="],
-        ),
-    ] {
-        let body = source_between(&source, root, end);
-        let guard = "if unsafe { p11_owner_cleanup() } != 0 {";
+    {
+        let root = "fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {";
+        let body = source_between(&source, root, "pub fn sched_process_exit");
+        let guard = "if unsafe { p11_owner_cleanup() } == 1 {";
         let opened = body
             .find(guard)
-            .unwrap_or_else(|| panic!("{root} must read the cleanup result before lifecycle work"));
+            .unwrap_or_else(|| panic!("{root} must fault only on cleanup == 1"));
         let arm = &body[opened..];
         let closed = arm.find("\n    }\n").expect("guarded fault arm closes");
         let arm = &arm[..closed];
@@ -420,13 +436,94 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
             "{root} must continue lifecycle bookkeeping after the fault"
         );
         let fault_at = opened + arm.find("p11_object_fault()").expect("fault site");
-        for marker in before {
+        for marker in ["p11_instance_exec()", "scope_auth()"] {
             let site = body
                 .find(marker)
                 .unwrap_or_else(|| panic!("{root} must still contain {marker}"));
             assert!(fault_at < site, "{root} must fault before {marker}");
         }
+        assert!(
+            body.contains("Only 1 is"),
+            "{root} must document that only 1 is failure"
+        );
+        assert!(
+            !body.contains("OWNER_CLEANUP_ABANDONED_START"),
+            "{root} must not gap on 2 (fresh prefix leaves it healthy)"
+        );
+        assert!(
+            !body.contains("p11_instance_scope_gap()"),
+            "{root} must not gap on cleanup"
+        );
     }
+    {
+        let root = "fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {";
+        let body = source_between(&source, root, "fn cookie_of<C>");
+        let read = "let cleanup = unsafe { p11_owner_cleanup() };";
+        let read_at = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{root} must read the cleanup outcome once"));
+        let fault_guard = "if cleanup == 1 {";
+        let fault_opened = body
+            .find(fault_guard)
+            .unwrap_or_else(|| panic!("{root} must fault only on cleanup == 1"));
+        assert!(
+            read_at < fault_opened,
+            "{root} must read the cleanup result before the fault arm"
+        );
+        let arm = &body[fault_opened..];
+        let closed = arm.find("\n    }\n").expect("guarded fault arm closes");
+        let arm = &arm[..closed];
+        assert!(
+            arm.contains("p11_object_fault()"),
+            "{root} must fault on cleanup failure"
+        );
+        assert!(
+            !arm.contains("return"),
+            "{root} must continue lifecycle bookkeeping after the fault"
+        );
+        let gap_guard = "if cleanup == OWNER_CLEANUP_ABANDONED_START {";
+        let gap_opened = body
+            .find(gap_guard)
+            .unwrap_or_else(|| panic!("{root} must handle the abandoned-START outcome explicitly"));
+        assert!(
+            read_at < gap_opened,
+            "{root} must read the cleanup result before the gap arm"
+        );
+        let gap_arm = &body[gap_opened..];
+        let gap_closed = gap_arm
+            .find("\n    }\n")
+            .expect("abandoned-START gap arm closes");
+        let gap_arm = &gap_arm[..gap_closed];
+        assert!(
+            gap_arm.contains("p11_instance_scope_gap()"),
+            "{root} must dirty the leader row on the abandoned-START outcome"
+        );
+        assert!(
+            !gap_arm.contains("p11_object_fault()"),
+            "{root} must not fault on the healthy abandoned-START outcome"
+        );
+        let fault_at = fault_opened + arm.find("p11_object_fault()").expect("fault site");
+        let gap_at = gap_opened + gap_arm.find("p11_instance_scope_gap()").expect("gap site");
+        for marker in ["p11_root_current_exit()", "pid_tgid as u32 !="] {
+            let site = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("{root} must still contain {marker}"));
+            assert!(
+                fault_at < site && gap_at < site,
+                "{root} must settle cleanup before {marker}"
+            );
+        }
+    }
+}
+
+/// Idle cleanup with no live START settles exactly zero: the healthy twin
+/// of the abandoned-START outcome, including discovery-only abandonment.
+#[test]
+fn object_producer_cleanup_idle_returns_zero() {
+    owner_fixture::run_object_subcommand(
+        "object_producer_cleanup_idle_returns_zero",
+        "object custody idle cleanup passed",
+    );
 }
 
 /// G06/E2: side-insert success followed by a readback miss never

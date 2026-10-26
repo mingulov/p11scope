@@ -2478,17 +2478,90 @@ fn scope_gaps_for_test(driver: &mut ClassicDriver<'_>) -> Vec<(String, String)> 
         .collect()
 }
 
+/// The display borrow a stop disclosure warns through. The Joint
+/// finish driver is associated functions without `self`, so the
+/// method call sites build this from the split display borrow and
+/// pass it down to the hold.
+struct WarnSink<'a> {
+    display: &'a mut Option<Display>,
+}
+
+impl WarnSink<'_> {
+    fn emit(&mut self, line: &str) {
+        ClassicDriver::warn_recorded(self.display, line);
+    }
+}
+
+/// Lifetime counts for one honest stop disclosure, read from the
+/// lane (plus the coordinator's binding count) before any handoff
+/// that would clear them. Counts only; no identities, paths or
+/// payloads.
+struct SemanticStopCounts {
+    refusals: [u64; 12],
+    collected: u64,
+    joined: u64,
+    shed: u64,
+    bindings: u64,
+    refused: u64,
+}
+
+impl SemanticStopCounts {
+    fn read(
+        lane: &crate::inventory_semantics::AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    ) -> Self {
+        let refusals = lane.scan_refusal_counts();
+        let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
+        let bindings = coordinator.semantic_bindings_mut().len() as u64;
+        Self {
+            refusals,
+            collected,
+            joined,
+            shed,
+            bindings,
+            refused,
+        }
+    }
+}
+
+/// One honest stop disclosure, shared by the legacy terminal
+/// sequence and the Joint finish driver: the aggregate scan-refusal
+/// gap (nothing recorded when nothing was refused) plus the
+/// lifetime call-count line. Counts only; no identities, paths or
+/// payloads.
+fn disclose_semantic_stop(
+    counts: &SemanticStopCounts,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    warn: &mut WarnSink<'_>,
+) {
+    coordinator.record_scan_refusals_gap(&counts.refusals);
+    warn.emit(&crate::inventory_semantics::semantic_stop_line(
+        counts.collected,
+        counts.joined,
+        counts.shed,
+        counts.bindings,
+        counts.refused,
+    ));
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept
     /// for stderr past the screen.
     fn warn(&mut self, warning: &str) {
-        #[cfg(test)]
-        record_warned_for_test(warning);
-        match self.display.as_mut() {
+        Self::warn_recorded(&mut self.display, warning);
+    }
+
+    /// One warning through a split display borrow (the stop
+    /// disclosure calls this where `warn` cannot borrow `self`):
+    /// stderr on the classic path, the log tail under the dashboard.
+    fn warn_recorded(display: &mut Option<Display>, warning: &str) {
+        match display.as_mut() {
             Some(display) => display.warn(warning),
             None => inventory_diagnostic(warning),
         }
+        #[cfg(test)]
+        record_warned_for_test(warning);
     }
 
     /// The lane's sanitized summary for this pass's presentation:
@@ -2608,19 +2681,18 @@ impl ClassicDriver<'_> {
                 ),
             }
         }
-        // One honest stop disclosure: the aggregate scan-refusal gap
-        // plus the lifetime call-count line. Counts only; no
-        // identities, paths or payloads.
-        let counters = self
+        // One honest stop disclosure through the shared helper: the
+        // same aggregate scan-refusal gap plus lifetime call-count
+        // line the Joint finish driver emits.
+        let counts = self
             .semantic
             .as_ref()
-            .map(|lane| (lane.scan_refusal_counts(), lane.semantic_stop_call_counts()));
-        let bindings = self.coordinator.semantic_bindings_mut().len() as u64;
-        if let Some((refusals, (collected, joined, shed, refused))) = counters {
-            self.coordinator.record_scan_refusals_gap(&refusals);
-            self.warn(&crate::inventory_semantics::semantic_stop_line(
-                collected, joined, shed, bindings, refused,
-            ));
+            .map(|lane| SemanticStopCounts::read(lane, &mut *self.coordinator));
+        if let Some(counts) = counts {
+            let mut warn = WarnSink {
+                display: &mut self.display,
+            };
+            disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
         }
     }
 
@@ -2965,15 +3037,18 @@ impl ClassicDriver<'_> {
     }
 
     /// Hold a Joint lane for exit after its finish failed (item 7,
-    /// §6.4): abandon where admitted (best-effort commit, whose
-    /// failure is kept as its own gap; first error kept), then hold
-    /// the whole lane. Returns the first error: the disposition
-    /// where latched, else the trigger cause. Callers disclose the
-    /// skips (finished or unadmitted holds).
+    /// §6.4): disclose the lane's stop counts once, abandon where
+    /// admitted (best-effort commit, whose failure is kept as its
+    /// own gap; first error kept), then hold the whole lane. The
+    /// disclosure runs before the abandon commit so its gap rides
+    /// that commit. Returns the first error: the disposition where
+    /// latched, else the trigger cause. Callers disclose the skips
+    /// (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         cause: &str,
+        warn: &mut WarnSink<'_>,
     ) -> String {
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
@@ -2981,6 +3056,8 @@ impl ClassicDriver<'_> {
             .collected_graph_refused()
             .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
+        let counts = SemanticStopCounts::read(&lane, coordinator);
+        disclose_semantic_stop(&counts, coordinator, warn);
         if !lane.is_finished()
             && latched
             && let Ok(batch) = lane.abandon_finish_for_exit(coordinator, reason)
@@ -3001,17 +3078,36 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// Direct-step entrypoint for the live privileged tests, which
+    /// drive the step without a driver display: the same step with a
+    /// stderr disclosure sink (those drivers carry no display, so
+    /// this matches their production route).
+    #[cfg(test)]
+    fn step_begun_joint_finish(
+        lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
+        finish: &mut JointFinishDriver,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        first_error: &mut Option<String>,
+    ) -> JointStepOutcome {
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        Self::step_begun_joint_finish_with_warn(lane, finish, coordinator, first_error, &mut warn)
+    }
+
     /// Step a begun Joint finish once within the 10 ms /
     /// 1024-action budget (§8.3): Polling polls the finish (a
     /// disposition abandons through the finite stop, a finished lane
     /// resumes at Published, anything else stays for the latch to
     /// bound); Published polls only the wound-down (a refusal skips
     /// the abandon per §6.4 and holds); Abandoned does nothing.
-    fn step_begun_joint_finish(
+    fn step_begun_joint_finish_with_warn(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         first_error: &mut Option<String>,
+        warn: &mut WarnSink<'_>,
     ) -> JointStepOutcome {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3029,6 +3125,7 @@ impl ClassicDriver<'_> {
                             owned,
                             coordinator,
                             "joint finish disposition required",
+                            warn,
                         );
                         first_error.get_or_insert(error);
                     }
@@ -3081,6 +3178,7 @@ impl ClassicDriver<'_> {
                                 owned,
                                 coordinator,
                                 &cause,
+                                warn,
                             ));
                         }
                         *finish = JointFinishDriver::Abandoned;
@@ -3103,6 +3201,9 @@ impl ClassicDriver<'_> {
         {
             self.joint_begin_calls += 1;
         }
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
         match Self::begin_lane_finish(lane, coordinator) {
             JointFinishDriver::Abandoned => {
                 let lane = semantic.take().expect("joint lane");
@@ -3110,6 +3211,7 @@ impl ClassicDriver<'_> {
                     lane,
                     coordinator,
                     "joint finish disposition required",
+                    &mut warn,
                 );
                 self.joint_first_error.get_or_insert(error);
                 self.joint_finish = JointFinishDriver::Abandoned;
@@ -3136,10 +3238,14 @@ impl ClassicDriver<'_> {
         };
         let latched = lane.joint_finish_disposition_required();
         let finished = lane.is_finished();
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
         let error = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             "second stop during joint finish",
+            &mut warn,
         );
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
@@ -3157,17 +3263,25 @@ impl ClassicDriver<'_> {
     /// live Session, substituted lanes cleared their seams. A
     /// not-ready take (framed, or a re-polled pending detach) or a
     /// refusal keeps the lane for the next hook, whose wound-down
-    /// poll re-verifies it.
+    /// poll re-verifies it. A handoff discloses the lane's stop
+    /// counts once, before the release.
     fn complete_final_joint_lane(&mut self) {
         self.snapshot_seated_summary();
         let Some(lane) = self.semantic.as_mut() else {
             return;
         };
+        // Read the lifetime counts before the take hands the live
+        // Session away: after it the lane reads zeros.
+        let counts = SemanticStopCounts::read(lane, &mut *self.coordinator);
         let handed_off = match lane.take_joined_session() {
             Ok(_) => !lane.is_finished(),
             Err(_) => return,
         };
         if handed_off {
+            let mut warn = WarnSink {
+                display: &mut self.display,
+            };
+            disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
             self.semantic = None;
         }
     }
@@ -3278,19 +3392,36 @@ impl ClassicDriver<'_> {
             .expect("a winding lane retires")
             .joined;
         if !joined {
+            let mut warn = WarnSink {
+                display: &mut self.display,
+            };
             let outcome = {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let winding = retiring.winding.as_mut().expect("a winding lane retires");
-                Self::step_begun_joint_finish(
+                Self::step_begun_joint_finish_with_warn(
                     &mut winding.lane,
                     &mut winding.finish,
                     &mut *self.coordinator,
                     &mut self.joint_first_error,
+                    &mut warn,
                 )
             };
             if !matches!(outcome, JointStepOutcome::WoundDown) {
                 return false;
             }
+            // Read the lifetime counts before the take hands the live
+            // Session away: after it the lane reads zeros.
+            let counts = {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let lane = retiring
+                    .winding
+                    .as_ref()
+                    .expect("winding")
+                    .lane
+                    .as_ref()
+                    .expect("winding lane");
+                SemanticStopCounts::read(lane, &mut *self.coordinator)
+            };
             let session = {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let lane = retiring
@@ -3310,7 +3441,8 @@ impl ClassicDriver<'_> {
             // Session, substituted lanes cleared their seams. A
             // not-ready take (framed, or a re-polled pending detach)
             // keeps the lane finishable, so the next tick reaps
-            // again; only a handoff arms the joined tail.
+            // again; only a handoff arms the joined tail — and
+            // discloses the lane's stop counts once.
             {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let winding = retiring.winding.as_mut().expect("winding");
@@ -3320,6 +3452,10 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| !lane.is_finished())
                 {
                     winding.joined = true;
+                    let mut warn = WarnSink {
+                        display: &mut self.display,
+                    };
+                    disclose_semantic_stop(&counts, &mut *self.coordinator, &mut warn);
                 }
             }
             if let Some(session) = session {
@@ -3472,6 +3608,7 @@ impl ClassicDriver<'_> {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         first_error: &mut Option<String>,
         commit_retries: &mut u16,
+        warn: &mut WarnSink<'_>,
     ) -> NotBegunStep {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3505,6 +3642,7 @@ impl ClassicDriver<'_> {
                             live,
                             coordinator,
                             "joint finish disposition required",
+                            warn,
                         );
                         first_error.get_or_insert(error);
                         *finish = JointFinishDriver::Abandoned;
@@ -3528,6 +3666,7 @@ impl ClassicDriver<'_> {
                     live,
                     coordinator,
                     "joint finish disposition required",
+                    warn,
                 );
                 first_error.get_or_insert(error);
                 if finished {
@@ -3555,12 +3694,16 @@ impl ClassicDriver<'_> {
         }
         if matches!(self.joint_finish, JointFinishDriver::NotBegun) {
             if self.joint_commit_pending {
+                let mut warn = WarnSink {
+                    display: &mut self.display,
+                };
                 let stepped = Self::step_not_begun_joint_finish(
                     &mut self.semantic,
                     &mut self.joint_finish,
                     &mut *self.coordinator,
                     &mut self.joint_first_error,
                     &mut self.joint_commit_retries,
+                    &mut warn,
                 );
                 match stepped {
                     NotBegunStep::Began => {
@@ -3592,11 +3735,15 @@ impl ClassicDriver<'_> {
             self.joint_step_calls += 1;
         }
         self.snapshot_seated_summary();
-        let outcome = Self::step_begun_joint_finish(
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
+        let outcome = Self::step_begun_joint_finish_with_warn(
             &mut self.semantic,
             &mut self.joint_finish,
             &mut *self.coordinator,
             &mut self.joint_first_error,
+            &mut warn,
         );
         if matches!(outcome, JointStepOutcome::WoundDown) {
             self.complete_final_joint_lane();
@@ -3702,6 +3849,9 @@ impl ClassicDriver<'_> {
                 }
                 let winding = retiring.winding.as_mut().expect("winding");
                 let lane = winding.lane.as_mut().expect("winding lane");
+                let mut warn = WarnSink {
+                    display: &mut self.display,
+                };
                 match Self::begin_lane_finish(lane, &mut *self.coordinator) {
                     JointFinishDriver::Abandoned => {
                         let lane = winding.lane.take().expect("winding lane");
@@ -3709,6 +3859,7 @@ impl ClassicDriver<'_> {
                             lane,
                             &mut *self.coordinator,
                             "joint finish disposition required",
+                            &mut warn,
                         );
                         self.joint_first_error.get_or_insert(error);
                         winding.finish = JointFinishDriver::Abandoned;
@@ -4527,11 +4678,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 self.joint_step_calls += 1;
             }
             self.snapshot_seated_summary();
-            let outcome = Self::step_begun_joint_finish(
+            let mut warn = WarnSink {
+                display: &mut self.display,
+            };
+            let outcome = Self::step_begun_joint_finish_with_warn(
                 &mut self.semantic,
                 &mut self.joint_finish,
                 &mut *self.coordinator,
                 &mut self.joint_first_error,
+                &mut warn,
             );
             if matches!(outcome, JointStepOutcome::WoundDown) {
                 self.complete_final_joint_lane();
@@ -4754,11 +4909,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     self.joint_step_calls += 1;
                 }
                 self.snapshot_seated_summary();
-                let outcome = Self::step_begun_joint_finish(
+                let mut warn = WarnSink {
+                    display: &mut self.display,
+                };
+                let outcome = Self::step_begun_joint_finish_with_warn(
                     &mut self.semantic,
                     &mut self.joint_finish,
                     &mut *self.coordinator,
                     &mut self.joint_first_error,
+                    &mut warn,
                 );
                 if matches!(outcome, JointStepOutcome::WoundDown) {
                     self.complete_final_joint_lane();
@@ -15323,7 +15482,10 @@ mod promotion_driver_tests {
         );
         // A further hook reaps nothing further.
         driver.on_lane_stopped();
-        assert_eq!(take_warned_for_test().len(), 1, "the line prints once");
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the line printed once: a further hook warns nothing more"
+        );
         assert_eq!(
             committed_gaps_by_subject(&mut driver, "semantic scan refused").len(),
             1,
@@ -15496,9 +15658,8 @@ mod promotion_driver_tests {
             "the stop disclosure still prints"
         );
         driver.on_stop_requested();
-        assert_eq!(
-            take_warned_for_test().len(),
-            1,
+        assert!(
+            take_warned_for_test().is_empty(),
             "a repeat escalation warns nothing more"
         );
         assert_eq!(
@@ -15647,9 +15808,8 @@ mod promotion_driver_tests {
             "the gap carries the lane's per-reason counts"
         );
         driver.on_tick();
-        assert_eq!(
-            take_warned_for_test().len(),
-            1,
+        assert!(
+            take_warned_for_test().is_empty(),
             "a further tick discloses nothing more"
         );
     }

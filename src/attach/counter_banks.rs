@@ -7884,6 +7884,14 @@ pub(crate) mod tests {
             CounterMode::Latency,
         ];
         let cpus_list = [1usize, 4, 12, 64, 128, 172, 256];
+        // One literal per-bank count: a `+ cpus` scaling mutant reads
+        // self-consistently everywhere else in this table, so the literal
+        // is what kills it directly.
+        assert_eq!(
+            counter_bank_map_bytes(CounterMode::Counts, 12).unwrap(),
+            147_456,
+            "512 cells * 24 value bytes * 12 CPUs"
+        );
         println!("mode P fixed per_bank banks endpoints total");
         for mode in modes {
             for cpus in cpus_list {

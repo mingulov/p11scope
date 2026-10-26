@@ -5462,7 +5462,6 @@ fn steady_caller_exit_before_any_pass_classifies_it_discloses_only_the_tail() {
     );
 }
 
-
 /// The wait that keeps commit lag from failing count authority waits
 /// only for the queuing projection's own publication. A module the
 /// committed registry knows is judged at once; one it still does not
@@ -5598,12 +5597,12 @@ fn demotion_retirement_projected_observation_waits_for_admission_upgrade() {
             }
         },
     };
-    scene
-        .native
-        .scene
-        .coordinator
-        .registry
-        .note_mapping(caller, 7, info(AdmissionState::Refused), 400);
+    scene.native.scene.coordinator.registry.note_mapping(
+        caller,
+        7,
+        info(AdmissionState::Refused),
+        400,
+    );
     scene.native.scene.coordinator.registry.publish();
     let id = scene
         .native
@@ -5640,12 +5639,12 @@ fn demotion_retirement_projected_observation_waits_for_admission_upgrade() {
     };
     let mut ownership = fresh(&scene);
     let published = scene.native.scene.coordinator.registry.published_revision();
-    scene
-        .native
-        .scene
-        .coordinator
-        .registry
-        .note_mapping(caller, 7, info(AdmissionState::Admitted), 500);
+    scene.native.scene.coordinator.registry.note_mapping(
+        caller,
+        7,
+        info(AdmissionState::Admitted),
+        500,
+    );
     assert!(ownership.queue_projected_observation(
         caller,
         vec![key.clone()],

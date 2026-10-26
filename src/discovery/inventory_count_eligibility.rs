@@ -407,8 +407,9 @@ impl CountOwnership {
     /// A catalog projection's observation: its module mappings are staged
     /// in the registry, unpublished, and `published` is the registry
     /// publication current at queue time. A module the committed registry
-    /// does not know yet is judged only after a later publication, which
-    /// carries this projection: commit lag is never failed authority.
+    /// has not admitted yet is judged only after a later publication,
+    /// which carries this projection: commit lag is never failed
+    /// authority.
     pub(super) fn queue_projected_observation(
         &mut self,
         caller: CallerId,
@@ -906,20 +907,25 @@ impl CountOwnership {
                 budget.spend(2);
                 let key = &observation.modules[observation.cursor];
                 let id = registry.module_id_for(key);
-                if id.is_none()
+                let committed_admitted = id
+                    .and_then(|id| registry.module(id))
+                    .is_some_and(|record| record.admission == AdmissionState::Admitted);
+                if !committed_admitted
                     && observation
                         .published
                         .is_some_and(|published| registry.published_revision() <= published)
                 {
                     // The projection that queued this observation staged
-                    // this module's mapping and has not published yet: the
-                    // committed registry cannot judge a module first noted
-                    // by that same projection. Wait for the publication —
-                    // the caller stays deferred, nothing is accepted — and
-                    // judge it then; a module still unknown after it fails
-                    // authority below. Commit lag is not an authority
-                    // failure: recording it would revoke ordinary origin
-                    // for every later pair of this caller.
+                    // this module's mapping — or its admission upgrade —
+                    // and has not published yet: the committed registry
+                    // cannot judge a module first noted, or newly
+                    // admitted, by that same projection. Wait for the
+                    // publication — the caller stays deferred, nothing is
+                    // accepted — and judge it then; a module still not
+                    // admitted after it fails authority below. Commit lag
+                    // is not an authority failure: recording it would
+                    // revoke ordinary origin for every later pair of this
+                    // caller.
                     continue;
                 }
                 observation.authoritative &= matches!(
@@ -928,9 +934,7 @@ impl CountOwnership {
                         sha256: Some(_),
                         ..
                     }
-                ) && id
-                    .and_then(|id| registry.module(id))
-                    .is_some_and(|record| record.admission == AdmissionState::Admitted);
+                ) && committed_admitted;
                 observation.equal &= slot
                     .active
                     .as_ref()

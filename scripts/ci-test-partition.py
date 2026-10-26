@@ -803,7 +803,7 @@ def self_test():
     assert rest_expected_targets(_fake_metadata()) == {
         ("p11scope", "src/lib.rs"), ("p11scope", "src/main.rs"),
         ("example", "examples/example.rs"), ("alpha", "tests/alpha.rs"),
-        ("zeta", "tests/zeta.rs"),
+        ("beta", "tests/beta.rs"), ("zeta", "tests/zeta.rs"),
     }
     zero = _FakeRest([
         ("p11scope-1a2b3c4d5e6f7890", "src/lib.rs", (10, 0, 0, 0)),
@@ -896,6 +896,20 @@ def self_test():
         assert "tests/zeta.rs" in str(error), error
     else:
         raise AssertionError("a selected target with no section went unnoticed")
+    # The member target is expected and required: a run missing only
+    # its section fails naming it, so member coverage cannot hide
+    # behind a root target of the same name.
+    member_missing = _FakeRest([
+        section for section in _full_rest_sections()
+        if not section[0].startswith("beta-")
+    ])
+    try:
+        run_partition("rest", gate, runner=member_missing,
+                      metadata=lambda c: _fake_metadata())
+    except PartitionError as error:
+        assert "tests/beta.rs" in str(error), error
+    else:
+        raise AssertionError("a missing member section went unnoticed")
     # An unrecognized header form fails closed naming the line: the
     # unknown section's healthy summary must not merge into the
     # previous section and mask its zero.

@@ -38,6 +38,7 @@ use crate::semantics_objects::journal::{
     EndpointClass, FaultEpoch, FaultReadError, JournalAdapter, JournalDomainProof,
     SessionClosureGrant, SessionDrainGrant,
 };
+use p11scope_ebpf_common::event_type;
 use std::time::Instant;
 
 const RAW_CAPACITY: usize = 4_096;
@@ -432,6 +433,8 @@ struct CollectedReports {
     refused: Option<SemanticBatch>,
     receipt_limit: usize,
     nested_per_receipt: usize,
+    nested_limit: usize,
+    nested_used: usize,
     _storage: ResourceLease,
 }
 
@@ -448,11 +451,61 @@ fn array_bytes<T>(capacity: usize) -> Option<usize> {
 impl CollectedReports {
     fn new(
         lane: &AttestedSemanticLane,
-        inputs: usize,
+        raw: &RawJointQuantum,
         reserve: &SemanticResourceReserver,
     ) -> Result<Self, SemanticRefusal> {
-        let receipt_limit = inputs
-            .checked_add(REFRESHES_PER_BIND)
+        // Receipts are minted per input partition, never per record: one
+        // scan job per (caller image, provider slot) key, one accepted scan
+        // per job per pass (an accepted scan resolves every waiting call of
+        // its key, so the job is never requeued), plus whatever the refresh
+        // stash still holds and the binder's at most four refresh receipts.
+        // Count the distinct CALL partitions with an allocation-free scalar
+        // scan, so counting itself needs no lease. Event slots over-approximate
+        // attachment file slots (the slot-to-endpoint map is a function), and
+        // non-call records mint no jobs, so this count still dominates.
+        let records = raw
+            .h0_input(lane.domain(), MAX_PENDING)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?
+            .0;
+        let mut partitions = 0usize;
+        for (index, record) in records.iter().enumerate() {
+            if record.base.event.event_type != event_type::CALL {
+                continue;
+            }
+            let image = record.base.event.image;
+            let key = (image.task_cookie, image.exec_id, record.base.event.slot);
+            let seen = records[..index].iter().any(|prior| {
+                prior.base.event.event_type == event_type::CALL
+                    && prior.base.event.image.task_cookie == key.0
+                    && prior.base.event.image.exec_id == key.1
+                    && prior.base.event.slot == key.2
+            });
+            if !seen {
+                partitions += 1;
+            }
+        }
+        // Stashed refresh receipts drain into this same pass's first tick.
+        // They already exist, so measure their exact nested bytes instead
+        // of bounding them. An unmeasurable receipt cannot be covered.
+        let mut stashed_count = 0usize;
+        let mut stashed_nested = 0usize;
+        if let Some(live) = lane.live.as_deref() {
+            for receipt in live.stashed_refresh.stashed.iter() {
+                stashed_count = stashed_count
+                    .checked_add(1)
+                    .ok_or(SemanticRefusal::ProviderStorage)?;
+                stashed_nested = stashed_nested
+                    .checked_add(
+                        receipt
+                            .owned_storage_bytes()
+                            .ok_or(SemanticRefusal::ProviderStorage)?,
+                    )
+                    .ok_or(SemanticRefusal::ProviderStorage)?;
+            }
+        }
+        let receipt_limit = partitions
+            .checked_add(stashed_count)
+            .and_then(|count| count.checked_add(REFRESHES_PER_BIND))
             .ok_or(SemanticRefusal::ProviderStorage)?;
         let allocation_limit = receipt_limit
             .checked_next_power_of_two()
@@ -469,10 +522,29 @@ impl CollectedReports {
         let nested_per_receipt = array_bytes::<InstanceId>(MAX_INSTANCES)
             .and_then(|bytes| bytes.checked_add(watched_bound))
             .ok_or(SemanticRefusal::ProviderStorage)?;
+        // Nested bytes are bounded globally, not per receipt times the
+        // count: every pass receipt names its own partition's current
+        // instances from the router's shared minted pool, so the distinct
+        // keys together name at most MAX_INSTANCES ids. Each id list is
+        // collected with capacity at most twice its length plus one
+        // minimal allocation (pinned-toolchain growth law), plus its own
+        // padding and one watched-file copy. The merge checks below
+        // enforce this cumulative limit before taking any batch.
+        let tick_nested = (|| {
+            MAX_INSTANCES
+                .checked_mul(2)?
+                .checked_add(partitions.checked_mul(4)?)?
+                .checked_mul(size_of::<InstanceId>())?
+                .checked_add(partitions.checked_mul(OWNED_ALLOCATION_PADDING)?)?
+                .checked_add(partitions.checked_mul(watched_bound)?)
+        })()
+        .ok_or(SemanticRefusal::ProviderStorage)?;
+        let nested_limit = tick_nested
+            .checked_add(stashed_nested)
+            .ok_or(SemanticRefusal::ProviderStorage)?;
         // Both the accumulator and the current callback's original buffers
         // coexist. Each Current keeps its actual IDs/watched-file allocation.
-        // There are at most input-partition receipts plus the four refreshes:
-        // empty-input retries resolve those same jobs, never add interests.
+        // Empty-input retries resolve those same jobs, never add interests.
         let bytes = (|| {
             size_of::<Self>()
                 .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
@@ -480,11 +552,7 @@ impl CollectedReports {
                     array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?,
                 )?
                 .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
-                .checked_add(
-                    nested_per_receipt
-                        .checked_mul(receipt_limit)?
-                        .checked_mul(2)?,
-                )
+                .checked_add(nested_limit.checked_mul(2)?)
         })()
         .ok_or(SemanticRefusal::ProviderStorage)?;
         let storage = reserve
@@ -522,12 +590,23 @@ impl CollectedReports {
             refused: None,
             receipt_limit,
             nested_per_receipt,
+            nested_limit,
+            nested_used: 0,
             _storage: storage,
         })
     }
 
     fn merge(&mut self, mut incoming: SemanticBatch) -> Result<bool, SemanticRefusal> {
         let batch = self.batch.as_mut().expect("not staged until H0 finishes");
+        // The cumulative nested check mirrors the count checks: measure the
+        // incoming receipts' exact bytes first. An unmeasurable receipt, an
+        // overflowing sum, or a total past the prepaid limit refuses before
+        // any field moves; the retained incoming batch keeps its diagnosis.
+        let incoming_nested: Option<usize> =
+            incoming.current.iter().try_fold(0usize, |sum, receipt| {
+                sum.checked_add(receipt.owned_storage_bytes()?)
+            });
+        let nested_total = incoming_nested.and_then(|nested| self.nested_used.checked_add(nested));
         let fits = incoming.domain == batch.domain
             && batch
                 .outcomes
@@ -548,11 +627,13 @@ impl CollectedReports {
                 receipt
                     .owned_storage_bytes()
                     .is_some_and(|bytes| bytes <= self.nested_per_receipt)
-            });
+            })
+            && nested_total.is_some_and(|total| total <= self.nested_limit);
         if !fits {
             self.refused = Some(incoming);
             return Err(SemanticRefusal::ProviderStorage);
         }
+        self.nested_used = nested_total.expect("the fits check measured this same total");
         batch.outcomes.append(&mut incoming.outcomes);
         batch.current.append(&mut incoming.current);
         batch.negatives.append(&mut incoming.negatives);
@@ -578,6 +659,11 @@ impl CollectedReports {
         let batch = self.batch.as_mut().ok_or(SemanticRefusal::Unavailable)?;
         let outcomes = batch.outcomes.len().checked_add(incoming.outcomes().len());
         let current = batch.current.len().checked_add(incoming.current().len());
+        let incoming_nested: Option<usize> =
+            incoming.current().iter().try_fold(0usize, |sum, receipt| {
+                sum.checked_add(receipt.owned_storage_bytes()?)
+            });
+        let nested_total = incoming_nested.and_then(|nested| self.nested_used.checked_add(nested));
         if self.refused.is_some()
             || domain != batch.domain
             || !outcomes
@@ -590,9 +676,11 @@ impl CollectedReports {
                     .owned_storage_bytes()
                     .is_some_and(|bytes| bytes <= self.nested_per_receipt)
             })
+            || !nested_total.is_some_and(|total| total <= self.nested_limit)
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
+        self.nested_used = nested_total.expect("the merge checks measured this same total");
         batch.awaiting_floor = incoming.awaiting_floor();
         batch.shed_floor = batch
             .shed_floor
@@ -1991,11 +2079,7 @@ impl LiveJointMachine {
             }
             Phase::Binding(mut original) => {
                 let reserve = coordinator.registry().semantic_storage_reserver();
-                let reports = match CollectedReports::new(
-                    lane,
-                    original.raw.pending_h0_records(),
-                    &reserve,
-                ) {
+                let reports = match CollectedReports::new(lane, &original.raw, &reserve) {
                     Ok(reports) => reports,
                     Err(reason) => return (Phase::Binding(original), Err(reason)),
                 };

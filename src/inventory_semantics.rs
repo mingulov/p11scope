@@ -304,9 +304,10 @@ pub(crate) struct SemanticBatch {
     awaiting_floor: Option<u64>,
     shed_floor: Option<u64>,
     exhausted: bool,
-    /// Guard signals carried from the tick report: scans attempted for
-    /// awaited keys, and whether any awaited job or hold is still pending.
-    pending_scans: usize,
+    /// Guard signals carried from the tick report: whether any scan was
+    /// attempted for an awaited key, and whether any awaited job or hold
+    /// is still pending. Bools only, so the pinned batch size is unchanged.
+    has_pending_scans: bool,
     awaited_jobs_pending: bool,
     awaited_hold_pending: bool,
 }
@@ -385,7 +386,7 @@ impl SemanticBatch {
         let awaiting_floor = report.awaiting_floor();
         let shed_floor = report.shed_floor();
         let exhausted = report.exhausted();
-        let pending_scans = report.pending_scans;
+        let has_pending_scans = report.pending_scans > 0;
         let awaited_jobs_pending = report.awaited_jobs_pending;
         let awaited_hold_pending = report.awaited_hold_pending;
         let (outcomes, current) = report.into_parts();
@@ -404,7 +405,7 @@ impl SemanticBatch {
             awaiting_floor,
             shed_floor,
             exhausted,
-            pending_scans,
+            has_pending_scans,
             awaited_jobs_pending,
             awaited_hold_pending,
         })
@@ -440,8 +441,8 @@ impl SemanticBatch {
     }
 
     /// Guard signals for the Joint no-progress tripwire.
-    pub(crate) fn pending_scans(&self) -> usize {
-        self.pending_scans
+    pub(crate) fn has_pending_scans(&self) -> bool {
+        self.has_pending_scans
     }
     pub(crate) fn awaited_jobs_pending(&self) -> bool {
         self.awaited_jobs_pending

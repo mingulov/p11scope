@@ -386,7 +386,7 @@ impl Collected {
     fn note_h0_merge(
         &mut self,
         before: Option<(usize, usize)>,
-        pending_scans: usize,
+        has_pending_scans: bool,
         has_future_job: bool,
         has_hold: bool,
     ) -> bool {
@@ -394,7 +394,7 @@ impl Collected {
             self.h0_idle_passes = 0;
             return false;
         }
-        if pending_scans > 0 || has_future_job || has_hold {
+        if has_pending_scans || has_future_job || has_hold {
             self.h0_idle_passes = 0;
             return false;
         }
@@ -690,7 +690,7 @@ impl CollectedReports {
                 awaiting_floor: None,
                 shed_floor: None,
                 exhausted: false,
-                pending_scans: 0,
+                has_pending_scans: false,
                 awaited_jobs_pending: false,
                 awaited_hold_pending: false,
             }),
@@ -1576,7 +1576,7 @@ impl LiveJointMachine {
             // note call: its reset on a progressing PendingQ merge matters to
             // the shared count. On the unreachable trip, never refuse the
             // lane; AwaitH0's ticks or its own guard trip expire and publish.
-            if original.note_h0_merge(before, 0, false, false) {
+            if original.note_h0_merge(before, false, false, false) {
                 original.h0_guard_trip = Some("h0_no_progress_no_job_no_hold_expired");
             }
             return (Phase::AwaitH0(original), Ok(Step::Yield));
@@ -2379,7 +2379,7 @@ impl LiveJointMachine {
                 let batch = retain_on_refusal!(Phase::AwaitH0(original), ticked);
                 budget.spend(1);
                 let before = original.h0_accumulated();
-                let pending_scans = batch.pending_scans();
+                let has_pending_scans = batch.has_pending_scans();
                 let has_future_job = batch.awaited_jobs_pending();
                 let has_hold = batch.awaited_hold_pending();
                 let complete = match original
@@ -2392,7 +2392,7 @@ impl LiveJointMachine {
                     Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
                 };
                 if !complete {
-                    if original.note_h0_merge(before, pending_scans, has_future_job, has_hold) {
+                    if original.note_h0_merge(before, has_pending_scans, has_future_job, has_hold) {
                         original.h0_guard_trip = Some("h0_no_progress_no_job_no_hold_expired");
                         let expired =
                             match io.expire_collected_h0_for_guard(lane, &mut original.raw) {

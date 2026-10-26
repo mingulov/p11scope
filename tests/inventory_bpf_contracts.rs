@@ -1,6 +1,38 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use std::process::Command;
 
+/// Inventory verifier budget: both inventory flavors build the BPF crate
+/// with `-C opt-level=3`, restoring the pre-size-first code shape the
+/// 5.15/6.1 verifier accepts for `interface_list_worker` (the crate
+/// profile's `opt-level = "s"` shrank the worker's static size but doubled
+/// its verifier states past the 1M limit). Detailed and counter flavors
+/// keep the profile default, so their pinned budgets stay valid.
+#[test]
+fn inventory_build_restores_worker_opt_level() {
+    let manifest = std::fs::read_to_string("crates/ebpf/Cargo.toml").expect("read BPF manifest");
+    assert!(
+        manifest
+            .lines()
+            .any(|line| line.trim() == "opt-level = \"s\""),
+        "the BPF release profile must keep opt-level \"s\" for Detailed/counters"
+    );
+    let build = std::fs::read_to_string("build.rs").expect("read build script");
+    let lines: Vec<&str> = build.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("append_flag(\"opt-level=3\")"))
+        .expect("inventory BPF builds must override opt-level to 3");
+    let guard = lines[at.saturating_sub(6)..at]
+        .iter()
+        .rev()
+        .find(|line| line.trim_start().starts_with("if "))
+        .expect("opt-level override must sit under a flavor guard");
+    assert!(
+        guard.trim() == "if inventory {",
+        "opt-level 3 must apply to both inventory flavors only, under `{guard}`"
+    );
+}
+
 #[test]
 fn compact_inventory_object_matches_manifest_and_relocates_without_kernel_syscalls() {
     let directory = tempfile::tempdir().expect("inventory object test directory");

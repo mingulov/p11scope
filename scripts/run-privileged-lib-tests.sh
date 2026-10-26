@@ -312,7 +312,7 @@ inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
 # journal_unavailable S1 marker. Spawns a real observer binary:
 # P11SCOPE_E2E_OBSERVER, else the p11scope sibling of the test
 # binary. Prints MAN1_E2E lines (about a minute).
-inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softsm_edges_lp64
+inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

@@ -902,7 +902,7 @@
     },
     {
       "file": "src/inventory_manifest_e2e_tests.rs",
-      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softsm_edges_lp64",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64",
       "reason": "privileged: inventory --system --manifest end to end with a SoftHSM workload exits 0 with populated S1 edges or named route-loss gaps",
       "cell": "privileged"
     },

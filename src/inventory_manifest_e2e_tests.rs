@@ -4,10 +4,11 @@
 //! through the real CLI surface (`cli::parse` + `inventory::run`).
 //! Root BPF lane, run serially through `scripts/run-privileged-lib-tests.sh`.
 //! The workload dlopens after a gate the cell opens once the native
-//! attach has settled, so its calls are post-attach (R-34b) and the
-//! semantic edges form deterministically; the cell asserts rc 0 plus
-//! populated S1 edges (mechanisms and API results) and the
-//! `journal_unavailable` S1 marker. Prints MAN1_E2E lines.
+//! attach has settled, so its calls are post-attach (R-34b). The cell
+//! asserts rc 0 plus populated S1 edges (mechanisms and API results)
+//! or named route-loss gaps (R-51); a run with neither fails as a
+//! silent drop. It also asserts the `journal_unavailable` S1 marker.
+//! Prints MAN1_E2E lines.
 
 use super::*;
 use anyhow::ensure;
@@ -294,16 +295,17 @@ fn mech_manifest(workload: &E2eWorkload, module: &str) -> Result<PathBuf> {
 
 /// The v0.5.0 headline command end to end: `inventory --system
 /// --manifest` over a live SoftHSM2 ledger workload exits 0 with
-/// populated S1 edges (mechanisms and API results). The workload
-/// dlopens after the gate opens, strictly post-attach: the cell
-/// opens the gate once the observer's pass 0 publishes (the native
-/// attach settled in its apply step). Needs an observer binary via
-/// `P11SCOPE_E2E_OBSERVER` (the guest driver stages one) or a
-/// `p11scope` sibling of this test binary. Prints MAN1_E2E lines.
-/// Root BPF lane, serial, about a minute.
+/// populated S1 edges (mechanisms and API results) or named
+/// route-loss gaps (R-51); a run with neither fails as a silent
+/// drop. The workload dlopens after the gate opens, strictly
+/// post-attach: the cell opens the gate once the observer's pass 0
+/// publishes (the native attach settled in its apply step). Needs an
+/// observer binary via `P11SCOPE_E2E_OBSERVER` (the guest driver
+/// stages one) or a `p11scope` sibling of this test binary. Prints
+/// MAN1_E2E lines. Root BPF lane, serial, about a minute.
 #[test]
 #[ignore = "privileged: inventory --system --manifest end to end with a SoftHSM workload exits 0 with populated S1 edges or named route-loss gaps"]
-fn privileged_inventory_system_manifest_e2e_softsm_edges_lp64() -> Result<()> {
+fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = E2eWorkload::build(&module)?;
@@ -375,6 +377,10 @@ fn privileged_inventory_system_manifest_e2e_softsm_edges_lp64() -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
+    ensure!(
+        target.child.try_wait()?.is_none(),
+        "the workload is still alive at the observer stop"
+    );
     target.kill();
     let rc = status.code().unwrap_or(-1);
     println!("MAN1_E2E observer rc={rc}");

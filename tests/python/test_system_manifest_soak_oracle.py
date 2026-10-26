@@ -236,6 +236,12 @@ class SoakOracleTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
         self.assertFalse(verdict["qualifying"])
 
+    def test_vehicle_supports_fedora_softhsm_layout(self):
+        vehicle = ROOT / "scripts" / "system-manifest-soak.sh"
+        text = vehicle.read_text(encoding="utf-8")
+        self.assertIn("/usr/lib64/pkcs11/libsofthsm2.so", text,
+                      "the soak vehicle must try the Fedora SoftHSM layout")
+
     def test_red_stop_rc(self):
         target = mutate_copy(self.green, "leg-stop-rc", lambda target: rewrite_json(
             target / "run.json", lambda run: run["observer"].update({"exit": 1})))
@@ -277,6 +283,16 @@ class SoakOracleTest(unittest.TestCase):
         self.assert_red_only(self.evaluate(mutate_copy(self.green, "leg-foreign", add_foreign)),
                              "workload_ledger")
 
+    def test_red_ledger_malformed_row_is_structured_fail(self):
+        def corrupt(target):
+            path = target / "workload-0.log"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text + "LEDGER this-token-has-no-equals-sign\n",
+                            encoding="utf-8")
+        self.assert_red_only(
+            self.evaluate(mutate_copy(self.green, "leg-malformed", corrupt)),
+            "workload_ledger")
+
     def test_red_loss_unconserved(self):
         def break_conservation(target):
             (target / "observer.stderr").write_text(
@@ -316,6 +332,17 @@ class SoakOracleTest(unittest.TestCase):
                 "endpoints"].update({"refused": 4}))
         self.assert_red_only(
             self.evaluate(mutate_copy(self.green, "leg-refused", refuse)),
+            "loss_accounting")
+
+    def test_red_loss_budget_refusal_needs_named_subject(self):
+        def refuse_unrelated(target):
+            rewrite_json(target / "report.json", lambda report: (
+                report["budgets"]["endpoints"].update({"refused": 4}),
+                report.update({"gaps": [{"subject": "kernel threads",
+                                          "reason": "verified absence"}]})))
+        self.assert_red_only(
+            self.evaluate(mutate_copy(self.green, "leg-refused-unrelated",
+                                      refuse_unrelated)),
             "loss_accounting")
 
     def test_red_resources_over_bound(self):

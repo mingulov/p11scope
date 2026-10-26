@@ -3476,6 +3476,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         object_required: 0,
     };
     if unsafe { p11_link_current_identity(&mut seed.image) } != 1 || seed.image.task_cookie == 0 {
+        // H8-D birth marker: a call lost to identity failure is an
+        // uncaptured call, so it dirties the leader row.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         let _ = owned_start_remove(&key, false);
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
@@ -3500,6 +3506,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     // pointer escapes a failed transaction; its native cleanup owns rollback.
     let start_pointer = unsafe { p11_owner_start_begin(&key, &seed) };
     if start_pointer.is_null() {
+        // H8-D birth marker: a call lost to START refusal is an
+        // uncaptured call, so it dirties the leader row.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         bump_evidence(EVIDENCE_START_INSERT_FAILURES);
         return 0;
     }
@@ -3786,6 +3798,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             slot,
             _pad: 0,
         };
+        // H8-D birth marker: a return that lost its scope loses the
+        // completion, so it dirties the leader row.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
@@ -3805,6 +3823,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         _pad: 0,
     };
     let Some(layout) = ret_probe_layout(&ctx) else {
+        // H8-D birth marker: a return with a refused ABI loses the
+        // completion, so it dirties the leader row.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         owned_start_discard(&key);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
@@ -3813,6 +3837,13 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     // an outlined call: the object branch receives only a raw live pointer.
     let start = unsafe { p11_owner_start_get(&key, 0) };
     if start.is_null() {
+        // H8-D birth marker: a return without START loses the
+        // completion. Absence and owner-custody refusal share this NULL,
+        // so both dirty the leader row.
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
         return 0;
     }
     if cfg!(feature = "counter-broad") && unsafe { (*start).object_required } != 0 {
@@ -3821,11 +3852,22 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
-    if unsafe { (*start).object_required } == 0 {
+    // H8-D birth marker: the outlined return halves report a lost
+    // in-scope call with a nonzero code instead of calling the leaf (a
+    // call there would deepen return's 512-byte chain); the root dirties
+    // the leader row here at root depth.
+    let lost = if unsafe { (*start).object_required } == 0 {
         ordinary_return(ctx, &key, start, flags, layout)
     } else {
         object_return(ctx, &key, start, flags, layout)
+    };
+    if lost != 0 {
+        #[cfg(not(feature = "counter-broad"))]
+        unsafe {
+            p11_instance_scope_gap();
+        }
     }
+    0
 }
 
 #[cfg(not(feature = "inventory-only"))]
@@ -3959,6 +4001,13 @@ fn capture_return_facts(
     }
 }
 
+/// H8-D birth marker: the outlined return halves report a lost
+/// in-scope call (identity mismatch, ring loss) with this code. The
+/// root dirties the leader row at root depth; the helpers never call
+/// the leaf themselves, keeping return's 512-byte chain intact.
+#[cfg(not(feature = "inventory-only"))]
+const RETURN_CALL_LOST: u32 = 1;
+
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn ordinary_return(
@@ -3987,7 +4036,7 @@ fn ordinary_return(
         || !image_pair_matches(start.image, image)
     {
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        return 0;
+        return RETURN_CALL_LOST;
     }
     let facts = capture_return_facts(ctx, &start, flags, layout, accounting);
     match EVENTS.reserve::<EventRecord>(0) {
@@ -4004,7 +4053,10 @@ fn ordinary_return(
             }
             e.submit(0);
         }
-        None => bump_evidence(EVIDENCE_RING_LOSS),
+        None => {
+            bump_evidence(EVIDENCE_RING_LOSS);
+            return RETURN_CALL_LOST;
+        }
     }
     0
 }
@@ -4083,10 +4135,13 @@ fn object_return(
     let rv = accounting.rv;
     let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
         if owned_start_remove(&key, true).is_err() {
+            // The fault below already refuses births; report no loss.
             unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_RING_LOSS);
+            return 0;
         }
         bump_evidence(EVIDENCE_RING_LOSS);
-        return 0;
+        return RETURN_CALL_LOST;
     };
     // H7-E1: populate in place under ownership with the base event
     // and its continuity landing in the reserved record FIRST, then

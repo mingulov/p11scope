@@ -2312,21 +2312,21 @@ static void counter_bank_owner_start_failures(void)
     reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     fail_start_delete = -16;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     /* The failure occurs at the last callback: helper count 8192 alone
      * cannot distinguish successful completion from explicit callback failure. */
     assert(bank_loop_calls == 1 && row(&START, &high));
     assert(owners[0].start_count == 1 && ctl.outstanding == 1 && ctl.poison);
     assert(!ctl.abandoned_start);
     fail_start_delete = 0;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(!row(&START, &high) && !ctl.outstanding && idle(0));
     assert(ctl.abandoned_start == 1 && ctl.poison);
 
     reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     bank_hide_start_slot = 8191;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(bank_loop_calls == 1 && row(&START, &high));
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
     assert(!ctl.abandoned_start);
@@ -2334,7 +2334,7 @@ static void counter_bank_owner_start_failures(void)
     reset(); object_setup(); high = start_key(8191);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     owners[0].start_count = 2;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(!row(&START, &high) && ctl.abandoned_start == 1);
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
 }
@@ -2372,13 +2372,13 @@ static void counter_bank_owner_orphan_failures(void)
 
     high = counter_bank_owner_orphan();
     fail_object_side_delete = -16;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(bank_loop_calls == 2 && row(&OBJECT_START, &high));
     assert(object_bytes_zeroed(row(&OBJECT_START, &high)->value));
     assert(checked_side_deletes == 1 && ctl.poison && ctl.outstanding == 1);
     assert(!owners[0].start_count && !ctl.abandoned_start && !idle(0));
     fail_object_side_delete = 0;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(!row(&OBJECT_START, &high) && !ctl.outstanding);
     assert(ctl.poison && ctl.abandoned_start == 1 && idle(0));
 }
@@ -2396,7 +2396,7 @@ static void counter_bank_owner_incomplete_loops(void)
             }
             if (short_result) bank_loop_short_on = phase;
             else bank_loop_error_on = phase;
-            assert(p11_owner_cleanup());
+            assert(p11_owner_cleanup() == 1);
             assert(bank_loop_calls == phase && ctl.poison && ctl.outstanding == 1);
             assert(owners[0].flags && owners[0].original_pid_tgid && !idle(0));
             assert(!ctl.abandoned_start);
@@ -2422,7 +2422,7 @@ static void counter_bank_owner_incomplete_loops(void)
     assert(p11_owner_start_aggregate(&low, 17) == 1);
     assert(!update(&OBJECT_START, &high, side, 1));
     bank_loop_short_on = 1;
-    assert(p11_owner_cleanup());
+    assert(p11_owner_cleanup() == 1);
     assert(bank_loop_calls == 1 && !row(&START, &low));
     assert(!owners[0].start_count && owners[0].flags);
     assert(owners[0].original_pid_tgid == pid_tgid() && ctl.outstanding == 1);

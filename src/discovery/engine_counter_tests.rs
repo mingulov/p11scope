@@ -48,10 +48,6 @@ fn detailed_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     .unwrap()
 }
 
-fn counters_plan(count: u32) -> plan::AttachPlan {
-    counters_plan_on(count, PinnedObjectId(7))
-}
-
 fn counters_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     plan::AttachPlan::from_slots_with_policy(
         (0..count).map(|index| counter_slot(index, object)).collect(),

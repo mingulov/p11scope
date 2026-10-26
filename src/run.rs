@@ -2366,6 +2366,25 @@ impl OutputSink {
     }
 }
 
+/// Counter read inputs for this capture: counter policies with a Counters
+/// plan read through bounded inputs (rows from the endpoint budget, RV
+/// keys from the shared pool, charges on the Engine's counter pool).
+/// Anything else reads the legacy path exactly as before.
+fn counter_inputs_for_capture(
+    policy: CapturePolicy,
+    engine: &Engine,
+) -> Option<metrics::CounterCaptureInputs> {
+    policy.counter_mode()?;
+    let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy() else {
+        return None;
+    };
+    Some(metrics::CounterCaptureInputs::new(
+        budget.endpoint_limit() as usize,
+        crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
+        engine.counter_reserver(),
+    ))
+}
+
 /// Picks the loop `kind` selects. The only place either loop is entered, so
 /// there is exactly one profile loop and one trace loop in this binary.
 #[allow(clippy::too_many_arguments)]
@@ -2400,6 +2419,7 @@ fn run_loop(
                 OutputSink::Profile(file) => Some(*file),
                 _ => None,
             };
+            let counter_inputs = counter_inputs_for_capture(policy, engine);
             capture_profile(
                 engine,
                 session,
@@ -2413,7 +2433,7 @@ fn run_loop(
                 ring_bytes,
                 uretprobe_override,
                 resource_start,
-                None,
+                counter_inputs,
             )
         }
         Kind::Trace => {

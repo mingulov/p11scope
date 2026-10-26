@@ -150,6 +150,14 @@ impl CounterCaptureInputs {
             reserve,
         }
     }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.limits.rows
+    }
+
+    pub(crate) fn rv_keys(&self) -> usize {
+        self.limits.rv_keys
+    }
 }
 
 #[derive(Debug, Clone)]

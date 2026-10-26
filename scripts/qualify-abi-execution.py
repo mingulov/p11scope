@@ -40,9 +40,9 @@ through its CLI, so any verdict replays byte-for-byte from the artifacts.
 The blocked cell instead proves in-flight accounting on a real call: the
 slot-10 provider entry waits for this driver's release file, the driver
 ends the capture with the call in flight only after the provider proves
-the entry, checks the stopped report saw it, and only then releases, so
-the S1 pin for that cell is exactly one in-flight call with its matching
-observation cause.
+the entry, checks the stopped report saw it, and only then releases. The
+capture ends before the workload exits, so that cell pins exactly one
+in-flight call with exactly {interface_selection, in_flight_at_end}.
 
 Usage (as root; the observer refuses otherwise):
   python3 -I scripts/qualify-abi-execution.py --observer ./p11scope --out DIR
@@ -461,7 +461,7 @@ def _ownership(row):
 
 def check_s1_report(report, pin, *, verdict_module=None,
                     expected_in_flight_at_end=0,
-                    extra_observation_causes=frozenset()):
+                    expected_observation_causes=None):
     """The S1 proof for a scan-only pid profile: loss-free and healthy,
     with the attach-late disclosure pinned.
 
@@ -469,13 +469,14 @@ def check_s1_report(report, pin, *, verdict_module=None,
     loss, kernel account, canonical terminal verdict, provider admission,
     well-formed rows), restricts attribution causes to the known scan-only
     disclosure, pins the observation causes to the deterministic attach-late
-    set, and requires a fully walked 104-function surface. The terminal
-    verdict itself is recorded, never pinned.
+    set (or the given expected set), and requires a fully walked
+    104-function surface. The terminal verdict itself is recorded, never
+    pinned.
 
-    The blocked cell designs one genuinely unreturned provider call, so it
-    pins in_flight_at_end to exactly 1 with the matching observation cause
-    instead of 0; every other cell pins 0 with no extra cause. Either way
-    the value is exact, never a floor.
+    The blocked cell ends its capture before the workload exits, so it
+    never sees the exit-time loader evidence: it pins in_flight_at_end to
+    exactly 1 with exactly {interface_selection, in_flight_at_end} instead
+    of the three-cause set. Either way the values are exact, never floors.
     """
     verdict = verdict_module
     if verdict is None:
@@ -516,7 +517,10 @@ def check_s1_report(report, pin, *, verdict_module=None,
     _terminal(evidence, verdict)
     observation = evidence.get("gap_classes", {}).get("observation", {})
     causes = observation.get("causes", [])
-    expected_causes = PINNED_OBSERVATION_CAUSES | set(extra_observation_causes)
+    if expected_observation_causes is None:
+        expected_causes = set(PINNED_OBSERVATION_CAUSES)
+    else:
+        expected_causes = set(expected_observation_causes)
     if (not isinstance(causes, list) or set(causes) != expected_causes):
         raise DriverRefusal("observation disclosure differs from the pinned "
                             "attach-late set")
@@ -889,7 +893,8 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
         if cond == "blocked":
             s1 = check_s1_report(
                 report, pin, expected_in_flight_at_end=1,
-                extra_observation_causes={"in_flight_at_end"})
+                expected_observation_causes={"interface_selection",
+                                             "in_flight_at_end"})
         else:
             s1 = check_s1_report(report, pin)
     except DriverRefusal as error:

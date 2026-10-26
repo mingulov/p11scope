@@ -1426,4 +1426,155 @@ pub(super) mod tests {
         drop(capture);
         assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
+
+    #[test]
+    fn counter_empty_capture_reports_fresh_empty_for_all_modes() {
+        use std::cell::Cell;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let plan = AttachPlan::from_slots_with_policy(
+                vec![],
+                AdmissionPolicy::counters(crate::capacity::CounterBudget::new(512).unwrap()),
+            )
+            .unwrap();
+            assert!(plan.slots.is_empty());
+            let pins = PinnedObjects::empty();
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            let calls = Cell::new(0);
+            let fresh = collection
+                .fresh_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| {
+                        calls.set(calls.get() + 1);
+                        Err(ReadStage::BankRouting)
+                    },
+                    || panic!("empty counter must not use legacy"),
+                )
+                .expect("unstaged empty counter fresh succeeds");
+            assert_eq!(calls.get(), 0, "empty bypasses bank reads");
+            assert!(fresh.reports().is_empty());
+            let terminal = collection
+                .terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| {
+                        calls.set(calls.get() + 1);
+                        Err(ReadStage::BankRouting)
+                    },
+                    || panic!("empty counter must not use legacy"),
+                )
+                .expect("unstaged empty counter terminal succeeds");
+            assert_eq!(calls.get(), 0, "empty bypasses bank reads");
+            assert!(terminal.reports().is_empty());
+            let metadata = terminal.counter_collection().expect("empty carries collection");
+            assert_eq!(metadata["mode"], mode.name());
+            assert_eq!(metadata["status"], "fresh");
+            assert!(metadata["failure"].is_null());
+            assert_eq!(metadata["health"]["saturated"], false);
+            assert_eq!(metadata["health"]["contended"], false);
+            assert_eq!(metadata["discontinuity"], false);
+            assert!(metadata["generation"].as_u64().is_some_and(|g| g >= 1));
+            assert!(metadata["read_window"].is_null());
+            assert!(terminal.counter().is_some_and(|c| c.is_fresh()));
+            drop(fresh);
+            drop(terminal);
+            drop(collection);
+            assert_eq!(pool.snapshot().charged_bytes, baseline);
+        }
+    }
+
+    #[test]
+    fn counter_empty_capture_preserves_real_failures() {
+        use crate::attach::counter_banks::BankRefusal;
+        let empty_plan = || {
+            AttachPlan::from_slots_with_policy(
+                vec![],
+                AdmissionPolicy::counters(crate::capacity::CounterBudget::new(512).unwrap()),
+            )
+            .unwrap()
+        };
+        // Empty with a quarantined binding still errors (no masking).
+        {
+            let plan = empty_plan();
+            let pins = PinnedObjects::empty();
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            assert!(
+                collection
+                    .terminal_with(
+                        &plan,
+                        &pins,
+                        false,
+                        Err::<Option<()>, _>(BankRefusal::Quarantined),
+                        |(), _, _, _, _| panic!("quarantined must not read"),
+                        || panic!("quarantined must not use legacy"),
+                    )
+                    .is_err()
+            );
+        }
+        // Non-empty with bank routing still errors (no fabrication).
+        {
+            let (_file, plan, pins) = fixture();
+            assert!(!plan.slots.is_empty());
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            assert!(
+                collection
+                    .terminal_with(
+                        &plan,
+                        &pins,
+                        false,
+                        Ok(Some(())),
+                        |(), _, _, _, _| Err(ReadStage::BankRouting),
+                        || panic!("counter must not use legacy"),
+                    )
+                    .is_err()
+            );
+        }
+        // Empty with a legacy binding and counter inputs still errors.
+        {
+            let plan = empty_plan();
+            let pins = PinnedObjects::empty();
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let mut collection = CaptureCollection::new(Some(CounterCaptureInputs::new(
+                LIMITS.rows,
+                LIMITS.rv_keys,
+                pool.reserver(),
+            )));
+            assert!(
+                collection
+                    .terminal_with(
+                        &plan,
+                        &pins,
+                        false,
+                        Ok(None::<()>),
+                        |(), _, _, _, _| panic!("absent binding must not read"),
+                        || panic!("counter capture cannot switch to legacy"),
+                    )
+                    .is_err()
+            );
+        }
+    }
 }

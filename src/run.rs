@@ -17016,6 +17016,70 @@ mod tests {
         }
     }
 
+    /// Extract one top-level function body from this file's source for the
+    /// wiring pin below (the uretprobe loader-contract shape).
+    fn pin_body<'a>(
+        source: &'a str,
+        signature: &str,
+        end: &str,
+    ) -> std::result::Result<&'a str, String> {
+        source
+            .split_once(signature)
+            .ok_or_else(|| format!("{signature} not found"))?
+            .1
+            .split_once(end)
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("{signature} body end not found"))
+    }
+
+    /// Output evidence carries the session's object-capture status: the
+    /// evidence builder takes it as a parameter instead of re-reading the
+    /// global cache. (The production call sites are pinned from the render
+    /// side.) Fails while the builder re-reads the cache.
+    #[test]
+    fn evidence_for_carries_the_session_object_capture() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            let built = pin_body(source, "fn evidence_for(", "\n}\n")?;
+            if !built.contains("object_capture,") {
+                return Err("evidence_for must take the session's object capture".to_string());
+            }
+            if built.contains("object_capture_evidence") {
+                return Err("evidence_for must not re-read the global cache".to_string());
+            }
+            Ok(())
+        }
+
+        let source = include_str!("run.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "object_capture,",
+            "object_capture: crate::attach::Session::object_capture_evidence(),",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts the builder");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// The uretprobe preflight refuses a flavor mismatch with the plain
+    /// gate message: no capture lane can work, so the override is not
+    /// offered. Fails while the mismatch classifies as an unknown kernel.
+    #[test]
+    fn uretprobe_preflight_reports_a_flavor_mismatch_without_an_override_hint() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        for overridden in [false, true] {
+            let error = preflight_uretprobe_hazard(None, overridden)
+                .err()
+                .expect("a flavor mismatch must refuse the preflight");
+            let message = format!("{error:#}");
+            assert!(message.contains("stale or mismatched"), "{message}");
+            assert!(!message.contains("allow-uretprobe"), "{message}");
+        }
+    }
+
     #[test]
     fn broken_stdout_closes_only_that_sink_and_file_continues() {
         let mut stdout = FailingWriter {

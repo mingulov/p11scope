@@ -16094,6 +16094,272 @@ mod tests {
         assert!(message.contains("no exact return adapter"), "{message}");
     }
 
+    /// Extract one top-level function body from this file's source for the
+    /// wiring pins below (the uretprobe loader-contract shape).
+    fn pin_body<'a>(
+        source: &'a str,
+        signature: &str,
+        end: &str,
+    ) -> std::result::Result<&'a str, String> {
+        source
+            .split_once(signature)
+            .ok_or_else(|| format!("{signature} not found"))?
+            .1
+            .split_once(end)
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("{signature} body end not found"))
+    }
+
+    /// The planted-flavor seam is per thread: the holder's own thread reads
+    /// the planted value while a sibling thread keeps reading the real
+    /// bytes, so planting tests never leak a mismatch into tests running
+    /// beside them. Fails while the hook is process-global.
+    #[test]
+    fn flavor_override_stays_on_the_planting_thread() {
+        let bytes = super::embedded_flavor_from_bytes(crate::EBPF_OBJECT)
+            .expect("embedded Detailed bytes must probe");
+        let planted = super::EmbeddedFlavor {
+            stubbed: !bytes.stubbed,
+            unsafe_present: !bytes.unsafe_present,
+        };
+        let _guard = super::hold_embedded_flavor_for_test(Ok(planted));
+        assert_eq!(
+            super::embedded_flavor().expect("own thread reads the planted value"),
+            planted
+        );
+        let seen = std::thread::spawn(|| super::embedded_flavor().expect("sibling reads bytes"))
+            .join()
+            .expect("sibling thread joins");
+        assert_eq!(
+            seen, bytes,
+            "a sibling thread must see bytes, not the plant"
+        );
+    }
+
+    /// The cache initializer is pinned to the object bytes: `embedded_flavor`
+    /// must initialize from `embedded_flavor_from_bytes(crate::EBPF_OBJECT)`,
+    /// and no step of the probe path may read the Cargo features. A normal
+    /// test build cannot hold mismatched bytes, so the planted twins cannot
+    /// tell a feature-reading initializer apart; this pin can. Non-vacuity:
+    /// the feature-reading mutant fails below on the mutated source, and in
+    /// the mutant build log with the test hook kept.
+    #[test]
+    fn embedded_flavor_cache_initializes_from_object_bytes() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            let flavor = pin_body(source, "pub(crate) fn embedded_flavor()", "\n}\n")?;
+            if !flavor.contains("embedded_flavor_from_bytes(crate::EBPF_OBJECT)") {
+                return Err("embedded_flavor must initialize from the object bytes".to_string());
+            }
+            for signature in [
+                "pub(crate) fn embedded_flavor()",
+                "pub(crate) fn embedded_flavor_from_bytes(",
+                "fn probed_capture_entry(",
+                "fn probed_entry_reaches_reader(",
+                "fn probed_capture_is_stubbed(",
+                "fn probed_unsafe_is_present(",
+            ] {
+                let probed = pin_body(source, signature, "\n}\n")?;
+                if probed.contains("cfg!(feature") {
+                    return Err(format!("{signature} must probe bytes, not features"));
+                }
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            ".get_or_init(|| embedded_flavor_from_bytes(crate::EBPF_OBJECT))",
+            ".get_or_init(|| Ok(super::EmbeddedFlavor { stubbed: cfg!(feature = \"stub-object-attributes\"), unsafe_present: cfg!(feature = \"unsafe-unvalidated-metadata\") }))",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant changes the initializer");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// Attach grouping and output evidence read the flavor the session was
+    /// set up with, never a re-read of the global cache: the three grouping
+    /// bodies pass the stored flavor and the evidence method reads it, with
+    /// no silent fallback. Fails while any site re-reads the cache.
+    #[test]
+    fn session_flavor_feeds_grouping_and_evidence() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            for signature in [
+                "pub(crate) fn attach_targets(",
+                "fn attach_targets_multi(",
+                "fn rebuild_affected_groups(",
+            ] {
+                let grouped = pin_body(source, signature, "\n}\n")?;
+                if !grouped.contains("self.embedded_flavor.unsafe_present") {
+                    return Err(format!("{signature} must pass the session's flavor"));
+                }
+                if grouped.contains("probed_unsafe_for_grouping")
+                    || grouped.contains("embedded_flavor()")
+                {
+                    return Err(format!("{signature} must not re-read the global cache"));
+                }
+            }
+            let evidence = pin_body(source, "pub(crate) fn object_capture_evidence(", "\n}\n")?;
+            if !evidence.contains("self.embedded_flavor.stubbed") {
+                return Err("output evidence must read the session's flavor".to_string());
+            }
+            if evidence.contains("embedded_flavor()") || evidence.contains("unwrap_or") {
+                return Err("output evidence must have no silent fallback".to_string());
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "self.embedded_flavor.unsafe_present",
+            "probed_unsafe_for_grouping()",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts one grouping site");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// The entry lookup refuses a detached entry key instead of panicking:
+    /// the program's key need not be in the function map. Fails (panics at
+    /// the index) while the lookup indexes the map.
+    #[test]
+    fn probed_entry_lookup_refuses_a_detached_entry_key() {
+        let mut parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let key = parsed
+            .programs
+            .get("p11_entry")
+            .expect("embedded Detailed object lacks entry")
+            .function_key();
+        let entry = parsed
+            .functions
+            .remove(&key)
+            .expect("embedded entry function present");
+        let address = parsed
+            .functions
+            .keys()
+            .map(|(_, address)| *address)
+            .max()
+            .unwrap()
+            + 8;
+        parsed.functions.insert((key.0, address), entry);
+        let error = super::probed_capture_entry(parsed)
+            .expect_err("a detached entry key must refuse, not panic");
+        assert!(
+            error.reason().contains("ambiguous embedded entry function"),
+            "{}",
+            error.reason()
+        );
+    }
+
+    /// The stub rule has one copy: the exact-symbol test helpers delegate to
+    /// the production probe, so the two cannot drift. (The agreement test
+    /// beside them keeps pinning the wiring.) Fails while the helpers carry
+    /// their own duplicated rule.
+    #[test]
+    fn stub_rule_tests_use_the_production_probe() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            for (helper, production) in [
+                ("fn embedded_object_capture_entry(", "probed_capture_entry("),
+                (
+                    "fn embedded_entry_reaches_reader(",
+                    "probed_entry_reaches_reader(",
+                ),
+                (
+                    "fn embedded_object_capture_is_stubbed(",
+                    "probed_capture_is_stubbed(",
+                ),
+            ] {
+                let delegated = pin_body(source, helper, "\n}\n")?;
+                if !(delegated.contains(production) && delegated.contains(".expect(")) {
+                    return Err(format!("{helper} must delegate to {production}"));
+                }
+            }
+            Ok(())
+        }
+
+        let source = include_str!("attach.rs");
+        contract(source).unwrap();
+        let mutant = source.replacen(
+            "probed_capture_is_stubbed(parsed)",
+            "duplicated_stub_logic(parsed)",
+            1,
+        );
+        assert_ne!(mutant, source, "the mutant reverts one helper");
+        assert!(contract(&mutant).is_err());
+    }
+
+    /// Every flavor-mismatch refusal names the operator's fix: a clean
+    /// rebuild. Both `check_flavor_against_build` directions and the
+    /// undeterminable wrap carry the hint. Fails while the suffix names no fix.
+    #[test]
+    fn flavor_mismatch_names_a_rebuild() {
+        for probed in [
+            super::EmbeddedFlavor {
+                stubbed: !cfg!(feature = "stub-object-attributes"),
+                unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+            },
+            super::EmbeddedFlavor {
+                stubbed: cfg!(feature = "stub-object-attributes"),
+                unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
+            },
+        ] {
+            let error = super::check_flavor_against_build(probed).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("stale or mismatched"), "{message}");
+            assert!(
+                message.contains("rebuild p11scope from a clean target directory"),
+                "{message}"
+            );
+        }
+        let _guard = super::hold_embedded_flavor_for_test(Err(super::FlavorProbeError::new(
+            "test probe reason",
+        )));
+        let error = super::checked_embedded_flavor().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot determine embedded BPF object flavor"),
+            "{message}"
+        );
+        assert!(
+            message.contains("rebuild p11scope from a clean target directory"),
+            "{message}"
+        );
+    }
+
+    /// The half-wired stub refusal is plain operator text, not reader/emit
+    /// jargon. (The rebuild hint rides the shared mismatch suffix pinned
+    /// beside this.) Fails while the reason names internals.
+    #[test]
+    fn half_wired_stub_refusal_is_plain_operator_text() {
+        let parsed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let emit = *parsed
+            .functions
+            .iter()
+            .find(|(_, function)| {
+                super::embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
+            })
+            .unwrap()
+            .0;
+        let mut half_wired = parsed;
+        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
+        let instruction = *body.last().unwrap();
+        body.resize(
+            if cfg!(feature = "stub-object-attributes") {
+                300
+            } else {
+                49
+            },
+            instruction,
+        );
+        let error =
+            super::probed_capture_is_stubbed(half_wired).expect_err("half-wired must refuse");
+        let reason = error.reason();
+        assert!(reason.contains("half-wired"), "{reason}");
+        assert!(!reason.contains("entry reader"), "{reason}");
+        assert!(!reason.contains("emit "), "{reason}");
+    }
+
     /// Load-refusal detector matrix: only the E2BIG budget errno
     /// classifies; every other errno — and a missing errno — stays a
     /// loud unrelated failure.

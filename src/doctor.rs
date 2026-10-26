@@ -2407,6 +2407,50 @@ mod tests {
         assert!(!extra_strict_violations(&[check]).is_empty());
     }
 
+    /// A flavor mismatch exits nonzero through the object-attribute capture
+    /// row itself: the row's `Fail` gates the verdict without needing a
+    /// preflight row beside it. Fails while the row is not a capture row.
+    #[test]
+    fn object_capture_mismatch_alone_exits_nonzero() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        {
+            let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+            let check = object_capture_check();
+            assert!(matches!(check.status, Status::Fail(_)), "{check:?}");
+            assert_eq!(verdict(&[check]), 1);
+        }
+        let check = object_capture_check();
+        assert!(
+            matches!(check.status, Status::Ok(_) | Status::Warn(_)),
+            "{check:?}"
+        );
+        assert_eq!(verdict(&[check]), 0);
+    }
+
+    /// The uretprobe row fails (not warns) on a flavor mismatch with the
+    /// plain gate message: the build is broken, so the kernel was never
+    /// assessed. Fails while the mismatch classifies as an unknown kernel.
+    #[test]
+    fn uretprobe_row_fails_on_flavor_mismatch() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let check = uretprobe_seccomp_check();
+        assert_eq!(check.name, "uretprobe vs seccomp");
+        let Status::Fail(detail) = &check.status else {
+            panic!(
+                "a flavor mismatch must Fail the row, got {:?}",
+                check.status
+            );
+        };
+        assert!(detail.contains("stale or mismatched"), "{detail}");
+    }
+
     /// A budget refusal names its cause: E2BIG through preflight formats
     /// as a verifier-budget refusal with the bounded log excerpt.
     #[test]

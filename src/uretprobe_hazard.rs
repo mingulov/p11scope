@@ -979,6 +979,24 @@ mod tests {
         }
     }
 
+    /// `probe_kernel` reports a flavor mismatch as itself, not as an
+    /// unknown kernel: the load is still refused, but the verdict names
+    /// the broken build. Fails while every gate error classifies as
+    /// `Unknown`.
+    #[test]
+    fn probe_kernel_reports_a_flavor_mismatch_plainly() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let verdict = probe_kernel();
+        let text = format!("{verdict:?}");
+        assert!(text.contains("FlavorMismatch"), "{text}");
+        assert!(text.contains("stale or mismatched"), "{text}");
+        assert!(!text.contains("Unknown"), "{text}");
+    }
+
     /// HIGH-1: EPERM from loading the probe's BPF, or EACCES from its uprobe
     /// attach, is missing privilege; a verifier EACCES or anything else stays
     /// an unknown kernel verdict.

@@ -7337,6 +7337,74 @@ mod tests {
         .unwrap()
     }
 
+    /// Extract one top-level function body from this file's source for the
+    /// wiring pin below (the uretprobe loader-contract shape).
+    fn pin_body<'a>(
+        source: &'a str,
+        signature: &str,
+        end: &str,
+    ) -> std::result::Result<&'a str, String> {
+        source
+            .split_once(signature)
+            .ok_or_else(|| format!("{signature} not found"))?
+            .1
+            .split_once(end)
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("{signature} body end not found"))
+    }
+
+    /// A flavor mismatch degrades the semantic lane instead of refusing the
+    /// inventory: the lane never goes live, and the gap carries the plain
+    /// mismatch message (never the bare attachment code). Fails while the
+    /// lane startup skips the flavor check.
+    #[test]
+    fn semantic_lane_degrades_on_flavor_mismatch_with_plain_message() {
+        let planted = crate::attach::EmbeddedFlavor {
+            stubbed: !cfg!(feature = "stub-object-attributes"),
+            unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
+        };
+        let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
+        let mut coordinator = coordinator();
+        let lane = super::start_semantic_lane(
+            &mut coordinator,
+            &Scope::Pid(std::process::id()),
+            crate::attach::BackendSelection::Auto,
+        );
+        assert!(
+            lane.as_ref().is_none_or(|lane| !lane.is_live()),
+            "a flavor mismatch must not start a live lane"
+        );
+        coordinator.registry_mut().publish();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        let (_, reason) = gaps
+            .iter()
+            .find(|(subject, _)| subject == "semantic lane unavailable")
+            .expect("a flavor mismatch must note a semantic-lane gap");
+        assert!(reason.contains("stale or mismatched"), "{reason}");
+        assert!(reason.contains("FULL"), "{reason}");
+        assert!(reason.contains("P0"), "{reason}");
+        assert!(!reason.contains("semantic_attachment_refused"), "{reason}");
+        let startup = pin_body(
+            include_str!("inventory.rs"),
+            "fn start_semantic_lane(",
+            "\n}\n",
+        )
+        .unwrap();
+        assert!(
+            startup.contains("checked_embedded_flavor"),
+            "the flavor check runs up front in start_semantic_lane"
+        );
+        assert!(
+            startup.contains("inventory_diagnostic"),
+            "the mismatch also reaches stderr"
+        );
+    }
+
     #[test]
     fn inventory_selected_budget_reaches_native_preparation_and_fallback() {
         use crate::attach::BackendSelection;

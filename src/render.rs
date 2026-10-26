@@ -3308,8 +3308,16 @@ pub(crate) mod tests {
         }
         let source = include_str!("run.rs");
         assert!(
-            source.contains("object_capture: crate::attach::Session::object_capture_evidence(),"),
+            source.contains("session.object_capture_evidence()"),
             "evidence_for must wire the session status"
+        );
+        assert!(
+            source.contains("context.1.object_capture_evidence()"),
+            "evidence_for must wire the session status"
+        );
+        assert!(
+            !source.contains("Session::object_capture_evidence()"),
+            "output evidence never re-reads the global cache"
         );
     }
 

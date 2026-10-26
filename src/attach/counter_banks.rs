@@ -122,14 +122,14 @@ impl CounterSpec {
 
     /// Production preparation: the embedded object for the spec mode with
     /// the real kernel probe and the real CPU count.
-    pub(super) fn prepare(self, backend: super::AttachBackend) -> Result<CounterPreparation<'static>> {
+    pub(super) fn prepare(&self, backend: super::AttachBackend) -> Result<CounterPreparation<'static>> {
         self.prepare_with_probe_and_cpus(backend, super::kernel_bpf_loop_probe, None)
     }
 
     /// Preparation with an injected probe verdict and CPU count, so tests
     /// pin the envelope deterministically on any kernel.
     pub(super) fn prepare_with_probe_and_cpus(
-        self,
+        &self,
         backend: super::AttachBackend,
         probe: impl FnOnce() -> BpfLoopVerdict,
         cpus_override: Option<usize>,
@@ -3337,6 +3337,18 @@ impl Session {
                 BankShapeCause::StagedGeometryChanged,
             ));
         };
+        // Rebuilt candidate plans start unconsumed; restore the staged
+        // prefix from the directory high-water before consuming the tail.
+        if plan.counter_consumed_end() == 0 {
+            let high_water = directory.allocated_high_water();
+            if high_water != 0
+                && plan
+                    .adopt_counter_consumed(high_water as u32)
+                    .is_err()
+            {
+                return BankPublication::Refused(BankRefusal::Topology);
+            }
+        }
         let first = directory.allocated_high_water();
         let end = plan.slots.len();
         if first == end {

@@ -5700,6 +5700,37 @@ impl Session {
             owned_child,
             selection,
             None,
+            None,
+        )
+    }
+
+    /// Counter capture start: the Engine's route for
+    /// `CapturePolicy::Counter`. Identical to `start` except for the
+    /// counter spec, so the FD raise and backend selection cover counter
+    /// sessions with no parallel constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_counter(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        counter: &counter_banks::CounterSpec,
+    ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+            Some(counter),
         )
     }
 
@@ -5714,6 +5745,7 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         selection: BackendSelection,
         selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
     ) -> Result<Self> {
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
@@ -5736,6 +5768,7 @@ impl Session {
             owned_child,
             backend,
             selected,
+            counter,
         ) {
             Ok(session) => Ok((session, fallback)),
             Err(error)
@@ -5764,6 +5797,7 @@ impl Session {
                     owned_child,
                     AttachBackend::Singles,
                     selected,
+                    counter,
                 )
                 .map(|session| (session, Some(reason)))
             }
@@ -5869,6 +5903,7 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -5883,6 +5918,7 @@ impl Session {
             owned_child,
             backend,
             selected,
+            counter,
         )
         .map_err(unsupported_environment_context)?;
         #[cfg(test)]
@@ -5890,9 +5926,13 @@ impl Session {
             crate::first_use_probe::DiscoveryStage::LifecycleActive,
             &session,
         );
-        session
-            .attach_plan(plan, objects)
-            .map_err(unsupported_environment_context)?;
+        // Counter sessions stage banks through the Engine after start; the
+        // bank guard refuses Detailed slot attach once banks exist.
+        if policy.counter_mode().is_none() {
+            session
+                .attach_plan(plan, objects)
+                .map_err(unsupported_environment_context)?;
+        }
         // The lifecycle producers ran through the whole static attach: stage
         // what they produced before the Engine's per-view phases (RB-2).
         // The Engine holds nothing yet; whatever does not fit waits in the
@@ -5924,6 +5964,7 @@ impl Session {
             None,
             AttachBackend::Singles,
             None,
+            None,
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -5931,6 +5972,7 @@ impl Session {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         scope: &Scope,
         policy: CapturePolicy,
@@ -5939,6 +5981,7 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
     ) -> Result<Self> {
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
             scope,
@@ -5948,6 +5991,7 @@ impl Session {
             owned_child,
             backend,
             selected,
+            counter,
         )?;
         session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
@@ -5990,6 +6034,7 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_inner_unlinked(
         scope: &Scope,
         policy: CapturePolicy,
@@ -5998,17 +6043,33 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
+        counter: Option<&counter_banks::CounterSpec>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
-        Self::prepare_inner_unlinked_with_object(
-            scope,
-            policy,
-            pause_key,
-            ring_bytes,
-            owned_child,
-            backend,
-            selected,
-            None,
-        )
+        match counter {
+            None => Self::prepare_inner_unlinked_with_object(
+                scope,
+                policy,
+                pause_key,
+                ring_bytes,
+                owned_child,
+                backend,
+                selected,
+                None,
+            ),
+            Some(spec) => {
+                let prepared = spec.prepare(backend)?;
+                Self::prepare_inner_unlinked_with_object(
+                    scope,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    backend,
+                    selected,
+                    Some(prepared),
+                )
+            }
+        }
     }
 
     #[expect(
@@ -8344,6 +8405,7 @@ impl Session {
             None,
             None,
             AttachBackend::Singles,
+            None,
             None,
         )
     }

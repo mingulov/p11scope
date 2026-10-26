@@ -3413,12 +3413,18 @@ fn group_static_slots_with_roots(
                 "private counter grouping requires the prepared mode's fixed aggregate-only roots"
             );
         }
+        // The guard above pinned the policy and the prepared mode together;
+        // name that mode in per-slot refusals (every mode reaches here).
+        let mode_name = policy
+            .counter_mode()
+            .or(expected_counter_mode)
+            .map_or("counter", CounterMode::name);
         for slot in slots {
-            let (path, abi) = attach_targets
-                .get(&slot.index)
-                .context("private Counts target facts missing before grouping")?;
+            let (path, abi) = attach_targets.get(&slot.index).with_context(|| {
+                format!("private {mode_name} target facts missing before grouping")
+            })?;
             if *abi != ElfAbi::Lp64 || !counter_attach_path_is_valid(path) {
-                bail!("private Counts grouping requires an LP64 retained-FD attach path");
+                bail!("private {mode_name} grouping requires an LP64 retained-FD attach path");
             }
         }
     }
@@ -13487,6 +13493,27 @@ mod tests {
             assert!(
                 !text.contains("fixed aggregate-only roots"),
                 "{mode:?}: past the policy-mismatch arm: {text}"
+            );
+            // The missing-facts refusal names the mode too.
+            let mut missing = targets.clone();
+            missing.remove(&first.index);
+            let error = group_static_slots_with_roots(
+                &slots,
+                CapturePolicy::Counter(mode),
+                false,
+                &missing,
+                StaticRoots::CounterBanks,
+                Some(mode),
+            )
+            .expect_err("missing facts must refuse grouping");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("target facts missing before grouping"),
+                "{mode:?}: {text}"
+            );
+            assert!(
+                text.contains(mode.name()),
+                "{mode:?}: refusal names the mode: {text}"
             );
         }
     }

@@ -5739,7 +5739,7 @@ mod tests {
     /// A bare `total >= max` passes on all-zero timing and would hide a BPF
     /// clock or collection zeroing on this path.
     fn held_timing_is_live(total: u64, max: u64) -> bool {
-        total >= max
+        total > 0 && max > 0
     }
 
     #[test]

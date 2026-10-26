@@ -2585,6 +2585,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn probe_reports_the_inventory_object_load_row() {
+        let checks = probe(None, None);
+        let row = checks
+            .iter()
+            .find(|c| c.name == "inventory program preflight")
+            .unwrap_or_else(|| panic!("inventory preflight row is missing: {checks:?}"));
+        // Host state decides Ok vs Fail (unprivileged CI legitimately
+        // fails the BPF rows); what's invariant is the host row is
+        // assessed, never NotApplicable.
+        assert!(
+            matches!(row.status, Status::Ok(_) | Status::Fail(_)),
+            "unexpected status: {row:?}"
+        );
+    }
+
+    #[test]
+    fn inventory_preflight_failure_fails_the_requested_lane_verdict() {
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let mut checks = vec![
+            row("BPF map create", Status::Ok("available".into())),
+            row("host program preflight", Status::Ok("available".into())),
+            row(
+                "inventory program preflight",
+                Status::Fail(
+                    "verifier budget refused the program (E2BIG); verifier: denied".into(),
+                ),
+            ),
+        ];
+        assert_eq!(verdict(&checks), 1);
+        assert!(
+            verdict_line(&checks).starts_with("verdict: capture unavailable"),
+            "{}",
+            verdict_line(&checks)
+        );
+        assert_eq!(
+            render(&checks).lines().next(),
+            Some("Doctor: requested lane unavailable.")
+        );
+        checks[2].status = Status::Ok("available".into());
+        assert_eq!(verdict(&checks), 0);
+    }
+
     // ---- Slice 1b-2 doctor contract (design §10.1) ------------------------
 
     /// Every live-discovery row doctor may print, and the finite vocabulary its

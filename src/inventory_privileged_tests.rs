@@ -5795,9 +5795,10 @@ fn joint_edge_census(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec
 /// absence-proven, never a false positive); H holds a semantic call on
 /// the held provider so that module genuinely exists in the run; S enters
 /// its held call before attach (entries genuinely shed) and returns it
-/// late, so its orphan END registers S1Only and reduces S1-direct exactly
-/// once, never upgraded to Joint. Three transactions, one revision each,
-/// then a finite stop with joined same-owner cleanup.
+/// late, but the entry-less return is dropped in-kernel before any event,
+/// so S stays mapped-but-silent with its admission refusal disclosed:
+/// never bound, never an edge, never Joint. Three transactions, one
+/// revision each, then a finite stop with joined same-owner cleanup.
 #[test]
 #[ignore = "privileged: live Joint absence and S1Only siblings beside an exec"]
 fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
@@ -6015,16 +6016,19 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         !process_h.has("RETURNED "),
         "H's held call returned before release"
     );
-    let (_, e_total, e_bad) = ledger_calls(&process_e.out)?;
-    let (_, c_total, c_bad) = ledger_calls(&process_c.out)?;
+    let (e_by_fn, e_total, e_bad) = ledger_calls(&process_e.out)?;
+    let (c_by_fn, c_total, c_bad) = ledger_calls(&process_c.out)?;
     ensure!(e_bad == 0 && c_bad == 0, "E and C never fail");
     ensure!(e_total > 0 && c_total == 3, "E and C ran their scripts");
 
     // q1: E-post and C completed, H held, S held pre-attach (its
     // entries shed, contributing nothing). Nothing replays through the
     // missing END(H), not even H's own completed SignInit: the frame
-    // gates replay as a whole. S is admitted (bound) but registers
-    // nothing: records come only from observed calls.
+    // gates replay as a whole. S is neither bound nor registered: its
+    // entries predate attach and it fired no post-attach probe event,
+    // so the kernel minted no task cookie for it; the H0 scan refuses
+    // and the refresh mints no receipt. Fail-closed absence, disclosed
+    // below — not an upgrade to come.
     let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16b-q1")?;
     let q1_end_ns = monotonic_ns();
     let reduced_q1: u64 = coordinator
@@ -6041,8 +6045,17 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         "r16b-q1: the pre-attach sibling registers nothing without observed calls"
     );
     ensure!(
-        coordinator.semantic_bindings().get(caller_s).is_some(),
-        "r16b-q1: the pre-attach sibling is admitted"
+        coordinator.semantic_bindings().get(caller_s).is_none(),
+        "r16b-q1: the pre-attach sibling stays unbound without a kernel cookie"
+    );
+    ensure!(
+        count_disclosed_gaps(
+            &coordinator,
+            "semantic admission refused",
+            "semantic_unavailable:no_receipt",
+            Some(caller_s),
+        ) >= 1,
+        "r16b-q1: the pre-attach sibling's admission refusal is disclosed"
     );
     let feeds_q1 = coordinator.registry().joint_feeds();
     let receipts_q1 = coordinator
@@ -6051,7 +6064,14 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         .len();
     eprintln!(
         "JOINT_R16 r16b-q1 polls={q1_polls} feeds={feeds_q1} receipts={receipts_q1} \
-         census={:?}",
+         s_bound={} s_refusals={} census={:?}",
+        u8::from(coordinator.semantic_bindings().get(caller_s).is_some()),
+        count_disclosed_gaps(
+            &coordinator,
+            "semantic admission refused",
+            "semantic_unavailable:no_receipt",
+            Some(caller_s),
+        ),
         joint_edge_census(&coordinator),
     );
     ensure_joint_birth_refusal(&coordinator, "r16b-q1")?;
@@ -6059,13 +6079,24 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // Release H into q2; S stays held on its own FIFO.
     std::fs::OpenOptions::new().write(true).open(&release_h)?;
     process_h.wait_for("RETURNED ", Duration::from_secs(30))?;
+    // DONE lands after the CALLS flush, so the ledger read below sees
+    // H's whole pair.
+    process_h.wait_for("DONE ", Duration::from_secs(30))?;
     let h_enter = ledger_stamp(&process_h.out, "HELD ")?;
     let h_exit = ledger_stamp(&process_h.out, "RETURNED ")?;
     ensure!(
         h_enter < q1_end_ns && q1_end_ns < h_exit,
         "H's hold genuinely spans q1"
     );
+    let (h_by_fn, h_total, h_bad) = ledger_calls(&process_h.out)?;
+    ensure!(
+        h_bad == 0 && h_total == 2,
+        "H made exactly SignInit plus its held Sign"
+    );
     let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q2")?;
+    let (e_semantic, e_count_only) = ledger_semantic_split(&e_by_fn);
+    let (c_semantic, c_count_only) = ledger_semantic_split(&c_by_fn);
+    let (h_semantic, h_count_only) = ledger_semantic_split(&h_by_fn);
     let edge_e = joint_edge_snapshot(&coordinator, process_e.pid(), "soft-copy.so")?;
     let edge_c = joint_edge_snapshot(&coordinator, process_c.pid(), "soft-copy.so")?;
     let edge_h = joint_edge_snapshot(&coordinator, process_h.pid(), "live-joint-held.so")?;
@@ -6073,24 +6104,65 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         edge_e.joint && edge_c.joint && edge_h.joint,
         "E, C and H are Joint"
     );
+    let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
+        if !ok {
+            for line in exactness_diagnosis(&coordinator, pid, module, by_fn) {
+                eprintln!("JOINT_R16 r16b-q2-diag {line}");
+            }
+        }
+    };
+    diagnose(
+        edge_e.api_returns == Some(e_semantic) && edge_e.reduced == e_semantic,
+        process_e.pid(),
+        "soft-copy.so",
+        &e_by_fn,
+    );
     ensure!(
-        edge_e.api_returns == Some(e_total) && edge_e.reduced == e_total,
-        "E-post is exact: {:?}/{} vs {e_total}",
+        edge_e.api_returns == Some(e_semantic) && edge_e.reduced == e_semantic,
+        "E-post is exact: {:?}/{} vs semantic {e_semantic} \
+         (entered {e_total}, count-only {e_count_only})",
         edge_e.api_returns,
         edge_e.reduced
     );
+    diagnose(
+        edge_c.api_returns == Some(c_semantic) && edge_c.reduced == c_semantic,
+        process_c.pid(),
+        "soft-copy.so",
+        &c_by_fn,
+    );
     ensure!(
-        edge_c.api_returns == Some(c_total) && edge_c.reduced == c_total,
-        "C is exact: {:?}/{} vs {c_total}",
+        edge_c.api_returns == Some(c_semantic) && edge_c.reduced == c_semantic,
+        "C is exact: {:?}/{} vs semantic {c_semantic} \
+         (entered {c_total}, count-only {c_count_only})",
         edge_c.api_returns,
         edge_c.reduced
     );
+    diagnose(
+        edge_h.api_returns == Some(h_semantic) && edge_h.reduced == h_semantic,
+        process_h.pid(),
+        "live-joint-held.so",
+        &h_by_fn,
+    );
     ensure!(
-        edge_h.api_returns == Some(2) && edge_h.reduced == 2,
-        "H is exact: {:?}/{}",
+        edge_h.api_returns == Some(h_semantic) && edge_h.reduced == h_semantic,
+        "H is exact: {:?}/{} vs semantic {h_semantic} \
+         (entered {h_total}, count-only {h_count_only})",
         edge_h.api_returns,
         edge_h.reduced
     );
+    // The count-only calls never admit: each refusal is disclosed.
+    for (pid, count_only, who) in [
+        (process_e.pid(), e_count_only, "E-post"),
+        (process_c.pid(), c_count_only, "C"),
+        (process_h.pid(), h_count_only, "H"),
+    ] {
+        let caller = caller_of(&coordinator, pid)?;
+        ensure!(
+            count_disclosed_gaps(&coordinator, "semantic input refused", "slot", Some(caller))
+                == count_only,
+            "{who}'s count-only calls are disclosed as slot refusals: {count_only}"
+        );
+    }
     ensure!(
         edge_e.started == Some(3) && edge_e.completed == Some(3),
         "E-post completions are exact: {:?}/{:?}",
@@ -6147,9 +6219,12 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         .pending_joint_receipts_for_test()
         .len();
 
-    // q3: S's late return lands as an orphan END (both entries shed
-    // pre-attach). Without a birth receipt it registers S1Only and
-    // reduces S1-direct exactly once, never upgraded to Joint.
+    // q3: S's late return is kernel-silent. Its entries predate
+    // attach, so no START row exists for the held call and the return
+    // probe drops it before emitting any event: no kernel record, no
+    // task cookie, still no binding, still no edge. S stays
+    // mapped-but-silent with its admission refusal disclosed per
+    // transaction; it never holds a feed, Joint or otherwise.
     let unknown_before = coordinator
         .registry()
         .keyuse_for_test()
@@ -6157,6 +6232,9 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         .unknown_key_rows;
     std::fs::OpenOptions::new().write(true).open(&release_s)?;
     process_s.wait_for("RETURNED ", Duration::from_secs(30))?;
+    // DONE lands after the CALLS flush, so the ledger read below sees
+    // S's whole pair.
+    process_s.wait_for("DONE ", Duration::from_secs(30))?;
     let s_enter = ledger_stamp(&process_s.out, "HELD ")?;
     let s_exit = ledger_stamp(&process_s.out, "RETURNED ")?;
     ensure!(
@@ -6169,24 +6247,35 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         "S entered exactly its held pair"
     );
     let q3_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q3")?;
-    let edge_s = joint_edge_snapshot(&coordinator, process_s.pid(), "live-joint-held.so")?;
-    ensure!(!edge_s.joint, "S never upgrades to Joint");
     ensure!(
-        edge_s.api_returns == Some(1) && edge_s.reduced == 1,
-        "S observes only its orphan END: {:?}/{} (ledger entered {s_total})",
-        edge_s.api_returns,
-        edge_s.reduced
+        coordinator.semantic_bindings().get(caller_s).is_none(),
+        "r16b-q3: the pre-attach sibling stays unbound after its silent return"
     );
     ensure!(
-        edge_s.started == Some(0) && edge_s.completed == Some(0),
-        "the orphan END starts no operation: {:?}/{:?}",
-        edge_s.started,
-        edge_s.completed
+        joint_edge_snapshot(&coordinator, process_s.pid(), "live-joint-held.so").is_err(),
+        "r16b-q3: the pre-attach sibling registers nothing without observed calls"
     );
     ensure!(
-        edge_s.orphans == Some(1),
-        "the orphan END counts exactly once: {:?}",
-        edge_s.orphans
+        has_mapped_edge(&coordinator, process_s.pid()),
+        "r16b-q3: the pre-attach sibling stays mapped"
+    );
+    ensure!(
+        coordinator.semantic_bindings().get(caller_s).is_none()
+            && coordinator
+                .registry()
+                .instance_semantic_edges()
+                .all(|record| record.caller != caller_s),
+        "S never holds a feed, Joint or otherwise: no binding, no edge"
+    );
+    let s_refusals = count_disclosed_gaps(
+        &coordinator,
+        "semantic admission refused",
+        "semantic_unavailable:no_receipt",
+        Some(caller_s),
+    );
+    ensure!(
+        s_refusals >= 3,
+        "r16b-q3: the pre-attach sibling's admission refusals stay disclosed: {s_refusals}"
     );
     ensure!(
         coordinator.registry().joint_feeds() == feeds_q2,
@@ -6205,9 +6294,8 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     ensure!(
         census_q3
             .iter()
-            .any(|(edge_pid, path)| *edge_pid == process_s.pid()
-                && path.contains("live-joint-held.so")),
-        "r16b-q3: S pairs with its mapped provider: {census_q3:?}"
+            .all(|(edge_pid, _)| *edge_pid != process_s.pid()),
+        "r16b-q3: S pairs with nothing while kernel-silent: {census_q3:?}"
     );
     let unknown_after = coordinator
         .registry()
@@ -6215,8 +6303,8 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         .evidence()
         .unknown_key_rows;
     ensure!(
-        unknown_after > unknown_before,
-        "S contributes unknown-key S1 facts: {unknown_before} -> {unknown_after}"
+        unknown_after == unknown_before,
+        "S contributes no key facts while kernel-silent: {unknown_before} -> {unknown_after}"
     );
     let receipts = coordinator.registry().pending_joint_receipts_for_test();
     ensure!(!receipts.is_empty(), "nonzero observed Joint receipts");
@@ -6234,10 +6322,38 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         !observations.key_operations.is_empty(),
         "the populated section carries key-operation rows"
     );
-    assert_quiet_twins(&coordinator, "r16b-q3")?;
+    let caller_e = caller_of(&coordinator, process_e.pid())?;
+    let caller_c = caller_of(&coordinator, process_c.pid())?;
+    assert_quiet_twins_except(
+        &coordinator,
+        "r16b-q3",
+        &[
+            QuietExemption {
+                subject: "semantic input refused",
+                reason: "slot",
+                caller: Some(caller_e),
+                min: e_count_only,
+                max: Some(e_count_only),
+            },
+            QuietExemption {
+                subject: "semantic input refused",
+                reason: "slot",
+                caller: Some(caller_c),
+                min: c_count_only,
+                max: Some(c_count_only),
+            },
+            QuietExemption {
+                subject: "semantic admission refused",
+                reason: "semantic_unavailable:no_receipt",
+                caller: Some(caller_s),
+                min: 3,
+                max: None,
+            },
+        ],
+    )?;
     eprintln!(
         "JOINT_R16 r16b-q3 polls={q3_polls} revision={revision} feeds={} receipts={} \
-         unknown_key={unknown_before}->{unknown_after}",
+         unknown_key={unknown_before}->{unknown_after} s_refusals={s_refusals}",
         coordinator.registry().joint_feeds(),
         receipts.len(),
     );

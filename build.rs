@@ -702,15 +702,6 @@ fn build_variant_with_proof(
     }
     append_flag("-C");
     append_flag("link-arg=--export=DISCOVERY_STATE");
-    // The crate release profile optimizes for size, which the Detailed
-    // object needs for its FULL-capture verifier budget; the same shape
-    // doubles the inventory `interface_list_worker` states past the 1M
-    // 5.15/6.1 limit. Both inventory flavors restore level 3, the setting
-    // their worker verified under before the profile change.
-    if inventory {
-        append_flag("-C");
-        append_flag("opt-level=3");
-    }
     // Counter bank objects are identical across FULL, P0 and unsafe builds:
     // counter flavors never take the stub or unsafe features.
     if !inventory
@@ -730,6 +721,40 @@ fn build_variant_with_proof(
             append_flag(flag);
         }
     }
+    // The crate release profile optimizes for size, which the Detailed
+    // object needs for its FULL-capture verifier budget; the same shape
+    // doubles the inventory `interface_list_worker` states past the 1M
+    // 5.15/6.1 limit. Both inventory flavors restore level 3, the setting
+    // their worker verified under before the profile change. This stays
+    // the last flag appended: rustc takes the last `-C opt-level`, so a
+    // later opt-level would silently win.
+    if inventory {
+        append_flag("-C");
+        append_flag("opt-level=3");
+    }
+    // Record the effective per-flavor flags for the host contract test:
+    // inventory flavors must end with `-C opt-level=3`, and no other
+    // flavor may carry an opt-level override.
+    println!(
+        "cargo:rustc-env={}={flags}",
+        match flavor {
+            BpfFlavor::Detailed => "P11SCOPE_BPF_RUSTFLAGS_DETAILED",
+            BpfFlavor::InventoryGlobal => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY",
+            BpfFlavor::InventoryCallers => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY_CALLERS",
+            BpfFlavor::CounterCounts if bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS_PROOF"
+            }
+            BpfFlavor::CounterCounts => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS",
+            BpfFlavor::CounterTimestamps if bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS_PROOF"
+            }
+            BpfFlavor::CounterTimestamps => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS",
+            BpfFlavor::CounterLatency if bank_proof => {
+                "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY_PROOF"
+            }
+            BpfFlavor::CounterLatency => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY",
+        }
+    );
     cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
     // Coverage instrumentation is host-only, and it arrives on three
     // channels: plain RUSTFLAGS, the encoded var above, and (for

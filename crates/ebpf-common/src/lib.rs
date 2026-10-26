@@ -1509,7 +1509,7 @@ pub mod journal_marker {
     /// READY state bits.
     pub const MARKER_READY_STATE: u64 = 2;
     /// Admission control cap: spent permits before the failed latch trips.
-    pub const MARKER_ADMIT_CAP: u64 = 16384;
+    pub const MARKER_ADMIT_CAP: u64 = 1 << 24;
 
     /// A validated marker readback.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -155,6 +155,7 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",
         "MapDefsTests.test_runner_guards",
+        "MapDefsTests.test_frozen_map_names_survive_kernel_truncation",
         "Ia32SpanProofTests.test_saved_sentinel_requires_proven_full_width_register_flow",
     ];
     let output = Command::new("python3")
@@ -163,12 +164,14 @@ fn native_bpf_map_decoder_contracts() {
         .args(cases)
         .output()
         .expect("run required native map decoder tests");
-    assert!(
-        output.status.success(),
-        "native map decoder suite failed: stdout={} stderr={}",
+    let report = format!(
+        "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "native map decoder suite: {report}");
+    assert!(report.contains("Ran 13 tests"), "zero selection: {report}");
+    assert!(report.contains("\nOK\n"), "skipped decoder proof: {report}");
 }
 
 /// H8-D birth marker twins: the freeze and call-site checks run here so

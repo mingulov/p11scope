@@ -8259,6 +8259,24 @@ mod tests {
     }
 
     #[test]
+    fn no_table_found_reason_quotes_paths_needing_shell_quoting() {
+        let spaced = no_table_found_reason("/opt/my providers/p11.so", false);
+        assert!(
+            spaced.ends_with(
+                "; to observe it, run p11scope-discover --module '/opt/my providers/p11.so' -o \
+                 <manifest.json> and pass --manifest <manifest.json>"
+            ),
+            "{spaced:?} must quote a path with spaces"
+        );
+        assert!(!spaced.contains('\n'), "{spaced:?} must stay one line");
+        let quoted = no_table_found_reason("/opt/p11's;rm/x.so", false);
+        assert!(
+            quoted.contains("--module '/opt/p11'\\''s;rm/x.so' -o"),
+            "{quoted:?} must escape the quote and stay one shell word"
+        );
+    }
+
+    #[test]
     fn scan_skip_truncation_classifier_marks_only_verified_absence_benign() {
         let mut budget = CaptureWorkBudget::default();
         let table_reason = budget.table_exhaustion_reason().unwrap();

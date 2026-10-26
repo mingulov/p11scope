@@ -4957,6 +4957,35 @@ mod tests {
             }
         }
         #[test]
+        fn retirement_scan_allows_absence_for_new_no_table_reason() {
+            let allows = |reason: String| {
+                let outcome = ScanOutcome::Scanned {
+                    modules: Vec::new(),
+                    skipped: vec![Skipped {
+                        subject: "/opt/p11.so".into(),
+                        reason,
+                    }],
+                    scan_ms: 0,
+                };
+                retirement_scan_allows_absence(&[], &outcome, &[], (None, (0, 0)), (None, (0, 0)))
+            };
+            assert!(
+                allows(crate::discovery::scan::no_table_found_reason(
+                    "/opt/p11.so",
+                    false
+                )),
+                "the scan-side reason and the matcher must agree"
+            );
+            assert!(
+                !allows(
+                    "no function table was found in its file-backed data; a table built at run \
+                     time in .bss or on the heap is outside the memory scan's reach"
+                        .into()
+                ),
+                "the bare pre-suffix reason must stay a real gap"
+            );
+        }
+        #[test]
         fn system_inspect_failed_or_unexamined_rows_never_gain_names() {
             let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
             for status in [

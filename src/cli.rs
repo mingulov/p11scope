@@ -1748,6 +1748,20 @@ mod tests {
     }
 
     #[test]
+    fn inventory_help_names_discover_for_run_time_tables() {
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("example"), "{help}");
+        assert!(
+            help.contains(
+                "Providers that build the table at run time need a manifest: run \
+                 p11scope-discover --module <provider.so> -o <manifest.json> and pass \
+                 --manifest <manifest.json>."
+            ),
+            "{help}"
+        );
+    }
+
+    #[test]
     fn capture_needs_no_manifest_and_accepts_repeated_discovery_flags() {
         let Command::Profile(a) = parse(args(&[
             "profile",

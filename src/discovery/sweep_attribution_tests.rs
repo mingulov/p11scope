@@ -5010,6 +5010,8 @@ fn privileged_d4_btrfs_live_thread_private_files_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     create_subvolume(parent, "a");
@@ -5824,8 +5826,12 @@ impl D4RawCloneGuard {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .expect("raw worker kernel join exceeded its deadline");
+            // `tv_sec` is 64-bit signed on x86-64 under both glibc and musl;
+            // `libc::time_t` names the same type but is deprecated on musl.
+            // The remaining join budget is at most ten seconds, so this cast
+            // is exact.
             let timeout = libc::timespec {
-                tv_sec: remaining.as_secs() as libc::time_t,
+                tv_sec: remaining.as_secs() as i64,
                 tv_nsec: remaining.subsec_nanos() as libc::c_long,
             };
             // SAFETY: the naturally aligned boxed TID word and timeout stay
@@ -5969,6 +5975,8 @@ fn privileged_d4_btrfs_clone_without_files_backend_parity() {
         0
     );
     // SAFETY: initialized by the successful statfs above.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
     let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
     create_subvolume(parent, "a");
@@ -7201,9 +7209,11 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
         0
     );
     // SAFETY: successful statfs initialized the output.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
     assert_eq!(
-        unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff,
-        0x9123_683e,
+        magic, 0x9123_683e,
         "fixture: actual disk TMPDIR must be Btrfs"
     );
     create_subvolume(parent, "a");

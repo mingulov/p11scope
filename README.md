@@ -312,6 +312,11 @@ Anything else is dropped in the kernel. That is a containment boundary, not
 pointer validation — `bpf_probe_read_user` avoids faults, it does not check
 types.
 
+Discovery reads the target's `/proc/<pid>/maps` and bounded bytes of its
+readable provider mappings via `/proc/<pid>/mem` (function tables, interface
+descriptors, offsets); interface-name bytes are classified in userspace and
+only finite classes ever leave discovery.
+
 The previous unvalidated parameter/template decoders still exist, but only
 behind **both** an off-by-default Cargo feature and an explicit
 `--unsafe-unvalidated-metadata` flag; the flag alone cannot enable code that is
@@ -332,6 +337,12 @@ key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
 lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the
 transient raw `pMechanism` address the return probe needs.
+
+The `doctor` command, given an explicit `--pid`, reads that process's
+executable header, memory map and the export names of its mapped executables
+to check capture readiness. It reads nothing else, keeps nothing after the
+check, and publishes only readiness verdicts (including how many mapped
+executables look like providers).
 
 See the [quickstart](docs/usage.md#quickstart) for the CLI, live output, and
 trace lines, and [the v3 schema](docs/schema/observed-profile-v3.md) for the

@@ -405,6 +405,12 @@ exclude mm borrowers from localization), `group_leader`, `clone_flags`. No
 syscall argument, user address or length, target memory, or kernel pointer
 is captured or emitted.
 
+The image query additionally reads the candidate task's flags word for the
+kernel-thread bit; fork and exec maintain only the row's shared-memory mark
+and attach generation; the calibration cell also carries the observer's own
+calibration thread id and hit count. The flags word is checked and
+discarded; none of these values is emitted.
+
 Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
 entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.
 Userspace keeps the entry IP inside the instance router (`EntryIp`: no
@@ -501,7 +507,7 @@ inspect outputs are untouched).
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| Inventory caller `pid`, `start_time`, `image.exe` (`dev`, `ino`, `mtime_secs`, `mtime_nanos`, `path`) | `/proc/<pid>/stat` starttime and the `/proc/<pid>/exe` link (readlink plus stat) of a process whose maps hold an admitted provider object, read by the scan lane at admission and revalidation. No `cmdline`, `environ`, `comm`, argument or memory read. The native lane adds none: CALLER_USE rows bind through a pidfd TASK_COOKIE query, and their kernel tgid is never published. | Public per caller incarnation in `p11scope/inventory/v1` (`callers[]`), the inventory event stream's caller records, and the inventory dashboard/pager. PIDs are in the observer's `/proc` numbering (`pid_namespace`). `gaps[].pid` repeats the `/proc` pid of the caller or admission subject a gap names; no native witness gap carries a row's kernel tgid. | An unreadable value is `null`, never guessed. The path is the exe link observed at admission, not identity: incarnation identity is the pidfd/start-time pin plus `dev`/`ino`/`mtime`. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
+| Inventory caller `pid`, `start_time`, `image.exe` (`dev`, `ino`, `mtime_secs`, `mtime_nanos`, `path`) | `/proc/<pid>/stat` starttime and the `/proc/<pid>/exe` link (readlink plus stat) of a process whose maps hold an admitted provider object, read by the scan lane at admission and revalidation. No `cmdline`, `environ`, argument or memory read, and no retained or published `comm` (start-time sampling reads the whole stat line and parses around the comm field, discarding it). The native lane adds none: CALLER_USE rows bind through a pidfd TASK_COOKIE query, and their kernel tgid is never published. | Public per caller incarnation in `p11scope/inventory/v1` (`callers[]`), the inventory event stream's caller records, and the inventory dashboard/pager. PIDs are in the observer's `/proc` numbering (`pid_namespace`). `gaps[].pid` repeats the `/proc` pid of the caller or admission subject a gap names; no native witness gap carries a row's kernel tgid. | An unreadable value is `null`, never guessed. The path is the exe link observed at admission, not identity: incarnation identity is the pidfd/start-time pin plus `dev`/`ino`/`mtime`. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
 
 **Status of the row below: IMPLEMENTED on this branch per owner ruling
 D-C7-1 (2026-10-05); the controller shows this final text to the owner
@@ -510,7 +516,7 @@ new kernel-side state is the per-pair entry counter BPF already keeps.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| Per-edge entry count and last activity (C7 C4) | The uprobe firing on an admitted endpoint, counted in BPF against the existing CALLER_USE key for the (caller image, provider object) pair. No target-memory read, no argument read, no BPF timestamp: recency is derived in userspace from the read instant. | Public per (caller incarnation × module) edge in `p11scope/inventory/v1` (`edges[].entries`: saturating lower-bound `count` of entries on attached endpoints since the pair's first record, including calls that returned errors, with `last_seen_ns` at pass resolution), the inventory event stream's `edge_observed` records, and the inventory dashboard/pager. Never per function, per thread, or per call time. A pair with no row reads `unknown (uncounted)` and names the `PairInsertFailure` evidence, never 0. | A count read mid-capture is a lower bound; only the post-stop read is final, and settlement stays `unsettled`. An unreadable health cell withholds watches without inventing counts. Documented in [inventory v1](../schema/inventory-v1.md) (`edges[].entries.coverage`) and [inventory events v1](../schema/inventory-events-v1.md) (`edge_observed`). |
+| Per-edge entry count and last activity (C7 C4) | The uprobe firing on an admitted endpoint, counted in BPF against the existing CALLER_USE key for the (caller image, provider object) pair. No target-memory read and no argument read. Each row carries the BPF entry timestamp of its first record (`recorded_at_ns`, kernel monotonic clock), published as `first_ns`; `last_seen_ns` remains derived in userspace from the read instant. | Public per (caller incarnation × module) edge in `p11scope/inventory/v1` (`edges[].entries`: saturating lower-bound `count` of entries on attached endpoints since the pair's first record, including calls that returned errors, with `last_seen_ns` at pass resolution), the inventory event stream's `edge_observed` records, and the inventory dashboard/pager. Never per function, per thread, or per call time. A pair with no row reads `unknown (uncounted)` and names the `PairInsertFailure` evidence, never 0. | A count read mid-capture is a lower bound; only the post-stop read is final, and settlement stays `unsettled`. An unreadable health cell withholds watches without inventing counts. Documented in [inventory v1](../schema/inventory-v1.md) (`edges[].entries.coverage`) and [inventory events v1](../schema/inventory-events-v1.md) (`edge_observed`). |
 
 ## Inline inventory identity (P5U, 2026-10-09)
 
@@ -596,8 +602,10 @@ not a desktop application, script name, package, service or trust identity.
 Producer sample attempts may read only the original admitted task's exe link
 and existing filesystem identity, start time and retained-pin/namespace/cookie
 validation facts. Failed or deferred partial samples are discarded within the
-same shared accounting. No command line, argument, environment, `comm`, secret,
-provider-memory or new kernel capture/query is introduced. Rendering performs
+same shared accounting. No command line, argument, environment, secret,
+provider-memory or new kernel capture/query is introduced, and no `comm` is
+retained or published (start-time sampling reads the whole stat line and
+parses around the comm field, discarding it). Rendering performs
 no I/O and holds only an already decided borrowed view.
 
 The whole bridge shares one Session-owned ceiling of 16384 charged entries
@@ -623,6 +631,13 @@ It samples an already admitted original task after one authentic CALL and proves
 its historical image with a second same-key post-sample CALL. Pending or refused
 proof remains unknown; this method does not infer continuous cgroup membership.
 Installed named coverage remains an open required release obligation.
+
+In selected sessions only, the kernel gate additionally compares the calling
+task's leader process id, exec id and task cookie against the published
+target; a cgroup-migrate hook reads only the migrating task's process id to
+invalidate a stale target; and a bounded task iterator publishes one
+bootstrap row per selected target to the selecting session. None of these
+values is stored beyond the check, and none reaches public output.
 
 V1/v2 bytes/exclusions, U5 inline inventory identity and offline inventory diff
 remain unchanged. Source acceptance and permission to publish these fields do
@@ -767,7 +782,7 @@ for profile, metrics or trace. V1 and v2 remain byte-for-byte unchanged.
 
 | Field | Source and validation | Output/retention | Failure |
 | --- | --- | --- | --- |
-| Inspect `application`: observed executable `path`, `dev`, `ino`, `mtime_secs`, `mtime_nanos`, retained `start_time`, finite identity `status` | New private validated application receipt from BOTH PID and system deep-scan producers: executable and fresh start-time samples before scan and after scan/provider pinning agree while the SAME original ProcessView pin holds. Retained pin start-time is also checked. MapsMatched instead consumes the separately confirmed SweptMember through its dedicated producer adapter. Raw ProcessRecord.generation.exe and pidfd liveness alone grant no publication. No cmdline, environ, comm, argument or extra memory read. | Additive root application/application_status in inspect v1 and per-process application/application_status in inspect-system v1, plus their text detail. Existing PID numbering/references persist. Application contains exactly path/dev/ino/mtime_secs/mtime_nanos/start_time/status; successful status is observed. Retain only this completed scan's fact; render without live lookup or late repair. | Null application and finite application_status: unavailable, changed, lost or not_examined. Scanned/MemoryUnavailable may name only after successful receipt and completed mapping scan; Unreadable/Exited/NotSelected stay unknown. MapsMatched uses confirmed attribution only. A receipt rejection withholds names without reclassifying provider mappings. |
+| Inspect `application`: observed executable `path`, `dev`, `ino`, `mtime_secs`, `mtime_nanos`, retained `start_time`, finite identity `status` | New private validated application receipt from BOTH PID and system deep-scan producers: executable and fresh start-time samples before scan and after scan/provider pinning agree while the SAME original ProcessView pin holds. Retained pin start-time is also checked. MapsMatched instead consumes the separately confirmed SweptMember through its dedicated producer adapter. Raw ProcessRecord.generation.exe and pidfd liveness alone grant no publication. No cmdline, environ, argument or extra memory read, and no retained or published comm (start-time sampling reads the whole stat line and parses around the comm field, discarding it). | Additive root application/application_status in inspect v1 and per-process application/application_status in inspect-system v1, plus their text detail. Existing PID numbering/references persist. Application contains exactly path/dev/ino/mtime_secs/mtime_nanos/start_time/status; successful status is observed. Retain only this completed scan's fact; render without live lookup or late repair. | Null application and finite application_status: unavailable, changed, lost or not_examined. Scanned/MemoryUnavailable may name only after successful receipt and completed mapping scan; Unreadable/Exited/NotSelected stay unknown. MapsMatched uses confirmed attribution only. A receipt rejection withholds names without reclassifying provider mappings. |
 
 The path is an observed executable-link label, including a retained deleted
 marker, not a service/package/script or trust identity. Text escapes controls,
@@ -882,8 +897,11 @@ reports `evidence.object_capture = {available: false, reason: "not_enabled"}`.
 FULL reports `available: true`, which is a build fact, not evidence that any
 attribute was observed.
 
-In FULL builds, for object-marked calls under `allowlisted`, `p11_entry` and
-`p11_entry_ia32` perform the inspection described here. This narrows v1's
+In FULL builds, for object-marked calls under `allowlisted`, `p11_entry`
+performs the inspection described here for both LP64 and ia32 callers
+(mixed-ABI root). (`p11_entry_ia32` exists only in
+`unsafe-unvalidated-metadata` builds, where the entry roots split by ABI.)
+This narrows v1's
 structural statement at its "Structural enforcement" section; v1's
 `walk_template` and its numeric template-type output remain
 unsafe-diagnostic only, and v3 publishes no raw attribute type.

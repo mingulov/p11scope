@@ -108,7 +108,9 @@ fn effective_bpf_rustflags_keep_inventory_last_and_detailed_plain() {
     }
     for (name, flags) in plain {
         assert!(
-            !flags.split('\u{1f}').any(|token| token.starts_with("opt-level")),
+            !flags
+                .split('\u{1f}')
+                .any(|token| token.starts_with("opt-level")),
             "{name} BPF rustflags must carry no opt-level override: {flags:?}"
         );
     }

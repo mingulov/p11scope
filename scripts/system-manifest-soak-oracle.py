@@ -422,10 +422,25 @@ def evaluate(directory):
     except (OracleError, OSError, AttributeError) as error:
         gates = {name: {"pass": False, "detail": f"evidence load failed: {error}"}
                  for name in GATES}
-        return {"schema": VERDICT_SCHEMA, "cell_id": None, "mode": None,
-                "verdict": "FAIL", "qualifying": False,
-                "require_duration_s": None, "window_s": None, "gates": gates,
-                "evidence_dir": str(Path(directory))}
+        # A hang still names its cell: run.json loads even when the
+        # report it points at was never written.
+        identity: dict = {"cell_id": None, "mode": None,
+                          "require_duration_s": None, "window_s": None}
+        try:
+            run = json.loads((Path(directory) / "run.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            run = None
+        if isinstance(run, dict):
+            identity["cell_id"] = run.get("cell_id")
+            identity["mode"] = run.get("mode")
+            identity["require_duration_s"] = run.get("require_duration_s")
+            timing = run.get("timing")
+            if isinstance(timing, dict):
+                start, end = timing.get("start_mono_ns"), timing.get("end_mono_ns")
+                if type(start) is int and type(end) is int:
+                    identity["window_s"] = (end - start) / 1e9
+        return {"schema": VERDICT_SCHEMA, "verdict": "FAIL", "qualifying": False,
+                "gates": gates, "evidence_dir": str(Path(directory)), **identity}
     gates = {}
     for name in GATES:
         try:

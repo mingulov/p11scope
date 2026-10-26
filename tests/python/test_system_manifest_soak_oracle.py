@@ -383,6 +383,7 @@ class SoakOracleTest(unittest.TestCase):
         for gate in self.oracle.GATES:
             self.assert_gate(verdict, gate, False)
         self.assertIn("report.json", verdict["gates"]["finite_stop"]["detail"])
+        self.assertEqual(verdict["cell_id"], "soak-manifest.1800s")
 
 
 if __name__ == "__main__":

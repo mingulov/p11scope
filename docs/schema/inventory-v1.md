@@ -696,6 +696,16 @@ non-null values needs a new allowlist row.
   watched caller's scope). Refusal never erases
   retained evidence: over-budget members are dropped with a named
   gap while catalog entries and previously observed use stay.
+- `object_observations` (additive within v1): the frozen H9
+  key-operation section (`version` 1), rendered from the
+  `inventory-v1-object-observations` schema only. `status` is
+  `populated`, `partial`, `stale`, or `unavailable`; `reason` is the
+  finite machine reason (`none` only when populated). In v0.5.0 no
+  journal producer is linked, so the section reads `unavailable`
+  with `journal_unavailable` (no key-operation feed exists; S1
+  mechanisms and API results are unaffected), and the lane records
+  one `joint_journal_unavailable` gap. `bootstrap_unavailable` keeps
+  its 0.5.1 meaning (journal linked, no birth yet).
 
 ## Semantic instances (additive within v1)
 

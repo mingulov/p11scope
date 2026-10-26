@@ -29,9 +29,14 @@ pub(crate) const KEY_OP_ROW_CAPACITY: usize = 65_536;
 pub(crate) const OBSERVATIONS_VERSION: u8 = 1;
 
 /// Frozen machine reasons. `none` only when populated.
-pub(crate) const REASON_LABELS: [&str; 8] = [
+/// `journal_unavailable` (OD33/R-50) names the v0.5.0 world: no journal
+/// producer is linked, so no key-operation feed exists;
+/// `bootstrap_unavailable` keeps its 0.5.1 meaning (linked, no birth
+/// yet).
+pub(crate) const REASON_LABELS: [&str; 9] = [
     "none",
     "bootstrap_unavailable",
+    "journal_unavailable",
     "proof_refused_fallback",
     "authority_lost",
     "row_budget_exhausted",
@@ -466,8 +471,9 @@ pub(crate) struct ObjectObservations {
 impl ObjectObservations {
     /// The honest no-evidence publication: no Joint facts exist, so
     /// sessions/objects/rows are empty and S1 is unaffected. The
-    /// reason is finite (`bootstrap_unavailable` in production
-    /// today), never an empty successful projection.
+    /// reason is finite (`journal_unavailable` in production v0.5.0,
+    /// whose lanes link no journal producer), never an empty
+    /// successful projection.
     pub(crate) fn unavailable(revision: u64, reason: &'static str) -> Self {
         debug_assert!(
             REASON_LABELS.contains(&reason),
@@ -784,11 +790,26 @@ pub(crate) mod producer {
     /// unknown-key S1 facts, never a refusal); with no Joint feed
     /// the reason names the loss. Rows aggregate per-operation
     /// reducer state into frozen aggregate rows; budgets measure.
+    /// Linked by default (the 0.5.1 world the committed suites model);
+    /// lanes pass their latched linkage explicitly.
     pub(crate) fn commit(
         revision: u64,
         stagings: &[&JointStaging],
         model: &ObjectProjection,
         keyuse: &KeyUseReducer,
+    ) -> ObjectObservations {
+        commit_with_journal_linked(revision, stagings, model, keyuse, true)
+    }
+
+    /// Commit with the lane's latched journal linkage: with no Joint
+    /// feed and no linked producer the reason is `journal_unavailable`
+    /// (OD33/R-50); every other census maps exactly as before.
+    pub(crate) fn commit_with_journal_linked(
+        revision: u64,
+        stagings: &[&JointStaging],
+        model: &ObjectProjection,
+        keyuse: &KeyUseReducer,
+        journal_linked: bool,
     ) -> ObjectObservations {
         let evidence = keyuse.evidence();
         let joint = stagings
@@ -804,8 +825,10 @@ pub(crate) mod producer {
             (ObsStatus::Unavailable, "authority_lost")
         } else if fallback {
             (ObsStatus::Unavailable, "proof_refused_fallback")
-        } else {
+        } else if journal_linked {
             (ObsStatus::Unavailable, "bootstrap_unavailable")
+        } else {
+            (ObsStatus::Unavailable, "journal_unavailable")
         };
         let mut observations = ObjectObservations {
             revision,

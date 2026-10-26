@@ -2477,6 +2477,12 @@ pub(crate) struct AttachedSemanticSet {
     domain: crate::attach::capture::NativeDomainId,
     subset: crate::inventory_semantics::AttestedSubset,
     generation: u64,
+    /// Whether a journal producer is linked for this attachment: only a
+    /// linked attachment may install key-operation (Joint) feeds. OD33/R-50:
+    /// v0.5.0 links the object-journal producer into no BPF flavor, so the
+    /// production seal marks every attachment unlinked; the test sealer
+    /// marks its attachments linked for the 0.5.1 Joint suites.
+    journal_linked: bool,
 }
 
 impl std::fmt::Debug for AttachedSemanticSet {
@@ -2497,6 +2503,14 @@ impl AttachedSemanticSet {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Whether a journal producer is linked for this attachment. The
+    /// v0.5.0 production seal always marks false (OD33/R-50); 0.5.1
+    /// wires the sealed value through to the lane.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn journal_linked(&self) -> bool {
+        self.journal_linked
+    }
 }
 
 /// One Session's retained drain producers: its native identity
@@ -2508,6 +2522,12 @@ impl AttachedSemanticSet {
 pub(crate) struct SessionDrainProducers {
     native: crate::attach::capture::NativeDomainId,
     events: events::EventsDomain,
+    /// Whether a journal producer is linked for this lane: only a
+    /// linked lane may install key-operation (Joint) feeds. OD33/R-50:
+    /// v0.5.0 links the object-journal producer into no BPF flavor, so
+    /// production producers are never linked. A capability, not
+    /// identity: [`SessionDrainProducers::same_producers`] ignores it.
+    journal_linked: bool,
 }
 
 /// Session-owned Q metadata. No constructor, Clone or Copy permits a caller
@@ -2664,16 +2684,42 @@ impl SessionDrainProducers {
         self.events.id()
     }
 
+    /// Whether a journal producer is linked for this lane. Production
+    /// producers are never linked in v0.5.0 (OD33/R-50).
+    pub(crate) fn journal_linked(&self) -> bool {
+        self.journal_linked
+    }
+
     /// Pair one scene's genuine test producers: its fixture's minted
     /// native domain plus its retained test EVENTS domain. The
     /// common-owner check still runs at mint — this pairs values, it
-    /// never authorizes a splice.
+    /// never authorizes a splice. Linked, like the test sealer, so the
+    /// Joint suites keep exercising the linked 0.5.1 world.
     #[cfg(test)]
     pub(crate) fn test_pair(
         native: crate::attach::capture::NativeDomainId,
         events: events::EventsDomain,
     ) -> Self {
-        Self { native, events }
+        Self {
+            native,
+            events,
+            journal_linked: true,
+        }
+    }
+
+    /// Pair one scene's genuine test producers for the unlinked v0.5.0
+    /// world: no journal producer, so the Joint birth path bars and the
+    /// lane stays S1-only with one disclosure.
+    #[cfg(test)]
+    pub(crate) fn test_pair_unlinked(
+        native: crate::attach::capture::NativeDomainId,
+        events: events::EventsDomain,
+    ) -> Self {
+        Self {
+            native,
+            events,
+            journal_linked: false,
+        }
     }
 }
 
@@ -2986,6 +3032,9 @@ pub(crate) fn seal_attached_subset_native(
         domain,
         subset,
         generation: 0,
+        // OD33/R-50: v0.5.0 links the object-journal producer into no
+        // BPF flavor, so no production attachment is journal-linked.
+        journal_linked: false,
     };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     // Only a successful sealing mints, from native: the generation
@@ -3018,6 +3067,9 @@ pub(crate) fn seal_attached_subset_with(
         domain,
         subset,
         generation: 0,
+        // The test seal models the linked 0.5.1 world, so the Joint
+        // suites keep exercising birth-to-grant mapping.
+        journal_linked: true,
     };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     // Only a successful sealing mints: the generation always names a
@@ -8453,6 +8505,9 @@ impl Session {
         Some(SessionDrainProducers {
             native: self.native_domain()?,
             events: self.events_domain(),
+            // OD33/R-50: v0.5.0 links the object-journal producer into
+            // no BPF flavor, so production producers are never linked.
+            journal_linked: false,
         })
     }
 

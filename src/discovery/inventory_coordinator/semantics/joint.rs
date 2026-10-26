@@ -505,7 +505,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(output) = completed {
             *output = authorization;
         }
-        drop(disposed.take());
+        // The disposed scalar metadata needs no Drop; take only clears
+        // the slot (clippy drop_non_drop).
+        let _ = disposed.take();
         drop(pending._storage); // Original collection/events have moved or finished first.
         Ok(JointCommitProgress::Published(receipt))
     }
@@ -539,6 +541,25 @@ fn disclose_s1_birth_refusal(
         reason,
         budget: None,
     });
+}
+
+/// OD33/R-50 wedge guard: latch the lane's journal linkage from its
+/// drain producers, and bar the whole birth path when unlinked. A
+/// Joint feed fed only bare CALL rows (no journal BEGIN/END) wedges
+/// awaiting seals that never come, so an unlinked lane installs no
+/// grant, reads no marker word, and makes no per-birth gap — it
+/// records the one lane disclosure and reports zero installs, and the
+/// batch stages S1 directly. Linked lanes run the birth path (`None`).
+fn refuse_unlinked_joint_births(
+    registry: &mut CallerRegistry,
+    producers: &SessionDrainProducers,
+) -> Option<PreparedBirthDisposition> {
+    registry.note_journal_linked(producers.journal_linked());
+    if producers.journal_linked() {
+        return None;
+    }
+    registry.disclose_joint_journal_unavailable_once();
+    Some(PreparedBirthDisposition { installed: 0 })
 }
 
 /// The existing single pending slot changes phase; preparation adds no queue.
@@ -927,6 +948,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 return Err(RawQuantumRefusal::Admission);
             }
+        }
+        // OD33/R-50 wedge guard, after the admission preamble (whose
+        // refusals stand unchanged) and before any birth work: an
+        // unlinked lane decides zero births here, like the empty and
+        // capacity paths below.
+        if let Some(disposition) = refuse_unlinked_joint_births(&mut self.registry, producers) {
+            if let Some(PendingSemanticBatch::Prepared(batch)) = self
+                .semantic_finalizer
+                .as_mut()
+                .and_then(|state| state.pending_semantic.as_mut())
+            {
+                batch.births_decided = true;
+            }
+            return Ok(disposition);
         }
         let count = batch
             .current

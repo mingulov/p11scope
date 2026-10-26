@@ -1474,6 +1474,20 @@ pub(super) struct InstanceState {
     negative_refused: u64,
     negative_exhausted: bool,
     identity_exhausted: bool,
+    /// Whether a journal producer is linked for this lane, latched from
+    /// the lane's drain producers on the Joint birth path. Only a linked
+    /// lane installs key-operation (Joint) feeds. OD33/R-50: production
+    /// v0.5.0 is never linked; test fixtures model the linked 0.5.1 world
+    /// unless a test latches unlinked.
+    journal_linked: bool,
+    /// Whether the lane already disclosed its unlinked journal: the
+    /// `joint_journal_unavailable` gap records once per lane, however
+    /// many births arrive.
+    journal_unavailable_disclosed: bool,
+    /// Grants routed to S1Only by the unlinked backstop: stray installs
+    /// that reached registration despite the Births guard. Exact even
+    /// though the disclosure stays one gap.
+    joint_backstop_routed: u64,
 }
 
 impl Default for InstanceState {
@@ -1492,6 +1506,15 @@ impl Default for InstanceState {
             negative_refused: 0,
             negative_exhausted: false,
             identity_exhausted: false,
+            // OD33/R-50: production v0.5.0 links the object-journal
+            // producer into no BPF flavor, so production lanes start
+            // unlinked. Test fixtures start linked (the 0.5.1 world the
+            // Joint suites exercise); the Births guard re-latches from
+            // the lane's producers every quantum, and tests latch
+            // unlinked explicitly.
+            journal_linked: cfg!(test),
+            journal_unavailable_disclosed: false,
+            joint_backstop_routed: 0,
         }
     }
 }
@@ -1892,6 +1915,44 @@ impl CallerRegistry {
         self.joint_feeds
     }
 
+    /// Latch the lane's journal linkage from its drain producers. The
+    /// Joint birth path calls this every quantum; tests latch the world
+    /// they model. Only a linked lane installs Joint feeds.
+    pub(crate) fn note_journal_linked(&mut self, linked: bool) {
+        self.instance_state.journal_linked = linked;
+    }
+
+    /// Whether a journal producer is linked for this lane.
+    pub(crate) fn journal_linked(&self) -> bool {
+        self.instance_state.journal_linked
+    }
+
+    /// Disclose the unlinked journal once per lane: the first call
+    /// records the `joint_journal_unavailable` gap; later calls change
+    /// nothing, however many births arrive.
+    pub(crate) fn disclose_joint_journal_unavailable_once(&mut self) {
+        if self.instance_state.journal_unavailable_disclosed {
+            return;
+        }
+        self.instance_state.journal_unavailable_disclosed = true;
+        self.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results"
+                .into(),
+            reason: "joint_journal_unavailable".into(),
+            budget: None,
+        });
+    }
+
+    /// Grants the unlinked backstop routed to S1Only. Exact even though
+    /// the lane discloses once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn joint_backstop_routed(&self) -> u64 {
+        self.instance_state.joint_backstop_routed
+    }
+
     pub(crate) fn joint_feed_targets(&self) -> impl Iterator<Item = JointFeedTarget> + '_ {
         self.instance_state.semantics.values().filter_map(|record| {
             if record.feed.mode() != FeedMode::Joint {
@@ -2236,15 +2297,23 @@ impl CallerRegistry {
     }
 
     /// Capture the guarded H9 section: commit from retained Joint
-    /// evidence, or unavailable exactly as before without it.
+    /// evidence, or unavailable exactly as before without it. Without a
+    /// linked journal the reason is `journal_unavailable` (OD33/R-50);
+    /// `bootstrap_unavailable` keeps its 0.5.1 meaning (linked, no
+    /// birth yet). Status stays unavailable either way.
     pub(crate) fn joint_observations(
         &self,
         revision: u64,
     ) -> crate::key_operation_projection::ObjectObservations {
+        let linked = self.journal_linked();
         let Some(projection) = self.key_projection.as_ref() else {
             return crate::key_operation_projection::ObjectObservations::unavailable(
                 revision,
-                "bootstrap_unavailable",
+                if linked {
+                    "bootstrap_unavailable"
+                } else {
+                    "journal_unavailable"
+                },
             );
         };
         let stagings: Vec<&JointStaging> = self
@@ -2253,11 +2322,12 @@ impl CallerRegistry {
             .values()
             .map(|record| &record.feed)
             .collect();
-        crate::key_operation_projection::producer::commit(
+        crate::key_operation_projection::producer::commit_with_journal_linked(
             revision,
             &stagings,
             projection,
             &self.joint_keyuse,
+            linked,
         )
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
@@ -2438,7 +2508,19 @@ impl CallerRegistry {
         // Feed selection, once at registration: an installed Joint
         // receipt selects Joint (consumed — one receipt, one feed);
         // without one the feed stays S1Only, exactly as before.
-        let feed = JointStaging::select_joint(installed.as_ref().map(|grant| &grant.receipt));
+        // OD33/R-50 backstop: a receipt on an unlinked attachment is
+        // stray (the Births guard installs none), so it routes to
+        // S1Only, counts, and discloses — S1 calls still reduce
+        // through the normal S1Only path, never dropped.
+        let stray = installed.is_some() && !self.journal_linked();
+        let feed = if stray {
+            self.instance_state.joint_backstop_routed =
+                self.instance_state.joint_backstop_routed.saturating_add(1);
+            self.disclose_joint_journal_unavailable_once();
+            JointStaging::select_s1_only()
+        } else {
+            JointStaging::select_joint(installed.as_ref().map(|grant| &grant.receipt))
+        };
         if feed.mode() == FeedMode::Joint {
             self.joint_feeds = self.joint_feeds.saturating_add(1);
             self.joint_accounting = true;

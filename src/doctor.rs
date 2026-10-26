@@ -648,6 +648,8 @@ const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
 /// FULL bytes wire capture, P0 (stub) bytes warn by design (a
 /// [`BUILD_LIMIT_ROWS`] member). A stale or mismatched object fails the
 /// row with the same reason capture setup refuses with.
+/// OD33/R-50: v0.5.0 reads attributes but reports key operations only
+/// from 0.5.1, and the OK detail says so.
 fn object_capture_check() -> Check {
     match crate::attach::checked_embedded_flavor() {
         Err(error) => Check {
@@ -656,7 +658,9 @@ fn object_capture_check() -> Check {
         },
         Ok(flavor) if !flavor.stubbed => Check {
             name: "object-attribute capture".into(),
-            status: Status::Ok("enabled".into()),
+            status: Status::Ok(
+                "enabled (read only; key operations are reported from 0.5.1)".into(),
+            ),
         },
         Ok(_) => Check {
             name: "object-attribute capture".into(),

@@ -407,6 +407,9 @@ fn seal_collected(
     let producers = super::super::SessionDrainProducers {
         native: super::super::capture::NativeDomainId::mint(),
         events: crate::events::EventsDomain::test_standin(0xc011),
+        // Test fixture: linked, like test_pair, so retirement scenes
+        // keep the linked 0.5.1 world (OD33/R-50).
+        journal_linked: true,
     };
     let events = crate::events::EventDrain::over_domain(
         crate::events::ScriptedRecords::records([vec![0]], 1),

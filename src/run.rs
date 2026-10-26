@@ -12049,6 +12049,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn counter_inputs_come_from_policy_and_counters_plan() {
+        use crate::attach::CapturePolicy;
+        use crate::discovery::engine::Engine;
+        let mut engine = Engine::empty_for_test();
+        let plan = crate::plan::AttachPlan::from_slots_with_policy(
+            vec![],
+            crate::plan::AdmissionPolicy::Counters(
+                crate::capacity::CounterBudget::new(512).unwrap(),
+            ),
+        )
+        .unwrap();
+        engine.inject_counter_start_state_for_test(
+            crate::attach::Scope::Pid(1),
+            Vec::new(),
+            plan,
+            crate::discovery::identity::PinnedObjects::empty(),
+        );
+        // Counter policy + Counters plan -> bounded inputs from the budget.
+        let inputs = counter_inputs_for_capture(
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts),
+            &engine,
+        )
+        .expect("counter plan builds inputs");
+        assert_eq!(inputs.rows(), 512);
+        assert_eq!(inputs.rv_keys(), 65536);
+        // Non-counter policies never build inputs.
+        for policy in [CapturePolicy::AggregateOnly, CapturePolicy::Allowlisted] {
+            assert!(
+                counter_inputs_for_capture(policy, &engine).is_none(),
+                "{policy:?} builds no counter inputs"
+            );
+        }
+        // Counter policy without a Counters plan builds nothing.
+        let mut detailed = Engine::empty_for_test();
+        detailed.inject_counter_start_state_for_test(
+            crate::attach::Scope::Pid(1),
+            Vec::new(),
+            crate::plan::AttachPlan::from_slots(vec![]),
+            crate::discovery::identity::PinnedObjects::empty(),
+        );
+        assert!(
+            counter_inputs_for_capture(
+                CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts),
+                &detailed
+            )
+            .is_none()
+        );
+    }
+
     /// Review P2: a PID-scoped capture refuses by name before its target is
     /// even opened (this PID cannot exist).
     #[test]

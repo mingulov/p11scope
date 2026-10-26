@@ -5,9 +5,11 @@
  *   PROVIDER    SoftHSM library path to dlopen and drive
  *   MODE        single (one worker) or churn (waves of short-lived threads)
  *   RATE        1k, 10k or 100k (paced PKCS#11 calls per second)
- *   DURATION_S  hot-loop seconds, 1..3600
- *   LEDGER      single: ledger JSONL path; churn: filename prefix, one
- *               PREFIX.t<nn>.jsonl per worker thread
+ *   DURATION_S  hot-loop seconds, 1..3600 (gated cells need >= 2)
+ *   LEDGER      single: hot-loop ledger JSONL path; churn: filename
+ *               prefix, one PREFIX.t<nn>.jsonl per worker thread.
+ *               Teardown is ledgered beside the hot ledgers (2 calls
+ *               single, 9 churn); pass every emitted file to --ledger.
  *   GO_FILE     optional gate path: print READY, wait for the path, run
  *
  * Also: gen-calls --help (usage, exit 0) and gen-calls --dry-run with the
@@ -17,12 +19,21 @@
  * Setup (C_Initialize, first token slot, one session per concurrent
  * worker) runs before READY and is never ledgered: it causally precedes
  * the observer's attach, so it stays outside the compared window. The
- * ledger covers the hot loop only: repeated single-part C_DigestInit +
+ * hot loop is ledgered per worker: repeated single-part C_DigestInit +
  * C_Digest operations under CKM_SHA_256, two ledgered calls per op, on
- * a fixed 64-byte input. Every ledgered row carries CLOCK_MONOTONIC
- * t0/t1 stamps in the T0 per-call shape (ready, call, ack), one ready
- * row per file, so every emitted file validates with
- * scripts/joint-ledger-oracle.py unchanged.
+ * a fixed 64-byte input. Teardown (C_CloseSession per session plus
+ * C_Finalize) runs after the hot loop while the observer is still
+ * attached, so it is ledgered too, in its own T0-valid file: single
+ * mode writes <LEDGER minus a trailing .jsonl>-teardown.jsonl (2
+ * calls), churn mode <PREFIX>-teardown.jsonl (8 closes + finalize).
+ * Every ledgered row carries CLOCK_MONOTONIC t0/t1 stamps in the T0
+ * per-call shape (ready, call, ack), one ready row per file, so every
+ * emitted file validates with scripts/joint-ledger-oracle.py unchanged.
+ *
+ * Gated comparisons need DURATION_S >= 2: workers pace 5% above nominal
+ * on absolute deadlines, so a 1 s run ends near 0.95 s with no full 1 s
+ * window, and the comparison refuses it. Use 1 s runs as --min-rate 0
+ * smoke only.
  *
  * Pacing aims 5% above nominal on absolute CLOCK_MONOTONIC deadlines,
  * so scheduling jitter and churn wave boundaries cannot push a full 1 s
@@ -172,9 +183,12 @@ static void usage(const char *name) {
            "  PROVIDER    SoftHSM library path to dlopen and drive\n"
            "  MODE        single (one worker) or churn (thread waves)\n"
            "  RATE        1k, 10k or 100k paced calls per second\n"
-           "  DURATION_S  hot-loop seconds, 1..3600\n"
-           "  LEDGER      single: ledger JSONL path; churn: filename prefix\n"
-           "              (one PREFIX.t<nn>.jsonl per worker thread)\n"
+           "  DURATION_S  hot-loop seconds, 1..3600; gated cells need >= 2\n"
+           "              (1 s runs are --min-rate 0 smoke only)\n"
+           "  LEDGER      single: hot-loop ledger path; churn: filename\n"
+           "              prefix (one PREFIX.t<nn>.jsonl per worker).\n"
+           "              Teardown (closes + finalize) is ledgered beside\n"
+           "              the hot ledgers: 2 calls single, 9 churn.\n"
            "  GO_FILE     optional gate: print READY, wait for it, run\n"
            "  %s --help | --dry-run PROVIDER MODE RATE DURATION_S LEDGER "
            "[GO_FILE]\n",
@@ -401,6 +415,144 @@ static int make_plan(int churn, unsigned long rate, unsigned long duration,
     return 0;
 }
 
+/* Teardown ledger path: "<base>-teardown.jsonl", where base is the churn
+ * prefix, or the single ledger path minus a trailing ".jsonl". Returns
+ * 0, or -1 when the path does not fit. */
+static int teardown_path_for(int churn, const char *ledger_arg, char *out,
+                             size_t out_size) {
+    if (churn) {
+        if (snprintf(out, out_size, "%s-teardown.jsonl", ledger_arg) >=
+            (int)out_size) {
+            return -1;
+        }
+        return 0;
+    }
+    static const char suffix[] = ".jsonl";
+    size_t len = strlen(ledger_arg);
+    size_t base = len;
+    if (len > sizeof suffix - 1 &&
+        strcmp(ledger_arg + len - (sizeof suffix - 1), suffix) == 0) {
+        base = len - (sizeof suffix - 1);
+    }
+    if (snprintf(out, out_size, "%.*s-teardown.jsonl", (int)base,
+                 ledger_arg) >= (int)out_size) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Ledgered teardown: C_CloseSession per session, then C_Finalize, each
+ * stamped and written to its own T0-valid ledger. The provider calls
+ * always run to completion (process hygiene), even when stamping or
+ * emission fails; returns 0 with *unhealthy counting non-OK returns, or
+ * -1 when the ledger is unusable. */
+static int write_teardown_ledger(struct provider *provider,
+                                 CK_SESSION_HANDLE *sessions,
+                                 unsigned long sessions_open,
+                                 const char *path,
+                                 unsigned long *unhealthy) {
+    *unhealthy = 0;
+    FILE *ledger = fopen(path, "w");
+    if (ledger == NULL) {
+        fprintf(stderr, "gen-calls: cannot open ledger %s: %s\n", path,
+                strerror(errno));
+        for (unsigned long i = 0; i < sessions_open; i++) {
+            provider->close_session(sessions[i]);
+        }
+        provider->finalize(NULL);
+        return -1;
+    }
+    int pid = (int)getpid();
+    int tid = (int)gettid();
+    uint64_t start = 0;
+    if (clock_ns(&start) != 0) {
+        fprintf(stderr, "gen-calls: clock read failed\n");
+        fclose(ledger);
+        for (unsigned long i = 0; i < sessions_open; i++) {
+            provider->close_session(sessions[i]);
+        }
+        provider->finalize(NULL);
+        return -1;
+    }
+    int failed = fprintf(ledger,
+                         "{\"kind\":\"ready\",\"pid\":%d,\"tid\":%d,\"t\":%" PRIu64
+                         ",\"clock\":\"CLOCK_MONOTONIC\",\"unit\":\"ns\"}\n",
+                         pid, tid, start) < 0;
+    unsigned long seq = 0;
+    unsigned long closed = 0;
+    for (; closed < sessions_open && !failed;) {
+        uint64_t t0 = 0, t1 = 0;
+        if (clock_ns(&t0) != 0) {
+            failed = 1;
+            break;
+        }
+        CK_RV rv = provider->close_session(sessions[closed]);
+        closed++;
+        if (clock_ns(&t1) != 0) {
+            failed = 1;
+            break;
+        }
+        seq++;
+        *unhealthy += rv != CKR_OK;
+        if (fprintf(ledger,
+                    "{\"kind\":\"call\",\"seq\":%lu,\"fn\":\"C_CloseSession\","
+                    "\"rv\":%lu,\"pid\":%d,\"tid\":%d,\"t0\":%" PRIu64
+                    ",\"t1\":%" PRIu64 "}\n",
+                    seq, (unsigned long)rv, pid, tid, t0, t1) < 0) {
+            failed = 1;
+            break;
+        }
+    }
+    /* Sessions the ledgered loop did not reach still close, unledgered. */
+    for (; closed < sessions_open; closed++) {
+        provider->close_session(sessions[closed]);
+    }
+    int finalized = 0;
+    if (!failed) {
+        uint64_t t0 = 0, t1 = 0;
+        if (clock_ns(&t0) != 0) {
+            failed = 1;
+        } else {
+            CK_RV rv = provider->finalize(NULL);
+            finalized = 1;
+            if (clock_ns(&t1) != 0) {
+                failed = 1;
+            } else {
+                seq++;
+                *unhealthy += rv != CKR_OK;
+                if (fprintf(ledger,
+                            "{\"kind\":\"call\",\"seq\":%lu,\"fn\":\"C_Finalize\","
+                            "\"rv\":%lu,\"pid\":%d,\"tid\":%d,\"t0\":%" PRIu64
+                            ",\"t1\":%" PRIu64 "}\n",
+                            seq, (unsigned long)rv, pid, tid, t0, t1) < 0) {
+                    failed = 1;
+                }
+            }
+        }
+    }
+    if (!finalized) {
+        /* The finalize call above never ran; the provider still
+         * finalizes, unledgered. */
+        provider->finalize(NULL);
+    }
+    uint64_t done = 0;
+    if (!failed && clock_ns(&done) != 0) {
+        failed = 1;
+    }
+    if (!failed && fprintf(ledger, "{\"kind\":\"ack\",\"issued\":%lu,\"t\":%" PRIu64 "}\n",
+                           seq, done) < 0) {
+        failed = 1;
+    }
+    if (fclose(ledger) != 0) {
+        failed = 1;
+    }
+    if (failed) {
+        fprintf(stderr, "gen-calls: ledger emission failed for %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *name = argc > 0 ? argv[0] : "gen-calls";
     int dry_run = 0;
@@ -443,18 +595,25 @@ int main(int argc, char **argv) {
     if (make_plan(churn, rate, duration, &plan) != 0) {
         return 2;
     }
+    char teardown[4096];
+    if (teardown_path_for(churn, ledger_arg, teardown, sizeof teardown) != 0) {
+        fprintf(stderr, "gen-calls: teardown ledger path too long\n");
+        return 2;
+    }
     if (dry_run) {
         if (!churn) {
             printf("gen-calls dry run: provider=%s mode=single rate=%lu/s "
-                   "duration=%lus %lu calls %lu ops threads=1 ledgers=%s\n",
+                   "duration=%lus %lu calls %lu ops threads=1 ledgers=%s "
+                   "teardown=%s (2 calls)\n",
                    argv[first], rate, duration, plan.total_calls,
-                   plan.total_ops, ledger_arg);
+                   plan.total_ops, ledger_arg, teardown);
         } else {
             printf("gen-calls dry run: provider=%s mode=churn rate=%lu/s "
                    "duration=%lus %lu calls %lu ops threads=%lu waves=%lu "
-                   "ledgers=%s.t<nn>.jsonl\n",
+                   "ledgers=%s.t<nn>.jsonl teardown=%s (9 calls)\n",
                    argv[first], rate, duration, plan.total_calls,
-                   plan.total_ops, plan.threads, plan.waves, ledger_arg);
+                   plan.total_ops, plan.threads, plan.waves, ledger_arg,
+                   teardown);
         }
         return 0;
     }
@@ -626,11 +785,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (unsigned long i = 0; i < sessions_open; i++) {
-        provider.close_session(sessions[i]);
+    unsigned long teardown_unhealthy = 0;
+    if (write_teardown_ledger(&provider, sessions, sessions_open, teardown,
+                              &teardown_unhealthy) != 0) {
+        rc = 2;
+    } else if (teardown_unhealthy != 0 && rc == 0) {
+        rc = 1;
     }
     free(sessions);
-    provider.finalize(NULL);
     dlclose(provider.handle);
     return rc;
 }

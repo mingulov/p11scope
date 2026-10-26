@@ -56,7 +56,7 @@ DRY_RUN=0
 OBSERVER_STUB=
 KERNEL_PROFILE=current/default
 TEST_ID=
-SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
+SOURCE_MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 MODULE=
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}
 CARGO_LANE=${CARGO_LANE:-/var/tmp/p11scope-ws-tmp/v040-cargo-lane.lock}
@@ -179,9 +179,12 @@ if [ "$MODE" = live ] && [ "$IS_ROOT" -eq 0 ]; then
     sudo -n true || refuse "passwordless sudo required for live mode as non-root"
 fi
 if [ ! -f "$SOURCE_MODULE" ]; then
-    SOURCE_MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+    SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
 fi
-test -f "$SOURCE_MODULE" || refuse "SoftHSM2 not installed (tried both layouts)"
+if [ ! -f "$SOURCE_MODULE" ]; then
+    SOURCE_MODULE=/usr/lib64/pkcs11/libsofthsm2.so
+fi
+test -f "$SOURCE_MODULE" || refuse "SoftHSM2 not installed (tried all three layouts)"
 : "${TMPDIR:=/var/tmp/p11scope-ws-tmp}"
 export TMPDIR
 mkdir -p "$TMPDIR" "$WORK"
@@ -326,7 +329,8 @@ if [ "$MODE" = live ]; then
         # unique name (pid + nanoseconds; never pre-created, or the
         # sticky ownership check would deny the dropped writer), then
         # the vehicle installs it privately. The manifest file itself
-        # is always checked: discover can report an error yet exit 0.
+        # is always checked: discover exits nonzero on write failure;
+        # the existence check is defense in depth.
         MANIFEST_TMP=/tmp/manifest-soak-manifest.$$.$(mono_ns).json
         env -u SOFTHSM2_CONF "$DISCOVER_COPY" --module "$MODULE" -o "$MANIFEST_TMP"
         [ -f "$MANIFEST_TMP" ] || refuse "discover wrote no manifest"

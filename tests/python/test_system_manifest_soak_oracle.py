@@ -345,6 +345,15 @@ class SoakOracleTest(unittest.TestCase):
                                       refuse_unrelated)),
             "loss_accounting")
 
+    def test_green_budget_refusal_with_named_gap_passes(self):
+        counted = make_green(
+            self.base / "budget-named",
+            gaps=[("endpoint budget exhausted", "registry retains at most 8192")])
+        rewrite_json(counted / "report.json", lambda report: report["budgets"][
+            "endpoints"].update({"refused": 4}))
+        verdict = self.evaluate(counted)
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
     def test_red_resources_over_bound(self):
         def fatten(target):
             rows = [(n * 1000, 300_000, 300_000, 40) for n in range(1900)]

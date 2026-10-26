@@ -142,6 +142,17 @@ def gate_finite_stop(evidence):
     return True, f"observer exit=0, {detail_window}, {passes} passes"
 
 
+def split_log_fields(line):
+    """Split a DONE/LEDGER row into fields; a token without '=' fails the gate."""
+    fields = {}
+    for part in line.split()[1:]:
+        key_value = part.split("=", 1)
+        if len(key_value) != 2:
+            raise OracleError(f"malformed log token without '=': {part!r}")
+        fields[key_value[0]] = key_value[1]
+    return fields
+
+
 def parse_workload_log(text, pid):
     """Split one ledger log into post-gate truth and setup counts.
 
@@ -156,13 +167,13 @@ def parse_workload_log(text, pid):
     done = None
     for line in text.splitlines():
         if line.startswith("DONE "):
-            fields = dict(part.split("=", 1) for part in line.split()[1:])
+            fields = split_log_fields(line)
             if fields.get("pid") == str(pid):
                 done = fields.get("status")
             continue
         if not line.startswith("LEDGER "):
             continue
-        fields = dict(part.split("=", 1) for part in line.split()[1:])
+        fields = split_log_fields(line)
         require(fields.get("pid") == str(pid), "LEDGER row names another pid")
         count = strict_int(int(fields.get("n", "x")) if fields.get("n", "").isdigit()
                            else fields.get("n"), "LEDGER n")
@@ -301,9 +312,9 @@ def gate_loss_accounting(evidence):
             needs(shed, ("semantic", "shed"), "shed"),
             needs(refused, ("admission", "refus"), "refused"),
             needs(unrouted, ("unrout",), "unrouted_returns"),
-            needs(refused_total + refused_endpoints, (), "budget refusals")
-            if (refused_total + refused_endpoints) and not subjects
-            else None):
+            needs(refused_total + refused_endpoints,
+                  ("admission", "refus", "budget", "exhaust"),
+                  "budget_refused")):
         if missing:
             return False, missing
     detail = (f"conserved collected={collected} joined={joined} shed={shed} "

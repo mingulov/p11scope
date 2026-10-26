@@ -127,7 +127,9 @@ and `path`), read from `/proc/<pid>/stat` and `/proc/<pid>/exe` of processes
 whose mappings hold a provider object — reads the scan lane already makes.
 The native lane adds none: its witness rows bind through a pidfd cookie
 query, and no witness gap carries the kernel tgid. No command line,
-environment, `comm` or argument is read or published. See the inventory
+environment or argument is read or published, and no `comm` is retained
+or published (start-time sampling reads the whole stat line and parses
+around the comm field, discarding it). See the inventory
 caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
 `callers[].image.task_cookie` and `.exec_id` are always null in v0.2.0
 (`owner_image` returns `None` everywhere in production); only a future

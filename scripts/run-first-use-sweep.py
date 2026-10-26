@@ -192,11 +192,8 @@ def check_evidence(evidence):
                       f"{record.get('completeness')!r}")
     scheduling = record.get("scheduling")
     if isinstance(scheduling, dict):
-        # sink_stall_ms stays ungated: it is backpressure timing, not loss.
-        # A 1 ms stall with a proven drain and zero drops is still an exact
-        # capture (measured so on Linux 7.0.14; src/render.rs documents the
-        # field as stall milliseconds). Only the loss counters gate the cell.
-        for field in ("sink_timeouts", "sink_dropped_bytes"):
+        for field in ("sink_stall_ms", "sink_timeouts",
+                      "sink_dropped_bytes"):
             if field not in scheduling:
                 continue
             value = scheduling[field]

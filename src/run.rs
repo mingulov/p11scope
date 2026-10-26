@@ -2542,6 +2542,18 @@ fn pause_failure(error: PauseError) -> anyhow::Error {
     anyhow!("pause: {error}")
 }
 
+/// Whether the finished capture ended with its owned target naturally
+/// exited: only a proven exit (`Ok(true)`) counts. An unreadable pin —
+/// notably `Interrupted` when a second signal lands in the readiness
+/// poll — proves nothing and stays `false`, the same fail-closed reading
+/// the engine uses for poll failures (`Engine::original_exited`); the
+/// selection coverage invalidates instead of the error vetoing
+/// settlement and publication, so teardown still publishes the report
+/// it owes (SG-I7).
+fn finish_observation_natural_exit(end: CaptureEnd, observation: Result<bool, String>) -> bool {
+    end == CaptureEnd::TargetExit && matches!(observation, Ok(true))
+}
+
 impl Owned {
     /// Closes the pause epoch and settles the child, *before* any terminal
     /// evidence is built: `child_still_running` is a fact the final document
@@ -2557,10 +2569,8 @@ impl Owned {
         let Some(child) = self.child.as_ref() else {
             return Ok(());
         };
-        let observation = child.pin().original_exited().map_err(anyhow::Error::msg);
-        engine.finish_owned_selection_coverage(
-            end == CaptureEnd::TargetExit && matches!(observation, Ok(true)),
-        );
+        let natural_exit = finish_observation_natural_exit(end, child.pin().original_exited());
+        engine.finish_owned_selection_coverage(natural_exit);
         // Request the stop gate before pause cleanup instead of detaching
         // there: the links move to the background cleanup worker after
         // publication, once the held child is resumed.
@@ -2590,10 +2600,10 @@ impl Owned {
         }
         // Both outcomes are retained: a cleanup failure must not be lost
         // behind a reap failure, or the other way round (design §10.3).
-        combine_finish_errors(
-            observation.map(|_| ()),
-            combine_finish_errors(cleanup.map_err(pause_failure), settled),
-        )
+        // The exit observation is not combined here: an unreadable pin
+        // already invalidated the coverage above, and must not veto the
+        // settlement — or the report the settlement publishes — behind it.
+        combine_finish_errors(cleanup.map_err(pause_failure), settled)
     }
 }
 
@@ -10231,6 +10241,45 @@ mod tests {
             -1,
             "settlement dropped the original owner before its EVENTS fence"
         );
+    }
+
+    /// An unreadable exit observation at finish invalidates the selection
+    /// coverage instead of failing the run: only a proven exit after a
+    /// target end closes coverage naturally, and an `Interrupted` poll
+    /// from a second signal must not veto the report teardown owes.
+    #[test]
+    fn finish_observation_failure_invalidates_coverage_without_vetoing_finish() {
+        assert!(finish_observation_natural_exit(
+            CaptureEnd::TargetExit,
+            Ok(true)
+        ));
+        for end in [
+            CaptureEnd::Signal,
+            CaptureEnd::DurationExpired,
+            CaptureEnd::LimitReached,
+            CaptureEnd::Error,
+        ] {
+            assert!(
+                !finish_observation_natural_exit(end, Ok(true)),
+                "only a target end closes coverage naturally: {end:?}"
+            );
+        }
+        assert!(!finish_observation_natural_exit(
+            CaptureEnd::TargetExit,
+            Ok(false)
+        ));
+        for observation in [
+            "cannot check whether original pid 7 exited: Interrupted system call (os error 4)",
+            "original pidfd poll failed: revents=0x18",
+        ] {
+            assert!(
+                !finish_observation_natural_exit(
+                    CaptureEnd::TargetExit,
+                    Err(observation.to_string())
+                ),
+                "an unreadable pin proves no exit: {observation}"
+            );
+        }
     }
 
     #[test]

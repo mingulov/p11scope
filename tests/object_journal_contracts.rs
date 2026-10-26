@@ -1113,8 +1113,7 @@ fn object_journal_cleanup_abandoned_code_matches_native() {
         .expect("native abandoned-start code define");
     let literal = line[define.len()..].trim().trim_end_matches('U').trim();
     let native: u32 = literal.parse().expect("native code parses");
-    let source =
-        std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
     let binding = "const OWNER_CLEANUP_ABANDONED_START: u32 = ";
     let line = source
         .lines()
@@ -1149,8 +1148,7 @@ fn object_journal_marker_build_uses_one_gate() {
         "the marker build must share one predicate"
     );
     assert!(
-        predicates[0].contains("BpfFlavor::Detailed")
-            && predicates[0].contains("!bank_proof"),
+        predicates[0].contains("BpfFlavor::Detailed") && predicates[0].contains("!bank_proof"),
         "the shared gate must select Detailed non-bank builds: {}",
         predicates[0]
     );

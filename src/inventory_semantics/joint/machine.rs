@@ -331,6 +331,9 @@ struct Collected {
     attempted: usize,
     poll: DispatchPoll,
     reports: Option<CollectedReports>,
+    /// A Requested demand already took its one fresh pull past a stale
+    /// no-backlog poll, so the quiet case still binds after one pull.
+    request_pulled: bool,
 }
 
 enum PendingQResolution {
@@ -1895,6 +1898,7 @@ impl LiveJointMachine {
                             attempted: poll.attempted,
                             poll,
                             reports: None,
+                            request_pulled: false,
                         }),
                         Err(SemanticRefusal::Unavailable),
                     );
@@ -1906,6 +1910,7 @@ impl LiveJointMachine {
                         attempted: poll.attempted,
                         poll,
                         reports: None,
+                        request_pulled: false,
                     }),
                     Ok(Step::Continue),
                 )
@@ -1933,8 +1938,21 @@ impl LiveJointMachine {
                         && !requested
                         && original.attempted < RAW_CAPACITY;
                     if !unrequested_empty && !needs_first_end {
-                        budget.spend(1);
-                        return (Phase::Binding(original), Ok(Step::Continue));
+                        // A Requested Running demand must not bind on a
+                        // stale no-backlog poll: rows may have landed
+                        // since idle services last pulled. Take one fresh
+                        // pull past the request; the flag keeps the quiet
+                        // case to a single wasted pull per transaction.
+                        if q.is_none()
+                            && matches!(self.demand, Some(Demand::Requested { .. }))
+                            && original.attempted == 0
+                            && !original.request_pulled
+                        {
+                            original.request_pulled = true;
+                        } else {
+                            budget.spend(1);
+                            return (Phase::Binding(original), Ok(Step::Continue));
+                        }
                     }
                 }
                 let work = budget

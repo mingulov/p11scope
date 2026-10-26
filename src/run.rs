@@ -4973,6 +4973,7 @@ fn capture_profile(
                 session.dynamic_per_offset_attached(),
                 session.static_multi_attached(),
                 session.attach_backend_evidence(),
+                session.object_capture_evidence(),
                 session.attach_failures(),
                 reports,
                 kernel_evidence,
@@ -5491,6 +5492,7 @@ fn capture_profile(
             context.1.dynamic_per_offset_attached(),
             context.1.static_multi_attached(),
             context.1.attach_backend_evidence(),
+            context.1.object_capture_evidence(),
             context.1.attach_failures(),
             reports,
             kernel_evidence,
@@ -6331,6 +6333,7 @@ fn capture_trace(
                         context.1.dynamic_per_offset_attached(),
                         context.1.static_multi_attached(),
                         context.1.attach_backend_evidence(),
+                        context.1.object_capture_evidence(),
                         context.1.attach_failures(),
                         &reports,
                         terminal_kernel,
@@ -7773,10 +7776,10 @@ fn report_trace_loss<W: Write>(
 }
 
 /// Evidence built from the plan (skips, aliases, surface/vendor gaps), the
-/// session (attach failures), the current reports (in-flight count), and
-/// (profile mode only — always 0 in metrics mode) the ring-buffer/semantic
-/// gap counters. Calls `.verdict()` itself before returning, so callers
-/// must not call it again.
+/// session (attach failures, object-capture status), the current reports
+/// (in-flight count), and (profile mode only — always 0 in metrics mode)
+/// the ring-buffer/semantic gap counters. Calls `.verdict()` itself before
+/// returning, so callers must not call it again.
 #[allow(clippy::too_many_arguments)]
 fn evidence_for(
     engine: &Engine,
@@ -7785,6 +7788,7 @@ fn evidence_for(
     dynamic_per_offset_attached: bool,
     static_multi_attached: bool,
     attach_backend: render::AttachBackendEvidence,
+    object_capture: render::ObjectCaptureEvidence,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
@@ -7925,7 +7929,7 @@ fn evidence_for(
             Vec::new()
         },
         attach_backend,
-        object_capture: crate::attach::Session::object_capture_evidence(),
+        object_capture,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
         // Design §5.7: a live-learned attach key is protected only inside a
@@ -7969,6 +7973,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         false,
         false,
         Default::default(),
+        render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
         &[],
         &[],
         metrics::KernelEvidence::default(),
@@ -8794,6 +8799,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &failures,
             &[],
             metrics::KernelEvidence::default(),
@@ -14341,6 +14347,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -16360,6 +16367,7 @@ mod tests {
                 false,
                 false,
                 Default::default(),
+                render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
                 &[],
                 &[],
                 metrics::KernelEvidence::default(),
@@ -16457,6 +16465,9 @@ mod tests {
                     false,
                     false,
                     Default::default(),
+                    render::ObjectCaptureEvidence::for_build(cfg!(
+                        feature = "stub-object-attributes"
+                    )),
                     &[],
                     &[],
                     metrics::KernelEvidence::default(),
@@ -16529,6 +16540,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -16582,6 +16594,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -17053,7 +17066,7 @@ mod tests {
         contract(source).unwrap();
         let mutant = source.replacen(
             "object_capture,",
-            "object_capture: crate::attach::Session::object_capture_evidence(),",
+            "object_capture: render::ObjectCaptureEvidence::for_build(crate::attach::embedded_flavor().map(|flavor| flavor.stubbed).unwrap_or(false)),",
             1,
         );
         assert_ne!(mutant, source, "the mutant reverts the builder");

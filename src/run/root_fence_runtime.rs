@@ -216,6 +216,7 @@ fn document(
         session.dynamic_per_offset_attached(),
         session.static_multi_attached(),
         session.attach_backend_evidence(),
+        session.object_capture_evidence(),
         session.attach_failures(),
         &reports,
         kernel,

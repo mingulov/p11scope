@@ -3319,6 +3319,15 @@ pub(crate) mod tests {
             !source.contains("Session::object_capture_evidence()"),
             "output evidence never re-reads the global cache"
         );
+        let fence = include_str!("run/root_fence_runtime.rs");
+        assert!(
+            fence.contains("session.object_capture_evidence()"),
+            "evidence_for must wire the session status"
+        );
+        assert!(
+            !fence.contains("Session::object_capture_evidence()"),
+            "output evidence never re-reads the global cache"
+        );
     }
 
     #[test]

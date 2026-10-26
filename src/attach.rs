@@ -1323,6 +1323,10 @@ pub struct Session {
     successful_static: BTreeSet<StaticEndpoint>,
     dynamic_attach_evidence: DynamicAttachEvidence,
     policy: CapturePolicy,
+    /// The embedded flavor this session was set up with, checked at the
+    /// gate before anything loaded. Grouping and output evidence read
+    /// this, never a re-read of the global cache.
+    embedded_flavor: EmbeddedFlavor,
     /// Load-time backend: static endpoint twins load with attach type 48
     /// under multi, so the attach path must match the load decision.
     backend: AttachBackend,
@@ -4785,15 +4789,6 @@ pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<Embed
     Ok(probed)
 }
 
-/// Probed unsafe presence for attach grouping. Preparation already refused
-/// on mismatch or undeterminable bytes, so the fallback never runs on a
-/// live path; absent is the safe direction (safe entry programs).
-fn probed_unsafe_for_grouping() -> bool {
-    embedded_flavor()
-        .map(|flavor| flavor.unsafe_present)
-        .unwrap_or(false)
-}
-
 /// The cached probed flavor, refused unless it matches the build features.
 /// Missing, ambiguous or half-wired evidence refuses here, before any
 /// attach or load.
@@ -6018,6 +6013,7 @@ impl Session {
                 successful_static: BTreeSet::new(),
                 dynamic_attach_evidence: DynamicAttachEvidence::default(),
                 policy,
+                embedded_flavor: flavor,
                 backend,
                 selection: BackendSelection::Auto,
                 backend_fallback: None,
@@ -6820,7 +6816,7 @@ impl Session {
             attach_targets_observed_with_roots(
                 targets,
                 self.policy,
-                probed_unsafe_for_grouping(),
+                self.embedded_flavor.unsafe_present,
                 roots,
                 |slot| {
                     Ok(attach_targets
@@ -6977,7 +6973,7 @@ impl Session {
         let groups = group_static_slots_with_roots(
             targets,
             self.policy,
-            probed_unsafe_for_grouping(),
+            self.embedded_flavor.unsafe_present,
             attach_targets,
             roots,
         )?;
@@ -7549,7 +7545,7 @@ impl Session {
         let groups = group_static_slots(
             &regrouped,
             self.policy,
-            probed_unsafe_for_grouping(),
+            self.embedded_flavor.unsafe_present,
             &targets,
         );
         let rebuilt_groups = affected_group_count(&self.links, affected);
@@ -8651,20 +8647,14 @@ impl Session {
         self.backend_fallback.as_deref()
     }
 
-    /// Object-attribute capture availability in the embedded bytes: byte
-    /// scope, so every session of this binary reports the same status.
-    /// Stubbed (P0) bytes disclaim attribute coverage; FULL bytes report
-    /// available. The consistency test pins this against the probed
-    /// embedded bytes in every flavor.
-    pub(crate) fn object_capture_evidence() -> crate::render::ObjectCaptureEvidence {
+    /// Object-attribute capture availability in the embedded bytes this
+    /// session was set up with. Stubbed (P0) bytes disclaim attribute
+    /// coverage; FULL bytes report available. Setup already refused on
+    /// mismatch or undeterminable bytes, so this never falls back.
+    pub(crate) fn object_capture_evidence(&self) -> crate::render::ObjectCaptureEvidence {
         // The bytes rule: report the embedded object's capture, not the
-        // build feature. Setup already refused on mismatch or
-        // undeterminable bytes, so the fallback never reaches output;
-        // FULL (available) is the disclose-not-hide direction.
-        let stubbed = embedded_flavor()
-            .map(|flavor| flavor.stubbed)
-            .unwrap_or(false);
-        crate::render::ObjectCaptureEvidence::for_build(stubbed)
+        // build feature, from the flavor checked at setup.
+        crate::render::ObjectCaptureEvidence::for_build(self.embedded_flavor.stubbed)
     }
 
     /// Under PID scope, what keeps other processes out of the static
@@ -15611,13 +15601,16 @@ mod tests {
         }
     }
 
-    /// Forced-refusal / no-spurious-degrade control: the session's
-    /// object-capture status agrees with the embedded bytes' probed
-    /// flavor, in every build. A stubbed build that claimed available —
-    /// or a FULL build that claimed unavailable — fails here.
+    /// Forced-refusal / no-spurious-degrade control: the status a session
+    /// reports over its setup-checked flavor agrees with the embedded
+    /// bytes' probed flavor, in every build. (The wiring pin beside this
+    /// proves the method reads the stored flavor.) A stubbed build that
+    /// claimed available — or a FULL build that claimed unavailable —
+    /// fails here.
     #[test]
     fn session_object_capture_status_matches_bytes() {
-        let status = super::Session::object_capture_evidence();
+        let checked = super::checked_embedded_flavor().expect("bytes agree with the build");
+        let status = crate::render::ObjectCaptureEvidence::for_build(checked.stubbed);
         assert_eq!(status.available, !super::embedded_object_is_stubbed());
         if status.available {
             assert_eq!(status.reason, None);

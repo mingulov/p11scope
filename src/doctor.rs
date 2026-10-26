@@ -2349,8 +2349,10 @@ mod tests {
     fn object_capture_check_matches_build() {
         let check = object_capture_check();
         assert_eq!(check.name, "object-attribute capture");
-        let status = crate::attach::Session::object_capture_evidence();
-        match status.available {
+        // The session reports the bytes it was set up with; the row must
+        // agree with those same bytes.
+        let available = !crate::attach::embedded_object_is_stubbed();
+        match available {
             true => assert!(matches!(check.status, Status::Ok(_)), "{check:?}"),
             false => {
                 assert!(matches!(check.status, Status::Warn(_)), "{check:?}");

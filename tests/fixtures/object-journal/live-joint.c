@@ -14,14 +14,18 @@
  *                   script, print CALLS + DONE.
  *   MODE exec     exec producer: gen 0 maps the provider, READY, waits
  *                   --go, runs the mini probe (GEN0DONE, never CALLS: its
- *                   image is retired at conversion, so it sheds), prints
- *                   EXEC and execs itself with --gen 1; gen 1 maps again
- *                   (fresh image), READY, waits --trig, runs the mini
- *                   probe (TRIGDONE, tallied: its current image stages),
- *                   waits --late, runs the b script, DONE. The two probes
- *                   are observed pre/post-exec calls, so the native binder
- *                   sees the ended image and its later image in one domain
- *                   and mints the exec successor.
+ *                   image is retired at conversion, so it sheds), waits
+ *                   --execgate, prints EXEC and execs itself with --gen 1;
+ *                   the gate lets the observer read and settle gen 0's
+ *                   rows (bind its image) before the EXEC record drains,
+ *                   since rows first read after the exec cannot bind the
+ *                   pre-exec incarnation. Gen 1 maps again (fresh image),
+ *                   READY, waits --trig, runs the mini probe (TRIGDONE,
+ *                   tallied: its current image stages), waits --late,
+ *                   runs the b script, DONE. The two probes are observed
+ *                   pre/post-exec calls, so the native binder sees the
+ *                   ended image and its later image in one domain and
+ *                   mints the exec successor.
  *   MODE absent   absence subject: maps --module only, runs Initialize +
  *                   one GetSlotList + Finalize (so it is admitted), never
  *                   maps the subset's other provider, DONE. The observer
@@ -38,6 +42,8 @@
  *   --late FILE    second gate (exec gen 1). Required by that mode.
  *   --trig FILE    first gate (exec gen 1): the trigger probe proving the
  *                   later image runs once it opens. Required by that mode.
+ *   --execgate F   second gate (exec gen 0): the EXEC + exec(2) run once
+ *                   it opens. Required by that mode.
  *   --release FIFO (a) the release FIFO the held call blocks on. Required.
  *                   One FIFO per held process (each opens its own).
  *   --iters N      (b/exec) digest iterations (default 2).
@@ -455,6 +461,7 @@ static void read_self_exe(void)
 int main(int argc, char **argv)
 {
     const char *mode, *module = NULL, *go = "-", *late = NULL, *trig = NULL, *release = NULL;
+    const char *execgate = NULL;
     int iters = 2, hold = 0, i;
     void *dl;
     void **f;
@@ -479,6 +486,9 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--trig") && v) {
             trig = v;
+            i++;
+        } else if (!strcmp(a, "--execgate") && v) {
+            execgate = v;
             i++;
         } else if (!strcmp(a, "--release") && v) {
             release = v;
@@ -575,10 +585,16 @@ int main(int argc, char **argv)
         if (gen == 0) {
             /* Pre-exec image: bind its native image with the mini probe
              * (observed calls), then EXEC. Without an observed pre-exec
-             * call the binder could never prove the image ended. */
+             * call the binder could never prove the image ended. The
+             * probe rows must be read and settled before the EXEC record
+             * drains, so the exec waits for its own gate. */
             char gen_arg[32];
             char *child_argv[64];
             int n = 0, k;
+            if (!execgate) {
+                fprintf(stderr, "mode exec gen 0 needs --execgate\n");
+                return 2;
+            }
             dl = map_provider(module);
             (void)dl;
             printf("READY cell=%s pid=%d exe=%s\n", cell, getpid(), self_exe);
@@ -587,6 +603,7 @@ int main(int argc, char **argv)
             f = function_table(dl);
             if (run_mini_probe(f, "GEN0DONE", 0))
                 die("gen 0 probe failed");
+            wait_for_file(execgate, "exec gate never opened");
             printf("EXEC cell=%s pid=%d gen=0 next=1\n", cell, getpid());
             fflush(stdout);
             snprintf(gen_arg, sizeof(gen_arg), "%d", 1);

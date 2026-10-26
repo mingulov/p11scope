@@ -5311,6 +5311,8 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     let go_e_arg = go_e.to_str().context("go-e path")?.to_string();
     let trig_e = workload.path("trig-e");
     let trig_e_arg = trig_e.to_str().context("trig-e path")?.to_string();
+    let exec_e = workload.path("exec-e");
+    let exec_e_arg = exec_e.to_str().context("exec-e path")?.to_string();
     let go_s = workload.path("go-s");
     let go_s_arg = go_s.to_str().context("go-s path")?.to_string();
     let late_e = workload.path("late-e");
@@ -5333,6 +5335,8 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             &go_e_arg,
             "--trig",
             &trig_e_arg,
+            "--execgate",
+            &exec_e_arg,
             "--late",
             &late_e_arg,
             "--iters",
@@ -5407,19 +5411,27 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // coordinator when the drive ends, so a second drive's passes would
     // refuse while its counter never advances. The binder mints the
     // successor only when a single domain sees gen 0's bound image, the
-    // EXEC record and gen 1's later-image row. go_e opens once mapping
-    // has had its passes (witness rows bind against admitted callers);
-    // trig_e opens once gen 1 readies (its probe proves the later
-    // image). Passes take seconds next to the fixture's milliseconds,
-    // so the schedule has wide margins; the post-drive ensures check
-    // the mapping, the mint and the successor's mapped edge.
+    // EXEC record and gen 1's later-image row, in that order: rows first
+    // read after the EXEC record drains refuse against the pre-exec
+    // incarnation, so gen 0's probe must be read and settled before the
+    // exec. go_e opens once pass 1 has admitted E; the exec gate opens
+    // at pass 8, several passes after gen 0's rows bind; trig_e opens
+    // once gen 1 readies (its probe proves the later image). Passes take
+    // seconds next to the fixture's milliseconds, so the schedule has
+    // wide margins; the post-drive ensures check the mapping, the mint
+    // and the successor's mapped edge.
     let e_out = process_e.out.clone();
     let mut go_written = false;
+    let mut exec_written = false;
     let mut trig_written = false;
     drive_native_passes_until(&mut coordinator, &mut |passes| {
-        if !go_written && passes >= 5 {
+        if !go_written && passes >= 2 {
             std::fs::write(&go_e, b"")?;
             go_written = true;
+        }
+        if !exec_written && passes >= 8 {
+            std::fs::write(&exec_e, b"")?;
+            exec_written = true;
         }
         let text = std::fs::read_to_string(&e_out).unwrap_or_default();
         let readys = text
@@ -5434,11 +5446,12 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         let gen0 = text.lines().any(|line| line.starts_with("GEN0DONE "));
         let trig_done = text.lines().any(|line| line.starts_with("TRIGDONE "));
         eprintln!(
-            "JOINT_R16 r16b-exec pass={passes} readys={readys} exec={} gen0={} trig={} trigdone={}",
+            "JOINT_R16 r16b-exec pass={passes} readys={readys} exec={} gen0={} trig={} trigdone={} xgate={}",
             u8::from(exec),
             u8::from(gen0),
             u8::from(trig_written),
             u8::from(trig_done),
+            u8::from(exec_written),
         );
         Ok(passes >= 16)
     })?;

@@ -11868,6 +11868,8 @@ mod tests {
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT));
     }
 
+    use super::*;
+
     #[test]
     fn verifier_budget_refusal_gets_verifier_hint_not_privilege_hint() {
         let error = unsupported_environment_context(
@@ -11899,7 +11901,6 @@ mod tests {
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
         assert!(!rendered.contains("too complex"), "{rendered}");
     }
-    use super::*;
 
     fn expected_preparation(unsafe_object: bool) -> Vec<SessionPreparation> {
         use SessionPreparation::*;

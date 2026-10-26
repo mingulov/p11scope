@@ -44709,7 +44709,7 @@ impl CollectedFinishGraphCase {
             engine.plan.module_of_slot(original_slot.index),
             Some(original_owner)
         );
-        assert_eq!(engine.plan.slots, [original_slot.clone()]);
+        assert_eq!(engine.plan.slots, std::slice::from_ref(original_slot));
         let probe = engine.allocate_view_id().unwrap();
         assert_ne!(probe, view, "the original graph owner ID is still held");
         engine.release_view_id(probe);

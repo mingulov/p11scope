@@ -5950,10 +5950,12 @@ fn privileged_d4_btrfs_clone_without_files_backend_parity() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 
-    assert!(
-        cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
-        "the required actual raw worker uses the x86-64 LP64 syscall ABI"
-    );
+    const {
+        assert!(
+            cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+            "the required actual raw worker uses the x86-64 LP64 syscall ABI"
+        );
+    }
     crate::attach::identity_iter::ensure_kernel_identity_btf()
         .expect("required kernel identity capability; refusal cannot qualify");
     let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
@@ -7180,10 +7182,12 @@ fn privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity() {
     use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    assert!(
-        cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
-        "fixture: actual zombie survivor requires x86-64 LP64"
-    );
+    const {
+        assert!(
+            cfg!(all(target_arch = "x86_64", target_pointer_width = "64")),
+            "fixture: actual zombie survivor requires x86-64 LP64"
+        );
+    }
     crate::attach::identity_iter::ensure_kernel_identity_btf()
         .expect("fixture: required kernel identity capability; refusal cannot qualify");
     let btf = aya::Btf::from_sys_fs().expect("fixture: readable host BTF");

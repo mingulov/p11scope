@@ -2009,7 +2009,7 @@ fn joint_machine_collected_finish_preserves_last_return_before_stopped() {
     );
     let at_stop = finish.at_stop.as_ref().unwrap();
     assert_eq!(at_stop.reduced, 3);
-    assert!(at_stop.revision >= revision + 1);
+    assert!(at_stop.revision > revision);
     assert_eq!(
         at_stop.h3.0,
         h3.0 + 1,

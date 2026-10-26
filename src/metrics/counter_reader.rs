@@ -4764,8 +4764,8 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, a cgroup v2 hierarchy, and authorized native Multi staging as root: Engine-driven cgroup growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_cgroup_counts_multi_lp64() {
-        let group = OwnedCounterCgroup::create()
-            .expect("cgroup v2 hierarchy for the counter cgroup cell");
+        let group =
+            OwnedCounterCgroup::create().expect("cgroup v2 hierarchy for the counter cgroup cell");
         let mut parts = engine_counter_fixture();
         group
             .move_in(parts.fixture.child.id())
@@ -4780,10 +4780,7 @@ mod tests {
                 crate::attach::BackendSelection::Multi,
             )
             .unwrap();
-        assert_eq!(
-            session.counter_budgets(0).unwrap().endpoints.published,
-            512
-        );
+        assert_eq!(session.counter_budgets(0).unwrap().endpoints.published, 512);
         // Cgroup growth stages through the same seam as PID growth.
         let full = parts.slots.clone();
         let fresh = full[512..].to_vec();
@@ -4847,11 +4844,8 @@ mod tests {
     fn counter_engine_growth_system_counts_multi_lp64() {
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
-        let mut engine = engine_over_counter_fixture_with_scope(
-            &mut parts,
-            first,
-            crate::attach::Scope::System,
-        );
+        let mut engine =
+            engine_over_counter_fixture_with_scope(&mut parts, first, crate::attach::Scope::System);
         let mut session = engine
             .start_session(
                 crate::attach::CapturePolicy::Counter(CounterMode::Counts),
@@ -4946,7 +4940,9 @@ mod tests {
             "the refusal adds exactly one PARTIAL: {over_partials:?} vs {partials:?}"
         );
         assert!(
-            over_partials.last().is_some_and(|reason| reason.contains("PlanBudgetMismatch")),
+            over_partials
+                .last()
+                .is_some_and(|reason| reason.contains("PlanBudgetMismatch")),
             "refusal carries the honest budget token: {over_partials:?}"
         );
         let budgets = session.counter_budgets(0).unwrap();
@@ -4976,10 +4972,7 @@ mod tests {
                 crate::attach::BackendSelection::Singles,
             )
             .unwrap();
-        assert_eq!(
-            session.counter_budgets(0).unwrap().endpoints.published,
-            512
-        );
+        assert_eq!(session.counter_budgets(0).unwrap().endpoints.published, 512);
         let full = parts.slots.clone();
         let fresh = full[512..].to_vec();
         let plan = crate::plan::AttachPlan::from_slots_with_policy(
@@ -5003,9 +4996,7 @@ mod tests {
         );
         let stop = std::time::Instant::now();
         let mut out = Vec::new();
-        session
-            .detach_producers_driven(|| false, &mut out)
-            .unwrap();
+        session.detach_producers_driven(|| false, &mut out).unwrap();
         let wall = stop.elapsed();
         let text = String::from_utf8(out).unwrap();
         assert!(
@@ -5034,15 +5025,10 @@ mod tests {
                 crate::attach::BackendSelection::Multi,
             )
             .unwrap();
-        assert_eq!(
-            session.counter_budgets(0).unwrap().endpoints.published,
-            512
-        );
+        assert_eq!(session.counter_budgets(0).unwrap().endpoints.published, 512);
         let stop = std::time::Instant::now();
         let mut out = Vec::new();
-        session
-            .detach_producers_driven(|| false, &mut out)
-            .unwrap();
+        session.detach_producers_driven(|| false, &mut out).unwrap();
         let wall = stop.elapsed();
         let text = String::from_utf8(out).unwrap();
         assert!(
@@ -5116,7 +5102,10 @@ mod tests {
             wall < std::time::Duration::from_secs(30),
             "abandonment is prompt, took {wall:?}"
         );
-        eprintln!("COUNTER_SINGLES_ABANDON interrupted=1 wall_ms={}", wall.as_millis());
+        eprintln!(
+            "COUNTER_SINGLES_ABANDON interrupted=1 wall_ms={}",
+            wall.as_millis()
+        );
         drop(session);
         drop(engine);
     }
@@ -5136,10 +5125,7 @@ mod tests {
                 crate::attach::BackendSelection::Multi,
             )
             .unwrap();
-        assert_eq!(
-            session.counter_budgets(0).unwrap().endpoints.published,
-            512
-        );
+        assert_eq!(session.counter_budgets(0).unwrap().endpoints.published, 512);
         let full = parts.slots.clone();
         let fresh = full[512..].to_vec();
         let plan = crate::plan::AttachPlan::from_slots_with_policy(

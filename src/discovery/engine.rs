@@ -27112,9 +27112,8 @@ impl Engine {
     /// at these CPUs, from the existing preparation sizing (never a
     /// hand-written constant).
     fn counter_start_budget(mode: CounterMode, cpus: usize) -> Result<CounterBudget> {
-        let ceiling =
-            crate::attach::counter_banks::counter_affordable_endpoints(mode, cpus)
-                .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))?;
+        let ceiling = crate::attach::counter_banks::counter_affordable_endpoints(mode, cpus)
+            .map_err(|refusal| anyhow!("counter capture refused: {refusal:?}"))?;
         let ceiling =
             u64::try_from(ceiling).map_err(|_| anyhow!("counter ceiling does not fit u64"))?;
         CounterBudget::new(ceiling).map_err(|refusal| anyhow!("{refusal}"))

@@ -364,7 +364,10 @@ fn counter_growth_bare_pins_hit_missing_loader_context_identity() {
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
         .expect("apply");
     assert_eq!(
-        (outcome.static_completions.len(), outcome.static_failures.len()),
+        (
+            outcome.static_completions.len(),
+            outcome.static_failures.len()
+        ),
         (0, 0)
     );
     assert!(!additions_allowed);

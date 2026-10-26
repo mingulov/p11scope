@@ -5313,8 +5313,7 @@ pub(crate) mod tests {
         let policy = crate::plan::AdmissionPolicy::counters(
             crate::capacity::CounterBudget::new(8192).unwrap(),
         );
-        let mut history =
-            AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut history = AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
         let mut directory = BankDirectory::counts_growth_v2();
         let mut io = GrowthIo::new(&pool);
         io.target_store = Some(&pins);
@@ -5364,8 +5363,7 @@ pub(crate) mod tests {
         let policy = crate::plan::AdmissionPolicy::counters(
             crate::capacity::CounterBudget::new(8192).unwrap(),
         );
-        let mut history =
-            AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
+        let mut history = AttachPlan::from_slots_with_policy(vec![first.clone()], policy).unwrap();
         let mut directory = BankDirectory::counts_growth_v2();
         let mut io = GrowthIo::new(&pool);
         io.target_store = Some(&pins);
@@ -5389,7 +5387,10 @@ pub(crate) mod tests {
             &pool.reserver(),
         );
         assert_eq!(publication, BankPublication::Refused(BankRefusal::Topology));
-        assert_eq!(check, Some("counter plan consumed prefix differs from the staged length"));
+        assert_eq!(
+            check,
+            Some("counter plan consumed prefix differs from the staged length")
+        );
         assert_eq!(candidate.counter_consumed_end(), 0);
         assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
         assert_eq!(io.routes.len(), 1, "no fresh route was inserted");

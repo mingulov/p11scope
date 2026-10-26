@@ -1852,5 +1852,352 @@ class CollisionEmissionTests(unittest.TestCase):
             self.assertIn("READY pid=", completed.stdout)
 
 
+def require_s1(test):
+    """Fail naming the missing S1 mode (RED) or return the oracle."""
+    oracle = require_oracle(test)
+    if not hasattr(oracle, "compare_s1"):
+        test.fail("S1 mode not implemented: oracle.compare_s1 missing")
+    return oracle
+
+
+def s1_section():
+    """The v0.5.0 S1 marker: unavailable/journal_unavailable, no rows."""
+    return {"version": 1, "revision": 7, "status": "unavailable",
+            "reason": "journal_unavailable", "sessions": [], "objects": [],
+            "key_operations": [], "unknown_key_operations": [],
+            "gaps": {"rows": [], "suppressed": 0},
+            "budgets": {
+                "key_rows": {"limit": 65536, "occupied": 0, "refused": 0},
+                "object_rows": {"limit": 65536, "occupied": 0,
+                                "refused": 0},
+                "unknown_rows": {"occupied": 0},
+                "encoded_bytes": 0, "allocation_refused": False,
+                "refusal_reason": "none"}}
+
+
+def s1_stream(status="unavailable"):
+    """Markers-only S1 stream: no H9 rows ride an unavailable section."""
+    return [
+        {"schema": "p11scope/inventory-events/v1", "seq": 0, "at_ns": 1000,
+         "kind": "pass_committed",
+         "event": {"pass": 1, "object_revision": 7,
+                   "object_status": status, "gaps_suppressed": 0}},
+        {"schema": "p11scope/inventory-events/v1", "seq": 1, "at_ns": 1100,
+         "kind": "ended", "event": {"gaps_suppressed": 0}},
+    ]
+
+
+def expected_s1(rows_a, rows_b):
+    """Independent S1 tallies: every call row counts, per (fn, rv).
+
+    Mechanisms come from each ledger's own scenario row (never the
+    oracle's summary); errors are non-OK returns at S1 granularity.
+    """
+    returns, mechanisms, calls = {}, {}, 0
+    for rows in (rows_a, rows_b):
+        mechanism = rows[1]["mechanism"]
+        group = mechanisms.setdefault(mechanism, {"calls": 0, "errors": 0})
+        for row in rows:
+            if row.get("kind") != "call":
+                continue
+            calls += 1
+            tally = returns.setdefault(row["fn"], {})
+            tally[row["rv"]] = tally.get(row["rv"], 0) + 1
+            group["calls"] += 1
+            if row["rv"] != 0:
+                group["errors"] += 1
+    return {"calls": calls, "returns": returns, "mechanisms": mechanisms}
+
+
+class S1Twins(unittest.TestCase):
+    def test_s1_healthy_pair_passes(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section(), s1_stream(), s1_stream())
+        want = expected_s1(rows_a, rows_b)
+        self.assertEqual(result["mode"], "s1")
+        self.assertEqual(result["processes"], 2)
+        self.assertEqual(result["calls"], want["calls"])
+        self.assertEqual(result["returns"], want["returns"])
+        self.assertEqual(result["mechanisms"], want["mechanisms"])
+
+    def test_s1_works_without_streams(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section())
+        self.assertEqual(result["mode"], "s1")
+        self.assertEqual(result["calls"], expected_s1(rows_a, rows_b)["calls"])
+
+    def test_s1_counts_every_call_row(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "cancel")
+        kinds = {(row["fn"], row["phase"]) for row in rows_b
+                 if row.get("kind") == "call"}
+        self.assertIn(("async_finalize", "teardown"), kinds)
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section(), s1_stream(), s1_stream())
+        want = expected_s1(rows_a, rows_b)
+        self.assertEqual(result["calls"], want["calls"])
+        self.assertEqual(result["returns"], want["returns"])
+        self.assertEqual(result["mechanisms"], want["mechanisms"])
+
+    def test_s1_populated_sections_refused(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        collision = oracle.compare_collision(
+            oracle.validate_ledger(rows_a, "ledger A"),
+            oracle.validate_ledger(rows_b, "ledger B"))
+        joint = healthy_joint(oracle, collision)
+        single = healthy_s1only(oracle, collision)
+        for label, first, second in (("joint", joint, s1_section()),
+                                    ("s1only", s1_section(), single)):
+            with self.subTest(label), self.assertRaises(oracle.LedgerError) as caught:
+                oracle.compare_s1(rows_a, rows_b, first, second)
+            self.assertIn("want unavailable/journal_unavailable",
+                          str(caught.exception))
+
+    def test_s1_reason_must_be_journal(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        for label in ("joint", "s1only"):
+            with self.subTest(label):
+                first, second = s1_section(), s1_section()
+                target = first if label == "joint" else second
+                target["reason"] = "bootstrap_unavailable"
+                with self.assertRaises(oracle.LedgerError) as caught:
+                    oracle.compare_s1(rows_a, rows_b, first, second)
+                self.assertIn("want unavailable/journal_unavailable",
+                              str(caught.exception))
+
+    def test_s1_rows_refused_everywhere(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        key_row = {"instance": "i3", "object": 11, "category": "operation",
+                   "role": "key", "metadata_at_use": "rsa_2048",
+                   "unit": "operations", "started": 1, "completed": 1,
+                   "failed": 0, "cancelled": 0, "unknown": 0, "active": 0,
+                   "key_join_lost": 0}
+        unknown_row = {"category": "operation", "reason": "unbound",
+                       "unit": "operations", "completed": 1, "failed": 0,
+                       "cancelled": 0, "unknown": 0, "active": 0}
+        session_row = {"session": 1, "origin": "opened", "status": "live"}
+        cases = (("key_operations", [key_row], "needs no key-operation rows"),
+                 ("unknown_key_operations", [unknown_row],
+                  "needs no unknown key-operation rows"),
+                 ("sessions", [session_row], "needs no session rows"),
+                 ("objects", [object_row(11, "rsa_2048")],
+                  "needs no session rows"))
+        for label in ("joint", "s1only"):
+            for field, planted, token in cases:
+                with self.subTest(label, field=field):
+                    first, second = s1_section(), s1_section()
+                    target = first if label == "joint" else second
+                    target[field] = planted
+                    with self.assertRaises(oracle.LedgerError) as caught:
+                        oracle.compare_s1(rows_a, rows_b, first, second)
+                    self.assertIn(token, str(caught.exception))
+
+    def test_s1_section_denied_gap_everywhere(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        denied = "joint machine unavailable"
+        for label in ("joint", "s1only"):
+            for field in ("subject", "reason"):
+                with self.subTest(label, field=field):
+                    first, second = s1_section(), s1_section()
+                    target = first if label == "joint" else second
+                    gap = {"subject": "model", "reason": "loss",
+                           "repeats": 1}
+                    gap[field] = denied
+                    target["gaps"]["rows"] = [gap]
+                    with self.assertRaises(oracle.LedgerError) as caught:
+                        oracle.compare_s1(rows_a, rows_b, first, second)
+                    self.assertIn("denied joint-machine text",
+                                  str(caught.exception))
+
+    def test_s1_section_benign_gap_still_refused(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        first, second = s1_section(), s1_section()
+        first["gaps"]["rows"] = [{"subject": "model", "reason": "loss",
+                                  "repeats": 2}]
+        with self.assertRaises(oracle.LedgerError) as caught:
+            oracle.compare_s1(rows_a, rows_b, first, second)
+        self.assertNotIn("denied joint-machine text", str(caught.exception))
+
+    def test_s1_section_shape_still_enforced(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        first, second = s1_section(), s1_section()
+        first["gaps"]["rows"] = [{"subject": "bogus", "reason": "loss",
+                                  "repeats": 1}]
+        with self.assertRaises(oracle.LedgerError) as caught:
+            oracle.compare_s1(rows_a, rows_b, first, second)
+        self.assertIn("subject invalid", str(caught.exception))
+
+    def test_s1_section_suppressed_refused(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        for label in ("joint", "s1only"):
+            with self.subTest(label):
+                first, second = s1_section(), s1_section()
+                target = first if label == "joint" else second
+                target["gaps"]["suppressed"] = 1
+                with self.assertRaises(oracle.LedgerError) as caught:
+                    oracle.compare_s1(rows_a, rows_b, first, second)
+                self.assertIn("hides dispositions", str(caught.exception))
+
+    def test_s1_stream_denied_gap_everywhere(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        denied = "joint machine unavailable"
+        for label in ("joint", "s1only"):
+            for field in ("subject", "reason"):
+                with self.subTest(label, field=field):
+                    gap = {"schema": "p11scope/inventory-events/v1",
+                           "seq": 1, "at_ns": 1050, "kind": "gap_recorded",
+                           "event": {"subject": "model", "reason": "loss"}}
+                    gap["event"][field] = denied
+                    joint_events = s1_stream()
+                    single_events = s1_stream()
+                    joint_events.insert(1, copy.deepcopy(gap))
+                    single_events.insert(1, copy.deepcopy(gap))
+                    for position, line in enumerate(joint_events):
+                        line["seq"] = position
+                    for position, line in enumerate(single_events):
+                        line["seq"] = position
+                    with self.assertRaises(oracle.LedgerError) as caught:
+                        oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                          s1_section(), joint_events,
+                                          single_events)
+                    self.assertIn("denied joint-machine text",
+                                  str(caught.exception))
+
+    def test_s1_stream_markers_enforced(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        with self.subTest("suppressed"):
+            events = s1_stream()
+            events[1]["event"]["gaps_suppressed"] = 1
+            with self.assertRaises(oracle.LedgerError) as caught:
+                oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                  s1_section(), events, s1_stream())
+            self.assertIn("hides dispositions", str(caught.exception))
+        with self.subTest("status"):
+            events = s1_stream()
+            events[0]["event"]["object_status"] = "populated"
+            with self.assertRaises(oracle.LedgerError) as caught:
+                oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                  s1_section(), events, s1_stream())
+            self.assertIn("disagrees with snapshot status",
+                          str(caught.exception))
+        with self.subTest("row-event"):
+            events = s1_stream()
+            row = {"category": "operation", "reason": "unbound",
+                   "unit": "operations", "completed": 1, "failed": 0,
+                   "cancelled": 0, "unknown": 0, "active": 0}
+            events.insert(1, {"schema": "p11scope/inventory-events/v1",
+                              "seq": 1, "at_ns": 1050,
+                              "kind": "key_operations_observed",
+                              "event": {"revision": 2, "bucket": "unknown",
+                                        "row": row}})
+            for position, line in enumerate(events):
+                line["seq"] = position
+            with self.assertRaises(oracle.LedgerError) as caught:
+                oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                  s1_section(), events, s1_stream())
+            self.assertIn("unclaimed row", str(caught.exception))
+
+    def test_s1_empty_ledgers_refused(self):
+        oracle = require_s1(self)
+        rows_a = build_ledger(SCEN["owner_poll"], [], pid=4242)
+        rows_b = build_ledger(SCEN["chal_message"], [], pid=4343)
+        oracle.validate_ledger(rows_a, "ledger A")
+        oracle.validate_ledger(rows_b, "ledger B")
+        with self.assertRaises(oracle.LedgerError) as caught:
+            oracle.compare_s1(rows_a, rows_b, s1_section(), s1_section())
+        self.assertIn("at least one ledger call", str(caught.exception))
+
+    def test_s1_returns_follow_ledger_mutation(self):
+        oracle = require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(oracle, "poll_msg")
+        before = expected_s1(rows_a, rows_b)
+        terminal = next(row for row in rows_a
+                        if row.get("kind") == "call"
+                        and row["phase"] == "terminal")
+        terminal["rv"] = BAD
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section())
+        want = expected_s1(rows_a, rows_b)
+        self.assertEqual(result["returns"], want["returns"])
+        self.assertEqual(result["mechanisms"], want["mechanisms"])
+        self.assertEqual(result["returns"]["async_poll"][BAD], 1)
+        self.assertEqual(result["mechanisms"]["poll"]["errors"],
+                         before["mechanisms"]["poll"]["errors"] + 1)
+        terminal["fn"] = "async_wait"
+        result = oracle.compare_s1(rows_a, rows_b, s1_section(),
+                                   s1_section())
+        want = expected_s1(rows_a, rows_b)
+        self.assertEqual(result["returns"], want["returns"])
+        self.assertIn("async_wait", result["returns"])
+
+    def test_s1_collision_still_required(self):
+        oracle = require_s1(self)
+        rows_a = build_ledger(SCEN["owner_poll"], plan_poll_owner(2),
+                              pid=4242)
+        rows_b = build_ledger(SCEN["owner_poll"], plan_poll_owner(2),
+                              pid=4343)
+        with self.assertRaises(oracle.LedgerError) as caught:
+            oracle.compare_s1(rows_a, rows_b, s1_section(), s1_section())
+        self.assertIn("processes share one label", str(caught.exception))
+
+    def test_s1_cli_healthy_and_mutation(self):
+        require_s1(self)
+        rows_a, rows_b, _, _ = validated_pair(ORACLE, "poll_msg")
+        want = expected_s1(rows_a, rows_b)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_a = Path(tmp) / "a.jsonl"
+            ledger_b = Path(tmp) / "b.jsonl"
+            snap_joint = Path(tmp) / "joint.json"
+            snap_single = Path(tmp) / "s1only.json"
+            events_joint = Path(tmp) / "joint.jsonl"
+            events_single = Path(tmp) / "s1only.jsonl"
+            write_jsonl(ledger_a, rows_a)
+            write_jsonl(ledger_b, rows_b)
+            write_json(snap_joint, s1_section())
+            write_json(snap_single, s1_section())
+            write_jsonl(events_joint, s1_stream())
+            write_jsonl(events_single, s1_stream())
+            healthy = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), "--s1", str(ledger_a),
+                 str(ledger_b), str(snap_joint), str(snap_single),
+                 str(events_joint), str(events_single)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            summary = json.loads(healthy.stdout)
+            self.assertEqual(summary["mode"], "s1")
+            self.assertEqual(summary["calls"], want["calls"])
+            self.assertEqual(
+                {name: {int(rv): count for rv, count in tally.items()}
+                 for name, tally in summary["returns"].items()},
+                want["returns"])
+            self.assertEqual(summary["mechanisms"], want["mechanisms"])
+            broken = s1_section()
+            broken["status"] = "populated"
+            broken["reason"] = "none"
+            write_json(snap_joint, broken)
+            refused = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), "--s1", str(ledger_a),
+                 str(ledger_b), str(snap_joint), str(snap_single)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(refused.returncode, 1)
+            self.assertEqual(refused.stdout, "")
+            self.assertIn("want unavailable/journal_unavailable",
+                          refused.stderr)
+            self.assertNotIn("Traceback", refused.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

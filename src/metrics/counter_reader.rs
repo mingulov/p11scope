@@ -4663,6 +4663,10 @@ mod tests {
     }
 
     const SOFT1024_CHILD: &str = "P11SCOPE_A27_SOFT1024_CHILD";
+    /// Marker the re-executed child prints after `body()` returns. The
+    /// parent requires this line plus libtest's `1 passed`, so a child
+    /// that merely exited 0 while filtered to nothing fails loudly.
+    const SOFT1024_DONE_MARKER: &str = "P11SCOPE_SOFT1024_CHILD_DONE";
 
     fn soft_nofile() -> u64 {
         let mut limit = libc::rlimit {
@@ -4700,13 +4704,41 @@ mod tests {
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     }
 
+    /// Verifies a soft-1024 child's captured stdout: the child must have
+    /// exited successfully, printed its done-marker line (proving `body()`
+    /// ran to completion), and reported exactly one passed test. A
+    /// skipped or filtered child (no marker, `0 passed`) fails.
+    fn soft1024_child_output_ok(cell: &str, status_ok: bool, stdout: &str) -> bool {
+        if !status_ok {
+            return false;
+        }
+        let expected = format!("{SOFT1024_DONE_MARKER} {cell}");
+        stdout.lines().any(|line| line == expected) && stdout.contains("1 passed")
+    }
+
+    /// Last `max` bytes of `s` on a character boundary, for bounded
+    /// failure messages over captured child output.
+    fn soft1024_tail(s: &str, max: usize) -> &str {
+        let mut start = s.len().saturating_sub(max);
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
+        &s[start..]
+    }
+
     /// Runs `body` in a forked-off test child with a bounded watchdog, so a
     /// hung stage cannot hang the campaign. The child re-executes this exact
-    /// test with `SOFT1024_CHILD` set and returns after `body`.
+    /// ignored test with `SOFT1024_CHILD` set, runs `body`, then prints its
+    /// done marker. The parent captures the child's output and requires the
+    /// marker plus `1 passed`; a skipped or filtered child fails the parent.
+    /// Child output stays small (one libtest summary plus the marker), so the
+    /// parent reads the pipes after exit; a child that ever fills a pipe
+    /// blocks into the watchdog and fails loudly instead of hanging.
     fn soft1024_cell(cell: &str, test: &str, deadline_secs: u64, body: impl FnOnce()) {
         if let Some(requested) = std::env::var_os(SOFT1024_CHILD) {
             if requested == cell {
                 body();
+                println!("{SOFT1024_DONE_MARKER} {cell}");
             }
             return;
         }
@@ -4723,15 +4755,31 @@ mod tests {
         let deadline = start + std::time::Duration::from_secs(deadline_secs);
         let mut child = Reaped(
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .args(["--exact", test, "--ignored", "--test-threads=1", "--nocapture"])
                 .env(SOFT1024_CHILD, cell)
                 .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(status.success(), "soft-1024 cell {cell} failed: {status}");
+                let mut stdout = String::new();
+                if let Some(mut pipe) = child.0.stdout.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
+                }
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.0.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+                }
+                assert!(
+                    soft1024_child_output_ok(cell, status.success(), &stdout),
+                    "soft-1024 cell {cell} failed: status={status} \
+                     stdout_tail={:?} stderr_tail={:?}",
+                    soft1024_tail(&stdout, 2000),
+                    soft1024_tail(&stderr, 2000),
+                );
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -4762,6 +4810,44 @@ mod tests {
             result.is_err(),
             "a soft-1024 child that ran zero tests must fail the parent"
         );
+    }
+
+    #[test]
+    fn soft1024_output_check_accepts_marker_and_one_passed() {
+        let stdout = "running 1 test\ntest metrics::counter_reader::tests::cell ... ok\n\
+            P11SCOPE_SOFT1024_CHILD_DONE raise\n\
+            test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.01s\n";
+        assert!(soft1024_child_output_ok("raise", true, stdout));
+    }
+
+    #[test]
+    fn soft1024_output_check_rejects_skipped_or_filtered_child() {
+        // The a2-7a root shape: exit 0, no marker, zero passed.
+        let filtered = "running 1 test\ntest metrics::counter_reader::tests::cell ... ignored\n\
+            test result: ok. 0 passed; 0 failed; 1 ignored; finished in 0.00s\n";
+        assert!(!soft1024_child_output_ok("raise", true, filtered));
+        // A failed child never passes, even with marker and count.
+        let failed = "P11SCOPE_SOFT1024_CHILD_DONE raise\ntest result: FAILED. 0 passed; 1 failed\n";
+        assert!(!soft1024_child_output_ok("raise", false, failed));
+        // Marker without the passed count, and count without the marker.
+        let uncounted = "P11SCOPE_SOFT1024_CHILD_DONE raise\n\
+            test result: ok. 0 passed; 0 failed; 1 ignored\n";
+        assert!(!soft1024_child_output_ok("raise", true, uncounted));
+        let unmarked =
+            "test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.01s\n";
+        assert!(!soft1024_child_output_ok("raise", true, unmarked));
+        // Another cell's marker does not satisfy this cell.
+        let foreign = "P11SCOPE_SOFT1024_CHILD_DONE bypass\n\
+            test result: ok. 1 passed; 0 failed; 0 ignored\n";
+        assert!(!soft1024_child_output_ok("raise", true, foreign));
+    }
+
+    #[test]
+    fn soft1024_tail_stays_bounded_on_character_boundaries() {
+        assert_eq!(soft1024_tail("abc", 2000), "abc");
+        assert_eq!(soft1024_tail("abcdef", 3), "def");
+        assert_eq!(soft1024_tail("aébc", 3), "bc");
+        assert_eq!(soft1024_tail("", 2000), "");
     }
 
     #[test]

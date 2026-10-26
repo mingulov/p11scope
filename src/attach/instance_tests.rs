@@ -2931,13 +2931,106 @@ fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
     Ok(())
 }
 
-/// Birth marker: a process outside Scope::Pid dirties its own row once no
-/// matter how often it calls, and a later exec keeps DIRTY. The in-scope
-/// target's calls never dirty. PID scope follows no children by
-/// construction, so the outsider stays out for the whole cell.
+/// Birth marker under Scope::Cgroup: an outsider that never enters the
+/// private cgroup dirties its own absent row once no matter how often it
+/// calls, and a later out-of-scope exec keeps DIRTY. The outsider is
+/// spawned before attach, so it has no Stage A row: this is the only live
+/// cell for the gap's reserve-then-create path, and it fails if that path
+/// stops creating (no row), stops charging once (spent moves), or faults.
+/// The in-scope twin joins clean. The private cgroup is removed at the end.
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
-fn privileged_journal_marker_out_of_scope_call_dirties_once() -> Result<()> {
+fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<()> {
+    let PairSetup {
+        _directory,
+        provider,
+        mut inner,
+        mut outer,
+    } = spawn_pair_targets()?;
+    let pid = inner.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("outsider")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    ensure!(
+        current_cgroup(outer.pid())? == home,
+        "the outsider must never enter the private cgroup"
+    );
+    // Twin: the in-scope target joins, spending nothing and dirtying nothing.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    // Two out-of-scope calls on the absent row: one DIRTY, one admission.
+    outer.command(b'c')?;
+    outer.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "out-of-scope calls must dirty the outsider row: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "two calls, one admission: {control:?}"
+    );
+    // A later out-of-scope exec by the same leader keeps DIRTY and spends
+    // nothing: it never reaches the birth path.
+    let ready = outer.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness, &outer)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an out-of-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a DIRTY exec spends nothing: {control:?}"
+    );
+    // The in-scope target still joins with a clean row.
+    inner.command(b'c')?;
+    single_join(&pump_until(&mut harness, &inner, 1)?)?;
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
+        "in-scope calls never dirty"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_CGROUP_OUTSIDER minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
+/// Birth marker under Scope::Pid: an outsider sibling is never observed,
+/// so it has no row, spends nothing and routes no call. Perf links bind to
+/// the target and the kernel pid filter drops the rest, on every backend;
+/// no outsider call ever reaches BPF. The in-scope target joins clean.
+/// (No vfork child runs here, so the CLONE_VM-sharer exception is out of
+/// scope for this cell.)
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
     let PairSetup {
         _directory,
         provider,
@@ -2958,34 +3051,22 @@ fn privileged_journal_marker_out_of_scope_call_dirties_once() -> Result<()> {
         marker_word_of(&proc_record_of(&harness, &inner)?) == 0,
         "in-scope calls never dirty"
     );
-    // Two out-of-scope calls: one DIRTY, one admission.
+    // Two outsider calls: no row, no admission, no routed call.
     outer.command(b'c')?;
     outer.command(b'c')?;
-    let dirtied = proc_record_of(&harness, &outer)?;
+    let absent = proc_record_of(&harness, &outer)?;
     ensure!(
-        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
-        "out-of-scope calls must dirty the outsider row: {}",
-        marker_summary(&dirtied)
+        marker_word_of(&absent) == 0,
+        "an unobserved outsider must have no row: {}",
+        marker_summary(&absent)
     );
     let control = admission_of(&harness)?;
     ensure!(
-        control.spent == 1 && control.failed == 0,
-        "two calls, one admission: {control:?}"
+        control.spent == 0 && control.failed == 0,
+        "unobserved calls spend nothing: {control:?}"
     );
-    // A later exec by the same leader keeps DIRTY and spends nothing.
-    let ready = outer.command(b'e')?;
-    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
-    let kept = proc_record_of(&harness, &outer)?;
-    ensure!(
-        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
-        "an exec must not clear DIRTY: {}",
-        marker_summary(&kept)
-    );
-    let control = admission_of(&harness)?;
-    ensure!(
-        control.spent == 1 && control.failed == 0,
-        "a DIRTY exec spends nothing: {control:?}"
-    );
+    let stray = pump_rounds(&mut harness, &inner, 10)?;
+    ensure!(stray.is_empty(), "the outsider must route no call");
     // The in-scope target still joins with a clean row.
     inner.command(b'c')?;
     single_join(&pump_until(&mut harness, &inner, 1)?)?;
@@ -2995,7 +3076,7 @@ fn privileged_journal_marker_out_of_scope_call_dirties_once() -> Result<()> {
     );
     let counters = harness.session.instance_maps().counters()?;
     eprintln!(
-        "MARKER_OUT_OF_SCOPE minted={minted} control={control:?} \
+        "MARKER_PID_OUTSIDER minted={minted} control={control:?} \
          counters={counters:?} scans={:?}",
         harness.scan
     );

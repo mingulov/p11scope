@@ -49814,9 +49814,7 @@ fn collected_graph_charge_covers_requested_heap() {
     // The drive waits on the async worker close instead of racing it
     // with a fixed count; every assertion below is unchanged.
     let (_, heap) = crate::test_alloc::requested_peak_during(|| {
-        drive_graph_until(&mut engine, &mut session, |_, _, outcome| {
-            !outcome.pending
-        });
+        drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     });
     assert!(engine.pending_retirements.is_empty());
     assert_eq!(engine.collected_graphs_created, 1);

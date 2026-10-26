@@ -4020,6 +4020,73 @@ fn a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it()
     );
 }
 
+/// run-short: the quiesce batch after a short-lived `run` child exits.
+/// The named target's expected removal settled (exit proven, arm set)
+/// while its attached loader context was still draining, so the latch
+/// has not run. The empty view set is the expected end, not a vanished
+/// generation: the batch succeeds, and the latch completes once the
+/// loader context drains.
+#[test]
+fn armed_expected_exit_without_views_is_not_a_lost_generation() {
+    let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    // Settle the ExpectedRemoval the way process_discovery_records does:
+    // the view is gone and its intent consumed, the arm records the
+    // proven exit — but the loader ids are still draining.
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.expected_target_exit_pending = Some(view);
+    assert!(!engine.expected_target_exit());
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the latch must still be blocked for this repro"
+    );
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a settled named exit is the expected end, not a lost generation");
+    assert!(
+        !engine.expected_target_exit(),
+        "the latch still waits on the loader ids"
+    );
+    engine
+        .loader_registry
+        .remove(context)
+        .expect("draining the loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the draining batch succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the latch completes once drainage finishes"
+    );
+    assert!(engine.views.is_empty());
+}
+
+/// Twin: without the arm, empty views stay a loud failure — the yield
+/// above covers only a settled expected removal, never a disappearance
+/// nothing explains.
+#[test]
+fn unarmed_empty_views_still_fail_as_no_longer_retained() {
+    let (mut engine, _context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    assert!(engine.expected_target_exit_pending.is_none());
+    let mut session = ScriptedSession::default();
+    let error = engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect_err("unexplained empty views must still bail");
+    assert!(
+        format!("{error:#}").contains("the named process generation is no longer retained"),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[test]
 fn expected_exit_requires_a_definitive_original_pin_result() {
     assert!(!retirement_ready_with(RetirementCause::ExpectedRemoval, || Ok(false)).unwrap());

@@ -2875,6 +2875,100 @@ fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<
     Ok(())
 }
 
+/// Birth marker DIRTY-first twin under Scope::Cgroup: after an exec, a
+/// cgroup gap, and re-entry, a non-leader exec gives the fresh leader its
+/// own READY row with a second admission. The old leader's task_struct,
+/// and its DIRTY row, is discarded; in effect the process recovers by
+/// re-execing from a thread. Reads the row after the exec, never events.
+/// The private cgroup is removed at the end.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let home = current_cgroup(pid)?;
+    let group = MarkerCgroup::create("dirty-exec")?;
+    group.move_in(pid)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_cgroup(&plan, &scope, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let old = ready_exec_of(&row, "the in-scope exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    // One call outside the cgroup dirties without charging: the row is READY.
+    move_process_to(pid, &home)?;
+    target.command(b'c')?;
+    let dirtied = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    // Back inside: a call still joins (S1 continues) and keeps DIRTY.
+    group.move_in(pid)?;
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let reentered = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&reentered) == journal_marker::MARKER_DIRTY,
+        "re-entry must not clear DIRTY: {}",
+        marker_summary(&reentered)
+    );
+    // The non-leader exec under test: a fresh READY row, one more admission.
+    let ready = target.command(b'E')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 2 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after nonleader exec: {ready}"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the fresh leader")?;
+    ensure!(
+        exec != old,
+        "the fresh row must name a new exec: {exec} == {old}"
+    );
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "the fresh row must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 2 && control.failed == 0,
+        "two admissions, one per leader: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_DIRTY_NONLEADER_EXEC old={old} exec={exec} minted={minted} \
+         control={control:?} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    // Teardown before rmdir: the retired session must not hold the cgroup.
+    drop(harness);
+    move_process_to(pid, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
+    Ok(())
+}
+
 /// Birth marker: a fork without exec publishes nothing. The reaped child
 /// keeps no row (task storage dies with the task), every marker write
 /// charges first, and the parent's row is untouched.

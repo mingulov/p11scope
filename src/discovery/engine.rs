@@ -8829,7 +8829,10 @@ fn candidate_admission(
 /// Finite counter staging refusal text: the publication plus the failing
 /// check when the refusal named one. Bare variants keep their exact
 /// historical text when no check was recorded.
-fn counter_staging_refusal_text(publication: &BankPublication, check: Option<&str>) -> String {
+pub(crate) fn counter_staging_refusal_text(
+    publication: &BankPublication,
+    check: Option<&str>,
+) -> String {
     match check {
         Some(check) => format!("counter bank staging refused: {publication:?} ({check})"),
         None => format!("counter bank staging refused: {publication:?}"),

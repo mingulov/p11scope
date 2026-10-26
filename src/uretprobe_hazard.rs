@@ -47,6 +47,12 @@ pub(crate) enum KernelVerdict {
     /// capture would be refused the same way at attach, so it is reported as
     /// what it is, and the uretprobe override cannot help.
     NotPermitted(String),
+    /// The embedded BPF object does not match this build (a stale or
+    /// mismatched object): the probe refused its own load, so the kernel
+    /// was never assessed — and no capture lane can work until the
+    /// observer is rebuilt. Never an unknown kernel, and never something
+    /// the override can accept.
+    FlavorMismatch(String),
 }
 
 /// The target's seccomp mode, as `/proc/<pid>/status` reports it.
@@ -79,6 +85,10 @@ pub(crate) enum Action {
     /// The self-probe was not permitted to load BPF: whatever the override
     /// says, nothing can attach. Carries the kernel's refusal.
     NotPermitted(String),
+    /// The embedded object does not match this build: nothing can attach
+    /// until the observer is rebuilt, whatever the override says. Carries
+    /// the gate's plain mismatch message.
+    FlavorMismatch(String),
 }
 
 /// The whole policy, in one pure function so it is testable without a kernel.
@@ -93,6 +103,11 @@ pub(crate) fn decide(
     overridden: bool,
 ) -> Action {
     let reason = match (kernel, target) {
+        // Not a verdict about the kernel at all: the embedded object does
+        // not match this build, so no capture lane can work whatever the
+        // target confines — and the override (which only accepts a hazard)
+        // must not be offered or taken.
+        (KernelVerdict::FlavorMismatch(why), _) => return Action::FlavorMismatch(why.clone()),
         // Nothing to fear: the kernel exempts the trampoline.
         (KernelVerdict::Clean, _) => return Action::Proceed,
         // The target cannot refuse a syscall, so the trampoline cannot kill it.
@@ -243,6 +258,12 @@ fn evaluate_mode(
 /// The probe then needs nothing from the attach path, runs before a session
 /// exists, and cannot leave a link or a stray event behind in one.
 pub(crate) fn probe_kernel() -> KernelVerdict {
+    // The flavor gate first, as its own verdict: a stale or mismatched
+    // embedded object is a broken observer build, not an unknown kernel.
+    // The load is still refused; only the report changes.
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return KernelVerdict::FlavorMismatch(format!("{error:#}"));
+    }
     match probe_kernel_inner() {
         Ok(verdict) => verdict,
         Err(error) => classify_probe_error(&error),
@@ -754,12 +775,14 @@ fn describe_owned_child_death_with(
                 ". This kernel exempts the uretprobe trampoline from seccomp, so p11scope's \
                  uretprobes are not the cause",
             ),
-            KernelVerdict::Unknown(why) | KernelVerdict::NotPermitted(why) => {
-                message.push_str(&format!(
-                    ". Whether this kernel filters the uretprobe trampoline could not be \
+            // A broken build never assessed the kernel either (unreachable: a
+            // mismatch attaches nothing, so this arm only keeps the match total).
+            KernelVerdict::Unknown(why)
+            | KernelVerdict::NotPermitted(why)
+            | KernelVerdict::FlavorMismatch(why) => message.push_str(&format!(
+                ". Whether this kernel filters the uretprobe trampoline could not be \
                      established ({why}), so p11scope's uretprobes cannot be ruled out"
-                ))
-            }
+            )),
         }
     }
     Some(message)
@@ -974,6 +997,32 @@ mod tests {
                 assert!(
                     !message.contains("stale or mismatched"),
                     "agreeing flavors must pass the gate: {message}"
+                );
+            }
+        }
+    }
+
+    /// A flavor mismatch refuses whatever the target confines and whatever
+    /// the override says: the build is broken, so there is no hazard to
+    /// accept. (The preflight twin failed first on the same behavior; this
+    /// pins the policy matrix directly.)
+    #[test]
+    fn a_flavor_mismatch_refuses_whatever_the_target_or_override() {
+        let mismatch =
+            KernelVerdict::FlavorMismatch("embedded BPF object flavor mismatch: test".to_string());
+        for target in [
+            Some(SeccompMode::Disabled),
+            Some(SeccompMode::Strict),
+            Some(SeccompMode::Filter),
+            None,
+        ] {
+            for overridden in [false, true] {
+                assert!(
+                    matches!(
+                        decide(&mismatch, target, overridden),
+                        Action::FlavorMismatch(_)
+                    ),
+                    "{target:?} overridden={overridden}"
                 );
             }
         }

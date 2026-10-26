@@ -3318,6 +3318,8 @@ fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<O
                 uretprobe_hazard::PrivilegeFacts::current()
             )))
         }
+        // A broken observer build is not a hazard; the override is not offered.
+        uretprobe_hazard::Action::FlavorMismatch(why) => Err(anyhow!("{why}")),
     }
 }
 

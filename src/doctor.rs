@@ -797,6 +797,9 @@ fn uretprobe_seccomp_check() -> Check {
                 crate::uretprobe_hazard::PrivilegeFacts::current(),
             )
         )),
+        // A broken observer build was never assessed: fail with the plain
+        // gate message, not an unknown-kernel warning.
+        crate::uretprobe_hazard::KernelVerdict::FlavorMismatch(why) => Status::Fail(why),
     };
     Check {
         name: "uretprobe vs seccomp".to_string(),

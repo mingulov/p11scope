@@ -3307,6 +3307,56 @@ impl BankIo for NativeIo<'_> {
     }
 }
 
+/// Named refusal for a counter program the kernel verifier rejects
+/// as too complex: shared by the start-path mapping and the doctor
+/// load preflight so both name one token.
+const COUNTER_VERIFIER_BUDGET_REFUSAL: &str = "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)";
+
+/// Finite refusal for a counter-object preflight load failure: only a
+/// real E2BIG becomes the old-kernel token; any other failure names
+/// its errno class (or a static fallback when no errno is present) so
+/// callers treat it as unproven instead of refused. The loader error
+/// itself is never rendered: its Display can carry the verifier log.
+fn counter_load_refusal(error: &anyhow::Error) -> String {
+    let mut io_error = None;
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_error = Some(io);
+            if super::is_verifier_budget_errno(io.raw_os_error()) {
+                return COUNTER_VERIFIER_BUDGET_REFUSAL.to_string();
+            }
+        }
+    }
+    match io_error {
+        Some(io) => format!("counter object load failed ({io})"),
+        None => "counter object load failed before the verifier ran".to_string(),
+    }
+}
+
+/// Doctor load preflight for one counter object: loads the embedded
+/// object with the production loader and releases it without
+/// attaching anything, so the doctor counter line reports the kernel
+/// verifier's real verdict. Omitted builds refuse at the build gate
+/// before any load.
+pub(crate) fn counter_object_preflight(mode: CounterMode) -> Result<(), String> {
+    check_counter_build(
+        env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+        env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+    )?;
+    let host = super::host_btf::shared()
+        .map_err(|error| format!("counter object load failed ({error})"))?;
+    let scope = Scope::Pid(std::process::id());
+    super::load_capture_object_bytes_with_images(
+        host.btf(),
+        crate::run::resolve_ring_bytes(None),
+        super::discovery_ring_bytes(&scope),
+        CapturePolicy::Counter(mode).wants_instance_hooks(),
+        counter_object_for_mode(mode),
+    )
+    .map(|_| ())
+    .map_err(|error| counter_load_refusal(&anyhow::Error::new(error)))
+}
+
 /// Whether the error chain already carries a named `counter-mode-*`
 /// refusal (the old-kernel token, the build token, or a mapped
 /// verifier-budget refusal). Any chain link counts: intermediate
@@ -3346,9 +3396,7 @@ fn map_counter_verifier_budget_refusal(error: anyhow::Error) -> anyhow::Error {
             .is_some_and(|io| super::is_verifier_budget_errno(io.raw_os_error()))
     });
     if budget {
-        anyhow::anyhow!(
-            "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)"
-        )
+        anyhow::anyhow!("{COUNTER_VERIFIER_BUDGET_REFUSAL}")
     } else {
         error
     }
@@ -10232,6 +10280,33 @@ pub(crate) mod tests {
         let text = format!("{started:#}");
         assert!(!text.contains("counter-mode-unavailable-on-kernel"), "{text}");
         assert!(text.contains("CAP_BPF"), "{text}");
+    }
+
+    #[test]
+    fn counter_load_refusal_names_e2big_and_bounds_other_failures() {
+        // The preflight names the same token for a real E2BIG, even
+        // wrapped under loader context; any other failure is a
+        // one-line errno-class text (unproven, never refused), and a
+        // failure with no errno at all gets the static fallback.
+        let e2big = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new("verifier-line\n".repeat(9000)),
+        })
+        .context("loading function_list_return");
+        assert_eq!(
+            super::counter_load_refusal(&e2big),
+            super::COUNTER_VERIFIER_BUDGET_REFUSAL
+        );
+        let denied: anyhow::Error = std::io::Error::from_raw_os_error(libc::EPERM).into();
+        let text = super::counter_load_refusal(&denied.context("loading p11_return"));
+        assert!(text.starts_with("counter object load failed ("), "{text}");
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains("counter-mode-"), "{text}");
+        let bare = anyhow::anyhow!("no errno here");
+        assert_eq!(
+            super::counter_load_refusal(&bare),
+            "counter object load failed before the verifier ran"
+        );
     }
 
     /// The C producer's bucket index must equal the shared `bucket_of` over

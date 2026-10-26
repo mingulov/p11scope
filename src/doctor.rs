@@ -1757,6 +1757,32 @@ pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> S
     }
 }
 
+/// Counter-mode line with load-preflight verdicts (one per mode,
+/// `Ok(())` when the object loads and releases). A proven old-kernel
+/// token replaces the availability sentence; an unproven load failure
+/// (privilege, unexpected errors) keeps it, since only the verifier's
+/// own E2BIG proves unavailability.
+pub(crate) fn counter_modes_footer_with_preflight(
+    verdict: &crate::attach::BpfLoopVerdict,
+    preflight: Option<&[(p11scope_ebpf_common::CounterMode, Result<(), String>)]>,
+) -> String {
+    if let (crate::attach::BpfLoopVerdict::Available, Some(loads)) = (verdict, preflight) {
+        if cfg!(p11scope_counter_objects) {
+            if let Some((_, Err(refusal))) = loads
+                .iter()
+                .find(|(_, result)| result.as_ref().is_err_and(|s| s.starts_with("counter-mode-")))
+            {
+                return format!("counter modes: {refusal}\n");
+            }
+            if loads.iter().all(|(_, result)| result.is_ok()) {
+                return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
+                    .to_string();
+            }
+        }
+    }
+    counter_modes_footer(verdict)
+}
+
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
@@ -1772,9 +1798,25 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Resul
     } else {
         (render(&checks), verdict(&checks))
     };
-    text.push_str(&counter_modes_footer(
-        &crate::attach::kernel_bpf_loop_probe(),
-    ));
+    let loop_probe = crate::attach::kernel_bpf_loop_probe();
+    // The preflight loads each counter object and releases it without
+    // attaching; only a proven bpf_loop host can answer, and omitted
+    // builds refuse at the probe sentence.
+    let loads;
+    let preflight = if matches!(loop_probe, crate::attach::BpfLoopVerdict::Available)
+        && cfg!(p11scope_counter_objects)
+    {
+        loads = [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ]
+        .map(|mode| (mode, crate::attach::counter_banks::counter_object_preflight(mode)));
+        Some(loads.as_slice())
+    } else {
+        None
+    };
+    text.push_str(&counter_modes_footer_with_preflight(&loop_probe, preflight));
     write_report(&mut std::io::stdout().lock(), &text)?;
     Ok(code)
 }
@@ -3377,6 +3419,7 @@ mod tests {
             counter_modes_footer(&BpfLoopVerdict::Available)
                 .contains("the kernel provides bpf_loop (helper 181)")
         );
+
         // The refusal token appears only on proven absence.
         assert!(
             !counter_modes_footer(&BpfLoopVerdict::Available)
@@ -3399,5 +3442,72 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    #[test]
+    fn counter_modes_footer_with_preflight_reports_load_verdicts() {
+        use crate::attach::BpfLoopVerdict;
+        use p11scope_ebpf_common::CounterMode;
+        let loads = |results: [Result<(), String>; 3]| {
+            [
+                CounterMode::Counts,
+                CounterMode::Timestamps,
+                CounterMode::Latency,
+            ]
+            .into_iter()
+            .zip(results)
+            .collect::<Vec<_>>()
+        };
+        let oks = loads([Ok(()), Ok(()), Ok(())]);
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&oks));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.contains("counter objects load on this kernel"),
+                "{line:?}"
+            );
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        // A proven old-kernel token replaces the availability sentence.
+        let refused = loads([
+            Err("counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        let line =
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&refused));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counter-mode-unavailable-on-kernel:"),
+                "{line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // An unproven load failure keeps the probe sentence, whatever
+        // the build carries.
+        let unproven = loads([
+            Err("counter object load failed (Operation not permitted (os error 1))".to_string()),
+            Ok(()),
+            Ok(()),
+        ]);
+        assert_eq!(
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven)),
+            counter_modes_footer(&BpfLoopVerdict::Available)
+        );
+        // Other verdicts ignore the preflight.
+        assert_eq!(
+            counter_modes_footer_with_preflight(
+                &BpfLoopVerdict::Unavailable("test old kernel".into()),
+                Some(&oks)
+            ),
+            counter_modes_footer(&BpfLoopVerdict::Unavailable("test old kernel".into()))
+        );
+        assert_eq!(
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, None),
+            counter_modes_footer(&BpfLoopVerdict::Available)
+        );
     }
 }

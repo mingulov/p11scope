@@ -2591,8 +2591,8 @@ impl SemanticCapture {
                 ImageQueryRefusal::Present => "Present",
             }
         }
-        let mut groups: BTreeMap<(bool, bool, Option<u64>, &'static str, bool, bool, bool), usize> =
-            BTreeMap::new();
+        type GroupKey = (bool, bool, Option<u64>, &'static str, bool, bool, bool);
+        let mut groups: BTreeMap<GroupKey, usize> = BTreeMap::new();
         for waiting in self.awaiting.values() {
             let key = Self::pending_key(waiting);
             let image = waiting.record.base.event.image;

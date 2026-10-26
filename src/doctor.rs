@@ -635,8 +635,8 @@ fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> Stri
             // verifier log. Keep the independently bounded excerpt instead,
             // naming a budget refusal for what it is.
             let excerpt = bounded_verifier_diagnostic(&verifier_log.to_string());
-            if crate::attach::is_verifier_budget_refusal(program) {
-                break format!("verifier budget refused the program (E2BIG); {excerpt}");
+            if let Some(errno_name) = crate::attach::verifier_budget_refusal_errno_name(program) {
+                break format!("verifier budget refused the program ({errno_name}); {excerpt}");
             }
             break excerpt;
         }

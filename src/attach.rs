@@ -5152,18 +5152,30 @@ pub(crate) fn is_verifier_budget_errno(errno: Option<i32>) -> bool {
 /// Permission, map-policy, identity and malformed-object failures — and
 /// every non-load error — return false and keep their own errors.
 pub(crate) fn is_verifier_budget_refusal(error: &aya::programs::ProgramError) -> bool {
+    verifier_budget_refusal_errno_name(error).is_some()
+}
+
+/// The errno name a verifier-budget load refusal carries for hint text:
+/// E2BIG when the program exceeds the complexity limit, ENOSPC when
+/// verbose verification logging fills the load log buffer first
+/// (observed on 5.15 for an over-budget worker: the same refusal
+/// through a different errno). `None` for every other error — the one
+/// routing behind `is_verifier_budget_refusal` — so hints name the
+/// real errno without re-classifying. The shared errno predicate above
+/// stays E2BIG-only so the counter mapping keeps rewriting genuine
+/// E2BIG alone.
+pub(crate) fn verifier_budget_refusal_errno_name(
+    error: &aya::programs::ProgramError,
+) -> Option<&'static str> {
     match error {
         aya::programs::ProgramError::LoadError { io_error, .. } => {
-            // ENOSPC joins E2BIG only here, at the attach/doctor seam: a
-            // too-complex program whose verbose log fills the load buffer
-            // first. The shared errno predicate above stays E2BIG-only so
-            // the counter mapping keeps rewriting genuine E2BIG alone.
-            matches!(
-                io_error.raw_os_error(),
-                Some(libc::E2BIG | libc::ENOSPC)
-            )
+            match io_error.raw_os_error() {
+                Some(libc::E2BIG) => Some("E2BIG"),
+                Some(libc::ENOSPC) => Some("ENOSPC"),
+                _ => None,
+            }
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -5624,16 +5636,20 @@ pub(crate) const VERIFIER_BUDGET_HINT: &str = "hint: the kernel's verifier found
 complex and refused it (E2BIG) — this is a p11scope bug on this kernel, not a privilege \
 problem. Report it with the `p11scope doctor` output.";
 
+pub(crate) const VERIFIER_BUDGET_HINT_LOG_EXHAUSTION: &str = "hint: the kernel's verifier found a p11scope program too \
+complex and the verbose verifier log filled the load buffer first, so the load was refused (ENOSPC) — this is a \
+p11scope bug on this kernel, not a privilege problem. Report it with the `p11scope doctor` output.";
+
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
-    let budget_refusal = error.chain().any(|cause| {
+    let budget_errno = error.chain().find_map(|cause| {
         cause
             .downcast_ref::<aya::programs::ProgramError>()
-            .is_some_and(is_verifier_budget_refusal)
+            .and_then(verifier_budget_refusal_errno_name)
     });
-    if budget_refusal {
-        error.context(VERIFIER_BUDGET_HINT)
-    } else {
-        error.context(UNSUPPORTED_ENV_HINT)
+    match budget_errno {
+        Some("ENOSPC") => error.context(VERIFIER_BUDGET_HINT_LOG_EXHAUSTION),
+        Some(_) => error.context(VERIFIER_BUDGET_HINT),
+        None => error.context(UNSUPPORTED_ENV_HINT),
     }
 }
 

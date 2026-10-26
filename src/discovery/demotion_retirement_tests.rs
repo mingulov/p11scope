@@ -5462,6 +5462,7 @@ fn steady_caller_exit_before_any_pass_classifies_it_discloses_only_the_tail() {
     );
 }
 
+
 /// The wait that keeps commit lag from failing count authority waits
 /// only for the queuing projection's own publication. A module the
 /// committed registry knows is judged at once; one it still does not
@@ -5562,4 +5563,124 @@ fn demotion_retirement_projected_observation_waits_only_for_its_own_publication(
         0,
         "unknown outside a projection: authority fails at once"
     );
+}
+
+/// The same wait covers an admission upgrade: a module the committed
+/// registry knows but has not admitted is judged only after the
+/// publication that carries the upgrade, not against the stale
+/// pre-upgrade verdict. Staging Admitted over a published Refused,
+/// then judging before the publish, must wait (nothing accepted, no
+/// failure); after the publish the caller is judged with Admitted.
+#[test]
+fn demotion_retirement_projected_observation_waits_for_admission_upgrade() {
+    use super::count_eligibility::CountOwnership;
+    use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let key = ModuleKey::physical(253, 7, 999_998, Some("sha-flip".into()), "");
+    let info = |admission: AdmissionState| ModuleInfo {
+        path: "/lib/flip.so".into(),
+        key: key.clone(),
+        double_loaded: false,
+        build_id: None,
+        identity_source: Some("mountinfo".into()),
+        admission,
+        admission_class: Some("exact".into()),
+        admission_endpoints: match admission {
+            AdmissionState::Admitted => Some(1),
+            AdmissionState::Refused | AdmissionState::Unresolved => None,
+        },
+        admission_reasons: match admission {
+            AdmissionState::Admitted => Vec::new(),
+            AdmissionState::Refused | AdmissionState::Unresolved => {
+                vec!["attach-budget churn".into()]
+            }
+        },
+    };
+    scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .note_mapping(caller, 7, info(AdmissionState::Refused), 400);
+    scene.native.scene.coordinator.registry.publish();
+    let id = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .module_id_for(&key)
+        .expect("published module is known");
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry
+            .module(id)
+            .expect("published module record")
+            .admission,
+        AdmissionState::Refused
+    );
+    let fresh = |scene: &Scene| {
+        let coordinator = &scene.native.scene.coordinator;
+        let mut ownership = CountOwnership::new(coordinator.registry.limits());
+        assert!(ownership.register_pair(caller, object));
+        ownership.invalidate_memberships(coordinator.attach_set.count_revision());
+        ownership.begin_catalog_pass();
+        ownership
+    };
+    let complete = |scene: &Scene| {
+        Some(crate::inspect_system::CompleteMemberScan::scripted(
+            scene.generation.clone(),
+            300,
+            301,
+        ))
+    };
+    let mut ownership = fresh(&scene);
+    let published = scene.native.scene.coordinator.registry.published_revision();
+    scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .note_mapping(caller, 7, info(AdmissionState::Admitted), 500);
+    assert!(ownership.queue_projected_observation(
+        caller,
+        vec![key.clone()],
+        complete(&scene),
+        published
+    ));
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(caller),
+        0,
+        "nothing accepted while the upgrade is unpublished"
+    );
+    assert_eq!(
+        ownership.caller_authority_failure(caller),
+        0,
+        "an unpublished admission upgrade is not failed authority"
+    );
+    scene.native.scene.coordinator.registry.publish();
+    assert!(scene.native.scene.coordinator.registry.published_revision() > published);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry
+            .module(id)
+            .expect("upgraded module record")
+            .admission,
+        AdmissionState::Admitted
+    );
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(caller),
+        301,
+        "after its publication the caller is judged with the Admitted admission"
+    );
+    assert_eq!(ownership.caller_authority_failure(caller), 0);
 }

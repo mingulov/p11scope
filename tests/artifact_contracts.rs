@@ -13434,6 +13434,30 @@ fn license_header_checker_rejects_bad_fixtures() {
 }
 
 #[test]
+fn license_rust_include_exemption_is_exact_path() {
+    // The `//`-header allowance for `include!`d Rust files covers
+    // only the pinned exact paths: an unrelated Rust file with the
+    // `//` form still fails, while the pinned include target
+    // accepts it (rustc E0753 rejects `//!` across `include!`).
+    let unlisted = license_header_error(
+        "src/not_an_include_target.rs",
+        b"// SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
+    );
+    assert!(
+        unlisted.is_some(),
+        "an unlisted Rust file must still require the `//!` header"
+    );
+    let pinned = license_header_error(
+        "src/inventory_joint_cells_tests.rs",
+        b"// SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
+    );
+    assert!(
+        pinned.is_none(),
+        "the pinned include target must accept the `//` header"
+    );
+}
+
+#[test]
 fn license_legal_surface_checker_rejects_bad_fixtures() {
     // A stub tree missing LICENSE, carrying a wrong manifest license, an
     // on-disk removed text, and a file naming a pre-relicense text.

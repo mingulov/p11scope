@@ -46,7 +46,7 @@
 //! `(st_dev, st_ino)` of mapped provider-candidate ranges — metadata, never
 //! file contents. Paths come only from matched provider mappings.
 
-use crate::discovery::caller_registry::ExeIdentity;
+use crate::discovery::caller_registry::{ColdMint, ExeIdentity};
 use crate::discovery::engine::is_provider_mapping;
 use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
@@ -1899,6 +1899,13 @@ pub(crate) struct OsConfirmIo<'p> {
     /// every member read. A `ReservedPin`: the dup'd pidfd closes before
     /// its member-owner lease returns, like every other held FD.
     minter: Option<ReservedPin<Arc<crate::process::PidPin>>>,
+    /// A cold-minted member handed in from outside (never minted here),
+    /// waiting for its pid's next prepare, with its minter. Separate
+    /// from the stash so a handoff never disturbs an in-flight confirm;
+    /// the mint prologue moves a matching validated handoff into the
+    /// stash and drops any other.
+    handed: Option<(u32, RetainedGroupMember)>,
+    handed_minter: Option<ReservedPin<Arc<crate::process::PidPin>>>,
     /// The member's private reservation owner: exactly two retained
     /// slots (the member directory plus the dup'd original pidfd) plus
     /// one transient unit, sized for a single confirm. The confirm path
@@ -2098,8 +2105,25 @@ impl OsConfirmIo<'_> {
             observer: None,
             member: None,
             minter: None,
+            handed: None,
+            handed_minter: None,
             member_owner: member_owner(),
         }
+    }
+
+    /// Hand a cold-minted survivor into this confirm's routing: the next
+    /// prepare for `pid` re-validates it and uses it instead of minting.
+    /// The handoff MOVES custody — the hander drops its own handles —
+    /// and the member's leases move with it (no new FD opens here; the
+    /// minter clone names the hander's already-held description, so it
+    /// carries no new lease).
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
+    pub(crate) fn hand_cold_member(&mut self, pid: u32, minted: ColdMint) {
+        self.handed = Some((pid, minted.member));
+        self.handed_minter = Some(ReservedPin {
+            pin: minted.minter,
+            _lease: None,
+        });
     }
 
     /// The stashed survivor, only for the confirm pid that minted it.
@@ -2232,6 +2256,22 @@ impl ConfirmIo for OsConfirmIo<'_> {
         // take, so anything left here belongs to an older confirm.
         self.member = None;
         self.minter = None;
+        // A handed cold member takes precedence over a fresh mint: it is
+        // re-validated (never trusted blind), then moved into the stash
+        // it would have minted. A handoff for another pid, or one that
+        // no longer validates, drops and the ordinary mint runs.
+        let handed_matches = self
+            .handed
+            .as_ref()
+            .is_some_and(|(handed_pid, member)| *handed_pid == pid && member.selector().is_ok());
+        if handed_matches {
+            let (_, member) = self.handed.take().expect("a handed member matched");
+            self.member = Some((pid, member));
+            self.minter = self.handed_minter.take();
+            return Ok(());
+        }
+        self.handed = None;
+        self.handed_minter = None;
         if !crate::process::process_is_zombie(pid) {
             return Ok(());
         }

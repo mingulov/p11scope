@@ -6,9 +6,11 @@
 //! layout comes from `pkcs11_module::tables_for`/`read_fn_pointers` — the same
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
+use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
-use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
+use crate::discovery::retained_member::RetainedGroupMember;
+use crate::process::{MountNamespaceId, PidPin, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
@@ -3626,9 +3628,27 @@ trait ScanIo {
             crate::discovery::identity::map_files_identity(view.pid(), start, end)
         })
     }
+    /// Stash a cold-minted survivor for this scan: later `open_maps`
+    /// and `range_identity` calls route to it. The default drops the
+    /// stash (scripted IOs never serve survivor reads).
+    fn note_cold_member(&mut self, _pid: u32, _member: RetainedGroupMember, _minter: Arc<PidPin>) {}
+    /// The stashed cold survivor for `pid`, if this scan holds one.
+    fn cold_member_for(&self, _pid: u32) -> Option<&RetainedGroupMember> {
+        None
+    }
 }
 
-struct ProcScanIo;
+struct ProcScanIo {
+    cold: Option<ProcColdMember>,
+}
+
+/// One scan's cold survivor: the member plus the minter Arc that keeps
+/// its borrow alive. Dropped with the scan; never shared across scans.
+struct ProcColdMember {
+    pid: u32,
+    member: RetainedGroupMember,
+    _minter: Arc<PidPin>,
+}
 
 impl ScanIo for ProcScanIo {
     type Memory = File;
@@ -3638,6 +3658,11 @@ impl ScanIo for ProcScanIo {
         view: &ProcessView,
         _: &CaptureWorkBudget,
     ) -> std::io::Result<Box<dyn Read>> {
+        // The survivor's maps for a cold scan, not the dead leader's
+        // empty ones; live scans see the ordinary open unchanged.
+        if let Some(member) = self.cold_member_for(view.pid()) {
+            return Ok(Box::new(member.open_maps()?));
+        }
         Ok(Box::new(File::open(format!("/proc/{}/maps", view.pid()))?))
     }
 
@@ -3647,6 +3672,41 @@ impl ScanIo for ProcScanIo {
 
     fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
         view.run_while_same(|| ())
+    }
+
+    fn range_identity(
+        &mut self,
+        view: &ProcessView,
+        start: u64,
+        end: u64,
+    ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+        // One range through the stashed survivor when this scan holds
+        // it: sequential cold-scan proofs (zombie scans are rare). The
+        // member re-proves birth and liveness itself, which subsumes
+        // the pin check for a proved survivor.
+        if let Some(member) = self.cold_member_for(view.pid()) {
+            return Ok(member
+                .stat_map_file(start, end)
+                .map_err(std::io::Error::other));
+        }
+        view.run_while_same(|| {
+            crate::discovery::identity::map_files_identity(view.pid(), start, end)
+        })
+    }
+
+    fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
+        self.cold = Some(ProcColdMember {
+            pid,
+            member,
+            _minter: minter,
+        });
+    }
+
+    fn cold_member_for(&self, pid: u32) -> Option<&RetainedGroupMember> {
+        self.cold
+            .as_ref()
+            .filter(|cold| cold.pid == pid)
+            .map(|cold| &cold.member)
     }
 }
 
@@ -3794,13 +3854,24 @@ fn acquire_scan_maps(
     budget
         .spend(1)
         .map_err(|error| AcquireMapsError::refused(error.to_owned()))?;
+    read_and_parse_maps(reader, budget, || io.maps_now())
+}
+
+/// Read, limit-check and parse one maps snapshot: shared by the leader
+/// maps read and the cold survivor-maps read, so both charge and
+/// classify identically.
+fn read_and_parse_maps(
+    reader: Box<dyn Read>,
+    budget: &mut CaptureWorkBudget,
+    maps_now: impl FnMut() -> Option<u64>,
+) -> Result<Vec<MapEntry>, AcquireMapsError> {
     let (bytes, reasons) = read_maps_with_limits(
         reader,
         budget,
         MAX_MAPS_BYTES,
         MAX_MAP_ENTRIES,
         64 * 1024,
-        || io.maps_now(),
+        maps_now,
     )
     .map_err(|error| AcquireMapsError::refused(error.to_string()))?;
     if let Some(reason) = reasons.first().copied().or(budget.stopped_now()) {
@@ -3830,6 +3901,31 @@ fn acquire_scan_maps(
         ));
     }
     Ok(maps)
+}
+
+/// Cold survivor maps for a zombie leader with one live survivor: mint
+/// the survivor from the view's own pin (duplicated, never reopened by
+/// number), stash it in the scan IO for this scan's later range proofs,
+/// and return the survivor's maps. `None` on ANY refusal — dead group,
+/// ambiguity, races, budget — so the caller falls through to the
+/// existing exited path unchanged.
+fn acquire_cold_survivor_maps(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+) -> Option<Vec<MapEntry>> {
+    if !crate::process::process_is_zombie(view.pid()) {
+        return None;
+    }
+    let original = Arc::new(view.retained_pin().try_clone().ok()?);
+    let minted = cold_admit_member(&original, budget).ok()?;
+    io.note_cold_member(view.pid(), minted.member, minted.minter);
+    let reader = view
+        .run_while_same(|| io.open_maps(view, budget))
+        .ok()?
+        .ok()?;
+    budget.spend(1).ok()?;
+    read_and_parse_maps(reader, budget, || io.maps_now()).ok()
 }
 
 /// The scan-level exited outcome: the engine proves the end through the
@@ -3906,7 +4002,7 @@ pub fn scan_process_view(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo);
+    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo { cold: None });
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, true, budget, &result);
     result
@@ -3920,7 +4016,13 @@ pub(crate) fn scan_process_view_without_memory(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo, false);
+    let result = scan_process_view_with_io_mode(
+        request,
+        view,
+        budget,
+        &mut ProcScanIo { cold: None },
+        false,
+    );
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, false, budget, &result);
     result
@@ -3944,7 +4046,8 @@ pub(crate) fn scan_process_view_examined(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
-    let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo, true);
+    let result =
+        scan_view_with_examined(request, view, budget, &mut ProcScanIo { cold: None }, true);
     #[cfg(test)]
     {
         let probe = result
@@ -3988,7 +4091,15 @@ pub(crate) fn scan_process_view_held(
     custody: &mut super::kernel_identity::ExaminedCustody,
     scan: u64,
 ) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
-    scan_view_with_custody(request, view, budget, &mut ProcScanIo, true, custody, scan)
+    scan_view_with_custody(
+        request,
+        view,
+        budget,
+        &mut ProcScanIo { cold: None },
+        true,
+        custody,
+        scan,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4064,8 +4175,8 @@ fn scan_view_examined_mode(
     };
     let maps = match acquire_scan_maps(view, budget, io) {
         Ok(maps) => maps,
-        Err(error) if error.empty_snapshot => match classify_empty_maps_snapshot(view, io)? {
-            EmptyMapsClass::KernelThread => {
+        Err(error) if error.empty_snapshot => match classify_empty_maps_snapshot(view, io) {
+            Ok(EmptyMapsClass::KernelThread) => {
                 budget.note_kernel_thread_absence();
                 return Ok((
                     ScanOutcome::Scanned {
@@ -4076,7 +4187,14 @@ fn scan_view_examined_mode(
                     Vec::new(),
                 ));
             }
-            EmptyMapsClass::Refuse => return Ok(refused_initial(error.reason)),
+            Ok(EmptyMapsClass::Refuse) => return Ok(refused_initial(error.reason)),
+            // A zombie leader with one live survivor scans the
+            // survivor's maps instead of exiting; every other
+            // unproven shape keeps the exact existing error.
+            Err(error) => match acquire_cold_survivor_maps(view, budget, io) {
+                Some(maps) => maps,
+                None => return Err(error),
+            },
         },
         Err(error) => return Ok(refused_initial(error.reason)),
     };

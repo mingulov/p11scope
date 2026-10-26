@@ -25,6 +25,9 @@ use instance_input::{
 };
 
 use crate::discovery::native_binding::{BindingCensus, UnboundReason};
+use crate::discovery::retained_member::RetainedGroupMember;
+use crate::discovery::scan::CaptureWorkBudget;
+use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
 pub(crate) mod metadata;
@@ -41,6 +44,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Capture-clock basis for every `*_ns` timestamp in the registry.
 pub(crate) const CLOCK_BASIS: &str = "CLOCK_MONOTONIC";
@@ -174,6 +178,16 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
+    /// Cold-admit an already-zombie leader: when `pin` names a zombie
+    /// thread group with exactly one live survivor, mint the survivor
+    /// from this same pin and return its exe identity for the record.
+    /// `Ok(None)` means "not a cold-admittable zombie" (the ordinary
+    /// gone refusal applies); `Err` is a NAMED refusal (ambiguity —
+    /// never a pick). The default never cold-admits: scripted sources
+    /// gain no process authority from this hook.
+    fn cold_zombie_exe(&self, _pin: &Arc<Self::Pin>) -> Result<Option<ExeIdentity>, String> {
+        Ok(None)
+    }
     /// Share original custody only when the source can prove its concrete type.
     /// Scripted sources do not gain process authority from an Arc wrapper.
     fn shared_semantic_custody(&self, _pin: &Arc<Self::Pin>) -> Option<Arc<PidPin>> {
@@ -230,6 +244,27 @@ impl ProcessSource for OsProcessSource {
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
     }
+
+    fn cold_zombie_exe(&self, pin: &Arc<PidPin>) -> Result<Option<ExeIdentity>, String> {
+        if !process_is_zombie(pin.pid()) {
+            return Ok(None);
+        }
+        // A scratch budget bounds the mint's own charges; the mint is a
+        // handful of local reads, never pass work.
+        let mut work = CaptureWorkBudget::default();
+        match cold_admit_member(pin, &mut work) {
+            Ok(minted) => {
+                let exe = minted.member.read_exe_identity();
+                drop(minted);
+                // A member whose exe is unreadable proves nothing: fail
+                // closed to the ordinary gone refusal.
+                Ok(exe)
+            }
+            Err(ColdRefusal::Ambiguous(reason)) => Err(reason),
+            Err(ColdRefusal::Dead) | Err(ColdRefusal::Raced) => Ok(None),
+        }
+    }
+
     fn shared_semantic_custody(&self, pin: &Arc<PidPin>) -> Option<Arc<PidPin>> {
         Some(Arc::clone(pin))
     }
@@ -240,6 +275,108 @@ impl ProcessSource for OsProcessSource {
 
     fn semantic_custody_ref<'pin>(&self, pin: &'pin PidPin) -> Option<&'pin PidPin> {
         Some(pin)
+    }
+}
+
+/// A cold-minted survivor: the retained member plus the minter Arc that
+/// keeps its borrow alive. The minter clones the admission pin's own
+/// Arc — never a fresh numeric-PID reopen — so the original custody
+/// stays authoritative across the handoff.
+pub(crate) struct ColdMint {
+    pub member: RetainedGroupMember,
+    pub minter: Arc<PidPin>,
+}
+
+/// Why a cold mint refused: the group has no live survivor (the
+/// ordinary gone path), the survivors are ambiguous (a NAMED refusal —
+/// never a pick), or the proof raced and stayed unproven (fail closed
+/// like a gone process, like the sweep mint's silent custody refusal).
+#[derive(Debug)]
+pub(crate) enum ColdRefusal {
+    Dead,
+    Ambiguous(String),
+    Raced,
+}
+
+/// The private reservation owner for one cold mint: exactly the member
+/// envelope (two retained slots — the member directory plus the dup'd
+/// original pidfd — and one transient unit), mirroring the sweep
+/// confirm's member owner. Private to the mint, invisible to any
+/// shared census; its leases return when the mint drops.
+pub(crate) fn cold_member_owner() -> ReservationOwner {
+    ReservationOwner::new(SegmentPolicy {
+        headroom: 7,
+        workers: 1,
+        retained: 2,
+        max_ranges: 0,
+    })
+}
+
+/// The local-syscall grace for a cold mint: a handful of nonblocking
+/// reads, capped by the work budget's own deadline when it has one.
+/// Mirrors the sweep confirm's mint deadline; expiry fails closed.
+fn cold_mint_deadline(work: &CaptureWorkBudget) -> Instant {
+    const GRACE: Duration = Duration::from_secs(1);
+    let grace = Instant::now() + GRACE;
+    let capped = work.effective_deadline_ns().and_then(|limit| {
+        let clock = crate::attach::monotonic_ns()?;
+        let left = limit.checked_sub(clock)?;
+        Instant::now().checked_add(Duration::from_nanos(left))
+    });
+    capped.map(|deadline| deadline.min(grace)).unwrap_or(grace)
+}
+
+/// Mint the lone survivor of an already-zombie leader from the held
+/// original: the TGID's own task listing selects exactly one non-leader
+/// candidate, then the retained-member proof (tgkill liveness, group
+/// anchor, birth brackets) admits it. No numeric-PID reopen anywhere:
+/// the listing and the mint both derive from `original`, whose pidfd
+/// stays non-ready while threads live. A bare TID never selects here —
+/// its own task listing holds no non-leader entry — and no parentage is
+/// consulted.
+pub(crate) fn cold_admit_member(
+    original: &Arc<PidPin>,
+    work: &mut CaptureWorkBudget,
+) -> Result<ColdMint, ColdRefusal> {
+    let tgid = original.pid();
+    work.spend(1).map_err(|_| ColdRefusal::Raced)?;
+    let mut lone = None;
+    let mut extra = false;
+    let entries = std::fs::read_dir(format!("/proc/{tgid}/task")).map_err(|_| ColdRefusal::Dead)?;
+    for entry in entries {
+        let tid: u32 = entry
+            .map_err(|_| ColdRefusal::Dead)?
+            .file_name()
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ColdRefusal::Dead)?;
+        if tid == tgid {
+            continue;
+        }
+        if lone.is_some() {
+            extra = true;
+            break;
+        }
+        lone = Some(tid);
+    }
+    if extra {
+        return Err(ColdRefusal::Ambiguous(format!(
+            "thread group {tgid} has more than one live survivor (ambiguous; refusing to pick one)"
+        )));
+    }
+    let Some(tid) = lone else {
+        return Err(ColdRefusal::Dead);
+    };
+    let owner = cold_member_owner();
+    let deadline = cold_mint_deadline(work);
+    match RetainedGroupMember::acquire(original, tid, &owner, work, deadline) {
+        Ok(member) => Ok(ColdMint {
+            member,
+            minter: Arc::clone(original),
+        }),
+        // A raced or refused proof carries no admission signal: fail
+        // closed to the ordinary gone refusal.
+        Err(_) => Err(ColdRefusal::Raced),
     }
 }
 
@@ -544,19 +681,35 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 self.callers.len() + 1,
             );
         }
-        let pin = self
+        let mut pin = self
             .source
             .open(pid)
             .map_err(|error| anyhow!("cannot pin caller pid {pid}: {error}"))?;
         // A zombie pins successfully (its pidfd and `/proc` entries
         // survive until the parent reaps it), but admitting one mints a
         // caller for a dead generation that retires on the next pass —
-        // one spurious incarnation per pass. Refuse up front instead.
+        // one spurious incarnation per pass. Refuse up front instead,
+        // unless it is an already-zombie leader with exactly one live
+        // survivor, which cold-admits below with the survivor-served
+        // image (the opened pin stays authoritative throughout).
+        let mut cold_exe = None;
         if self.source.gone(pid) {
-            bail!("cannot pin caller pid {pid}: no live process with that pid (it exited)");
+            let original = Arc::new(pin);
+            match self.source.cold_zombie_exe(&original) {
+                Ok(Some(exe)) => {
+                    cold_exe = Some(exe);
+                    pin = Arc::try_unwrap(original).map_err(|_| {
+                        anyhow!("cannot pin caller pid {pid}: cold admission retained its original")
+                    })?;
+                }
+                Ok(None) => {
+                    bail!("cannot pin caller pid {pid}: no live process with that pid (it exited)")
+                }
+                Err(named) => bail!("cannot admit caller pid {pid}: {named}"),
+            }
         }
         let start_time = self.source.start_time(pid);
-        let exe = self.source.exe_identity(pid);
+        let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;

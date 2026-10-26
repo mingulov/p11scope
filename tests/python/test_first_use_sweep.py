@@ -724,16 +724,13 @@ class EvidenceStrictnessTests(unittest.TestCase):
                                                 "sink_dropped_bytes": 0})
         self.assertEqual(sweep.check_evidence(evidence), [])
 
-    def test_a_small_sink_stall_with_proven_drain_passes(self):
-        # sink_stall_ms is backpressure timing, not loss: the Linux 7.0.14
-        # sweep measured 1 ms stalls in passing exact cells (PARTIAL, drain
-        # proven, zero loss), and src/render.rs documents the field as
-        # stall milliseconds. Only the loss counters gate the cell.
+    def test_sink_stall_milliseconds_are_an_error(self):
         sweep = require_sweep(self)
         evidence = _strict_evidence(scheduling={"sink_stall_ms": 1,
                                                 "sink_timeouts": 0,
                                                 "sink_dropped_bytes": 0})
-        self.assertEqual(sweep.check_evidence(evidence), [])
+        self.assertTrue(any("sink_stall_ms" in error for error in
+                            sweep.check_evidence(evidence)))
 
 
 def _cell_line(**extra):

@@ -87,16 +87,17 @@ pub(crate) enum JointCommitRefusal {
 /// seal, receipt or publication-completion word.
 pub(crate) trait JointMachineIo {
     fn producers(&self) -> &SessionDrainProducers;
-    /// The normal Session keeps this inactive until the owning Finish path
-    /// exists. A test may forward only the existing immediate admission gate.
-    #[allow(dead_code)] // Inert Finish surface in normal and libtest builds.
+    /// The Session override admits the live Finish request against the
+    /// owning lane; the default refuses. A test may forward only the
+    /// existing immediate admission gate.
+    #[allow(dead_code)] // Default refuses; the Session override serves the live Finish.
     fn request_finish_stop(
         &mut self,
         _lane: &mut AttestedSemanticLane,
     ) -> Result<(), SemanticRefusal> {
         Err(SemanticRefusal::Unavailable)
     }
-    #[allow(dead_code)] // Q observation is not yet called by the inert machine.
+    #[allow(dead_code)] // Default observes no Q; the Session override serves the live Finish.
     fn observe_finish_q(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -914,7 +915,7 @@ impl LiveJointMachine {
 
     /// Latch the request before invoking the existing immediate admission
     /// gate. The same machine retains every later Q/report/frame owner.
-    #[allow(dead_code)] // Ordinary Finish selection is intentionally inactive.
+    #[allow(dead_code)] // Live Finish entry: the Joint finish driver begins here.
     pub(crate) fn begin_finish_with_io<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -950,6 +951,13 @@ impl LiveJointMachine {
         if self.finish.is_some() {
             return Err(SemanticRefusal::Unavailable);
         }
+        // A requested Running pull may have set the pulled flag and yielded
+        // on an empty drain just before this begin; rows landing after that
+        // pull are still unread. Clear the flag so the finish's first
+        // advance takes its own fresh pull past the begin.
+        if let Some(Phase::Collecting(original)) = self.phase.as_mut() {
+            original.request_pulled = false;
+        }
         // The observed Q is boxed once so the transfer owner the native
         // carrier compares stays stable across machine moves. A refused
         // box latches at once; no Finish starts without it.
@@ -982,7 +990,7 @@ impl LiveJointMachine {
     }
 
     /// Bounded service of the same original until actual Finish publication.
-    #[allow(dead_code)] // Ordinary driver selection remains inactive.
+    #[allow(dead_code)] // Live Finish entry: the Joint finish driver polls here.
     pub(crate) fn poll_finish_with_io<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -2067,16 +2075,14 @@ impl LiveJointMachine {
                         && !requested
                         && original.attempted < RAW_CAPACITY;
                     if !unrequested_empty && !needs_first_end {
-                        // A Requested Running demand must not bind on a
-                        // stale no-backlog poll: rows may have landed
-                        // since idle services last pulled. Take one fresh
-                        // pull past the request; the flag keeps the quiet
-                        // case to a single wasted pull per transaction.
-                        if q.is_none()
-                            && matches!(self.demand, Some(Demand::Requested { .. }))
-                            && original.attempted == 0
-                            && !original.request_pulled
-                        {
+                        // A requested transaction must not bind on a stale
+                        // no-backlog poll: rows may have landed since idle
+                        // services last pulled. The finish's first advance
+                        // is requested too (it carries Q), so it takes the
+                        // same one fresh pull past the begin; the flag keeps
+                        // the quiet case to a single wasted pull per
+                        // transaction.
+                        if requested && original.attempted == 0 && !original.request_pulled {
                             original.request_pulled = true;
                         } else {
                             budget.spend(1);

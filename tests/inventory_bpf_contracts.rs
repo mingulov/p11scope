@@ -33,6 +33,27 @@ fn inventory_build_restores_worker_opt_level() {
     );
 }
 
+/// Last-wins order: rustc takes the LAST `-C opt-level`, so any
+/// `opt-level` flag appended after the inventory override would silently
+/// restore the E2BIG codegen while the presence pin above stays green.
+/// No `opt-level` append may follow the inventory override.
+#[test]
+fn inventory_opt_level_override_is_not_shadowed() {
+    let build = std::fs::read_to_string("build.rs").expect("read build script");
+    let lines: Vec<&str> = build.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("append_flag(\"opt-level=3\")"))
+        .expect("inventory BPF builds must override opt-level to 3");
+    for (offset, line) in lines[at + 1..].iter().enumerate() {
+        assert!(
+            !(line.contains("append_flag") && line.contains("opt-level")),
+            "build.rs:{} appends opt-level after the inventory override, shadowing it: {line}",
+            at + offset + 2,
+        );
+    }
+}
+
 #[test]
 fn compact_inventory_object_matches_manifest_and_relocates_without_kernel_syscalls() {
     let directory = tempfile::tempdir().expect("inventory object test directory");

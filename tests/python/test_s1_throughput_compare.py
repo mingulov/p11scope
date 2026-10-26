@@ -12,15 +12,17 @@ observer's --event-log and inventory JSON for a --pid-scoped run.
 
 Gates (all must pass): every full 1 s window aligned to ready.t holds
 at least --min-rate (default 10,000) ledgered calls (a burst followed
-by idle fails; the partial tail is reported, never gated); per-function
-API results equal the ledger (exact totals plus per-mechanism calls /
-errors plus function and return-code set equality); zero event loss
-(ring_loss == 0, unrouted S1 returns == 0, a proven full drain, no loss
-gap or lossy coverage, a complete event stream); and the S1-active gate
-(object_observations unavailable with reason journal_unavailable, the
-semantic lane past disabled). S1 publish latency (coarse per-call
-edge-count publication delay) is recorded as p50/p99 with its sample
-count, never gated.
+by idle fails; the partial tail is reported, never gated); exact call
+and error totals per mechanism (edge and operation totals plus
+per-mechanism calls / errors, with function and return-code set
+equality over the hot loop; the driver's ledgered teardown calls are
+conserved in the exact totals but claim no mechanism row); zero event
+loss (ring_loss == 0, unrouted S1 returns == 0, a proven full drain, no
+loss gap or lossy coverage, a complete event stream); and the
+S1-active gate (object_observations unavailable with reason
+journal_unavailable, the semantic lane past disabled). S1 publish
+latency (coarse per-call edge-count publication delay) is recorded as
+p50/p99 with its sample count, never gated.
 
 Healthy and mutation twins run unignored; the driver tests build the
 tracked gen-calls.c fixture with gcc and drive a test-only in-suite
@@ -28,7 +30,9 @@ stub provider (real PKCS#11 entry signatures, counting-free immediate
 OK returns), so they need no SoftHSM install.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import shutil
 import signal
@@ -101,6 +105,28 @@ def uniform_ledger(count, per_s, pid=PID, tid=PID, start_ns=R0,
         last = end
     rows.append({"kind": "ack", "issued": count,
                  "t": last + 500 if ack_ns is None else ack_ns})
+    return rows
+
+
+def ledger_with_teardown(count, per_s, pid=PID, teardown_rv=0):
+    """uniform_ledger plus the two ledgered teardown calls.
+
+    C_CloseSession then C_Finalize land after the last hot-loop END, so
+    they sit in the partial tail, never in a gated full window.
+    """
+    rows = uniform_ledger(count, per_s, pid=pid)
+    ack = rows.pop()
+    assert ack["kind"] == "ack"
+    last = max(row["t1"] for row in rows if row["kind"] == "call")
+    seq = count
+    for fn in ("C_CloseSession", "C_Finalize"):
+        seq += 1
+        end = last + (seq - count) * 1000
+        rows.append({"kind": "call", "seq": seq, "fn": fn,
+                     "rv": teardown_rv, "pid": pid, "tid": pid,
+                     "t0": end - 500, "t1": end})
+        last = end
+    rows.append({"kind": "ack", "issued": seq, "t": last + 500})
     return rows
 
 
@@ -593,6 +619,53 @@ class ConservationGate(unittest.TestCase):
                            str(inventory_path), 10)
             self.assertIn("divergence", str(ctx.exception))
 
+    def run_teardown_triple(self, teardown_rv=0, row_calls=25):
+        """Ledger with teardown vs observer totals that include it.
+
+        The mechanism row keeps the hot-loop calls only: teardown claims
+        no mechanism row. Returns the pass verdict or raises.
+        """
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-teardown-") as tmp:
+            workdir = Path(tmp)
+            ledger_path, events_path, inventory_path = healthy_triple(
+                workdir, count=25, per_s=21)
+            rows = ledger_with_teardown(25, 21, teardown_rv=teardown_rv)
+            write_jsonl(ledger_path, rows)
+            last_t1 = max(row["t1"] for row in rows
+                          if row["kind"] == "call")
+            with open(inventory_path, encoding="utf-8") as stream:
+                inventory = json.load(stream)
+            edge = inventory["edges"][0]
+            edge["entries"]["count"] = 27
+            edge["operations"]["calls"] = 27
+            edge["mechanisms"][0]["calls"] = row_calls
+            inventory["semantic_edges"][0]["mechanisms"][0]["calls"] = \
+                row_calls
+            inventory["semantic_edges"][0]["api_returns"]["count"] = 27
+            write_json(inventory_path, inventory)
+            rewrite_events_for_edge(workdir, edge, last_t1)
+            return s1.compare([str(ledger_path)], [str(events_path)],
+                              str(inventory_path), 10)
+
+    def test_ledgered_teardown_conserves_in_the_exact_totals(self):
+        result = self.run_teardown_triple()
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["issued"], 27)
+        self.assertEqual(result["conservation"]["teardown"]["calls"], 2)
+        self.assertEqual(result["conservation"]["teardown"]["errors"], 0)
+
+    def test_teardown_inside_a_mechanism_row_fails(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.run_teardown_triple(row_calls=27)
+        self.assertIn("calls 27 != ledger 25", str(ctx.exception))
+
+    def test_teardown_only_return_code_is_exempt_from_the_rv_set(self):
+        result = self.run_teardown_triple(teardown_rv=1)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["issued"], 27)
+        self.assertEqual(result["conservation"]["teardown"]["errors"], 2)
+
 
 class LossGate(unittest.TestCase):
     def run_mutation(self, mutate_inventory=None, mutate_events=None):
@@ -659,6 +732,41 @@ class LossGate(unittest.TestCase):
                                   "pid": None,
                                   "subject": "semantic capture loss",
                                   "reason": "Detailed event overflow",
+                                  "budget": None})
+            events.insert(-1, gap)
+            ended["seq"] += 1
+
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory, mutate_events)
+        self.assertIn("loss gap", str(ctx.exception))
+
+    def test_joint_machine_unavailable_reason_fails(self):
+        def mutate(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "S1 lane stopped",
+                 "reason": "joint machine unavailable", "budget": None,
+                 "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("loss gap", str(ctx.exception))
+
+    def test_joint_machine_unavailable_subject_fails(self):
+        def mutate_inventory(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "joint machine unavailable",
+                 "reason": "S1 lane stopped", "budget": None,
+                 "repeats": 1})
+
+        def mutate_events(events):
+            ended = events[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "joint machine unavailable",
+                                  "reason": "S1 lane stopped",
                                   "budget": None})
             events.insert(-1, gap)
             ended["seq"] += 1
@@ -829,6 +937,29 @@ class ScopeAndClock(unittest.TestCase):
             self.assertIn("clock", str(ctx.exception))
 
 
+class MalformedLedgerCLI(unittest.TestCase):
+    def test_malformed_ledger_cli_prints_a_json_fail_verdict(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-badledger-") as tmp:
+            workdir = Path(tmp)
+            ledger_path, events_path, inventory_path = healthy_triple(
+                workdir, count=25, per_s=21)
+            ledger_path.write_text("{not a json row\n", encoding="utf-8")
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = s1.main(["--ledger", str(ledger_path),
+                              "--events", str(events_path),
+                              "--inventory", str(inventory_path),
+                              "--min-rate", "10"])
+            self.assertEqual(rc, 1)
+            verdict = json.loads(out.getvalue())
+            self.assertEqual(verdict["verdict"], "fail")
+            self.assertIn("ledger", verdict["reason"])
+            self.assertNotIn("Traceback", err.getvalue())
+
+
 STUB_PROVIDER = r"""/* Test-only stub provider: immediate OK returns, real entry shapes. */
 typedef unsigned long CK_RV;
 typedef unsigned long CK_ULONG;
@@ -934,6 +1065,15 @@ class DriverFixture(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("50000 calls", proc.stdout)
 
+    def test_driver_help_names_the_gated_minimum_duration(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-min-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            proc = subprocess.run([str(driver), "--help"], capture_output=True,
+                                  text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(">= 2", proc.stdout)
+            self.assertIn("smoke only", proc.stdout)
+
     def test_driver_stub_run_emits_a_valid_1k_ledger(self):
         t0 = require_t0(self)
         s1 = require_s1(self)
@@ -1021,6 +1161,66 @@ class DriverFixture(unittest.TestCase):
             self.assertEqual(view["issued"], 2000)
             windows = s1.check_windows(view, 1000)
             self.assertGreaterEqual(len(windows["windows"]), 1)
+            self.assertTrue(all(window["count"] >= 1000
+                                for window in windows["windows"]),
+                            windows["windows"])
+
+    def test_driver_single_run_ledgers_teardown_beside_the_hot_ledger(self):
+        t0 = require_t0(self)
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-td1-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_stub(workdir)
+            ledger = workdir / "ledger.jsonl"
+            proc = subprocess.run(
+                [str(driver), str(stub), "single", "1k", "2", str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            teardown = workdir / "ledger-teardown.jsonl"
+            self.assertTrue(
+                teardown.exists(),
+                "teardown ledger missing beside the hot ledger")
+            with open(teardown, encoding="utf-8") as stream:
+                rows = t0.read_ledger(stream)
+            summary = t0.validate_ledger(rows)
+            self.assertEqual(summary, {"issued": 2, "calls": 2})
+            fns = [row["fn"] for row in rows if row.get("kind") == "call"]
+            self.assertEqual(fns, ["C_CloseSession", "C_Finalize"])
+            view = s1.load_ledgers([str(ledger), str(teardown)])
+            self.assertEqual(view["issued"], 2002)
+            windows = s1.check_windows(view, 1000)
+            self.assertTrue(all(window["count"] >= 1000
+                                for window in windows["windows"]),
+                            windows["windows"])
+
+    def test_driver_churn_run_ledgers_teardown_in_its_own_file(self):
+        t0 = require_t0(self)
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-tdc-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_stub(workdir)
+            prefix = workdir / "churn"
+            proc = subprocess.run(
+                [str(driver), str(stub), "churn", "1k", "2", str(prefix)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            teardown = workdir / "churn-teardown.jsonl"
+            self.assertTrue(teardown.exists(),
+                            "churn teardown ledger missing")
+            with open(teardown, encoding="utf-8") as stream:
+                rows = t0.read_ledger(stream)
+            summary = t0.validate_ledger(rows)
+            self.assertEqual(summary, {"issued": 9, "calls": 9})
+            fns = [row["fn"] for row in rows if row.get("kind") == "call"]
+            self.assertEqual(fns, ["C_CloseSession"] * 8 + ["C_Finalize"])
+            ledgers = sorted(workdir.glob("churn.t*.jsonl"))
+            view = s1.load_ledgers(
+                [str(path) for path in ledgers] + [str(teardown)])
+            self.assertEqual(view["issued"], 2009)
 
 
 if __name__ == "__main__":

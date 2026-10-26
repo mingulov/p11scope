@@ -4749,6 +4749,22 @@ mod tests {
     }
 
     #[test]
+    fn soft1024_cell_rejects_child_that_ran_nothing() {
+        // A child filtered to zero tests exits 0 with "0 passed"; the
+        // parent must fail that, never pass vacuously. Uses a test name
+        // that matches nothing, so the body can never run.
+        let result = std::panic::catch_unwind(|| {
+            soft1024_cell("probe-none", "this::test::does::not::exist", 60, || {
+                panic!("the body must never run in a filtered child");
+            });
+        });
+        assert!(
+            result.is_err(),
+            "a soft-1024 child that ran zero tests must fail the parent"
+        );
+    }
+
+    #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, authorized native Multi staging as root, and a high hard RLIMIT_NOFILE: soft-1024 start raises through the Engine path"]
     fn counter_start_raises_nofile_from_soft_1024_lp64() {
         const TEST: &str =

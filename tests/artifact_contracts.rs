@@ -6973,44 +6973,51 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
     let directory = tempfile::tempdir().expect("temporary native instance test");
     // Both state sizes (F5): the small-state build must shrink
     // INSTANCE_START (pinned by a static assert in the harness) while the
-    // native hook logic passes unchanged.
+    // native hook logic passes unchanged. Both marker modes (H8-D): the
+    // marker build runs the birth and gap tests, while the marker-off
+    // build keeps today's exec assertions, which cover counter flavors.
     for small in [false, true] {
-        let binary = directory
-            .path()
-            .join(format!("instance-epoch-tests-small-{small}"));
-        let mut compiler = Command::new("clang-18");
-        compiler.args([
-            "-O2",
-            "-g",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-Wno-unknown-attributes",
-            "-I",
-            "crates/ebpf/native",
-            "tests/fixtures/instance-epoch/helper_tests.c",
-        ]);
-        if small {
-            compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        for marker in [false, true] {
+            let binary = directory.path().join(format!(
+                "instance-epoch-tests-small-{small}-marker-{marker}"
+            ));
+            let mut compiler = Command::new("clang-18");
+            compiler.args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wno-unknown-attributes",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/instance-epoch/helper_tests.c",
+            ]);
+            if small {
+                compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+            }
+            if marker {
+                compiler.arg("-DP11SCOPE_JOURNAL_MARKER");
+            }
+            let compile = compiler
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .expect("execute clang-18 for native instance regression");
+            assert!(
+                compile.status.success(),
+                "native compile failed (small={small} marker={marker}): {}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let run = Command::new(binary)
+                .output()
+                .expect("execute native instance regression");
+            assert!(
+                run.status.success(),
+                "native instance regression failed (small={small} marker={marker}): {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
         }
-        let compile = compiler
-            .arg("-o")
-            .arg(&binary)
-            .output()
-            .expect("execute clang-18 for native instance regression");
-        assert!(
-            compile.status.success(),
-            "native compile failed (small={small}): {}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
-        let run = Command::new(binary)
-            .output()
-            .expect("execute native instance regression");
-        assert!(
-            run.status.success(),
-            "native instance regression failed (small={small}): {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
     }
 }
 

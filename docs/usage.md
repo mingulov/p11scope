@@ -706,9 +706,14 @@ Limits that matter in pods:
   its own process (`nsenter -m` without `-p`) is refused before attaching.
   To keep no report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
-  already stream to stdout when `-o` is omitted; profile (including `run`
-  without `--trace`) refuses `-o -` because its report requires a file —
-  omit `-o` for display frames on stdout. No command ever creates a file
+  already stream to stdout when `-o` is omitted. When stdout is a slow
+  pipe, trace output that cannot be delivered within the bounded wait is
+  dropped and counted as dropped bytes
+  (`scheduling.sink_dropped_bytes` in the JSON evidence), which can cut
+  the last stdout line; the `-o` file is always complete. Profile
+  (including `run` without `--trace`) refuses `-o -` because its report
+  requires a file — omit `-o` for display frames on stdout. No command
+  ever creates a file
   literally named `-`. Every
   directory on the way to the file must be a real directory (no symlinks)
   owned by root, you, or the user who ran `sudo`, and not group- or

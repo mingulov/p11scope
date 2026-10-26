@@ -12,8 +12,8 @@ probe, never a version check). On older kernels without uprobe_multi
 (5.15, 6.1, and `--pid` captures where the kernel pid filter is not
 proven) captures stay correct and stop in finite time, but slowly:
 teardown detaches one link at a time at about 18 ms per link (5.15
-guest) and 50–73 ms per link on newer kernels stopping one link at a
-time, and startup takes about 15–22 s on 5.15/6.1 versus about 4–7 s
+guest) and tens of ms per link on newer kernels stopping one link at
+a time, and startup takes about 15–22 s on 5.15/6.1 versus about 4–7 s
 on 6.6+. The report always discloses which backend was used
 (`observation.attach`, `evidence.attach_backend`). On 5.15, per-copy
 module attribution and calls held across a non-leader exec stay
@@ -222,15 +222,17 @@ capture behavior or establish the provenance of its input files.
 
 On kernels without uprobe_multi (5.15, 6.1), stopping a capture with many
 probes closes the probe links one at a time: about 18 ms per link in a
-5.15 guest and about 50–73 ms per link on newer hosts using single links
-(for example, 4,227 links take roughly 1.3–5 minutes). The stop stays
-correct and finite with no cap: once the estimate reaches 2 s, p11scope
-prints one up-front estimate line (computed at 50 ms per link, so on 5.15
-it can overstate the wait), then the usual per-second progress, and a
-second Ctrl-C stops waiting and leaves the kernel to finish the remaining
-closes after exit. Measured on Fedora 7.2.9 (5 vCPU) with the release
-candidate at 8,194 per-offset links: attach 41 s, stop (link release)
-339 s.
+5.15 guest and tens of ms per link on newer hosts using single links
+(host-dependent; for example, 4,227 links take roughly 1.3–5 minutes).
+The stop stays correct and finite with no cap: once the estimate reaches
+2 s, p11scope prints one up-front estimate line (computed at 50 ms per
+link, so on 5.15 it can overstate the wait), then the usual per-second
+progress, and a second Ctrl-C stops waiting and leaves the kernel to
+finish the remaining closes after exit. Measured on Fedora 7.2.9
+(5 vCPU) with the release candidate at 8,194 per-offset links (the
+singles path; `--attach-backend singles` selects it where multi-attach
+is available): attach 41 s, stop (link release) 339 s, about 41 ms per
+link.
 
 ### 5.15: physical-identity controls and non-leader exec unqualified
 
@@ -927,6 +929,15 @@ subsequent sync failed, so the record alone does not confirm durable
 completion. Event creation and the initial `started` write remain fail-fast.
 This fixes returned errors only; stalled final stdout remains limited as
 described above.
+
+### Slow stdout can truncate a live trace stream
+
+When stdout is a slow pipe, trace output that cannot be delivered within
+the bounded wait is dropped and counted as dropped bytes
+(`scheduling.sink_dropped_bytes`), which can cut the last stdout line;
+the report then reads PARTIAL. The `-o` file is always complete: every
+line is written to it, and a file write failure is an error rather than
+a silent drop.
 
 ### Providers that build their function table at run time need a manifest
 

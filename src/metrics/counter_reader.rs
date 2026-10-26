@@ -4752,8 +4752,8 @@ mod tests {
         assert_eq!(failed, 0);
         assert_eq!(partials.len(), 1);
         assert!(
-            partials[0].contains("PlanBudgetMismatch"),
-            "refusal carries the honest budget token: {}",
+            partials[0].contains("8193 endpoints exceed the 8192 counter ceiling"),
+            "refusal states the budget in plain words with the counts: {}",
             partials[0]
         );
         assert_eq!(
@@ -4866,8 +4866,8 @@ mod tests {
         assert_eq!(failed, 0);
         assert_eq!(partials.len(), 1);
         assert!(
-            partials[0].contains("PlanBudgetMismatch"),
-            "refusal carries the honest budget token: {}",
+            partials[0].contains("8193 endpoints exceed the 8192 counter ceiling"),
+            "refusal states the budget in plain words with the counts: {}",
             partials[0]
         );
         assert_eq!(
@@ -4981,10 +4981,10 @@ mod tests {
             "the refusal adds exactly one PARTIAL: {over_partials:?} vs {partials:?}"
         );
         assert!(
-            over_partials
-                .last()
-                .is_some_and(|reason| reason.contains("PlanBudgetMismatch")),
-            "refusal carries the honest budget token: {over_partials:?}"
+            over_partials.last().is_some_and(
+                |reason| reason.contains("8193 endpoints exceed the 8192 counter ceiling")
+            ),
+            "refusal states the budget in plain words with the counts: {over_partials:?}"
         );
         let budgets = session.counter_budgets(0).unwrap();
         assert_eq!(
@@ -5208,8 +5208,8 @@ mod tests {
         assert_eq!(failed, 0);
         assert_eq!(partials.len(), 1);
         assert!(
-            partials[0].contains("PlanBudgetMismatch"),
-            "refusal carries the honest budget token: {}",
+            partials[0].contains("8193 endpoints exceed the 8192 counter ceiling"),
+            "refusal states the budget in plain words with the counts: {}",
             partials[0]
         );
         assert_eq!(

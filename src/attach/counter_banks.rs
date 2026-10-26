@@ -3328,6 +3328,39 @@ fn map_counter_verifier_budget_refusal(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Resource name for the counter endpoint ceiling `BudgetExhausted`
+/// refusal: growth past the ceiling refuses with the requested and
+/// ceiling counts. The Engine growth refusal text renders this resource
+/// in plain words.
+pub(crate) const COUNTER_ENDPOINT_CEILING_RESOURCE: &str = "counter endpoints";
+
+/// Over-ceiling refusal for counter growth: when the candidate plan holds
+/// more slots than the endpoint budget or the bank geometry allows, the
+/// budget refuses with the requested and ceiling counts. Returns `None`
+/// when the plan fits, so callers build extents only for in-budget plans.
+/// The predicate matches validate_plan_detailed's budget arm (over iff
+/// longer than the smaller of the budget and geometry limits); only the
+/// refusal value carries the counts.
+fn counter_growth_ceiling_refusal(
+    slots: usize,
+    budget: crate::capacity::CounterBudget,
+    geometry: BankGeometry,
+) -> Option<BankRefusal> {
+    let Ok(needed) = u64::try_from(slots) else {
+        return Some(BankRefusal::Budget);
+    };
+    let ceiling = budget.endpoint_limit().min(u64::from(geometry.limit()));
+    if needed > ceiling {
+        Some(BankRefusal::BudgetExhausted {
+            resource: COUNTER_ENDPOINT_CEILING_RESOURCE,
+            needed,
+            available: ceiling,
+        })
+    } else {
+        None
+    }
+}
+
 impl Session {
     /// A new private Session only, with its backend fixed before root loading.
     pub(crate) fn prepare_counter_banks_with_backend(
@@ -3531,6 +3564,19 @@ impl Session {
         let end = plan.slots.len();
         if first == end {
             return BankPublication::Refused(BankRefusal::Allocated);
+        }
+        // The plan budget precedes the extent shape: growth past the
+        // endpoint ceiling refuses with the budget (carrying the
+        // requested and ceiling counts) instead of a shape error, so the
+        // refusal names the honest cause. ExtentBounds stays for
+        // genuinely misshapen extents within the ceiling.
+        let crate::plan::AdmissionPolicy::Counters(budget) = plan.admission_policy() else {
+            drop(directory);
+            return BankPublication::Refused(BankRefusal::Shape(BankShapeCause::PlanNotCounters));
+        };
+        if let Some(refusal) = counter_growth_ceiling_refusal(plan.slots.len(), budget, geometry) {
+            drop(directory);
+            return BankPublication::Refused(refusal);
         }
         let extent = match BankExtent::checked(first as u32, end as u32, geometry.limit()) {
             Ok(extent) => extent,
@@ -5394,6 +5440,38 @@ pub(crate) mod tests {
         assert_eq!(candidate.counter_consumed_end(), 0);
         assert_eq!(directory.published_indices().collect::<Vec<_>>(), [0]);
         assert_eq!(io.routes.len(), 1, "no fresh route was inserted");
+    }
+
+    #[test]
+    fn counter_growth_ceiling_refusal_carries_requested_and_ceiling_counts() {
+        // The growth seam checks the plan budget before building bank
+        // extents, so the 8,193rd endpoint refuses with the budget (and
+        // its counts) instead of a shape error. In-budget plans pass
+        // through to the extent shape check.
+        let growth = BankGeometry::checked(CounterMode::Counts, 16, 512).unwrap();
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        assert_eq!(
+            counter_growth_ceiling_refusal(8193, budget, growth),
+            Some(BankRefusal::BudgetExhausted {
+                resource: COUNTER_ENDPOINT_CEILING_RESOURCE,
+                needed: 8193,
+                available: 8192,
+            })
+        );
+        assert_eq!(counter_growth_ceiling_refusal(8192, budget, growth), None);
+        assert_eq!(counter_growth_ceiling_refusal(512, budget, growth), None);
+        // The tighter of the budget and the geometry wins: a small budget
+        // on the growth geometry refuses at the budget.
+        let small = crate::capacity::CounterBudget::new(512).unwrap();
+        assert_eq!(
+            counter_growth_ceiling_refusal(513, small, growth),
+            Some(BankRefusal::BudgetExhausted {
+                resource: COUNTER_ENDPOINT_CEILING_RESOURCE,
+                needed: 513,
+                available: 512,
+            })
+        );
+        assert_eq!(counter_growth_ceiling_refusal(512, small, growth), None);
     }
 
     #[test]

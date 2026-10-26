@@ -2,7 +2,8 @@
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::counter_banks::{
-    BankPublication, BankRefusal, BankShapeCause, CounterSpec, check_counter_endpoints_fit,
+    BankPublication, BankRefusal, BankShapeCause, COUNTER_ENDPOINT_CEILING_RESOURCE, CounterSpec,
+    check_counter_endpoints_fit,
 };
 #[cfg(feature = "h6-reexec-diagnostic")]
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
@@ -8835,13 +8836,27 @@ fn counter_staging_refusal_text(publication: &BankPublication, check: Option<&st
     }
 }
 
-/// Finite counter growth refusal text: the publication token plus the
-/// failing check when the refusal named one. Unnamed refusals keep their
-/// exact historical token text.
+/// Finite counter growth refusal text: the endpoint-ceiling budget
+/// refusal renders in plain words with its counts; every other
+/// publication keeps the token plus the failing check when the refusal
+/// named one. Unnamed refusals keep their exact historical token text.
 pub(crate) fn counter_growth_refusal_text(
     publication: &BankPublication,
     check: Option<&str>,
 ) -> String {
+    if let BankPublication::Refused(BankRefusal::BudgetExhausted {
+        resource,
+        needed,
+        available,
+    }) = publication
+        && *resource == COUNTER_ENDPOINT_CEILING_RESOURCE
+    {
+        let text = format!("{needed} endpoints exceed the {available} counter ceiling");
+        return match check {
+            Some(check) => format!("{text} ({check})"),
+            None => text,
+        };
+    }
     match check {
         Some(check) => format!("{publication:?} ({check})"),
         None => format!("{publication:?}"),

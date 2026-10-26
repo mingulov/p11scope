@@ -296,9 +296,11 @@ jobs:
           # variables after sudo's own environment strip; plain
           # `sudo VAR=...` needs a SETENV sudoers tag the runner lacks.
           rc=0
-          sudo env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 \
-            bash -c '"$0" doctor 9>"$1" >"$2" 2>&1' \
-            "$OBSERVER" "$OUT/probe-host.jsonl" "$OUT/doctor-host.txt" || rc=$?
+          # LD_PRELOAD is set inside the root shell for the observer only,
+          # as in the guest driver; preloading the probe into the shell too
+          # left the stats file empty on the first hosted run.
+          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" doctor 9>"$1" >"$2" 2>&1' \
+            "$OBSERVER" "$OUT/probe-host.jsonl" "$OUT/doctor-host.txt" "$PROBE" || rc=$?
           echo "doctor rc=$rc"
           for f in "$OUT/probe-host.jsonl" "$OUT/doctor-host.txt"; do
             if [ -e "$f" ]; then

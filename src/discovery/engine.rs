@@ -27212,8 +27212,15 @@ impl Engine {
         new: Vec<plan::Slot>,
         pinned: PinnedObjects,
     ) -> Result<(usize, usize, Vec<String>)> {
+        // Production candidates evolve from committed pins (absorb), so
+        // loader contexts always resolve; bare fresh pins would trip the
+        // missing-contexts admission and stage nothing.
+        let mut candidate_pins = self.pinned.clone();
+        for skip in candidate_pins.absorb(pinned) {
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
         let candidate = LiveCandidate {
-            pinned,
+            pinned: candidate_pins,
             modules: Vec::new(),
             plan,
             delta: plan::AttachDelta {

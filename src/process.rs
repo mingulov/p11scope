@@ -1723,7 +1723,8 @@ mod tests {
             // particular no SA_RESTART, so a signal during poll surfaces as
             // EINTR exactly like the second SIGINT in production).
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = sigurg_noop_handler as libc::sighandler_t;
+            action.sa_sigaction =
+                sigurg_noop_handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
             unsafe { libc::sigemptyset(&mut action.sa_mask) };
             let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
             // SAFETY: installing a signal-safe no-op handler; the old
@@ -1802,9 +1803,8 @@ mod tests {
         let elapsed = start.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         sender.join().expect("the sender thread joins");
-        assert_eq!(
-            ready.expect("a signal during a finite wait retries, never fails"),
-            false,
+        assert!(
+            !ready.expect("a signal during a finite wait retries, never fails"),
             "a live child is never ready"
         );
         assert!(
@@ -1849,10 +1849,9 @@ mod tests {
     #[test]
     fn a_finite_pidfd_wait_without_signals_times_out_unready() {
         let (pin, _child) = live_pin_and_child();
-        assert_eq!(
-            pin.wait_ready(Some(Duration::from_millis(50)))
-                .expect("an unobstructed wait succeeds"),
-            false
+        assert!(
+            !pin.wait_ready(Some(Duration::from_millis(50)))
+                .expect("an unobstructed wait succeeds")
         );
     }
 

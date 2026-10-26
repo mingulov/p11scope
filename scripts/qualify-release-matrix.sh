@@ -56,7 +56,9 @@ usage() {
   sed -n '2,30p' "$0" >&2
 }
 
-# Source-registered kernels and the separately owned host lane.
+# Source-registered kernels and the separately owned host lane. Fedora
+# stays out of the defaults: its lane runs via the live-cell procedure
+# on fedora, never through this runner (run_one refuses it).
 default_kernels() {
   printf '%s\n' \
     "v5.15.221" \
@@ -64,6 +66,7 @@ default_kernels() {
     "v6.6.157" \
     "/home/user/.cache/virtme-ng/ubuntu-6.8.0-142/amd64/boot/vmlinuz-6.8.0-142-generic" \
     "v6.12.111" \
+    "v6.18.58" \
     "v7.2.6" \
     "host"
 }
@@ -74,8 +77,10 @@ resolve_kernel() {
     6.1|6.1.188|v6.1.188) echo "v6.1.188" ;;
     6.6|6.6.157|v6.6.157) echo "v6.6.157" ;;
     host) echo host ;;
+    fedora|fedora-7.2.9) echo "fedora-7.2.9" ;;
     6.8|6.8.0-142|6.8.0-142-generic|ubuntu-6.8*) echo "/home/user/.cache/virtme-ng/ubuntu-6.8.0-142/amd64/boot/vmlinuz-6.8.0-142-generic" ;;
     6.12|6.12.111|v6.12.111) echo "v6.12.111" ;;
+    6.18|6.18.58|v6.18.58) echo "v6.18.58" ;;
     7.2|7.2.6|v7.2.6) echo "v7.2.6" ;;
     *) echo "$1" ;;
   esac
@@ -566,6 +571,10 @@ SUMMARY=$OUT_REV/summary.md
 
 run_one() {
   local k=$1 tag lane stage out start end wall vng_exit judge_exit
+  if [ "$k" = fedora-7.2.9 ]; then
+    echo "fedora lane fedora-7.2.9 runs via the live-cell procedure on fedora, not this matrix runner" >&2
+    return 2
+  fi
   tag=$(tag_for_kernel "$k"); lane=${tag#v}
   stage=$STAGE_REV/$tag; out=$OUT_REV/$tag
   [ ! -e "$stage" ] && [ ! -e "$out" ] || { echo "refusing existing stage/output: $tag" >&2; return 1; }

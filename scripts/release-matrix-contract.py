@@ -22,7 +22,13 @@ import uuid
 
 SCHEMA = "p11scope/release-matrix-contract/v1"
 ROOT = Path(__file__).resolve().parents[1]
-LANES = ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "7.2.6", "host")
+# The Fedora live-cell lane: Fedora 7.2.9 runs live cells on the real
+# host through its own live-cell procedure, never as a vng guest, so
+# the contract treats it like "host" (no guest boot config, no vng
+# launch) while the matrix runner refuses to execute it.
+FEDORA_LANE = "fedora-7.2.9"
+LANES = ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "host",
+         FEDORA_LANE)
 PID_TEST = "tests::the_pid_filter_probe_reaches_the_kernel"
 # Exact source registrations; only an actual candidate list establishes membership.
 DEFAULT_LIB_TESTS = (
@@ -352,6 +358,7 @@ def guest_disk_input(image, filesystem_uuid):
 
 def launch_guest(stage, contract_path, kernel):
     contract = verify_inputs(stage, contract_path)
+    require(contract["lane"] != FEDORA_LANE, "fedora lanes run via the live-cell procedure on fedora, not vng")
     require(contract["lane"] != "host" and kernel is not None, "guest launcher requires a guest kernel lane")
     config, release = guest_boot_config(kernel)
     require(release == contract["expected_osrelease"] and str(config) == contract["guest_boot_config"]["source"]
@@ -472,6 +479,7 @@ def mount_guest_work_disk(stage, contract):
 
 def run_guest_inner(stage, contract_path):
     contract = verify_inputs(stage, contract_path)
+    require(contract["lane"] != FEDORA_LANE, "fedora lanes run via the live-cell procedure on fedora, not the guest inner entrypoint")
     require(os.geteuid() == 0 and contract["lane"] != "host", "guest inner launcher requires root in a guest lane")
     release = subprocess.run(["uname", "-r"], text=True, capture_output=True)
     require(release.returncode == 0 and release.stdout.strip() == contract["expected_osrelease"], "wrong executed guest osrelease")
@@ -838,8 +846,10 @@ D4_CELLS = {
 D4_LANES = {
     "D4:overlay-6.1": ("6.1.188",),
     "D4:overlay-6.6": ("6.6.157",),
-    "D4:overlay-6.8+": ("6.8.0-142-generic", "6.12.111", "7.2.6", "host"),
-    "D4:ext4-inode-reuse": ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "7.2.6", "host"),
+    "D4:overlay-6.8+": ("6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "host",
+                        FEDORA_LANE),
+    "D4:ext4-inode-reuse": ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "6.18.58",
+                            "7.2.6", "host", FEDORA_LANE),
 }
 D4_READY = frozenset(
     {
@@ -925,14 +935,16 @@ def validate_contract(contract):
     require(isinstance(contract.get("run_id"), str) and re.fullmatch(r"[0-9a-f]{32}", contract["run_id"]), "invalid run binding")
     validate_run_identity(contract.get("run_identity"))
     if contract.get("guest_disk") is not None:
+        require(contract["lane"] != FEDORA_LANE, "fedora lane cannot use a guest disk")
         require(contract["lane"] != "host", "host lane cannot use a guest disk")
         validate_guest_disk_binding(contract["guest_disk"])
     work_root = contract.get("guest_work_root")
     require(isinstance(work_root, str) and Path(work_root).is_absolute() and str(Path(work_root)) == work_root,
             "invalid guest work-root binding")
     boot = contract.get("guest_boot_config")
-    if contract["lane"] == "host":
-        require(boot is None and contract.get("expected_osrelease") is None, "host lane must not stage guest boot config")
+    if contract["lane"] in ("host", FEDORA_LANE):
+        local = "host" if contract["lane"] == "host" else "fedora"
+        require(boot is None and contract.get("expected_osrelease") is None, f"{local} lane must not stage guest boot config")
     else:
         require(isinstance(boot, dict) and set(boot) == {"source", "sha256", "osrelease"}, "invalid guest boot binding")
         require(isinstance(boot["source"], str) and Path(boot["source"]).is_absolute()
@@ -996,8 +1008,9 @@ def prepare(args):
     require(args.kernel is not None, "prepare requires the actual selected --kernel")
     disk = guest_disk_input(args.guest_disk, args.guest_disk_uuid)
     require(args.lane != "host" or disk is None, "host lane cannot use a guest disk")
-    if args.lane == "host":
-        require(args.kernel == "host", "host lane requires host kernel")
+    if args.lane in ("host", FEDORA_LANE):
+        local = "host" if args.lane == "host" else "fedora"
+        require(args.kernel == args.lane, f"{local} lane requires {local} kernel")
         config, release = None, None
     else:
         config, release = guest_boot_config(args.kernel)
@@ -1567,7 +1580,7 @@ def judge(stage, contract_path):
     for name, digest in hashes.items():
         require(sha(relative(stage, name)) == digest, "stale evidence hash: " + name)
     read = lambda name: relative(stage, name).read_text()
-    require(contract["lane"] == "host" or read("uname.txt").strip() == contract["expected_osrelease"], "wrong executed kernel osrelease")
+    require(contract["lane"] in ("host", FEDORA_LANE) or read("uname.txt").strip() == contract["expected_osrelease"], "wrong executed kernel osrelease")
     exits = {name: process_exit(read(path), name, contract["run_id"]) for path, name in EXITS.items()}
     if contract["include_scan"]:
         exits["inv_scan"] = process_exit(read("inv-scan.log"), "inv_scan", contract["run_id"])

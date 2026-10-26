@@ -46,15 +46,22 @@ printf 'directories.tokendir = %s\nobjectstore.backend = file\nlog.level = ERROR
 ITERATIONS=200
 FAILED=0
 ulimit -n 65536 2>/dev/null || true
+if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_UID:-}" ]; then
+    # A root observer drops the owned child to a non-root uid; default
+    # to 1000 like the owned-run cells when the caller sets none.
+    export SUDO_UID=1000 SUDO_GID="${SUDO_GID:-1000}"
+    echo "# SUDO_UID unset: dropping owned children to $SUDO_UID:$SUDO_GID"
+fi
 
 run_capture() {
     name=$1
     shift
     log="$OUTDIR/$name.log"
     echo "## $name"
-    # shellcheck disable=SC2086
-    if ! timeout -k 30 300 "$OBSERVER" "$@" >"$log" 2>&1; then
-        echo "# error: $name exited $?"
+    rc=0
+    timeout -k 30 300 "$OBSERVER" "$@" >"$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "# error: $name exited $rc"
         tail -5 "$log"
         FAILED=1
         return 1

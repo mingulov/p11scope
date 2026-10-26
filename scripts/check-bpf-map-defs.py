@@ -718,6 +718,80 @@ def validate_marker_helpers(elf, inventory=False):
             )
 
 
+def validate_marker_call_sites(elf):
+    """Keep the birth marker wired: every defined Detailed root that can
+    birth or gap must call its marker global.
+
+    Objects without both globals skip this check (fixtures without a
+    marker, counter and inventory objects). Core roots (p11_entry,
+    p11_return, sched_process_exec) must exist; unsafe-only roots
+    (p11_entry_ia32, the template continuation) must call when defined.
+    Each call must resolve to the GLOBAL .text definition, never a
+    same-named local.
+    """
+    markers = {symbol[0] for symbol in elf.symbols
+               if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS}
+    if markers != REQUIRED_GLOBAL_MARKER_HELPERS:
+        return
+    text = elf.indices.get(".text")
+    relocs = {}
+    for row, raw in elf.sections.values():
+        if row[1] != 9:
+            continue
+        if row[9] != 16 or len(raw) % 16:
+            raise RuntimeError("invalid marker call relocation table")
+        for at in range(0, len(raw), 16):
+            address, info = struct.unpack_from("<QQ", raw, at)
+            if info >> 32 >= len(elf.symbols) or (row[7], address) in relocs:
+                raise RuntimeError("invalid/duplicate marker call relocation")
+            relocs[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+    bodies = [symbol for symbol in elf.symbols
+              if symbol[1] & 15 == 2 and symbol[1] >> 4 == 1 and symbol[3] and symbol[5]]
+    by_name = {}
+    for symbol in bodies:
+        by_name.setdefault(symbol[0], []).append(symbol)
+    required = {
+        "p11_entry": "p11_instance_scope_gap",
+        "p11_return": "p11_instance_scope_gap",
+        "sched_process_exec": "p11_instance_exec_birth",
+    }
+    optional = {
+        "p11_entry_ia32": "p11_instance_scope_gap",
+        "p11_entry_template_second": "p11_instance_scope_gap",
+    }
+    for root in required:
+        if root not in by_name:
+            raise RuntimeError(f"Detailed {root} program is missing")
+    for root, marker in list(required.items()) + list(optional.items()):
+        for _, _, _, section, start, size in by_name.get(root, []):
+            body = checked_slice(sections.get(section, b""), start, size,
+                                 "marker caller body")
+            wired = False
+            for pos in range(0, len(body), 8):
+                op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+                if op != 0x85 or reg != 0x10:
+                    continue
+                relocation = relocs.get((section, start + pos))
+                if relocation:
+                    kind, target = relocation
+                    if kind != 10:
+                        raise RuntimeError(
+                            f"invalid marker call relocation kind in {root}")
+                    if (target[0] == marker and target[1] == 0x12
+                            and target[3] == text):
+                        wired = True
+                        break
+                else:
+                    dest = (section, start + pos + (imm + 1) * 8)
+                    if any(symbol[0] == marker and symbol[1] == 0x12
+                           and (symbol[3], symbol[4]) == dest for symbol in bodies):
+                        wired = True
+                        break
+            if not wired:
+                raise RuntimeError(f"Detailed {root} must call {marker}")
+
+
 def validate_diagnostic_helper_linkage(elf):
     """Pin GLOBAL linkage for the diagnostic decoder/walkers.
 
@@ -1793,6 +1867,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
     validate_marker_helpers(elf, inventory)
+    validate_marker_call_sites(elf)
     if not inventory:
         validate_selected_leaf(elf)
         validate_root_helpers(elf)

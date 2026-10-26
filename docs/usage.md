@@ -478,6 +478,9 @@ Views without an executable (kernel threads) and static executables are not
 loader-arming candidates and no longer count as `unavailable`: arming returns
 a silent NotArmable outcome, retried next tick like any unarmed view, while
 genuine arm failures still mark and record as before.
+Memory scans treat the same shape the same way: a process whose maps read
+0 bytes and whose stat flags carry PF_KTHREAD scans as verified absence (no
+modules, no skip), so kernel threads no longer force system captures PARTIAL.
 
 For cgroup event captures, `task/task_newtask` records ordinary non-thread
 creation as a semantic hint and may preserve the parent's proven state while

@@ -362,10 +362,41 @@ mod tests {
         body: String,
     }
 
+    /// Strip balanced `#[...]` attribute groups from the front of one
+    /// source line, returning the remainder. A capture attribute may
+    /// carry `#[cfg(..)]` or other attributes between itself and its
+    /// fn, or share the fn line; anything else before the fn fails
+    /// closed at the call site.
+    fn strip_rust_attributes(line: &str) -> &str {
+        let mut rest = line.trim_start();
+        while let Some(after_open) = rest.strip_prefix("#[") {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (offset, byte) in after_open.bytes().enumerate() {
+                if byte == b'[' {
+                    depth += 1;
+                } else if byte == b']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+            }
+            let Some(end) = end else {
+                break;
+            };
+            rest = after_open[end + 1..].trim_start();
+        }
+        rest
+    }
+
     /// OD-1 capture-program inventory: every `#[uprobe]` /
     /// `#[uretprobe]` / `#[raw_tracepoint(..)]` function in a capture
-    /// source, including `#[cfg(feature = ..)]`-gated ones. The body runs
-    /// from the `pub fn` line through its column-zero closing brace.
+    /// source, including `#[cfg(feature = ..)]`-gated ones. Attribute
+    /// lines between the probe attribute and its fn are skipped; the
+    /// body runs from the `pub fn` line through its column-zero closing
+    /// brace.
     fn scan_rust_programs(source: &str) -> Vec<RustProgram> {
         let lines: Vec<&str> = source.lines().collect();
         let mut programs = Vec::new();
@@ -384,19 +415,34 @@ mod tests {
                 index += 1;
                 continue;
             };
-            let head = lines[index + 1]
-                .strip_prefix("pub fn ")
-                .expect("a capture attribute is immediately followed by its fn");
+            // Attribute lines between the probe attribute and its fn
+            // are skipped; the fn may also share its line with a
+            // trailing attribute prefix. Anything else fails closed.
+            let mut head_index = index + 1;
+            let head = loop {
+                let line = lines
+                    .get(head_index)
+                    .expect("a capture attribute is followed by its fn");
+                let trimmed = line.trim_start();
+                if let Some(head) = strip_rust_attributes(trimmed).strip_prefix("pub fn ") {
+                    break head;
+                }
+                assert!(
+                    trimmed.starts_with("#[") && strip_rust_attributes(trimmed).is_empty(),
+                    "a capture attribute is immediately followed by its fn"
+                );
+                head_index += 1;
+            };
             let name = head.split('(').next().expect("a fn name").to_string();
-            let end = lines[index + 2..]
+            let end = lines[head_index + 1..]
                 .iter()
                 .position(|line| *line == "}")
-                .map(|offset| index + 2 + offset)
+                .map(|offset| head_index + 1 + offset)
                 .expect("a top-level fn ends at column zero");
             programs.push(RustProgram {
                 name,
                 attr,
-                body: lines[index + 1..=end].join("\n"),
+                body: lines[head_index..=end].join("\n"),
             });
             index = end + 1;
         }
@@ -798,8 +844,10 @@ mod tests {
                 .contains("#[cfg(feature = \"inventory-only\")]\nmod inventory;"),
             "the usage rows are owned by the inventory-only module line"
         );
-        // The 2 counter-bank roots: private bank-proof build only, so this
-        // source check is their only guard; each passes the gate rule.
+        // The 4 counter-bank roots: the counts pair, gated on their
+        // signature lines, then the timing pair, gated before their
+        // attributes. Private bank-proof build only, so this source
+        // check is their only guard; each passes the gate rule.
         let banks = scan_rust_programs(include_str!("../../crates/ebpf/src/counter_bank_proof.rs"));
         let bank_names: Vec<(&str, RustProgramAttr)> = banks
             .iter()
@@ -810,8 +858,10 @@ mod tests {
             [
                 ("p11_counter_bank_entry", RustProgramAttr::UProbe),
                 ("p11_counter_bank_return", RustProgramAttr::URetProbe),
+                ("p11_counter_bank_entry", RustProgramAttr::UProbe),
+                ("p11_counter_bank_return", RustProgramAttr::URetProbe),
             ],
-            "counter_bank_proof.rs holds exactly its 2 roots"
+            "counter_bank_proof.rs holds exactly its 4 roots"
         );
         for program in &banks {
             check_rust_gate(&program.name, &program.body, false).unwrap();

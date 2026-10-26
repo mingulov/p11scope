@@ -4387,6 +4387,45 @@ fn count_disclosed_gaps(
         .fold(0u64, |total, repeats| total.saturating_add(repeats))
 }
 
+/// Sorted fingerprint of every semantic edge's observable populations.
+/// The idle loop proves ambient lifecycle publishes move none of them.
+fn joint_edges_fingerprint(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
+    let mut rows: Vec<String> = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| {
+            format!(
+                "{:?}/{:?} api={:?} red={} joint={} st={:?} co={:?} lossy={} reasons={:?}",
+                record.caller,
+                record.module,
+                record.api_returns,
+                record.feed.reduced(),
+                record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
+                record.semantics.as_ref().map(|edge| edge.started()),
+                record.semantics.as_ref().map(|edge| edge.completed()),
+                record.lossy,
+                record.reasons,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Sorted fingerprint of every published gap row with its repeat count.
+fn joint_gaps_fingerprint(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
+    let registry = coordinator.registry();
+    let mut rows: Vec<String> = registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .map(|(gap, repeats)| format!("{gap:?} x{repeats}"))
+        .collect();
+    rows.sort();
+    rows.push(format!("suppressed={}", registry.gaps_suppressed()));
+    rows
+}
+
 /// The single disclosed reason for a caller-less scope-gap subject:
 /// exactly one published row must carry the subject, else the
 /// disclosure is missing or ambiguous and no exemption can pin it.
@@ -4884,33 +4923,80 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
             edge.api_returns
         );
     }
-    // Without A's END, further service changes nothing observable: no
-    // replay, no revision, no H3 movement.
+    // Without A's END, further service adds no CALL facts: no replay, no
+    // edge movement, no new gaps, no H3 pending. The ring is system-wide,
+    // so ambient non-call (FORK/task-newtask) lifecycle records may land
+    // mid-window; a demandless service legally collects and publishes
+    // them, one H3 take per publish. The revision may advance on ambient
+    // lifecycle only; call content must not move.
     let revision_q1 = coordinator.registry().published_revision();
     let h3_q1 = coordinator.reference_h3_audit_state();
+    let edges_q1 = joint_edges_fingerprint(&coordinator);
+    let gaps_q1 = joint_gaps_fingerprint(&coordinator);
+    let feeds_q1 = coordinator.registry().joint_feeds();
+    let receipts_q1 = coordinator
+        .registry()
+        .pending_joint_receipts_for_test()
+        .len();
+    let mut idle_publishes = 0u64;
     for idle in 0..3 {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
         };
         joint_drive_line(&lane, &coordinator, "r16-q1", &format!("idle{idle}"));
-        lane.service_joint(
-            &mut coordinator,
-            crate::inventory_semantics::JointServiceMode::Running,
-            &mut budget,
-        )
-        .map_err(|reason| {
-            joint_drive_line(&lane, &coordinator, "r16-q1", "idle-FAILED");
-            anyhow::anyhow!("r16-q1: idle service refused: {reason}")
-        })?;
+        let progress = lane
+            .service_joint(
+                &mut coordinator,
+                crate::inventory_semantics::JointServiceMode::Running,
+                &mut budget,
+            )
+            .map_err(|reason| {
+                joint_drive_line(&lane, &coordinator, "r16-q1", "idle-FAILED");
+                anyhow::anyhow!("r16-q1: idle service refused: {reason}")
+            })?;
+        if progress == crate::inventory_semantics::JointServiceProgress::Published {
+            idle_publishes += 1;
+        }
     }
+    let revision_idle = coordinator.registry().published_revision();
+    let h3_idle = coordinator.reference_h3_audit_state();
+    let rev_advance = revision_idle.saturating_sub(revision_q1);
     ensure!(
-        coordinator.registry().published_revision() == revision_q1,
-        "r16-q1: idle service publishes nothing"
+        rev_advance == idle_publishes,
+        "r16-q1: each idle revision comes from exactly one idle publish: \
+         {revision_q1}->{revision_idle} with {idle_publishes} publishes"
     );
     ensure!(
-        coordinator.reference_h3_audit_state() == h3_q1,
-        "r16-q1: idle service moves no H3 audit"
+        h3_idle.0.saturating_sub(h3_q1.0) == idle_publishes as usize,
+        "r16-q1: one H3 take per idle publish: takes {}->{} with {idle_publishes} publishes",
+        h3_q1.0,
+        h3_idle.0,
+    );
+    ensure!(
+        h3_idle.1 == h3_q1.1,
+        "r16-q1: idle service opens no H3 pending"
+    );
+    ensure!(
+        joint_edges_fingerprint(&coordinator) == edges_q1,
+        "r16-q1: idle service moves no edge call facts: {:?} vs {:?}",
+        joint_edges_fingerprint(&coordinator),
+        edges_q1,
+    );
+    ensure!(
+        joint_gaps_fingerprint(&coordinator) == gaps_q1,
+        "r16-q1: idle service records no gaps: {:?} vs {:?}",
+        joint_gaps_fingerprint(&coordinator),
+        gaps_q1,
+    );
+    ensure!(
+        coordinator.registry().joint_feeds() == feeds_q1
+            && coordinator
+                .registry()
+                .pending_joint_receipts_for_test()
+                .len()
+                == receipts_q1,
+        "r16-q1: idle service mints no feeds or receipts"
     );
     let reduced_idle: u64 = coordinator
         .registry()
@@ -4918,6 +5004,14 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         .map(|record| record.feed.reduced())
         .sum();
     ensure!(reduced_idle == 0, "r16-q1: idle service replays nothing");
+    eprintln!(
+        "JOINT_R16 r16-q1-idle revisions={revision_q1}->{revision_idle} \
+         takes={}->{} publishes={idle_publishes} edges={} gaps={}",
+        h3_q1.0,
+        h3_idle.0,
+        edges_q1.len(),
+        gaps_q1.len(),
+    );
     eprintln!(
         "JOINT_R16 r16-q1 polls={q1_polls} revision={revision_before}->{revision_q1} \
          reduced={reduced_q1} b_edge={} a_edge={}",
@@ -5548,8 +5642,9 @@ mod joint_ledger_parse_tests {
     //! here rather than trusted implicitly.
     use super::{
         JOINT_SOFT_FUNCTIONS, QuietExemption, assert_quiet_twins_except, count_disclosed_gaps,
-        disclosed_scope_reason, exactness_diagnosis, ledger_calls, ledger_semantic_split,
-        ledger_stamp, system_joint_coordinator,
+        disclosed_scope_reason, exactness_diagnosis, joint_edges_fingerprint,
+        joint_gaps_fingerprint, ledger_calls, ledger_semantic_split, ledger_stamp,
+        system_joint_coordinator,
     };
     use std::collections::BTreeMap;
 
@@ -5737,6 +5832,40 @@ mod joint_ledger_parse_tests {
             ),
             0
         );
+        Ok(())
+    }
+
+    /// The idle fingerprints distinguish gap content and repeats, and
+    /// cover edges: identical states fingerprint identically, any new
+    /// gap row changes the fingerprint, and an edge-less coordinator
+    /// fingerprints empty.
+    #[test]
+    fn idle_fingerprints_distinguish_gaps_and_cover_edges() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let mut coordinator = system_joint_coordinator(&[])?;
+        assert!(joint_edges_fingerprint(&coordinator).is_empty());
+        let bare = joint_gaps_fingerprint(&coordinator);
+        assert_eq!(bare, vec!["suppressed=0".to_string()]);
+        let caller = CallerId(7);
+        for _ in 0..2 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: None,
+                subject: "semantic input refused".into(),
+                reason: "slot".into(),
+                budget: None,
+            });
+        }
+        coordinator.registry_mut().publish();
+        let gapped = joint_gaps_fingerprint(&coordinator);
+        assert_ne!(gapped, bare);
+        // One published row with two repeats, plus the suppressed line.
+        assert_eq!(gapped.len(), 2);
+        assert!(gapped.iter().any(|row| row.contains("x2")));
+        // An unchanged state fingerprints identically.
+        assert_eq!(joint_gaps_fingerprint(&coordinator), gapped);
+        assert!(joint_edges_fingerprint(&coordinator).is_empty());
         Ok(())
     }
 

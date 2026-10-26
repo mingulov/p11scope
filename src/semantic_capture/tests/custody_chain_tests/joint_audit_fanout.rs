@@ -3878,10 +3878,11 @@ fn gap_fingerprint(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<S
     rows
 }
 
+/// Per-edge call facts: api returns, reduced, started, completed.
+type EdgeCallFacts = (Option<u64>, u64, Option<u64>, Option<u64>);
+
 /// Sorted per-edge call facts: api returns, reduced, started, completed.
-fn edge_call_facts(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
-) -> Vec<(Option<u64>, u64, Option<u64>, Option<u64>)> {
+fn edge_call_facts(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<EdgeCallFacts> {
     let mut facts: Vec<_> = coordinator
         .registry()
         .instance_semantic_edges()
@@ -3960,10 +3961,7 @@ fn joint_machine_idle_service_without_records_publishes_nothing() {
                 .0,
             claims
         );
-        assert_eq!(
-            coordinator.joint_capture().ledger().roles_for_test(),
-            roles
-        );
+        assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
     }
     assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
 }
@@ -4061,10 +4059,7 @@ fn joint_machine_idle_service_with_fork_records_publishes_without_call_facts() {
             .0,
         claims
     );
-    assert_eq!(
-        coordinator.joint_capture().ledger().roles_for_test(),
-        roles
-    );
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
 }
 
 #[test]

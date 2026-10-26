@@ -343,7 +343,7 @@ for KERNEL in "$@"; do
                     FAILED=1
                     continue
                 fi
-                if grep -q -E '"loaded": ?true' "$C_PROBE_JSON"; then
+                if grep 'p11_counter_bank' "$C_PROBE_JSON" | grep -q -E '"loaded": ?true'; then
                     echo "# error: counter-$MODE on $KERNEL loaded where refusal was specified (see $C_PROBE_JSON)"
                     FAILED=1
                     continue

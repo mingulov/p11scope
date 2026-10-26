@@ -4321,7 +4321,6 @@ struct JointEdgeSnapshot {
     joint: bool,
     started: Option<u64>,
     completed: Option<u64>,
-    orphans: Option<u64>,
 }
 
 fn joint_edge_snapshot(
@@ -4342,7 +4341,6 @@ fn joint_edge_snapshot(
         joint: record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
         started: record.semantics.as_ref().map(|edge| edge.started()),
         completed: record.semantics.as_ref().map(|edge| edge.completed()),
-        orphans: record.semantics.as_ref().map(|edge| edge.orphans()),
     })
 }
 
@@ -4352,7 +4350,100 @@ fn assert_quiet_twins(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     tag: &str,
 ) -> Result<()> {
+    assert_quiet_twins_except(coordinator, tag, &[])
+}
+
+/// Split a CALLS ledger's entered calls into the semantically admitted
+/// population (`api_returns`/`reduced`) and the count-only population.
+/// Conversion refuses COUNT_ONLY slots, so the observer's exact semantic
+/// populations are the semantic side, never the raw ledger total. Unknown
+/// names count as count-only: without a descriptor they have no slot and
+/// are never observed.
+fn ledger_semantic_split(per_function: &BTreeMap<String, u64>) -> (u64, u64) {
+    let mut semantic = 0u64;
+    let mut count_only = 0u64;
+    for (function, entered) in per_function {
+        let admitted = crate::kinds::descriptor(function).is_some_and(|descriptor| {
+            descriptor != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        });
+        if admitted {
+            semantic = semantic.saturating_add(*entered);
+        } else {
+            count_only = count_only.saturating_add(*entered);
+        }
+    }
+    (semantic, count_only)
+}
+
+/// Count registry gaps with an exact subject/reason/caller triple,
+/// summing repeat counts: the registry publishes one gap row per run
+/// and bumps repeats, so identical refusals share a row. This is the
+/// disclosed side of an expected refusal (count-only slot, no-receipt
+/// admission).
+fn count_disclosed_gaps(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    subject: &str,
+    reason: &str,
+    caller: Option<crate::discovery::caller_registry::CallerId>,
+) -> u64 {
+    let registry = coordinator.registry();
+    registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .filter(|(gap, _)| gap.subject == subject && gap.reason == reason && gap.caller == caller)
+        .map(|(_, repeats)| *repeats)
+        .fold(0u64, |total, repeats| total.saturating_add(repeats))
+}
+
+/// One disclosed gap population exempted from the quiet check: an exact
+/// subject/reason/caller triple with a minimum and an optional maximum.
+/// The exemption asserts the population first (never vacuous), then the
+/// quiet check skips exactly those gaps.
+struct QuietExemption<'a> {
+    subject: &'a str,
+    reason: &'a str,
+    caller: Option<crate::discovery::caller_registry::CallerId>,
+    min: u64,
+    max: Option<u64>,
+}
+
+/// The quiet-path loss twins with disclosed exemptions. Anything else
+/// loss-ish still fails.
+fn assert_quiet_twins_except(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    exempt: &[QuietExemption<'_>],
+) -> Result<()> {
+    for exemption in exempt {
+        let count = count_disclosed_gaps(
+            coordinator,
+            exemption.subject,
+            exemption.reason,
+            exemption.caller,
+        );
+        let within_max = exemption.max.is_none_or(|max| count <= max);
+        ensure!(
+            count >= exemption.min && within_max,
+            "{tag}: disclosed {:?}/{:?} gaps for {:?}: {count} (expected >={} {})",
+            exemption.subject,
+            exemption.reason,
+            exemption.caller,
+            exemption.min,
+            exemption
+                .max
+                .map_or("".to_string(), |max| format!("and <={max}")),
+        );
+    }
     for gap in coordinator.registry().gaps() {
+        let excused = exempt.iter().any(|exemption| {
+            gap.subject == exemption.subject
+                && gap.reason == exemption.reason
+                && gap.caller == exemption.caller
+        });
+        if excused {
+            continue;
+        }
         let subject = gap.subject.to_lowercase();
         let reason = gap.reason.to_lowercase();
         ensure!(
@@ -4404,6 +4495,98 @@ fn assert_quiet_twins(
     ensure!(!pending, "{tag}: H3 pending after publication");
     eprintln!("JOINT_R16 {tag} h3_takes={takes}");
     Ok(())
+}
+
+/// Failure-path diagnosis for an exactness mismatch: the caller's full
+/// edge record (or its absence), the binding/mapping state, every
+/// registry gap, the per-function ledger with each function's
+/// semantic/count-only verdict, and the lane counters. The cell prints
+/// these lines before bailing so the root log shows where missing
+/// calls went.
+fn exactness_diagnosis(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    pid: u32,
+    module_substr: &str,
+    per_function: &BTreeMap<String, u64>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let caller = coordinator.adapter().live_id(pid);
+    lines.push(format!(
+        "pid={pid} caller={caller:?} module~{module_substr:?}"
+    ));
+    match caller {
+        Some(id) => {
+            lines.push(format!(
+                "bound={} mapped={}",
+                coordinator.semantic_bindings().get(id).is_some(),
+                u8::from(has_mapped_edge(coordinator, pid)),
+            ));
+            let mut found = false;
+            for record in coordinator.registry().instance_semantic_edges() {
+                if record.caller != id {
+                    continue;
+                }
+                let path = coordinator
+                    .registry()
+                    .module(record.module)
+                    .map(|module| module.paths.iter().next().cloned().unwrap_or_default())
+                    .unwrap_or_default();
+                if !path.contains(module_substr) {
+                    continue;
+                }
+                found = true;
+                let reasons: Vec<&str> =
+                    record.reasons.iter().map(|reason| reason.label()).collect();
+                lines.push(format!(
+                    "edge api_returns={:?} historical_only={} saturated={} lossy={} \
+                     reasons={reasons:?} started={:?} completed={:?} orphans={:?} \
+                     joint={} reduced={}",
+                    record.api_returns,
+                    record.historical_only_returns,
+                    record.saturated,
+                    record.lossy,
+                    record.semantics.as_ref().map(|edge| edge.started()),
+                    record.semantics.as_ref().map(|edge| edge.completed()),
+                    record.semantics.as_ref().map(|edge| edge.orphans()),
+                    record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
+                    record.feed.reduced(),
+                ));
+            }
+            if !found {
+                lines.push("no semantic edge for this caller/module".to_string());
+            }
+        }
+        None => lines.push("caller never admitted".to_string()),
+    }
+    let registry = coordinator.registry();
+    for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
+        lines.push(format!(
+            "gap subject={:?} reason={:?} caller={:?} module={:?} repeats={repeats}",
+            gap.subject, gap.reason, gap.caller, gap.module
+        ));
+    }
+    let mut ledger: Vec<(&String, &u64)> = per_function.iter().collect();
+    ledger.sort();
+    for (function, entered) in ledger {
+        let verdict = match crate::kinds::descriptor(function) {
+            Some(descriptor) if descriptor != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY => {
+                "semantic"
+            }
+            Some(_) => "count-only",
+            None => "unknown",
+        };
+        lines.push(format!("ledger fn={function} entered={entered} {verdict}"));
+    }
+    let (takes, pending) = coordinator.reference_h3_audit_state();
+    lines.push(format!(
+        "h3 takes={takes} pending={pending} feeds={} receipts={}",
+        coordinator.registry().joint_feeds(),
+        coordinator
+            .registry()
+            .pending_joint_receipts_for_test()
+            .len(),
+    ));
+    lines
 }
 
 /// A ClassicDriver seating the Joint lane, for the production finish
@@ -5164,7 +5347,12 @@ mod joint_ledger_parse_tests {
     //! Unit tests for the R1.6 ledger parsers (pure, no root): the exact
     //! population assertions rest on these, so their parsing is pinned
     //! here rather than trusted implicitly.
-    use super::{ledger_calls, ledger_stamp};
+    use super::{
+        JOINT_SOFT_FUNCTIONS, QuietExemption, assert_quiet_twins_except, count_disclosed_gaps,
+        exactness_diagnosis, ledger_calls, ledger_semantic_split, ledger_stamp,
+        system_joint_coordinator,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn calls_ledger_sums_per_function_and_totals() -> anyhow::Result<()> {
@@ -5209,6 +5397,247 @@ mod joint_ledger_parse_tests {
         assert_eq!(ledger_stamp(&out, "HELD ")?, 100);
         assert_eq!(ledger_stamp(&out, "RETURNED ")?, 200);
         assert!(ledger_stamp(&out, "MISSING ").is_err());
+        Ok(())
+    }
+
+    /// Exactly the script's probed SoftHSM functions stay semantic except
+    /// C_Initialize and C_GetSlotList, which the capture catalog pins
+    /// count-only. If this catalog moves, every semantic-only population
+    /// below (and the cells' exactness asserts) must be revisited.
+    #[test]
+    fn joint_soft_functions_pin_two_count_only() {
+        let mut count_only = Vec::new();
+        for name in JOINT_SOFT_FUNCTIONS {
+            let descriptor = crate::kinds::descriptor(name)
+                .unwrap_or_else(|| panic!("{name} leaves the capture catalog"));
+            if descriptor == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY {
+                count_only.push(*name);
+            }
+        }
+        assert_eq!(count_only, ["C_Initialize", "C_GetSlotList"]);
+    }
+
+    fn script_ledger(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        entries
+            .iter()
+            .map(|(function, entered)| ((*function).to_string(), *entered))
+            .collect()
+    }
+
+    /// The cells' exact semantic populations per script shape: the raw
+    /// ledger total minus the count-only entered calls. Unknown names
+    /// count as count-only (no descriptor, no slot, never observed).
+    #[test]
+    fn script_ledgers_split_semantic_from_count_only() {
+        // Cell 1 B: the fixed script at --iters 2 over two token slots.
+        let digest2 = script_ledger(&[
+            ("C_Initialize", 1),
+            ("C_GetSlotList", 1),
+            ("C_GetTokenInfo", 2),
+            ("C_OpenSession", 1),
+            ("C_Login", 1),
+            ("C_GenerateKey", 1),
+            ("C_SignInit", 1),
+            ("C_Sign", 1),
+            ("C_DigestInit", 2),
+            ("C_Digest", 2),
+            ("C_Logout", 1),
+            ("C_CloseSession", 1),
+            ("C_Finalize", 1),
+        ]);
+        assert_eq!(digest2.values().sum::<u64>(), 16);
+        assert_eq!(ledger_semantic_split(&digest2), (14, 2));
+        // Cell 3 A / cell 2 E script: --iters 1 over two token slots.
+        let digest1 = script_ledger(&[
+            ("C_Initialize", 1),
+            ("C_GetSlotList", 1),
+            ("C_GetTokenInfo", 2),
+            ("C_OpenSession", 1),
+            ("C_Login", 1),
+            ("C_GenerateKey", 1),
+            ("C_SignInit", 1),
+            ("C_Sign", 1),
+            ("C_DigestInit", 1),
+            ("C_Digest", 1),
+            ("C_Logout", 1),
+            ("C_CloseSession", 1),
+            ("C_Finalize", 1),
+        ]);
+        assert_eq!(digest1.values().sum::<u64>(), 14);
+        assert_eq!(ledger_semantic_split(&digest1), (12, 2));
+        // Cell 2 E: the tallied gen-1 probe plus the --iters 1 script.
+        let mut probe = digest1.clone();
+        for function in ["C_Initialize", "C_GetSlotList", "C_Finalize"] {
+            *probe.get_mut(function).expect("scripted call") += 1;
+        }
+        assert_eq!(probe.values().sum::<u64>(), 17);
+        assert_eq!(ledger_semantic_split(&probe), (13, 4));
+        // Cell 2 C: the absence subject's three calls.
+        let absent = script_ledger(&[("C_Initialize", 1), ("C_GetSlotList", 1), ("C_Finalize", 1)]);
+        assert_eq!(ledger_semantic_split(&absent), (1, 2));
+        // The held pair (cells 1 A, 2 H/S): fully semantic.
+        let held = script_ledger(&[("C_SignInit", 1), ("C_Sign", 1)]);
+        assert_eq!(ledger_semantic_split(&held), (2, 0));
+        // Unknown names are never observed.
+        let strange = script_ledger(&[("C_Initialize", 1), ("C_Bogus", 3)]);
+        assert_eq!(ledger_semantic_split(&strange), (0, 4));
+    }
+
+    /// The disclosed-gap counter matches the exact subject/reason/caller
+    /// triple and nothing else.
+    #[test]
+    fn disclosed_gap_counter_matches_exact_triples() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let mut coordinator = system_joint_coordinator(&[])?;
+        let caller = CallerId(7);
+        for _ in 0..2 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: None,
+                subject: "semantic input refused".into(),
+                reason: "slot".into(),
+                budget: None,
+            });
+        }
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: Some(CallerId(9)),
+            module: None,
+            pid: None,
+            subject: "semantic input refused".into(),
+            reason: "slot".into(),
+            budget: None,
+        });
+        // Gaps stage until publication; the two identical rows share
+        // one published row with two repeats.
+        coordinator.registry_mut().publish();
+        assert_eq!(coordinator.registry().gaps().len(), 2);
+        assert_eq!(
+            count_disclosed_gaps(&coordinator, "semantic input refused", "slot", Some(caller)),
+            2
+        );
+        assert_eq!(
+            count_disclosed_gaps(
+                &coordinator,
+                "semantic input refused",
+                "slot",
+                Some(CallerId(9))
+            ),
+            1
+        );
+        assert_eq!(
+            count_disclosed_gaps(&coordinator, "semantic input refused", "slot", None),
+            0
+        );
+        assert_eq!(
+            count_disclosed_gaps(
+                &coordinator,
+                "semantic input refused",
+                "custody",
+                Some(caller)
+            ),
+            0
+        );
+        Ok(())
+    }
+
+    /// The exemption asserts its population first: a missing disclosed
+    /// population fails, and a present one is skipped by the quiet check
+    /// while anything else loss-ish still fails.
+    #[test]
+    fn quiet_exemption_demands_its_gaps() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let mut coordinator = system_joint_coordinator(&[])?;
+        let caller = CallerId(7);
+        let exemption = QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller),
+            min: 2,
+            max: Some(2),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_err());
+        for _ in 0..2 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: None,
+                subject: "semantic input refused".into(),
+                reason: "slot".into(),
+                budget: None,
+            });
+        }
+        coordinator.registry_mut().publish();
+        let exemption = QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller),
+            min: 2,
+            max: Some(2),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_ok());
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "semantic calls unrouted".into(),
+            reason: "1 calls shed without a route (pending=1)".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        let exemption = QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller),
+            min: 2,
+            max: Some(2),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_ok());
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "semantic calls lost".into(),
+            reason: "loss".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        let exemption = QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller),
+            min: 2,
+            max: Some(2),
+        };
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_err());
+        Ok(())
+    }
+
+    /// The failure diagnosis names the missing edge, every gap, and each
+    /// ledger function's verdict without root or a live lane.
+    #[test]
+    fn exactness_diagnosis_names_edge_gaps_and_verdicts() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let mut coordinator = system_joint_coordinator(&[])?;
+        coordinator.registry_mut().record_gap(RegistryGap {
+            caller: Some(CallerId(7)),
+            module: None,
+            pid: None,
+            subject: "semantic input refused".into(),
+            reason: "slot".into(),
+            budget: None,
+        });
+        coordinator.registry_mut().publish();
+        let ledger = script_ledger(&[("C_Initialize", 1), ("C_Sign", 2)]);
+        let lines = exactness_diagnosis(&coordinator, 999, "soft-copy.so", &ledger).join("\n");
+        assert!(lines.contains("caller never admitted"), "{lines}");
+        assert!(lines.contains("semantic input refused"), "{lines}");
+        assert!(
+            lines.contains("fn=C_Initialize entered=1 count-only"),
+            "{lines}"
+        );
+        assert!(lines.contains("fn=C_Sign entered=2 semantic"), "{lines}");
+        assert!(lines.contains("h3 takes="), "{lines}");
         Ok(())
     }
 }

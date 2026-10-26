@@ -23,7 +23,7 @@ use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventor
 use crate::discovery::instances::MappedFileIdentity;
 use crate::plan::Slot;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{Array, HashMap, MapData, MapType};
 use aya::programs::fentry::FEntryLinkId;
 use aya::programs::fexit::FExitLinkId;
 use aya::programs::{FEntry, FExit};
@@ -1170,14 +1170,58 @@ fn marker_row_or_refuse(
     row.ok_or(BirthRowError::Unreadable)
 }
 
-/// Pure control-row verdict behind `prepare_marker_control` (stub:
-/// every verdict refuses until the freeze lands).
+/// Detailed-only birth marker control (`JOURNAL_MARKER_CTL[0]`):
+/// exact metadata, zero readback, then freeze before any link. A
+/// Detailed object without the map is a stale build; a counter
+/// bank object with the map is refused without touching it.
+/// UNRUN: live map access stays out of tests; the verdict below is
+/// pinned over pure values.
+pub(super) fn prepare_marker_control(ebpf: &aya::Ebpf, roots: StaticRoots) -> Result<()> {
+    const NAME: &str = "JOURNAL_MARKER_CTL";
+    let map = ebpf.map(NAME);
+    if roots == StaticRoots::CounterBanks {
+        return marker_control_verdict(map.is_some(), roots, None);
+    }
+    let Some(map) = map else {
+        return marker_control_verdict(false, roots, None);
+    };
+    let data = super::policy_map_data(NAME, map)?;
+    super::validate_map_metadata(NAME, data, super::map_metadata(MapType::Array, 4, 16, 1, 0))?;
+    let control: Array<&MapData, JournalAdmissionControl> = Array::try_from(map)?;
+    let readback = control
+        .get(&0, 0)
+        .with_context(|| format!("reading {NAME} control row"))?;
+    marker_control_verdict(true, roots, Some(readback))?;
+    super::freeze_map(NAME, map)
+}
+
+/// Pure control-row verdict behind [`prepare_marker_control`]: a
+/// Detailed session needs the map with a zero readback (a missing
+/// map is a stale build; a nonzero row moved before the freeze),
+/// while counter banks must not carry the map at all.
 fn marker_control_verdict(
-    _present: bool,
-    _roots: StaticRoots,
-    _readback: Option<JournalAdmissionControl>,
+    present: bool,
+    roots: StaticRoots,
+    readback: Option<JournalAdmissionControl>,
 ) -> Result<()> {
-    bail!("marker control verdict unimplemented")
+    match (roots, present) {
+        (StaticRoots::CounterBanks, true) => {
+            bail!("JOURNAL_MARKER_CTL present in a counter bank object")
+        }
+        (StaticRoots::CounterBanks, false) => Ok(()),
+        (StaticRoots::Detailed, false) => {
+            bail!("JOURNAL_MARKER_CTL missing from the Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true) => match readback {
+            Some(control) if control.spent == 0 && control.failed == 0 => Ok(()),
+            Some(control) => bail!(
+                "JOURNAL_MARKER_CTL moved before links: spent={} failed={}",
+                control.spent,
+                control.failed
+            ),
+            None => bail!("JOURNAL_MARKER_CTL has no readback row"),
+        },
+    }
 }
 
 #[allow(dead_code)] // As above.

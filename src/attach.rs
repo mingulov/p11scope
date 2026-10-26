@@ -5565,6 +5565,7 @@ impl Session {
                     validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
                     image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
+                    instance::prepare_marker_control(&ebpf, roots)?;
                     selected_detailed::validate_maps(&ebpf)?;
                 }
                 SessionPreparation::ValidateStopGate => {

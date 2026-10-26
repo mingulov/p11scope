@@ -27,6 +27,7 @@ a failure: it lands in the table as an exact integer.
 """
 
 import argparse
+import grp
 import hashlib
 import json
 import os
@@ -155,6 +156,14 @@ def check_body_returns(body_rows):
     return errors
 
 
+def check_foreign_rows(selected, pid):
+    """Refuse trace rows captured outside the cell pid."""
+    if selected["foreign"]:
+        return [f"trace captured {len(selected['foreign'])} rows "
+                f"outside the cell pid {pid}"]
+    return []
+
+
 def check_counts(rows, counts):
     """The terminal count record must account every parsed row."""
     if len(counts) != 1:
@@ -177,6 +186,23 @@ def check_evidence(evidence):
     if record.get("privacy_mode") != "allowlisted":
         errors.append("capture privacy policy differs from the requested "
                       f"allowlisted policy: {record.get('privacy_mode')!r}")
+    if record.get("completeness") not in ("COMPLETE", "PARTIAL"):
+        errors.append("terminal evidence without COMPLETE or PARTIAL "
+                      "completeness: "
+                      f"{record.get('completeness')!r}")
+    scheduling = record.get("scheduling")
+    if isinstance(scheduling, dict):
+        # sink_stall_ms stays ungated: it is backpressure timing, not loss.
+        # A 1 ms stall with a proven drain and zero drops is still an exact
+        # capture (measured so on Linux 7.0.14; src/render.rs documents the
+        # field as stall milliseconds). Only the loss counters gate the cell.
+        for field in ("sink_timeouts", "sink_dropped_bytes"):
+            if field not in scheduling:
+                continue
+            value = scheduling[field]
+            if type(value) is not int or value != 0:
+                errors.append(f"capture reports {field} {value!r} in this "
+                              "exact-count cell")
     for field in ZERO_LOSS_FIELDS:
         if field not in record:
             if field == "event_loss":
@@ -214,6 +240,26 @@ def without_sink_fields(record):
             scheduling.pop(field, None)
         record["scheduling"] = scheduling
     return record
+
+
+def compare_streams(file_parsed, stdout_parsed):
+    """Problems where the trace file and stdout streams disagree.
+
+    Rows and terminal counts must match exactly; evidence must match once
+    the per-stream sink-timing fields are stripped.
+    """
+    problems = []
+    if file_parsed["rows"] != stdout_parsed["rows"]:
+        problems.append("stdout/file trace row disagreement")
+    if file_parsed["counts"] != stdout_parsed["counts"]:
+        problems.append("stdout/file terminal count disagreement")
+    file_evidence = [without_sink_fields(record) for record in
+                     file_parsed["evidence"]]
+    stdout_evidence = [without_sink_fields(record) for record in
+                       stdout_parsed["evidence"]]
+    if file_evidence != stdout_evidence:
+        problems.append("stdout/file terminal evidence disagreement")
+    return problems
 
 
 def run_bounded(argv, timeout_s, cwd=None, env=None):
@@ -351,6 +397,16 @@ def render_markdown(cells, bounds):
     return "\n".join(lines) + "\n"
 
 
+def _run_build(argv):
+    """Run one fixture build command; keep the compiler diagnostic."""
+    done = run_bounded(argv, BUILD_TIMEOUT_S)
+    if done.returncode != 0:
+        detail = done.stderr.decode("utf-8", "replace")[-2000:]
+        raise SweepError(f"build {' '.join(argv)} exited "
+                         f"{done.returncode}: {detail}")
+    return done
+
+
 def compile_fixture(gcc, source, build_dir):
     """Build the caller plus the file-backed and heap-table providers."""
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -360,11 +416,11 @@ def compile_fixture(gcc, source, build_dir):
             (["-DT2_PROVIDER", "-DT2_HEAP_TABLE"],
              build_dir / "provider-heap.so")]
     try:
-        run_bounded([gcc, *GCC_FLAGS, str(source), "-ldl", "-o",
-                     str(driver)], BUILD_TIMEOUT_S)
+        _run_build([gcc, *GCC_FLAGS, str(source), "-ldl", "-o",
+                    str(driver)])
         for extra, path in runs:
-            run_bounded([gcc, *GCC_FLAGS, "-shared", "-fPIC", *extra,
-                         str(source), "-o", str(path)], BUILD_TIMEOUT_S)
+            _run_build([gcc, *GCC_FLAGS, "-shared", "-fPIC", *extra,
+                        str(source), "-o", str(path)])
             kind = "heap" if "-DT2_HEAP_TABLE" in extra else "file"
             providers[kind] = path
     except SweepError as error:
@@ -390,12 +446,40 @@ def observer_argv(observer, provider, built, ledger, pub_gate, entry_gate,
     return argv
 
 
+# The same ledger bounds the oracle enforces in its read_rows
+# (scripts/measure-first-use.py): the driver extracts the cell pid before
+# the oracle re-validates, so it must not read unbounded input first.
+LEDGER_MAX_BYTES = 1024 * 1024
+LEDGER_MAX_ROWS = 1024
+LEDGER_LINE_CAP = 65536 + 1
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def _read_ledger(ledger):
+    """Read the fixture ledger with the oracle's byte/row/key bounds."""
     rows = []
+    total = 0
     with open(ledger, encoding="utf-8") as stream:
-        for line in stream.read().splitlines():
-            if line.strip():
-                rows.append(json.loads(line))
+        while True:
+            line = stream.readline(LEDGER_LINE_CAP)
+            if not line:
+                break
+            total += len(line.encode("utf-8", "replace"))
+            if total > LEDGER_MAX_BYTES:
+                raise ValueError("ledger exceeds its byte limit")
+            if len(rows) >= LEDGER_MAX_ROWS:
+                raise ValueError("ledger exceeds its row limit")
+            if not line.strip():
+                continue
+            rows.append(json.loads(line, object_pairs_hook=_unique_object))
     cells = [row for row in rows
              if isinstance(row, dict) and row.get("phase") == "cell"]
     if len(cells) != 1:
@@ -468,25 +552,13 @@ def run_cell(observer, measure, built, cell_dir, mode, delay_us, armed,
                     + [f"trace stdout: {error}"
                        for error in stdout_parsed["errors"]])
         if not problems:
-            if file_parsed["rows"] != stdout_parsed["rows"]:
-                problems.append("stdout/file trace row disagreement")
-            if file_parsed["counts"] != stdout_parsed["counts"]:
-                problems.append("stdout/file terminal count disagreement")
-            file_evidence = [without_sink_fields(record) for record in
-                             file_parsed["evidence"]]
-            stdout_evidence = [without_sink_fields(record) for record in
-                               stdout_parsed["evidence"]]
-            if file_evidence != stdout_evidence:
-                problems.append("stdout/file terminal evidence disagreement")
+            problems += compare_streams(file_parsed, stdout_parsed)
             problems += check_counts(file_parsed["rows"],
                                      file_parsed["counts"])
             problems += check_evidence(file_parsed["evidence"])
         if not problems:
             selected = select_body_rows(file_parsed["rows"], pid)
-            if selected["foreign"]:
-                problems.append(
-                    f"trace captured {len(selected['foreign'])} rows "
-                    f"outside the cell pid {pid}")
+            problems += check_foreign_rows(selected, pid)
             problems += check_body_returns(selected["body"])
         if problems:
             return {"mode": mode, "delay_us": delay_us, "armed": armed,
@@ -577,6 +649,10 @@ def preflight(args):
         pwd.getpwuid(args.uid)
     except KeyError as error:
         raise SweepError(f"unknown workload uid {args.uid}") from error
+    try:
+        grp.getgrgid(args.gid)
+    except KeyError as error:
+        raise SweepError(f"unknown workload gid {args.gid}") from error
     observer = Path(args.observer)
     if not (observer.is_file() and os.access(observer, os.X_OK)):
         raise SweepError(f"observer is not executable: {observer}")
@@ -599,6 +675,8 @@ def preflight(args):
         out.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
         raise SweepError(f"refusing to reuse out dir: {out}") from error
+    except OSError as error:
+        raise SweepError(f"cannot create out dir {out}: {error}") from error
     return {"observer": observer, "measure": measure, "source": source,
             "out": out}
 
@@ -670,7 +748,7 @@ def main(argv=None):
                           "table": str(ready["out"] / "table.json")}),
               flush=True)
         return 0 if result["verdict"] == "pass" else 1
-    except SweepError as error:
+    except (SweepError, OSError) as error:
         print(f"sweep refused: {error}", file=sys.stderr)
         return 1
 

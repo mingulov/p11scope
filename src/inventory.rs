@@ -4342,7 +4342,20 @@ fn start_semantic_lane(
     scope: &Scope,
     backend: crate::attach::BackendSelection,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
-    use crate::inventory_semantics::AttestedSemanticLane;
+    // The bytes rule before any semantic-lane BPF work: a stale or
+    // mismatched embedded object degrades here with the plain mismatch
+    // message (never the bare attachment code); broad inventory continues.
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        let message = format!("{error:#}");
+        coordinator.note_scope_gap(
+            "semantic lane unavailable".into(),
+            format!("{message}; broad inventory continues without instance semantics"),
+        );
+        inventory_diagnostic(&format!(
+            "p11scope: {message}; broad inventory continues without instance semantics"
+        ));
+        return fallback_shell(coordinator, scope, backend);
+    }
     let preparation = seal_prepare_subset(coordinator);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
@@ -4377,15 +4390,26 @@ fn start_semantic_lane(
                 "semantic lane unavailable".into(),
                 format!("{refusal}; broad inventory continues without instance semantics"),
             );
-            seal_prepare_subset(coordinator)
-                .subset
-                .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
-                .map(|mut shell| {
-                    shell.mark_startup_failed();
-                    shell
-                })
+            fallback_shell(coordinator, scope, backend)
         }
     }
+}
+
+/// The shell lane a refused live startup keeps for its honest
+/// `unavailable` summary; `None` when no subset mints.
+fn fallback_shell(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scope: &Scope,
+    backend: crate::attach::BackendSelection,
+) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
+    use crate::inventory_semantics::AttestedSemanticLane;
+    seal_prepare_subset(coordinator)
+        .subset
+        .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
+        .map(|mut shell| {
+            shell.mark_startup_failed();
+            shell
+        })
 }
 
 /// The subset-mint boundary of the lane startup: the coordinator's

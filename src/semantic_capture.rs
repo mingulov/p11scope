@@ -411,6 +411,10 @@ impl RetainedBirthWitness {
         Ok(evidence)
     }
 
+    /// Test-only recheck over substituted I/O: the scan window is measured
+    /// on the fixture clock, like every other bound on this path, so a
+    /// descheduled test thread never reads a stale window. The production
+    /// [`Self::fresh_evidence`] port keeps the wall clock for real I/O.
     #[cfg(test)]
     fn fresh_evidence_with(
         &self,
@@ -424,7 +428,8 @@ impl RetainedBirthWitness {
         crate::attach::BirthObservationRefusal,
     > {
         self.validate_scope(attachment, binding)?;
-        let deadline = Instant::now()
+        let deadline = io
+            .now()
             .checked_add(capture.limits.scan_slice)
             .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
         capture.validate_birth_candidate(io, &self.candidate, true)?;
@@ -436,7 +441,7 @@ impl RetainedBirthWitness {
             self.receipt.birth(),
         )?;
         capture.validate_birth_candidate(io, &self.candidate, true)?;
-        if Instant::now() >= deadline {
+        if io.now() >= deadline {
             return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
         }
         Ok(evidence)

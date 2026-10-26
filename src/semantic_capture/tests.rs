@@ -952,6 +952,7 @@ struct ScriptIo {
     output_image: Option<ImageIdentity>,
     output_file: Option<u32>,
     scan_advance: Duration,
+    receipt_advance: Duration,
     collection_status: CollectionStatus,
     extra_range: bool,
     watched: [RetainedInventoryTarget; 2],
@@ -1023,6 +1024,7 @@ impl ScriptIo {
             output_image: None,
             output_file: None,
             scan_advance: Duration::ZERO,
+            receipt_advance: Duration::ZERO,
             collection_status: CollectionStatus::Complete,
             extra_range: false,
             watched: [watched, sibling],
@@ -1160,6 +1162,7 @@ impl CaptureIo for ScriptIo {
         _: u32,
         _: Instant,
     ) -> Result<ReceiptState, CurrentReceiptRefusal> {
+        self.now += self.receipt_advance;
         if let Some(refusal) = self.receipt_refusal {
             return Err(refusal);
         }
@@ -2246,26 +2249,14 @@ fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
         ),
         Err(crate::attach::BirthObservationRefusal::GenerationMismatch)
     );
-    struct SlowRows<'a>(&'a mut NativeBirthRows);
-    impl crate::attach::BirthRowReader for SlowRows<'_> {
-        fn read_marker_row(
-            &mut self,
-        ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
-            std::thread::sleep(Duration::from_millis(60));
-            crate::attach::BirthRowReader::read_marker_row(self.0)
-        }
-        fn read_admission_control(
-            &mut self,
-        ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
-        {
-            crate::attach::BirthRowReader::read_admission_control(self.0)
-        }
-    }
+    // The bounded window is measured on the fixture clock: advance it past
+    // the scan slice instead of sleeping on the wall clock.
+    harness.io.receipt_advance = harness.capture.limits.scan_slice + Duration::from_millis(1);
     assert!(
         witness
             .fresh_evidence_with(
                 &mut harness.io,
-                &mut SlowRows(&mut rows),
+                &mut rows,
                 &harness.capture,
                 harness.fixture.attachment(),
                 harness.fixture.binding()
@@ -2273,6 +2264,7 @@ fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
             .is_err(),
         "fresh native reads share one bounded window"
     );
+    harness.io.receipt_advance = Duration::ZERO;
     assert!(
         witness
             .fresh_evidence_with(

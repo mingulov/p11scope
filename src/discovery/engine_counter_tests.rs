@@ -271,6 +271,135 @@ fn counter_growth_stages_fresh_tail_through_apply() {
     );
 }
 
+/// Committed pins with a provider plus a loader, and a loader context
+/// registered against the loader: the post-arming shape a growth
+/// candidate must resolve.
+fn committed_pins_with_loader_context(
+    engine: &mut Engine,
+) -> (PinnedObjects, PinnedObjectId, PinnedObjectId) {
+    use crate::discovery::identity::test_fixture as fixture;
+    let committed = fixture::pin_set(
+        &[
+            (fixture::overlay(102), fixture::SHA, 0),
+            (fixture::overlay(103), fixture::SHA, 0),
+        ],
+        false,
+    );
+    let ids: Vec<_> = committed.pinned().map(|entry| entry.id).collect();
+    let provider = ids.first().copied().expect("provider pin");
+    let loader = ids.get(1).copied().expect("loader pin");
+    engine.pinned = committed.clone();
+    let spec = crate::discovery::loader::LoaderContextSpec {
+        view: crate::process::ProcessViewId(7),
+        loader,
+        mapping: None,
+        hook: p11scope_manifest::elf::SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let prepared = engine.loader_registry.preflight(spec).unwrap();
+    engine.loader_registry.prepare(prepared).unwrap();
+    (committed, provider, loader)
+}
+
+#[test]
+fn counter_growth_bare_pins_hit_missing_loader_context_identity() {
+    // The (0, 0) mechanism: a growth candidate whose pins drop the
+    // committed loader context is refused before staging with the
+    // identity PARTIAL (not a counter PARTIAL), so completions and static
+    // failures both stay empty. Production candidates never do this —
+    // they evolve from committed pins — so the early return is correct
+    // and the growth seam must build faithful candidates.
+    use crate::discovery::identity::test_fixture as fixture;
+    let mut engine = Engine::empty_for_test();
+    let (_committed, provider, _loader) = committed_pins_with_loader_context(&mut engine);
+    engine.plan = counters_plan_on(2, provider);
+    engine
+        .plan
+        .consume_counter_extent(0, 2)
+        .expect("staged prefix");
+    let mut session = ScriptedSession::default();
+    session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Published {
+            transaction: 1,
+            extent: BankExtent { first: 2, end: 3 },
+        });
+    let mut plan = counters_plan_on(3, provider);
+    plan.adopt_counter_consumed(2).expect("staged prefix");
+    let new = vec![plan.slots[2].clone()];
+    let bare = fixture::pin_set(&[(fixture::overlay(102), fixture::SHA, 0)], false);
+    assert_eq!(
+        bare.pinned().next().expect("provider pin").id,
+        provider,
+        "the bare candidate carries the same provider ID without the loader"
+    );
+    let candidate = growth_candidate(plan, new, bare);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("apply");
+    assert_eq!(
+        (outcome.static_completions.len(), outcome.static_failures.len()),
+        (0, 0)
+    );
+    assert!(!additions_allowed);
+    assert!(
+        session.staged_counter_calls.is_empty(),
+        "staging is never attempted"
+    );
+    let identity = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "live discovery identity")
+        .expect("identity PARTIAL");
+    assert!(
+        identity.reason.contains("loader context"),
+        "refusal names the loader context: {}",
+        identity.reason
+    );
+}
+
+#[test]
+fn counter_growth_seam_absorbs_committed_loader_identity() {
+    // The growth seam must build production-faithful candidates: fresh
+    // pins absorbed into committed pins, so registered loader contexts
+    // resolve and the fresh tail stages.
+    use crate::discovery::identity::test_fixture as fixture;
+    let mut engine = Engine::empty_for_test();
+    let (_committed, provider, _loader) = committed_pins_with_loader_context(&mut engine);
+    engine.plan = counters_plan_on(2, provider);
+    engine
+        .plan
+        .consume_counter_extent(0, 2)
+        .expect("staged prefix");
+    let mut session = ScriptedSession::default();
+    session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
+    session
+        .counter_stage_script
+        .push_back(BankPublication::Published {
+            transaction: 1,
+            extent: BankExtent { first: 2, end: 3 },
+        });
+    let mut plan = counters_plan_on(3, provider);
+    plan.adopt_counter_consumed(2).expect("staged prefix");
+    let new = vec![plan.slots[2].clone()];
+    let fresh = fixture::pin_set(&[(fixture::overlay(102), fixture::SHA, 0)], false);
+    let (completed, failed, partials) = engine
+        .apply_counter_growth_for_test(&mut session, plan, new, fresh)
+        .expect("apply");
+    assert_eq!((completed, failed), (1, 0));
+    assert!(
+        partials.is_empty(),
+        "clean growth marks no PARTIAL: {partials:?}"
+    );
+    assert_eq!(session.staged_counter_calls, vec![3]);
+}
+
 #[test]
 fn counter_growth_refusal_partials_with_plan_intact() {
     let mut engine = Engine::empty_for_test();

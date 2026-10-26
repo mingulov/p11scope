@@ -27207,7 +27207,7 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn apply_counter_growth_for_test(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         plan: plan::AttachPlan,
         new: Vec<plan::Slot>,
         pinned: PinnedObjects,

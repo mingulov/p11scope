@@ -3015,6 +3015,30 @@ class MatrixLaneRegistration(unittest.TestCase):
                          ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111",
                           "6.18.58", "7.2.6", "host", "fedora-7.2.9"))
 
+    def test_prepare_refuses_guest_disk_on_host_like_lanes(self):
+        for lane, kernel, message in (
+                ("host", "host", "host lane cannot use a guest disk"),
+                ("fedora-7.2.9", "fedora-7.2.9",
+                 "fedora lane cannot use a guest disk")):
+            with self.subTest(lane=lane):
+                args = mock.Mock(
+                    prepare=self.base / ("early disk " + lane),
+                    object_input=[], lane=lane, lib_test=None,
+                    public_cell=None, without_scan=False, kernel=kernel,
+                    guest_disk="image", guest_disk_uuid="uuid",
+                    bin_dir=None)
+                disk = {"path": "/" + lane + "/disk", "uuid": "0" * 32}
+                # runpy hands back a copy: patch the globals the
+                # prepare function actually closes over.
+                namespace = CHECKER_MOD["prepare"].__globals__
+                with mock.patch.dict(
+                        namespace,
+                        {"guest_disk_input": lambda *given: disk}):
+                    with self.assertRaises(CHECKER_MOD["Invalid"]) as caught:
+                        CHECKER_MOD["prepare"](args)
+                self.assertIn(message, str(caught.exception))
+                self.assertFalse((self.base / ("early disk " + lane)).exists())
+
     def test_plan_accepts_both_lanes_with_full_selection(self):
         for lane in ("6.18.58", "fedora-7.2.9"):
             with self.subTest(lane=lane):

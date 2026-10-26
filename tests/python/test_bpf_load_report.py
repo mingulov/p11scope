@@ -17,8 +17,37 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/bpf-load-report.py"
+DRIVER = ROOT / "scripts/check-bpf-load-kernels.sh"
+BUDGETS_FILE = ROOT / "tests/bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
+# The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
+# plus the 7.0 guest the budgets also cover.
+EXPECTED_BUDGET_KERNELS = frozenset({
+    "v5.15.221", "v6.1.188", "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+})
+
+
+def check_budgets_shape(path):
+    """Every budgeted program carries the same kernel set; a missing cell fails.
+
+    The report's budgeted-but-missing FAIL only fires for roots carrying a
+    cell for the requested kernel, so a root silently dropped from one
+    kernel's column would pass with no rows at all. This pin fails such a
+    file. Raises AssertionError naming the mismatch.
+    """
+    document = json.loads(Path(path).read_text(encoding="ascii"))
+    programs = document["programs"]
+    assert programs, "budgets file names no programs"
+    kernel_sets = {name: frozenset(cells) for name, cells in programs.items()}
+    first, *rest = sorted(kernel_sets)
+    for name in rest:
+        assert kernel_sets[name] == kernel_sets[first], (
+            f"{name} kernels {sorted(kernel_sets[name])} differ from "
+            f"{first} {sorted(kernel_sets[first])}")
+    assert kernel_sets[first] == EXPECTED_BUDGET_KERNELS, (
+        f"budget kernels {sorted(kernel_sets[first])} differ from "
+        f"{sorted(EXPECTED_BUDGET_KERNELS)}")
 
 next_program_id = 100
 
@@ -209,6 +238,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("Traceback", result.stderr)
         self.assertIn("result=FAIL", result.stdout)
+
+    def test_budgets_file_gives_every_program_the_same_kernel_set(self):
+        self.assertTrue(BUDGETS_FILE.is_file(),
+                        "tests/bpf-verifier-budgets.json is missing")
+        try:
+            check_budgets_shape(BUDGETS_FILE)
+        except AssertionError as error:
+            self.fail(str(error))
+
+    def test_driver_anchors_guest_release_on_version_boundary(self):
+        # The release check must accept the exact version or a `-`-suffixed
+        # release only; a bare prefix also matches a different kernel
+        # (6.1.1880 for 6.1.188). Real guest runs prove the behavior; this
+        # pins the anchored pattern against revert.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('"${KERNEL#v}"|"${KERNEL#v}-"*)', text)
 
 
 if __name__ == "__main__":

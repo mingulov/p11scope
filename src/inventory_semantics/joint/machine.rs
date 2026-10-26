@@ -378,7 +378,8 @@ struct Collected {
     /// future deadline or hold resets it; reaching the bound expires the
     /// stuck waiters as unobserved and publishes with joined outcomes kept.
     h0_idle_passes: u32,
-    /// The guard trip cause, set when the bound expires the stall.
+    /// The guard trip cause, set when the bound expires the stall and
+    /// cleared by the next progressing merge.
     h0_guard_trip: Option<&'static str>,
 }
 
@@ -394,11 +395,13 @@ impl Collected {
 
     /// Count one incomplete merge toward the no-progress bound. Returns
     /// true when the bound trips a true no-job stall. Any newly
-    /// accumulated outcome or receipt resets the count, as does any scan
-    /// attempted for an awaited key (even if refused), any job for an
-    /// awaited key with a future deadline, or any retained hold inside
-    /// its horizon — so only a waiter set with no job, no hold, no
-    /// deadline and no scan can trip.
+    /// accumulated outcome or receipt resets the count and clears a
+    /// stale trip cause, as does any scan attempted for an awaited key
+    /// (even if refused), any job for an awaited key with a future
+    /// deadline, or any retained hold inside its horizon — so only a
+    /// waiter set with no job, no hold, no deadline and no scan can
+    /// trip, and the drive line never publishes a trip that expired
+    /// nothing.
     fn note_h0_merge(
         &mut self,
         before: Option<(usize, usize)>,
@@ -408,10 +411,12 @@ impl Collected {
     ) -> bool {
         if self.h0_accumulated() != before {
             self.h0_idle_passes = 0;
+            self.h0_guard_trip = None;
             return false;
         }
         if has_pending_scans || has_future_job || has_hold {
             self.h0_idle_passes = 0;
+            self.h0_guard_trip = None;
             return false;
         }
         self.h0_idle_passes = self.h0_idle_passes.saturating_add(1);
@@ -982,9 +987,10 @@ pub(crate) struct LiveJointMachine {
     /// reset: retryable refusals occur only in the Finish tail, so the cap
     /// bounds the tail. The 100th latches the disposition.
     finish_storage_retries: u16,
-    /// Consecutive no-progress Audited polls inside this Finish. Any
-    /// spending, publication or non-finish visit resets it; the 600th
-    /// consecutive stall refuses with a named gap.
+    /// Consecutive no-progress Audited polls inside this Finish: a
+    /// diagnostic count for the gap text and the recorded trip. Any
+    /// spending, publication or non-finish visit resets it; the
+    /// wall-time bound (not the count) trips the refusal.
     finish_no_progress_polls: u32,
     /// Wall-clock start of the current consecutive no-progress Audited
     /// stall, if any. Any spending, publication or non-finish visit
@@ -3036,6 +3042,7 @@ impl LiveJointMachine {
                 match result {
                     Ok(Ok(JointCommitProgress::Published(receipt))) => {
                         self.finish_no_progress_polls = 0;
+                        self.finish_no_progress_since = None;
                         if final_original {
                             self.finish_receipt = Some(receipt);
                         }
@@ -3052,22 +3059,32 @@ impl LiveJointMachine {
                         (Phase::Idle, Ok(Step::Published))
                     }
                     Ok(Ok(JointCommitProgress::Pending)) => {
-                        // Finish-scoped no-progress bound: a wedged audit
-                        // spends nothing and publishes nothing, forever.
-                        // Spending, publication and non-finish visits reset
-                        // the count; the bound records a named gap and
-                        // refuses, keeping the retained frame and its audit
-                        // tags for the disposition hold and diagnosis.
+                        // Finish-scoped wall-time no-progress bound: a
+                        // wedged audit spends nothing and publishes
+                        // nothing, forever. Spending, publication and
+                        // non-finish visits reset the stall clock; the
+                        // bound records a named gap, latches the trip
+                        // cause for the exit hold's stderr disclosure,
+                        // and refuses, keeping the retained frame and
+                        // its audit tags for the disposition hold and
+                        // diagnosis.
                         if q.is_some() && !progressed {
                             self.finish_no_progress_polls =
                                 self.finish_no_progress_polls.saturating_add(1);
-                            if self.finish_no_progress_polls >= JOINT_FINISH_NO_PROGRESS_LIMIT {
+                            let now = Instant::now();
+                            let since = *self.finish_no_progress_since.get_or_insert(now);
+                            let stalled = now.duration_since(since);
+                            if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
+                                let polls = self.finish_no_progress_polls;
+                                self.finish_no_progress_trip =
+                                    Some(FinishNoProgressTrip { polls, stalled });
                                 coordinator.note_scope_gap(
                                     "joint finish made no progress".to_string(),
                                     format!(
-                                        "{} consecutive finish polls without progress in Audited; \
-                                         abandoning the finish for exit",
-                                        JOINT_FINISH_NO_PROGRESS_LIMIT,
+                                        "{}s without progress across {} consecutive finish polls in \
+                                         Audited; abandoning the finish for exit",
+                                        stalled.as_secs(),
+                                        polls,
                                     ),
                                 );
                                 return (
@@ -3081,6 +3098,7 @@ impl LiveJointMachine {
                             }
                         } else {
                             self.finish_no_progress_polls = 0;
+                            self.finish_no_progress_since = None;
                         }
                         (
                             Phase::Audited {

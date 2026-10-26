@@ -2573,6 +2573,17 @@ fn disclose_semantic_stop(
     ));
 }
 
+/// The shared once-gate predicate for winding stop disclosures: a
+/// disclosure is still owed unless a stop path already disclosed it.
+/// The stop path, the join tail and the exit hold consult this one
+/// predicate, so a future edit cannot desync the callers; arming stays
+/// at the call sites (the stop path and the hold arm, the join tail
+/// deliberately never does, since a later stop still owes its
+/// held-for-exit gap).
+fn stop_counts_owed(disclosed: bool) -> bool {
+    !disclosed
+}
+
 /// Disclose a winding lane's stop counts unless a stop path already
 /// disclosed them: the join tail, the stop path and the exit hold
 /// share this one gate, so each winding discloses exactly once. The
@@ -2585,7 +2596,7 @@ fn disclose_stop_counts_once(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     warn: &mut WarnSink<'_>,
 ) {
-    if winding.stop_disclosed {
+    if !stop_counts_owed(winding.stop_disclosed) {
         return;
     }
     disclose_semantic_stop(counts, coordinator, warn);
@@ -3108,10 +3119,22 @@ impl ClassicDriver<'_> {
             .collected_graph_refused()
             .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
+        // Name a tripped no-progress wedge on stderr: the wedged
+        // publication stands in front of the commit, so the staged gap
+        // cannot commit while the wedge stands, and this warning is the
+        // user-visible name. Outside the counts once-gate: the wedge is
+        // new information even past a counts disclosure.
+        if let Some(trip) = lane.joint_finish_no_progress_trip() {
+            warn.emit(&format!(
+                "joint finish made no progress for {}s across {} polls; the lane is held for exit",
+                trip.stalled.as_secs(),
+                trip.polls,
+            ));
+        }
         let counts = SemanticStopCounts::read(&lane, coordinator);
         match winding_disclosed {
             // A stop path already disclosed this winding: stay silent.
-            Some(disclosed) if *disclosed => {}
+            Some(disclosed) if !stop_counts_owed(*disclosed) => {}
             // A winding hold discloses through the shared once-gate and
             // arms it; a live lane always discloses, as before.
             winding => {

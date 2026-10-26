@@ -91,6 +91,10 @@ RUNNING_HEADER = re.compile(r"^\s*Running (\S+) (\S+) \((.*?)\)\s*$")
 RUNNING_SRC_HEADER = re.compile(r"^\s*Running (\S+) \((.*?)\)\s*$")
 BARE_RUNNING_HEADER = re.compile(r"^\s*Running (\S+)\s*$")
 DOCTEST_HEADER = re.compile(r"^\s*Doc-tests (\S+)\s*$")
+# A header-looking line that matches none of the known forms: failing
+# closed keeps a future cargo format from merging its summary into the
+# previous section and masking that section's verdict.
+UNKNOWN_HEADER = re.compile(r"^\s*(Running|Doc-tests)\b")
 # The one rest binary that legitimately holds no tests: the p11scope bin
 # is CLI dispatch only (src/main.rs), so its total-0 summary is pinned,
 # not proved. (binary stem, target source) from the Running header; a
@@ -288,7 +292,9 @@ def verify_rest_output(output, expected=None):
     the binary's own summary is its section's last `test result:` line
     (a nested libtest run inside a test can only print earlier). A
     `Doc-tests` header starts its own section so a doctest summary can
-    never stand in for its lib's. When `expected` (from
+    never stand in for its lib's. A header-looking line that matches
+    none of the known forms fails naming the line, so every section
+    ends at the next header of any form. When `expected` (from
     `rest_expected_targets`) is given, every expected target must have
     run a section: a selected target cargo silently skips fails naming
     it instead of passing invisibly.
@@ -313,6 +319,8 @@ def verify_rest_output(output, expected=None):
         if bare is not None:
             sections.append((None, bare.group(1), []))
             continue
+        if UNKNOWN_HEADER.match(line):
+            raise PartitionError(f"unrecognized rest header: {line.strip()}")
         if sections:
             sections[-1][2].append(line)
     if not sections:

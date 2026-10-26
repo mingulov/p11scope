@@ -360,7 +360,11 @@ ELF object identity plus file offset, and uprobes attach to that object/offset
 in the selected PID or cgroup. Virtual addresses never have to match.
 
 The default scan reads the target's mapped table; it does not call into the
-provider. The optional helper reconstructs a table in its own unprivileged
+provider. Providers that build the table at run time (in `.bss` or on the
+heap) are invisible to the default scan and need a manifest from
+`p11scope-discover` (see
+[known limitations](known-limitations.md#providers-that-build-their-function-table-at-run-time-need-a-manifest)).
+The optional helper reconstructs a table in its own unprivileged
 process and does not read or inject into the target. Its manifest is suitable
 only when that independently reconstructed table describes the same hash-pinned
 provider. Anonymous or JIT-generated targets and process-specific tables remain

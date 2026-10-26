@@ -13,7 +13,8 @@ assessment and incident diagnostics.
 
 > **Status: v0.5.0** adds FULL object-attribute capture in release builds
 > (P0 stays an explicit option), a `key operations:` line in text inventory
-> snapshots, a named `--max-endpoints` hint on over-budget plans, and
+> snapshots (reading `not reported by this version (planned for 0.5.1)`),
+> a named `--max-endpoints` hint on over-budget plans, and
 > discovery for kernel threads and zombie leaders. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
@@ -262,7 +263,11 @@ If you installed the optional helper, also run
 
   Start with a passive diagnostic capture. This manifest-free path retains
   aggregate function counts, return values and latency; scanned slots are
-  semantics-unverified and count-only. Rows carry standard function names
+  semantics-unverified and count-only. Providers that build their function
+  table at run time instead of keeping it in the file stay invisible to
+  this path and need a manifest built with `p11scope-discover` (see
+  [known limitations](docs/known-limitations.md#providers-that-build-their-function-table-at-run-time-need-a-manifest)).
+  Rows carry standard function names
   when the provider's own `.dynsym` exports every standard name exactly where
   its function table points (`linkage: "exports"`, as SoftHSM2 does);
   otherwise they read `unknown#<ordinal>`, never a guessed name. `doctor` and

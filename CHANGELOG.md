@@ -26,10 +26,11 @@ main thread already exited. User-facing limits live in
 
 ### Inventory output
 
-- Text snapshots carry a `key operations:` summary line from the same
-  shared tally as the dashboard: per-category completed/failed/active
-  counts once object observations are populated, else `key operations:
-  unavailable (<reason>)`. `--json` keeps the full rows.
+- Text snapshots carry a `key operations:` summary line. This version
+  never reports key operations, so it always reads `key operations:
+  not reported by this version (planned for 0.5.1)`; per-category
+  completed/failed/active counts arrive in 0.5.1. `--json` keeps the
+  full rows.
 - A combined key label is withheld when the class and key type are
   incompatible, instead of printing a misleading label.
 - Edwards and Montgomery key types are recognized at their standard

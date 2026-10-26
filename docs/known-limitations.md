@@ -63,6 +63,8 @@ declared per kernel, not a product guarantee.
 
 ## Planned for later versions
 
+- Live key operations (key type and size, sign/verify per key) in 0.5.1.
+- Promoting one endpoint to full detail during a counter capture, in 0.5.1.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.
@@ -226,7 +228,9 @@ correct and finite with no cap: once the estimate reaches 2 s, p11scope
 prints one up-front estimate line (computed at 50 ms per link, so on 5.15
 it can overstate the wait), then the usual per-second progress, and a
 second Ctrl-C stops waiting and leaves the kernel to finish the remaining
-closes after exit.
+closes after exit. Measured on Fedora 7.2.9 (5 vCPU) with the release
+candidate at 8,194 per-offset links: attach 41 s, stop (link release)
+339 s.
 
 ### 5.15: physical-identity controls and non-leader exec unqualified
 
@@ -551,15 +555,20 @@ closes after exit.
 
 - What the user sees: long `--cgroup`/`--system` captures of busy hosts can
   spend the 16,384-identity budget (about an hour at 5 new processes/s);
-  later processes are counted only as identity refusals, and later callers
-  become identity refusals.
+  later processes get no identity: the capture prints
+  `p11scope: kernel could not give a process an identity (lifetime budget
+  of 16384 identities spent); its calls and fork records are not captured
+  and the report is PARTIAL`, counts each refusal in
+  `evidence.kernel_control.identity_unavailable` with
+  `identity_budget_exhausted: true`, and inventory callers show a `usage
+  coverage health regression` gap naming the refused identity counts.
 - Kernels/conditions: all kernels; Detailed `task_newtask` fork-wrapper
   ticket burn in `--system` Detailed subsets is unmeasured.
 - Disclosure: `evidence.kernel_control` (`identity_budget_exhausted`,
   `identity_unavailable`, `owner_admission_failures`), gaps, `PARTIAL`.
 - Workaround: `--pid` or a narrow `--cgroup`, or split the capture.
-- Planned: v0.3.0 (C6 30-minute churn cell from M5 projections; lazy
-  allocation, retirement/recycling, or a declared envelope).
+- Planned: reusable identity slots are planned for 0.5.1; v0.5.0 keeps
+  the 16,384 budget with the named gaps above.
 
 ### Provisional P/N defaults (DR-07)
 
@@ -578,16 +587,32 @@ closes after exit.
 
 ### Loader contexts 256 per capture, never recycled (X-1)
 
-- What the user sees: `profile`/`trace --system` with more than 256
-  short-lived `dlopen` processes leaves a late provider `dlopen` past 256
-  hooked views invisible to the loader path; only `discovery_truncated`
-  records it.
+- What the user sees: a capture that arms more than 256 provider loads
+  refuses the 257th with a named gap: `evidence.discovery_truncated`
+  counts it (`N discovery records truncated`), `evidence.skipped` keeps
+  the entry (`live loader arming`, or `owned initial-set discovery` on
+  the owned path, with `loader context capacity 256 is exhausted`),
+  `evidence.loader_discovery.strategies.unavailable` counts it, and the
+  report reads `PARTIAL`.
 - Kernels/conditions: all kernels; compounds per-process loader hooks
   (`OneProcess` scope, deep-scanned views only).
-- Disclosure: `discovery_truncated` counter.
+- Disclosure: `discovery_truncated`, `evidence.skipped`, `PARTIAL`.
 - Workaround: narrower scope, longer-lived providers.
-- Planned: v0.3.0 (recycle loader contexts and sweep after discovery loss;
-  attach `dl_debug_state` once per distinct ld.so inode with a cookie).
+- Planned: reusable loader contexts are planned for 0.5.1; v0.5.0 keeps
+  the 256 limit with the named gap above.
+
+### Stop-time graph pool is one fixed 384 MiB accounting limit
+
+- What the user sees: the stop sequence accounts the collected call graph
+  against one fixed 384 MiB limit, sized for 8,192 endpoints, whatever
+  `--max-endpoints` is set to. A stop that would exceed it ends as a
+  finite incomplete stop, with the retired objects reported attached and
+  the measured peak disclosed.
+- Kernels/conditions: all kernels; the stop of a large capture.
+- Disclosure: the incomplete-stop report with the measured peak.
+- Workaround: fewer endpoints (`--module`, narrower scope).
+- Planned: stays one fixed accounting limit for every `--max-endpoints`
+  value.
 
 ### Scan-induced target stalls unmeasured (DR-39)
 
@@ -902,6 +927,28 @@ subsequent sync failed, so the record alone does not confirm durable
 completion. Event creation and the initial `started` write remain fail-fast.
 This fixes returned errors only; stalled final stdout remains limited as
 described above.
+
+### Providers that build their function table at run time need a manifest
+
+- What the user sees: automatic discovery finds no table in the
+  provider's file-backed data, attaches 0 probes, and reports
+  `discovery skipped <path> — no function table was found in its
+  file-backed data; ...`. A table built at run time (in `.bss` or on
+  the heap) is outside the memory scan's reach. The known example is
+  SoftHSM 2.7.0 on Fedora 44 (`/usr/lib64/pkcs11/libsofthsm2.so`);
+  SoftHSM 2.6.1 on Ubuntu keeps its table in the file and needs no
+  manifest.
+- Kernels/conditions: all kernels; any provider that builds its
+  function table at run time instead of keeping it in the file.
+- Disclosure: the `discovery skipped` line above, which ends with the
+  `p11scope-discover` command that observes the provider, and the
+  0-probe attach count.
+- Workaround: build a manifest with the offline helper and pass it to
+  the capture: `p11scope-discover --module <path> -o manifest.json`,
+  then `--manifest manifest.json` on the capture command. The Fedora
+  SoftHSM example then finds 68 functions and attaches 136 probes.
+- Planned: automatic discovery of run-time-built tables is planned for
+  a later version.
 
 ## Scopes (cgroup and pod)
 

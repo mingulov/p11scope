@@ -1175,6 +1175,83 @@ fn object_journal_marker_build_uses_one_gate() {
     }
 }
 
+/// H8-D marker drop arms: every silent in-scope drop arm calls the scope
+/// gap at its own site, not just somewhere in its root. The entry ABI
+/// refusals, the entry identity and START failures, the return ABI
+/// refusal and missing START, and both lost-code root branches each name
+/// their arm; deleting any one call fails. E2/R2 are covered live, and
+/// the six fault-only object arms are a different row class.
+#[test]
+fn object_journal_marker_drop_arms_call_the_gap() {
+    const GAP: &str = "p11_instance_scope_gap();";
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let lines: Vec<&str> = source.lines().collect();
+    let entry_at = lines
+        .iter()
+        .position(|line| line.starts_with("fn p11_entry_impl"))
+        .expect("entry impl");
+    let return_at = lines
+        .iter()
+        .position(|line| line.starts_with("fn p11_return_impl"))
+        .expect("return impl");
+    let accounting_at = lines
+        .iter()
+        .position(|line| line.starts_with("struct ReturnAccounting"))
+        .expect("return impl end");
+    let entry = &lines[entry_at..return_at];
+    let returned = &lines[return_at..accounting_at];
+    // (region, arm anchor, expected arms, gap above the anchor).
+    let arms: &[(&[&str], &str, usize, bool)] = &[
+        (entry, "bump_evidence(EVIDENCE_ABI_REFUSALS);", 3, true),
+        (
+            entry,
+            "bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);",
+            1,
+            true,
+        ),
+        (entry, "if start_pointer.is_null() {", 1, false),
+        (returned, "bump_evidence(EVIDENCE_ABI_REFUSALS);", 1, true),
+        (returned, "if start.is_null() {", 1, false),
+        (
+            returned,
+            "ordinary_return(ctx, &key, start, flags, layout) != 0 {",
+            1,
+            false,
+        ),
+        (
+            returned,
+            "object_return(ctx, &key, start, flags, layout) != 0 {",
+            1,
+            false,
+        ),
+    ];
+    for (region, anchor, expected, above) in arms {
+        let hits: Vec<usize> = region
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim().contains(anchor))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            *expected,
+            "expected {expected} {anchor} arms, found {}",
+            hits.len()
+        );
+        for hit in hits {
+            let window = if *above {
+                &region[hit.saturating_sub(6)..hit]
+            } else {
+                &region[hit + 1..(hit + 7).min(region.len())]
+            };
+            assert!(
+                window.iter().any(|line| line.contains(GAP)),
+                "drop arm {anchor} must call the scope gap within six lines"
+            );
+        }
+    }
+}
+
 /// H8-D birth marker wiring: only the Detailed object carries the
 /// control map and the two marker globals; inventory and counter
 /// objects carry neither; no built object carries a transaction

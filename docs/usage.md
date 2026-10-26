@@ -21,10 +21,12 @@ implementation limits are code contracts, not measurements.
 > and the [profile schema](schema/observed-profile-v3.md) define the capture
 > boundary and public evidence.
 
-`--counter-mode counts|timestamps|latency` is reserved for `profile` or `run`
-with `--mode metrics`. Explicit selections are unavailable and return
-`counter-mode-unwired` before capture setup or owned-child launch.
-Omit `--counter-mode` to keep existing metrics behavior.
+`--counter-mode counts|timestamps|latency` selects kernel-aggregated
+capture for `profile` or `run` with `--mode metrics`, available on 6.6+
+(LP64). On 5.15 and 6.1 every mode refuses with the named
+`counter-mode-unavailable-on-kernel` reason before capture setup or
+owned-child launch. Omit `--counter-mode` to keep existing metrics
+behavior.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)

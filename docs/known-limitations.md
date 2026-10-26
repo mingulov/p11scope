@@ -19,9 +19,13 @@ on 6.6+. The report always discloses which backend was used
 module attribution and calls held across a non-leader exec stay
 unqualified (see below).
 
-Measurement modes stay reserved: `--counter-mode counts|timestamps|
-latency` is refused with `counter-mode-unwired` before capture setup.
-Omitting the flag keeps existing metrics behavior. Per-call
+Measurement modes aggregate in the kernel on 6.6+ (LP64):
+`--counter-mode counts|timestamps|latency` for `profile`/`run` with
+`--mode metrics`. On 5.15 and 6.1 every mode refuses with the named
+`counter-mode-unavailable-on-kernel` reason before capture setup, and
+`run` never starts its program then. Latency banks grow with the host
+possible-CPU count and refuse with `counter-memory-limit` past the
+per-capture kernel-map memory cap on hosts with many CPUs. Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build).
 
@@ -95,7 +99,8 @@ apply. FULL and broader installed/package qualification remain open.
 The unreleased development checkpoint retains the existing metrics path when
 `--counter-mode` is omitted. Explicit `counts`, `timestamps` and `latency`
 requests are preparatory and refuse before capture setup. Useful public
-activation of those measurement modes remains outside this checkpoint.
+activation of those measurement modes remains outside this checkpoint;
+v0.5.0 activates them (see above).
 
 The G21 FULL-capture wrap legs (660 rounds in 900s, pid + system) are not
 qualified in v0.4.0: FULL is absent from the selected P0 build, and earlier legs

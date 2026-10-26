@@ -10,9 +10,10 @@ versioned separately and are opaque, exact dispatch keys.
 v0.5.0: official release builds read object attributes by default (FULL),
 with the P0 build staying an explicit option. Text inventory snapshots
 carry a `key operations:` summary line, over-budget inventory plans name
-`--max-endpoints`, reserved `--counter-mode` selections are refused with
-a named error, and discovery handles kernel threads and processes whose
-main thread already exited. User-facing limits live in
+`--max-endpoints`, `--counter-mode` selections aggregate in the kernel
+on 6.6+ (LP64) and refuse by name on 5.15 and 6.1, and discovery handles
+kernel threads and processes whose main thread already exited.
+User-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
 ### Scale and --system
@@ -51,10 +52,14 @@ main thread already exited. User-facing limits live in
   flag, value length, RSA modulus bits and finite EC parameters, with
   the result rules, retention table and publication section. Nothing
   else in v3 grants capture.
-- `--counter-mode counts|timestamps|latency` stays reserved for
-  `profile`/`run` with `--mode metrics`: explicit selections return
-  `counter-mode-unwired` before capture setup. Omit the flag to keep
-  existing metrics behavior.
+- `--counter-mode counts|timestamps|latency` selects kernel-aggregated
+  capture for `profile`/`run` with `--mode metrics` on 6.6+ (LP64). On
+  5.15 and 6.1 every mode refuses with the named
+  `counter-mode-unavailable-on-kernel` reason before capture setup, and
+  `run` never starts its program then. Latency banks refuse with
+  `counter-memory-limit` past the per-capture kernel-map memory cap on
+  hosts with many possible CPUs. Omit the flag to keep existing metrics
+  behavior.
 - Startup readiness bounds are disclosed per kernel (8 s on 6.6+,
   30 s on 5.15/6.1); see
   [known limitations](docs/known-limitations.md#known-limitations-v050).
@@ -88,8 +93,9 @@ Most important for this release:
   (6.6 and later); older kernels stay correct but stop slowly and start
   slowly.
 - Startup takes about 15–22 s on 5.15/6.1, about 4–7 s on 6.6+.
-- `--counter-mode` selections are reserved and refused; metrics behavior
-  without the flag is unchanged.
+- `--counter-mode` selections aggregate in the kernel on 6.6+ (LP64)
+  and refuse by name on 5.15 and 6.1; metrics behavior without the
+  flag is unchanged.
 - In containers, a process that loaded a provider before a copy-up is
   attributed to the copied-up file and its later calls are missed;
   restart such processes.

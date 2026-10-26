@@ -23,8 +23,10 @@ assessment and incident diagnostics.
 > this release was qualified on.
 
 Omitting `--counter-mode` keeps existing metrics behavior. Explicit
-`counts`, `timestamps` and `latency` selections are reserved and return
-a `counter-mode-unwired` error before capture setup.
+`counts`, `timestamps` and `latency` selections aggregate in the kernel
+on 6.6+ (LP64); on 5.15 and 6.1 they refuse with the named
+`counter-mode-unavailable-on-kernel` reason before capture setup, and
+`run` never starts its program when a counter refusal happens.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in

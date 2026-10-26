@@ -419,26 +419,29 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 /// - `fstat` of an opened fd is NOT comparable with maps either (1786658:
 ///   btrfs `st_dev` is the subvolume's anonymous device, 0:37, never the
 ///   maps device). And since 4.19 (stacked file operations) overlayfs
-///   `mmap` installs the BACKING file in the VMA (`ovl_mmap` ->
-///   `backing_file_mmap` -> `vma_set_file(realfile)`); what changed around
-///   6.8 is only what procfs renders for maps lines. Before, maps shows
-///   the backing file itself (observed on 6.1 and 6.6, 5498046); from
-///   then on it renders the user-visible overlay file (`file_user_inode`
-///   in `show_map_vma`; read in the 6.17 source). `map_files` stat is the
-///   overlay identity on BOTH sides of 6.8, never the backing file:
-///   probed on 6.6.157 and 7.0.14 (upper-only, lower-layer and
-///   second-mount files, xino=off), the `map_files` stat always equals
-///   `fstat` of the same path — with xino=off both even share the layer's
-///   pseudo `st_dev` (upper `(49, *)`, lower `(50, *)` while the mount
-///   itself is `0:48` on 6.6), never the backing device maps shows
-///   pre-6.8. An earlier revision of this comment claimed pre-6.8
-///   `map_files` shows the backing file; the probe refutes that half
-///   (the maps half stands).
-/// - So both sides use the kernel's own `vm_file`: the candidate side
-///   stats the target's `map_files` range; the pinned side mmaps the held
-///   fd itself (one private read-only page, like `KernelSelfMappingProbe`)
-///   and stats `/proc/self/map_files` for that mapping. The same kernel
-///   path installs both VMAs and the same procfs code renders both
+///   `mmap` installs the BACKING file in the VMA (in v6.6 `ovl_mmap`
+///   calls `vma_set_file(vma, realfile)` directly; the
+///   `backing_file_mmap` step appears only in v6.8 `fs/backing-file.c`);
+///   what changed around 6.8 is only what procfs renders for maps
+///   lines. Before, maps shows the backing file itself (observed on
+///   6.1 and 6.6, 5498046); from then on it renders the user-visible
+///   overlay file (`file_user_inode` in `show_map_vma`; read in the
+///   6.17 source). `map_files` stat is the overlay identity on BOTH
+///   sides of 6.8, never the backing file: probed on 6.6.157 and
+///   7.0.14 (upper-only, lower-layer and second-mount files,
+///   xino=off), the `map_files` stat always equals `fstat` of the
+///   same path — when the layers are on different filesystems, with
+///   xino=off both even share the layer's pseudo `st_dev` (upper
+///   `(49, *)`, lower `(50, *)` while the mount itself is `0:48` on
+///   6.6), never the backing device maps shows pre-6.8.
+/// - So both sides compare like-for-like by construction: the candidate
+///   side stats the target's `map_files` range; the pinned side mmaps
+///   the held fd itself (one private read-only page, like
+///   `KernelSelfMappingProbe`) and stats `/proc/self/map_files` for
+///   that mapping. That the `map_files` stat equals `fstat` of the
+///   same path is observed (probed on both sides of 6.8) but not
+///   relied on. The same kernel path installs both VMAs and the same
+///   procfs code renders both
 ///   (overlay or not, before or after 6.8), so equal identities are the
 ///   same kernel file: on btrfs the subvolume's `(anon dev, ino)`, unique;
 ///   on overlay both render this mount's view of the file, which is also

@@ -106,8 +106,11 @@ struct HookPreparationRefusal {
 #[derive(Debug)]
 pub(crate) struct WatchedFile {
     pub(crate) file_slot: u32,
-    /// The maps-visible keys this pinned object is known under; the scan
-    /// selects the file's ranges in `/proc/PID/maps` by these.
+    /// The keys this pinned object is known under in `/proc/PID/maps`;
+    /// the scan selects the file's ranges by these. The pin's raw keys
+    /// are maps-visible on every kernel; the appended calibration key
+    /// is maps-visible only before 6.8 (from then on maps renders the
+    /// user-visible overlay identity instead).
     pub(crate) maps_keys: Vec<ObjectKey>,
     /// The file's map_files `stat()` identity, recorded at calibration; a
     /// scan keeps only ranges with exactly this identity.
@@ -694,7 +697,9 @@ fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
 /// The calibration protocol: arm `INSTANCE_CALIB` with this thread, map one
 /// page of the pinned fd, and require the hook's record of exactly that
 /// mapping start. The recorded `{s_dev, i_ino}` is the kernel identity every
-/// hook will compute for this file (btrfs anonymous dev, overlay real inode).
+/// hook will compute for this file: the filesystem-wide `s_dev` (shared by
+/// every btrfs subvolume, not the subvolume's anonymous device) and the
+/// real inode.
 /// Calibrates the kernel file key of `path` from the observer's own mapping
 /// and records that mapping's `/proc/self/map_files` identity. The key
 /// (`s_dev`, `i_ino`) may collide across btrfs subvolumes or overlay layers;
@@ -766,15 +771,17 @@ fn calibrate(ebpf: &mut Ebpf, path: &Path) -> Result<(InstanceFileKey, MappedFil
 /// (v6.8), /proc/PID/maps shows an overlayfs-backed mapping under the
 /// backing file's (device, inode), which the mountinfo-derived raw key
 /// never matches; the calibration pair is exactly what those kernels show
-/// (the same `f_inode` both sides; probed on 6.6.157 for upper-only and
-/// lower-layer files). On 6.8+ the raw key matches and the calibration key
-/// is normally dead, but it can still select another mount's ranges:
-/// pre-6.8 every mount of the same lower file shares the backing maps line
-/// (probed `(52, 11)` on both mounts on 6.6); on 6.8+ only by numeric
-/// coincidence. Identity confirmation still gates every selected
-/// candidate, so such extras only cost a few refused `map_files` stats —
-/// never a false join (a second mount compares unequal: `(66, 11)` vs
-/// `(68, 11)` on 6.6, `(69, 11)` vs `(71, 11)` on 7.0).
+/// (both read `vm_file->f_inode`; maps probed on 6.6.157 for upper-only
+/// and lower-layer files; joins proven live for upper-only). On 6.8+ the
+/// raw key matches and the calibration key is normally dead. Pre-6.8 the
+/// key also selects other mounts of the same lower file (shared backing
+/// line, probed `(52, 11)` on both mounts on 6.6); on 6.8+ it matches
+/// only direct mappings of the backing filesystem. Identity confirmation
+/// still gates every selected candidate, so such extras cost extra
+/// `map_files` stats (a failing stat refuses the scan); no false join
+/// beyond what the raw key already admits on 6.8+ (a second mount
+/// compares unequal: `(66, 11)` vs `(68, 11)` on 6.6, `(69, 11)` vs
+/// `(71, 11)` on 7.0).
 pub(super) fn maps_keys_for_watch(
     mut raw: Vec<ObjectKey>,
     calib: InstanceFileKey,

@@ -1263,6 +1263,59 @@ fn object_journal_marker_drop_arms_call_the_gap() {
     }
 }
 
+/// H8-D object ring-loss guard: the in-place scope gap runs only when
+/// the START removal settled (`if !failed`), because the fault arm
+/// above already refuses births when removal failed. Flipping the guard
+/// to `if failed` loses the only birth-refusal signal on the settled
+/// path; dropping it gaps spuriously on the fault path. The pin holds
+/// the exact `bump -> cfg -> if !failed -> gap` block, and both mutants
+/// fail it.
+#[test]
+fn object_journal_object_ring_loss_gap_requires_settled_guard() {
+    const GAP: &str = "p11_instance_scope_gap();";
+    const CFG: &str = "#[cfg(not(feature = \"counter-broad\"))]";
+    const GUARD: &str = "if !failed {";
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let lines: Vec<&str> = source.lines().collect();
+    let object_at = lines
+        .iter()
+        .position(|line| line.starts_with("fn object_return("))
+        .expect("object half");
+    let fork_at = lines
+        .iter()
+        .position(|line| line.starts_with("pub extern \"C\" fn p11_link_fork_allowed"))
+        .expect("halves end");
+    let object = &lines[object_at..fork_at];
+    let bump_at = object
+        .iter()
+        .position(|line| line.trim().contains("bump_evidence(EVIDENCE_RING_LOSS);"))
+        .expect("object ring-loss bump");
+    let window = &object[bump_at + 1..(bump_at + 9).min(object.len())];
+    let trimmed: Vec<&str> = window.iter().map(|line| line.trim()).collect();
+    let cfg_at = trimmed
+        .iter()
+        .position(|line| *line == CFG)
+        .expect("object ring-loss gap keeps its counter-broad cfg");
+    let guard_at = trimmed
+        .iter()
+        .position(|line| *line == GUARD)
+        .expect("object ring-loss gap needs its `if !failed` guard");
+    let gap_at = window
+        .iter()
+        .position(|line| line.contains(GAP))
+        .expect("object ring-loss gap call");
+    assert!(
+        cfg_at < guard_at && guard_at < gap_at,
+        "the object ring-loss arm must read bump -> cfg -> `if !failed` -> gap"
+    );
+    assert!(
+        !trimmed
+            .iter()
+            .any(|line| *line == "if failed {" || line.starts_with("if failed ")),
+        "the object ring-loss guard must not be the flipped `if failed`"
+    );
+}
+
 /// H8-D birth marker wiring: only the Detailed object carries the
 /// control map and the two marker globals; inventory and counter
 /// objects carry neither; no built object carries a transaction

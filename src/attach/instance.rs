@@ -551,7 +551,7 @@ impl InstanceTracking {
         };
         Ok(WatchedFile {
             file_slot,
-            maps_keys: objects.raw_keys_for(object),
+            maps_keys: maps_keys_for_watch(objects.raw_keys_for(object), key),
             identity,
             target,
         })
@@ -734,6 +734,18 @@ fn calibrate(ebpf: &mut Ebpf, path: &Path) -> Result<(InstanceFileKey, MappedFil
     })();
     calib.set(0, InstanceCalib::default(), 0)?;
     result
+}
+
+/// Maps-selection keys for a watched object: the pin's raw keys plus the
+/// calibration kernel key (`s_dev`, `i_ino`). Before upstream 3efdc78fdc21
+/// (v6.8), /proc/PID/maps shows an overlayfs-backed mapping under the
+/// backing file's (device, inode), which the mountinfo-derived raw key
+/// never matches; the calibration pair is exactly what those kernels show
+/// (the same `f_inode` both sides). On 6.8+ the raw key matches and the
+/// calibration key is a harmless dead key. Identity confirmation still
+/// gates every selected candidate.
+fn maps_keys_for_watch(raw: Vec<ObjectKey>, _calib: InstanceFileKey) -> Vec<ObjectKey> {
+    raw
 }
 
 /// `stat()` of one `map_files` entry: the identity of the file that VMA maps.
@@ -2461,5 +2473,92 @@ mod tests {
                 "{disabled:?} must read non-LTO"
             );
         }
+    }
+
+    #[test]
+    fn pre_68_overlay_maps_select_through_the_calibration_key() {
+        use p11scope_ebpf_common::InstanceFileKey;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        // A 6.6 guest maps snapshot for a provider on the virtme /tmp
+        // overlay: maps shows the backing (upper tmpfs) device 0x19 = 25,
+        // while the mountinfo-derived raw key carries the overlay
+        // superblock 0:48. Both name inode 802 (`xino=off`).
+        let snapshot = b"771234560000-771234561000 r--p 00000000 00:19 802 /tmp/provider.so\n\
+            771234561000-771234571000 r-xp 00001000 00:19 802 /tmp/provider.so\n\
+            00400000-00401000 r-xp 00000000 08:01 111 /usr/bin/driver\n";
+        let entries = p11scope_manifest::maps::parse_maps(snapshot).expect("fixture parses");
+        assert_eq!(entries.len(), 3);
+        let raw = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 48,
+            },
+            inode: 802,
+        };
+        // The raw key alone selects nothing on pre-6.8 overlay maps.
+        assert!(
+            crate::discovery::instances::ranges_for(
+                &entries,
+                raw.device.major,
+                raw.device.minor,
+                raw.inode
+            )
+            .is_empty()
+        );
+        // The watch keeps the raw key (6.8+ kernels show it) and adds the
+        // calibration kernel key (pre-6.8 kernels show it).
+        let keys = super::maps_keys_for_watch(vec![raw], InstanceFileKey { dev: 25, ino: 802 });
+        assert!(keys.contains(&raw));
+        let selected: Vec<_> = keys
+            .iter()
+            .flat_map(|key| {
+                crate::discovery::instances::ranges_for(
+                    &entries,
+                    key.device.major,
+                    key.device.minor,
+                    key.inode,
+                )
+            })
+            .collect();
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn calibration_key_uses_kernel_kdev_t_decoding() {
+        use p11scope_ebpf_common::InstanceFileKey;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        // An ext4 provider on 8:1: the hook reports the raw `s_dev`
+        // (8 << 20) | 1, and maps shows 08:01. Userspace `st_dev`
+        // decoding (`libc::major`/`libc::minor`) would misread this as
+        // major 0; kernel MAJOR/MINOR must be used, so the calibration
+        // key dedupes against the identical raw key.
+        let raw = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 99,
+        };
+        assert_eq!(
+            super::maps_keys_for_watch(
+                vec![raw],
+                InstanceFileKey {
+                    dev: (8 << 20) | 1,
+                    ino: 99
+                }
+            ),
+            vec![raw]
+        );
+        // An unnamed device with a minor above 255 decodes to (0, 300),
+        // never the userspace-st_dev reading (1, 44).
+        assert_eq!(
+            super::maps_keys_for_watch(Vec::new(), InstanceFileKey { dev: 300, ino: 7 }),
+            vec![ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 300
+                },
+                inode: 7
+            }]
+        );
     }
 }

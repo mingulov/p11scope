@@ -388,8 +388,8 @@ impl CaptureCollection {
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
         legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
-        _generation: NonZeroU64,
-        _kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
+        generation: NonZeroU64,
+        kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
         match binding {
             Ok(None) => {
@@ -419,13 +419,18 @@ impl CaptureCollection {
                 // Zero endpoints with a healthy binding is a normal capture:
                 // nothing to count, nothing stale. Bypass banks and the
                 // collector; later growth still starts from no baseline.
+                // The bypass still reads kernel evidence: the lifecycle
+                // programs are attached, so identity tickets and owner
+                // accounting move even with nothing to count. A read
+                // error fails loudly instead of publishing zeros.
                 if plan.slots.is_empty() && matches!(&binding, Ok(Some(_))) {
                     let counter = self.counter.as_mut().expect("owner inputs checked above");
                     let mode = counter.mode;
                     let discontinuity = counter.discontinuity;
                     let reserve = counter.collector.reserver();
-                    let generation = std::num::NonZeroU64::new(1).expect("nonzero generation");
-                    let kernel = KernelEvidence::default();
+                    let kernel = kernel().map_err(|_| {
+                        anyhow::anyhow!("counter collection unavailable (kernel_evidence)")
+                    })?;
                     let reservation = ReadReservation::reserve(0, 0, reserve).map_err(|_| {
                         anyhow::anyhow!("counter collection unavailable (read_budget)")
                     })?;

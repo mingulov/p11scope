@@ -6103,6 +6103,52 @@ mod tests {
         assert!(collection["failure"].is_null());
         let functions = document["functions"].as_array().expect("functions array");
         assert!(functions.is_empty(), "zero endpoints, zero functions");
+        // Non-counter twin: the same owned workload without
+        // --counter-mode must reach the same verdict and kernel
+        // control evidence (the counter verdict is the plain verdict).
+        let twin_id = id.wrapping_add(1);
+        let twin_out = std::env::temp_dir()
+            .join(format!("p11scope-counter-run-{twin_id}.json"));
+        let _twin_cleanup = RemoveReportOnDrop(twin_out.clone());
+        let twin_marker = counter_cli_run_marker_path(twin_id);
+        let _twin_marker_cleanup = RemoveReportOnDrop(twin_marker.clone());
+        let twin_out_text = twin_out.to_string_lossy().into_owned();
+        let twin_marker_text = twin_marker.to_string_lossy().into_owned();
+        let twin_script = format!("printf ran > '{twin_marker_text}'");
+        let twin_argv = [
+            "run",
+            "--mode",
+            "metrics",
+            "--attach-backend",
+            "multi",
+            "-o",
+            twin_out_text.as_str(),
+            "--",
+            "/bin/sh",
+            "-c",
+            twin_script.as_str(),
+        ];
+        let Ok(crate::cli::Command::Run(twin_args)) = crate::cli::parse(twin_argv) else {
+            panic!("twin run argv must parse as an owned run");
+        };
+        assert_eq!(twin_args.counter_mode, None);
+        let twin_outcome = crate::run::run_owned(&twin_args).expect("owned twin run completes");
+        assert_eq!(twin_outcome.child_exit_code, Some(0));
+        assert!(!twin_outcome.child_still_running);
+        assert!(twin_marker.is_file(), "the twin command never ran");
+        let twin_text = std::fs::read_to_string(&twin_out).expect("twin -o report exists");
+        let twin: serde_json::Value = serde_json::from_str(&twin_text).expect("valid twin JSON");
+        assert_eq!(twin["schema"], "p11scope/observed-profile/v3-metrics");
+        assert_eq!(
+            document["evidence"]["completeness"],
+            twin["evidence"]["completeness"],
+            "counter and plain runs must agree on completeness"
+        );
+        assert_eq!(
+            document["evidence"]["kernel_control"],
+            twin["evidence"]["kernel_control"],
+            "counter and plain runs must agree on kernel control"
+        );
         eprintln!("COUNTER_CLI_RUN child=0 functions=0 status=fresh");
     }
 

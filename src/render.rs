@@ -6409,6 +6409,297 @@ pub(crate) mod tests {
         assert_eq!(json["kernel_control"]["identity_budget_exhausted"], true);
     }
 
+    /// OD34/E1: the 256 process-view limit is named in the user's report.
+    /// The exact view-capacity skip projects to a finite named reason (not
+    /// the redacted pair), forces PARTIAL with the `skipped` cause, and the
+    /// text names the limit with its count. The twin pins that a clean
+    /// control stays silent.
+    #[test]
+    fn view_capacity_skip_names_the_limit_in_text_and_json() {
+        use crate::discovery::scan::Skipped;
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(clean.gap_classes.observation.causes.is_empty());
+        let internal = Skipped {
+            subject: "process view".into(),
+            reason: "capture process-view capacity 256 was exhausted; remaining generations were not scanned".into(),
+        };
+        let mut ev = evidence();
+        ev.skipped = vec![capture_skipped_out(&internal)];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                document["evidence"]["skipped"],
+                serde_json::json!([{
+                    "name": "discovery subject",
+                    "reason": "capture process-view capacity was exhausted; remaining generations were not scanned",
+                }])
+            );
+        }
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 entries skipped"), "{text}");
+        assert!(
+            text.contains(
+                "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            verdict_reasons(&ev).contains(
+                "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
+            ),
+            "{text}"
+        );
+    }
+
+    /// The fixed loader-limit skips name their limit too: both 256-context
+    /// arm paths share the capacity reason, and the two bounded-ledger
+    /// losses keep their fixed sentences. Every pair projects to its named
+    /// reason; PARTIAL with the count in text and JSON.
+    #[test]
+    fn loader_limit_skips_name_the_limit_for_every_arm_path() {
+        use crate::discovery::scan::Skipped;
+        // L1 formats the preflight refusal through `{error:#}` (the live
+        // arm path); a single-message error renders verbatim.
+        let live_reason = format!(
+            "{:#}",
+            anyhow::anyhow!("loader context capacity 256 is exhausted")
+        );
+        let internals: [(&str, &str, &str); 4] = [
+            (
+                "live loader arming",
+                &live_reason,
+                "loader context capacity 256 is exhausted",
+            ),
+            (
+                "owned initial-set discovery",
+                "loader context capacity 256 is exhausted",
+                "loader context capacity 256 is exhausted",
+            ),
+            (
+                "live loader memory discovery",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger",
+            ),
+            (
+                "post-arm provider discovery",
+                "the bounded loader-arm catch-up ledger was full",
+                "the bounded loader-arm catch-up ledger was full",
+            ),
+        ];
+        for (subject, reason, public) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(projected.reason, *public, "{subject} {reason}");
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason, _)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            document["evidence"]["skipped"],
+            serde_json::json!([
+                {"name": "discovery subject", "reason": "loader context capacity 256 is exhausted"},
+                {"name": "discovery subject", "reason": "loader context capacity 256 is exhausted"},
+                {"name": "discovery subject", "reason": "a deferred loader memory scan exceeded the bounded loader-context ledger"},
+                {"name": "discovery subject", "reason": "the bounded loader-arm catch-up ledger was full"},
+            ])
+        );
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("4 entries skipped"), "{text}");
+        for fragment in [
+            "loader context capacity 256 is exhausted: 2",
+            "a deferred loader memory scan exceeded the bounded loader-context ledger: 1",
+            "the bounded loader-arm catch-up ledger was full: 1",
+        ] {
+            assert!(text.contains(fragment), "{text}");
+        }
+    }
+
+    /// Twins: the same subjects with target-derived reasons stay redacted —
+    /// subject-only matching would leak paths through the allowlisted names,
+    /// so the allowlist matches exact (subject, reason) pairs.
+    #[test]
+    fn path_carrying_skip_reasons_stay_redacted() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "process view",
+                "member /private/PATH_VIEW could not be scanned: ESRCH",
+            ),
+            (
+                "live loader arming",
+                "arm failed for /private/PATH_ARM: no such process",
+            ),
+            (
+                "live loader memory discovery",
+                "scan of /private/PATH_SCAN unresolved: /proc/9999 gone",
+            ),
+            (
+                "owned initial-set discovery",
+                "preflight refused: mapping /private/PATH_OWNED changed",
+            ),
+            (
+                "post-arm provider discovery",
+                "catch-up for /private/PATH_CATCHUP skipped: budget spent",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            let rendered = document.to_string();
+            assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+            assert!(!rendered.contains("/private/"), "{rendered}");
+        }
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("5 entries skipped"), "{text}");
+    }
+
+    /// Twins: reasons that merely start with an allowlisted sentence but
+    /// carry more (a path, a detail suffix, wrong case or spacing) stay
+    /// redacted — the allowlist is exact, never prefix or substring. The
+    /// normalized view sentence without a value is not an engine form and
+    /// stays redacted too.
+    #[test]
+    fn allowlisted_prefix_plus_detail_stays_redacted() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "process view",
+                "capture process-view capacity 256 was exhausted; remaining generations were not scanned; extra /private/PATH_SUFFIX",
+            ),
+            (
+                "process view",
+                "capture process-view capacity 256 was exhausted",
+            ),
+            (
+                "process view",
+                "capture process-view capacity was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                "capture process-view capacity many was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                " capture process-view capacity 256 was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "process view",
+                "Capture process-view capacity 256 was exhausted; remaining generations were not scanned",
+            ),
+            (
+                "live loader arming",
+                "loader context capacity 256 is exhausted: /private/PATH_DETAIL",
+            ),
+            (
+                "live loader arming",
+                "loader context capacity 256 is exhausted ",
+            ),
+            (
+                "live loader memory discovery",
+                "a deferred loader memory scan exceeded the bounded loader-context ledger (pid /private/X)",
+            ),
+            (
+                "post-arm provider discovery",
+                "the bounded loader-arm catch-up ledger was full; see /private/Y",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let rendered = document.to_string();
+        assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+        assert!(!rendered.contains("/private/"), "{rendered}");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("10 entries skipped"), "{text}");
+    }
+
     /// With the compiled-in timing catalog empty (D3), debug-state discovery
     /// still runs but proves nothing about timing.
     #[test]

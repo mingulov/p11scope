@@ -1662,6 +1662,162 @@ mod tests {
         );
     }
 
+    /// A no-op SIGURG disposition for EINTR injection, restored on drop.
+    /// Signals are aimed at one thread with `pthread_kill`, so concurrent
+    /// tests are undisturbed; the handler does nothing, which is
+    /// behaviorally identical to SIGURG's default ignore.
+    struct SigurgNoop {
+        previous: libc::sigaction,
+    }
+
+    extern "C" fn sigurg_noop_handler(_signal: libc::c_int) {}
+
+    impl SigurgNoop {
+        fn install() -> Self {
+            // SAFETY: zeroed sigaction with an empty mask and no flags (in
+            // particular no SA_RESTART, so a signal during poll surfaces as
+            // EINTR exactly like the second SIGINT in production).
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = sigurg_noop_handler as libc::sighandler_t;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: installing a signal-safe no-op handler; the old
+            // disposition is restored by Drop, including on panic.
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGURG, &action, &mut previous) },
+                0
+            );
+            Self { previous }
+        }
+    }
+
+    impl Drop for SigurgNoop {
+        fn drop(&mut self) {
+            // SAFETY: restoring the previously installed disposition.
+            unsafe {
+                libc::sigaction(libc::SIGURG, &self.previous, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Sends SIGURG at `target` until `stop` is set. The tight loop keeps a
+    /// signal pending nearly always, so a `poll` on the target thread is
+    /// interrupted the way the second SIGINT interrupts teardown.
+    fn pummel_with_sigurg(
+        target: libc::pthread_t,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: pthread_kill to a live test thread with a valid signal.
+                unsafe {
+                    libc::pthread_kill(target, libc::SIGURG);
+                }
+            }
+        })
+    }
+
+    /// A `sleep` child that is always killed and reaped, including when
+    /// an assertion panics: leaked sleeps would hold their pids for 30 s.
+    struct SleepChild(std::process::Child);
+
+    impl Drop for SleepChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn live_pin_and_child() -> (PidPin, SleepChild) {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a live child to pin");
+        let pin = PidPin::open(child.id()).expect("pinning the live child");
+        assert!(
+            pin.pidfd().is_ok(),
+            "the test needs a pidfd pin: a /proc fallback never EINTRs, so it cannot prove the retry"
+        );
+        (pin, SleepChild(child))
+    }
+
+    /// A signal landing in a finite pidfd wait retries to the deadline
+    /// instead of failing: the second SIGINT during teardown must not
+    /// turn the exit probe into an error that drops the report.
+    #[test]
+    fn a_signal_during_a_finite_pidfd_wait_does_not_fail_the_wait() {
+        let (pin, _child) = live_pin_and_child();
+        let _sigurg = SigurgNoop::install();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self names the calling test thread.
+        let target = unsafe { libc::pthread_self() };
+        let sender = pummel_with_sigurg(target, Arc::clone(&stop));
+        let start = Instant::now();
+        let ready = pin.wait_ready(Some(Duration::from_millis(400)));
+        let elapsed = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().expect("the sender thread joins");
+        assert_eq!(
+            ready.expect("a signal during a finite wait retries, never fails"),
+            false,
+            "a live child is never ready"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a finite wait stays finite: {elapsed:?}"
+        );
+    }
+
+    /// Timeout-zero exit probes under signals also retry: `original_exited`
+    /// is the teardown observation, and one EINTR there used to veto the
+    /// whole report.
+    #[test]
+    fn signals_during_timeout_zero_exit_probes_do_not_fail_them() {
+        let (pin, _child) = live_pin_and_child();
+        let _sigurg = SigurgNoop::install();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self names the calling test thread.
+        let target = unsafe { libc::pthread_self() };
+        let sender = pummel_with_sigurg(target, Arc::clone(&stop));
+        let mut failures = 0u32;
+        let mut first = None;
+        for _ in 0..2000 {
+            match pin.original_exited() {
+                Ok(false) => {}
+                other => {
+                    failures += 1;
+                    if first.is_none() {
+                        first = Some(format!("{other:?}"));
+                    }
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().expect("the sender thread joins");
+        assert_eq!(
+            failures, 0,
+            "2000 live-child probes under signals, first failure: {first:?}"
+        );
+    }
+
+    /// Healthy twin: a finite wait with no signals times out unready.
+    #[test]
+    fn a_finite_pidfd_wait_without_signals_times_out_unready() {
+        let (pin, _child) = live_pin_and_child();
+        assert_eq!(
+            pin.wait_ready(Some(Duration::from_millis(50)))
+                .expect("an unobstructed wait succeeds"),
+            false
+        );
+    }
+
+    /// Healthy twin: timeout-zero probes with no signals report a live child.
+    #[test]
+    fn timeout_zero_exit_probes_without_signals_report_a_live_child() {
+        let (pin, _child) = live_pin_and_child();
+        assert_eq!(pin.original_exited(), Ok(false));
+    }
+
     /// Mutation caught: classifying a changed `/proc` start time as an exit
     /// would grant a later process at the reused numeric PID terminal authority.
     #[test]

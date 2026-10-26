@@ -10171,6 +10171,119 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_birth_after_h3_void_respects_fence() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // An H3 loss voids the registered key. A later birth for a key
+        // that did not exist at the void, naming a cut below the void,
+        // must refuse: its claimed-complete interval includes the loss.
+        // Absence resumption exactly at the fence stays sound.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        // Shed call for X: observed (ordinal 3) while X's key is
+        // unregistered, then lost to the H3 void below.
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(failure.h3_voided, Some(6));
+        // New history for X above the void: ordinals 4-5.
+        let x_begin = begin_bytes_image(2, 1, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest(&x_begin);
+        let x_end = end_bytes(&x_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&x_end), JournalDisposition::EndStaged);
+        // X's key is bound only after the void.
+        let mut x_fixture = AttestationFixture::new(x_image);
+        let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
+        // An exec-marker birth below the fence refuses at attestation.
+        assert!(
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(
+                    x_proof,
+                    BirthKind::ExecMarker,
+                    0,
+                    scene.closure_generation()
+                )
+            )
+            .is_err(),
+            "exec birth below the void refuses"
+        );
+        // The seal refuses the same cut even when attestation is bypassed.
+        let scripted = BootstrapReceipt::scripted(
+            x_proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &scripted,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&scripted),
+            )
+            .expect_err("seal below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        // Absence below the fence refuses as well.
+        assert!(
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(
+                    x_proof,
+                    BirthKind::AbsenceAppearance,
+                    0,
+                    scene.closure_generation()
+                )
+            )
+            .is_err(),
+            "absence birth below the void refuses"
+        );
+        // Absence exactly at the fence resumes and seals the new history.
+        let resume = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(
+                x_proof,
+                BirthKind::AbsenceAppearance,
+                3,
+                scene.closure_generation(),
+            ),
+        )
+        .expect("absence at the fence attests");
+        let success = scene.seal(&resume).expect("absence at the fence seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+    }
+
+    #[test]
     fn object_journal_bootstrap_requires_birth_and_closure() {
         use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;

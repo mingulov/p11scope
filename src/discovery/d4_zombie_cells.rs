@@ -1269,3 +1269,513 @@ fn zombie_survivor_segment_fallback_routes_range_proofs_through_member() {
         .reconcile(policy)
         .expect("census passes after member fallback");
 }
+
+/// A fresh caller adapter on the production process source, for the
+/// cold-admission twins below.
+fn cold_caller_adapter() -> crate::discovery::caller_registry::CallerAdapter<
+    crate::discovery::caller_registry::OsProcessSource,
+> {
+    use crate::discovery::caller_registry::{
+        CallerAdapter, CallerRegistry, OsProcessSource, RegistryLimits,
+    };
+    CallerAdapter::new(
+        OsProcessSource,
+        CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
+    )
+}
+
+/// A zombie-leader group parented by a helper child, never by the test:
+/// the helper forks the group (one survivor), reports (tgid, survivor)
+/// over a pipe, then parks in `pause()`. Killed and reaped on drop; the
+/// zombie reparents away once the helper dies.
+struct HelperHeldZombie {
+    helper: u32,
+    tgid: u32,
+    survivor: u32,
+}
+
+impl HelperHeldZombie {
+    fn spawn() -> Self {
+        let (mut pipes, mut report) = ([0; 2], [0u8; 8]);
+        // SAFETY: two valid two-element arrays for pipe2.
+        assert_eq!(
+            unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the child only runs the fork-safe group spawn, one
+        // pipe write, and `pause()`; no pthread, no locks.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "helper fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::close(pipes[0]);
+            }
+            let (tgid, survivors) = ZombieLeaderGroup::spawn_inner(1);
+            let mut report = [0u8; 8];
+            report[0..4].copy_from_slice(&tgid.to_ne_bytes());
+            report[4..8].copy_from_slice(&survivors[0].to_ne_bytes());
+            let mut written = 0;
+            while written < report.len() {
+                // SAFETY: writing the stack bytes to the pipe.
+                let done = unsafe {
+                    libc::write(
+                        pipes[1],
+                        report.as_ptr().add(written).cast(),
+                        report.len() - written,
+                    )
+                };
+                assert!(done > 0, "helper never reported its group");
+                written += done as usize;
+            }
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        // SAFETY: the parent keeps the read end and closes its write copy.
+        unsafe {
+            libc::close(pipes[1]);
+        }
+        let mut done = 0;
+        while done < report.len() {
+            // SAFETY: reading into a valid stack buffer.
+            let got = unsafe {
+                libc::read(
+                    pipes[0],
+                    report.as_mut_ptr().add(done).cast(),
+                    report.len() - done,
+                )
+            };
+            assert!(got > 0, "helper never reported its group");
+            done += got as usize;
+        }
+        // SAFETY: the read end served its single report.
+        unsafe {
+            libc::close(pipes[0]);
+        }
+        Self {
+            helper: pid as u32,
+            tgid: u32::from_ne_bytes(report[0..4].try_into().expect("tgid bytes")),
+            survivor: u32::from_ne_bytes(report[4..8].try_into().expect("tid bytes")),
+        }
+    }
+}
+
+impl Drop for HelperHeldZombie {
+    fn drop(&mut self) {
+        unsafe {
+            // SIGKILL to the TGID stops the survivor; the leader is dead.
+            libc::kill(self.tgid as libc::pid_t, libc::SIGKILL);
+            libc::kill(self.helper as libc::pid_t, libc::SIGKILL);
+            let mut status = 0;
+            while libc::waitpid(self.helper as libc::pid_t, &mut status, 0) < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err == Some(libc::ECHILD) {
+                    break;
+                }
+                assert_eq!(err, Some(libc::EINTR));
+            }
+        }
+        // Bounded hygiene: the reparented zombie is reaped elsewhere.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(format!("/proc/{}", self.tgid)).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "reparented zombie {} never reaped",
+                self.tgid
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Cold admission mints group ownership only through the TGID's own task
+/// listing plus the birth bracket — never by opening /proc/<TID>
+/// directly and never by parentage alone. Admitting the bare survivor
+/// TID mints no caller for the group, while the TGID itself cold-admits
+/// with the survivor-served image — including a group the observer
+/// never parented, which parentage alone could never reach.
+#[test]
+fn cold_admission_refuses_direct_proc_tid_lookup() {
+    use crate::discovery::caller_registry::ImageAuthority;
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    // The shortcut: admit the bare survivor TID. Whatever it concludes
+    // about the TID itself, it must never mint the GROUP.
+    let mut tid_adapter = cold_caller_adapter();
+    let _ = tid_adapter.admit(group.survivor, ImageAuthority::ScanPinned, 10);
+    assert!(
+        tid_adapter.live_id(group.tgid).is_none(),
+        "a direct /proc/<TID> lookup minted group ownership for {}",
+        group.tgid
+    );
+    // The TGID itself cold-admits with no pre-exit custody: the record
+    // names the leader generation with the survivor-served image (the
+    // fixture never execs, so it equals this process's own image).
+    let mut cold = cold_caller_adapter();
+    let id = cold
+        .admit(group.tgid, ImageAuthority::ScanPinned, 20)
+        .expect("the lone-survivor TGID cold-admits");
+    let record = cold.record(id).expect("the cold record is retained");
+    assert_eq!(record.pid, group.tgid);
+    assert_eq!(
+        record.start_time,
+        crate::process::process_start_time(group.tgid).ok(),
+        "the cold record binds the leader birth"
+    );
+    assert_eq!(
+        record.exe,
+        crate::discovery::caller_registry::read_exe_identity(std::process::id()),
+        "the cold record carries the survivor-served image"
+    );
+    assert!(record.exec_observed, "the cold image was observed");
+    // No parentage: a helper-held group — never our child — admits
+    // through the same TGID proof, which consults no parentage.
+    let foreign = HelperHeldZombie::spawn();
+    wait_leader_zombie(foreign.tgid);
+    assert_ne!(
+        foreign.survivor, foreign.tgid,
+        "the foreign survivor is a nonleader"
+    );
+    let foreign_tasks: Vec<u32> = std::fs::read_dir(format!("/proc/{}/task", foreign.tgid))
+        .expect("the foreign task list reads")
+        .map(|entry| {
+            entry
+                .expect("entry reads")
+                .file_name()
+                .to_string_lossy()
+                .parse()
+                .expect("numeric task id")
+        })
+        .collect();
+    assert!(
+        foreign_tasks.contains(&foreign.survivor),
+        "the foreign survivor {} is listed in {foreign_tasks:?}",
+        foreign.survivor
+    );
+    let mut foreign_adapter = cold_caller_adapter();
+    let foreign_id = foreign_adapter
+        .admit(foreign.tgid, ImageAuthority::ScanPinned, 30)
+        .expect("cold admission needs no parentage");
+    assert_eq!(
+        foreign_adapter
+            .record(foreign_id)
+            .expect("the foreign record is retained")
+            .pid,
+        foreign.tgid
+    );
+}
+
+/// Per-lane cold-admission capability (unprivileged): the observer's own
+/// forked zombie child exposes the whole cold route — /proc/<tgid>/task
+/// lists the survivor while the leader is Z, pidfd_open works post-exit
+/// with the pidfd non-ready while threads live, the birth bracket reads —
+/// and cold admission consumes it. Fails wherever the route is unavailable.
+#[test]
+fn cold_admission_task_enumeration_capability() {
+    use crate::discovery::caller_registry::ImageAuthority;
+    use crate::process::{PidPin, process_is_zombie, process_start_time};
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert!(
+        process_is_zombie(group.tgid),
+        "the leader reads Z while the survivor lives"
+    );
+    assert_lone_survivor(&group);
+    let pin = PidPin::open(group.tgid).expect("pidfd_open works on the zombie leader");
+    assert!(
+        pin.pidfd().is_ok(),
+        "the cold pin holds a pidfd, not a proc-only fallback"
+    );
+    assert!(
+        pin.still_the_same(),
+        "the pidfd stays non-ready while threads live"
+    );
+    let birth = process_start_time(group.tgid).expect("the leader birth reads post-exit");
+    assert_eq!(pin.start_time(), Some(birth));
+    let mut adapter = cold_caller_adapter();
+    let id = adapter
+        .admit(group.tgid, ImageAuthority::ScanPinned, 10)
+        .expect("cold admission consumes the enumerated survivor");
+    let record = adapter.record(id).expect("the cold record is retained");
+    assert_eq!(record.pid, group.tgid);
+    assert_eq!(record.start_time, Some(birth));
+}
+
+/// Cold-admission backend parity on Btrfs: the observer holds NO custody
+/// before the leader is Z (the first touch of the TGID is the admission
+/// itself); after admission both backends show the TGID/held-A positive,
+/// exactly like the warm leg — same members, same losses, same proof
+/// demand (warm-vs-cold population equivalence). The cold record keeps
+/// the leader birth (first-birth selection; the confirm receipt agrees),
+/// stays live with no tombstone across reconcile (link loss, not death),
+/// and stays out of native revalidation (unproven, never bound on a
+/// zombie read). Custody serializes: after both attributions the pin
+/// still holds and a fresh prepare still mints.
+#[test]
+#[ignore = "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; cold zombie admission parity"]
+fn privileged_d4_btrfs_zombie_cold_admission_backend_parity() {
+    use crate::discovery::caller_registry::ImageAuthority;
+    use crate::discovery::identity::{PinnedObjects, test_fixture::real_scan_pin};
+    use crate::discovery::kernel_identity::IdentitySession;
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and writable statfs buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs above.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+    let held_path = parent.join("libzombie-cold.so");
+    std::fs::write(&held_path, vec![0x5cu8; 8192]).unwrap();
+
+    // Twin mapper groups, each a leader-zombie with one live survivor
+    // executably mapping the held file. No custody before leader-Z: the
+    // first touch of the cold TGID below is the admission itself.
+    let warm = ZombieMapperGroup::spawn(&held_path, true);
+    let cold_group = ZombieMapperGroup::spawn(&held_path, true);
+    for group in [&warm, &cold_group] {
+        wait_leader_zombie(group.tgid);
+        assert_mapper_lone_survivor(group);
+    }
+    let warm_snapshot = warm.maps();
+    let cold_snapshot = cold_group.maps();
+    for (snapshot, address) in [
+        (&warm_snapshot, warm.address),
+        (&cold_snapshot, cold_group.address),
+    ] {
+        let text = snapshot
+            .iter()
+            .find(|entry| entry.start == address)
+            .expect("independent live mapping");
+        assert_eq!(text.permissions, *b"r-xp");
+    }
+    let key = ObjectKey::of(
+        warm_snapshot
+            .iter()
+            .find(|entry| entry.start == warm.address)
+            .expect("warm mapping"),
+    );
+    assert_eq!(
+        ObjectKey::of(
+            cold_snapshot
+                .iter()
+                .find(|entry| entry.start == cold_group.address)
+                .expect("cold mapping")
+        ),
+        key,
+        "twins map the same held file"
+    );
+
+    // Cold admission: the first touch of the TGID. Pre-route this is the
+    // failure point (no live process); post-route the record binds the
+    // leader birth with the survivor-served image.
+    let leader_birth =
+        crate::process::process_start_time(cold_group.tgid).expect("the cold leader birth reads");
+    let mut adapter = cold_caller_adapter();
+    let cold_id = adapter
+        .admit(cold_group.tgid, ImageAuthority::ScanPinned, 10)
+        .expect("the cold TGID admits with no prior custody");
+    let record = adapter
+        .record(cold_id)
+        .expect("the cold record is retained");
+    assert_eq!(record.pid, cold_group.tgid);
+    assert_eq!(record.start_time, Some(leader_birth));
+    assert_eq!(
+        record.exe,
+        crate::discovery::caller_registry::read_exe_identity(std::process::id()),
+        "the cold record carries the survivor-served image"
+    );
+    assert_eq!(
+        record.lifecycle,
+        crate::discovery::caller_registry::CallerLifecycle::Mapped
+    );
+    // Link loss, not death: reconcile with the TGID observed retires
+    // nothing and raises no exit.
+    let events = adapter.reconcile(
+        &BTreeSet::from([cold_group.tgid]),
+        &mut |_| ImageAuthority::ScanPinned,
+        20,
+    );
+    assert!(
+        events.is_empty(),
+        "the cold record stays live with no tombstone: {events:?}"
+    );
+    // Unproven for native binding: the live exe read serves nothing for
+    // a zombie leader, so the cold caller never revalidates — while a
+    // live control in the same adapter does.
+    let mut live = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sleep spawns");
+    let live_id = adapter
+        .admit(live.id(), ImageAuthority::ScanPinned, 20)
+        .expect("the live control admits");
+    let revalidated = adapter.revalidate_admitted_before(1_000);
+    assert!(
+        revalidated.contains(&live_id),
+        "the live control revalidates"
+    );
+    assert!(
+        !revalidated.contains(&cold_id),
+        "the cold caller stays unproven for native binding"
+    );
+    // The confirm receipt selects the leader birth too.
+    let mut io = OsConfirmIo::default();
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(
+        &mut io,
+        cold_group.tgid,
+        &BTreeSet::new(),
+        &mut budget,
+        None,
+    )
+    .expect("the cold TGID prepares through its member");
+    let selector = prepared
+        .member
+        .as_ref()
+        .expect("prepare carries the survivor")
+        .selector()
+        .expect("carried member selects");
+    assert_eq!(selector.tid(), cold_group.survivor);
+    let receipt = match finish_confirmation(
+        &io,
+        cold_group.tgid,
+        prepared,
+        MappedIdentities::new(),
+        None,
+        &mut budget,
+    ) {
+        Confirmation::Confirmed(read) => read,
+        other => panic!("the cold confirm seals on member proofs: {other:?}"),
+    };
+    assert_eq!(receipt.start_time, leader_birth);
+
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let digest =
+        p11scope_manifest::identity::hex(&Sha256::digest(std::fs::read(&held_path).unwrap()));
+    let pins: PinnedObjects = real_scan_pin(&held_path, Some(key), 0, &digest);
+    let object = pins.pinned().next().expect("actual held-file pin").id;
+    let (userspace_index, refused) = KnownKeyIndex::build(
+        [(key, Some(object))],
+        &BTreeMap::from([(key, object)]),
+        [],
+        &pins,
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(userspace_index.map_files_keys().contains(&key));
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session = IdentitySession::probe_and_load(&btf, probe_dir.path())
+        .expect("actual strict-loaded kernel session; no refused/fallback positive");
+    // Warm leg first (no admission anywhere near it), then the cold leg:
+    // both backends must show the TGID/held-A positive on both.
+    let mut legs = Vec::new();
+    for (position, (group, snapshot)) in [(&warm, warm_snapshot), (&cold_group, cold_snapshot)]
+        .into_iter()
+        .enumerate()
+    {
+        let userspace = d4_zombie_attribute_pid(group.tgid, snapshot.clone(), &userspace_index);
+        let kernel = d4_zombie_kernel_attribution_for_pid(
+            group.tgid,
+            snapshot,
+            &pins,
+            object,
+            key,
+            &mut session,
+            position as u64 + 1,
+        );
+        for (backend, out) in [("userspace", &userspace), ("kernel", &kernel)] {
+            let members: Vec<_> = out.members.iter().map(|member| member.pid).collect();
+            assert_eq!(members, [group.tgid], "{backend} exact zombie caller");
+            assert_eq!(
+                out.members[0]
+                    .objects
+                    .iter()
+                    .map(|matched| (matched.key, matched.object))
+                    .collect::<Vec<_>>(),
+                [(key, object)],
+                "{backend} exact held original-provider edge"
+            );
+            assert!(out.losses.is_empty(), "{backend}: {:?}", out.member_losses);
+            assert_eq!(out.probed, 1, "{backend} nonempty executable proof demand");
+        }
+        assert_eq!(
+            userspace.members, kernel.members,
+            "exact same-population backend members"
+        );
+        assert_eq!(
+            userspace.losses, kernel.losses,
+            "same actual loss classifications"
+        );
+        legs.push((userspace, kernel));
+        assert_mapper_lone_survivor(group);
+    }
+    // Warm-vs-cold population equivalence: the same edge count,
+    // losses and demand on each backend, modulo the TGID itself.
+    for (backend, warm_leg, cold_leg) in [
+        ("userspace", &legs[0].0, &legs[1].0),
+        ("kernel", &legs[0].1, &legs[1].1),
+    ] {
+        assert_eq!(
+            (
+                warm_leg.members.len(),
+                warm_leg.losses.clone(),
+                warm_leg.probed
+            ),
+            (
+                cold_leg.members.len(),
+                cold_leg.losses.clone(),
+                cold_leg.probed
+            ),
+            "{backend} warm-vs-cold population equivalence"
+        );
+    }
+    // Custody serializes past both attributions: the pin holds and a
+    // fresh prepare still mints (no stuck slot, no leaked lease).
+    assert!(
+        adapter
+            .live_pin(cold_group.tgid)
+            .is_some_and(|(_, pin)| pin.still_the_same()),
+        "the cold pin holds past both attributions"
+    );
+    let mut io = OsConfirmIo::default();
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(
+        &mut io,
+        cold_group.tgid,
+        &BTreeSet::new(),
+        &mut budget,
+        None,
+    )
+    .expect("a fresh prepare still mints after both attributions");
+    assert!(
+        prepared.member.is_some(),
+        "no stuck member slot past both attributions"
+    );
+    drop(prepared);
+    drop(io);
+    eprintln!(
+        "D4_ZOMBIE_COLD groups={}/{} userspace=1/1 kernel=1/1 fallback=none",
+        warm.tgid, cold_group.tgid
+    );
+    live.kill().expect("live control dies");
+    let _ = live.wait();
+    drop((warm, cold_group));
+    drop(session);
+    drop(pins);
+    std::fs::remove_file(&held_path).unwrap();
+}

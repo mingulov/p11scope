@@ -190,6 +190,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties",
+      "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
       "cell": "privileged"

@@ -110,6 +110,7 @@ attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
 # Birth marker cells: live exec/fork/scope-gap marker words and admission
 # counts through the session's instance maps.
+attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
 attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
 attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
 attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready

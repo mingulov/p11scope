@@ -390,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn requested_peak_retires_stale_entry_on_pointer_reuse() {
+        // A free the probe never sees (another thread drops a block this
+        // thread allocated, e.g. the async cleanup worker closing a batch
+        // it was handed) leaves a stale live entry. One pointer is never
+        // live twice, so re-inserting the same pointer proves the old
+        // entry dead: retire it instead of reporting incomplete.
+        PEAK.with(|tracker| {
+            let mut tracker = tracker.borrow_mut();
+            tracker.reset();
+            tracker.allocated(0x100, 40);
+            // No remove: the free happened off-thread.
+            tracker.allocated(0x100, 64);
+            assert!(!tracker.result.incomplete);
+            assert_eq!(tracker.result.live_bytes, 64);
+            assert_eq!(tracker.result.live_blocks, 1);
+            assert_eq!(tracker.result.peak_bytes, 64);
+            tracker.reset();
+        });
+    }
+
+    #[test]
     fn requested_peak_excludes_other_threads_and_disarms_on_unwind() {
         let barrier = std::sync::Barrier::new(2);
         let peak = std::thread::scope(|scope| {

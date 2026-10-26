@@ -2238,15 +2238,37 @@ fn joint_machine_finish_without_landed_row_publishes() {
     assert!(fixture.scene.real.lane.is_finished());
 }
 
+/// The staged "joint finish made no progress" gaps on a fixture.
+fn no_progress_gaps(fixture: &MachineScene) -> Vec<(String, String)> {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "joint finish made no progress")
+        .collect()
+}
+
 /// A finish whose Audited polls stop making progress must end
-/// finitely: after the no-progress bound it bails with a named,
+/// finitely: after the wall-time bound it bails with a named,
 /// disclosed refusal instead of polling Pending forever. The posed
 /// stall stands in for the live-only H3 veto (held scenes always
-/// resolve it): the counting, the bound, the gap and the kept tags
-/// are what this pins. The unposed control publishes normally.
+/// resolve it): rapid polls alone must never trip (the horizon is
+/// wall time, identical on the retained wait and the winding tick
+/// path), while a stall past the bound trips on its next poll. The
+/// bound, the gap, the recorded trip cause and the kept tags are
+/// what this pins. The unposed control publishes normally.
 #[test]
 fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    // The bound is 6 s (the retained 600-poll horizon at the 10 ms
+    // retained cadence). One posed poll takes microseconds, so a
+    // 100 ms margin pins the boundary within 2% without flake.
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
     for wedged in [true, false] {
         let mut fixture = MachineScene::new(1);
         fixture.prime(1);
@@ -2257,53 +2279,101 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
         fixture.enable_finish_fixture(Vec::new());
         fixture.begin_finish().unwrap();
         fixture.machine.pose_no_progress_poll_for_test(wedged);
-        let mut audited_polls = 0u64;
-        let mut outcome = None;
-        for _ in 0..700 {
-            if fixture.machine.diagnostic_snapshot_for_test().0 == "Audited" {
-                audited_polls += 1;
-            }
-            match fixture.poll_finish(1) {
-                Ok(JointCommitProgress::Published(_)) => {
-                    outcome = Some(Ok(()));
-                    break;
-                }
-                Ok(JointCommitProgress::Pending) => {}
-                Err(reason) => {
-                    outcome = Some(Err(reason));
-                    break;
-                }
-            }
-        }
         if wedged {
+            // Drive to Audited first (bounded): discovery and the
+            // advance take a handful of polls, none of them stalls.
+            for _ in 0..700 {
+                if fixture.machine.diagnostic_snapshot_for_test().0 == "Audited" {
+                    break;
+                }
+                match fixture.poll_finish(1) {
+                    Ok(JointCommitProgress::Pending) => {}
+                    other => panic!("must reach Audited before the bound: {other:?}"),
+                }
+            }
             assert_eq!(
-                outcome,
-                Some(Err(SemanticRefusal::Unavailable)),
-                "the stalled finish refuses instead of polling forever"
+                fixture.machine.diagnostic_snapshot_for_test().0,
+                "Audited",
+                "the stall is posed in Audited"
+            );
+            let mut audited_polls = 0u64;
+            // Rapid polls alone never trip: 650 posed polls (past
+            // the old 600-poll count) stay Pending with no gap and
+            // no latch, since only milliseconds elapse.
+            for n in 0..650 {
+                assert_eq!(
+                    fixture.machine.diagnostic_snapshot_for_test().0,
+                    "Audited",
+                    "the posed stall stays Audited (rapid poll {n})"
+                );
+                match fixture.poll_finish(1) {
+                    Ok(JointCommitProgress::Pending) => audited_polls += 1,
+                    other => panic!("rapid poll {n} must stay Pending: {other:?}"),
+                }
+            }
+            assert!(
+                no_progress_gaps(&fixture).is_empty(),
+                "rapid polls disclose no wedge gap"
+            );
+            assert!(
+                !fixture.machine.finish_disposition_required(),
+                "rapid polls latch nothing"
             );
             assert_eq!(
-                audited_polls, 600,
-                "the bound fires on exactly the 600th no-progress poll"
+                fixture.machine.finish_no_progress_trip_for_test(),
+                None,
+                "rapid polls record no trip"
             );
+            // Just under the bound stays Pending.
+            fixture.machine.set_finish_no_progress_since_for_test(Some(
+                std::time::Instant::now() - (bound - margin),
+            ));
+            match fixture.poll_finish(1) {
+                Ok(JointCommitProgress::Pending) => audited_polls += 1,
+                other => panic!("the just-under stall must stay Pending: {other:?}"),
+            }
+            assert!(
+                no_progress_gaps(&fixture).is_empty(),
+                "the just-under stall discloses no wedge gap"
+            );
+            assert!(
+                !fixture.machine.finish_disposition_required(),
+                "the just-under stall latches nothing"
+            );
+            // Just over the bound trips on the next poll.
+            fixture.machine.set_finish_no_progress_since_for_test(Some(
+                std::time::Instant::now() - (bound + margin),
+            ));
+            match fixture.poll_finish(1) {
+                Err(SemanticRefusal::Unavailable) => audited_polls += 1,
+                other => panic!("the over-bound stall must refuse: {other:?}"),
+            }
             // The wedged publication stands in front of the commit (as
             // with every mid-publication error), so the gap stages but
             // cannot commit here; the staged pair is the disclosure the
             // next commit carries.
-            let gaps: Vec<_> = fixture
-                .scene
-                .real
-                .scene
-                .coordinator
-                .registry()
-                .staged_scope_gaps_for_test()
-                .into_iter()
-                .filter(|(subject, _)| subject == "joint finish made no progress")
-                .collect();
+            let gaps = no_progress_gaps(&fixture);
             assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
+            assert_eq!(
+                gaps[0].1,
+                format!(
+                    "6s without progress across {audited_polls} consecutive finish polls in \
+                     Audited; abandoning the finish for exit"
+                ),
+                "the gap names the stall in time"
+            );
+            let trip = fixture
+                .machine
+                .finish_no_progress_trip_for_test()
+                .expect("the trip records its cause for the exit hold");
+            assert_eq!(
+                trip.polls, audited_polls as u32,
+                "the trip counts every consecutive stall poll"
+            );
             assert!(
-                gaps[0].1.contains("600"),
-                "the gap names the bound: {}",
-                gaps[0].1
+                trip.stalled >= bound,
+                "the trip stalls at least the bound: {:?}",
+                trip.stalled
             );
             let audit = fixture.machine.diagnostic_audit_for_test();
             assert!(
@@ -2319,10 +2389,22 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
                 "the finish retains its control past the refusal"
             );
         } else {
+            let mut published = false;
+            for _ in 0..700 {
+                match fixture.poll_finish(1) {
+                    Ok(JointCommitProgress::Published(_)) => {
+                        published = true;
+                        break;
+                    }
+                    Ok(JointCommitProgress::Pending) => {}
+                    Err(reason) => panic!("the unposed finish must publish: {reason:?}"),
+                }
+            }
+            assert!(published, "the unposed finish publishes within its bound");
             assert_eq!(
-                outcome,
-                Some(Ok(())),
-                "the unposed finish publishes within its bound"
+                fixture.machine.finish_no_progress_trip_for_test(),
+                None,
+                "the healthy finish records no trip"
             );
             assert!(
                 fixture
@@ -18923,5 +19005,107 @@ fn joint_machine_h0_true_stall_without_job_expires_and_publishes() {
     panic!(
         "a true stall must publish within a bound, still {:?}",
         fixture.machine.diagnostic_snapshot_for_test(),
+    );
+}
+
+/// A stale guard-trip cause must clear on the next progressing merge:
+/// both `note_h0_merge` reset sites (accumulated progress and
+/// scan/job/hold signals) clear the cause alongside the idle count, so
+/// the drive line never publishes a trip that never expired anything.
+/// The posed cause stands in for the one the unreachable PendingQ trip
+/// would leave behind.
+#[test]
+fn joint_machine_h0_stale_trip_clears_on_progress() {
+    let mut fixture = MachineScene::new(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 1);
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    for _ in 0..8 {
+        match fixture.service(1024) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => {
+                panic!("must not publish while scans refuse");
+            }
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {
+                if fixture.machine.diagnostic_snapshot_for_test().0 == "AwaitH0" {
+                    break;
+                }
+            }
+            Err(reason) => {
+                panic!(
+                    "must reach AwaitH0 before posing the stale cause: {reason:?} at {:?}",
+                    fixture.machine.diagnostic_snapshot_for_test(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "AwaitH0",
+        "the stale cause is posed in AwaitH0"
+    );
+    // The posed cause is observable through the trip reader first:
+    // the clear assertions below are not vacuous.
+    fixture
+        .machine
+        .pose_h0_guard_trip_for_test(Some("h0_no_progress_no_job_no_hold_expired"));
+    assert_eq!(
+        fixture.machine.h0_guard_trip_for_test(),
+        Some("h0_no_progress_no_job_no_hold_expired"),
+        "the posed stale cause is observable"
+    );
+    // Site one: accumulated progress clears the cause. No merge can
+    // accumulate `usize::MAX` outcomes and receipts, so this `before`
+    // always takes the progress reset.
+    assert!(
+        !fixture.machine.note_h0_merge_for_test(
+            Some((usize::MAX, usize::MAX)),
+            false,
+            false,
+            false
+        ),
+        "a progressing merge must not trip"
+    );
+    assert_eq!(
+        fixture.machine.h0_guard_trip_for_test(),
+        None,
+        "accumulated progress clears the stale cause"
+    );
+    // Site two: a real service with refused (but deadline-live) scans
+    // resets through the signal arm and clears the re-posed cause.
+    fixture
+        .machine
+        .pose_h0_guard_trip_for_test(Some("h0_no_progress_no_job_no_hold_expired"));
+    match fixture.service(1) {
+        Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+        other => panic!("a refused-scan pass must stay Pending: {other:?}"),
+    }
+    assert_eq!(
+        fixture.machine.h0_guard_trip_for_test(),
+        None,
+        "a signaled merge clears the stale cause"
+    );
+}
+
+/// A progressing PendingQ merge leaves the guard trip clear: the merge
+/// appends its resolved outcomes, so the shared count resets and no
+/// trip cause is recorded across it.
+#[test]
+fn joint_machine_h0_pending_q_progress_keeps_trip_clear() {
+    let (mut fixture, observer, _foreign) = pending_h0_finish_fixture(false);
+    let q = observe_pending_finish_q(&fixture, &observer);
+    assert_eq!(
+        fixture.machine.h0_guard_trip_for_test(),
+        None,
+        "no trip before the PendingQ merge"
+    );
+    // Resolve once: AwaitH0 becomes a retained PendingQ report, and the
+    // merge appends the resolved outcomes (a progressing merge).
+    fixture
+        .resolve_pending_q(&q, observer.discovery_domain(), 1)
+        .unwrap();
+    assert_eq!(
+        fixture.machine.h0_guard_trip_for_test(),
+        None,
+        "no trip across a progressing PendingQ merge"
     );
 }

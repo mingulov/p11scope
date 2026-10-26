@@ -16664,6 +16664,173 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn joint_stop_counts_once_gate_agrees_across_callers() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // The stop path and the exit hold consult the one shared
+        // once-gate: both stay silent past a disclosure, both disclose
+        // exactly once when it is still owed, and the hold arms the
+        // flag it discloses through.
+        let scripted_lane = || {
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+            lane.note_shed_calls(7);
+            lane
+        };
+        let mut coordinator = coordinator();
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        // Already disclosed: both callers stay silent.
+        let probe = scripted_lane();
+        let counts = SemanticStopCounts::read(&probe, &mut coordinator);
+        let mut winding = WindingLane {
+            lane: None,
+            finish: JointFinishDriver::NotBegun,
+            joint: true,
+            joined: false,
+            stop_disclosed: true,
+        };
+        disclose_stop_counts_once(&mut winding, &counts, &mut coordinator, &mut warn);
+        let mut held = true;
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "already disclosed",
+            &mut warn,
+            Some(&mut held),
+        );
+        assert!(
+            take_warned_for_test().is_empty(),
+            "both callers stay silent past a disclosure"
+        );
+        assert!(held, "a silent hold leaves the armed flag armed");
+        // Still owed: both callers disclose exactly once, and the
+        // hold arms the flag so the next hold stays silent.
+        winding.stop_disclosed = false;
+        disclose_stop_counts_once(&mut winding, &counts, &mut coordinator, &mut warn);
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the stop path discloses the owed counts once"
+        );
+        let mut held = false;
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "owed",
+            &mut warn,
+            Some(&mut held),
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the exit hold discloses the owed counts once"
+        );
+        assert!(held, "the disclosing hold arms the flag");
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "owed",
+            &mut warn,
+            Some(&mut held),
+        );
+        assert!(
+            take_warned_for_test().is_empty(),
+            "the armed hold stays silent"
+        );
+    }
+
+    #[test]
+    fn held_tripped_finish_names_wedge_on_stderr() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A lane whose finish tripped the no-progress bound names the
+        // wedge on stderr when the exit hold takes it: the wedged
+        // publication stands in front of the commit, so the staged gap
+        // cannot commit, and the hold's warning is the user-visible
+        // name. The untripped control discloses only its stop line.
+        let scripted_lane = || {
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+            lane.note_shed_calls(7);
+            lane
+        };
+        let mut coordinator = coordinator();
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        // Clear the posed trip even if an assertion panics: the
+        // override is thread-local and must not leak into the next
+        // test on this thread.
+        struct ClearPosedTrip;
+        impl Drop for ClearPosedTrip {
+            fn drop(&mut self) {
+                crate::inventory_semantics::AttestedSemanticLane::pose_no_progress_trip_for_test(
+                    None,
+                );
+            }
+        }
+        let _clear = ClearPosedTrip;
+        // Substituted lanes carry no live machine to trip, so the
+        // trip is posed (like the lane's `scripted_*` seams stage
+        // machine behavior); the hold still reads it through the
+        // production accessor.
+        crate::inventory_semantics::AttestedSemanticLane::pose_no_progress_trip_for_test(Some((
+            612,
+            std::time::Duration::from_secs(6),
+        )));
+        let staged = scripted_lane()
+            .joint_finish_no_progress_trip()
+            .expect("the posed trip is observable");
+        assert_eq!(staged.polls, 612, "the posed poll count is observable");
+        assert_eq!(
+            staged.stalled,
+            std::time::Duration::from_secs(6),
+            "the posed stall duration is observable"
+        );
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "tripped",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![
+                "joint finish made no progress for 6s across 612 polls; \
+                 the lane is held for exit"
+                    .to_string(),
+                expected_stop_line(),
+            ],
+            "the hold names the wedge before the stop line"
+        );
+        crate::inventory_semantics::AttestedSemanticLane::pose_no_progress_trip_for_test(None);
+        assert_eq!(
+            scripted_lane().joint_finish_no_progress_trip(),
+            None,
+            "clearing the pose records no trip"
+        );
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "untripped",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the untripped hold discloses only its stop line"
+        );
+    }
+
+    #[test]
     fn joint_stop_winding_without_live_session_names_unknown_counts() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.

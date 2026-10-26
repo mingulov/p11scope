@@ -40,7 +40,7 @@ use crate::semantics_objects::journal::{
     SessionClosureGrant, SessionDrainGrant,
 };
 use p11scope_ebpf_common::event_type;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const RAW_CAPACITY: usize = 4_096;
 // The actual shared binder selects at most four caller/provider pairs. Its
@@ -56,6 +56,22 @@ const REFRESHES_PER_BIND: usize = 4;
 // receipt resets the count, so honest slow drains and deadline waits
 // can never trip it.
 const H0_NO_PROGRESS_BOUND: u32 = 16;
+
+// Wall-time bound on a consecutive no-progress Audited stall inside one
+// Joint Finish: polls that spend no budget action and publish nothing.
+// The stall clock starts at the first consecutive stall; any spending,
+// publication or non-finish visit resets it, and reaching the bound
+// records a named gap and refuses, so a wedged finish ends finitely
+// through the disposition hold instead of polling Pending forever.
+// Calibrated to the retained 600-poll horizon: the retained stop wait
+// paces every poll to 10 ms, so 600 polls is about 6 s there. Unlike a
+// poll count, the wall-time horizon is the same on the retained wait
+// and the promotion-winding tick path (whose unpaced polls would
+// otherwise trip the same count far sooner). Matches the cells'
+// established wedge threshold; legitimate stalls are handfuls of polls
+// over milliseconds.
+pub(crate) const JOINT_FINISH_NO_PROGRESS_TIMEOUT: Duration =
+    Duration::from_millis(10 * (JOINT_FINISH_NO_PROGRESS_LIMIT as u64));
 
 pub(crate) struct JointWorkBudget {
     pub(crate) remaining_actions: usize,
@@ -922,6 +938,19 @@ impl std::fmt::Display for StagingDetail {
     }
 }
 
+/// The recorded Audited no-progress trip: the wall-time bound fired on a
+/// wedged finish. Commit-free by necessity: the wedged publication stands
+/// in front of the commit, so the staged gap cannot commit while the
+/// wedge stands; the exit hold reads this flag and names the wedge on
+/// stderr instead. Counts only; no identities, paths or payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FinishNoProgressTrip {
+    /// Consecutive no-progress Audited polls observed when the bound fired.
+    pub(crate) polls: u32,
+    /// Wall time stalled without progress when the bound fired.
+    pub(crate) stalled: Duration,
+}
+
 /// Scheduling state over the original owner, not an alternate capture/model.
 pub(crate) struct LiveJointMachine {
     producers: SessionDrainProducers,
@@ -957,6 +986,14 @@ pub(crate) struct LiveJointMachine {
     /// spending, publication or non-finish visit resets it; the 600th
     /// consecutive stall refuses with a named gap.
     finish_no_progress_polls: u32,
+    /// Wall-clock start of the current consecutive no-progress Audited
+    /// stall, if any. Any spending, publication or non-finish visit
+    /// clears it; the wall-time bound trips when the stall reaches it.
+    finish_no_progress_since: Option<Instant>,
+    /// The recorded Audited no-progress trip, if the wall-time bound
+    /// fired. Set once per Finish, never cleared: the trip latches the
+    /// disposition and the lane is held past it.
+    finish_no_progress_trip: Option<FinishNoProgressTrip>,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1026,6 +1063,8 @@ impl LiveJointMachine {
             finish_receipt: None,
             finish_storage_retries: 0,
             finish_no_progress_polls: 0,
+            finish_no_progress_since: None,
+            finish_no_progress_trip: None,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1044,6 +1083,66 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn pose_no_progress_poll_for_test(&mut self, on: bool) {
         self.pose_no_progress_poll = on;
+    }
+
+    /// Backdate (or clear) the current stall-clock start, so the twin
+    /// can pose a stall of any wall-time age without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn set_finish_no_progress_since_for_test(&mut self, since: Option<Instant>) {
+        self.finish_no_progress_since = since;
+    }
+
+    /// The recorded Audited no-progress trip, if the wall-time bound fired.
+    #[cfg(test)]
+    pub(crate) fn finish_no_progress_trip_for_test(&self) -> Option<FinishNoProgressTrip> {
+        self.finish_no_progress_trip
+    }
+
+    /// The current transaction's Collected, across every phase that
+    /// carries one (the same coverage as `h0_guard_trip_for_test`).
+    #[cfg(test)]
+    fn collected_mut_for_test(&mut self) -> Option<&mut Collected> {
+        match self.phase.as_mut()? {
+            Phase::Collecting(value)
+            | Phase::Binding(value)
+            | Phase::AwaitH0(value)
+            | Phase::Preparing(value)
+            | Phase::PreparationAttempted(value)
+            | Phase::FinishStopReady(value)
+            | Phase::PreparingAdmissions(value)
+            | Phase::Ingesting(value)
+            | Phase::StagingNegative(value) => Some(value),
+            Phase::PendingQ { original, .. }
+            | Phase::FinishStopReport { original, .. }
+            | Phase::BindingKeys { original, .. } => Some(original),
+            _ => None,
+        }
+    }
+
+    /// Pose (or clear) a stale guard-trip cause on the current
+    /// transaction, so the twin can stage the cause the PendingQ path
+    /// would leave behind without reaching that unreachable path.
+    #[cfg(test)]
+    pub(crate) fn pose_h0_guard_trip_for_test(&mut self, cause: Option<&'static str>) {
+        self.collected_mut_for_test()
+            .expect("a transaction Collected carries the guard cause")
+            .h0_guard_trip = cause;
+    }
+
+    /// Drive one real `note_h0_merge` against the current transaction
+    /// with chosen signals, so the twin can pin each reset site
+    /// deterministically.
+    #[cfg(test)]
+    pub(crate) fn note_h0_merge_for_test(
+        &mut self,
+        before: Option<(usize, usize)>,
+        has_pending_scans: bool,
+        has_future_job: bool,
+        has_hold: bool,
+    ) -> bool {
+        self.collected_mut_for_test()
+            .expect("a transaction Collected carries the guard count")
+            .note_h0_merge(before, has_pending_scans, has_future_job, has_hold)
     }
 
     pub(crate) fn begin_commit(&mut self, engine_changed: bool) -> Result<(), JointCommitRefusal> {
@@ -3500,6 +3599,16 @@ impl JointMachineIo for SessionMachineIo {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Posed no-progress trip for the exit-hold twin: substituted lanes
+    /// carry no live machine to trip, so the twin stages the trip here
+    /// (like the lane's `scripted_*` seams stage machine behavior) and
+    /// the accessor returns it. Cleared by the twin when done.
+    static POSED_NO_PROGRESS_TRIP: std::cell::Cell<Option<FinishNoProgressTrip>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl AttestedSemanticLane {
     /// Bind the initial machine to the actual Session and canonical pool,
     /// before the first publication request. This performs no EVENTS/H0 work.
@@ -3621,6 +3730,36 @@ impl AttestedSemanticLane {
                     .as_ref()
                     .is_some_and(|machine| machine.finish_disposition_required())
             })
+    }
+
+    /// The recorded Audited no-progress trip, if the wall-time bound
+    /// fired on this lane's machine. The exit hold names it on stderr:
+    /// the wedged publication stands in front of the commit, so the
+    /// staged gap cannot commit while the wedge stands. In tests, a
+    /// posed trip wins (substituted lanes carry no live machine).
+    pub(crate) fn joint_finish_no_progress_trip(&self) -> Option<FinishNoProgressTrip> {
+        #[cfg(test)]
+        if let Some(posed) = POSED_NO_PROGRESS_TRIP.with(|posed| posed.get()) {
+            return Some(posed);
+        }
+        self.live.as_deref().and_then(|live| {
+            live.joint_machine
+                .as_ref()
+                .and_then(|machine| machine.finish_no_progress_trip)
+        })
+    }
+
+    /// Pose (or clear) the no-progress trip the accessor returns, so
+    /// the exit-hold twin can stage a tripped lane without a live
+    /// machine. Associated rather than a method: substituted lanes
+    /// carry no live machine, so there is no lane state to hang it
+    /// on. Takes raw parts because the trip type stays inside the
+    /// joint module. The twin clears it when done (thread-local).
+    #[cfg(test)]
+    pub(crate) fn pose_no_progress_trip_for_test(trip: Option<(u32, Duration)>) {
+        POSED_NO_PROGRESS_TRIP.with(|posed| {
+            posed.set(trip.map(|(polls, stalled)| FinishNoProgressTrip { polls, stalled }));
+        });
     }
 
     /// Whether this lane's machine began a Finish that still owns control.

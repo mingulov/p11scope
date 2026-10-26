@@ -907,6 +907,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory_manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64",
+      "reason": "privileged: inventory --system --manifest over 4097+ endpoints stops finitely with S1 edges for a long-running caller and the journal_unavailable disclosure",
+      "cell": "privileged"
+    },
+    {
       "file": "src/inventory_privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",

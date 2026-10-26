@@ -313,6 +313,12 @@ inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
 # P11SCOPE_E2E_OBSERVER, else the p11scope sibling of the test
 # binary. Prints MAN1_E2E lines (about a minute).
 inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64
+# Inventory scale with --manifest: the same headline command over 4,097+
+# admitted endpoints (distinct SoftHSM2 copies held mapped plus the
+# gated ledger caller) stops finitely with a populated S1 edge for the
+# long-running caller and the journal_unavailable marker. Strict on
+# edges (no route-loss fallback). Prints SCALE2_E2E lines (a few minutes).
+inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

@@ -12133,8 +12133,8 @@ pub(crate) mod tests {
             );
         }
         // Admission control, all natively produced: an admit/exec
-        // mismatch trips the failed latch; 16384 real admits spend
-        // the cap exactly (failed still clear); 16383 admits observe.
+        // mismatch trips the failed latch; 2^24 real admits spend
+        // the cap exactly (failed still clear); 2^24 - 1 admits observe.
         let (ready_row, _, _) = publisher.publish(&["0", "1"]);
         let (_, latched, latched_wins) = publisher.publish(&["0", "1", "0", "1"]);
         assert_eq!(latched_wins, 0, "mismatch admits nothing");
@@ -12152,7 +12152,7 @@ pub(crate) mod tests {
             ),
             Err(BirthObservationRefusal::LatchTripped)
         );
-        let (ready_row, spent, spent_wins) = publisher.publish(&["0", "16384"]);
+        let (ready_row, spent, spent_wins) = publisher.publish(&["0", "16777216"]);
         assert_eq!(spent_wins, MARKER_ADMIT_CAP);
         assert_eq!((spent.spent, spent.failed), (MARKER_ADMIT_CAP, 0));
         let mut rows = NativeBirthRows {
@@ -12169,7 +12169,7 @@ pub(crate) mod tests {
             Err(BirthObservationRefusal::SpentExhausted)
         );
         let (ready_row, nearly, nearly_wins) =
-            publisher.publish_stamped(&["0", "16383"], scene.closure_generation());
+            publisher.publish_stamped(&["0", "16777215"], scene.closure_generation());
         assert_eq!(nearly_wins, MARKER_ADMIT_CAP - 1);
         let mut rows = NativeBirthRows {
             row: ready_row,
@@ -12352,7 +12352,7 @@ pub(crate) mod tests {
             Err(BirthObservationRefusal::LatchTripped)
         );
         // Spending the cap natively after the take refuses the same way.
-        let (_, spent, _) = publisher.publish(&["0", "16384"]);
+        let (_, spent, _) = publisher.publish(&["0", "16777216"]);
         let mut capped = ExecBirthSource::over(
             NativeBirthRows {
                 row: ready_row,

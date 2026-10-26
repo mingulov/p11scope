@@ -52,7 +52,7 @@ static void check_layout(void)
            offsetof(struct instance_record, journal_bootstrap));
     EXPECT(sizeof(struct journal_admission_control) == 16, "control row is 16 B, got %zu",
            sizeof(struct journal_admission_control));
-    EXPECT(P11_JOURNAL_MARKER_ADMIT_CAP == 16384ULL, "admit cap is 16384");
+    EXPECT(P11_JOURNAL_MARKER_ADMIT_CAP == 16777216ULL, "admit cap is 2^24");
 }
 
 static void check_publish_and_read(void)
@@ -114,12 +114,12 @@ static void check_admit(void)
     EXPECT(p11_journal_marker_admit(&ctl, ready7, 8) == 0, "wrong exec refuses");
     EXPECT(ctl.failed == 1, "refusal trips the failed latch");
     EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "latched failure sticks");
-    /* Cap: the 16,384th permit spends, the next trips the latch. */
-    ctl.spent = 16383;
+    /* Cap: the last permit spends, the next trips the latch. */
+    ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 1;
     ctl.failed = 0;
-    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 1, "permit 16384 spends");
-    EXPECT(ctl.spent == 16384 && ctl.failed == 0, "cap reached unlatched");
-    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "permit 16385 refuses");
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 1, "the last permit spends");
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP && ctl.failed == 0, "cap reached unlatched");
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "the permit after the cap refuses");
     EXPECT(ctl.failed == 1, "cap refusal trips the failed latch");
     /* Non-READY markers refuse: unpublished, DIRTY, garbage. */
     ctl.spent = 0;
@@ -172,11 +172,11 @@ static void check_admit_race(void)
     int round;
 
     /* Tight race at the last permit: 2 threads x 5000 rounds from
-     * spent=16383 admit exactly once per round. */
+     * spent=CAP-1 admit exactly once per round. */
     won = 0;
     assert(pthread_barrier_init(&admit_gate, 0, 2) == 0);
     for (round = 0; round < 5000; round++) {
-        ctl.spent = 16383;
+        ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 1;
         ctl.failed = 0;
         for (t = 0; t < 2; t++) {
             args[t].ctl = &ctl;
@@ -191,27 +191,27 @@ static void check_admit_race(void)
         won += args[0].won + args[1].won;
         if (args[0].won + args[1].won != 1)
             break;
-        EXPECT(ctl.spent == 16384, "round %d: spent is 16384, got %llu", round,
-               (unsigned long long)ctl.spent);
+        EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP, "round %d: spent is the cap, got %llu",
+               round, (unsigned long long)ctl.spent);
         EXPECT(ctl.failed == 1, "round %d: the loser trips the latch", round);
-        if (ctl.spent != 16384 || ctl.failed != 1)
+        if (ctl.spent != P11_JOURNAL_MARKER_ADMIT_CAP || ctl.failed != 1)
             break;
     }
     EXPECT(won == 5000, "last-permit race admits exactly once per round, won %u/5000", won);
     assert(pthread_barrier_destroy(&admit_gate) == 0);
     /* Sequential fill: one thread admits exactly the full cap with
-     * no latch, and the 16385th attempt refuses loudly. Deterministic
+     * no latch, and the CAP+1th attempt refuses loudly. Deterministic
      * exact-cap proof without contention. */
-    ctl.spent = 0;
+    ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 16384;
     ctl.failed = 0;
     won = 0;
     for (i = 0; i < 16384; i++)
         won += (unsigned)p11_journal_marker_admit(&ctl, ready7, 7);
     EXPECT(won == 16384, "sequential fill admits exactly the cap, won %u", won);
-    EXPECT(ctl.spent == 16384, "sequential fill spends exactly the cap, spent %llu",
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP, "sequential fill spends exactly the cap, spent %llu",
            (unsigned long long)ctl.spent);
     EXPECT(ctl.failed == 0, "sequential fill trips no latch");
-    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "permit 16385 refuses");
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "the permit after the cap refuses");
     EXPECT(ctl.failed == 1, "cap refusal trips the failed latch");
     /* Single-shot contention: 2048 rounds of an 8-way single-attempt
      * race admit exactly the full cap with no latch. Each round is an
@@ -219,7 +219,7 @@ static void check_admit_race(void)
      * attempt can lose at most one race per rival win — 7 losses max,
      * so 32-retry exhaustion is impossible by construction while every
      * round still exercises genuine atomic contention. */
-    ctl.spent = 0;
+    ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 16384;
     ctl.failed = 0;
     won = 0;
     assert(pthread_barrier_init(&admit_gate, 0, 8) == 0);
@@ -240,7 +240,7 @@ static void check_admit_race(void)
             break;
     }
     EXPECT(won == 16384, "single-shot contention admits exactly the cap, won %u", won);
-    EXPECT(ctl.spent == 16384, "single-shot contention spends exactly the cap, spent %llu",
+    EXPECT(ctl.spent == P11_JOURNAL_MARKER_ADMIT_CAP, "single-shot contention spends exactly the cap, spent %llu",
            (unsigned long long)ctl.spent);
     EXPECT(ctl.failed == 0, "single-shot contention trips no latch");
     assert(pthread_barrier_destroy(&admit_gate) == 0);
@@ -252,7 +252,7 @@ static void check_admit_race(void)
      * exactly: every win spent exactly one permit (no lost updates,
      * no phantom wins), spent never exceeds the cap (never
      * over-admits), and the latch explains any shortfall. */
-    ctl.spent = 0;
+    ctl.spent = P11_JOURNAL_MARKER_ADMIT_CAP - 16384;
     ctl.failed = 0;
     assert(pthread_barrier_init(&admit_gate, 0, 8) == 0);
     for (t = 0; t < 8; t++) {
@@ -268,9 +268,9 @@ static void check_admit_race(void)
     won = 0;
     for (i = 0; i < 8; i++)
         won += args[i].won;
-    EXPECT(won == ctl.spent, "hammer accounts every win, won %u spent %llu", won,
+    EXPECT(won == ctl.spent - (P11_JOURNAL_MARKER_ADMIT_CAP - 16384), "hammer accounts every win, won %u spent %llu", won,
            (unsigned long long)ctl.spent);
-    EXPECT(ctl.spent <= 16384, "hammer never over-admits, spent %llu",
+    EXPECT(ctl.spent <= P11_JOURNAL_MARKER_ADMIT_CAP, "hammer never over-admits, spent %llu",
            (unsigned long long)ctl.spent);
     EXPECT(ctl.failed == 1, "hammer trips the latch");
     assert(pthread_barrier_destroy(&admit_gate) == 0);

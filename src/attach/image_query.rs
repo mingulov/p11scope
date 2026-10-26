@@ -2145,6 +2145,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn calibration_keyed_ranges_keep_own_mount_and_drop_second_mount() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Pre-6.8 overlay, the probed 6.6.157 D1/D2/D4 shape: the
+        // watched file's own mount carries overlay key (0:66, 11), a
+        // second mount of the same lower file carries (0:68, 11), and
+        // BOTH mounts' maps lines carry the shared backing key
+        // (0:52, 11). Watch keys come from the production helper; the
+        // raw key alone selects nothing.
+        let fixture = ProcFixture::new();
+        std::fs::write(
+            fixture.directory.path().join("maps"),
+            b"1000-2000 r--p 00000000 00:34 11 /merged/provider.so\n\
+            3000-4000 r--p 00000000 00:34 11 /merged/provider.so\n",
+        )
+        .unwrap();
+        // The own range resolves to the watched file; the second-mount
+        // range resolves to another file behind the same maps line.
+        let link = |name: &str| fixture.directory.path().join("map_files").join(name);
+        std::fs::remove_file(link("1000-2000")).unwrap();
+        std::os::unix::fs::symlink(&fixture.successor, link("1000-2000")).unwrap();
+        std::os::unix::fs::symlink(&fixture.original, link("3000-4000")).unwrap();
+        let proc =
+            crate::process::ProcPin::test_open_at(&fixture.pin, fixture.directory.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let metadata = std::fs::metadata(&fixture.successor).unwrap();
+        let identity = crate::discovery::instances::MappedFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        let raw = p11scope_manifest::maps::ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: 0,
+                minor: 66,
+            },
+            inode: 11,
+        };
+        assert!(
+            read_confirmed_ranges_with(&proc, &[raw], identity, deadline, 1024, || {})
+                .unwrap()
+                .is_empty(),
+            "raw-only keys must select nothing pre-6.8"
+        );
+        let keys = super::super::instance::maps_keys_for_watch(
+            vec![raw],
+            p11scope_ebpf_common::InstanceFileKey { dev: 52, ino: 11 },
+        );
+        assert_eq!(
+            read_confirmed_ranges_with(&proc, &keys, identity, deadline, 1024, || {}).unwrap(),
+            vec![crate::discovery::instances::MapRange::new(
+                0x1000, 0x2000, 0, false
+            )]
+        );
+    }
+
     struct ProcScript<'a> {
         script: Script,
         fixture: &'a ProcFixture,
@@ -2408,6 +2463,47 @@ mod tests {
             prove_absence_with(&mut unreadable, domain(), 3, 4),
             Err(ImageQueryRefusal::Custody)
         ));
+    }
+
+    #[test]
+    fn absence_seal_finds_calibration_keyed_provider_present() {
+        // Pre-6.8 overlay: without the calibration key the absence path
+        // found no candidates under a mapped provider and would have
+        // sealed a provider-free interval — fail-open. The helper's
+        // keys select the backing-keyed entry and confirmation reports
+        // Present; raw-only keys still seal (the old hole, shown so
+        // the positive half cannot pass vacuously).
+        let raw = p11scope_manifest::maps::ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: 0,
+                minor: 66,
+            },
+            inode: 11,
+        };
+        let keys = super::super::instance::maps_keys_for_watch(
+            vec![raw],
+            p11scope_ebpf_common::InstanceFileKey { dev: 52, ino: 11 },
+        );
+        let mut source = absence_script();
+        source.keys = keys;
+        source
+            .entries
+            .push(absence_entry(0xb000_0000, 0xb000_1000, 0, 52, 11));
+        source.confirm_mode = ConfirmMode::Match;
+        assert!(matches!(
+            prove_absence_with(&mut source, domain(), 3, 4),
+            Err(ImageQueryRefusal::Present)
+        ));
+        assert_eq!(source.confirms, 1, "the backing-keyed range was confirmed");
+        let mut raw_only = absence_script();
+        raw_only.keys = vec![raw];
+        raw_only
+            .entries
+            .push(absence_entry(0xb000_0000, 0xb000_1000, 0, 52, 11));
+        raw_only.confirm_mode = ConfirmMode::Match;
+        let proof = prove_absence_with(&mut raw_only, domain(), 3, 4).unwrap();
+        assert_eq!(proof.total_entries(), 4);
+        assert_eq!(raw_only.confirms, 0, "raw-only keys consult no candidate");
     }
 
     #[test]

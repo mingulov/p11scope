@@ -127,6 +127,30 @@ impl Clone for WatchedFile {
     }
 }
 impl WatchedFile {
+    /// The only production way to build a watched file: the scan
+    /// selects ranges by the pin's raw keys plus the calibration
+    /// kernel key (pre-6.8 overlay maps show the backing identity;
+    /// see [`maps_keys_for_watch`]). `watch()` delegates here, so the
+    /// key-joining rule is pinned by the default-run
+    /// `watched_file_constructor_keeps_raw_and_calibration_keys`
+    /// test; `watch()` itself needs a loaded hook (calibration
+    /// requires exactly one `INSTANCE_CALIB` hit) and so cannot run
+    /// unprivileged.
+    fn for_watch(
+        file_slot: u32,
+        raw_keys: Vec<ObjectKey>,
+        calib: InstanceFileKey,
+        identity: MappedFileIdentity,
+        target: RetainedInventoryTarget,
+    ) -> Self {
+        Self {
+            file_slot,
+            maps_keys: maps_keys_for_watch(raw_keys, calib),
+            identity,
+            target,
+        }
+    }
+
     pub(super) fn check_unchanged(&self) -> Result<bool, String> {
         self.target.check_unchanged()
     }
@@ -549,12 +573,13 @@ impl InstanceTracking {
                 slot
             }
         };
-        Ok(WatchedFile {
+        Ok(WatchedFile::for_watch(
             file_slot,
-            maps_keys: maps_keys_for_watch(objects.raw_keys_for(object), key),
+            objects.raw_keys_for(object),
+            key,
             identity,
             target,
-        })
+        ))
     }
 
     /// The hook programs' statistics, summed. `run_time_ns`/`run_cnt` need
@@ -750,7 +775,10 @@ fn calibrate(ebpf: &mut Ebpf, path: &Path) -> Result<(InstanceFileKey, MappedFil
 /// candidate, so such extras only cost a few refused `map_files` stats —
 /// never a false join (a second mount compares unequal: `(66, 11)` vs
 /// `(68, 11)` on 6.6, `(69, 11)` vs `(71, 11)` on 7.0).
-fn maps_keys_for_watch(mut raw: Vec<ObjectKey>, calib: InstanceFileKey) -> Vec<ObjectKey> {
+pub(super) fn maps_keys_for_watch(
+    mut raw: Vec<ObjectKey>,
+    calib: InstanceFileKey,
+) -> Vec<ObjectKey> {
     // Kernel kdev_t decoding (12-bit major at bits 20-31, 20-bit minor):
     // the hook reports the raw `s_dev`, not a userspace `st_dev`, so
     // `libc::major`/`libc::minor` would misread it.
@@ -2596,5 +2624,59 @@ mod tests {
                 inode: 5
             }]
         );
+    }
+
+    #[test]
+    fn watched_file_constructor_keeps_raw_and_calibration_keys() {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        use p11scope_ebpf_common::InstanceFileKey;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        use std::os::unix::fs::MetadataExt as _;
+
+        // `watch()` builds every `WatchedFile` through `for_watch` (the
+        // only production construction site), so this pins the
+        // key-joining rule where the helper tests cannot: a later edit
+        // that drops the calibration key from the constructor fails
+        // here on every kernel, while on 6.8+ hosts even the live
+        // cells would stay green without it.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider");
+        std::fs::write(&path, b"provider bytes").unwrap();
+        let pins = real_scan_pin(&path, None, 1, "constructor-digest");
+        let object = pins.pinned().next().unwrap().id;
+        let raw = pins.raw_keys_for(object);
+        assert!(!raw.is_empty());
+        let metadata = std::fs::metadata(&path).unwrap();
+        // The probed 6.6 backing pair (52, 11): no raw key of this
+        // pinned temp file may already name it, or the added-key
+        // assertion below would pass vacuously.
+        let added = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 52,
+            },
+            inode: 11,
+        };
+        assert!(
+            !raw.contains(&added),
+            "test environment collides with the (52, 11) probe vector: {raw:?}"
+        );
+        let watched = super::WatchedFile::for_watch(
+            3,
+            raw.clone(),
+            InstanceFileKey { dev: 52, ino: 11 },
+            crate::discovery::instances::MappedFileIdentity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            pins.retain_inventory_target(object).unwrap(),
+        );
+        assert_eq!(watched.file_slot, 3);
+        for key in &raw {
+            assert!(watched.maps_keys.contains(key), "raw key lost: {key:?}");
+        }
+        assert!(watched.maps_keys.contains(&added));
+        assert_eq!(watched.identity.dev, metadata.dev());
+        assert_eq!(watched.identity.ino, metadata.ino());
     }
 }

@@ -54,6 +54,66 @@ fn inventory_opt_level_override_is_not_shadowed() {
     }
 }
 
+/// Effective-flags twin of the ordering pin: build.rs records the exact
+/// CARGO_ENCODED_RUSTFLAGS it hands each BPF flavor build. Both inventory
+/// flavors must end with `-C opt-level=3` (rustc takes the last
+/// `-C opt-level`); the Detailed and counter flavors must carry no
+/// opt-level override, so their pinned verifier budgets stay valid.
+#[test]
+fn effective_bpf_rustflags_keep_inventory_last_and_detailed_plain() {
+    for (name, flags) in [
+        ("inventory", env!("P11SCOPE_BPF_RUSTFLAGS_INVENTORY")),
+        (
+            "inventory-callers",
+            env!("P11SCOPE_BPF_RUSTFLAGS_INVENTORY_CALLERS"),
+        ),
+    ] {
+        let tail: Vec<&str> = flags.rsplit('\u{1f}').take(2).collect();
+        assert_eq!(
+            tail.as_slice(),
+            ["opt-level=3", "-C"],
+            "{name} BPF rustflags must end with `-C opt-level=3`: {flags:?}"
+        );
+    }
+    let mut plain = vec![("detailed", env!("P11SCOPE_BPF_RUSTFLAGS_DETAILED"))];
+    for (name, flags) in [
+        (
+            "counter-counts",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS"),
+        ),
+        (
+            "counter-timestamps",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS"),
+        ),
+        (
+            "counter-latency",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY"),
+        ),
+        (
+            "counter-counts-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS_PROOF"),
+        ),
+        (
+            "counter-timestamps-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS_PROOF"),
+        ),
+        (
+            "counter-latency-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY_PROOF"),
+        ),
+    ] {
+        if let Some(flags) = flags {
+            plain.push((name, flags));
+        }
+    }
+    for (name, flags) in plain {
+        assert!(
+            !flags.split('\u{1f}').any(|token| token.starts_with("opt-level")),
+            "{name} BPF rustflags must carry no opt-level override: {flags:?}"
+        );
+    }
+}
+
 #[test]
 fn compact_inventory_object_matches_manifest_and_relocates_without_kernel_syscalls() {
     let directory = tempfile::tempdir().expect("inventory object test directory");

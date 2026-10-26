@@ -23,9 +23,10 @@ use std::cell::RefCell;
 mod machine;
 #[cfg(test)]
 pub(crate) use machine::JointMachineIo;
+#[cfg(test)]
+pub(crate) use machine::StagingDetail;
 pub(crate) use machine::{
     JointCommitRefusal, JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
-    StagingDetail,
 };
 
 /// One original negative or completed witness in the SAME paid allocation.

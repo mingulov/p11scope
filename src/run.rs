@@ -17087,8 +17087,7 @@ mod tests {
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
         for overridden in [false, true] {
             let error = preflight_uretprobe_hazard(None, overridden)
-                .err()
-                .expect("a flavor mismatch must refuse the preflight");
+                .expect_err("a flavor mismatch must refuse the preflight");
             let message = format!("{error:#}");
             assert!(message.contains("stale or mismatched"), "{message}");
             assert!(!message.contains("allow-uretprobe"), "{message}");

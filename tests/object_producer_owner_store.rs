@@ -322,7 +322,7 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         "dispatcher must route ordinary calls and consume its lost code"
     );
     assert!(
-        dispatch.contains("} else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        dispatch.contains("\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {"),
         "dispatcher must route object calls and consume its lost code"
     );
     assert_eq!(
@@ -338,6 +338,37 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
             .count(),
         1,
         "dispatcher must call object_return exactly once with the live pointer"
+    );
+    // Mutant control: an object call nested inside the ordinary arm still
+    // matches the old unindented anchor and both exact-once counts, so only
+    // the 4-space anchor above catches it.
+    let nested = dispatch.replacen(
+        "\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {",
+        "\n        } else if object_return(ctx, &key, start, flags, layout) != 0 {",
+        1,
+    );
+    assert_ne!(nested, dispatch, "nesting mutant must change the dispatch");
+    assert!(
+        nested.contains("} else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        "nesting mutant must stay on target for the unindented anchor"
+    );
+    assert_eq!(
+        nested
+            .matches("ordinary_return(ctx, &key, start, flags, layout)")
+            .count(),
+        1,
+        "nesting mutant must keep the ordinary count"
+    );
+    assert_eq!(
+        nested
+            .matches("object_return(ctx, &key, start, flags, layout)")
+            .count(),
+        1,
+        "nesting mutant must keep the object count"
+    );
+    assert!(
+        !nested.contains("\n    } else if object_return(ctx, &key, start, flags, layout) != 0 {"),
+        "nesting mutant must be caught by the 4-space anchor"
     );
     for forbidden in [
         "EVENTS.reserve",

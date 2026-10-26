@@ -850,6 +850,11 @@ pub struct CaptureWorkBudget {
     interface_refusals: u64,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
+    /// Deep scans this pass classified as kernel threads with no user
+    /// memory (verified absence, never a refusal). Sticky and never reset:
+    /// the pass summary discloses the count once instead of repeating one
+    /// gap per thread.
+    kernel_thread_absences: u64,
     work_ceiling: u64,
     work_units: u64,
     active_window: Option<ActiveInventoryWindow>,
@@ -891,6 +896,7 @@ impl CaptureWorkBudget {
             interface_refusals: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
+            kernel_thread_absences: 0,
             work_ceiling: DEFAULT_WORK_CEILING,
             work_units: 0,
             active_window: None,
@@ -1365,6 +1371,19 @@ impl CaptureWorkBudget {
     /// with the skip — future minors walk as known prefixes now.)
     pub(crate) fn refusal_counts(&self) -> (u64, u64) {
         (self.table_refusals, self.interface_refusals)
+    }
+
+    /// Record one kernel-thread verified absence (empty maps with
+    /// PF_KTHREAD on the pinned generation). The pass summary discloses
+    /// the count; saturates instead of wrapping.
+    pub(crate) fn note_kernel_thread_absence(&mut self) {
+        self.kernel_thread_absences = self.kernel_thread_absences.saturating_add(1);
+    }
+
+    /// Deep scans this pass classified as kernel threads with no user
+    /// memory (0 when none ran).
+    pub(crate) fn kernel_thread_absences(&self) -> u64 {
+        self.kernel_thread_absences
     }
 
     pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
@@ -3535,6 +3554,19 @@ trait ScanIo {
     fn final_generation(&mut self, view: &ProcessView) -> Result<(), String>;
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
+    }
+    /// Raw `/proc/<pid>/stat` text for empty-maps classification
+    /// (kernel-thread detection). The caller reads it under the view's
+    /// generation pin; the default reads the live proc file.
+    fn stat_text(&mut self, view: &ProcessView) -> std::io::Result<String> {
+        std::fs::read_to_string(format!("/proc/{}/stat", view.pid()))
+    }
+    /// Target of `/proc/<pid>/exe` for empty-maps classification
+    /// (zombie/exiting detection: `NotFound` means the executable is gone).
+    /// The caller reads it under the view's generation pin; the default
+    /// reads the live proc link.
+    fn exe_target(&mut self, view: &ProcessView) -> std::io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/exe", view.pid()))
     }
     /// The opened object's own `vm_file`, when `map_files` is readable
     /// (`identity::self_mapped_file`).
@@ -8997,3 +9029,7 @@ mod tests {
 #[cfg(test)]
 #[path = "export_linkage_tests.rs"]
 mod export_linkage_tests;
+
+#[cfg(test)]
+#[path = "scan_kthread_tests.rs"]
+mod scan_kthread_tests;

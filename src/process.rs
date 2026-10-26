@@ -1488,7 +1488,7 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     start_time_from_stat(&stat)
 }
 
-fn start_time_from_stat(stat: &str) -> io::Result<u64> {
+pub(crate) fn start_time_from_stat(stat: &str) -> io::Result<u64> {
     let end = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat comm"))?;
@@ -1498,6 +1498,22 @@ fn start_time_from_stat(stat: &str) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))?
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))
+}
+
+/// `PF_KTHREAD` (`include/linux/sched.h`): set in `/proc/<pid>/stat` field 9
+/// (flags) only for kernel threads, which have no user address space.
+pub(crate) const PF_KTHREAD: u32 = 0x0020_0000;
+
+/// Flags word (field 9) of a `/proc/<pid>/stat` line, parsed after the LAST
+/// `)` of the comm field (comm may contain spaces and `)`). `None` on any
+/// malformed input — callers fail closed.
+pub(crate) fn stat_flags_from_stat_text(stat: &str) -> Option<u32> {
+    let end = stat.rfind(')')?;
+    stat[end + 1..]
+        .split_whitespace()
+        .nth(6)?
+        .parse::<u32>()
+        .ok()
 }
 
 #[cfg(test)]

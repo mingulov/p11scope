@@ -2039,6 +2039,25 @@ fn split_gaps(gaps: Vec<PidGap>) -> (Vec<PidGap>, Vec<PidGap>) {
     (skipped, notes)
 }
 
+/// One pass-level note for deep scans that classified kernel threads with
+/// no user memory (verified absence, counted on the pass budget). `None`
+/// when no scan classified one, so deterministic runs see no new record.
+/// A note, never a loss: kernel threads cannot load providers.
+fn kernel_thread_absence_note(absences: u64) -> Option<PidGap> {
+    if absences == 0 {
+        return None;
+    }
+    let reason = if absences == 1 {
+        "1 deep-scanned process is a kernel thread with no user memory to scan".to_string()
+    } else {
+        format!("{absences} deep-scanned processes are kernel threads with no user memory to scan")
+    };
+    Some(PidGap::scope(Skipped {
+        subject: "kernel threads".into(),
+        reason,
+    }))
+}
+
 /// Group catalog objects into discovered relationships: one path observed
 /// as two objects that are not one, and one object observed under two
 /// paths. Pure over the object list, so the grouping is unit-testable.
@@ -5415,6 +5434,66 @@ mod tests {
                 .any(|note| note.reason.starts_with("attribution complete"))
         }
 
+        #[test]
+        fn assemble_discloses_kernel_thread_absences_once() {
+            let mut collection = over_cap(&[]);
+            collection.budget.note_kernel_thread_absence();
+            collection.budget.note_kernel_thread_absence();
+            let catalog = catalog_with(
+                collection,
+                &Checks {
+                    changed: false,
+                    nonunique: None,
+                },
+            );
+            let notes: Vec<&PidGap> = catalog
+                .notes
+                .iter()
+                .filter(|note| note.subject == "kernel threads")
+                .collect();
+            assert_eq!(notes.len(), 1, "{:?}", catalog.notes);
+            assert_eq!(notes[0].pid, None);
+            assert_eq!(
+                notes[0].reason,
+                "2 deep-scanned processes are kernel threads with no user memory to scan"
+            );
+            assert!(
+                catalog
+                    .skipped
+                    .iter()
+                    .all(|gap| gap.subject != "kernel threads"),
+                "verified absence is a note, never a loss: {:?}",
+                catalog.skipped
+            );
+        }
+
+        #[test]
+        fn assemble_omits_kernel_thread_note_without_absences() {
+            let catalog = catalog_with(
+                over_cap(&[]),
+                &Checks {
+                    changed: false,
+                    nonunique: None,
+                },
+            );
+            assert!(
+                catalog
+                    .notes
+                    .iter()
+                    .all(|note| note.subject != "kernel threads"),
+                "{:?}",
+                catalog.notes
+            );
+            assert!(
+                catalog
+                    .skipped
+                    .iter()
+                    .all(|gap| gap.subject != "kernel threads"),
+                "{:?}",
+                catalog.skipped
+            );
+        }
+
         /// Capped with zero charged ranges (an unexamined-only snapshot,
         /// an empty snapshot, and an unavailable caller): the old cap-hit
         /// proxy claims proof, but the proof-plan gate must refuse it —
@@ -6053,6 +6132,25 @@ mod tests {
         );
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0].pid, Some(9));
+    }
+
+    #[test]
+    fn kernel_thread_absence_note_counts_once_per_pass() {
+        assert_eq!(kernel_thread_absence_note(0), None);
+        let one = kernel_thread_absence_note(1).expect("one absence is noted");
+        assert_eq!(one.pid, None);
+        assert_eq!(one.subject, "kernel threads");
+        assert_eq!(
+            one.reason,
+            "1 deep-scanned process is a kernel thread with no user memory to scan"
+        );
+        let many = kernel_thread_absence_note(117).expect("many absences are noted");
+        assert_eq!(many.pid, None);
+        assert_eq!(many.subject, "kernel threads");
+        assert_eq!(
+            many.reason,
+            "117 deep-scanned processes are kernel threads with no user memory to scan"
+        );
     }
 
     #[test]

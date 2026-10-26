@@ -725,6 +725,31 @@ class S1ModeTests(unittest.TestCase):
         def edges_empty(doc):
             doc["edges"] = []
 
+        def smuggled_key_row(doc):
+            section = doc["object_observations"]
+            section["sessions"] = copy.deepcopy(clean["sessions"])
+            section["objects"] = copy.deepcopy(clean["objects"])
+            section["key_operations"] = copy.deepcopy(
+                clean["key_operations"][:1])
+            section["budgets"]["key_rows"]["occupied"] = 1
+            section["budgets"]["object_rows"]["occupied"] = len(
+                clean["objects"])
+
+        def smuggled_unknown_row(doc):
+            section = doc["object_observations"]
+            section["unknown_key_operations"] = [
+                {"category": "sign", "reason": "unbound",
+                 "unit": "operations", "completed": 0, "failed": 0,
+                 "cancelled": 0, "unknown": 0, "active": 0}]
+            section["budgets"]["unknown_rows"]["occupied"] = 1
+
+        def smuggled_session_row(doc):
+            doc["object_observations"]["sessions"] = [
+                {"session": 1, "origin": "opened", "status": "live"}]
+
+        def section_missing(doc):
+            del doc["object_observations"]
+
         cases = [
             ("object observations populated", populated,
              ["needs unavailable", "populated"]),
@@ -737,6 +762,14 @@ class S1ModeTests(unittest.TestCase):
             ("edges not a list", edges_not_list, ["unexpected edges shape"]),
             ("no edges", edges_empty,
              ["entries total 0", "expected 68"]),
+            ("key row while unavailable", smuggled_key_row,
+             ["needs no key-operation rows"]),
+            ("unknown row while unavailable", smuggled_unknown_row,
+             ["needs no unknown key-operation rows"]),
+            ("session row while unavailable", smuggled_session_row,
+             ["needs no session rows"]),
+            ("section missing", section_missing,
+             ["missing object observations"]),
         ]
         for label, mutate, tokens in cases:
             with self.subTest(label):
@@ -888,6 +921,10 @@ class S1ModeTests(unittest.TestCase):
             del doc["edges"][0]["operations"]["evidence"][
                 "semantic_capture_failures"]
 
+        def operations_evidence_extra_key(doc):
+            doc["edges"][0]["operations"]["evidence"][
+                "future_counter"] = 999
+
         cases = [
             ("one sign result missing", drop_sign_function,
              ["misses expected functions", "C_Sign"]),
@@ -960,6 +997,9 @@ class S1ModeTests(unittest.TestCase):
             ("operations evidence missing key",
              operations_evidence_missing_key,
              ["S1 operations evidence", "is not a counter"]),
+            ("operations evidence extra key",
+             operations_evidence_extra_key,
+             ["unexpected fields"]),
         ]
         for label, mutate, tokens in cases:
             with self.subTest(label):
@@ -1027,6 +1067,30 @@ class S1ModeTests(unittest.TestCase):
             self.assert_s1_refused(rows, s1_doc(),
                                    ["application ledger refused",
                                     "unexpected application return value"])
+
+    def test_s1_application_checks_are_reachable(self):
+        application = ORACLE.LEDGER.validate_ledger(
+            APP_TESTS.application_rows())
+        with self.subTest("wrong call split"):
+            rows = APP_TESTS.application_rows()
+            moved = next(row for row in rows
+                         if row.get("kind") == "call"
+                         and row.get("operation"))
+            moved["operation"] = 0
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE._check_s1_application(rows, application)
+            self.assertIn("application call split",
+                          str(caught.exception))
+        with self.subTest("wrong per-function tally"):
+            rows = APP_TESTS.application_rows()
+            row = next(row for row in rows
+                       if row.get("kind") == "call"
+                       and row["fn"] == "C_Sign" and row["rv"] == 0)
+            row["rv"] = 0xC0
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE._check_s1_application(rows, application)
+            self.assertIn("application C_Sign results",
+                          str(caught.exception))
 
     def test_s1_cli_accepts_twin_and_refuses_mutations(self):
         command = [sys.executable,

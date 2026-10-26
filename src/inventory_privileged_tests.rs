@@ -4768,8 +4768,9 @@ fn finish_stop_take_mint(
 /// birth Joint. Process B completes its whole SoftHSM script meanwhile.
 /// q1 publishes with A retained (no replay through the missing END, no
 /// fabricated return); the release lands A's return in q2; q2 publishes
-/// everything exactly once; the lane stops finite with joined same-owner
-/// cleanup.
+/// everything semantic exactly once (B's two count-only calls are
+/// counted but refused from conversion by design, each refusal
+/// disclosed); the lane stops finite with joined same-owner cleanup.
 #[test]
 #[ignore = "privileged: live Joint first birth through a held q1 to q2 and stop"]
 fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
@@ -4837,7 +4838,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         !process_a.has("RETURNED "),
         "A's held call returned before release"
     );
-    let (_, b_total, b_bad) = ledger_calls(&process_b.out)?;
+    let (b_by_fn, b_total, b_bad) = ledger_calls(&process_b.out)?;
     ensure!(
         b_bad == 0,
         "B's script never fails: {:?}",
@@ -4909,6 +4910,18 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         edge_b_q1.is_ok(),
         edge_a_q1.is_ok(),
     );
+    eprintln!(
+        "JOINT_R16 r16-q1-bcount b_api={:?} slot_refusals={}",
+        edge_b_q1.as_ref().ok().and_then(|edge| edge.api_returns),
+        caller_of(&coordinator, process_b.pid())
+            .ok()
+            .map_or(0, |caller| count_disclosed_gaps(
+                &coordinator,
+                "semantic input refused",
+                "slot",
+                Some(caller),
+            )),
+    );
     ensure_joint_birth_refusal(&coordinator, "r16-q1")?;
 
     // Release A's return into q2.
@@ -4920,34 +4933,93 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         t_enter < q1_end_ns && q1_end_ns < t_exit,
         "the hold genuinely spans q1: enter {t_enter} q1-end {q1_end_ns} exit {t_exit}"
     );
-    let (_, a_total, a_bad) = ledger_calls(&process_a.out)?;
+    let (a_by_fn, a_total, a_bad) = ledger_calls(&process_a.out)?;
     ensure!(
         a_bad == 0 && a_total == 2,
         "A made exactly SignInit plus its held Sign"
     );
 
-    // q2: A's genuine END lands; everything completes exactly once.
+    // q2: A's genuine END lands; everything semantic completes exactly
+    // once. The ledgers' count-only calls (C_Initialize, C_GetSlotList)
+    // are counted but refused from semantic conversion by design, each
+    // refusal disclosed; `api_returns`/`reduced` cover the semantic
+    // side only, never the raw entered total.
     let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+    let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
+    let (b_semantic, b_count_only) = ledger_semantic_split(&b_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")?;
     let edge_b = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so")?;
+    let diagnose = |ok: bool, pid: u32, module: &str, by_fn: &BTreeMap<String, u64>| {
+        if !ok {
+            for line in exactness_diagnosis(&coordinator, pid, module, by_fn) {
+                eprintln!("JOINT_R16 r16-q2-diag {line}");
+            }
+        }
+    };
+    diagnose(
+        edge_a.api_returns == Some(a_semantic),
+        process_a.pid(),
+        "live-joint-held.so",
+        &a_by_fn,
+    );
     ensure!(
-        edge_a.api_returns == Some(a_total),
-        "A's API returns are exact: {:?} vs ledger {a_total}",
+        edge_a.api_returns == Some(a_semantic),
+        "A's API returns are exact: {:?} vs semantic ledger {a_semantic} \
+         (entered {a_total}, count-only {a_count_only})",
         edge_a.api_returns
     );
+    diagnose(
+        edge_b.api_returns == Some(b_semantic),
+        process_b.pid(),
+        "soft-copy.so",
+        &b_by_fn,
+    );
     ensure!(
-        edge_b.api_returns == Some(b_total),
-        "B's API returns are exact: {:?} vs ledger {b_total}",
+        edge_b.api_returns == Some(b_semantic),
+        "B's API returns are exact: {:?} vs semantic ledger {b_semantic} \
+         (entered {b_total}, count-only {b_count_only})",
         edge_b.api_returns
     );
+    let caller_a = caller_of(&coordinator, process_a.pid())?;
+    let caller_b = caller_of(&coordinator, process_b.pid())?;
     ensure!(
-        edge_a.reduced == a_total,
-        "A reduces exactly once: {} vs {a_total}",
-        edge_a.reduced
+        count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a)
+        ) == a_count_only,
+        "A's count-only calls are disclosed as slot refusals: {a_count_only}"
     );
     ensure!(
-        edge_b.reduced == b_total,
-        "B reduces exactly once: {} vs {b_total}",
+        count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b)
+        ) == b_count_only,
+        "B's count-only calls are disclosed as slot refusals: {b_count_only}"
+    );
+    diagnose(
+        edge_a.reduced == a_semantic,
+        process_a.pid(),
+        "live-joint-held.so",
+        &a_by_fn,
+    );
+    ensure!(
+        edge_a.reduced == a_semantic,
+        "A reduces exactly once: {} vs {a_semantic}",
+        edge_a.reduced
+    );
+    diagnose(
+        edge_b.reduced == b_semantic,
+        process_b.pid(),
+        "soft-copy.so",
+        &b_by_fn,
+    );
+    ensure!(
+        edge_b.reduced == b_semantic,
+        "B reduces exactly once: {} vs {b_semantic}",
         edge_b.reduced
     );
     ensure!(edge_a.joint && edge_b.joint, "both feeds are Joint");
@@ -4993,7 +5065,17 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         observations.revision == revision,
         "the section tags the published revision"
     );
-    assert_quiet_twins(&coordinator, "r16-q2")?;
+    assert_quiet_twins_except(
+        &coordinator,
+        "r16-q2",
+        &[QuietExemption {
+            subject: "semantic input refused",
+            reason: "slot",
+            caller: Some(caller_b),
+            min: b_count_only,
+            max: Some(b_count_only),
+        }],
+    )?;
     eprintln!(
         "JOINT_R16 r16-q2 polls={q2_polls} revision={revision} feeds={} receipts={} key_aggs={} \
          key_rows={} a_api={:?} b_api={:?}",

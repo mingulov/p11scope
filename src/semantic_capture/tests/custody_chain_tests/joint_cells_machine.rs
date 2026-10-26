@@ -1237,12 +1237,24 @@ fn joint_machine_empty_followup_transaction_publishes() {
     }
     scene.machine.begin_commit(true).unwrap();
     scene.published_labeled("empty-followup-q1", None);
-    let revision_q1 = scene.scene.real.scene.coordinator.registry().published_revision();
+    let revision_q1 = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
     let JointCommitProgress::Published(_) = scene.poll_commit(0).unwrap() else {
         panic!("q1 publishes exactly once");
     };
     assert_eq!(
-        scene.scene.real.scene.coordinator.registry().published_revision(),
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
         revision_q1,
         "the poll takes the q1 receipt without a second publication"
     );
@@ -1257,7 +1269,13 @@ fn joint_machine_empty_followup_transaction_publishes() {
     scene.machine.begin_commit(false).unwrap();
     scene.published_labeled("empty-followup-q2", None);
     assert_eq!(
-        scene.scene.real.scene.coordinator.registry().published_revision(),
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
         revision_q1 + 1,
         "the empty follow-up publishes exactly one more revision"
     );
@@ -1284,7 +1302,13 @@ fn joint_machine_followup_collects_row_landed_after_idle_poll() {
     let JointCommitProgress::Published(_) = scene.poll_commit(0).unwrap() else {
         panic!("q1 publishes exactly once");
     };
-    let revision_q1 = scene.scene.real.scene.coordinator.registry().published_revision();
+    let revision_q1 = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
     assert_eq!(scene.scene.drain.source_mut().remaining(), 0);
     // The cell's three idle services: fresh polls against an empty
     // drain, publishing nothing.
@@ -1293,7 +1317,13 @@ fn joint_machine_followup_collects_row_landed_after_idle_poll() {
         assert_eq!(progress, JointServiceProgress::Pending);
     }
     assert_eq!(
-        scene.scene.real.scene.coordinator.registry().published_revision(),
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
         revision_q1,
         "idle service publishes nothing"
     );
@@ -1328,7 +1358,13 @@ fn joint_machine_followup_collects_row_landed_after_idle_poll() {
         "q2 collects the row that landed before its begin"
     );
     assert_eq!(
-        scene.scene.real.scene.coordinator.registry().published_revision(),
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
         revision_q1 + 1,
         "q2 publishes exactly one more revision"
     );

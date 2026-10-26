@@ -1724,6 +1724,73 @@ impl PinnedObjects {
         );
     }
 
+    /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed
+    /// maps key, at pin time.
+    ///
+    /// The subset pinning path files manifest-only pins with no scan join
+    /// and no refile pass, so on a split the maps-domain raw must be filed
+    /// at pin time or every later exact join misses. This mirrors
+    /// [`refile_split_manifest_alias`](Self::refile_split_manifest_alias)
+    /// onto the manifest's own entry: the fd raw is replaced (not kept
+    /// alongside), because the helper records maps-domain keys and no
+    /// downstream join needs the fd key, while a second manifest raw
+    /// would break path resolution uniqueness. The entry re-keys with
+    /// its raw (retargeting and merges read the entry) but keeps its
+    /// retained fd (attach, unchanged checks and targets are unaffected);
+    /// the reported key becomes maps-canonical exactly as on the scan
+    /// path. Fail-closed: an unnormalizable path, a rejected key, a
+    /// stale id, a path the id never filed, an already-claimed maps key,
+    /// and anything but exactly one owned fd raw all file nothing, and a
+    /// refused re-key leaves the pins (including versions) untouched.
+    pub(crate) fn refile_manifest_raw_onto_maps_key(
+        &mut self,
+        id: PinnedObjectId,
+        maps_key: ObjectKey,
+        path: &str,
+    ) {
+        if !self.by_id.contains_key(&id) || self.rejected_keys.contains(&maps_key) {
+            return;
+        }
+        let Some(maps_raw) = RawObjectInstance::manifest(maps_key, path.to_string()) else {
+            return;
+        };
+        if let Some(existing) = self.raw_to_id.get(&maps_raw)
+            && *existing != id
+        {
+            return;
+        }
+        // The manifest raws this id already files for this path: the re-key
+        // must replace exactly one fd raw. Zero means an unowned path (or
+        // equal keys, or an idempotent re-call): file nothing. More than
+        // one is ambiguity, not a split. Scan raws are never touched.
+        let owned: Vec<RawObjectInstance> = self
+            .raw_to_id
+            .iter()
+            .filter(|(raw, owner)| {
+                **owner == id
+                    && raw.mount_namespace.is_none()
+                    && raw.path == maps_raw.path
+                    && raw.key != maps_key
+            })
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        if owned.len() != 1 {
+            return;
+        }
+        let Some(entry) = self.by_id.get_mut(&id) else {
+            return;
+        };
+        // The entry re-keys with its raw: retargeting reads the summary
+        // key and merges match entry keys, so a split-brain entry (fd)
+        // with a maps raw refuses the union. Only the key changes (both
+        // raws normalize the same path); the retained fd, mapping, pin
+        // and digest are untouched.
+        entry.raw = maps_raw.clone();
+        self.bump_copy_version();
+        self.raw_to_id.remove(&owned[0]);
+        self.raw_to_id.insert(maps_raw, id);
+    }
+
     /// Exact ordinary-file equality between two already opened, hashed pin sets.
     pub fn exactly_matches(
         &self,
@@ -6470,6 +6537,14 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
             }
         };
         let key = object_key(mapping);
+        // Pre-6.8 overlayfs renders a different device for maps than for
+        // the opened fd; this path has no scan join and no refile pass,
+        // so probe the kernel-rendered key now and file it as an alias
+        // with the entry below. One fstatfs off overlay; the probe
+        // refuses fail-closed and returns None unless the kernel
+        // renders a genuinely different key. The entry proof below
+        // reuses this same rendering: one probe call feeds both.
+        let maps_alias = self_mapped_fallback_key(&file, key, budget, probe);
         let Some(raw) = RawObjectInstance::manifest(key, object.path.clone()) else {
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
@@ -6513,27 +6588,32 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         }
         // A pre-6.8 overlay fd renders in maps at a different key than
         // the mount table resolves; record the kernel rendering of this
-        // exact held fd on the entry so the provider proof matches it.
-        // The probe returns None (no split) whenever the rendering agrees
-        // or is inconclusive. Never a second manifest raw: the
-        // one-manifest-raw-per-path invariant behind `id_for_path` holds.
-        entry.probed_maps_key = self_mapped_fallback_key(&entry.file, key, budget, probe);
-        opened.insert(object.id, (entry, inspected));
+        // exact held fd (probed once above) on the entry so the provider
+        // proof matches it. The probe returns None (no split) whenever
+        // the rendering agrees or is inconclusive. Never a second
+        // manifest raw: the one-manifest-raw-per-path invariant behind
+        // `id_for_path` holds.
+        entry.probed_maps_key = maps_alias;
+        opened.insert(object.id, (entry, inspected, maps_alias));
     }
 
     if !problems.is_empty() {
         return Err(ManifestPinError::Fatal(problems));
     }
     let mut result = PinnedObjects::empty();
-    for (entry, _) in opened.into_values() {
+    for (entry, _, maps_alias) in opened.into_values() {
         let path = entry.path.clone();
         let mut skipped = Vec::new();
-        if result.insert_entry(entry, &mut skipped).is_none() {
+        let Some(id) = result.insert_entry(entry, &mut skipped) else {
             problems.extend(
                 skipped
                     .into_iter()
                     .map(|skip| format!("{path}: {}", skip.reason)),
             );
+            continue;
+        };
+        if let Some(maps_key) = maps_alias {
+            result.refile_manifest_raw_onto_maps_key(id, maps_key, &path);
         }
     }
     if !problems.is_empty() {
@@ -13214,5 +13294,128 @@ mod tests {
             assert_eq!(raw.key, *key);
             assert_eq!(pins.raw_to_id.get(raw).copied(), Some(claims.pins[0]));
         }
+    }
+
+    /// The subset pinning path files manifest-only pins with no scan join
+    /// and no refile pass: on a pre-6.8 overlayfs split the probed maps
+    /// key must replace the fd raw at pin time, or every later exact join
+    /// misses and the refresh universe stays empty (6.6.157 guests bind
+    /// nothing). The fd raw is replaced (not kept alongside): the helper
+    /// records maps-domain keys, so no downstream join needs the fd key,
+    /// and a second manifest raw would break path resolution uniqueness.
+    #[test]
+    fn manifest_pinning_files_the_probed_maps_alias_on_split() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins
+            .id_for_manifest(fd_key, PATH)
+            .expect("manifest pin files under the fd key");
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            None,
+            "no maps alias before the probe files it"
+        );
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            Some(id),
+            "the probed maps alias joins"
+        );
+        assert_eq!(
+            pins.id_for_manifest(fd_key, PATH),
+            None,
+            "the fd raw is replaced, not kept alongside"
+        );
+        assert!(
+            pins.raw_keys_for(id).contains(&maps_key),
+            "the maps domain resolves"
+        );
+        assert_eq!(
+            pins.summary(id).map(|pin| pin.key),
+            Some(maps_key),
+            "the entry re-keys with its raw: retargeting and merges read the entry"
+        );
+    }
+
+    /// Path resolution stays unique through the split: one path names one
+    /// object even when the probe re-keys its raw.
+    #[test]
+    fn manifest_maps_alias_keeps_path_resolution_unique() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_path(PATH),
+            Some(id),
+            "one path still names one object after the re-key"
+        );
+    }
+
+    /// A maps key already claimed by another object must not be stolen:
+    /// the alias files nothing and the prior resolution stands.
+    #[test]
+    fn manifest_maps_alias_refuses_a_claimed_key() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        let other = manifest_pin(
+            maps_key,
+            "claimed0000000000000000000000000000000000000000000000000000000000",
+            2,
+        );
+        assert!(pins.absorb(other).is_empty());
+        let other_id = pins.id_for_manifest(maps_key, PATH).unwrap();
+        assert_ne!(id, other_id);
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, PATH);
+        assert_eq!(
+            pins.id_for_manifest(maps_key, PATH),
+            Some(other_id),
+            "the claimed key keeps its owner"
+        );
+        assert_eq!(
+            pins.raw_keys_for(id),
+            vec![fd_key],
+            "no alias filed on conflict"
+        );
+    }
+
+    /// Equal keys file nothing: the fd alias already resolves.
+    #[test]
+    fn manifest_maps_alias_ignores_equal_keys() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, fd_key, PATH);
+        assert_eq!(pins.raw_keys_for(id), vec![fd_key]);
+    }
+
+    /// A re-key for a path the id never filed mints nothing: the probe
+    /// must not fabricate a path association.
+    #[test]
+    fn manifest_maps_alias_refuses_an_unowned_path() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut pins = manifest_pin(fd_key, SHA, 1);
+        let id = pins.id_for_manifest(fd_key, PATH).unwrap();
+        pins.refile_manifest_raw_onto_maps_key(id, maps_key, "/other/path.so");
+        assert_eq!(
+            pins.id_for_manifest(fd_key, PATH),
+            Some(id),
+            "the owned raw is untouched"
+        );
+        assert_eq!(
+            pins.id_for_manifest(maps_key, "/other/path.so"),
+            None,
+            "no path association is minted"
+        );
     }
 }

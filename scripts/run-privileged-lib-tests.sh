@@ -111,10 +111,11 @@ attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
 # Birth marker cells: live exec/fork/scope-gap marker words and admission
 # counts through the session's instance maps.
 attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
+attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
 attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
 attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
 attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
-attach::instance_tests::privileged_journal_marker_out_of_scope_call_dirties_once
+attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
 attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 # H6 observer mapping interactions: owned idle target and genuine external
 # mutation control; distinguish ordinary scans from System identity anchors.

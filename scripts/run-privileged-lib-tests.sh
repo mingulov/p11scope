@@ -317,7 +317,9 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_
 # admitted endpoints (distinct SoftHSM2 copies held mapped plus the
 # gated ledger caller) stops finitely with a populated S1 edge for the
 # long-running caller and the journal_unavailable marker. Strict on
-# edges (no route-loss fallback). Prints SCALE2_E2E lines (a few minutes).
+# edges (no route-loss fallback). P11SCOPE_SCALE2_TARGET raises the
+# target up to 8192 for the full-scale run. Prints SCALE2_E2E lines
+# (a few minutes).
 inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.

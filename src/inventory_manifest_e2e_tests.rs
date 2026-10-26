@@ -23,10 +23,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// SoftHSM2 provider layouts across guest images (Debian multiarch
-/// first, then the /usr/lib layout the vng guests carry).
+/// first, then the /usr/lib layout the vng guests carry, then the
+/// Fedora /usr/lib64 layout the controller's live cells use).
 const SOFTHSM_CANDIDATES: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
     "/usr/lib/softhsm/libsofthsm2.so",
+    "/usr/lib64/pkcs11/libsofthsm2.so",
 ];
 
 /// PKCS#11 functions the ledger `mech` cell calls (setup, the ten
@@ -521,7 +523,62 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
 
 /// Scale target: one endpoint past the default 4,096 inventory budget,
 /// so the run must carry `--max-endpoints` and the admission is real.
+/// `P11SCOPE_SCALE2_TARGET` overrides it up to the 8,192 inventory
+/// ceiling for the controller's full-scale run; anything below the
+/// default or above the ceiling is refused.
 const SCALE_TARGET_ENDPOINTS: u64 = 4097;
+const SCALE_MAX_TARGET: u64 = 8192;
+
+/// The endpoint target for this run: the default 4,097 or the
+/// `P11SCOPE_SCALE2_TARGET` override inside 4,097..=8,192.
+fn scale_target() -> Result<u64> {
+    match std::env::var("P11SCOPE_SCALE2_TARGET") {
+        Ok(raw) => parse_scale_target(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_scale_target(None),
+        Err(error) => anyhow::bail!("P11SCOPE_SCALE2_TARGET is unreadable: {error}"),
+    }
+}
+
+/// The pure target rule: default without input, the override when it
+/// parses inside 4,097..=8,192, refused otherwise.
+fn parse_scale_target(raw: Option<&str>) -> Result<u64> {
+    let target = match raw {
+        Some(text) => text
+            .parse::<u64>()
+            .with_context(|| format!("P11SCOPE_SCALE2_TARGET={text:?} is not a number"))?,
+        None => SCALE_TARGET_ENDPOINTS,
+    };
+    ensure!(
+        (SCALE_TARGET_ENDPOINTS..=SCALE_MAX_TARGET).contains(&target),
+        "scale target {target} is outside 4097..=8192"
+    );
+    Ok(target)
+}
+
+#[test]
+fn scale_target_defaults_to_4097_without_env() {
+    assert_eq!(parse_scale_target(None).unwrap(), 4097);
+}
+
+#[test]
+fn scale_target_accepts_the_8192_ceiling() {
+    assert_eq!(parse_scale_target(Some("8192")).unwrap(), 8192);
+}
+
+#[test]
+fn scale_target_refuses_below_default() {
+    assert!(parse_scale_target(Some("4096")).is_err());
+}
+
+#[test]
+fn scale_target_refuses_above_ceiling() {
+    assert!(parse_scale_target(Some("8193")).is_err());
+}
+
+#[test]
+fn scale_target_refuses_a_non_number() {
+    assert!(parse_scale_target(Some("many")).is_err());
+}
 
 /// Upper bound on distinct provider copies. The population stops as
 /// soon as the resolved total reaches the target; this cap only bounds
@@ -693,10 +750,14 @@ impl Drop for ScaleHolder {
 /// `journal_unavailable` S1 marker. Strict on edges: a bound call with
 /// no edge and no gap is a silent drop and fails (R-51); the
 /// route-loss fallback the headline cell carries does not apply here.
-/// Prints SCALE2_E2E lines. Root BPF lane, serial, a few minutes.
+/// `P11SCOPE_SCALE2_TARGET` raises the target up to 8,192 for the
+/// full-scale run. Prints SCALE2_E2E lines. Root BPF lane, serial, a
+/// few minutes.
 #[test]
 #[ignore = "privileged: inventory --system --manifest over 4097+ endpoints stops finitely with S1 edges for a long-running caller and the journal_unavailable disclosure"]
 fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<()> {
+    let endpoint_target = scale_target()?;
+    println!("SCALE2_E2E target={endpoint_target}");
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = E2eWorkload::build(&module)?;
@@ -718,7 +779,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     manifests.push(first_manifest);
     let mut total = per_copy as u64 + MECH_FUNCTIONS.len() as u64;
     let mut index = 1usize;
-    while total < SCALE_TARGET_ENDPOINTS {
+    while total < endpoint_target {
         ensure!(
             copies.len() < SCALE_MAX_COPIES,
             "scale population hit the copy cap at {total} endpoints"
@@ -847,8 +908,8 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         .context("budgets.endpoints.occupied")?;
     println!("SCALE2_E2E endpoints_occupied={occupied}");
     ensure!(
-        occupied >= SCALE_TARGET_ENDPOINTS,
-        "4097+ endpoints are admitted, got {occupied}"
+        occupied >= endpoint_target,
+        "{endpoint_target}+ endpoints are admitted, got {occupied}"
     );
     let dir_prefix = workload
         .dir

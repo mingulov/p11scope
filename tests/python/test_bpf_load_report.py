@@ -106,6 +106,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("result=FAIL", result.stdout)
         self.assertIn("p11_return", result.stdout)
         self.assertIn("FAIL", result.stdout)
+        self.assertIn("refused errno=7", result.stdout)
         # The passing root is still printed with its count.
         self.assertIn("472892", result.stdout)
 

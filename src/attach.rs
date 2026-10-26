@@ -4837,29 +4837,26 @@ pub(crate) fn embedded_flavor() -> Result<EmbeddedFlavor, FlavorProbeError> {
 }
 
 #[cfg(test)]
-static TEST_FLAVOR_OVERRIDE: std::sync::Mutex<Option<Result<EmbeddedFlavor, FlavorProbeError>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static TEST_FLAVOR_OVERRIDE: std::cell::RefCell<
+        Option<Result<EmbeddedFlavor, FlavorProbeError>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
-#[cfg(test)]
-static TEST_FLAVOR_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Test seam: hold a planted flavor (or probe error) while the guard lives.
-/// The guard holds the serial mutex, so planted-mismatch tests run one at
-/// a time; the value mutex is only ever locked briefly, so ordinary flavor
-/// reads never observe a planted value and never block on a holder. The
-/// slot clears on drop. Lock poisoning is ignored: a panicked holder must
-/// not cascade into unrelated tests.
+/// Test seam: hold a planted flavor (or probe error) on this thread while
+/// the guard lives. The injection is per thread (the pidns test-seam
+/// shape), so a test sees it on its own thread only and no other test is
+/// affected. The previous value restores on drop, also on a panic; nested
+/// holders compose.
 #[cfg(test)]
 pub(crate) struct FlavorOverrideGuard {
-    _serial: std::sync::MutexGuard<'static, ()>,
+    previous: Option<Result<EmbeddedFlavor, FlavorProbeError>>,
 }
 
 #[cfg(test)]
 impl Drop for FlavorOverrideGuard {
     fn drop(&mut self) {
-        *TEST_FLAVOR_OVERRIDE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        TEST_FLAVOR_OVERRIDE.with(|cell| *cell.borrow_mut() = self.previous.take());
     }
 }
 
@@ -4867,21 +4864,13 @@ impl Drop for FlavorOverrideGuard {
 pub(crate) fn hold_embedded_flavor_for_test(
     flavor: Result<EmbeddedFlavor, FlavorProbeError>,
 ) -> FlavorOverrideGuard {
-    let serial = TEST_FLAVOR_SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *TEST_FLAVOR_OVERRIDE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(flavor);
-    FlavorOverrideGuard { _serial: serial }
+    let previous = TEST_FLAVOR_OVERRIDE.with(|cell| cell.borrow_mut().replace(flavor));
+    FlavorOverrideGuard { previous }
 }
 
 #[cfg(test)]
 fn test_flavor_override() -> Option<Result<EmbeddedFlavor, FlavorProbeError>> {
-    TEST_FLAVOR_OVERRIDE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    TEST_FLAVOR_OVERRIDE.with(|cell| cell.borrow().clone())
 }
 
 /// The probed flavor must match the build features: a stale or mismatched

@@ -13,7 +13,12 @@
 # attaches uprobes) and a kernel whose verifier accepts the counter
 # programs (6.6+); on older kernels the counter runs refuse by name
 # and the script fails naming the refusal. Exits 0 only when every
-# run exits 0 and every parity comparison passes.
+# report matches its workload LEDGER exactly and every parity
+# comparison passes. Runs are gated on their reports, not their exit
+# codes: `run` currently exits 1 from a teardown race after writing a
+# complete report (pre-existing, outside counter scope), so a valid
+# exact report with a nonzero exit warns instead of failing, while a
+# missing or inexact report always fails.
 set -eu
 
 if [ $# -lt 3 ]; then
@@ -54,36 +59,55 @@ if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_UID:-}" ]; then
     echo "# SUDO_UID unset: dropping owned children to $SUDO_UID:$SUDO_GID"
 fi
 
+LAST_RC=0
 run_capture() {
     name=$1
     shift
     log="$OUTDIR/$name.log"
     echo "## $name"
-    rc=0
-    timeout -k 30 300 "$OBSERVER" "$@" >"$log" 2>&1 || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo "# error: $name exited $rc"
+    LAST_RC=0
+    timeout -k 30 300 "$OBSERVER" "$@" >"$log" 2>&1 || LAST_RC=$?
+    echo "# $name exit: $LAST_RC"
+    grep -h -E '^(SETTLED|LEDGER) ' "$log" | tail -2 || true
+    if [ "$LAST_RC" -ne 0 ]; then
         tail -5 "$log"
+    fi
+}
+
+check_report() {
+    name=$1
+    json="$OUTDIR/$name.json"
+    log="$OUTDIR/$name.log"
+    if [ ! -f "$json" ]; then
+        echo "# error: $name left no report"
         FAILED=1
         return 1
     fi
-    grep -h -E '^(SETTLED|LEDGER) ' "$log" | tail -2 || true
+    ledger=$(grep -h '^LEDGER ' "$log" | tail -1 | sed 's/^LEDGER //' || true)
+    if [ -z "$ledger" ]; then
+        echo "# error: $name printed no LEDGER (the workload never ran its loop)"
+        FAILED=1
+        return 1
+    fi
+    if ! python3 -I "$COMPARE" --check-ledger "$json" --ledger "$ledger"; then
+        FAILED=1
+        return 1
+    fi
+    if [ "$LAST_RC" -ne 0 ]; then
+        echo "# warning: $name exit $LAST_RC with a valid exact report (known run-teardown race)"
+    fi
 }
 
 run_capture plain run --mode metrics -o "$OUTDIR/plain.json" -- \
-    "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE" || true
-if [ "$FAILED" -ne 0 ]; then
+    "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE"
+check_report plain || {
     echo "# error: plain run failed; refusing to compare"
     exit 1
-fi
+}
 for mode in $MODES; do
     run_capture "counter-$mode" run --mode metrics --counter-mode "$mode" \
-        -o "$OUTDIR/counter-$mode.json" -- "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE" || true
-    if [ ! -f "$OUTDIR/counter-$mode.json" ]; then
-        echo "# error: counter-$mode left no report"
-        FAILED=1
-        continue
-    fi
+        -o "$OUTDIR/counter-$mode.json" -- "$WORKLOAD" "$MODULE" "$ITERATIONS" "$SETTLE"
+    check_report "counter-$mode" || continue
     if ! python3 -I "$COMPARE" --compare "$OUTDIR/plain.json" \
         "$OUTDIR/counter-$mode.json" --mode "$mode"; then
         FAILED=1

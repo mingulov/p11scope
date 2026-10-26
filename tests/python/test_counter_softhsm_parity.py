@@ -13,7 +13,10 @@ rows (keyed by names and target file offset) with exactly equal
 (an empty pair proves nothing); in `timestamps` and `latency` modes
 the hot row of the counter document also carries nonzero
 `latency_ns.total` and `latency_ns.max`. `counts` publishes no timing
-and needs none.
+and needs none. Each document must also match the workload's own
+LEDGER exactly (`--check-ledger DOC --ledger "K=V ..."`): the
+observer's `calls` equal the issued calls per function, so a quiet
+undercount fails even when both runs undercount alike.
 
 Healthy and mutation twins run here with no SoftHSM install: the
 live guest runs are the script's, on 6.6+ kernels where counter
@@ -98,6 +101,67 @@ def compare_counter_parity(plain_doc, counter_doc, mode):
         summary["total"] = timing["total"]
         summary["max"] = timing["max"]
     return summary
+
+
+def parse_ledger(text):
+    """Parse a workload LEDGER body (`K=V` words) into a dict."""
+    ledger = {}
+    for word in text.split():
+        try:
+            key, value = word.split("=", 1)
+            ledger[key] = int(value)
+        except ValueError as error:
+            raise ParityMismatch(f"bad LEDGER word {word!r}") from error
+    if not ledger:
+        raise ParityMismatch("empty LEDGER")
+    return ledger
+
+
+def check_ledger(doc, ledger, label):
+    """Check the observer's per-function calls against the workload LEDGER.
+
+    Raises ParityMismatch naming the first drift; returns the checked
+    call total on success.
+    """
+    rows = _rows_by_key(doc, label)
+    by_name = {}
+    for key, row in rows.items():
+        for name in key[0]:
+            by_name.setdefault(name, row)
+    total = 0
+    for name, issued in sorted(ledger.items()):
+        row = by_name.get(name)
+        if row is None:
+            raise ParityMismatch(f"{label} document has no row for LEDGER {name}")
+        if row["calls"] != issued:
+            raise ParityMismatch(
+                f"{label} row {name}: observed calls={row['calls']} != issued {issued}"
+            )
+        total += issued
+    return total
+
+
+def _main_check_ledger(argv):
+    try:
+        doc_path = argv[argv.index("--check-ledger") + 1]
+        ledger_text = argv[argv.index("--ledger") + 1]
+    except (ValueError, IndexError):
+        print('usage: test_counter_softhsm_parity.py --check-ledger DOC --ledger "K=V ..."',
+              file=sys.stderr)
+        return 2
+    try:
+        doc = json.loads(Path(doc_path).read_text())
+    except (OSError, ValueError) as error:
+        print(f"ledger: cannot read {doc_path}: {error}", file=sys.stderr)
+        return 2
+    try:
+        ledger = parse_ledger(ledger_text)
+        total = check_ledger(doc, ledger, doc_path)
+    except ParityMismatch as error:
+        print(f"ledger FAIL ({doc_path}): {error}", file=sys.stderr)
+        return 1
+    print(f"ledger OK ({doc_path}): {len(ledger)} functions, {total} calls exact")
+    return 0
 
 
 def _main_compare(argv):
@@ -203,8 +267,31 @@ class ParityTwins(unittest.TestCase):
             with self.assertRaises(ParityMismatch, msg=mode):
                 compare_counter_parity(plain, counter, mode)
 
+    def test_ledger_match_passes(self):
+        doc = _doc([_HOT, _COLD])
+        total = check_ledger(doc, {"C_GetSlotList": 200, "C_GetSlotInfo": 12}, "test")
+        self.assertEqual(total, 212)
+
+    def test_ledger_drift_fails(self):
+        doc = _doc([_HOT])
+        with self.assertRaises(ParityMismatch):
+            check_ledger(doc, {"C_GetSlotList": 199}, "test")
+
+    def test_ledger_missing_function_fails(self):
+        doc = _doc([_HOT])
+        with self.assertRaises(ParityMismatch):
+            check_ledger(doc, {"C_GetSlotList": 200, "C_NoSuchCall": 1}, "test")
+
+    def test_ledger_parse_rejects_bad_words(self):
+        with self.assertRaises(ParityMismatch):
+            parse_ledger("C_GetSlotList=200 bogus")
+        with self.assertRaises(ParityMismatch):
+            parse_ledger("")
+
 
 if __name__ == "__main__":
     if "--compare" in sys.argv:
         sys.exit(_main_compare(sys.argv))
+    if "--check-ledger" in sys.argv:
+        sys.exit(_main_check_ledger(sys.argv))
     unittest.main()

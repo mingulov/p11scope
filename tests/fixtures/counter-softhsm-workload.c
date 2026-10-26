@@ -155,8 +155,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "workload: C_Finalize failed: 0x%lx\n", rv);
         return 3;
     }
-    printf("LEDGER C_GetInfo=%ld C_GetSlotList=%ld C_GetSlotInfo=%ld "
-           "C_GetTokenInfo=%ld C_GetMechanismList=%ld C_GetMechanismInfo=%ld\n",
+    printf("LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo=%ld C_GetSlotList=%ld "
+           "C_GetSlotInfo=%ld C_GetTokenInfo=%ld C_GetMechanismList=%ld "
+           "C_GetMechanismInfo=%ld\n",
            get_info, get_slot_list, get_slot_info, get_token_info,
            get_mechanism_list, get_mechanism_info);
     /* The hot calls are token-independent: exactly one C_GetInfo and

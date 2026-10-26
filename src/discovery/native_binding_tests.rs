@@ -559,8 +559,14 @@ fn same_binary_re_exec_splits_by_exec_id() {
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].caller(), x);
     assert_eq!(transitions[0].pid(), T);
-    assert_eq!(transitions[0].old().1, 1);
-    assert_eq!(transitions[0].new_image().1, 2);
+    assert_eq!(
+        transitions[0].old(),
+        Some((DomainCookie::scripted(d, 7), 1))
+    );
+    assert_eq!(
+        transitions[0].new_image(),
+        Some((DomainCookie::scripted(d, 7), 2))
+    );
 
     // The old image's rows still bind to X, at once (cached exact image).
     run.read(vec![row_on(d, 7, 1, T, 2_200, 2)]);

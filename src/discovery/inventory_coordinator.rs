@@ -30,8 +30,8 @@ use super::*;
 #[cfg(test)]
 use crate::attach::capture::ScopeIncarnation;
 use crate::attach::capture::{
-    CallerCountUpdate, CaptureScopeCoverage, DiscoveryBatch, DomainCookie, ExtendReceipt,
-    LifecycleLoss, NativeDomainId, ScopeCustody, WitnessBatch, WitnessRow,
+    CallerCountUpdate, CaptureScopeCoverage, CookieQuery, DiscoveryBatch, DomainCookie,
+    ExtendReceipt, LifecycleLoss, NativeDomainId, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
@@ -3417,6 +3417,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
     ) -> NativeReceipt {
+        let mut hook_events = Vec::new();
         match batch {
             NativeBatch::Witness(batch) => {
                 // The binder absorbs before the batch's health is noted:
@@ -3438,11 +3439,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .max(batch.drain_high_water_bytes);
                 self.binder.absorb_lifecycle(&batch);
                 self.note_leader_exits(&batch);
+                // Exec hooks for callers the binder never held mint through
+                // the hook path (the lost race); held callers stay the
+                // row-proven path's. Runs after absorption so a row the
+                // exec's own decide-ready bound already owns its caller.
+                let domain = batch.domain;
+                for record in &batch.records {
+                    if record.kind != DISCOVERY_KIND_EXEC {
+                        continue;
+                    }
+                    let pid = (record.pid_tgid >> 32) as u32;
+                    hook_events.extend(self.apply_exec_hook(
+                        domain,
+                        pid,
+                        record.hook_ts_ns,
+                        identity,
+                        now_ns,
+                        &mut crate::attach::monotonic_ns,
+                    ));
+                }
             }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
             NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
         }
-        let receipt = self.stage_binder_output(identity, now_ns);
+        let mut receipt = self.stage_binder_output(identity, now_ns);
+        receipt.events.extend(hook_events);
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         receipt
     }
@@ -3515,6 +3536,144 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.tail_uncertain.insert(caller);
             }
         }
+    }
+
+    /// One `EXEC` record for a caller whose image the binder never held
+    /// (the lost race): the hook fired before any row of the old image
+    /// bound, so the row-proven transition path can never emit (Rules 4+5
+    /// refuse both generations under the pre-exec admission, and the live
+    /// cookie has moved on). The hook plus a live cookie answer through
+    /// the held pin still prove the turnover: retire the unheld
+    /// predecessor and mint the successor, disclosed, without exact
+    /// old/new images. A caller the binder holds is the row-proven
+    /// path's: the hook stays out, so the two paths are mutually
+    /// exclusive by construction and never double-mint. Stale hooks and
+    /// missing callers skip silently (mirroring `note_leader_exits`);
+    /// every refusal to mint is a named gap, and the mint itself is
+    /// disclosed: nothing here is silent. No `ExecProof` is synthesized
+    /// (only the binder proves exact transitions); the old owner's image
+    /// invalidates through the normal guard revalidation instead.
+    fn apply_exec_hook(
+        &mut self,
+        domain: NativeDomainId,
+        pid: u32,
+        hook_ts_ns: u64,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
+    ) -> Vec<CallerEvent> {
+        let Some(caller) = self.adapter.live_id(pid) else {
+            return Vec::new();
+        };
+        if self.binder.holds_image(domain, caller) {
+            return Vec::new();
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            self.cgroup_fence.invalidate();
+        }
+        if let Some((collection, _)) = &mut self.pending_cgroup {
+            collection.invalidate(pid);
+        }
+        // The stale-hook guard is the exit guard's: without comparable
+        // clocks a hook cannot be ordered against the admission, and
+        // minting could retire a live caller for a stale hook. Unlike
+        // exits (safe unfiltered), a mint is fail-closed here.
+        if !self.exit_clocks_comparable {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused without comparable clocks".into(),
+                reason: "the observer's time-namespace offset is unknown, so the exec hook \
+                     cannot be ordered against the admission; minting could retire a live \
+                     caller for a stale hook, so no successor is minted"
+                    .into(),
+                budget: None,
+            });
+            return Vec::new();
+        }
+        if self
+            .adapter
+            .record(caller)
+            .is_some_and(|incarnation| hook_ts_ns < incarnation.admitted_ns)
+        {
+            return Vec::new();
+        }
+        // The live guard: a current image must answer through the held
+        // pin. Without it the successor is unproven; the hook still proved
+        // the old image ended, so the predecessor retires honestly without
+        // a successor rather than being claimed current.
+        let live = self.adapter.live_pin(pid).is_some_and(|(_, pin)| {
+            matches!(identity.query_cookie(domain, pin), CookieQuery::Cookie(_))
+        });
+        if !live {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused without a live image".into(),
+                reason: "no live cookie answered through the held pin, so the current \
+                     image is unproven; the proved old incarnation retires without a \
+                     successor"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: "exec successor minted without a held predecessor".into(),
+            reason: "an exec hook fired for a caller whose image the binder never held \
+                 (its rows were refused under the pre-exec admission); the hook proves \
+                 the old image ended and the live guard proves a current image, so the \
+                 successor is minted without exact old/new images"
+                .into(),
+            budget: None,
+        });
+        if self.stopped {
+            // Stop wins before successor admission: the old incarnation
+            // still retires on the proven image end, but no handoff is
+            // minted and no retry is scheduled.
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused while stopped".into(),
+                reason: "the coordinator stopped; the proved old incarnation retires \
+                     without a successor and no retry is scheduled"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self
+            .mint_pending_successor(ExecTransition::unheld_predecessor(caller, pid), now_ns)
+            .is_none()
+        {
+            // Defensive only: live callers never hold a handoff and never
+            // lack their pin. Refuse rather than double-mint.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            // An out-of-scope exec ends the old image but cannot admit its
+            // successor: re-entry needs a new current-scope transaction,
+            // which commits the held handoff.
+            return vec![self.adapter.retired_event(caller)];
+        }
+        let mut resolver = AuthorityResolver {
+            engine: &mut self.engine,
+            pending: &mut self.pending_owners,
+            guard: &mut super::inventory::UnavailableImageGuard,
+            identity,
+            native_failures: Vec::new(),
+            scan_pinned: 0,
+        };
+        let authority = resolver.resolve(pid);
+        let (native_failures, scan_pinned) = resolver.finish();
+        self.record_authority_gaps(native_failures, scan_pinned);
+        self.commit_pending_successor(caller, authority, now_ns, detected)
     }
 
     /// The exec-coverage revalidation (C1 ruling): for every domain whose
@@ -12482,6 +12641,195 @@ exit 0
                 .get("exec_transition"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn an_exec_without_a_held_image_still_mints_its_successor() {
+        // The lost race (Fedora mint): the exec is discovered before any
+        // row of the old image binds, so the binder can never emit a
+        // transition (Rules 4+5 refuse both generations under the pre-exec
+        // admission, and the live cookie has moved on). The exec hook plus
+        // the live guard still prove the turnover: retire the unheld
+        // predecessor and mint the successor, disclosed.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // NO rows: gen-0 never binds.
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+            panic!("the hook must mint the successor: {:?}", receipt.events);
+        };
+        assert_eq!(*old, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(*new));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "exec successor minted without a held predecessor"),
+            "the unheld predecessor is disclosed: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_stale_exec_hook_mints_no_successor() {
+        // A hook that predates the live incarnation's admission is the
+        // old image's delayed record (or a reused pid's): minting would
+        // retire a live caller for another process's exec.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 40;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(caller));
+    }
+
+    #[test]
+    fn an_exec_without_comparable_clocks_mints_no_successor() {
+        // Without comparable clocks a hook cannot be ordered against the
+        // admission: minting could retire a live caller for a stale hook,
+        // so the successor is refused (fail-closed) and disclosed.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = false;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "successor admission refused without comparable clocks"),
+            "{:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn an_exec_without_a_live_answer_mints_no_successor() {
+        // No live cookie answers through the held pin: the current image
+        // is unproven, so the old incarnation retires (the hook proved its
+        // end) without a successor, disclosed.
+        let (mut native, caller) = NativeScene::new();
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!("the proved end retires honestly: {:?}", receipt.events);
+        };
+        assert_eq!(*id, caller);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "successor admission refused without a live image"),
+            "{:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_second_exec_hook_mints_no_second_successor() {
+        // The first hook mints and retires; the replayed hook predates the
+        // successor's admission, so it is stale and mints nothing.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        let first = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { new, .. }] = first.events.as_slice() else {
+            panic!("the first hook must mint: {:?}", first.events);
+        };
+        let successor = *new;
+        assert_ne!(successor, caller);
+        let at2 = native.stamps.tick();
+        let mut replay = DiscoveryBatch::scripted(native.domain, Vec::new(), at2);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record2: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record2.hook_ts_ns = at;
+        record2.pid_tgid = (7u64 << 32) | 7u64;
+        record2.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        replay.records.push(record2);
+        let second = native.stage(NativeBatch::Lifecycle(replay));
+        assert!(second.events.is_empty(), "{:?}", second.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
     }
 
     #[test]

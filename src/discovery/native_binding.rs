@@ -312,8 +312,8 @@ pub(crate) struct Decision {
 pub(crate) struct ExecTransition {
     caller: CallerId,
     pid: u32,
-    old: (DomainCookie, u64),
-    new: (DomainCookie, u64),
+    old: Option<(DomainCookie, u64)>,
+    new: Option<(DomainCookie, u64)>,
 }
 
 impl ExecTransition {
@@ -326,16 +326,50 @@ impl ExecTransition {
         self.pid
     }
 
-    /// The ended image (ticket, exec sequence).
+    /// The ended image (ticket, exec sequence), when the binder held it.
+    /// `None` when the predecessor was never held: the exec hook proved
+    /// the end, but no bound row ever proved which image ended.
     #[cfg_attr(not(test), allow(dead_code))] // ExecProof carries it.
-    pub(crate) fn old(&self) -> (DomainCookie, u64) {
+    pub(crate) fn old(&self) -> Option<(DomainCookie, u64)> {
         self.old
     }
 
-    /// The image that replaced it.
+    /// The image that replaced it, when a decided row proved it. `None`
+    /// for a hook-minted handoff: the live guard proved a current image
+    /// exists, but no row proved its ticket or exec sequence.
     #[cfg_attr(not(test), allow(dead_code))] // ExecProof carries it.
-    pub(crate) fn new_image(&self) -> (DomainCookie, u64) {
+    pub(crate) fn new_image(&self) -> Option<(DomainCookie, u64)> {
         self.new
+    }
+
+    /// A transition the binder proves by a decided row against a held
+    /// image: both images are known exactly.
+    fn row_proven(
+        caller: CallerId,
+        pid: u32,
+        old: (DomainCookie, u64),
+        new: (DomainCookie, u64),
+    ) -> Self {
+        Self {
+            caller,
+            pid,
+            old: Some(old),
+            new: Some(new),
+        }
+    }
+
+    /// A transition the coordinator mints from an exec hook for a caller
+    /// whose image the binder never held (the lost race): the hook proved
+    /// the end and the live guard proved a current image, but neither
+    /// image is exactly known. Only the binder constructs transitions;
+    /// the coordinator calls this constructor for the hook path.
+    pub(crate) fn unheld_predecessor(caller: CallerId, pid: u32) -> Self {
+        Self {
+            caller,
+            pid,
+            old: None,
+            new: None,
+        }
     }
 }
 
@@ -562,6 +596,16 @@ impl NativeBinder {
     /// Image transitions proven since the last take.
     pub(crate) fn take_transitions(&mut self) -> Vec<ExecTransition> {
         std::mem::take(&mut self.transitions)
+    }
+
+    /// Whether the caller holds a bound image in this domain. The
+    /// coordinator's exec-hook path mints only for callers that hold
+    /// none: a held image means the row-proven transition path owns this
+    /// caller, so the hook path stays out. Read-only: it changes no rule.
+    pub(crate) fn holds_image(&self, domain: NativeDomainId, caller: CallerId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| self.domains[*index].callers.contains_key(&caller))
     }
 
     fn domain_index(&mut self, domain: NativeDomainId) -> usize {
@@ -965,12 +1009,12 @@ fn decide(
     if let Some(&(held, held_exec)) = state.callers.get(&caller) {
         let ended = held != cookie || exec > held_exec;
         if ended && state.ended.insert(caller) {
-            transitions.push(ExecTransition {
+            transitions.push(ExecTransition::row_proven(
                 caller,
-                pid: row.host_tgid,
-                old: (held, held_exec),
-                new: (cookie, exec),
-            });
+                row.host_tgid,
+                (held, held_exec),
+                (cookie, exec),
+            ));
         }
         return Binding::Unbound(if ended {
             UnboundReason::ExecTransition

@@ -2335,6 +2335,29 @@ impl Drop for OwnedCgroup {
     }
 }
 
+/// A panic between the cgroup move-in and move-out must not strand the
+/// test thread in the owned cgroup (whose `remove_dir` would then fail,
+/// littering a root-owned dir). The guard moves the pid back to the
+/// parent cgroup when dropped unless disarmed; dropping never panics.
+/// The file twin pins that disarming suppresses the write.
+#[test]
+fn cgroup_move_out_guard_returns_pid_to_parent_on_drop() {
+    let dest = std::env::temp_dir().join(format!(
+        "p11scope-guard-{}-cgroup.procs",
+        std::process::id()
+    ));
+    std::fs::write(&dest, b"").unwrap();
+    let pid = std::process::id();
+    drop(CgroupMoveOutGuard::arm(pid, dest.clone()));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), pid.to_string());
+    std::fs::write(&dest, b"").unwrap();
+    let mut guard = CgroupMoveOutGuard::arm(pid, dest.clone());
+    guard.disarm();
+    drop(guard);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "");
+    std::fs::remove_file(&dest).unwrap();
+}
+
 /// OD34 release-path cell 3.6 (loader half), corrected routing: 257 genuine
 /// provider loads on a real kernel. Views gate loader arms, and the view
 /// table holds 256, so the overflow strands at the VIEW gate: the 257th

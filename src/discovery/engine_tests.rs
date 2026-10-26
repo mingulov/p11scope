@@ -9488,6 +9488,76 @@ fn owned_initial_exec_preserves_the_prearm_until_later_loader_discovery() {
     );
 }
 
+/// OD34: the 257th loader context on the owned pre-exec path is a named,
+/// counted gap, not silence: the prearm refuses `Unavailable`, the skip
+/// names the 256 capacity, and `discovery_truncated` counts it. The twin
+/// is every `owned_prearmed_seed_route` test: the same call arms with room.
+#[test]
+fn owned_prearm_at_256_contexts_names_the_capacity_gap() {
+    let (fixture, _, _, _) = loaded_seed_provider();
+    let child = OwnedChild::spawn(
+        fixture._dir.path().join("seed-runner").into_os_string(),
+        vec![
+            fixture
+                ._dir
+                .path()
+                .join("seed-provider.so")
+                .into_os_string(),
+        ],
+    )
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(child.pid());
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
+    for _ in 0..crate::discovery::loader::MAX_LOADER_CONTEXTS {
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view: ProcessViewId(0),
+                loader: crate::discovery::identity::PinnedObjectId(9),
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("envelope fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("envelope fill must prepare");
+    }
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    let outcome = engine
+        .arm_owned_loader_before_release(
+            &child,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, OwnedLoaderPrearmOutcome::Unavailable),
+        "a full envelope must refuse the prearm, not arm: {outcome:?}"
+    );
+    assert_eq!(engine.capture_facts().discovery_truncated, 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "owned initial-set discovery"
+                && skip
+                    .reason
+                    .contains("loader context capacity 256 is exhausted")
+        }),
+        "the capacity refusal must be a named skip: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 #[test]
 fn owned_initial_exec_acknowledgment_cannot_cover_a_later_exec() {
     let (_fixture, child, mut engine, context, exec, mut session) = owned_prearmed_seed_route(true);

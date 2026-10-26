@@ -1810,6 +1810,158 @@ fn pressure_ticket_spend_fits_256_without_ambient() {
     );
 }
 
+/// OD34: the 257th loader context through the real ownership-gated arm path
+/// is a named, counted gap, not silence: `arm_loader_or_partial` refuses
+/// with the 256-capacity skip and `discovery_truncated` counts it. Twin:
+/// the first arm (ticket 1, room below) succeeds with no skip and no count.
+#[test]
+fn pressure_257th_loader_arm_through_real_path_is_a_named_gap() {
+    const WHAT: &str = "life-257-arm";
+    let fixtures = FixtureBuild::compile_all("life257");
+    // Two distinct provider files (same bytes): static discovery gives
+    // each mapper its own module, so both views arm for real.
+    let second = fixtures.dir.path().join("second.so");
+    std::fs::copy(&fixtures.early, &second).expect("second provider must copy");
+    let mut group = SmallGroup::spawn(&fixtures, &second, WHAT);
+    let owned = group.pids();
+    assert_eq!(owned.len(), 3);
+
+    let hints = vec![fixtures.early.clone(), second.clone()];
+    let mut engine =
+        Engine::discover(&system_args(hints), &Scope::System, None).expect("system discovery");
+    let provider_pids: BTreeSet<u32> = group
+        .children
+        .iter()
+        .filter(|child| child.role != "head")
+        .map(LiveChild::pid)
+        .collect();
+    let mut provider_views = BTreeSet::new();
+    for view in &engine.views {
+        let owned_provider = engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view.id());
+        if owned_provider {
+            assert!(
+                owned.contains(&view.pid()),
+                "{WHAT}: REFUSED: ambient provider-bearing view for foreign pid {}",
+                view.pid()
+            );
+            provider_views.insert(view.pid());
+        }
+    }
+    assert_eq!(
+        provider_views, provider_pids,
+        "{WHAT}: exactly the 2 owned provider views, no more, no fewer"
+    );
+
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    let mut owned_pids: Vec<u32> = provider_pids.iter().copied().collect();
+    owned_pids.sort_unstable();
+    let arm = |engine: &mut Engine,
+               session: &mut ScriptedSession,
+               additions_allowed: &mut bool,
+               pending_views: &mut PendingViewRetirements,
+               pid: u32| {
+        let position = live_position(engine, pid, WHAT);
+        let view_id = engine.views[position].id();
+        assert!(
+            !engine.loader_arming_gated(view_id),
+            "{WHAT}: owned pid {pid} is provider-owned, not gated"
+        );
+        engine
+            .arm_loader_or_partial(position, session, additions_allowed, pending_views)
+            .unwrap_or_else(|error| panic!("{WHAT}: arming owned pid {pid} failed: {error:#}"))
+    };
+
+    // Twin: the first arm mints ticket 1 with no skip and no count.
+    let _candidate_changed: bool = arm(
+        &mut engine,
+        &mut session,
+        &mut additions_allowed,
+        &mut pending_views,
+        owned_pids[0],
+    );
+    assert_eq!(engine.capture_facts().discovery_truncated, 0);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live loader arming"),
+        "{WHAT}: a successful arm marks no arming skip"
+    );
+
+    // Fill the envelope to exactly 256 through direct registry commits.
+    let first_view = engine.views[live_position(&engine, owned_pids[0], WHAT)].id();
+    for _ in 2..=MAX_LOADER_CONTEXTS as u16 {
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view: first_view,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("envelope fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("envelope fill must prepare");
+    }
+    assert_eq!(minted_ids(&engine).len(), 256);
+
+    // The 257th arm through the real path refuses as a named gap.
+    let _candidate_changed: bool = arm(
+        &mut engine,
+        &mut session,
+        &mut additions_allowed,
+        &mut pending_views,
+        owned_pids[1],
+    );
+    assert_eq!(
+        engine.capture_facts().discovery_truncated,
+        1,
+        "{WHAT}: the 257th arm counts exactly one truncation"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming"
+                && skip
+                    .reason
+                    .contains("loader context capacity 256 is exhausted")
+        }),
+        "{WHAT}: the 257th arm names the capacity: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.loader_discovery().strategies.unavailable,
+        1,
+        "{WHAT}: the refused view aggregates as unbound"
+    );
+    assert_eq!(engine.loader_arms, 2, "{WHAT}: 2 real arm attempts");
+    assert_no_ambient_arms(&engine, &owned, WHAT);
+
+    group.release_and_wait_ledgers(WHAT);
+    for child in &group.children {
+        if child.role == "head" {
+            continue;
+        }
+        let ledger = parse_provider_ledger(&child.log_text(), WHAT);
+        assert_eq!(ledger.burst, 1);
+        assert!(ledger.complete, "{WHAT}: {} ledger complete", child.pid());
+    }
+    drop(engine);
+    group.terminate_all(WHAT);
+}
+
 // ---------------------------------------------------------------------------
 // Privileged live cells (root + BPF + the exclusive privileged lane).
 // ---------------------------------------------------------------------------
@@ -2086,6 +2238,221 @@ fn pressure_live_ticket_spend_control_refuses_ambient() {
         wall_start.elapsed(),
         vm_hwm_kb(),
         self_cpu_jiffies().saturating_sub(cpu_start)
+    );
+}
+
+/// OD34 release-path cell 3.6 (loader half): 257 genuine provider loads on
+/// a real kernel spend the 256 loader contexts; the 257th arm refuses as a
+/// named, counted gap, never silence. One wave on a single provider file
+/// (the live path arms each owned view: live-control precedent), released
+/// and settled. Expected ~2-4 min, 257 sleeping children (<512 MiB), quiet
+/// host; any ambient provider-bearing view refuses the cell.
+#[test]
+#[ignore = "privileged: live BPF 257-provider-load loader-context gap; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn pressure_257_provider_loads_name_the_loader_capacity_gap() {
+    const WHAT: &str = "life-257-live";
+    const LOADS: usize = MAX_LOADER_CONTEXTS + 1;
+    assert_privileged_lane(WHAT);
+    assert_eq!(
+        MAX_LOADER_CONTEXTS, 256,
+        "{WHAT}: the cell proves the real 256"
+    );
+    let wall_start = Instant::now();
+
+    // Fixtures compile before capture: no forks inside the window.
+    let fixtures = FixtureBuild::compile_all("life-257");
+    let hints = vec![fixtures.early.clone()];
+    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+
+    let mut population = Population::spawn_on(fixtures, LOADS, LIVE_REPEAT, false, false, None);
+    assert_eq!(population.children.len(), LOADS);
+    let owned = population.pids();
+    assert_eq!(owned.len(), LOADS);
+    population.release_and_wait_ledgers();
+    let settle = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
+    for child in &population.children {
+        let ledger = parse_provider_ledger(&child.log_text(), WHAT);
+        assert_eq!(ledger.burst, 1, "{WHAT}: {} bursts once", child.pid());
+        assert!(ledger.complete, "{WHAT}: {} ledger complete", child.pid());
+    }
+    assert_eq!(
+        engine.loader_arms, LOADS as u64,
+        "{WHAT}: every owned view attempted exactly one arm"
+    );
+    assert_eq!(
+        minted_ids(&engine),
+        (1..=256).collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets 1..=256 minted exactly once"
+    );
+    assert_eq!(
+        engine.loader_registry.discovery_truncated(),
+        1,
+        "{WHAT}: the 257th arm counts exactly one loader truncation"
+    );
+    assert!(
+        engine.capture_facts().discovery_truncated >= 1,
+        "{WHAT}: the refusal reaches the published facts"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming"
+                && skip
+                    .reason
+                    .contains("loader context capacity 256 is exhausted")
+        }),
+        "{WHAT}: the 257th arm names the capacity: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.loader_discovery().strategies.unavailable,
+        1,
+        "{WHAT}: the refused view aggregates as unbound"
+    );
+    assert_no_ambient_arms(&engine, &owned, WHAT);
+
+    population.terminate_all(WHAT, &|_| 0);
+    drop(session);
+    drop(engine);
+    println!(
+        "life: 257-live: PASS: 256 tickets, 257th refused as a named gap; ticks={} wall={:?} VmHWM={}KiB",
+        settle.ticks,
+        wall_start.elapsed(),
+        vm_hwm_kb(),
+    );
+}
+
+/// OD34 release-path cell 3.6 (image half): 16,385 genuine process births
+/// on a real kernel spend the 16,384 image tickets; births past the budget
+/// are counted identity refusals, never silence. Each `/usr/bin/true`
+/// spawn burns at least one ticket through the Detailed fork wrapper, so
+/// the full wave must cross the budget on any controlled host; the cell
+/// then proves the ceiling holds (no reset, no reuse) and the production
+/// evidence names the refusals. Expected ~1-3 min, live 1 child, bounded
+/// 10 min. Deliberate exception to the no-fork-during-capture rule: the
+/// owned, counted, in-loop-reaped spawns are the stimulus, and nothing is
+/// drained while they run.
+#[test]
+#[ignore = "privileged: live BPF 16385-image ticket-quota gap; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn image_quota_16385_births_are_counted_identity_refusals() {
+    use p11scope_ebpf_common::{IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl};
+    const WHAT: &str = "life-quota-live";
+    const BIRTHS: usize = IMAGE_IDENTITY_TICKET_LIMIT as usize + 1;
+    const WAVE_DEADLINE: Duration = Duration::from_secs(600);
+    assert_privileged_lane(WHAT);
+    assert_eq!(
+        IMAGE_IDENTITY_TICKET_LIMIT, 16_384,
+        "{WHAT}: the cell proves the real 16,384"
+    );
+    let wall_start = Instant::now();
+    let true_bin = ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{WHAT}: no true binary to spawn"));
+
+    // One hint keeps discovery shaped like production; nothing maps it, so
+    // nothing arms and no ticket is spent by the observer itself.
+    let fixtures = FixtureBuild::compile_all("life-quota");
+    let hints = vec![fixtures.early.clone()];
+    let (engine, session) = start_live_system_capture(hints, WHAT);
+    let read_control = |session: &crate::attach::Session| {
+        let map: aya::maps::Array<_, ImageIdentityControl> = aya::maps::Array::try_from(
+            session
+                .ebpf
+                .map("COOKIE_CTL")
+                .unwrap_or_else(|| panic!("{WHAT}: COOKIE_CTL map missing")),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: COOKIE_CTL map: {error}"));
+        map.get(&0, 0)
+            .unwrap_or_else(|error| panic!("{WHAT}: COOKIE_CTL cell: {error}"))
+    };
+    let start_control = read_control(&session);
+    assert_eq!(
+        start_control.limit, 16_384,
+        "{WHAT}: the loader publishes the real limit"
+    );
+    assert!(
+        start_control.next_ticket < 16_384,
+        "{WHAT}: REFUSED: ambient already spent the budget (next_ticket={}); the host is not controlled",
+        start_control.next_ticket
+    );
+
+    for birth in 1..=BIRTHS {
+        let status = Command::new(&true_bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_clear()
+            .spawn()
+            .unwrap_or_else(|error| panic!("{WHAT}: spawn {birth}: {error}"))
+            .wait()
+            .unwrap_or_else(|error| panic!("{WHAT}: reap {birth}: {error}"));
+        assert!(status.success(), "{WHAT}: owned birth {birth} exits 0");
+        if birth % 4096 == 0 {
+            assert!(
+                wall_start.elapsed() < WAVE_DEADLINE,
+                "{WHAT}: birth wave exceeded its bound at {birth}/{BIRTHS}"
+            );
+            println!(
+                "life: {WHAT}: {birth}/{BIRTHS} births after {:?}",
+                wall_start.elapsed()
+            );
+        }
+    }
+    let quota = read_control(&session);
+    assert_eq!(
+        quota.next_ticket, 16_384,
+        "{WHAT}: 16,385 owned births spend the whole budget"
+    );
+    assert!(
+        quota.unavailable >= 1,
+        "{WHAT}: births past the budget are counted refusals: {quota:?}"
+    );
+    let kernel = crate::metrics::kernel_evidence(&session)
+        .unwrap_or_else(|error| panic!("{WHAT}: kernel evidence: {error:#}"));
+    assert!(
+        kernel.control.identity_unavailable >= 1,
+        "{WHAT}: the refusal count reaches production evidence"
+    );
+    assert!(
+        kernel.control.identity_budget_exhausted,
+        "{WHAT}: production evidence names the spent budget"
+    );
+
+    // The ceiling holds: 100 more births spend nothing and stay counted.
+    for birth in 1..=100 {
+        let status = Command::new(&true_bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_clear()
+            .spawn()
+            .unwrap_or_else(|error| panic!("{WHAT}: extra spawn {birth}: {error}"))
+            .wait()
+            .unwrap_or_else(|error| panic!("{WHAT}: extra reap {birth}: {error}"));
+        assert!(status.success(), "{WHAT}: extra birth {birth} exits 0");
+    }
+    let held = read_control(&session);
+    assert_eq!(
+        held.next_ticket, 16_384,
+        "{WHAT}: the ticket counter never resets or reuses"
+    );
+    assert!(
+        held.unavailable >= quota.unavailable,
+        "{WHAT}: refusals keep counting: {} -> {}",
+        quota.unavailable,
+        held.unavailable
+    );
+
+    drop(session);
+    drop(engine);
+    drop(fixtures);
+    println!(
+        "life: quota-live: PASS: 16,385 births, next_ticket=16384, unavailable={} (start {}); wall={:?} VmHWM={}KiB",
+        held.unavailable,
+        start_control.next_ticket,
+        wall_start.elapsed(),
+        vm_hwm_kb(),
     );
 }
 

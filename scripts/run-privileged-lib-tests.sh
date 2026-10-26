@@ -224,6 +224,10 @@ discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control
 # host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient
 # EXEC refuses the cell, so run it on a controlled host).
 discovery::engine::pressure_native_tests::pressure_live_ticket_spend_control_refuses_ambient
+# life-1 (OD34 cell 3.6, loader half): 257 genuine provider loads spend the
+# 256 loader contexts; the 257th refuses as a named, counted gap. Expected
+# ~2-4 min, 257 sleeping children, quiet host.
+discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_loader_capacity_gap
 discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
@@ -329,6 +333,10 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_p
 # (declared-cadence split; same fixture/seam as the short controls).
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64
+# life-1 (OD34 cell 3.6, image half): 16,385 genuine process births spend
+# the 16,384 image tickets; births past the budget are counted identity
+# refusals. Expected ~1-3 min, live 1 child, bounded 10 min, quiet host.
+discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_identity_refusals
 )
 
 # Static skips: external fixture/driver/env the script cannot provide.

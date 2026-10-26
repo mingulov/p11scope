@@ -691,6 +691,18 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::pressure_257_provider_loads_name_the_loader_capacity_gap",
+      "reason": "privileged: live BPF 257-provider-load loader-context gap; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_identity_refusals",
+      "reason": "privileged: live BPF 16385-image ticket-quota gap; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/publication_tests.rs",
       "path": "discovery::engine::publication_tests::broad_p11kit_admission_arithmetic",
       "reason": "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture",

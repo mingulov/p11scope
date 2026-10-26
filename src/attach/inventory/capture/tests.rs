@@ -10,7 +10,7 @@ use crate::plan::AdmissionPolicy;
 use p11scope_ebpf_common::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn budget(n: u64) -> InventoryBudget {
     InventoryBudget::new(n, n * 8).unwrap()
@@ -1056,6 +1056,77 @@ fn health(caller: [u64; 4], usage: [u64; 3], unavailable: u64) -> CaptureHealth 
         owner: Some(ThreadOwnerControl::default()),
         ..CaptureHealth::default()
     }
+}
+
+/// OD34: the 16,385th program image is a named, counted inventory gap, not
+/// silence. A scripted caller map at the exact ticket limit (16,384 spent,
+/// one identity refusal, one `IdentityUnavailable` pair failure) reads
+/// through the real health seam and assesses to one regression naming both
+/// counters with counts. The twin pins that a fresh budget stays quiet.
+#[test]
+fn quota_at_16384_tickets_names_identity_unavailable_with_counts() {
+    use super::super::callers::{CallerHealthIo, read_caller_health_with};
+    struct QuotaIo {
+        unavailable: u64,
+        identity_failures: u64,
+    }
+    impl CallerHealthIo for QuotaIo {
+        fn evidence_cell(&mut self, index: u32) -> Result<u64> {
+            Ok(if index == 1 {
+                self.identity_failures
+            } else {
+                0
+            })
+        }
+        fn identity_control(&mut self) -> Result<ImageIdentityControl> {
+            Ok(ImageIdentityControl {
+                limit: 16_384,
+                next_ticket: 16_384,
+                unavailable: self.unavailable,
+                create_failures: 0,
+                retry_exhausted: 0,
+            })
+        }
+    }
+    fn read(io: QuotaIo) -> CaptureHealth {
+        let mut io = io;
+        let read = read_caller_health_with(&mut io, Instant::now() + Duration::from_secs(1));
+        assert!(read.failures.is_empty());
+        CaptureHealth {
+            caller_evidence: read.evidence,
+            caller_control: read.control,
+            usage_evidence: Some([0; 3]),
+            evidence: Some([0; 9]),
+            owner: Some(ThreadOwnerControl::default()),
+            ..CaptureHealth::default()
+        }
+    }
+    let mut book = test_book(8, 8, None);
+    let fresh = read(QuotaIo {
+        unavailable: 0,
+        identity_failures: 0,
+    });
+    assert_eq!(fresh.caller_evidence, Some([0, 0, 0, 0]));
+    assert_eq!(
+        fresh.caller_control.map(|control| control.next_ticket),
+        Some(16_384)
+    );
+    assert_eq!(regression(&mut book, &fresh), None);
+    let quota = read(QuotaIo {
+        unavailable: 1,
+        identity_failures: 1,
+    });
+    let rose = regression(&mut book, &quota).expect("quota must regress");
+    assert!(rose.contains("CALLER_EVIDENCE[1] 0->1"), "{rose}");
+    assert!(
+        rose.contains("COOKIE_CTL(unavailable,create_failures,retry_exhausted)[0] 0->1"),
+        "{rose}"
+    );
+    assert_eq!(
+        regression(&mut book, &quota),
+        None,
+        "the same quota counters regress once"
+    );
 }
 
 #[test]

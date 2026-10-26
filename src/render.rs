@@ -6388,6 +6388,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// OD34: a spent 16,384 image budget on a Detailed capture is a named,
+    /// counted gap: identity refusals plus the budget-exhausted flag force
+    /// PARTIAL with the `kernel_control` cause, and the JSON keeps the
+    /// exact counts. The twin pins that a clean control stays silent.
+    #[test]
+    fn kernel_control_identity_refusals_force_partial_with_counts() {
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(clean.gap_classes.observation.causes.is_empty());
+        let mut ev = evidence();
+        ev.kernel_control.identity_unavailable = 7;
+        ev.kernel_control.identity_budget_exhausted = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["kernel_control"]);
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kernel_control"]["identity_unavailable"], 7);
+        assert_eq!(json["kernel_control"]["identity_budget_exhausted"], true);
+    }
+
     /// With the compiled-in timing catalog empty (D3), debug-state discovery
     /// still runs but proves nothing about timing.
     #[test]

@@ -3,7 +3,9 @@
 
 use super::tests::{SteadyFault, producers};
 use super::*;
-use crate::events::{EventsDomain, ScriptedRecords};
+use crate::events::{
+    BoundedRecord, BoundedRecordSource, EventsDomain, RecordSource, ScriptedRecords,
+};
 use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_objects::journal::tests::{
     COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes_absent, function_id,
@@ -426,6 +428,112 @@ fn joint_unlinked_broken_stream_resyncs_next_collect() {
     assert!(
         next.is_ok(),
         "an unlinked lane re-syncs after a break: {:?}",
+        next.err()
+    );
+    assert!(
+        !(owner.adapter.invalidated || owner.adapter.stream_broken),
+        "the re-sync clears the broken stream"
+    );
+}
+
+#[test]
+fn joint_unlinked_discarded_stream_resyncs_next_collect() {
+    // The live break trigger is a discarded ring reservation
+    // (discarded_delta = 1, kernel-overwritten), not a malformed
+    // record: break the adapter stream with a discard on an unlinked
+    // lane and assert the next collect re-syncs. Twin of the
+    // malformed-break test above, which stays as the second twin.
+    struct DiscardingRecords {
+        inner: ScriptedRecords,
+        discarded: std::rc::Rc<Cell<u64>>,
+    }
+    impl RecordSource for DiscardingRecords {
+        fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+            self.inner.next_record()
+        }
+        fn discarded(&self) -> u64 {
+            self.discarded.get()
+        }
+    }
+    impl BoundedRecordSource for DiscardingRecords {
+        fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            self.inner.positions()
+        }
+        fn consumer(&self) -> usize {
+            self.inner.consumer()
+        }
+        fn bounded_record(
+            &mut self,
+            stop: usize,
+        ) -> anyhow::Result<BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>> {
+            self.inner.bounded_record(stop)
+        }
+    }
+    let events = EventsDomain::test_standin(0xd15c);
+    let retained =
+        SessionDrainProducers::test_pair_unlinked(NativeDomainId::mint(), events.clone());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let counter = std::rc::Rc::new(Cell::new(0));
+    let mut drain = EventDrain::over_domain(
+        DiscardingRecords {
+            inner: ScriptedRecords::records([], 4),
+            discarded: counter.clone(),
+        },
+        events.clone(),
+    );
+    let fault = SteadyFault(Cell::new(None));
+    let mut raw = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &fault,
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    )
+    .unwrap();
+    counter.set(1);
+    raw.continue_collect_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        1,
+        &fault,
+        &retained,
+        owner.adapter_mut(),
+    )
+    .unwrap();
+    assert_eq!(raw.audit.malformed_delta, 0, "no malformed input here");
+    assert_eq!(raw.audit.discarded_delta, 1, "one discarded reservation");
+    raw.dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
+        .unwrap_or_else(|(_, reason)| panic!("discarded raw disposal: {reason:?}"));
+    assert!(
+        owner.adapter.invalidated && owner.adapter.stream_broken,
+        "the failed disposal breaks the stream"
+    );
+    // The next tick's collect on the same unlinked lane re-syncs.
+    let later = std::rc::Rc::new(Cell::new(1));
+    let mut drain = EventDrain::over_domain(
+        DiscardingRecords {
+            inner: ScriptedRecords::records([], 4),
+            discarded: later,
+        },
+        events.clone(),
+    );
+    let next = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    );
+    assert!(
+        next.is_ok(),
+        "an unlinked lane re-syncs after a discard break: {:?}",
         next.err()
     );
     assert!(

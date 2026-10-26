@@ -106,7 +106,11 @@ finish() {
 waitfor_quiet() {
   local file=$1 needle=$2 pid=$3 ticks=$4
   needle=${needle#^}
-  local end=$((SECONDS + (ticks + 9) / 10)) content
+  # SECONDS truncates to whole seconds, so without the extra second this
+  # deadline yields a 0-to-N window (near zero when computed just before a
+  # rollover) instead of the nominal ticks/10 seconds the ticking waiter
+  # provides. The +1 keeps the window at least nominal with builtins only.
+  local end=$((SECONDS + (ticks + 9) / 10 + 1)) content
   while [ "$SECONDS" -lt "$end" ]; do
     { content=$(<"$file"); } 2>/dev/null || content=''
     case $content in
@@ -122,7 +126,9 @@ waitfor_quiet() {
 }
 finish_quiet() {
   local pid=$1 ticks=$2
-  local end=$((SECONDS + (ticks + 9) / 10))
+  # Same SECONDS truncation as waitfor_quiet: the +1 keeps the window at
+  # least the nominal ticks/10 seconds with builtins only.
+  local end=$((SECONDS + (ticks + 9) / 10 + 1))
   while alive "$pid" && [ "$SECONDS" -lt "$end" ]; do :; done
   if alive "$pid"; then terminate "$pid"; return 1; fi
   wait "$pid"; LAST_EXIT=$?; unset 'CHILDREN[$pid]'; return 0

@@ -2984,7 +2984,7 @@ class Registration(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(DENIAL, json.loads(result.stdout)["execution"]["lib_tests"])
 
-    def test_dry_run_has_all_seven_lanes_mt12_and_exact_breadth_names(self):
+    def test_dry_run_has_all_eight_lanes_mt12_and_exact_breadth_names(self):
         result = command(str(RUNNER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         for literal in ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142", "6.12.111", "7.2.6", "host", "THREADS=12", LIB_A, LIB_B, LIB_D, LIB_C, "unready"):

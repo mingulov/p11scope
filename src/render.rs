@@ -429,8 +429,8 @@ impl ObjectCaptureEvidence {
     /// attribute capture out.
     pub const NOT_ENABLED: &'static str = "not_enabled";
 
-    /// Structured status for a build flavor: `stubbed` names the
-    /// `stub-object-attributes` feature state.
+    /// Structured status for a build flavor: `stubbed` names the probed
+    /// byte state, true when the embedded object's attribute capture is stubbed.
     pub const fn for_build(stubbed: bool) -> Self {
         if stubbed {
             Self {

@@ -4401,11 +4401,10 @@ fn validate_runtime_map(
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
 /// Whether the embedded Detailed object carries stubbed attribute capture.
-/// Entry capture is inlined, so prove its scalar reader is called. Identify
-/// the return adapter exactly, without confusing its closure with its body.
-/// Panics on missing, ambiguous or half-wired evidence. Production probes
-/// the same bytes through the checked twin; these tests cross-check the
-/// actual bytes independently.
+/// Entry capture is inlined, so the rule proves its scalar reader is called,
+/// and identifies the return adapter exactly, without confusing its closure
+/// with its body. Panics on missing, ambiguous or half-wired evidence.
+/// One copy of the rule: this delegates to the production probe.
 #[cfg(test)]
 pub(crate) fn embedded_object_is_stubbed() -> bool {
     let parsed =
@@ -4431,142 +4430,25 @@ fn embedded_adapter_symbol_matches(symbol: &str, helper: &str) -> bool {
     path == format!("13p11scope_ebpf{}{helper}", helper.len())
 }
 
+/// Test-only entry lookup: one copy of the rule, panicking where the
+/// production probe refuses.
 #[cfg(test)]
-fn embedded_object_capture_entry(mut parsed: aya_obj::Object) -> (aya_obj::Function, u32) {
-    let reader = "p11_request_cell";
-    let mut matches = parsed
-        .functions
-        .values()
-        .filter(|function| function.name == reader);
-    let function = matches
-        .next()
-        .expect("embedded Detailed object lacks request reader");
-    assert!(
-        matches.next().is_none(),
-        "ambiguous embedded request reader"
-    );
-    let reader_id = parsed
-        .btf
-        .as_ref()
-        .expect("embedded object needs original BTF")
-        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
-        .expect("embedded request reader needs original BTF FUNC");
-    assert_eq!(
-        function.func_info.func_info.len(),
-        1,
-        "ambiguous request function info"
-    );
-    assert_eq!(
-        function.func_info.func_info[0].type_id, reader_id,
-        "request reader function info must bind its original BTF FUNC"
-    );
-    let entry = parsed
-        .programs
-        .get("p11_entry")
-        .expect("embedded Detailed object lacks entry");
-    let key = entry.function_key();
-    assert_eq!(
-        parsed
-            .functions
-            .values()
-            .filter(|function| function.name == "p11_entry")
-            .count(),
-        1,
-        "ambiguous embedded entry function"
-    );
-    assert_eq!(parsed.functions[&key].name, "p11_entry");
-    let text_sections = parsed
-        .functions
-        .keys()
-        .map(|(section, _)| *section)
-        .collect();
-    // Link only the entry root. Inspect return size independently, so changing
-    // a return body cannot fabricate entry-reader reachability.
-    parsed.programs.retain(|name, _| name == "p11_entry");
-    parsed
-        .relocate_calls(&text_sections)
-        .expect("embedded entry calls relocate");
-    (
-        parsed
-            .functions
-            .remove(&key)
-            .expect("linked entry remains present"),
-        reader_id,
-    )
+fn embedded_object_capture_entry(parsed: aya_obj::Object) -> (aya_obj::Function, u32) {
+    probed_capture_entry(parsed).expect("embedded Detailed bytes must probe")
 }
 
+/// Test-only reachability walk: one copy of the rule, panicking where
+/// the production probe refuses.
 #[cfg(test)]
 fn embedded_entry_reaches_reader(entry: &aya_obj::Function, reader_id: u32) -> bool {
-    use std::ops::Bound::{Excluded, Unbounded};
-    let functions: BTreeMap<_, _> = entry
-        .func_info
-        .func_info
-        .iter()
-        .map(|info| (info.insn_off as usize, info.type_id))
-        .collect();
-    assert_eq!(
-        functions.len(),
-        entry.func_info.func_info.len(),
-        "ambiguous linked function info"
-    );
-    assert_eq!(
-        functions.first_key_value().map(|(start, _)| *start),
-        Some(0)
-    );
-    assert!(
-        functions
-            .keys()
-            .all(|start| *start < entry.instructions.len())
-    );
-    let mut seen = BTreeSet::new();
-    let mut pending = vec![0];
-    while let Some(start) = pending.pop() {
-        if !seen.insert(start) {
-            continue;
-        }
-        let end = functions
-            .range((Excluded(start), Unbounded))
-            .next()
-            .map_or(entry.instructions.len(), |(end, _)| *end);
-        for (at, instruction) in entry.instructions.iter().enumerate().take(end).skip(start) {
-            if instruction.code == 0x85 && instruction.src_reg() == 1 {
-                let target = (at + 1)
-                    .checked_add_signed(instruction.imm as isize)
-                    .expect("linked entry call target is in range");
-                assert!(
-                    functions.contains_key(&target),
-                    "linked entry call lacks exact function info"
-                );
-                pending.push(target);
-            }
-        }
-    }
-    seen.iter().any(|start| functions[start] == reader_id)
+    probed_entry_reaches_reader(entry, reader_id).expect("embedded Detailed bytes must probe")
 }
 
+/// Test-only stub rule: one copy of the rule, panicking where the
+/// production probe refuses.
 #[cfg(test)]
 fn embedded_object_capture_is_stubbed(parsed: aya_obj::Object) -> bool {
-    let mut matches = parsed.functions.values().filter(|function| {
-        embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
-    });
-    let emit = matches
-        .next()
-        .expect("embedded Detailed object has no exact return adapter")
-        .instructions
-        .len();
-    assert!(
-        matches.next().is_none(),
-        "embedded Detailed object has several exact return adapters"
-    );
-    let emit_stub = emit < 300;
-    let (entry, reader_id) = embedded_object_capture_entry(parsed);
-    let entry_stub = !embedded_entry_reaches_reader(&entry, reader_id);
-    assert!(
-        entry_stub == emit_stub,
-        "half-wired embedded object (entry reader {}, emit {emit} instructions)",
-        !entry_stub
-    );
-    entry_stub
+    probed_capture_is_stubbed(parsed).expect("embedded Detailed bytes must probe")
 }
 
 /// Flavor of the embedded Detailed BPF object, probed from its bytes rather
@@ -4610,9 +4492,8 @@ impl std::fmt::Display for FlavorProbeError {
 impl std::error::Error for FlavorProbeError {}
 
 /// Production byte probe: link the entry root and locate the request
-/// reader. Checked twin of the test-only `embedded_object_capture_entry`:
-/// the same exact-symbol rules, but every missing or ambiguous input is
-/// an error (a refusal), never a panic.
+/// reader. The test-only `embedded_object_capture_entry` delegates here;
+/// every missing or ambiguous input is an error (a refusal), never a panic.
 fn probed_capture_entry(
     mut parsed: aya_obj::Object,
 ) -> Result<(aya_obj::Function, u32), FlavorProbeError> {
@@ -4655,7 +4536,11 @@ fn probed_capture_entry(
     {
         return Err(FlavorProbeError::new("ambiguous embedded entry function"));
     }
-    if parsed.functions[&key].name != "p11_entry" {
+    if parsed
+        .functions
+        .get(&key)
+        .is_none_or(|function| function.name != "p11_entry")
+    {
         return Err(FlavorProbeError::new("ambiguous embedded entry function"));
     }
     let text_sections = parsed
@@ -4677,9 +4562,8 @@ fn probed_capture_entry(
 }
 
 /// Production byte probe: whether the linked entry reaches the request
-/// reader through real calls. Checked twin of the test-only
-/// `embedded_entry_reaches_reader`: malformed function info is an error,
-/// never a panic.
+/// reader through real calls. The test-only `embedded_entry_reaches_reader`
+/// delegates here: malformed function info is an error, never a panic.
 fn probed_entry_reaches_reader(
     entry: &aya_obj::Function,
     reader_id: u32,
@@ -4737,10 +4621,10 @@ fn probed_entry_reaches_reader(
 }
 
 /// Production byte probe: stubbed vs wired attribute capture from parsed
-/// bytes. Same exact-symbol rules as the test-only twin: the return
-/// adapter must match exactly and be small exactly when the entry root
-/// does not reach the request reader. Missing, ambiguous or half-wired
-/// evidence is an error (a refusal), never a panic.
+/// bytes. The test-only `embedded_object_capture_is_stubbed` delegates
+/// here: the return adapter must match exactly and be small exactly when
+/// the entry root does not reach the request reader. Missing, ambiguous or
+/// half-wired evidence is an error (a refusal), never a panic.
 fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
     let mut matches = parsed.functions.values().filter(|function| {
         embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
@@ -4761,10 +4645,9 @@ fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProb
     let (entry, reader_id) = probed_capture_entry(parsed)?;
     let entry_stub = !probed_entry_reaches_reader(&entry, reader_id)?;
     if entry_stub != emit_stub {
-        return Err(FlavorProbeError::new(format!(
-            "half-wired embedded object (entry reader {}, emit {emit} instructions)",
-            !entry_stub
-        )));
+        return Err(FlavorProbeError::new(
+            "half-wired embedded object: the entry program and the return adapter disagree about attribute capture",
+        ));
     }
     Ok(entry_stub)
 }
@@ -4885,7 +4768,7 @@ pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<Embed
             ("FULL", "stubbed (P0)")
         };
         bail!(
-            "embedded BPF object flavor mismatch: build expects {expected} object-attribute capture, embedded bytes are {actual} (stale or mismatched embedded object)"
+            "embedded BPF object flavor mismatch: build expects {expected} object-attribute capture, embedded bytes are {actual} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
         );
     }
     let expect_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
@@ -4896,7 +4779,7 @@ pub(crate) fn check_flavor_against_build(probed: EmbeddedFlavor) -> Result<Embed
             ("without", "contain")
         };
         bail!(
-            "embedded BPF object flavor mismatch: build was compiled {expected} unsafe-unvalidated-metadata, embedded bytes {actual} its decoders (stale or mismatched embedded object)"
+            "embedded BPF object flavor mismatch: build was compiled {expected} unsafe-unvalidated-metadata, embedded bytes {actual} its decoders (stale or mismatched embedded object; rebuild p11scope from a clean target directory)"
         );
     }
     Ok(probed)
@@ -4918,7 +4801,7 @@ pub(crate) fn checked_embedded_flavor() -> Result<EmbeddedFlavor> {
     match embedded_flavor() {
         Ok(probed) => check_flavor_against_build(probed),
         Err(error) => bail!(
-            "cannot determine embedded BPF object flavor: {} (stale or mismatched embedded object)",
+            "cannot determine embedded BPF object flavor: {} (stale or mismatched embedded object; rebuild p11scope from a clean target directory)",
             error.reason()
         ),
     }

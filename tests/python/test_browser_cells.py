@@ -13,6 +13,7 @@ prerequisite skips into failures. Single-browser hosts run their subset.
 Harness: tests/fixtures/browser/ (cells, flows, oracle, servers, profiles).
 """
 
+import ast
 import functools
 import json
 import os
@@ -1292,6 +1293,42 @@ def require_s1_wiring(test):
         test.fail("S1 oracle not implemented: check_report has no s1 wiring")
 
 
+def live_cells_missing_s1(source):
+    """Live-cell methods with no s1-proven check_report call.
+
+    Parses ``source`` (this suite file), finds every @gate-decorated
+    method of BrowserCells, and returns (found, missing): all live
+    cell names, and those whose body has no check_report call
+    carrying an ``s1=`` keyword. A future live cell that forgets
+    ``s1=`` — or never calls check_report — lands in ``missing``.
+    """
+    found, missing = [], []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            gated = any(
+                (isinstance(expr, ast.Call)
+                 and isinstance(expr.func, ast.Name)
+                 and expr.func.id == "gate")
+                or (isinstance(expr, ast.Name) and expr.id == "gate")
+                for expr in item.decorator_list)
+            if not gated:
+                continue
+            found.append(item.name)
+            proven = any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "check_report"
+                and any(keyword.arg == "s1" for keyword in call.keywords)
+                for call in ast.walk(item))
+            if not proven:
+                missing.append(item.name)
+    return found, missing
+
+
 def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
                      peak=2):
     """Balanced S1 session accounting (balance follows the counters)."""
@@ -1427,6 +1464,13 @@ class BrowserS1Oracle(unittest.TestCase):
         with patch.object(oracle, "sha256_of", return_value=sha):
             case.check_report(clean, store, {"C_FindObjects": 1},
                               attached=True)
+
+    def test_live_cells_all_wire_s1_proof(self):
+        require_s1_wiring(self)
+        found, missing = live_cells_missing_s1(
+            Path(__file__).read_text())
+        self.assertEqual(len(found), 5)
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

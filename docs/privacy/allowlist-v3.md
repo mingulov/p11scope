@@ -411,6 +411,13 @@ and attach generation; the calibration cell also carries the observer's own
 calibration thread id and hit count. The flags word is checked and
 discarded; none of these values is emitted.
 
+When the post-attach birth marker ships (Detailed only), an in-scope exec
+after closure reads the leader's exec generation onto its continuity row;
+any out-of-scope or refused call dirties the row instead, with no
+exec-generation read on that path. The marker word and the admission
+spent/failed counts stay private to the birth observation, read back
+through the held pidfd, and are never published.
+
 Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
 entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.
 Userspace keeps the entry IP inside the instance router (`EntryIp`: no

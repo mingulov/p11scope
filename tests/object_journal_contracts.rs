@@ -1069,3 +1069,24 @@ fn object_journal_birth_marker() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// H8-D birth marker budget: the native cap and the shared Rust cap are
+/// one number, so a later budget change is a single small commit. Until
+/// the owner rules it stays 16,384.
+#[test]
+fn object_journal_marker_cap_matches_native() {
+    let header = std::fs::read_to_string("crates/ebpf/native/journal_marker.h")
+        .expect("read native marker header");
+    let define = "#define P11_JOURNAL_MARKER_ADMIT_CAP";
+    let line = header
+        .lines()
+        .find(|line| line.starts_with(define))
+        .expect("native cap define");
+    let literal = line[define.len()..].trim().trim_end_matches("ULL").trim();
+    let native: u64 = literal.parse().expect("native cap parses");
+    assert_eq!(
+        native,
+        p11scope_ebpf_common::journal_marker::MARKER_ADMIT_CAP,
+        "native and Rust marker caps must match"
+    );
+}

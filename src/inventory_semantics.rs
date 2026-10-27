@@ -629,6 +629,8 @@ pub(crate) trait LaneTestIo {
     }
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
+    /// Service only the owned Detailed DISCOVERY reader, without collecting EVENTS.
+    fn service_live_discovery(&mut self) {}
     /// First-drain stamp of a retained image, for registration
     /// backdating. Test owners without a real H0 retain nothing.
     fn retained_registration_ns(&self, _image: ImageIdentity) -> Option<u64> {

@@ -2202,6 +2202,20 @@ impl InventoryCoordinator<OsProcessSource> {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// Borrow the actual retained classic batch without preparing or consuming it.
+    #[cfg(test)]
+    pub(crate) fn pending_semantic_batch_for_test(&self) -> Option<&SemanticBatch> {
+        match self
+            .semantic_finalizer
+            .as_ref()?
+            .pending_semantic
+            .as_ref()?
+        {
+            PendingSemanticBatch::Collected(batch) => Some(batch),
+            PendingSemanticBatch::Prepared(_) => None,
+        }
+    }
+
     /// Queue one owned lane batch for finalization: at most one ordinary
     /// collection quantum is owned at a time, then finalize/publish
     /// before another semantic collection. A refused collection records

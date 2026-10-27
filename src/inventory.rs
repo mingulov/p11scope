@@ -2105,6 +2105,21 @@ pub(crate) fn classic_semantic_tick_for_test(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: crate::inventory_semantics::AttestedSemanticLane,
 ) -> crate::inventory_semantics::AttestedSemanticLane {
+    classic_semantic_ticks_for_test(coordinator, lane, 1, |_, _, _| {})
+}
+
+/// Repeated real service hooks while the same coordinator and lane retain a batch.
+#[cfg(test)]
+pub(crate) fn classic_semantic_ticks_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+    ticks: usize,
+    mut inspect: impl FnMut(
+        &InventoryCoordinator<OsProcessSource>,
+        &crate::inventory_semantics::AttestedSemanticLane,
+        bool,
+    ),
+) -> crate::inventory_semantics::AttestedSemanticLane {
     let mut driver = ClassicDriver {
         coordinator,
         inventory_scope: None,
@@ -2151,7 +2166,14 @@ pub(crate) fn classic_semantic_tick_for_test(
         #[cfg(test)]
         commit_calls: 0,
     };
-    driver.on_tick();
+    for _ in 0..ticks {
+        driver.on_tick();
+        inspect(
+            &*driver.coordinator,
+            driver.semantic.as_ref().unwrap(),
+            driver.semantic_staged,
+        );
+    }
     driver.semantic.take().unwrap()
 }
 

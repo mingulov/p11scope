@@ -939,6 +939,7 @@ struct ScriptIo {
     domain: NativeDomainId,
     now: Instant,
     records: VecDeque<DecodedEventRecord>,
+    event_drain: Option<crate::events::EventDrain<crate::events::ScriptedRecords>>,
     health: VecDeque<Result<Health, ()>>,
     last_health: Health,
     pin: Arc<PidPin>,
@@ -1008,6 +1009,7 @@ impl ScriptIo {
             domain,
             now: Instant::now(),
             records: VecDeque::new(),
+            event_drain: None,
             health: VecDeque::new(),
             last_health: Health {
                 fault: 0,
@@ -1106,6 +1108,9 @@ impl CaptureIo for ScriptIo {
         self.now
     }
     fn collect(&mut self, limit: usize) -> Collection {
+        if let Some(drain) = self.event_drain.as_mut() {
+            return collect_event_prefix(drain, None, limit);
+        }
         Collection {
             records: (0..limit)
                 .filter_map(|_| self.records.pop_front())
@@ -3628,6 +3633,62 @@ fn merge_stash_records_shed_floor_and_exhaustion() {
     assert_eq!(report.merge_stashed_outcomes(vec![call(None)]), 1);
     assert!(report.exhausted());
 }
+fn retain_scripted_event_cursor(io: &mut ScriptIo) {
+    let records: Vec<_> = io
+        .records
+        .drain(..)
+        .map(|record| crate::events::record_bytes(&record.base))
+        .collect();
+    let bound = records.len();
+    io.event_drain = Some(crate::events::EventDrain::over(
+        crate::events::ScriptedRecords::records(records, bound),
+    ));
+}
+
+#[test]
+fn live_discovery_read_error_is_sticky_until_h0_consumes_the_events_prefix() {
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    prime(&mut capture, &mut io);
+    io.call(1, 0);
+    retain_scripted_event_cursor(&mut io);
+    capture.service_live_discovery_with(|| anyhow::bail!("owned DISCOVERY unavailable"));
+    capture.service_live_discovery_with(|| Ok(None));
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.calls().count(), 1);
+    assert_eq!(
+        report.calls().next().unwrap().route(),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    assert!(report.outcomes().iter().any(|outcome| matches!(
+        outcome,
+        TickOutcome::Invalidation(loss) if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+    )));
+    assert_eq!(io.event_drain.as_ref().unwrap().source().remaining(), 0);
+}
+
+#[test]
+fn live_discovery_malformed_is_sticky_until_h0_consumes_the_events_prefix() {
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    prime(&mut capture, &mut io);
+    io.call(1, 0);
+    retain_scripted_event_cursor(&mut io);
+    let mut discovery = crate::events::DiscoveryDrain::over(
+        crate::events::ScriptedRecords::records(vec![vec![0]], 1),
+    );
+    capture.service_live_discovery_with(|| Ok(discovery.dequeue()));
+    capture.service_live_discovery_with(|| Ok(None));
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.calls().count(), 1);
+    assert_eq!(
+        report.calls().next().unwrap().route(),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    assert_eq!(discovery.source().remaining(), 0);
+    assert_eq!(io.event_drain.as_ref().unwrap().source().remaining(), 0);
+}
+
 fn prime(capture: &mut SemanticCapture, io: &mut ScriptIo) -> Route {
     io.call(1, 0);
     let report = capture.tick_with(io).unwrap();
@@ -4879,6 +4940,8 @@ mod custody_chain_tests {
         awaiting_max: usize,
         attempted_files: Vec<u32>,
         faultera_total: usize,
+        events_consumer: usize,
+        discovery_consumer: usize,
     }
 
     /// Tests-only substituted H0 I/O behind a lane: the real H0
@@ -4889,6 +4952,7 @@ mod custody_chain_tests {
     struct H0TestIo {
         capture: SemanticCapture,
         io: ScriptIo,
+        discovery: Option<crate::events::DiscoveryDrain<crate::events::ScriptedRecords>>,
         stash: RefreshReceiptStash,
         engagement: std::rc::Rc<std::cell::RefCell<H0Engagement>>,
         attempted_drained: usize,
@@ -4912,6 +4976,7 @@ mod custody_chain_tests {
             Self {
                 capture,
                 io,
+                discovery: None,
                 stash: RefreshReceiptStash::new(),
                 engagement: std::rc::Rc::new(std::cell::RefCell::new(H0Engagement::default())),
                 attempted_drained: 0,
@@ -4925,6 +4990,15 @@ mod custody_chain_tests {
     }
 
     impl LaneTestIo for H0TestIo {
+        fn service_live_discovery(&mut self) {
+            use crate::events::BoundedRecordSource;
+            if let Some(discovery) = self.discovery.as_mut() {
+                self.capture
+                    .service_live_discovery_with(|| Ok(discovery.dequeue()));
+                self.engagement.borrow_mut().discovery_consumer = discovery.source().consumer();
+            }
+        }
+
         fn validate_current(
             &mut self,
             receipt: &CurrentPartitionReceipt,
@@ -4944,6 +5018,10 @@ mod custody_chain_tests {
             {
                 let mut engagement = self.engagement.borrow_mut();
                 engagement.ticks += 1;
+                if let Some(drain) = self.io.event_drain.as_ref() {
+                    use crate::events::BoundedRecordSource;
+                    engagement.events_consumer = drain.source().consumer();
+                }
                 engagement.awaiting_max = engagement.awaiting_max.max(self.capture.awaiting.len());
                 engagement.attempted_files.extend(
                     self.io.attempted_files[self.attempted_drained..]
@@ -5056,6 +5134,166 @@ mod custody_chain_tests {
             )
             .unwrap();
         LaneScene { scene, lane }
+    }
+
+    type HeldBatchFingerprint = (
+        NativeDomainId,
+        u64,
+        usize,
+        Vec<(Option<u64>, String, Vec<u8>)>,
+        Vec<usize>,
+    );
+
+    fn held_batch_fingerprint(batch: &SemanticBatch) -> HeldBatchFingerprint {
+        (
+            batch.domain(),
+            batch.observed_ns(),
+            batch.outcomes().as_ptr() as usize,
+            batch
+                .outcomes()
+                .iter()
+                .map(|outcome| {
+                    let record = match outcome {
+                        TickOutcome::Call(call) => crate::events::record_bytes(call.record()),
+                        TickOutcome::Other(other) => crate::events::record_bytes(other.record()),
+                        TickOutcome::Invalidation(_) => Vec::new(),
+                    };
+                    (outcome.position(), format!("{outcome:?}"), record)
+                })
+                .collect(),
+            batch
+                .current_receipts()
+                .iter()
+                .map(|receipt| Arc::as_ptr(receipt.original_pin()) as usize)
+                .collect(),
+        )
+    }
+
+    fn discovery_records(
+        count: usize,
+    ) -> crate::events::DiscoveryDrain<crate::events::ScriptedRecords> {
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        record.pid_tgid = (7u64 << 32) | 7;
+        record.hook_ts_ns = 1;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of_val(&record),
+            )
+        }
+        .to_vec();
+        crate::events::DiscoveryDrain::over(crate::events::ScriptedRecords::records(
+            vec![bytes; count],
+            count,
+        ))
+    }
+
+    fn discovery_service_while_batch_is_staged(positive: bool) {
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 1,
+        };
+        let mut fixture = bound_lane_scene(image);
+        let domain = fixture.lane.domain();
+        let mut h0 = H0TestIo::new(domain);
+        h0.capture.limits.records = 1;
+        h0.io.output_image = Some(image);
+        h0.discovery = Some(discovery_records(600));
+        if positive {
+            let pin = fixture
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .find_by_image(domain, image)
+                .unwrap()
+                .pin();
+            h0.refresh(pin, 0).unwrap();
+            h0.io.call_image(7, 1, 0);
+            h0.io.call_image(7, 1, 0);
+            // Keep the original positive quantum in the production staged slot.
+            crate::inventory::fail_next_classic_commit_for_test("retain original positive batch");
+        }
+        retain_scripted_event_cursor(&mut h0.io);
+        let engagement = h0.engagement.clone();
+        fixture.lane.install_test_io(Box::new(h0));
+        let mut first = None;
+        let mut first_consumer = 0;
+        let mut ticks = 0;
+        fixture.lane = crate::inventory::classic_semantic_ticks_for_test(
+            &mut fixture.scene.coordinator,
+            fixture.lane,
+            2,
+            |coordinator, _, staged| {
+                assert!(staged, "the original quantum stays staged");
+                let batch = coordinator
+                    .pending_semantic_batch_for_test()
+                    .expect("the actual original collected batch remains owned");
+                let fingerprint = held_batch_fingerprint(batch);
+                assert_eq!(batch.is_empty(), !positive);
+                if positive {
+                    assert!(batch.outcomes().iter().any(|outcome| matches!(
+                        outcome, TickOutcome::Call(call) if matches!(call.route(), Route::Joined(_))
+                    )));
+                }
+                let observed = engagement.borrow();
+                assert_eq!(
+                    observed.ticks, 1,
+                    "held publication forbids another EVENTS collection"
+                );
+                assert_eq!(observed.events_consumer, if positive { 8 } else { 0 });
+                if let Some(first) = first.as_ref() {
+                    assert_eq!(
+                        &fingerprint, first,
+                        "same positions, records, receipts and allocation"
+                    );
+                    assert_eq!(
+                        observed.discovery_consumer,
+                        first_consumer + 2048,
+                        "the held-batch hook services another bounded256 discovery records"
+                    );
+                } else {
+                    first = Some(fingerprint);
+                    first_consumer = observed.discovery_consumer;
+                }
+                ticks += 1;
+            },
+        );
+        assert_eq!(ticks, 2);
+        fixture
+            .scene
+            .coordinator
+            .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+            .unwrap();
+        let returns: u64 = fixture
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.api_returns)
+            .sum();
+        assert_eq!(
+            returns,
+            u64::from(positive),
+            "the original call publishes exactly once"
+        );
+        assert!(
+            fixture
+                .scene
+                .coordinator
+                .pending_semantic_batch_for_test()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_discovery_progresses_while_positive_batch_is_staged() {
+        discovery_service_while_batch_is_staged(true);
+    }
+
+    #[test]
+    fn live_discovery_progresses_while_empty_batch_is_staged() {
+        discovery_service_while_batch_is_staged(false);
     }
 
     /// Published semantic edge rows: (api returns, historical-only

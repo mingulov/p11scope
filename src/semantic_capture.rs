@@ -1149,15 +1149,13 @@ const LIVE_DISCOVERY_QUANTUM: usize = 16;
 
 // Private H0 collection services the lane's own retained DISCOVERY cursor
 // without applying publications or granting Inventory authority.
-fn collect_attested_with<T>(
-    owner: &mut T,
-    limit: usize,
-    mut dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<DiscoveryItem>>,
-    collect_events: impl FnOnce(&mut T, usize) -> Collection,
-) -> Collection {
+fn service_discovery_quantum(
+    quantum: usize,
+    mut dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+) -> CollectionStatus {
     let mut discovery_status = CollectionStatus::Complete;
-    for _ in 0..LIVE_DISCOVERY_QUANTUM {
-        match dequeue(owner) {
+    for _ in 0..quantum {
+        match dequeue() {
             Ok(Some(DiscoveryItem::Record(_))) => {}
             Ok(Some(DiscoveryItem::Malformed)) => discovery_status = CollectionStatus::Malformed,
             Ok(None) => break,
@@ -1167,6 +1165,16 @@ fn collect_attested_with<T>(
             }
         }
     }
+    discovery_status
+}
+
+fn collect_attested_with<T>(
+    owner: &mut T,
+    limit: usize,
+    mut dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<DiscoveryItem>>,
+    collect_events: impl FnOnce(&mut T, usize) -> Collection,
+) -> Collection {
+    let discovery_status = service_discovery_quantum(LIVE_DISCOVERY_QUANTUM, || dequeue(owner));
     // Even an unavailable DISCOVERY reader must not starve the genuine EVENTS
     // prefix. Preserve it and let H0's existing failure path forbid routing.
     let mut collection = collect_events(owner, limit);
@@ -1490,6 +1498,12 @@ impl SemanticCapture {
             last_refusal_by_key_for_test: BTreeMap::new(),
         })
     }
+    fn service_live_discovery_with(
+        &mut self,
+        _dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+    ) {
+    }
+
     pub(crate) fn router(&self) -> &InstanceRouter {
         &self.router
     }

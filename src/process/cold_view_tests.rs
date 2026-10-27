@@ -335,6 +335,26 @@ fn warm_constructor_does_not_bypass_a_stopped_capture() {
 }
 
 #[test]
+fn warm_only_custody_does_not_allocate_a_cold_discovery_allowance() {
+    let mut group = ColdLeaderSubject::spawn(1);
+    let warm = ProcessView::open_warm_only(ProcessViewId(48), group.pid()).unwrap();
+    assert_eq!(warm.pid(), group.pid());
+    assert_eq!(warm.mount_namespace(), group.member_namespace());
+    group.leave_leader();
+    let cold = ProcessView::open_warm_only(ProcessViewId(49), group.pid());
+    let error = match cold {
+        Ok(_) => panic!("a warm-only owner cannot start a cold census"),
+        Err(error) => error,
+    };
+    assert!(error.contains("warm-only"), "{error}");
+    let mut work = CaptureWorkBudget::default();
+    let view = ProcessView::open_with_budget(ProcessViewId(50), group.pid(), &mut work).unwrap();
+    assert_eq!(view.pid(), warm.pid());
+    assert!(work.attempted_io_bytes() > 0);
+    group.call_three();
+}
+
+#[test]
 fn repeated_cold_constructors_share_one_remaining_collection_allowance() {
     use crate::discovery::scan::CollectionWork;
     use std::sync::atomic::{AtomicU64, Ordering};

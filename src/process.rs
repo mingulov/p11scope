@@ -540,6 +540,23 @@ impl ProcessView {
         Self::open_with_budget(id, pid, &mut CaptureWorkBudget::default())
     }
 
+    /// Original leader metadata only, for native-owner custody before an
+    /// Inventory scan window exists. This never starts a cold task census or
+    /// allocates a default discovery allowance. Cold discovery requires the
+    /// separate constructor with its caller's actual budget.
+    pub(crate) fn open_warm_only(id: ProcessViewId, pid: u32) -> Result<Self, String> {
+        Self::open_with_filesystem(id, pid, |pin| {
+            mount_namespace_id(pin.pid())
+                .map(|namespace| (namespace, false))
+                .map_err(|error| {
+                    format!(
+                        "warm-only process view lacks original leader filesystem metadata: \
+                         {error}; cold filesystem proof requires an active capture allowance"
+                    )
+                })
+        })
+    }
+
     pub(crate) fn open_with_budget(
         id: ProcessViewId,
         pid: u32,
@@ -549,14 +566,22 @@ impl ProcessView {
             return Err(reason.into());
         }
         work.spend(1).map_err(str::to_owned)?;
+        Self::open_with_filesystem(id, pid, |pin| {
+            let filesystem = ViewFilesystem::open(pin, work)?;
+            filesystem.validate(work)?;
+            Ok((filesystem.namespace(), filesystem.is_cold()))
+        })
+    }
+
+    fn open_with_filesystem(
+        id: ProcessViewId,
+        pid: u32,
+        identify: impl FnOnce(&PidPin) -> Result<(MountNamespaceId, bool), String>,
+    ) -> Result<Self, String> {
         let ((pin, mount_namespace, cold_filesystem), admitted_ns) = validated_with_admission_time(
             || {
                 let pin = PidPin::open(pid)?;
-                let (mount_namespace, cold_filesystem) = {
-                    let filesystem = ViewFilesystem::open(&pin, work)?;
-                    filesystem.validate(work)?;
-                    (filesystem.namespace(), filesystem.is_cold())
-                };
+                let (mount_namespace, cold_filesystem) = identify(&pin)?;
                 if pin.original_exited()? {
                     return Err(format!(
                         "pid {pid} exited while its mount namespace was identified"

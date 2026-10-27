@@ -100,6 +100,53 @@ fn unavailable_image_guard_releases_reservation_but_never_reuses_id() {
 }
 
 #[test]
+fn pre_window_owner_refuses_a_cold_group_without_reading_a_default_census() {
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let mut engine = Engine::inventory(
+        config(2, 1),
+        Scope::Pid(group.pid()),
+        HookRegistry::builtin(),
+        vec![group.program.clone()],
+    )
+    .unwrap();
+    let error = engine
+        .open_inventory_owner(
+            group.pid(),
+            expected(),
+            &mut ScriptedImage(ImageCheck::Exact),
+        )
+        .expect_err("a pre-window owner cannot buy cold metadata with a new default budget");
+    assert!(error.to_string().contains("warm-only"), "{error:#}");
+    assert!(engine.views.is_empty());
+    assert!(engine.inventory_state().unwrap().owners.is_empty());
+    assert!(engine.inventory_state().unwrap().reservations.is_empty());
+    assert_eq!(engine.budget.attempted_io_bytes(), 0);
+    assert_eq!(engine.next_view_id, 1, "the refused ID is still burned");
+    group.call_three();
+}
+
+#[test]
+fn pre_window_warm_owner_keeps_original_inactive_inventory_operation() {
+    let mut engine = engine(2, 1);
+    let owner = open(&mut engine);
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].id(), owner);
+    assert!(engine.views[0].still_the_same());
+    assert_eq!(engine.budget.attempted_io_bytes(), 0);
+    assert!(engine.budget.remaining_window_io().is_err());
+    assert!(
+        engine
+            .inventory_state()
+            .unwrap()
+            .owners
+            .contains_key(&owner)
+    );
+}
+
+#[test]
 fn absent_cookie_or_wrong_pid_scope_cannot_admit_an_owner() {
     let mut engine = engine(2, 1);
     assert!(

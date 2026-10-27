@@ -309,7 +309,10 @@ impl Engine {
         }
         let id = self.allocate_view_id()?;
         let opened = (|| {
-            let view = ProcessView::open(id, pid).map_err(anyhow::Error::msg)?;
+            // This owner is opened before the coordinator's scan checkpoint.
+            // Keep the prior bounded leader-metadata path; cold discovery is
+            // paid by its scan collection and falls back there explicitly.
+            let view = ProcessView::open_warm_only(id, pid).map_err(anyhow::Error::msg)?;
             if guard.check(&view, image) != ImageCheck::Exact || !view.still_the_same() {
                 bail!("inventory exact-image authority unavailable or changed");
             }

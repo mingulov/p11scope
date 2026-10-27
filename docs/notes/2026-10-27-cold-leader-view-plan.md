@@ -158,11 +158,30 @@ regression remain **UNCOMPILED/UNRUN** under the controller's release build
 hold. They must pass before this batch is accepted. No Cargo/live run,
 FD-pressure qualification or warm-cost result is claimed.
 
-One pre-window seam is still unresolved: `Engine::open_inventory_owner`
-opens before an Inventory checkpoint exists. Its old default-budget wrapper
-must not perform a fresh cold census. Passing the inactive Inventory budget
-blindly would also refuse existing warm owners. The proposed conservative
-choice is a warm-only original-custody open at that seam, with a named cold
-refusal and the existing scan-pinned fallback. This requires controller
-adjudication before implementation; no new metadata allowance, synthetic
-window or semantic grant is introduced by this checkpoint.
+The pre-window `Engine::open_inventory_owner` seam was unresolved at
+`8d38f41f`: its old default-budget wrapper could start a fresh cold census,
+but the inactive Inventory budget could not replace the bounded warm path.
+The controller then approved explicit warm-only original metadata/custody
+there. `ProcessView::open_warm_only` checks only the original leader's
+namespace, birth/pidfd and admission clock. It cannot enumerate cold tasks or
+allocate a discovery allowance. A cold or unreadable leader refuses with a
+named warm-only reason and follows the existing scan-pinned fallback. The
+budgeted constructor retains cold discovery; no synthetic window, new
+metadata allowance or semantic grant is introduced.
+
+The actual pre-window owner method reproduced RED (it admitted the real cold
+fixture through its default budget) in a thin source harness before the
+change. That harness now passes 20 controls, including the actual owner
+method and warm-only constructor, with owner resource bookkeeping/native
+query and the earlier dependencies adapted. Two real product owner tests
+and a coordinator scan-pinned counter-target fallback test are written but
+**UNCOMPILED/UNRUN** with the other product controls. The fallback test checks
+the actual sparse callback's independently derived file offset and held
+target, the ScanPinned caller and named native-owner refusal; it does not
+claim delivered kernel counter samples. Installed counter delivery remains
+pending controller scheduling.
+
+Cold native-owner/S1 authority is still unavailable at pre-window admission,
+and the separate CallerRegistry semantic restriction is unchanged. This is
+bounded filesystem/scan and counter-target usefulness, not whole-group native
+admission or a v0.5.0 fix.

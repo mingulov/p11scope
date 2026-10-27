@@ -1877,6 +1877,101 @@ fn cold_admission_relist_refuses_survivor_appearing_after_mint() {
     assert_eq!(selector.tid(), group.survivor);
 }
 
+/// A re-list that passes while the group died underneath refuses raced:
+/// the scripted re-list returns the lone survivor (a passing set), but
+/// the kill inside the closure empties the group first, so the pidfd
+/// re-check after the re-list — not the admission — wins. Without that
+/// check this admits a dead group, so the `Raced` assert is the test.
+#[test]
+fn cold_admission_relist_passing_but_group_died_refuses_raced() {
+    use crate::discovery::caller_registry::{ColdRefusal, cold_admit_member_with_relist};
+    use crate::process::PidPin;
+    use std::sync::Arc;
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let pin = Arc::new(PidPin::open(group.tgid).expect("cold pin opens"));
+    // The closure kills the group and waits for the pidfd to report
+    // death (monotonic, polled like every seam death wait), then
+    // returns the passing set: the first listing and the mint read the
+    // live survivor, only the post-mint world is dead.
+    let killer = Arc::clone(&pin);
+    let survivor = group.survivor;
+    let tgid = group.tgid;
+    let mut work = CaptureWorkBudget::default();
+    match cold_admit_member_with_relist(&pin, &mut work, &mut |listed| {
+        assert_eq!(listed, tgid, "the re-list names the same group");
+        // SAFETY: SIGKILL to our own fixture group; Drop reaps it.
+        unsafe {
+            libc::kill(tgid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while killer.still_the_same() {
+            assert!(
+                Instant::now() < deadline,
+                "killed group {tgid} never reported dead"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(vec![survivor])
+    }) {
+        Err(ColdRefusal::Raced) => {}
+        Err(other) => panic!("a group dead under a passing re-list refuses raced, got {other:?}"),
+        Ok(_) => panic!("a group dead under a passing re-list never admits"),
+    }
+    assert!(
+        !pin.still_the_same(),
+        "the twin really killed the group it refused"
+    );
+}
+
+/// A raced cold proof refuses with its own reason — never the generic
+/// "no live process (it exited)" text, which is false for a live group.
+/// The race is a held mint slot (deterministic, no timing): while the
+/// pre-mint holds the survivor slot, admission refuses raced; the
+/// control drops the pre-mint and the same group cold-admits, proving
+/// the refusal was the race, not death.
+#[test]
+fn cold_admission_raced_refusal_names_the_race_not_an_exit() {
+    use crate::discovery::caller_registry::{ImageAuthority, cold_admit_member};
+    use crate::process::PidPin;
+    use std::sync::Arc;
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let pin = Arc::new(PidPin::open(group.tgid).expect("cold pin opens"));
+    let mut work = CaptureWorkBudget::default();
+    let held = cold_admit_member(&pin, &mut work).expect("the pre-mint holds the survivor slot");
+    let mut adapter = cold_caller_adapter();
+    let error = adapter
+        .admit(group.tgid, ImageAuthority::ScanPinned, 10)
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("admission raced a thread change"),
+        "a raced proof names the race, got {message}"
+    );
+    assert!(
+        !message.contains("exited") && !message.contains("no live process"),
+        "a raced proof never claims the group exited, got {message}"
+    );
+    assert!(
+        adapter.live_id(group.tgid).is_none(),
+        "a raced proof admits nothing"
+    );
+    // Control: release the slot and the same group cold-admits.
+    drop(held);
+    drop(pin);
+    let mut adapter = cold_caller_adapter();
+    let id = adapter
+        .admit(group.tgid, ImageAuthority::ScanPinned, 20)
+        .expect("the same group cold-admits once the race clears");
+    assert_eq!(
+        adapter.record(id).expect("cold record retained").pid,
+        group.tgid
+    );
+}
+
 /// A cold-minted member handed into the confirm routes the confirm
 /// through the survivor. Routing — not just carriage — is pinned with
 /// the work budget: the handed path spends 0 mint units while an

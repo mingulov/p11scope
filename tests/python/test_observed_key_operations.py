@@ -12,11 +12,11 @@ refused naming its targeted condition. Fixture `encoded_bytes` is
 illustrative, never asserted. No fixture, input, output or diagnostic here
 carries PIN, key, payload, handle or arbitrary bytes.
 
-The S1 mode (for releases without key operations) instead checks the
-installed RSA ledger against `edges[]`: exact per-function results,
-68 application calls through inventory entry counts, the
-CKM_SHA256_RSA_PKCS mechanism rows, and `object_observations` reading
-`unavailable`/`journal_unavailable`. Its twins are built in memory below.
+S1 twins preserve historical observed-parent comparisons and the current
+physical 68/instance 65 topology, including the actual stopped-child disclosure.
+They keep the exact operation/mechanism ledger denominator and unavailable
+journal guard. Lifetime EVENTS and actual stop accounting remain separate
+live-controller receipts, never invented Inventory fields.
 
 Run: python3 -I tests/python/test_observed_key_operations.py -v
 """
@@ -662,6 +662,264 @@ def s1_rsa_mechanisms(doc):
             if row["mechanism"] == 0x40]
 
 
+def s1_current_doc():
+    """Current b58 held-RSA capture shape, hand-built from the actual receipt.
+
+    Physical 68 and semantic 65 remain separate; the three COUNT_ONLY setup
+    calls are not semantic API observations. The stopped instance retains its
+    own 65/23/21/2 and 1+55 mechanism facts while the parent withholds a summary.
+    """
+    doc = s1_doc()
+    edge = doc["edges"][0]
+    child = {"caller": "c0", "module": "m0", "instance": "i0",
+             "entries": {"unit": "api_entries", "count": None,
+                         "observation": "unavailable"},
+             "api_returns": {"unit": "api_returns", "count": 65,
+                             "saturated": False, "historical_only_returns": 0},
+             "semantics": "observed", "operations": edge["operations"],
+             "mechanisms": edge["mechanisms"],
+             "coverage": {"lossy": True,
+                          "reasons": ["capture_stopped", "semantic_loss"]}}
+    edge.update(semantics="unknown (per-edge summary withheld; see semantic children)",
+                operations=None, mechanisms=None)
+    doc.update(scope="pid:41", callers=[{"id": "c0", "pid": 41,
+                                       "start_time": 110, "retired": False}],
+               modules=[{"id": "m0", "admission": {"state": "admitted",
+                         "class": "operator", "endpoints": 68, "reasons": []}}],
+               instances=[{"id": "i0", "caller": "c0", "module": "m0",
+                           "state": "uncertain", "reason": "semantic_loss",
+                           "first_seen_ns": 110, "last_seen_ns": 190}],
+               semantic_edges=[child], gaps_suppressed=0,
+               observation={"lane": "native", "lifecycle": {
+                   "ring_loss": 0, "malformed": 0, "failed_quanta": 0},
+                   "semantic_capture": {"status": "stopped", "admitted_endpoints": 68,
+                       "refused_endpoints": 0, "continuity_cuts": 0, "unrouted_returns": 0,
+                       "stop_quiescence": "quiesced", "final_drain": True}})
+    return doc
+
+
+class CurrentS1ModeTests(unittest.TestCase):
+    """The actual stopped child topology, with no loss/identity fallback."""
+    def check(self, doc):
+        return ORACLE.compare_s1(APP_TESTS.application_rows(), doc)
+
+    def test_actual_stopped_child_shape_passes_without_promoting_parent(self):
+        doc = s1_current_doc()
+        result = self.check(doc)
+        self.assertTrue(result["match"])
+        self.assertEqual(result["observed"]["entries"], 68)
+        self.assertEqual(result["observed"]["operations"]["calls"], 65)
+        self.assertEqual(result["observed"]["semantic_source"], {
+            "caller": "c0", "module": "m0", "instance": "i0", "api_returns": 65,
+            "coverage": {"lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}})
+        self.assertIsNone(doc["edges"][0]["operations"])
+        self.assertIsNone(doc["edges"][0]["mechanisms"])
+
+    def test_clean_observed_child_control_passes(self):
+        doc = s1_current_doc()
+        doc["instances"][0].update(state="observed", reason=None)
+        doc["semantic_edges"][0]["coverage"] = {"lossy": False, "reasons": []}
+        self.assertTrue(self.check(doc)["match"])
+
+    def test_bad_children_never_fall_back_to_a_healthy_legacy_parent(self):
+        for key, value in (("instances", None), ("semantic_edges", [])):
+            with self.subTest(key=key):
+                doc = s1_current_doc()
+                doc["edges"] = [s1_edge()]
+                doc[key] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+
+    def test_missing_null_empty_or_extra_graph_rows_are_refused(self):
+        for key in ("callers", "modules", "edges", "instances", "semantic_edges"):
+            for mode in ("missing", "null", "empty", "duplicate"):
+                with self.subTest(key=key, mode=mode):
+                    doc = s1_current_doc()
+                    if mode == "missing":
+                        del doc[key]
+                    elif mode == "null":
+                        doc[key] = None
+                    elif mode == "empty":
+                        doc[key] = []
+                    else:
+                        doc[key].append(copy.deepcopy(doc[key][0]))
+                    with self.assertRaises(ORACLE.OracleRefusal):
+                        self.check(doc)
+
+    def test_foreign_or_orphan_graph_references_are_refused(self):
+        cases = [("scope", None, "system"), ("callers", "pid", 42),
+                 ("callers", "id", "c1"), ("callers", "start_time", None),
+                 ("callers", "retired", True), ("modules", "id", "m1"),
+                 ("edges", "caller", "c1"), ("edges", "module", "m1"),
+                 ("instances", "caller", "c1"), ("instances", "module", "m1"),
+                 ("instances", "id", "i1"), ("semantic_edges", "instance", "i1"),
+                 ("semantic_edges", "caller", "c1"), ("semantic_edges", "module", "m1")]
+        for key, field, value in cases:
+            with self.subTest(key=key, field=field):
+                doc = s1_current_doc()
+                if field is None:
+                    doc[key] = value
+                else:
+                    doc[key][0][field] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+
+    def test_mixed_unrelated_child_cannot_supply_the_expected_counts(self):
+        doc = s1_current_doc()
+        foreign = copy.deepcopy(doc["semantic_edges"][0])
+        foreign.update(caller="c1", module="m1", instance="i1")
+        doc["semantic_edges"] = [foreign]
+        with self.assertRaises(ORACLE.OracleRefusal):
+            self.check(doc)
+
+    def test_exact_physical_and_semantic_denominators_are_separate(self):
+        for key, field, value in (("entries", "count", 67), ("entries", "count", 65),
+                                  ("entries", "in_flight", True), ("entries", "saturated", True),
+                                  ("api_returns", "count", 68), ("api_returns", "count", 64),
+                                  ("api_returns", "count", None), ("api_returns", "saturated", True),
+                                  ("api_returns", "historical_only_returns", 1),
+                                  ("api_returns", "unit", "calls")):
+            with self.subTest(key=key, field=field, value=value):
+                doc = s1_current_doc()
+                row = doc["edges"][0] if key == "entries" else doc["semantic_edges"][0]
+                row[key][field] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+        doc = s1_current_doc()
+        doc["semantic_edges"][0]["entries"]["count"] = 68
+        with self.assertRaises(ORACLE.OracleRefusal):
+            self.check(doc)
+
+    def test_native_lifecycle_and_final_capture_twins_are_refused(self):
+        cases = [("lane", None, "scan"), ("lifecycle", "ring_loss", 1),
+                 ("lifecycle", "malformed", 1), ("lifecycle", "failed_quanta", None),
+                 ("semantic_capture", "status", "active"),
+                 ("semantic_capture", "final_drain", False),
+                 ("semantic_capture", "stop_quiescence", "unproven"),
+                 ("semantic_capture", "refused_endpoints", 1),
+                 ("semantic_capture", "continuity_cuts", 1),
+                 ("semantic_capture", "unrouted_returns", 1)]
+        for key, field, value in cases:
+            with self.subTest(key=key, field=field):
+                doc = s1_current_doc()
+                if field is None:
+                    doc["observation"][key] = value
+                else:
+                    doc["observation"][key][field] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+
+    def test_only_the_exact_R59_stopped_reasons_are_accepted(self):
+        for reasons in (["semantic_loss"], ["capture_stopped"], [],
+                        ["capture_stopped", "semantic_loss", "task_retired"],
+                        ["capture_stopped", "instance_retired", "semantic_loss"],
+                        ["capture_stopped", "semantic_loss", "before_semantic_boundary"],
+                        ["capture_stopped", "semantic_loss", "semantic_loss"],
+                        ["semantic_loss", "capture_stopped"], ["unknown"]):
+            with self.subTest(reasons=reasons):
+                doc = s1_current_doc()
+                doc["semantic_edges"][0]["coverage"]["reasons"] = reasons
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+        for state, reason in (("retired", "task_retired"), ("uncertain", "instance_unproven"),
+                              ("observed", "semantic_loss")):
+            doc = s1_current_doc()
+            doc["instances"][0].update(state=state, reason=reason)
+            with self.subTest(state=state, reason=reason), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_parent_generic_unknown_or_semantic_payload_is_refused(self):
+        for field, value in (("semantics", "unknown (semantic capture withheld)"),
+                             ("operations", s1_operations()), ("mechanisms", [s1_rsa_row()])):
+            doc = s1_current_doc()
+            doc["edges"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_child_operations_and_mechanisms_remain_exact(self):
+        for field, value in (("calls", 64), ("started", 22), ("completed", 20),
+                             ("failed", 1), ("cancelled", 1), ("unknown", 1),
+                             ("orphans", 1), ("dropped", 1)):
+            with self.subTest(field=field):
+                doc = s1_current_doc()
+                doc["semantic_edges"][0]["operations"][field] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+        for index, field, value in ((0, "calls", 2), (0, "errors", 1),
+                                    (1, "calls", 54), (1, "errors", 2)):
+            with self.subTest(index=index, field=field):
+                doc = s1_current_doc()
+                doc["semantic_edges"][0]["mechanisms"][index][field] = value
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+        for missing in (0, 1):
+            doc = s1_current_doc()
+            del doc["semantic_edges"][0]["mechanisms"][missing]
+            with self.subTest(missing=missing), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        doc = s1_current_doc()
+        doc["semantic_edges"][0]["operations"]["evidence"]["semantic_capture_failures"] = 1
+        with self.assertRaises(ORACLE.OracleRefusal):
+            self.check(doc)
+        doc = s1_current_doc()
+        doc["semantic_edges"][0]["mechanisms"][1]["operations"].insert(0, "digest")
+        with self.assertRaises(ORACLE.OracleRefusal):
+            self.check(doc)
+
+    def test_manifest_mapping_and_gap_controls_are_not_relaxed(self):
+        for field, value in (("class", "heuristic"), ("state", "refused"),
+                             ("endpoints", 0), ("reasons", ["unproven"])):
+            doc = s1_current_doc()
+            doc["modules"][0]["admission"][field] = value
+            with self.subTest(field=field), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        for field, value in (("state", "ended"), ("interruptions", 1)):
+            doc = s1_current_doc()
+            doc["edges"][0]["mapping"][field] = value
+            with self.subTest(field=field), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        for value in (None, False, 1):
+            doc = s1_current_doc()
+            doc["gaps_suppressed"] = value
+            with self.subTest(suppressed=value), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_current_required_fields_cannot_be_unknown_or_boolean_counts(self):
+        for group, key in (("api_returns", "unit"), ("api_returns", "count"),
+                           ("api_returns", "saturated"), ("api_returns", "historical_only_returns"),
+                           ("entries", "observation"), ("coverage", "reasons"),
+                           ("coverage", "lossy")):
+            doc = s1_current_doc()
+            del doc["semantic_edges"][0][group][key]
+            with self.subTest(group=group, key=key), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        for group, key in (("lifecycle", "ring_loss"), ("semantic_capture", "continuity_cuts"),
+                           ("semantic_capture", "refused_endpoints"), ("semantic_capture", "unrouted_returns")):
+            doc = s1_current_doc()
+            doc["observation"][group][key] = False
+            with self.subTest(group=group, key=key), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_current_child_cli_positive_and_loss_negative(self):
+        with tempfile.TemporaryDirectory(prefix="rsa-current-child-") as directory:
+            application = Path(directory) / "application.jsonl"
+            application.write_text("".join(json.dumps(row) + "\n" for row in APP_TESTS.application_rows()))
+            observer = Path(directory) / "inventory.json"
+            command = [sys.executable, "-I", str(ROOT / "scripts/qualify-key-operations.py"),
+                       "--s1", str(application), str(observer)]
+            doc = s1_current_doc()
+            observer.write_text(json.dumps(doc))
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["observed"]["semantic_source"]["api_returns"], 65)
+            doc["semantic_edges"][0]["coverage"]["reasons"].append("task_retired")
+            observer.write_text(json.dumps(doc))
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn("Traceback", result.stderr)
+
+
 class S1ModeTests(unittest.TestCase):
     maxDiff = 4096
 
@@ -868,6 +1126,9 @@ class S1ModeTests(unittest.TestCase):
         def rsa_operations_short(doc):
             s1_rsa_mechanisms(doc)[0]["operations"] = ["sign"]
 
+        def rsa_operations_extra(doc):
+            s1_rsa_mechanisms(doc)[0]["operations"].insert(0, "digest")
+
         def rsa_truncated(doc):
             s1_rsa_mechanisms(doc)[0]["evidence"]["truncated"] = True
 
@@ -1039,6 +1300,8 @@ class S1ModeTests(unittest.TestCase):
              ["unexpected mechanism name"]),
             ("mechanism operations short", rsa_operations_short,
              ["missing expected operations"]),
+            ("mechanism operations extra", rsa_operations_extra,
+             ["unexpected operations"]),
             ("truncated provenance", rsa_truncated, ["truncated"]),
             ("extra function", extra_function, ["unexpected S1 functions"]),
             ("return name wrong", return_name_wrong,

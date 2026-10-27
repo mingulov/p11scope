@@ -21,12 +21,20 @@ as operations (all-zero rows of any category/role/unit/metadata are
 tolerated as idle and contribute nothing). Refusal diagnostics name only
 frozen labels and counts; unknown product strings are never echoed.
 
-With `--s1` (releases without a key-operation feed) the oracle instead
-checks the installed RSA ledger against `edges[]`: exact per-function
-results and the sign/verify/setup call split from the ledger's call rows,
-68 application calls through inventory entry counts, the operation
-aggregates, the CKM_SHA256_RSA_PKCS mechanism rows on the counted edges,
-and `object_observations` reading `unavailable`/`journal_unavailable`.
+With `--s1` the current Inventory topology proves 68 physical entries separately
+from one owned instance child's 65 reducer-admitted API observations, operations and
+mechanisms. The parent deliberately withholds its semantic summary. Only the
+exact stopped disclosure {capture_stopped, semantic_loss} is accepted beside
+proven terminal drain and the fixed ledger/child counts; the disclosure remains
+in the match summary. Any present child-topology key forces this strict path.
+When both additive keys are absent, the previous strict observed-parent format
+remains historical data compatibility, not a current release live receipt.
+
+This oracle proves only facts in the supplied ledger and Inventory document.
+Inventory does not publish lifetime Detailed EVENTS loss or collected/joined/
+shed accounting. A live qualification must separately require identity-bound
+held-map EVENTS loss of zero through observer exit and the actual 68/68/0 stop receipt.
+Neither those facts nor caller/module identities are invented from the ledger.
 
 Exit 0 prints the match summary as JSON; exit 1 leaves stdout empty and
 names the finite refusal cause on stderr.
@@ -712,8 +720,10 @@ def _check_s1_zero_count_edge(edge):
              f" != expected 0")
 
 
-def _check_s1_edge_counts(edges):
-    """Sum entry counts; counted edges must be loss-free and S1-observed.
+def _check_s1_edge_counts(edges, *, parent_semantics=True):
+    """Sum loss-free physical entry counts; legacy also requires parent S1.
+
+    The current topology validates the withheld parent and child separately.
 
     Zero-count edges contribute nothing but must still be empty: their
     mechanism rows keep the allowed ids with zero calls/errors, and any
@@ -741,12 +751,103 @@ def _check_s1_edge_counts(edges):
             raise OracleRefusal("unexpected S1 coverage state")
         _require(coverage.get("lossy") is False,
                  f"S1 edge with {count} entries is lossy")
-        _require(edge.get("semantics") == "observed",
-                 "S1 edge semantics is not observed")
+        if parent_semantics:
+            _require(edge.get("semantics") == "observed",
+                     "S1 edge semantics is not observed")
         counted.append(edge)
     _require(total == EXPECTED_API_CALLS,
              f"S1 entries total {total} != expected {EXPECTED_API_CALLS}")
     return total, counted
+
+
+def _s1_singleton(doc, name):
+    rows = doc.get(name)
+    _require(type(rows) is list and len(rows) == 1 and type(rows[0]) is dict,
+             f"S1 current topology needs exactly one {name} row")
+    return rows[0]
+
+
+def _s1_current_child(doc):
+    """Validate the single PID-scoped RSA population without mixing authorities.
+
+    The ledger has no PID or module hash: these are consistent envelope
+    references, while the live controller separately binds its actual child
+    PID generation and mapped provider. No missing topology may fall back.
+    """
+    caller = _s1_singleton(doc, "callers")
+    module = _s1_singleton(doc, "modules")
+    edge = _s1_singleton(doc, "edges")
+    instance = _s1_singleton(doc, "instances")
+    child = _s1_singleton(doc, "semantic_edges")
+    for row, prefix in ((caller, "c"), (module, "m"), (instance, "i")):
+        _require(type(row.get("id")) is str
+                 and re.fullmatch(prefix + r"[0-9]+", row["id"]) is not None,
+                 "invalid S1 current topology identity")
+    pid = caller.get("pid")
+    _require(_u64(pid) and 0 < pid < 2 ** 32 and doc.get("scope") == f"pid:{pid}"
+             and _u64(caller.get("start_time")) and caller.get("retired") is False,
+             "S1 caller is not the retained PID scope")
+    pair = (caller["id"], module["id"])
+    _require(all((row.get("caller"), row.get("module")) == pair
+                 for row in (edge, instance, child))
+             and child.get("instance") == instance["id"],
+             "S1 child does not resolve to the owned caller/module/instance")
+    admission = module.get("admission")
+    _require(type(admission) is dict and admission.get("state") == "admitted"
+             and admission.get("class") == "operator" and admission.get("reasons") == []
+             and _u64(admission.get("endpoints")) and admission["endpoints"] > 0,
+             "S1 module lacks validated manifest admission")
+    mapping = edge.get("mapping")
+    _require(type(mapping) is dict and mapping.get("state") == "mapped"
+             and _u64(mapping.get("interruptions")) and mapping["interruptions"] == 0,
+             "S1 physical mapping is retired or interrupted")
+    entries = edge.get("entries")
+    _require(type(entries) is dict and entries.get("observation") == "observed"
+             and entries.get("in_flight") is False and entries.get("saturated") is False,
+             "S1 physical entries are not complete observed counts")
+    _require(edge.get("semantics") == "unknown (per-edge summary withheld; see semantic children)"
+             and "operations" in edge and edge["operations"] is None
+             and "mechanisms" in edge and edge["mechanisms"] is None,
+             "S1 current parent is not the exact withheld semantic summary")
+    _require(child.get("semantics") == "observed"
+             and child.get("entries") == {"unit": "api_entries", "count": None,
+                                          "observation": "unavailable"},
+             "S1 child lacks observed semantics or invents physical entries")
+    returns = child.get("api_returns")
+    _require(type(returns) is dict and returns.get("unit") == "api_returns"
+             and _u64(returns.get("count")) and returns["count"] == S1_OPERATIONS["calls"]
+             and returns.get("saturated") is False
+             and _u64(returns.get("historical_only_returns"))
+             and returns["historical_only_returns"] == 0,
+             "S1 child API returns are not exactly 65 current observations")
+
+    observation = doc.get("observation")
+    _require(type(observation) is dict and observation.get("lane") == "native",
+             "S1 current capture is not native")
+    lifecycle = observation.get("lifecycle")
+    _require(type(lifecycle) is dict and all(_u64(lifecycle.get(name)) and lifecycle[name] == 0
+             for name in ("ring_loss", "malformed", "failed_quanta")),
+             "S1 lifecycle loss is unknown or nonzero")
+    capture = observation.get("semantic_capture")
+    _require(type(capture) is dict and capture.get("status") == "stopped"
+             and capture.get("final_drain") is True and capture.get("stop_quiescence") == "quiesced"
+             and _u64(capture.get("admitted_endpoints")) and capture["admitted_endpoints"] > 0
+             and all(_u64(capture.get(name)) and capture[name] == 0
+                     for name in ("refused_endpoints", "continuity_cuts", "unrouted_returns")),
+             "S1 terminal semantic drain or continuity is unproven")
+    _require(_u64(doc.get("gaps_suppressed")) and doc["gaps_suppressed"] == 0,
+             "S1 suppressed gaps are unknown or nonzero")
+    coverage = child.get("coverage")
+    _require(type(coverage) is dict, "S1 child coverage missing")
+    if coverage.get("lossy") is False and coverage.get("reasons") == []:
+        _require(instance.get("state") == "observed" and instance.get("reason") is None,
+                 "S1 child has unproven instance authority")
+    else:
+        _require(coverage.get("lossy") is True
+                 and coverage.get("reasons") == ["capture_stopped", "semantic_loss"]
+                 and instance.get("state") == "uncertain" and instance.get("reason") == "semantic_loss",
+                 "S1 child is not the exact R59 stopped instance disclosure")
+    return child
 
 
 def _check_s1_operations_row(operations):
@@ -819,6 +920,8 @@ def _check_s1_mechanisms(counted):
             _require(name == spec["name"], "unexpected mechanism name")
             _require(set(spec["operations"]) <= set(operations),
                      f"mechanism {spec['name']} missing expected operations")
+            _require(set(operations) <= set(spec["operations"]),
+                     f"mechanism {spec['name']} has unexpected operations")
             _require(truncated is False, "truncated mechanism provenance")
             seen = aggregate[mechanism]
             seen["present"] = True
@@ -866,7 +969,7 @@ def _check_s1_mechanisms(counted):
 
 
 def compare_s1(application_rows, observer_doc):
-    """S1 mode: check the RSA ledger against edges[] without key operations.
+    """Compare the fixed RSA ledger with physical counts and owned S1 facts.
 
     Returns {"match": True, "mode": "s1", "application": ..., "observed": ...}
     when the ledger's per-function results and call split equal the RSA cell
@@ -881,10 +984,14 @@ def compare_s1(application_rows, observer_doc):
     except LEDGER.LedgerError as error:
         raise OracleRefusal(f"application ledger refused: {error}") from None
     split, per_function = _check_s1_application(application_rows, application)
-    total, counted = _check_s1_edge_counts(edges)
+    current = "instances" in observer_doc or "semantic_edges" in observer_doc
+    child = _s1_current_child(observer_doc) if current else None
+    total, counted = _check_s1_edge_counts(edges, parent_semantics=not current)
+    if child is not None:
+        counted = [child]
     totals, active_total = _check_s1_operations(counted)
     observed_mechanisms = _check_s1_mechanisms(counted)
-    return {"match": True, "mode": "s1",
+    result = {"match": True, "mode": "s1",
             "application": {"api_calls": application["api_calls"],
                             "calls_by_function": application["calls_by_function"],
                             "operations": application["operations"],
@@ -896,12 +1003,19 @@ def compare_s1(application_rows, observer_doc):
             "observed": {"entries": total,
                          "operations": {**totals, "active": active_total},
                          "mechanisms": observed_mechanisms}}
+    if child is not None:
+        result["observed"]["semantic_source"] = {
+            "caller": child["caller"], "module": child["module"], "instance": child["instance"],
+            "api_returns": child["api_returns"]["count"],
+            "coverage": {"lossy": child["coverage"]["lossy"],
+                         "reasons": list(child["coverage"]["reasons"])}}
+    return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--s1", action="store_true",
-                        help="S1 mode: check the RSA ledger against edges[]"
+                        help="S1 mode: check physical entries and owned instance facts"
                         " with object_observations unavailable"
                         " (no key-operation feed)")
     parser.add_argument("application", help="application JSONL file")

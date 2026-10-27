@@ -113,8 +113,16 @@ pub fn classify_eperm_origin(evidence: EpermEvidence) -> EpermOrigin {
     }
 }
 
+#[cfg(test)]
 fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     const MAX_BYTES: usize = 4096;
+    bounded_verifier_diagnostic_with_budget(verifier_text, MAX_BYTES)
+}
+
+/// The verifier excerpt within a caller-supplied byte budget: the errno
+/// or refusal prefix keeps its own text while the excerpt shrinks, so the
+/// whole diagnostic stays within 4096 bytes however the refusal is named.
+fn bounded_verifier_diagnostic_with_budget(verifier_text: &str, max_bytes: usize) -> String {
     const PREFIX: &str = "verifier: ";
     const MIDDLE_OMITTED: &str = " [middle omitted] ";
 
@@ -122,10 +130,10 @@ fn bounded_verifier_diagnostic(verifier_text: &str) -> String {
     if escaped.is_empty() {
         return "verifier rejected the embedded program".to_string();
     }
-    if PREFIX.len() + escaped.len() <= MAX_BYTES {
+    if PREFIX.len() + escaped.len() <= max_bytes {
         return format!("{PREFIX}{escaped}");
     }
-    let excerpt_bytes = MAX_BYTES - PREFIX.len() - MIDDLE_OMITTED.len();
+    let excerpt_bytes = max_bytes.saturating_sub(PREFIX.len() + MIDDLE_OMITTED.len());
     let mut head_end = excerpt_bytes / 4;
     while !escaped.is_char_boundary(head_end) {
         head_end -= 1;
@@ -628,17 +636,42 @@ fn bounded_error_text(message: &str) -> String {
 fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
     let mut context = Vec::new();
     let detail = loop {
-        if let Some(program @ ProgramError::LoadError { verifier_log, .. }) =
-            error.downcast_ref::<ProgramError>()
+        if let Some(
+            program @ ProgramError::LoadError {
+                verifier_log,
+                io_error,
+                ..
+            },
+        ) = error.downcast_ref::<ProgramError>()
         {
             // Never format LoadError itself: its Display includes the complete
             // verifier log. Keep the independently bounded excerpt instead,
-            // naming a budget refusal for what it is.
-            let excerpt = bounded_verifier_diagnostic(&verifier_log.to_string());
-            if let Some(errno_name) = crate::attach::verifier_budget_refusal_errno_name(program) {
-                break format!("verifier budget refused the program ({errno_name}); {excerpt}");
-            }
-            break excerpt;
+            // naming a budget refusal for what it is — and, for any other
+            // refusal, the errno the log alone does not name.
+            let prefix = match crate::attach::verifier_budget_refusal_errno_name(program) {
+                // ENOSPC proves only that the verifier log filled during a
+                // very long check, not what the verifier concluded.
+                Some("ENOSPC") => "verifier log filled during a very long check (ENOSPC); \
+                 usually the complexity limit; "
+                    .to_string(),
+                Some(errno_name) => {
+                    format!("verifier budget refused the program ({errno_name}); ")
+                }
+                None => {
+                    let errno_text = match io_error.raw_os_error() {
+                        Some(errno) => match crate::attach::load_refusal_errno_name(errno) {
+                            Some(name) => format!("{name} (os error {errno})"),
+                            None => format!("os error {errno}"),
+                        },
+                        None => "unknown errno".to_string(),
+                    };
+                    format!("BPF_PROG_LOAD failed with {errno_text}; ")
+                }
+            };
+            let budget = 4096usize.saturating_sub(prefix.len());
+            let excerpt =
+                bounded_verifier_diagnostic_with_budget(&verifier_log.to_string(), budget);
+            break format!("{prefix}{excerpt}");
         }
         let Some(source) = error.source() else {
             break format_operation_error(error);
@@ -1423,9 +1456,15 @@ fn capability_tier_line(capability: CapabilityTierResult) -> String {
 }
 
 fn verdict_line(checks: &[Check]) -> String {
-    let capture_ok = !checks
-        .iter()
-        .any(|c| is_capture_row(&c.name) && matches!(c.status, Status::Fail(_)));
+    // The inventory lane gets its own part below: an inventory-only
+    // failure must not read as "capture unavailable" when the Detailed
+    // lanes work. Exit gating is unchanged (`verdict` still counts the
+    // inventory row as a requested lane).
+    let capture_ok = !checks.iter().any(|c| {
+        is_capture_row(&c.name)
+            && c.name != INVENTORY_PREFLIGHT_ROW
+            && matches!(c.status, Status::Fail(_))
+    });
     let mut parts = vec![format!(
         "capture {}",
         if capture_ok {
@@ -1434,6 +1473,11 @@ fn verdict_line(checks: &[Check]) -> String {
             "unavailable"
         }
     )];
+    if let Some(check) = checks.iter().find(|c| c.name == INVENTORY_PREFLIGHT_ROW)
+        && let Status::Fail(detail) = &check.status
+    {
+        parts.push(format!("inventory capture unavailable ({detail})"));
+    }
 
     if let Some(check) = checks.iter().find(|c| is_scan_row(&c.name)) {
         match &check.status {

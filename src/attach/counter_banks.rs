@@ -3411,14 +3411,20 @@ pub(super) fn map_counter_start_error(error: anyhow::Error) -> anyhow::Error {
 /// the named counter-mode refusal. Only a genuine BPF_PROG_LOAD E2BIG (the
 /// program is too complex for this kernel's verifier) is rewritten, with a
 /// finite reason that never embeds the raw verifier log; every other error
-/// passes through unchanged. Detection walks the io errors in the chain: a
-/// program-load failure carries its syscall errno as the chain source, so no
-/// direct match on the loader's private error shape is needed at this seam.
+/// passes through unchanged. Detection downcasts to a genuine program-load
+/// refusal, as `is_verifier_budget_refusal` does: any other E2BIG in the
+/// chain (a map-create E2BIG, a bare io error) keeps its own error.
 fn map_counter_verifier_budget_refusal(error: anyhow::Error) -> anyhow::Error {
     let budget = error.chain().any(|cause| {
         cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| super::is_verifier_budget_errno(io.raw_os_error()))
+            .downcast_ref::<aya::programs::ProgramError>()
+            .is_some_and(|program| {
+                matches!(
+                    program,
+                    aya::programs::ProgramError::LoadError { io_error, .. }
+                    if super::is_verifier_budget_errno(io_error.raw_os_error())
+                )
+            })
     });
     if budget {
         anyhow::anyhow!("{COUNTER_VERIFIER_BUDGET_REFUSAL}")
@@ -10185,11 +10191,14 @@ pub(crate) mod tests {
 
     #[test]
     fn counter_verifier_budget_refusal_maps_e2big_only() {
-        // A kernel verifier-budget rejection (E2BIG from BPF_PROG_LOAD)
-        // becomes the finite named refusal without the raw verifier log.
-        let blob = "verifier-line\n".repeat(9000);
-        let loaded: anyhow::Error = std::io::Error::from_raw_os_error(libc::E2BIG).into();
-        let loaded = loaded.context(format!("loading function_list_return\n{blob}"));
+        // A kernel verifier-budget rejection (E2BIG from BPF_PROG_LOAD,
+        // shaped as the genuine loader error) becomes the finite named
+        // refusal without the raw verifier log.
+        let loaded = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new("verifier-line\n".repeat(9000)),
+        })
+        .context("loading function_list_return");
         let mapped = map_counter_verifier_budget_refusal(loaded);
         assert_eq!(
             mapped.to_string(),
@@ -10200,13 +10209,14 @@ pub(crate) mod tests {
             "the raw verifier log must not survive the mapping"
         );
         // Every other failure passes through with its chain unchanged: the
-        // old-kernel token (no E2BIG), the Multi pid-filter errno (EINVAL)
-        // and an unrelated error.
+        // old-kernel token (no E2BIG), the Multi pid-filter errno (EINVAL),
+        // a bare io E2BIG without a program load, and an unrelated error.
         for untouched in [
             anyhow::anyhow!(
                 "counter-mode-unavailable-on-kernel: the kernel loads BPF programs but rejects the bpf_loop (helper 181) probe"
             ),
             std::io::Error::from_raw_os_error(libc::EINVAL).into(),
+            std::io::Error::from_raw_os_error(libc::E2BIG).into(),
             anyhow::anyhow!("some other failure"),
         ] {
             let before = format!("{untouched:#}");

@@ -5238,6 +5238,247 @@ pub(crate) fn verifier_budget_refusal_errno_name(
     }
 }
 
+/// Upper bound for a user-visible native-preparation reason: far below the
+/// 16,384-byte `inventory diff` per-string limit.
+pub(crate) const NATIVE_PREPARATION_REASON_MAX_BYTES: usize = 1024;
+
+/// Upper bound for a program-load refusal on stderr: the hint plus the
+/// fixed `main`/`run` wrappers must still fit the 1024-byte stderr bound
+/// (see `stderr_bound_leaves_room_for_hint_and_wrappers`).
+pub(crate) const STDERR_LOAD_REFUSAL_MAX_BYTES: usize = 512;
+
+/// Truncate to at most `max` bytes on a char boundary.
+pub(crate) fn truncate_to_char_boundary(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// The program a preparation context names, if any:
+/// `preparing Inventory: LoadProgram("NAME", MODE)`,
+/// `Inventory program NAME`, or a Detailed/counter `loading ...` stage.
+/// Bounded and line-local; never a log excerpt.
+pub(crate) fn program_name_in_preparation_context(context: &str) -> Option<String> {
+    for prefix in ["LoadProgram(\"", "Inventory program "] {
+        if let Some(rest) = context.split_once(prefix).map(|(_, rest)| rest) {
+            let end = rest
+                .find(|c: char| c == '"' || c.is_whitespace() || c.is_control())
+                .unwrap_or(rest.len());
+            let name = rest[..end].trim();
+            if !name.is_empty() && name.len() <= 128 {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // Detailed and counter loads name the program in `loading ...` stages
+    // (`loading {prog}`, `loading {prog} for multi attach`,
+    // `loading required raw|typed {prog}`); only those shapes qualify, so
+    // a BTF or object stage never yields a program name.
+    if let Some(rest) = context.split_once("loading ").map(|(_, rest)| rest) {
+        let line = rest.lines().next().unwrap_or_default();
+        let candidate = line.strip_suffix(" for multi attach").unwrap_or(line);
+        let candidate = candidate
+            .strip_prefix("required raw ")
+            .or_else(|| candidate.strip_prefix("required typed "))
+            .unwrap_or(candidate);
+        if !candidate.is_empty()
+            && candidate.len() <= 64
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Short errno name for a load refusal; unknown errnos stay numeric.
+pub(crate) fn load_refusal_errno_name(errno: i32) -> Option<&'static str> {
+    match errno {
+        libc::E2BIG => Some("E2BIG"),
+        libc::EACCES => Some("EACCES"),
+        libc::EINVAL => Some("EINVAL"),
+        libc::EPERM => Some("EPERM"),
+        libc::ENOSPC => Some("ENOSPC"),
+        libc::EAGAIN => Some("EAGAIN"),
+        libc::ENOMEM => Some("ENOMEM"),
+        libc::EBUSY => Some("EBUSY"),
+        libc::ENOENT => Some("ENOENT"),
+        _ => None,
+    }
+}
+
+/// The verifier's `processed N insns (limit M)` summary, scanned from the
+/// log tail where the kernel prints it. Pure parsing: the log itself is
+/// never copied into the reason.
+pub(crate) fn verifier_processed_counts(log: &str) -> Option<(u64, u64)> {
+    let rest = log
+        .rfind("processed ")
+        .map(|at| &log[at + "processed ".len()..])?;
+    let processed: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    let limit_key = "insns (limit ";
+    let limit_rest = rest
+        .find(limit_key)
+        .map(|at| &rest[at + limit_key.len()..])?;
+    let limit: u64 = limit_rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (processed > 0 && limit > 0).then_some((processed, limit))
+}
+
+/// The first program-load refusal in the chain, scanning outermost first:
+/// the program a preparation context names, the load errno, and the raw
+/// verifier log. `None` when no chain link is a program-load failure.
+pub(crate) fn find_program_load_refusal(
+    error: &anyhow::Error,
+) -> Option<(Option<String>, Option<i32>, String)> {
+    let mut program: Option<String> = None;
+    let mut refusal: Option<(Option<i32>, String)> = None;
+    for cause in error.chain() {
+        if let Some(load) = cause.downcast_ref::<aya::programs::ProgramError>() {
+            if let aya::programs::ProgramError::LoadError {
+                io_error,
+                verifier_log,
+            } = load
+            {
+                refusal.get_or_insert((io_error.raw_os_error(), verifier_log.to_string()));
+            }
+            continue;
+        }
+        if program.is_none() {
+            program = program_name_in_preparation_context(&cause.to_string());
+        }
+    }
+    refusal.map(|(errno, log)| (program, errno, log))
+}
+
+/// Named summary of a BPF program-load refusal: the stage, program, errno,
+/// and processed count when known, plus a pointer at doctor. The raw log
+/// is never embedded; its withheld size is named instead.
+pub(crate) fn summarize_program_load_refusal(
+    error: &anyhow::Error,
+    program: Option<String>,
+    errno: Option<i32>,
+    log: &str,
+) -> String {
+    let stage =
+        truncate_to_char_boundary(error.to_string().lines().next().unwrap_or_default(), 256);
+    let program = program.as_deref().unwrap_or("unknown program");
+    let errno_text = match errno {
+        Some(errno) => match load_refusal_errno_name(errno) {
+            Some(name) => format!("{name} (os error {errno})"),
+            None => format!("os error {errno}"),
+        },
+        None => "unknown errno".to_string(),
+    };
+    let counts = verifier_processed_counts(log).map_or(String::new(), |(processed, limit)| {
+        format!("; verifier processed {processed} insns (limit {limit})")
+    });
+    let summary = format!(
+        "{stage}: program \"{program}\" refused: BPF_PROG_LOAD failed with {errno_text}{counts}; \
+         run `p11scope doctor` to diagnose this host ({} verifier-log bytes withheld)",
+        log.len()
+    );
+    truncate_to_char_boundary(&summary, NATIVE_PREPARATION_REASON_MAX_BYTES)
+}
+
+/// Bounded, named summary of a native-lane preparation failure for the
+/// user-visible gap reason, stderr line, and native-mode error.
+///
+/// A program-load refusal carries the kernel verifier's full log inside
+/// [`aya::programs::ProgramError::LoadError`]; formatting the chain with
+/// `{error:#}` once embedded a 267 KiB dump in the gap reason and broke
+/// `inventory diff`. This summary names the refusing program, the errno,
+/// and the processed count when the chain carries them, points at
+/// `p11scope doctor`, and never embeds the raw log. Short failures without
+/// a load refusal pass through verbatim.
+pub(crate) fn summarize_native_preparation_error(error: &anyhow::Error) -> String {
+    match find_program_load_refusal(error) {
+        Some((program, errno, log)) => summarize_program_load_refusal(error, program, errno, &log),
+        None => {
+            let full = format!("{error:#}");
+            if full.len() <= NATIVE_PREPARATION_REASON_MAX_BYTES {
+                full
+            } else {
+                let head = truncate_to_char_boundary(
+                    full.lines().next().unwrap_or_default(),
+                    NATIVE_PREPARATION_REASON_MAX_BYTES / 2,
+                );
+                format!(
+                    "{head} …({} bytes withheld; run `p11scope doctor` to diagnose this host)",
+                    full.len()
+                )
+            }
+        }
+    }
+}
+
+/// Bounded summary of a program-load refusal for stderr: the stage,
+/// program, errno, processed count when known, and a short tail of the
+/// verifier log, with the truncation named by the log's original byte
+/// count. `None` when the chain carries no program-load refusal, in
+/// which case the caller keeps the error untouched.
+///
+/// The accompanying hint always points at `p11scope doctor`, so this
+/// summary spends its budget on the failure itself. Component budgets
+/// (stage 64, program 64, errno 29, counts 64, tail 128, naming 56, fixed
+/// template 69) keep it within [`STDERR_LOAD_REFUSAL_MAX_BYTES`] by
+/// construction; the final truncation is unreachable defense.
+pub(crate) fn summarize_load_refusal_for_stderr(error: &anyhow::Error) -> Option<String> {
+    let (program, errno, log) = find_program_load_refusal(error)?;
+    let stage = truncate_to_char_boundary(error.to_string().lines().next().unwrap_or_default(), 64);
+    let program = program.map(|name| truncate_to_char_boundary(&name, 64));
+    let program = program.as_deref().unwrap_or("unknown program");
+    let errno_text = match errno {
+        Some(errno) => match load_refusal_errno_name(errno) {
+            Some(name) => format!("{name} (os error {errno})"),
+            None => format!("os error {errno}"),
+        },
+        None => "unknown errno".to_string(),
+    };
+    let counts = verifier_processed_counts(&log)
+        .map(|(processed, limit)| format!("; verifier processed {processed} insns (limit {limit})"))
+        .filter(|clause| clause.len() <= 64)
+        .unwrap_or_default();
+    // The last bytes of the log, escaped to one line: the kernel prints
+    // the decisive refusal at the end.
+    let mut tail = log.as_str();
+    if tail.len() > 128 {
+        let mut start = tail.len() - 128;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = &tail[start..];
+    }
+    let escaped = crate::render::escape_controls(tail);
+    let tail = truncate_to_char_boundary(&escaped, 128);
+    let tail_clause = if tail.is_empty() {
+        String::new()
+    } else {
+        format!("; verifier tail: {tail}")
+    };
+    let naming = if log.len() <= 128 {
+        format!("{} verifier-log bytes total", log.len())
+    } else {
+        format!("{} verifier-log bytes total, tail shown", log.len())
+    };
+    let summary = format!(
+        "{stage}: program \"{program}\" refused: BPF_PROG_LOAD failed with {errno_text}{counts}{tail_clause}; ({naming})"
+    );
+    Some(truncate_to_char_boundary(
+        &summary,
+        STDERR_LOAD_REFUSAL_MAX_BYTES,
+    ))
+}
+
 /// The DISCOVERY ring size this scope loads with.
 /// The one loader configuration of the capture object, shared by capture
 /// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
@@ -5695,8 +5936,8 @@ pub(crate) const VERIFIER_BUDGET_HINT: &str = "hint: the kernel's verifier found
 complex and refused it (E2BIG) — this is a p11scope bug on this kernel, not a privilege \
 problem. Report it with the `p11scope doctor` output.";
 
-pub(crate) const VERIFIER_BUDGET_HINT_LOG_EXHAUSTION: &str = "hint: the kernel's verifier found a p11scope program too \
-complex and the verbose verifier log filled the load buffer first, so the load was refused (ENOSPC) — this is a \
+pub(crate) const VERIFIER_BUDGET_HINT_LOG_EXHAUSTION: &str = "hint: the verifier log filled during a very long check, \
+so the load was refused (ENOSPC) — usually the complexity limit; this is a \
 p11scope bug on this kernel, not a privilege problem. Report it with the `p11scope doctor` output.";
 
 fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
@@ -5705,6 +5946,13 @@ fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
             .downcast_ref::<aya::programs::ProgramError>()
             .and_then(verifier_budget_refusal_errno_name)
     });
+    // A program-load refusal carries the kernel's whole verifier log; the
+    // bounded summary replaces the chain before the hint is added, so
+    // stderr never dumps the raw log. Any other failure keeps its chain.
+    let error = match summarize_load_refusal_for_stderr(&error) {
+        Some(summary) => anyhow::anyhow!("{summary}"),
+        None => error,
+    };
     match budget_errno {
         Some("ENOSPC") => error.context(VERIFIER_BUDGET_HINT_LOG_EXHAUSTION),
         Some(_) => error.context(VERIFIER_BUDGET_HINT),
@@ -12126,6 +12374,26 @@ mod tests {
         assert!(stderr.contains("TAIL-MARKER"), "{stderr}");
         assert!(stderr.contains("307200 verifier-log bytes"), "{stderr}");
         assert_eq!(crate::failure_exit_code(&error), 1);
+    }
+
+    #[test]
+    fn stderr_bound_leaves_room_for_hint_and_wrappers() {
+        // Premise behind the CLI-level stderr bound: every hint plus the
+        // fixed `main`/`run` wrappers must leave room for the bounded
+        // refusal summary within 1024 bytes. Lengthening a hint past this
+        // fails here instead of silently breaking the bound.
+        let wrappers = "p11scope: ".len() + "starting attach session: ".len() + ": ".len() + 1;
+        for hint in [
+            UNSUPPORTED_ENV_HINT,
+            VERIFIER_BUDGET_HINT,
+            VERIFIER_BUDGET_HINT_LOG_EXHAUSTION,
+        ] {
+            assert!(
+                hint.len() + STDERR_LOAD_REFUSAL_MAX_BYTES + wrappers <= 1024,
+                "hint too long for the stderr bound: {} bytes",
+                hint.len()
+            );
+        }
     }
 
     #[test]

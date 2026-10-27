@@ -5800,11 +5800,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Mint one held exec handoff for a proven transition (H6 slice 2).
-    /// The sole minter: `apply_exec_transition` is the only caller. The
-    /// original held pin moves into the handoff first, then the old
-    /// incarnation retires; at most one handoff per ended caller. `None`
-    /// when one is already held or custody is gone (both defensive: live
-    /// callers hold neither state).
+    /// Called by `apply_exec_transition` (row-proven) and `apply_exec_hook`
+    /// (unheld predecessor). The original held pin moves into the handoff
+    /// first, then the old incarnation retires; at most one handoff per
+    /// ended caller. `None` when one is already held or custody is gone
+    /// (both defensive: live callers hold neither state).
     fn mint_pending_successor(&mut self, transition: ExecTransition, now_ns: u64) -> Option<()> {
         let caller = transition.caller();
         if self.pending_successors.contains_key(&caller) {
@@ -12967,6 +12967,103 @@ exit 0
                 .gap_subjects()
                 .contains(&"exec successor minted without a held predecessor".to_string())
         );
+    }
+
+    #[test]
+    fn an_ordered_exec_hook_for_a_held_caller_mints_no_successor() {
+        // The won race, held successor: the row path proved the exec
+        // transition and the successor bound its own first row, so the
+        // binder holds an image for it. An ORDERED exec hook (stamped
+        // after the successor's admission, comparable clocks, the held
+        // pin answering live) must stay out: the row path owns this
+        // caller, and only the holds-image skip stops the mint. This
+        // pins the mutual exclusion the stale-hint test cannot (a stale
+        // hook skips before the holds check runs).
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        // Gen-0 binds, then its next image proves the row-proven
+        // transition: the won race mints the successor.
+        let first = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![first]);
+        let later = native.row(41, 2, 7, 1_100, 1);
+        let events = native.witness(vec![later]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("the row path must mint the successor: {events:?}");
+        };
+        assert_eq!(*old, caller);
+        let successor = *new;
+        assert_ne!(successor, caller);
+        // The successor's own first row binds to it: the row path now
+        // holds this caller.
+        let t0 = native.stamps.tick();
+        let row = native.row(41, 2, 7, t0, 0);
+        let bound_events = native.witness(vec![row]);
+        assert!(bound_events.is_empty(), "{bound_events:?}");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor),
+            "the successor's own row binds: {:?}",
+            native.gap_subjects()
+        );
+        // Preconditions for the pin: comparable clocks, the live pin
+        // held, and an ordered hook (stamped after the successor's
+        // admission, so the stale skip cannot engage).
+        native.scene.coordinator.exit_clocks_comparable = true;
+        assert!(native.scene.coordinator.exit_clocks_comparable);
+        assert!(native.scene.coordinator.adapter.live_pin(7).is_some());
+        let admitted_ns = native
+            .scene
+            .coordinator
+            .adapter
+            .record(successor)
+            .unwrap()
+            .admitted_ns;
+        let hook_ts_ns = admitted_ns + 10;
+        assert!(
+            hook_ts_ns >= admitted_ns,
+            "the hook is ordered against the admission"
+        );
+        let before = native.gap_subjects();
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        // The row path still owns the caller: live, unretired, held.
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(successor)
+                .unwrap()
+                .retired
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor)
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let after = native.gap_subjects();
+        for subject in [
+            "exec successor minted without a held predecessor",
+            "successor admission refused without comparable clocks",
+            "successor admission refused without a live image",
+            "successor admission refused while stopped",
+            "duplicate exec handoff refused",
+            "exec handoff without custody refused",
+        ] {
+            assert!(
+                !after.iter().any(|gap| gap == subject),
+                "no hook mint or refusal gap: {after:?} (before: {before:?})"
+            );
+        }
     }
 
     #[test]

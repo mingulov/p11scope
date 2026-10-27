@@ -6205,9 +6205,9 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     );
 
     // The hold releases: B's request is taken (the queue drains and the
-    // scripted view refuses through the bounded refusal path — the §8.6
+    // rebound live-pair view refuses through the bounded refusal path — the §8.6
     // content is take-vs-hold, not preparation, which unit scenes own).
-    // A worker starting from a scripted view would be a finding, not a
+    // A worker starting from a rebound live-pair view would be a finding, not a
     // pass: fail loudly so it is investigated, never silently absorbed.
     driver.take_promotion_work();
     ensure!(
@@ -6394,7 +6394,7 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     // The quiet twins excuse exactly the disclosed populations: both
     // callers' count-only slot refusals (A's rows survive its retire;
     // gaps are audit rows, not domain state) and the single expected
-    // scripted-view promotion refusal.
+    // rebound live-pair view promotion refusal.
     let promotion_reason = disclosed_scope_reason(coordinator, "selected promotion refused")?;
     let expected_reasons = [
         crate::inventory_promotion::PromotionRefusal::StaleView.label(),

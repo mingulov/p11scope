@@ -22,6 +22,7 @@ import tempfile
 TOKEN = "uprobe-multi-required"
 OUTPUT_LIMIT = 4096
 WORK_IMAGE_BYTES = 128 * 1024 * 1024
+GUEST_WORK_MOUNT = Path("/var/tmp")
 
 
 def digest(path):
@@ -158,33 +159,34 @@ def prepare_guest_disk(stage):
 @contextmanager
 def guest_disk_work(stage):
     # A non-root runner's 9p stage can map guest-root creations to its UID.
-    # Atomic output
-    # correctly requires its retained private file to belong to guest root.
+    # Atomic output correctly requires a private file owned by guest root.
     # Keep shared-stage diagnostics, but run real sink checks on a fresh disk.
-    with tempfile.TemporaryDirectory(prefix="p11scope-multi-mount-", dir="/var/tmp") as mount:
-        loop = None
-        mounted = False
+    # Mount over the existing guest directory before creating private work;
+    # this needs no writable root/9p ancestor and never removes that directory.
+    mount = str(GUEST_WORK_MOUNT)
+    loop = None
+    mounted = False
+    try:
+        candidate = subprocess.run(["losetup", "-f", "--show", str(stage / "work.img")],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+        if re.fullmatch(r"/dev/loop[0-9]+", candidate) is None:
+            raise RuntimeError("unexpected owned guest loop device")
+        loop = candidate
+        subprocess.run(["mount", "-t", "ext4", "-o", "nodev,nosuid", loop, mount], check=True)
+        mounted = True
+        with tempfile.TemporaryDirectory(prefix="work-", dir=mount) as temp:
+            work = Path(temp)
+            metadata = work.stat()
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o777 != 0o700:
+                raise RuntimeError("guest work must be private and owned by the effective UID")
+            yield work
+    finally:
         try:
-            candidate = subprocess.run(["losetup", "-f", "--show", str(stage / "work.img")],
-                                       capture_output=True, text=True, check=True).stdout.strip()
-            if re.fullmatch(r"/dev/loop[0-9]+", candidate) is None:
-                raise RuntimeError("unexpected owned guest loop device")
-            loop = candidate
-            subprocess.run(["mount", "-t", "ext4", "-o", "nodev,nosuid", loop, mount], check=True)
-            mounted = True
-            with tempfile.TemporaryDirectory(prefix="work-", dir=mount) as temp:
-                work = Path(temp)
-                metadata = work.stat()
-                if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o777 != 0o700:
-                    raise RuntimeError("guest work must be private and owned by the effective UID")
-                yield work
+            if mounted:
+                subprocess.run(["umount", mount], check=True)
         finally:
-            try:
-                if mounted:
-                    subprocess.run(["umount", mount], check=True)
-            finally:
-                if loop is not None:
-                    subprocess.run(["losetup", "-d", loop], check=True)
+            if loop is not None:
+                subprocess.run(["losetup", "-d", loop], check=True)
 
 
 def guest(stage):

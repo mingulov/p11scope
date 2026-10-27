@@ -121,27 +121,33 @@ class CombinedRefusalTests(unittest.TestCase):
 
     def test_guest_disk_cleanup_runs_after_case_failure(self):
         workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        existing_mount = self.work / "guest-mount"
+        existing_mount.mkdir(mode=0o700)
         commands = []
 
         def run(argv, **kwargs):
             commands.append(argv)
             return subprocess.CompletedProcess(argv, 0, "/dev/loop23\n", "")
 
-        with patch("subprocess.run", side_effect=run):
+        with patch("subprocess.run", side_effect=run), \
+                patch.dict(workspace.__wrapped__.__globals__, {"GUEST_WORK_MOUNT": existing_mount}):
             with self.assertRaisesRegex(RuntimeError, "owned case failure"):
                 with workspace(self.work) as work:
                     mount = work.parent
-                    self.assertNotEqual(mount, self.work)
+                    self.assertEqual(mount, existing_mount, "use a pre-existing guest mountpoint")
                     self.assertEqual(work.stat().st_uid, os.geteuid())
                     self.assertEqual(work.stat().st_mode & 0o777, 0o700)
                     raise RuntimeError("owned case failure")
         self.assertEqual([argv[0] for argv in commands], ["losetup", "mount", "umount", "losetup"])
         self.assertEqual(commands[1][1:6], ["-t", "ext4", "-o", "nodev,nosuid", "/dev/loop23"])
         self.assertEqual(commands[-1], ["losetup", "-d", "/dev/loop23"])
-        self.assertFalse(mount.exists())
+        self.assertTrue(mount.is_dir())
+        self.assertEqual(list(mount.iterdir()), [], "preserve the empty original mountpoint")
 
     def test_failed_disk_mount_detaches_only_the_owned_loop(self):
         workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        existing_mount = self.work / "guest-mount"
+        existing_mount.mkdir(mode=0o700)
         commands = []
 
         def run(argv, **kwargs):
@@ -150,20 +156,25 @@ class CombinedRefusalTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, argv)
             return subprocess.CompletedProcess(argv, 0, "/dev/loop23\n", "")
 
-        with patch("subprocess.run", side_effect=run):
+        with patch("subprocess.run", side_effect=run), \
+                patch.dict(workspace.__wrapped__.__globals__, {"GUEST_WORK_MOUNT": existing_mount}):
             with self.assertRaises(subprocess.CalledProcessError):
                 with workspace(self.work):
                     self.fail("failed mount cannot run a control")
         self.assertEqual([argv[0] for argv in commands], ["losetup", "mount", "losetup"])
         self.assertEqual(commands[-1], ["losetup", "-d", "/dev/loop23"])
-        self.assertFalse(Path(commands[1][-1]).exists())
+        self.assertEqual(Path(commands[1][-1]), existing_mount)
+        self.assertTrue(existing_mount.is_dir())
 
     def test_guest_disk_refuses_an_unexpected_work_owner(self):
         workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        existing_mount = self.work / "guest-mount"
+        existing_mount.mkdir(mode=0o700)
         owner = os.geteuid()
         with patch("subprocess.run", return_value=subprocess.CompletedProcess(
                 [], 0, "/dev/loop23\n", "")) as run, \
-                patch("os.geteuid", return_value=owner + 1):
+                patch("os.geteuid", return_value=owner + 1), \
+                patch.dict(workspace.__wrapped__.__globals__, {"GUEST_WORK_MOUNT": existing_mount}):
             with self.assertRaisesRegex(RuntimeError, "owned by the effective UID"):
                 with workspace(self.work):
                     self.fail("a different owner cannot run a control")

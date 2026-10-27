@@ -649,7 +649,9 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
         ensure!(harness.events == 0 && harness.routed.is_empty());
         {
             let (drain, rows) = harness.session.event_drain_with_object_table()?;
-            ensure!(rows.is_some(), "requires the actual atomic 368/608 decoder");
+            // Ordinary transport verifies the frozen rows independently;
+            // it does not admit a semantic object tail without attestation.
+            ensure!(rows.is_none(), "ordinary S1 has no attested semantic rows");
             ensure!(drain.malformed() == 0);
         }
         let before = crate::events::event_drain_positions(harness.session.event_drain()?);
@@ -759,15 +761,16 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             collected == 1 && calls.len() == 1,
             "one actual call must conserve one collected/routed outcome"
         );
+        ensure!(harness.session.event_drain()?.malformed() == 0);
         let (record, route, object) = calls.pop().unwrap();
         ensure!(record.event.event_type == event_type::CALL && record.event.slot == 0);
         ensure!(record.event.pid_tgid == key.pid_tgid && record.event.rv == 0);
         ensure!(record.continuity.return_stamp == entry.entry_stamp);
+        ensure!(object.is_none(), "ordinary S1 grants no semantic object tail");
         if missing_entry {
             ensure!(record.continuity.entry_ip == 0);
             ensure!(record.continuity.entry_stamp == InstanceStamp::default());
             ensure!(!continuity_joins(&record.continuity));
-            ensure!(object.is_none());
             ensure!(
                 matches!(route, Route::Unknown(_)),
                 "actual negative route: {route:?}"
@@ -780,10 +783,6 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             ensure!(record.continuity.entry_ip == entry.entry_ip);
             ensure!(record.continuity.entry_stamp == entry.entry_stamp);
             ensure!(continuity_joins(&record.continuity));
-            ensure!(
-                object.context("healthy608 object tail")?.descriptor_index()
-                    == plan.slots[0].descriptor_index
-            );
             ensure!(
                 matches!(route, Route::Joined(_)),
                 "healthy route: {route:?}"

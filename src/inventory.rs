@@ -288,6 +288,14 @@ const SELECTED_PREPARATION_WINDOW: Duration = Duration::from_secs(30);
 /// attempt, which retries only for a new frame/pair.
 const PROMOTION_BASELINE_WINDOW: Duration = Duration::from_millis(25);
 
+/// Wall bound on a continuously pending Joint commit inside the
+/// retained drain: a healthy commit publishes in milliseconds, so a
+/// commit still Pending past this is stuck and the drain holds the
+/// lane (named gap, Partial summary) so the report still writes.
+/// Sixty seconds aligns with the normal-stop figure; it is a
+/// backstop, not a pacing target.
+const RETAINED_JOINT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct DiagnosticRequest<'a> {
     path: Option<&'a Path>,
     pid_filter: Option<u32>,
@@ -4820,6 +4828,44 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// Hold a Joint commit stuck Pending past the retained wall
+    /// bound: snapshot Partial, hold the lane for exit (dropping the
+    /// hold error like a conversion, so the run exits 0), clear the
+    /// pending flag, and name the hold in its own gap plus a stderr
+    /// line. The pump's next Poll then legacy-commits past the held
+    /// lane and the report writes.
+    fn hold_stuck_retained_joint_publication(&mut self, stalled: Duration) {
+        self.snapshot_seated_summary();
+        if let Some(summary) = self.seated_summary.as_mut() {
+            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+        }
+        let mut warn = WarnSink {
+            display: &mut self.display,
+        };
+        if let Some(lane) = self.semantic.take() {
+            Self::hold_joint_lane_for_exit(
+                lane,
+                &mut *self.coordinator,
+                "retained joint publication timed out",
+                "joint finish abandoned for exit",
+                &mut warn,
+                None,
+            );
+        }
+        self.joint_commit_pending = false;
+        self.coordinator.note_scope_gap(
+            "retained joint publication timed out".to_string(),
+            format!(
+                "the joint publication was still pending {}s after the deadline; the semantic lane was held and the report written without its latest pass",
+                stalled.as_secs(),
+            ),
+        );
+        self.warn(&format!(
+            "p11scope: the joint publication was still pending {}s after the deadline; the semantic lane is held so the report can be written",
+            stalled.as_secs(),
+        ));
+    }
+
     /// Drain a retained run beside its driver: every 10 ms poll with
     /// a 1024-action budget until the run finalizes. An abandoned
     /// Joint finish exits through the folded first error; the lane
@@ -4840,33 +4886,46 @@ impl ClassicDriver<'_> {
             error,
             clock,
             publish,
-            Duration::from_secs(60),
+            RETAINED_JOINT_PUBLICATION_TIMEOUT,
         )
     }
 
     /// The drain above with an explicit wall bound on a continuously
     /// pending Joint commit (tests pose a short one; production
-    /// passes the retained publication timeout). The bound is not
-    /// yet enforced here.
+    /// passes the retained publication timeout). Past the bound the
+    /// drain holds the stuck lane — named gap, Partial summary, no
+    /// run error — so the report still writes instead of hanging.
     fn consume_retained_run_with_bound(
         &mut self,
         run: RetainedClassicRun<FacadeLane>,
         error: Option<anyhow::Error>,
         clock: &LoopClock,
         publish: &mut dyn FnMut(&mut Self, Publish<'_>) -> Result<()>,
-        _bound: Duration,
+        bound: Duration,
     ) -> (
         Option<Stopped<FacadeLane>>,
         Option<anyhow::Error>,
         Option<ZeroPassStop>,
     ) {
         self.suspended = true;
+        // Name a deadline-retained pending publication: a slow drain
+        // is visible instead of a silent hang.
+        if run.stop_cause == Some(crate::inventory_capture::ZeroPassCause::Deadline)
+            && self.publication_pending()
+        {
+            self.warn(
+                "p11scope: the deadline arrived while a joint publication was still pending; draining the retained run to write the report",
+            );
+        }
         let mut outcome = ClassicOutcome {
             stopped: None,
             error,
             zero_pass: None,
             retained: Some(run),
         };
+        // Start of the current continuously pending Joint commit, if
+        // any; any Published, refusal or conversion resets it.
+        let mut pending_since: Option<Instant> = None;
         loop {
             match outcome.into_completion() {
                 Ok(ClassicCompletion::Finalized {
@@ -4878,6 +4937,18 @@ impl ClassicDriver<'_> {
                     return (stopped, self.fold_retained_joint_error(error), zero_pass);
                 }
                 Ok(ClassicCompletion::Retained { run, error }) => {
+                    if self.joint_commit_pending && self.semantic.is_some() {
+                        let now = Instant::now();
+                        let since = *pending_since.get_or_insert(now);
+                        if now.duration_since(since) >= bound {
+                            self.hold_stuck_retained_joint_publication(
+                                now.duration_since(since),
+                            );
+                            pending_since = None;
+                        }
+                    } else {
+                        pending_since = None;
+                    }
                     let started = Instant::now();
                     let mut budget = RetainedWorkBudget {
                         remaining_actions: 1024,

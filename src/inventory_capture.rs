@@ -1749,10 +1749,13 @@ fn collect_job_off_thread(
     job: CollectJob,
     tick: Duration,
     service: &mut dyn FnMut(),
+    deadline: Option<Instant>,
 ) -> CollectedPass {
     match job {
         CollectJob::Legacy(job) => {
-            CollectedPass::Legacy(collect_off_thread(job, tick, service).map(Box::new))
+            CollectedPass::Legacy(
+                collect_off_thread_with_deadline(job, tick, service, deadline).map(Box::new),
+            )
         }
         CollectJob::Cgroup { control, task } => match task {
             Ok(job) => {
@@ -1909,20 +1912,34 @@ pub(crate) trait PassDriver<Pin> {
 /// overrun once (stderr in production, recorded for tests) and keeps
 /// servicing until the worker's value crosses back. A worker thread
 /// cannot be cancelled, so the check discloses the wedge; it never
-/// drops the pass. The check is not yet enforced here.
+/// drops the pass.
 pub(crate) fn collect_off_thread_with_deadline<T: Send>(
     job: impl FnOnce() -> T + Send,
     tick: Duration,
     service: &mut dyn FnMut(),
-    _deadline: Option<Instant>,
+    deadline: Option<Instant>,
 ) -> T {
-    collect_off_thread(job, tick, service)
+    collect_off_thread_inner(job, tick, service, deadline)
 }
 
 /// Whether the last wait named a passed deadline (tests drain it).
 #[cfg(test)]
 pub(crate) fn take_collection_deadline_noted_for_test() -> bool {
-    false
+    collection_deadline_test::take_noted()
+}
+
+#[cfg(test)]
+pub(crate) mod collection_deadline_test {
+    use std::cell::Cell;
+    thread_local! {
+        static NOTED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(super) fn note() {
+        NOTED.with(|noted| noted.set(true));
+    }
+    pub(super) fn take_noted() -> bool {
+        NOTED.with(|noted| noted.replace(false))
+    }
 }
 
 /// Runs `job` on a scoped worker thread and calls `service` every `tick`
@@ -1935,6 +1952,15 @@ pub(crate) fn collect_off_thread<T: Send>(
     job: impl FnOnce() -> T + Send,
     tick: Duration,
     service: &mut dyn FnMut(),
+) -> T {
+    collect_off_thread_inner(job, tick, service, None)
+}
+
+fn collect_off_thread_inner<T: Send>(
+    job: impl FnOnce() -> T + Send,
+    tick: Duration,
+    service: &mut dyn FnMut(),
+    deadline: Option<Instant>,
 ) -> T {
     use std::sync::mpsc::{self, RecvTimeoutError};
     let slot = std::sync::Mutex::new(Some(job));
@@ -1969,12 +1995,26 @@ pub(crate) fn collect_off_thread<T: Send>(
             }
         };
         let mut schedule = TickSchedule::starting(Instant::now(), tick);
+        let mut deadline_noted = false;
         loop {
             match results.recv_timeout(schedule.wait(Instant::now())) {
                 Ok(value) => return value,
                 Err(RecvTimeoutError::Timeout) => {
                     service();
                     schedule.advance(Instant::now());
+                    // Name a passed run deadline once while the worker
+                    // still runs; the wait keeps servicing until the
+                    // value crosses back, never dropping the pass.
+                    if !deadline_noted
+                        && deadline.is_some_and(|end| Instant::now() >= end)
+                    {
+                        deadline_noted = true;
+                        let _ = crate::sink::try_stderr_line(
+                            "p11scope: the run deadline passed while this pass was still collecting; waiting for the collection to finish so the report keeps its evidence",
+                        );
+                        #[cfg(test)]
+                        collection_deadline_test::note();
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => match worker.join() {
                     Err(panic) => std::panic::resume_unwind(panic),
@@ -3130,19 +3170,24 @@ where
                 let job = driver.collector();
                 // The ring first, then the display (C5.3): on a fixed-rate schedule,
                 // so the draw never delays the next ring service.
-                let collected = collect_job_off_thread(job, clock.collection_tick, &mut || {
-                    if let Some(lane) = lane.as_mut() {
-                        lane.collecting_tick();
-                    }
-                    driver.on_native_service(
-                        lane.as_mut()
-                            .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
-                    );
-                    driver.on_tick();
-                    if let Some(control) = &control {
-                        latch_collection_stop(control, clock);
-                    }
-                });
+                let collected = collect_job_off_thread(
+                    job,
+                    clock.collection_tick,
+                    &mut || {
+                        if let Some(lane) = lane.as_mut() {
+                            lane.collecting_tick();
+                        }
+                        driver.on_native_service(
+                            lane.as_mut()
+                                .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
+                        );
+                        driver.on_tick();
+                        if let Some(control) = &control {
+                            latch_collection_stop(control, clock);
+                        }
+                    },
+                    clock.deadline,
+                );
                 if let Some(control) = &control {
                     latch_collection_stop(control, clock);
                 }

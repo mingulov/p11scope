@@ -909,6 +909,147 @@ fn full_surface_manifest(module: &str, out: &Path) -> Result<usize> {
     Ok(resolved)
 }
 
+fn build_capacity_tail(directory: &Path, endpoints: usize) -> Result<(PathBuf, PathBuf)> {
+    use p11scope_manifest::manifest::{Manifest, Resolution};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    ensure!((1..=68).contains(&endpoints), "capacity tail fits legacy68");
+    let matrix = capacity_matrix_source();
+    ensure!(matrix.exists(), "capacity matrix fixture is missing");
+    let provider = directory.join("tail.so");
+    let flag = format!("-DCAPACITY_UNIQUE={endpoints}");
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC", &flag])
+        .arg("-o")
+        .arg(&provider)
+        .arg(&matrix)
+        .status()
+        .context("building the capacity tail")?;
+    ensure!(status.success(), "capacity tail build failed");
+    ensure!(provider.exists(), "the capacity tail was not written");
+    let manifest_path = directory.join("tail.json");
+    let out = directory.join("tail-helper.out");
+    let stderr = directory.join("tail-helper.stderr");
+    let private_log = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    // Use the same real helper entrypoint as lifecycle regressions, in a
+    // fresh process so unrelated fixture dlopens cannot churn its maps.
+    let child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", &provider)
+        .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", &manifest_path)
+        .stdin(Stdio::null())
+        .stdout(private_log(&out)?)
+        .stderr(private_log(&stderr)?)
+        .spawn()
+        .context("spawning the capacity-tail helper")?;
+    let mut helper = E2eProcess { child, out, stderr };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = helper.child.try_wait()? {
+            break status;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "capacity-tail helper did not stop: {}",
+            helper.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    ensure!(
+        status.success(),
+        "capacity-tail helper exited with {status}: {}",
+        helper.diagnostics()
+    );
+    let manifest: Manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let problems = crate::manifest_input::validate_structure(&manifest);
+    ensure!(problems.is_empty(), "capacity-tail manifest: {problems:?}");
+    ensure!(
+        manifest.module_path == provider.to_str().context("capacity-tail path")?,
+        "capacity-tail helper preserved the provider path"
+    );
+    let targets: std::collections::BTreeSet<_> = manifest
+        .surfaces
+        .iter()
+        .flat_map(|surface| &surface.functions)
+        .filter_map(|function| match function.resolution {
+            Resolution::Resolved {
+                object,
+                file_offset,
+            } => Some((object, file_offset)),
+            _ => None,
+        })
+        .collect();
+    ensure!(
+        targets.len() == endpoints,
+        "capacity tail resolves {} unique targets, expected {endpoints}",
+        targets.len()
+    );
+    Ok((provider, manifest_path))
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn scale_tail_helper_manifest_admits_thirty_two_unique_lp64_targets() -> Result<()> {
+    use crate::discovery::identity::pin_manifest_objects;
+    use crate::plan::{AdmissionPolicy, AdmissionScope, build_from_sources_for_policy_scoped};
+    use p11scope_manifest::elf::ElfAbi;
+    use p11scope_manifest::manifest::Manifest;
+
+    let directory = tempfile::tempdir()?;
+    let (provider, manifest_path) = build_capacity_tail(directory.path(), 32)?;
+    let manifest: Manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    assert_eq!(manifest.module_path, provider.to_str().unwrap());
+    let problems = crate::manifest_input::validate_structure(&manifest);
+    assert!(problems.is_empty(), "{problems:?}");
+    let pins = pin_manifest_objects(&manifest).map_err(|errors| anyhow::anyhow!("{errors:?}"))?;
+    let policy = AdmissionPolicy::inventory(
+        crate::capacity::InventoryBudget::new(32, 32 * 8).map_err(anyhow::Error::msg)?,
+    );
+    let plan = build_from_sources_for_policy_scoped(
+        &[],
+        std::slice::from_ref(&manifest),
+        &pins,
+        policy,
+        AdmissionScope::Shared,
+    );
+    assert_eq!(
+        plan.slots.len(),
+        32,
+        "alias rows must deduplicate to32 targets"
+    );
+    assert_eq!(plan.refused_modules().count(), 0);
+    for slot in &plan.slots {
+        assert_eq!(pins.abi_for(slot.object), Some(ElfAbi::Lp64));
+        let pinned = pins.summary(slot.object).unwrap();
+        assert_eq!(pinned.path, provider.to_str().unwrap());
+        assert_eq!(
+            Some(pinned.sha256),
+            manifest.objects[0].identity.sha256.as_deref()
+        );
+    }
+
+    // The helper's input proof cannot be reused after the file changes.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&provider)?
+        .write_all(&[0])?;
+    assert!(pin_manifest_objects(&manifest).is_err());
+    Ok(())
+}
+
 /// Holder source: dlopens every argv path, prints READY, then sleeps
 /// until killed. One process holds all scale copies mapped so system
 /// discovery finds them; it makes no PKCS#11 calls itself.
@@ -989,7 +1130,7 @@ impl Drop for ScaleHolder {
 /// no edge and no gap is a silent drop and fails (R-51); the
 /// route-loss fallback the headline cell carries does not apply here.
 /// `P11SCOPE_SCALE2_TARGET` raises the target up to 8,192 for the
-/// full-scale run; near-cap targets add one smaller scan-only tail so
+/// full-scale run; near-cap targets add one smaller helper-discovered tail so
 /// the admitted total equals the target exactly (119 full copies plus
 /// a 32-endpoint tail at 8,192). Prints SCALE2_E2E lines. Root BPF
 /// lane, serial, a few minutes.
@@ -1006,7 +1147,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     // the 8192 cap a full-copies-only population overshoots into whole-
     // module refusals (68-endpoint granules cannot hit 8192: 120*68 =
     // 8160), so those targets use an exact composition instead: full
-    // copies plus one smaller scan-only tail so the admitted total
+    // copies plus one smaller helper-discovered tail so the admitted total
     // equals the target with nothing refused.
     let first_copy = workload.path("copy-0.so");
     std::fs::copy(&module, &first_copy)?;
@@ -1087,25 +1228,14 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
             copies.len()
         );
         if tail > 0 {
-            let matrix = capacity_matrix_source();
-            ensure!(matrix.exists(), "capacity matrix fixture is missing");
-            let tail_so = workload.path("tail.so");
-            let flag = format!("-DCAPACITY_UNIQUE={tail}");
-            let status = Command::new("cc")
-                .args(["-shared", "-fPIC", &flag])
-                .arg("-o")
-                .arg(&tail_so)
-                .arg(&matrix)
-                .status()
-                .context("building the capacity tail")?;
-            ensure!(status.success(), "capacity tail build failed");
-            ensure!(tail_so.exists(), "the capacity tail was not written");
+            let (tail_so, tail_manifest) = build_capacity_tail(workload.dir.path(), tail)?;
+            manifests.push(tail_manifest);
             tail_path = Some(tail_so);
         } else {
             tail_path = None;
         }
         tail_endpoints = tail;
-        total = MECH_FUNCTIONS.len() as u64 + full as u64 * per_copy as u64;
+        total = MECH_FUNCTIONS.len() as u64 + full as u64 * per_copy as u64 + tail as u64;
     }
     println!(
         "SCALE2_E2E copies={} tail_endpoints={tail_endpoints} endpoints_attested={total}",

@@ -8,7 +8,9 @@ root passes; the processed count of every root is printed either way.
 """
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -813,6 +815,143 @@ class ReportTests(unittest.TestCase):
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
 # against src/attach.rs by the fingerprint test above.
 EXPECTED_BPF_LOOP_PROBE_FNV = "27ef27a73ecc6270"
+
+
+class DriverHarnessTests(unittest.TestCase):
+    """Run the real driver/helper/scorers with owned fake guest devices."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="bpf-driver-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.bin = self.work / "bin"
+        self.bin.mkdir()
+        self.events = self.work / "events.jsonl"
+        self.cache = self.work / "cache"
+        config = self.cache / "virtme-ng/v7.0.14/amd64/boot/config-7.0.14-test"
+        config.parent.mkdir(parents=True)
+        config.write_text("owned test config\n")
+        rows = {"doctor": [load_row("p11_image_query", processed=100)],
+                "inventory": [load_row("p11_usage_entry_lp64", processed=100)],
+                "profile": [load_row("p11_counter_bank_entry", processed=100)]}
+        (self.work / "rows.json").write_text(json.dumps(rows))
+        budgets = {"limit": 1000000, "min_headroom_percent": 5,
+                   "programs": {name: {"v7.0.14": 1000} for name in
+                                ("detailed/p11_image_query", "inventory/p11_usage_entry_lp64")}}
+        self.budgets = self.work / "budgets.json"
+        self.budgets.write_text(json.dumps(budgets))
+        budgets["programs"] = {"counter-" + mode + "/p11_counter_bank_entry": {"v7.0.14": 1000}
+                               for mode in _COUNTER_MODES}
+        self.counter_budgets = self.work / "counter-budgets.json"
+        self.counter_budgets.write_text(json.dumps(budgets))
+        tool = self.bin / "tool"
+        tool.write_text("#!" + sys.executable + "\n" + r'''
+import json,os,pathlib,subprocess,sys,tempfile
+name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]
+with open(os.environ['FAKE_EVENTS'],'a') as log:
+    log.write(json.dumps({'tool':name,'args':args})+'\n')
+if name=='vng':
+    command=args[args.index('--exec')+1]
+    out=pathlib.Path(args[args.index('--rwdir')+1])
+    if os.environ.get('FAKE_BAD_HELPER')=='missing': (out/'guest-env.sh').unlink()
+    if os.environ.get('FAKE_BAD_HELPER')=='bad': (out/'guest-env.sh').write_text('return 0\n')
+    sys.exit(subprocess.run(['/bin/sh','-c',command]).returncode)
+if name=='mkfs.ext4': sys.exit(0)
+if name=='id': print('0');sys.exit(0)
+if name=='uname': print('7.0.14-test');sys.exit(0)
+if name=='stat': print('0:700');sys.exit(0)
+if name=='losetup':
+    if '-f' in args: print('/dev/loop23')
+    sys.exit(0)
+if name=='mount':
+    sys.exit(1 if 'ext4' in args and os.environ.get('FAKE_FAIL_MOUNT') else 0)
+if name=='umount': sys.exit(0)
+if name=='mktemp': print(tempfile.mkdtemp(prefix='guest-work-',dir=os.environ['FAKE_WORK']));sys.exit(0)
+if name=='cp':
+    if args[-1].startswith('/boot/'): sys.exit(0)
+    os.execv('/bin/cp',['cp',*args])
+if name=='observer':
+    root=pathlib.Path(os.environ['FAKE_WORK'])
+    work=pathlib.Path(os.environ.get('TMPDIR','/tmp'))
+    if not work.is_relative_to(root) or work==root or not work.is_dir():
+        print('unsafe inherited TMPDIR',file=sys.stderr);sys.exit(8)
+    rows=json.loads((root/'rows.json').read_text())[args[0]]
+    if os.environ.get('FAKE_OBSERVER_REFUSAL') and args[0]=='inventory':
+        rows[0].update(loaded=False,errno=13,returned_fd=-1,program_id=0,returned_program_type=0)
+    for row in rows: os.write(9,(json.dumps(row)+'\n').encode())
+    os.write(9,(json.dumps({'record':'probe-summary','pid':111,'records':len(rows),'write_failures':0,'overflow':False})+'\n').encode())
+    if args[0]=='doctor': print('host program preflight ........ ok available')
+    sys.exit(1 if os.environ.get('FAKE_OBSERVER_REFUSAL') and args[0]=='inventory' else 0)
+raise SystemExit('unknown owned tool '+name)
+''')
+        tool.chmod(0o700)
+        for name in ("vng", "mkfs.ext4", "id", "uname", "stat", "losetup", "mount", "umount", "mktemp", "cp", "observer"):
+            (self.bin / name).symlink_to(tool)
+        self.probe = self.work / "probe.so"
+        shutil.copyfile("/lib/x86_64-linux-gnu/libc.so.6", self.probe)
+
+    def run_driver(self, *, extra=None, long_path=False):
+        out = self.work / "out ' quoted"
+        if long_path:
+            out = self.work.joinpath(*(["long" * 45] * 6))
+        out.mkdir(parents=True)
+        env = os.environ.copy()
+        env.update(PATH=str(self.bin) + os.pathsep + env["PATH"], XDG_CACHE_HOME=str(self.cache),
+                   FAKE_EVENTS=str(self.events), FAKE_WORK=str(self.work),
+                   TMPDIR="/tmp/forbidden-inherited")
+        env.update(extra or {})
+        result = subprocess.run(["sh", str(DRIVER), "--budgets", str(self.budgets),
+                                 "--counter-budgets", str(self.counter_budgets),
+                                 str(self.bin / "observer"), str(self.probe), str(out), "v7.0.14"],
+                                env=env, capture_output=True, text=True, timeout=30)
+        events = [json.loads(line) for line in self.events.read_text().splitlines()] if self.events.exists() else []
+        return result, events
+
+    def test_driver_runs_five_disk_scoped_guests_and_cleans_each(self):
+        result, events = self.run_driver()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observers = [row["args"] for row in events if row["tool"] == "observer"]
+        self.assertEqual([args[0] for args in observers], ["doctor", "inventory", "profile", "profile", "profile"])
+        self.assertEqual([args[args.index("--counter-mode")+1] for args in observers[2:]], list(_COUNTER_MODES))
+        guests = [row for row in events if row["tool"] == "vng"]
+        self.assertEqual(len(guests), 5)
+        self.assertTrue(all(len(row["args"][row["args"].index("--exec")+1]) <= 950 for row in guests))
+        self.assertEqual(sum(row["tool"] == "umount" for row in events), 5)
+        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 5)
+        self.assertFalse(list(self.work.glob("guest-work-*")))
+        self.assertIn("# OVERALL: PASS", result.stdout)
+
+    def test_failed_disk_setup_never_runs_observer_and_releases_loop(self):
+        result, events = self.run_driver(extra={"FAKE_FAIL_MOUNT": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(any(row["tool"] == "observer" for row in events))
+        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 1)
+        self.assertFalse(any(row["tool"] == "umount" for row in events))
+
+    def test_missing_helper_never_runs_observer(self):
+        result, events = self.run_driver(extra={"FAKE_BAD_HELPER": "missing"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(any(row["tool"] == "observer" for row in events))
+
+    def test_successful_but_incomplete_helper_never_runs_observer(self):
+        result, events = self.run_driver(extra={"FAKE_BAD_HELPER": "bad"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(any(row["tool"] == "observer" for row in events))
+
+    def test_refused_inventory_still_scores_and_cleans_all_five_guests(self):
+        result, events = self.run_driver(extra={"FAKE_OBSERVER_REFUSAL": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("inventory --system exited rc=1", result.stdout)
+        self.assertIn("# OVERALL: FAIL", result.stdout)
+        self.assertEqual(sum(row["tool"] == "vng" for row in events), 5)
+        self.assertEqual(sum(row["tool"] == "umount" for row in events), 5)
+        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 5)
+
+    def test_command_line_limit_refuses_before_any_guest(self):
+        result, events = self.run_driver(long_path=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("guest command exceeds the kernel-cmdline budget", result.stdout)
+        self.assertFalse(any(row["tool"] in {"vng", "observer"} for row in events))
 
 
 if __name__ == "__main__":

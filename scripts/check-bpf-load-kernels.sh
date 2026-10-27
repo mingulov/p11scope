@@ -163,12 +163,71 @@ q() {
 
 FAILED=0
 VNG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/virtme-ng"
-# Guest shell below: every $ for the guest is \$ here; only single
-# quotes travel (virtme hands the string to the guest shell as one
-# argument). Staging never aborts the chain: a staging failure is
-# caught by the marker check below, and the hooks it would enable
-# are caught by the budgets when they never load.
-STAGE="K=\$(uname -r); if [ ! -r /boot/config-\$K ]; then C=\$(ls $(q "$VNG_CACHE")/*/amd64/boot/config-\$K 2>/dev/null | head -n 1); if [ x\$C = x ]; then echo no-kernel-config-for-\$K; else mount -t tmpfs -o mode=755 guestboot /boot && cp \$C /boot/ && echo staged-boot-config-\$K || echo stage-boot-failed-\$K; fi; else echo boot-config-present-\$K; fi"
+GUEST_ENV="$OUTDIR/guest-env.sh"
+WORK_IMAGE="$OUTDIR/guest-work.img"
+if [ -e "$GUEST_ENV" ] || [ -L "$GUEST_ENV" ] || [ -e "$WORK_IMAGE" ] || [ -L "$WORK_IMAGE" ]; then
+    echo "# error: guest helper/work image already exists; use a fresh output directory" >&2
+    exit 2
+fi
+# Only this invocation owns the image. Five sequential fresh guests reuse it
+# after checked unmount/detach; product temp I/O never inherits host /tmp/9p.
+(umask 077; set -C; : > "$WORK_IMAGE"; truncate -s 536870912 "$WORK_IMAGE")
+mkfs.ext4 -q -F "$WORK_IMAGE"
+(
+    umask 077
+    set -C
+    {
+        printf 'BPF_VNG_CACHE=%s\nBPF_GUEST_IMAGE=%s\n' "$(q "$VNG_CACHE")" "$(q "$WORK_IMAGE")"
+        cat <<'GUEST_ENV_EOF'
+umask 022
+BPF_GUEST_LOOP=
+BPF_GUEST_MOUNTED=0
+BPF_GUEST_TMP=
+BPF_GUEST_TMP_OWNED=0
+bpf_guest_cleanup() {
+    BPF_GUEST_RC=$?
+    trap - 0
+    cd / || BPF_GUEST_RC=1
+    if [ "$BPF_GUEST_TMP_OWNED" = 1 ]; then
+        rm -rf --one-file-system -- "$BPF_GUEST_TMP" || BPF_GUEST_RC=1
+    fi
+    if [ "$BPF_GUEST_MOUNTED" = 1 ]; then
+        umount /var/tmp || BPF_GUEST_RC=1
+    fi
+    if [ -n "$BPF_GUEST_LOOP" ]; then
+        losetup -d "$BPF_GUEST_LOOP" || BPF_GUEST_RC=1
+    fi
+    exit "$BPF_GUEST_RC"
+}
+trap bpf_guest_cleanup 0
+[ "$(id -u)" = 0 ] || return 1
+K=$(uname -r)
+if [ ! -r "/boot/config-$K" ]; then
+    C=$(ls "$BPF_VNG_CACHE"/*/amd64/boot/config-"$K" 2>/dev/null | head -n 1)
+    [ -n "$C" ] || { echo "no-kernel-config-for-$K"; return 1; }
+    mount -t tmpfs -o mode=755 guestboot /boot && cp "$C" /boot/ || { echo "stage-boot-failed-$K"; return 1; }
+    echo "staged-boot-config-$K"
+else
+    echo "boot-config-present-$K"
+fi
+BPF_GUEST_LOOP=$(losetup -f --show "$BPF_GUEST_IMAGE") || return 1
+case "$BPF_GUEST_LOOP" in /dev/loop[0-9]*) ;; *) BPF_GUEST_LOOP=; return 1;; esac
+mount -t ext4 -o nodev,nosuid "$BPF_GUEST_LOOP" /var/tmp || return 1
+BPF_GUEST_MOUNTED=1
+BPF_GUEST_TMP=$(mktemp -d /var/tmp/p11scope-bpf.XXXXXX) || return 1
+case "$BPF_GUEST_TMP" in /var/tmp/*) ;; *) return 1;; esac
+[ "$(stat -c '%u:%a' "$BPF_GUEST_TMP")" = 0:700 ] || return 1
+BPF_GUEST_TMP_OWNED=1
+TMPDIR=$BPF_GUEST_TMP
+export TMPDIR
+BPF_GUEST_READY=1
+echo "guest-work-ready=ext4 uid-mode=0:700 TMPDIR=$TMPDIR"
+GUEST_ENV_EOF
+    } > "$GUEST_ENV"
+)
+# A short sourced helper fits virtme's kernel command line. Reset readiness
+# before sourcing: a missing, bad or failed setup never runs the observer.
+STAGE="{ BPF_GUEST_READY=0; . $(q "$GUEST_ENV") && [ x\$BPF_GUEST_READY = x1 ]; } || exit 2"
 for KERNEL in "$@"; do
     echo "## kernel $KERNEL"
     PROBE_JSON="$OUTDIR/probe-$KERNEL.jsonl"

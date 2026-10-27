@@ -5433,6 +5433,73 @@ mod promotion_lifecycle_tests {
     }
 
     #[test]
+    fn manifest_pinning_inconclusive_probe_records_the_unproven_maps_note() {
+        use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+        let fixture = SelectedProviderFixture::new();
+        let fd_key = fixture
+            .pins
+            .pinned()
+            .next()
+            .expect("fixture pins one object")
+            .key;
+        // An inconclusive probe on overlayfs (budget spent, mmap failure):
+        // the pin stays fd-primary and carries the named unproven note, so
+        // a caller the rendering would have bound never stays unbound
+        // silently.
+        let mut budget = CaptureWorkBudget::default();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_probe(
+                &fixture.manifest,
+                &[],
+                &mut budget,
+                &probe,
+            )
+            .expect("pinning succeeds with an inconclusive probe");
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 1);
+        let pin = pinning.pins.pinned().next().expect("one object");
+        assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
+        assert_eq!(
+            pin.note,
+            Some(crate::discovery::identity::PROBED_MAPS_UNPROVEN_NOTE),
+            "the inconclusive probe discloses the unproven rendering"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_agreeing_probe_records_no_maps_note() {
+        use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+        let fixture = SelectedProviderFixture::new();
+        let fd_key = fixture
+            .pins
+            .pinned()
+            .next()
+            .expect("fixture pins one object")
+            .key;
+        // The kernel renders this exact fd at its own key: the probe ran
+        // and agreed, so the pin discloses nothing.
+        let mut budget = CaptureWorkBudget::default();
+        let probe = FakeSelfMappingProbe::new(true, Some(fd_key));
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_probe(
+                &fixture.manifest,
+                &[],
+                &mut budget,
+                &probe,
+            )
+            .expect("pinning succeeds with an agreeing probe");
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 1);
+        let pin = pinning.pins.pinned().next().expect("one object");
+        assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
+        assert_eq!(
+            pin.note, None,
+            "an agreeing probe leaves the pin without a note"
+        );
+    }
+
+    #[test]
     fn manifest_pinning_split_key_labels_through_the_joint_prefilter() {
         use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
         use p11scope_manifest::maps::{Device, ObjectKey};

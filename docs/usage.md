@@ -7,8 +7,8 @@ name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
 > **Status: v0.5.0.** This source provides `doctor`,
-> `inspect` (`--system` is a preview), `profile` (including `--mode metrics`),
-> `trace`, `run` and `inventory` (with `--cgroup` scope, offline `diff`
+> `inspect`, `profile` (including `--mode metrics`),
+> `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
 > comparison and diagnostics), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
 > per-edge entry counts, FULL object-attribute capture in release builds
@@ -17,9 +17,9 @@ implementation limits are code contracts, not measurements.
 > [Install](../README.md#install) distinguishes the source build from the
 > older v0.3.0 binary downloads, and
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) records what
-> this release was qualified on. The [privacy allowlist](privacy/allowlist-v1.md)
-> and the [profile schema](schema/observed-profile-v3.md) define the capture
-> boundary and public evidence.
+> this release was qualified on. The [privacy boundary](#what-it-does-not-intentionally-decode)
+> combines unchanged allowlists v1/v2 with the approved FULL sections of v3; the
+> [profile schema](schema/observed-profile-v3.md) defines public profile evidence.
 
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
@@ -71,18 +71,28 @@ There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
 operation-state blobs, raw mechanism byte arrays, raw session handles, or
 ordinary buffers.
 
-The privacy-first 1.0 product boundary is function, registered-mechanism,
-return-code, latency, and lifecycle evidence. The default release does not
-correlate object handles and does not promise symbolic `CKA_CLASS` or
-`CKA_KEY_TYPE` output. The unsafe diagnostic build described below does not
-enlarge the default allowlist.
+Public profile evidence covers functions, registered mechanisms, return
+codes, latency and admitted lifecycle observations. Profile, trace and metrics
+publish no object handles or object attribute facts. `evidence.object_capture`
+reports build availability, not an observed attribute. The unsafe diagnostic
+build described below does not enlarge the default allowlist.
 
-The default capture policy is `allowlisted`. Under it, pointer-derived bytes
-reach output only by exact membership in a finite published set — a mechanism
-id in the registry, or one of the 104 published function names — so a caller
-that aliases a metadata pointer into unrelated readable memory produces no
-decoded value rather than an arbitrary read. `metrics` mode uses
-`aggregate-only`, which reads no call arguments in the kernel at all.
+The default capture policy is `allowlisted`. For function and mechanism
+metadata, pointer-derived bytes reach output only by exact membership in a
+finite published set — a mechanism id in the registry, or one of the 104
+published function names. Other values in those fields are dropped even when
+a caller aliases a metadata pointer into unrelated readable memory. `metrics`
+mode uses `aggregate-only`, which reads no call arguments in the kernel at all.
+
+Release builds default to FULL. For attested object calls under `allowlisted`,
+FULL performs the approved bounded reads of `CKA_CLASS`, `CKA_KEY_TYPE`,
+`CKA_TOKEN`, `CKA_VALUE_LEN`, `CKA_MODULUS_BITS` and finite `CKA_EC_PARAMS`
+values, behind descriptor, ABI, span and result checks. These reads stay enabled
+in `profile`, `trace` and `run` with `--manifest`, although those commands
+publish no object facts. The explicit P0 build option
+(`--no-default-features --features stub-object-attributes`) skips these six
+attribute-value reads; it retains the separately approved handle and lifecycle
+reads. FULL availability is not a claim that public object delivery is enabled.
 
 The older unvalidated fixed-offset decoders still exist as a diagnostic, but
 only in a build compiled with the off-by-default `unsafe-unvalidated-metadata`
@@ -93,16 +103,17 @@ The official builder selects `--no-default-features --features
 stub-object-attributes` for P0, and packaging fails if the unsafe path is
 reachable. See
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) with its
-[v2 extension](privacy/allowlist-v2.md) for the field-by-field
-enforcement (what is captured, why, and how each read is gated — structural
-where a leak is impossible by construction, runtime-gated where a length/
-null check stands in front of the read, each gate named with the test that
-exercises it). The canary matrix includes secret, unterminated, and hostile-
-alias `C_GetInterface` names and scans every artifact and observer-owned map
-for their bytes. Separately marked reviewed sections of
-[allowlist v3](privacy/allowlist-v3.md) cover presentation, caller metadata and
-the internal FULL object producer; its remaining proposals grant no capture
-authority or public object projection.
+[v2 extension](privacy/allowlist-v2.md) and the explicitly approved
+[v3 H7-E4 sections](privacy/allowlist-v3.md#h7-e4-attribute-capture-2026-10-20)
+for the field-by-field enforcement (what is captured, why, and how each read
+is gated — structural where a leak is impossible by construction, runtime-gated
+where a length/null check stands in front of the read, each gate named with
+the test that exercises it). The canary matrix includes secret, unterminated,
+and hostile-alias `C_GetInterface` names and scans every artifact and observer-owned map
+for their bytes. The [v3 header](privacy/allowlist-v3.md) identifies the approved
+read, finite-vocabulary, result and retention rules and separately reviewed
+presentation/caller metadata sections. Its remaining proposals grant no
+capture authority or public object projection.
 
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see
@@ -110,31 +121,33 @@ window. It is never proof of what the application *cannot* do — see
 
 ## PKCS #11 versions and interface names
 
-Support is cumulative: legacy 2.00 (67 slots), 2.01 through 2.40 (68), 3.0
-and 3.1 interfaces (92), and the final 3.2 interface (104 published slots).
-Newer support does not replace 2.x support.
+Version values are reported metadata, not proof of a table's allocated extent
+or a provider acceptance gate. An observed `C_GetFunctionList` return is bounded
+to the known 68 legacy entries, including a table labelled 3.2. Interface
+acquisition can retain available known extensions, up to 104 entries, when
+supported by its source and bounded reads. A longer allocation alone does not
+justify naming extra words as newer API fields.
 
-One versioning rule governs every path. The live memory scan, the
-live-export path, and the offline `p11scope-discover` helper all walk the
-same layouts: any minor of a known major (2.x, 3.x), with a newer minor
-decoded as its known prefix — 68 slots for 2.x past 2.40, 104 for 3.x
-past 3.2 — and only a new major refused. A walked prefix is a
-`known_prefix` surface, so the report stays `PARTIAL` with a named
-"surface gaps" cause: the unhooked appended tail is disclosed, never
-silent. The `unsupported function-table version` skip reason remains in
-the report vocabulary only so older captures still validate.
+Short or sparse acquired tables retain their usable targets and actual
+ordinals, including around NULL or unusable entries. An acquired all-NULL table
+is a valid empty observation. Unread words remain unavailable, never invented
+NULLs. Actual missing or unusable portions of an established extent are
+disclosed as incomplete coverage; a complete bounded legacy table is not
+incomplete solely because its version label suggests a larger interface.
 
-The standard name `"PKCS 11"` is common but not universal. Discovery also
-handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
-only when standard export anchors—or an independently acquired legacy 2.40
-table—corroborate the expected layout. Such a walk is a known prefix and keeps
-the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
-and are not decoded. The observer and `p11scope inspect` make zero PKCS #11
-calls. Only the explicit offline `p11scope-discover` helper enumerates
-`C_GetInterfaceList`, then makes exactly ten bounded `C_GetInterface`
-compatibility calls (the fixed selector/version/flag matrix) before
-`C_Initialize`; these helper calls are separate from live target observation
-and never initialize the provider.
+The standard name `"PKCS 11"` is common but not universal. Alternate, null,
+unreadable and non-UTF-8 names do not by themselves discard observed targets.
+Standard API names require layout evidence from a typed getter, an exact-standard
+interface, an accepted manifest or exact agreement with the provider's own
+exports. Other valid targets stay unknown and count-only; arbitrary memory is
+not established as an API table by its size or header alone. Naming does not
+grant mechanism, object or interface-selection semantics.
+
+The observer and `p11scope inspect` make zero PKCS #11 calls. The explicit
+offline `p11scope-discover` helper calls the available getter and enumeration
+exports and makes ten bounded `C_GetInterface` compatibility calls when that
+export is available (the fixed selector/version/flag matrix). These calls are
+separate from live target observation; the helper never calls `C_Initialize`.
 
 Interface-name discovery reads at most 64 bytes and never crosses the readable
 VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text
@@ -406,9 +419,9 @@ included, is refused with `not a cgroup v2 directory` before discovery, by
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
-rarest providers first). `--system` is a preview (see the
-[known limitations](../CHANGELOG.md#known-limitations)): scope admission does
-not promise that every process or call is captured, and the whole-machine
+rarest providers first). Scope admission does not promise that every process
+or call is captured (see the
+[known limitations](../CHANGELOG.md#known-limitations)), and the whole-machine
 scope shares the 512 attach slots with every ambient provider. Without
 `--module`, a `--cgroup` or `--system` capture admits each provider whole or
 not at all, by value: `--manifest` providers, then providers with a

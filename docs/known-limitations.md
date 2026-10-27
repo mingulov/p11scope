@@ -870,7 +870,7 @@ The old bounds are measurements, not a product startup SLA.
   after its leader died still needs its follow-up.
 - Development checkpoint: discovery can classify a zombie-leader group as
   exited even while a surviving thread runs, and omit that group from its
-  membership result. `--system` remains a preview; an absent group does not
+  membership result. An absent group does not
   prove that its provider use or surviving threads have ended. Complete
   live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
@@ -1081,8 +1081,10 @@ a silent drop.
 - Workaround: build a manifest with the offline helper and pass it to
   the capture: `p11scope-discover --module <path> -o manifest.json`,
   then `--manifest manifest.json` on the capture command. This supplies
-  explicit addresses to Detailed captures and inventory's S1 lane;
-  inventory's ordinary admission remains scan-only.
+  validated targets to Detailed captures, inventory's ordinary count plan and
+  its optional S1 lane. Count inputs must match a provider mapped in the
+  selected scope and pass identity/ABI checks before shared admission; they
+  do not grant object or interface-selection authority.
 - Planned: automatic discovery of run-time-built tables is planned for
   a later version.
 

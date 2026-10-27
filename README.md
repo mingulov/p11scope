@@ -18,7 +18,7 @@ assessment and incident diagnostics.
 > discovery for kernel threads and zombie leaders. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
-> capture; `--system` is a preview, and
+> capture. `--system` selects whole-machine scope;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what
 > this release was qualified on.
 
@@ -37,17 +37,20 @@ Omitting `--counter-mode` keeps existing metrics behavior. Explicit
 `counts`, `timestamps` and `latency` aggregate in the kernel on eligible LP64
 hosts, subject to mode-specific verifier and memory limits.
 
-Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
-table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
-the final 3.2 header). A newer minor version (after 2.40 or 3.2) is read up to
-the slots of the newest known layout; the report names the rest as a surface
-gap and stays `PARTIAL`. Exact `"PKCS 11"` interface names take the normal path.
-Alternate, null, or unreadable names are not discarded: discovery accepts a
-bounded known prefix only when the table is independently corroborated by the
-module's standard exports or legacy table, records that evidence as `PARTIAL`,
-and leaves deceptive/vendor tables undecoded. The explicit offline helper
-performs ten fixed `C_GetInterface` queries before any provider initialization;
-live observation remains passive.
+Function-table versions are metadata, not proof of allocated storage. An
+observed legacy getter supplies at most the known 68 entries, including when
+its table reports version 3.2. Discovery preserves usable functions in short
+or sparse acquired tables, including around NULL or unusable entries, with
+their actual ordinals. An acquired all-NULL table is a valid empty observation;
+unread words never become NULL. Available known interface extensions can also
+be retained, without guessing extra API fields from a longer allocation.
+Actual gaps remain explicit in coverage.
+
+Standard function names require evidence for the ordinal layout; other valid
+targets remain useful as unknown, count-only observations. Alternate, null or
+unreadable interface names alone do not discard those targets. The explicit
+offline helper makes ten fixed `C_GetInterface` queries when that export is
+available and never calls `C_Initialize`; live observation remains passive.
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release contains and its
 known limitations, [Install](#install) to build and install it, and
@@ -185,7 +188,7 @@ its own Rust 1.98.1 pin; rebuild it with the instructions from that tag.
 The P0 configuration needs `--features stub-object-attributes` as well as
 `--no-default-features`. Omitting that feature selects FULL;
 `--no-default-features` alone does not disable object-attribute capture.
-FULL source builds and their broader acceptance remain development work.
+The official builder defaults to FULL; the observer example below selects P0.
 
 **Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
 toolchains from [docs/development.md](docs/development.md). The scripts select
@@ -290,7 +293,7 @@ If you installed the optional helper, also run
   sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
   ```
 
-  Whole-machine capture (a preview) needs no PID or cgroup path;
+  Whole-machine capture needs no PID or cgroup path;
   `--module` aims it at one provider:
 
   ```bash
@@ -321,11 +324,18 @@ mechanism byte arrays, raw session handles, or ordinary buffers.
 
 The default capture policy is `allowlisted`, and it is safe against a caller
 that aliases a metadata pointer into unrelated readable memory. Pointer-derived
-bytes become output only by *exact* membership in a finite published set: a
-mechanism id in the registry, or one of the 104 published function names.
-Anything else is dropped in the kernel. That is a containment boundary, not
-pointer validation — `bpf_probe_read_user` avoids faults, it does not check
-types.
+function and mechanism metadata become output only by *exact* membership in a
+finite published set: a mechanism id in the registry, or one of the 104
+published function names. Other values in those fields are dropped in the
+kernel. That is a containment boundary, not pointer validation —
+`bpf_probe_read_user` avoids faults, it does not check types.
+
+FULL release builds additionally perform the approved bounded reads of
+`CKA_CLASS`, `CKA_KEY_TYPE`, `CKA_TOKEN`, `CKA_VALUE_LEN`, `CKA_MODULUS_BITS`
+and finite `CKA_EC_PARAMS` values for attested object calls under `allowlisted`,
+with descriptor, ABI, span and result checks. P0 skips these six attribute-value
+reads. FULL keeps them enabled in `profile`, `trace` and `run` with
+`--manifest`; those commands publish no object facts.
 
 Discovery reads the target's `/proc/<pid>/maps` and bounded bytes of its
 readable provider mappings via `/proc/<pid>/mem` (function tables, interface
@@ -343,12 +353,13 @@ The field-by-field inventory is
 [docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md), extended by
 [docs/privacy/allowlist-v2.md](docs/privacy/allowlist-v2.md) (interface
 selection, attach mechanism, descendant rebuild, task-uprobe loss and ABI
-refusal evidence). Separately marked reviewed sections of
-[allowlist v3](docs/privacy/allowlist-v3.md) cover presentation, caller metadata
-and the internal FULL object producer; its remaining proposals grant no capture
-authority or public object projection. The boundary is backed by a secret-canary
-suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
-key material, and buffer contents in a real workload and scans every output
+refusal evidence). The explicitly approved sections of
+[allowlist v3](docs/privacy/allowlist-v3.md#h7-e4-attribute-capture-2026-10-20)
+extend that boundary for the internal FULL producer, including these six
+attribute reads; its header identifies the other reviewed sections. Remaining
+proposals grant no capture authority or public object projection. The boundary
+is backed by a secret-canary suite (`scripts/verify-canaries.sh`) that plants
+sentinel PINs, key material, and buffer contents in a real workload and scans every output
 artifact and every observer-owned BPF map for leaks — including hostile-alias
 lanes, secret/unterminated/hostile-alias `C_GetInterface` names, and the
 transient raw `pMechanism` address the return probe needs.

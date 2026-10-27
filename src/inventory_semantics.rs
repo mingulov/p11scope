@@ -784,7 +784,10 @@ pub(crate) struct AttestedSemanticLane {
     /// completes the lane, and substituted lanes prove the same
     /// drain without a live Session.
     stop_state: StopState,
-    /// True only beside a Quiesced stop: the final drain is proven.
+    /// Coverage loss declared by an at-Q tick during this lane's Finish.
+    /// Kept across retries and later healthy quanta through certification.
+    finish_window_loss: bool,
+    /// True only beside a Quiesced stop with no declared finish-window loss.
     final_drain: bool,
     /// Set by the I2 abandon: the lane finished without a published
     /// Finish and stays retained for process exit. Wound-down and take
@@ -1354,6 +1357,7 @@ impl AttestedSemanticLane {
             collected_finish_requested: false,
             joint_finish_failure: None,
             stop_state: StopState::Running,
+            finish_window_loss: false,
             final_drain: false,
             exit_retained: false,
             wound_down_complete: false,
@@ -1502,6 +1506,7 @@ impl AttestedSemanticLane {
             collected_finish_requested: false,
             joint_finish_failure: None,
             stop_state: StopState::Running,
+            finish_window_loss: false,
             final_drain: false,
             exit_retained: false,
             wound_down_complete: false,
@@ -1733,10 +1738,11 @@ impl AttestedSemanticLane {
     /// means Q was observed, discovery drained to Q, the retained
     /// original sealed and delivered at Q, and producers frozen
     /// (the checks above). Only completion certifies; a refusal
-    /// anywhere above leaves the drain unproven.
+    /// anywhere above leaves the drain unproven. Quiescence remains proven
+    /// after a declared finish-window loss, but its drain is not lossless.
     fn certify_joint_stop(&mut self) {
         self.stop_state = StopState::Quiesced { at: Instant::now() };
-        self.final_drain = true;
+        self.final_drain = !self.finish_window_loss;
     }
 
     /// Begin native closes only after the driver's H0 Finish publication.

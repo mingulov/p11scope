@@ -23,8 +23,8 @@ use crate::inventory_semantics::{
     finish_grant_admissible,
 };
 use crate::semantic_capture::{
-    CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, RetainedBirthWitness,
-    TickOutcome, TickReport,
+    CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, InvalidationScope,
+    RetainedBirthWitness, TickOutcome, TickReport,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -2547,6 +2547,18 @@ impl LiveJointMachine {
                     ),
                 };
                 let batch = retain_on_refusal!(Phase::AwaitH0(original), ticked);
+                // A successful at-Q tick can declare loss while still
+                // permitting Finish. Keep that declaration on the lane
+                // before any fallible merge; later healthy ticks and
+                // retries cannot turn it into a lossless final drain.
+                if q.is_some()
+                    && batch.outcomes().iter().any(|outcome| {
+                        matches!(outcome, TickOutcome::Invalidation(loss)
+                            if matches!(loss.scope(), InvalidationScope::CoverageFailed))
+                    })
+                {
+                    lane.finish_window_loss = true;
+                }
                 budget.spend(1);
                 let before = original.h0_accumulated();
                 let has_pending_scans = batch.has_pending_scans();
@@ -3147,15 +3159,22 @@ impl LiveJointMachine {
                                 let stalled = now.duration_since(since);
                                 if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
                                     let polls = self.finish_no_progress_polls;
+                                    let watermarks = frame
+                                        .as_ref()
+                                        .map(IngestedJointQuantum::no_progress_watermarks);
                                     self.finish_no_progress_trip =
                                         Some(FinishNoProgressTrip { polls, stalled });
                                     coordinator.note_scope_gap(
                                         "joint finish made no progress".to_string(),
                                         format!(
                                             "{}s without progress across {} consecutive finish polls in \
-                                             Audited; abandoning the finish for exit",
+                                             Audited; abandoning the finish for exit; \
+                                             h0_below={:?}, staged_max={:?}, floor={:?}",
                                             stalled.as_secs(),
                                             polls,
+                                            watermarks.map(|bounds| bounds.0),
+                                            watermarks.and_then(|bounds| bounds.1),
+                                            watermarks.and_then(|bounds| bounds.2),
                                         ),
                                     );
                                     return (
@@ -3179,15 +3198,22 @@ impl LiveJointMachine {
                                 let stalled = now.duration_since(since);
                                 if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
                                     let polls = self.audit_no_progress_polls;
+                                    let watermarks = frame
+                                        .as_ref()
+                                        .map(IngestedJointQuantum::no_progress_watermarks);
                                     self.audit_no_progress_trip =
                                         Some(FinishNoProgressTrip { polls, stalled });
                                     coordinator.note_scope_gap(
                                         "joint audit made no progress".to_string(),
                                         format!(
                                             "{}s without progress across {} consecutive commit polls in \
-                                             Audited; the semantic lane stops",
+                                             Audited; the semantic lane stops; \
+                                             h0_below={:?}, staged_max={:?}, floor={:?}",
                                             stalled.as_secs(),
                                             polls,
+                                            watermarks.map(|bounds| bounds.0),
+                                            watermarks.and_then(|bounds| bounds.1),
+                                            watermarks.and_then(|bounds| bounds.2),
                                         ),
                                     );
                                     return (

@@ -2369,7 +2369,8 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
                 gaps[0].1,
                 format!(
                     "6s without progress across {audited_polls} consecutive finish polls in \
-                     Audited; abandoning the finish for exit"
+                     Audited; abandoning the finish for exit; \
+                     h0_below=Some(4), staged_max=Some(3), floor=None"
                 ),
                 "the gap names the stall in time"
             );
@@ -2517,7 +2518,8 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
                 gaps[0].1,
                 format!(
                     "6s without progress across {audited_polls} consecutive commit polls in \
-                     Audited; the semantic lane stops"
+                     Audited; the semantic lane stops; \
+                     h0_below=Some(3), staged_max=Some(2), floor=None"
                 ),
                 "the gap names the stall in time"
             );

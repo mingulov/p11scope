@@ -480,6 +480,21 @@ fn failure_storage(failure: &SealFailure) -> Option<usize> {
 }
 
 impl IngestedJointQuantum {
+    /// Bounded diagnostics from this frame's immutable audit. These scalar
+    /// watermarks cannot advance H3 or authorize delivery or publication.
+    pub(crate) fn no_progress_watermarks(&self) -> (u64, Option<u64>, Option<u64>) {
+        let (staged_max, floor) = match self.audit.h3 {
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => (Some(staged_max), pending_floor),
+            H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
+                (None, None)
+            }
+        };
+        (self.audit.h0_below, staged_max, floor)
+    }
+
     fn original_failures(&self) -> impl Iterator<Item = &SealFailure> {
         self.raw_failure.iter().chain(self.failure.iter()).chain(
             self.active

@@ -999,17 +999,27 @@ pub(crate) struct LiveJointMachine {
     finish_storage_retries: u16,
     /// Consecutive no-progress Audited polls inside this Finish: a
     /// diagnostic count for the gap text and the recorded trip. Any
-    /// spending, publication or non-finish visit resets it; the
+    /// spending, publication or running visit resets it; the
     /// wall-time bound (not the count) trips the refusal.
     finish_no_progress_polls: u32,
     /// Wall-clock start of the current consecutive no-progress Audited
-    /// stall, if any. Any spending, publication or non-finish visit
-    /// clears it; the wall-time bound trips when the stall reaches it.
+    /// stall, if any. Shared by the finish and running bounds: any
+    /// spending or publication clears it, and a mode flip restarts
+    /// it; the wall-time bound trips when the stall reaches it.
     finish_no_progress_since: Option<Instant>,
     /// The recorded Audited no-progress trip, if the wall-time bound
     /// fired. Set once per Finish, never cleared: the trip latches the
     /// disposition and the lane is held past it.
     finish_no_progress_trip: Option<FinishNoProgressTrip>,
+    /// Consecutive no-progress Audited polls on the running commit
+    /// path: a diagnostic count for the gap text and the recorded
+    /// trip. Any spending, publication or finish visit resets it;
+    /// the wall-time bound (not the count) trips the refusal.
+    audit_no_progress_polls: u32,
+    /// The recorded running-commit Audited no-progress trip, if the
+    /// wall-time bound fired. Set once per demand, never cleared:
+    /// the trip latches the disposition and the lane is held past it.
+    audit_no_progress_trip: Option<FinishNoProgressTrip>,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1081,6 +1091,8 @@ impl LiveJointMachine {
             finish_no_progress_polls: 0,
             finish_no_progress_since: None,
             finish_no_progress_trip: None,
+            audit_no_progress_polls: 0,
+            audit_no_progress_trip: None,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1093,9 +1105,10 @@ impl LiveJointMachine {
         })
     }
 
-    /// Pose (or clear) an Audited stall: while posed, finish polls skip
-    /// the commit and report Pending without spending, as a live
-    /// no-progress poll would.
+    /// Pose (or clear) an Audited stall: while posed, Audited polls
+    /// skip the commit and report Pending without spending, as a live
+    /// no-progress poll would. The pose covers running polls too (the
+    /// finish twin only poses around finish polls, so it is unaffected).
     #[cfg(test)]
     pub(crate) fn pose_no_progress_poll_for_test(&mut self, on: bool) {
         self.pose_no_progress_poll = on;
@@ -1112,6 +1125,12 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn finish_no_progress_trip_for_test(&self) -> Option<FinishNoProgressTrip> {
         self.finish_no_progress_trip
+    }
+
+    /// The recorded running-commit Audited no-progress trip, if fired.
+    #[cfg(test)]
+    pub(crate) fn audit_no_progress_trip_for_test(&self) -> Option<FinishNoProgressTrip> {
+        self.audit_no_progress_trip
     }
 
     /// The current transaction's Collected, across every phase that
@@ -3028,7 +3047,7 @@ impl LiveJointMachine {
                 let before = budget.remaining_actions;
                 let final_original = self.finish_original == Some(identity);
                 #[cfg(test)]
-                let wedged = self.pose_no_progress_poll && q.is_some();
+                let wedged = self.pose_no_progress_poll;
                 #[cfg(not(test))]
                 let wedged = false;
                 let result = if wedged {
@@ -3063,6 +3082,7 @@ impl LiveJointMachine {
                 match result {
                     Ok(Ok(JointCommitProgress::Published(receipt))) => {
                         self.finish_no_progress_polls = 0;
+                        self.audit_no_progress_polls = 0;
                         self.finish_no_progress_since = None;
                         if final_original {
                             self.finish_receipt = Some(receipt);
@@ -3080,45 +3100,87 @@ impl LiveJointMachine {
                         (Phase::Idle, Ok(Step::Published))
                     }
                     Ok(Ok(JointCommitProgress::Pending)) => {
-                        // Finish-scoped wall-time no-progress bound: a
-                        // wedged audit spends nothing and publishes
-                        // nothing, forever. Spending, publication and
-                        // non-finish visits reset the stall clock; the
-                        // bound records a named gap, latches the trip
-                        // cause for the exit hold's stderr disclosure,
-                        // and refuses, keeping the retained frame and
-                        // its audit tags for the disposition hold and
-                        // diagnosis.
-                        if q.is_some() && !progressed {
-                            self.finish_no_progress_polls =
-                                self.finish_no_progress_polls.saturating_add(1);
-                            let now = Instant::now();
-                            let since = *self.finish_no_progress_since.get_or_insert(now);
-                            let stalled = now.duration_since(since);
-                            if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
-                                let polls = self.finish_no_progress_polls;
-                                self.finish_no_progress_trip =
-                                    Some(FinishNoProgressTrip { polls, stalled });
-                                coordinator.note_scope_gap(
-                                    "joint finish made no progress".to_string(),
-                                    format!(
-                                        "{}s without progress across {} consecutive finish polls in \
-                                         Audited; abandoning the finish for exit",
-                                        stalled.as_secs(),
-                                        polls,
-                                    ),
-                                );
-                                return (
-                                    Phase::Audited {
-                                        frame,
-                                        identity,
-                                        base,
-                                    },
-                                    Err(SemanticRefusal::Unavailable),
-                                );
+                        // Wall-time no-progress bound, finish and
+                        // running alike: a wedged audit spends nothing
+                        // and publishes nothing, forever. Spending and
+                        // publication reset the stall clock; the bound
+                        // records a named gap, latches the trip cause
+                        // for the exit hold's stderr disclosure, and
+                        // refuses, keeping the retained frame and its
+                        // audit tags for the disposition hold and
+                        // diagnosis. The two modes share the clock but
+                        // count separately; a mode flip restarts it, so
+                        // a running stall and a finish stall never fuse
+                        // into one trip.
+                        if !progressed {
+                            if q.is_some() {
+                                if self.audit_no_progress_polls > 0 {
+                                    self.finish_no_progress_since = None;
+                                }
+                                self.audit_no_progress_polls = 0;
+                                self.finish_no_progress_polls =
+                                    self.finish_no_progress_polls.saturating_add(1);
+                                let now = Instant::now();
+                                let since = *self.finish_no_progress_since.get_or_insert(now);
+                                let stalled = now.duration_since(since);
+                                if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
+                                    let polls = self.finish_no_progress_polls;
+                                    self.finish_no_progress_trip =
+                                        Some(FinishNoProgressTrip { polls, stalled });
+                                    coordinator.note_scope_gap(
+                                        "joint finish made no progress".to_string(),
+                                        format!(
+                                            "{}s without progress across {} consecutive finish polls in \
+                                             Audited; abandoning the finish for exit",
+                                            stalled.as_secs(),
+                                            polls,
+                                        ),
+                                    );
+                                    return (
+                                        Phase::Audited {
+                                            frame,
+                                            identity,
+                                            base,
+                                        },
+                                        Err(SemanticRefusal::Unavailable),
+                                    );
+                                }
+                            } else {
+                                if self.finish_no_progress_polls > 0 {
+                                    self.finish_no_progress_since = None;
+                                }
+                                self.finish_no_progress_polls = 0;
+                                self.audit_no_progress_polls =
+                                    self.audit_no_progress_polls.saturating_add(1);
+                                let now = Instant::now();
+                                let since = *self.finish_no_progress_since.get_or_insert(now);
+                                let stalled = now.duration_since(since);
+                                if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
+                                    let polls = self.audit_no_progress_polls;
+                                    self.audit_no_progress_trip =
+                                        Some(FinishNoProgressTrip { polls, stalled });
+                                    coordinator.note_scope_gap(
+                                        "joint audit made no progress".to_string(),
+                                        format!(
+                                            "{}s without progress across {} consecutive commit polls in \
+                                             Audited; the semantic lane stops",
+                                            stalled.as_secs(),
+                                            polls,
+                                        ),
+                                    );
+                                    return (
+                                        Phase::Audited {
+                                            frame,
+                                            identity,
+                                            base,
+                                        },
+                                        Err(SemanticRefusal::Unavailable),
+                                    );
+                                }
                             }
                         } else {
                             self.finish_no_progress_polls = 0;
+                            self.audit_no_progress_polls = 0;
                             self.finish_no_progress_since = None;
                         }
                         (

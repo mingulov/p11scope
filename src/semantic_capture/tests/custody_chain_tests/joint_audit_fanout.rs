@@ -2423,6 +2423,142 @@ fn joint_machine_finish_no_progress_bound_refuses_with_named_gap() {
     }
 }
 
+/// The staged "joint audit made no progress" gaps on a fixture.
+fn audit_no_progress_gaps(fixture: &MachineScene) -> Vec<(String, String)> {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "joint audit made no progress")
+        .collect()
+}
+
+/// A running commit whose Audited polls stop making progress must end
+/// finitely too: the live wedge sat in Audited on the running commit
+/// path (no Finish), spending nothing and publishing nothing, until the
+/// retained exit wait gave up a minute after the deadline. The running
+/// bound uses the same wall-time horizon as the finish bound: rapid
+/// polls alone never trip, a stall just under the bound stays Pending,
+/// and a stall past it refuses once with a named gap, records its trip
+/// for the hold's stderr line, latches the disposition and keeps the
+/// retained frame (the abandon path needs it). The finish bound stays
+/// silent. The unposed control publishes with no trip and no gap.
+#[test]
+fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    for wedged in [true, false] {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+        fixture.machine.pose_no_progress_poll_for_test(wedged);
+        if wedged {
+            fixture.reach_phase("Audited");
+            let mut audited_polls = 0u64;
+            for n in 0..650 {
+                assert_eq!(
+                    fixture.machine.diagnostic_snapshot_for_test().0,
+                    "Audited",
+                    "the posed stall stays Audited (rapid poll {n})"
+                );
+                match fixture.service(1) {
+                    Ok(JointServiceProgress::Pending) => audited_polls += 1,
+                    other => panic!("rapid poll {n} must stay Pending: {other:?}"),
+                }
+            }
+            assert!(
+                audit_no_progress_gaps(&fixture).is_empty(),
+                "rapid polls disclose no wedge gap"
+            );
+            assert_eq!(
+                fixture.machine.disposition_reason(),
+                None,
+                "rapid polls latch nothing"
+            );
+            assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+            fixture.machine.set_finish_no_progress_since_for_test(Some(
+                std::time::Instant::now() - (bound - margin),
+            ));
+            match fixture.service(1) {
+                Ok(JointServiceProgress::Pending) => audited_polls += 1,
+                other => panic!("the just-under stall must stay Pending: {other:?}"),
+            }
+            assert!(
+                audit_no_progress_gaps(&fixture).is_empty(),
+                "the just-under stall discloses no wedge gap"
+            );
+            assert_eq!(fixture.machine.disposition_reason(), None);
+            fixture.machine.set_finish_no_progress_since_for_test(Some(
+                std::time::Instant::now() - (bound + margin),
+            ));
+            match fixture.service(1) {
+                Err(SemanticRefusal::Unavailable) => audited_polls += 1,
+                other => panic!("the over-bound stall must refuse: {other:?}"),
+            }
+            let gaps = audit_no_progress_gaps(&fixture);
+            assert_eq!(gaps.len(), 1, "the refusal is disclosed exactly once");
+            assert_eq!(
+                gaps[0].1,
+                format!(
+                    "6s without progress across {audited_polls} consecutive commit polls in \
+                     Audited; the semantic lane stops"
+                ),
+                "the gap names the stall in time"
+            );
+            let trip = fixture
+                .machine
+                .audit_no_progress_trip_for_test()
+                .expect("the trip records its cause for the hold");
+            assert_eq!(trip.polls, audited_polls as u32);
+            assert!(trip.stalled >= bound, "{:?}", trip.stalled);
+            assert_eq!(
+                fixture.machine.finish_no_progress_trip_for_test(),
+                None,
+                "a running stall is not a finish stall"
+            );
+            assert!(
+                no_progress_gaps(&fixture).is_empty(),
+                "a running stall stages no finish gap"
+            );
+            assert_eq!(
+                fixture.machine.diagnostic_snapshot_for_test().0,
+                "Audited",
+                "the retained frame is kept for the abandon"
+            );
+            assert_eq!(
+                fixture.machine.disposition_reason(),
+                Some(SemanticRefusal::Unavailable),
+                "the refusal latches the running disposition"
+            );
+            // A latched machine refuses at once on later polls: the
+            // wedge cannot spin past its bound.
+            assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
+            assert_eq!(audit_no_progress_gaps(&fixture).len(), 1);
+        } else {
+            fixture.published_labeled("running stall control", None);
+            assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+            assert_eq!(fixture.machine.disposition_reason(), None);
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != "joint audit made no progress"),
+                "the healthy commit discloses no wedge gap"
+            );
+        }
+    }
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

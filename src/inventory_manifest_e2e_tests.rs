@@ -56,6 +56,10 @@ fn ledger_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-cli/inventory-ledger.c")
 }
 
+fn capacity_matrix_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture/version_matrix.c")
+}
+
 fn softhsm_path() -> Result<String> {
     for candidate in SOFTHSM_CANDIDATES {
         if Path::new(candidate).exists() {
@@ -580,11 +584,49 @@ fn scale_target_refuses_a_non_number() {
     assert!(parse_scale_target(Some("many")).is_err());
 }
 
+/// Exact population for near-cap targets: full SoftHSM copies plus a
+/// smaller physical tail so the admitted total equals the target.
+/// Returns `(full_copies, tail_endpoints)`. The ledger's original
+/// provider adds one more full surface; the tail is scan-only (no
+/// manifest) and `0` means no tail file is needed.
+fn scale_exact_population(target: u64, per_copy: usize) -> (usize, usize) {
+    let per_copy_u64 = per_copy as u64;
+    let full_including_original = (target / per_copy_u64) as usize;
+    let tail = (target % per_copy_u64) as usize;
+    (full_including_original.saturating_sub(1), tail)
+}
+
+#[test]
+fn scale_exact_8192_is_119_full_plus_32_tail() {
+    assert_eq!(scale_exact_population(8192, 68), (119, 32));
+}
+
+#[test]
+fn scale_exact_8160_needs_no_tail() {
+    assert_eq!(scale_exact_population(8160, 68), (119, 0));
+}
+
+#[test]
+fn scale_exact_8108_is_118_plus_16_tail() {
+    assert_eq!(scale_exact_population(8108, 68), (118, 16));
+}
+
+#[test]
+fn scale_exact_composition_hits_its_target() {
+    for target in [8108u64, 8160, 8192] {
+        let (full, tail) = scale_exact_population(target, 68);
+        assert_eq!((full + 1) * 68 + tail, target as usize);
+        assert!(tail < 68, "the tail is smaller than one full surface");
+    }
+}
+
 /// Upper bound on distinct provider copies. The population stops as
-/// soon as the resolved total reaches the target; this cap only bounds
-/// a degenerate surface (a symbol-read bug resolving a handful of
-/// functions must fail, never spawn thousands of copies).
-const SCALE_MAX_COPIES: usize = 130;
+/// soon as the resolved total reaches the target (or the exact
+/// composition for near-cap targets); this cap only bounds a
+/// degenerate surface (a symbol-read bug resolving a handful of
+/// functions must fail, never spawn thousands of copies). It covers
+/// the smallest valid surface (60): 135 copies plus a tail at 8192.
+const SCALE_MAX_COPIES: usize = 140;
 
 /// A full SoftHSM2 2.40 surface resolves ~68 functions. Fewer than 60
 /// resolved on a copy means the manifest shape broke, not that the
@@ -701,20 +743,23 @@ int main(int argc, char **argv) {
 struct ScaleHolder {
     child: Child,
     out: PathBuf,
+    err: PathBuf,
 }
 
 impl ScaleHolder {
     fn spawn(holder: &Path, out: &Path, copies: &[PathBuf]) -> Result<Self> {
+        let err = out.with_extension("err");
         let child = Command::new(holder)
             .args(copies)
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(out)?)
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&err)?)
             .spawn()
             .context("spawning holder")?;
         Ok(Self {
             child,
             out: out.to_path_buf(),
+            err,
         })
     }
 
@@ -726,11 +771,12 @@ impl ScaleHolder {
             {
                 return Ok(());
             }
-            ensure!(
-                Instant::now() < deadline,
-                "holder {} never printed READY",
-                self.out.display()
-            );
+            if Instant::now() >= deadline {
+                let tail = std::fs::read_to_string(&self.err)
+                    .map(|text| text.lines().rev().take(5).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                anyhow::bail!("holder {} never printed READY: {tail}", self.out.display());
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -751,8 +797,10 @@ impl Drop for ScaleHolder {
 /// no edge and no gap is a silent drop and fails (R-51); the
 /// route-loss fallback the headline cell carries does not apply here.
 /// `P11SCOPE_SCALE2_TARGET` raises the target up to 8,192 for the
-/// full-scale run. Prints SCALE2_E2E lines. Root BPF lane, serial, a
-/// few minutes.
+/// full-scale run; near-cap targets add one smaller scan-only tail so
+/// the admitted total equals the target exactly (119 full copies plus
+/// a 32-endpoint tail at 8,192). Prints SCALE2_E2E lines. Root BPF
+/// lane, serial, a few minutes.
 #[test]
 #[ignore = "privileged: inventory --system --manifest over 4097+ endpoints stops finitely with S1 edges for a long-running caller and the journal_unavailable disclosure"]
 fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<()> {
@@ -762,7 +810,12 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     let observer = observer_binary()?;
     let workload = E2eWorkload::build(&module)?;
     // Distinct copies, one full-surface manifest each, until the
-    // resolved total reaches the target past the default budget.
+    // resolved total reaches the target past the default budget. Near
+    // the 8192 cap a full-copies-only population overshoots into whole-
+    // module refusals (68-endpoint granules cannot hit 8192: 120*68 =
+    // 8160), so those targets use an exact composition instead: full
+    // copies plus one smaller scan-only tail so the admitted total
+    // equals the target with nothing refused.
     let first_copy = workload.path("copy-0.so");
     std::fs::copy(&module, &first_copy)?;
     let first_manifest = workload.path("copy-0.json");
@@ -777,30 +830,98 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     let mut manifests = vec![mech_manifest_path];
     let mut copies = vec![first_copy];
     manifests.push(first_manifest);
-    let mut total = per_copy as u64 + MECH_FUNCTIONS.len() as u64;
-    let mut index = 1usize;
-    while total < endpoint_target {
+    // The ledger's original provider admits a full surface via the scan
+    // union on top of its 15-function mech manifest (run 1: attested
+    // 4163, occupied 4216 = 62*68), so the admitted demand is one full
+    // surface per copy plus one for the original. When that loop total
+    // would exceed the cap, size exactly with a tail instead.
+    let loop_copies = ((endpoint_target - MECH_FUNCTIONS.len() as u64 + per_copy as u64 - 1)
+        / per_copy as u64) as usize;
+    let loop_admitted = (loop_copies + 1) * per_copy;
+    let tail_path: Option<PathBuf>;
+    let tail_endpoints: usize;
+    let total: u64;
+    if loop_admitted as u64 <= SCALE_MAX_TARGET {
+        let mut running = per_copy as u64 + MECH_FUNCTIONS.len() as u64;
+        let mut index = 1usize;
+        while running < endpoint_target {
+            ensure!(
+                copies.len() < SCALE_MAX_COPIES,
+                "scale population hit the copy cap at {running} endpoints"
+            );
+            let copy = workload.path(&format!("copy-{index}.so"));
+            std::fs::copy(&module, &copy)?;
+            let manifest_path = workload.path(&format!("copy-{index}.json"));
+            let resolved =
+                full_surface_manifest(copy.to_str().context("copy path")?, &manifest_path)?;
+            ensure!(
+                resolved == per_copy,
+                "every scale copy resolves the same surface, got {resolved}"
+            );
+            copies.push(copy);
+            manifests.push(manifest_path);
+            running += per_copy as u64;
+            index += 1;
+        }
+        tail_path = None;
+        tail_endpoints = 0;
+        total = running;
+    } else {
+        let (full, tail) = scale_exact_population(endpoint_target, per_copy);
         ensure!(
-            copies.len() < SCALE_MAX_COPIES,
-            "scale population hit the copy cap at {total} endpoints"
+            full <= SCALE_MAX_COPIES,
+            "scale population hit the copy cap at {full} copies"
         );
-        let copy = workload.path(&format!("copy-{index}.so"));
-        std::fs::copy(&module, &copy)?;
-        let manifest_path = workload.path(&format!("copy-{index}.json"));
-        let resolved = full_surface_manifest(copy.to_str().context("copy path")?, &manifest_path)?;
         ensure!(
-            resolved == per_copy,
-            "every scale copy resolves the same surface, got {resolved}"
+            tail < per_copy && tail <= 68,
+            "the tail fits one smaller surface, got {tail}"
         );
-        copies.push(copy);
-        manifests.push(manifest_path);
-        total += per_copy as u64;
-        index += 1;
+        for index in 1..full {
+            let copy = workload.path(&format!("copy-{index}.so"));
+            std::fs::copy(&module, &copy)?;
+            let manifest_path = workload.path(&format!("copy-{index}.json"));
+            let resolved =
+                full_surface_manifest(copy.to_str().context("copy path")?, &manifest_path)?;
+            ensure!(
+                resolved == per_copy,
+                "every scale copy resolves the same surface, got {resolved}"
+            );
+            copies.push(copy);
+            manifests.push(manifest_path);
+        }
+        ensure!(
+            copies.len() == full,
+            "the exact population holds {full} copies, got {}",
+            copies.len()
+        );
+        if tail > 0 {
+            let matrix = capacity_matrix_source();
+            ensure!(matrix.exists(), "capacity matrix fixture is missing");
+            let tail_so = workload.path("tail.so");
+            let flag = format!("-DCAPACITY_UNIQUE={tail}");
+            let status = Command::new("cc")
+                .args(["-shared", "-fPIC", &flag])
+                .arg("-o")
+                .arg(&tail_so)
+                .arg(&matrix)
+                .status()
+                .context("building the capacity tail")?;
+            ensure!(status.success(), "capacity tail build failed");
+            ensure!(tail_so.exists(), "the capacity tail was not written");
+            tail_path = Some(tail_so);
+        } else {
+            tail_path = None;
+        }
+        tail_endpoints = tail;
+        total = MECH_FUNCTIONS.len() as u64 + full as u64 * per_copy as u64;
     }
     println!(
-        "SCALE2_E2E copies={} endpoints_attested={total}",
-        copies.len()
+        "SCALE2_E2E copies={} tail_endpoints={tail_endpoints} endpoints_attested={total}",
+        copies.len(),
     );
+    if let Some(tail) = &tail_path {
+        println!("SCALE2_E2E tail_built={}", tail.display());
+    }
     // The holder maps every copy before the observer starts, so pass 0
     // discovers and attaches the whole population at once.
     let holder_source = workload.path("holder.c");
@@ -816,12 +937,17 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         .context("running cc")?;
     ensure!(status.success(), "holder build failed");
     let holder_out = workload.path("holder.out");
-    let holder = ScaleHolder::spawn(&holder_bin, &holder_out, &copies)?;
+    let mut holder_modules = copies.clone();
+    if let Some(tail) = &tail_path {
+        holder_modules.push(tail.clone());
+    }
+    let holder = ScaleHolder::spawn(&holder_bin, &holder_out, &holder_modules)?;
     holder.wait_ready(Duration::from_secs(60))?;
     println!(
-        "SCALE2_E2E holder spawned pid={} copies={}",
+        "SCALE2_E2E holder spawned pid={} copies={} holder_modules={}",
         holder.child.id(),
-        copies.len()
+        copies.len(),
+        holder_modules.len()
     );
     let out = workload.path("inv.json");
     let gate = workload.path("gate");

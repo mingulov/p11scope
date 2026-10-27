@@ -35919,24 +35919,29 @@ fn wait_peer_mapped(pid: u32, soname: &str) {
 /// exact serial and original age across all three opportunities.
 #[test]
 fn pressure_services_unprotected_request_before_original_head() {
-    // Oracle first: one bare selected-request service transaction for the
-    // same live-provider shape, with no parked head and no park/resume
-    // disposition. Its scan and work cost is the ordinary completion cost;
-    // the main episode's success opportunity must match it exactly,
-    // proving the pressure disposition adds no scan and no work charge.
+    // Oracle first: bare refused-decoy and successful selected-request
+    // transactions with no parked head or park/resume disposition. The
+    // refused scan warms file-shared ELF facts, so both cold refusal and
+    // warm completion have the same cache state as the main episode.
+    // Their exact scan/work costs prove pressure adds no extra charge.
     let (mut oracle_fixture, mut oracle, _oarmed, _orecord, mut oracle_session) =
         armed_seed_route(1);
     oracle.frame_work_budget_ns = u64::MAX;
     let oracle_pid = oracle.views[0].pid();
-    let oracle_peer = oracle_fixture.spawn_peer();
-    wait_peer_mapped(oracle_peer, "seed-provider.so");
-    oracle
-        .views
-        .push(ProcessView::open(ProcessViewId(1), oracle_peer).unwrap());
-    oracle.next_view_id = 2;
+    let mut oracle_peers: Vec<u32> = (0..2).map(|_| oracle_fixture.spawn_peer()).collect();
+    oracle_peers.sort_unstable();
+    let (oracle_decoy, oracle_peer) = (oracle_peers[0], oracle_peers[1]);
+    for (index, peer) in oracle_peers.iter().enumerate() {
+        wait_peer_mapped(*peer, "seed-provider.so");
+        oracle
+            .views
+            .push(ProcessView::open(ProcessViewId(1 + index as u32), *peer).unwrap());
+    }
+    oracle.next_view_id = 3;
     assert!(oracle.request_refresh_consumed(oracle_pid, Some(1_000)));
+    assert!(oracle.request_refresh_consumed(oracle_decoy, Some(1_100)));
     assert!(oracle.request_refresh_consumed(oracle_peer, Some(1_200)));
-    for offset in 0..254u32 {
+    for offset in 0..253u32 {
         assert!(
             oracle
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
@@ -35948,11 +35953,52 @@ fn pressure_services_unprotected_request_before_original_head() {
         serial: oracle.refresh_requested[&oracle_peer].serial,
     };
     let oracle_protection = oracle.pressure_protection_for(&[], &[]);
+    let mut oracle_collect = Engine::collect_discovery_records;
+    let mut oracle_diverted = Vec::new();
+    let oracle_decoy_before = oracle.refresh_requested[&oracle_decoy].clone();
+    let oracle_cold_cache = oracle.budget.retained_counts().4;
+    assert_eq!(oracle_cold_cache, 0, "the bare refusal starts cold");
+    let oracle_scans_before = oracle.deep_scans;
+    let oracle_work_before = oracle.budget.work_units_count();
+    oracle_session.refuse_preflights([true]);
+    let refused = oracle
+        .pressure_service_pass(
+            &mut oracle_session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            &mut oracle_collect,
+            &mut PauseClosure::new(true),
+            &oracle_protection,
+            PressureSelection {
+                pid: oracle_decoy,
+                serial: oracle_decoy_before.serial,
+            },
+            0,
+            &mut oracle_diverted,
+        )
+        .expect("the bare decoy refusal completes");
+    assert!(refused.attempted, "the bare refusal ran a real attempt");
+    assert_eq!(oracle.deep_scans, oracle_scans_before + 1);
+    assert_eq!(
+        oracle.refresh_requested.get(&oracle_decoy),
+        Some(&oracle_decoy_before),
+        "the bare refusal preserves its request serial and age"
+    );
+    let oracle_warm_cache = oracle.budget.retained_counts().4;
+    assert!(
+        oracle_warm_cache > oracle_cold_cache,
+        "the real refused scan warms shared ELF facts"
+    );
+    assert_eq!(
+        oracle.budget.table_candidates_count(),
+        0,
+        "the seed has no function table; ELF metadata creates no candidates"
+    );
+    let oracle_refusal_work_delta = oracle.budget.work_units_count() - oracle_work_before;
+    assert!(oracle_refusal_work_delta > 0);
     oracle_session.refuse_preflights([false, false]);
     let oracle_scans_before = oracle.deep_scans;
     let oracle_work_before = oracle.budget.work_units_count();
-    let mut oracle_collect = Engine::collect_discovery_records;
-    let mut oracle_diverted = Vec::new();
     let oracle_outcome = oracle
         .pressure_service_pass(
             &mut oracle_session,
@@ -35974,7 +36020,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert!(
         !oracle
             .loader_registry
-            .ids_for_view(ProcessViewId(1))
+            .ids_for_view(ProcessViewId(2))
             .is_empty(),
         "the oracle completion really rearmed"
     );
@@ -35995,6 +36041,16 @@ fn pressure_services_unprotected_request_before_original_head() {
         .budget
         .work_units_count()
         .saturating_sub(oracle_work_before);
+    assert_eq!(
+        oracle.budget.retained_counts().4,
+        oracle_warm_cache,
+        "the bare completion reuses the warmed ELF facts"
+    );
+    assert_eq!(
+        oracle.budget.table_candidates_count(),
+        0,
+        "completion does not mistake metadata for a raw function table"
+    );
     assert!(
         oracle_work_delta > 0,
         "the oracle completion charged real work"
@@ -36163,6 +36219,11 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert!(
         work_after_first > work_before,
         "the refused rescan charged real work"
+    );
+    assert_eq!(
+        work_after_first - work_before,
+        oracle_refusal_work_delta,
+        "the refusal opportunity charges exactly the bare cold-scan cost"
     );
     // Second opportunity: the unprotected provider completes with a genuine
     // rescan, rearm and publication, and the unchanged head resumes into

@@ -3370,21 +3370,18 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        let error =
-            Self::hold_joint_lane_for_exit(
-                lane,
-                &mut *self.coordinator,
-                cause,
-                "joint finish abandoned for exit",
-                &mut warn,
-                None,
-            );
+        let error = Self::hold_joint_lane_for_exit(
+            lane,
+            &mut *self.coordinator,
+            cause,
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
-            self.coordinator.note_scope_gap(
-                "joint finish held for exit".to_string(),
-                cause.to_string(),
-            );
+            self.coordinator
+                .note_scope_gap("joint finish held for exit".to_string(), cause.to_string());
         }
         self.joint_finish = JointFinishDriver::Abandoned;
     }
@@ -3775,15 +3772,14 @@ impl ClassicDriver<'_> {
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
-            format!("{reason}; broad inventory continues; semantic probes stay attached until exit"),
+            format!(
+                "{reason}; broad inventory continues; semantic probes stay attached until exit"
+            ),
         );
         match self.commit(engine_changed) {
             Ok(()) => Ok(PassCommitProgress::Published),
             Err(error)
-                if Self::commit_hit_unfinished_joint_publication(
-                    &error,
-                    &self.coordinator,
-                ) =>
+                if Self::commit_hit_unfinished_joint_publication(&error, &self.coordinator) =>
             {
                 // The machine latched after physically preparing the
                 // commit: the coordinator still holds the unfinished
@@ -3913,10 +3909,8 @@ impl ClassicDriver<'_> {
                     let held = coordinator
                         .collected_graph_refused()
                         .unwrap_or("joint finish disposition required");
-                    coordinator.note_scope_gap(
-                        "joint finish held for exit".to_string(),
-                        held.to_string(),
-                    );
+                    coordinator
+                        .note_scope_gap("joint finish held for exit".to_string(), held.to_string());
                 } else {
                     let live = lane.take().expect("a failed lane holds");
                     Self::hold_joint_lane_for_exit(
@@ -3930,8 +3924,7 @@ impl ClassicDriver<'_> {
                     // The lane stopped with declared loss: the served
                     // snapshot reads Partial, like the Poll path.
                     if let Some(summary) = seated_summary.as_mut() {
-                        summary.status =
-                            crate::inventory_semantics::SemanticCaptureStatus::Partial;
+                        summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
                     }
                     coordinator.note_scope_gap(
                         "semantic lane stopped".to_string(),
@@ -4981,9 +4974,7 @@ impl ClassicDriver<'_> {
                         let now = Instant::now();
                         let since = *pending_since.get_or_insert(now);
                         if now.duration_since(since) >= bound {
-                            self.hold_stuck_retained_joint_publication(
-                                now.duration_since(since),
-                            );
+                            self.hold_stuck_retained_joint_publication(now.duration_since(since));
                             pending_since = None;
                         }
                     } else {
@@ -14166,10 +14157,7 @@ mod tests {
             "the retained run finalizes"
         );
         assert!(error.is_none(), "the bound hold folds no run error");
-        assert!(
-            driver.semantic.is_none(),
-            "the stuck lane is held for exit"
-        );
+        assert!(driver.semantic.is_none(), "the stuck lane is held for exit");
         assert!(
             !driver.joint_commit_pending,
             "the held commit pends nothing"
@@ -14189,8 +14177,7 @@ mod tests {
             .collect();
         assert_eq!(timeouts.len(), 1, "the bound hold is disclosed once");
         assert!(
-            timeouts[0].1.contains("still pending")
-                && timeouts[0].1.contains("report written"),
+            timeouts[0].1.contains("still pending") && timeouts[0].1.contains("report written"),
             "the gap words the hold in plain words: {:?}",
             timeouts[0].1
         );
@@ -14291,9 +14278,7 @@ mod tests {
             "the error names the semantic cause: {error:#}"
         );
         assert!(
-            !error
-                .to_string()
-                .contains("must resume its original frame"),
+            !error.to_string().contains("must resume its original frame"),
             "never the internal message: {error:#}"
         );
         assert!(
@@ -14440,10 +14425,7 @@ mod tests {
             "one publication begins exactly once"
         );
         assert_eq!(driver.joint_commit_polls, 3, "all three calls polled");
-        assert_eq!(
-            driver.commit_calls, 0,
-            "no legacy commit on the Joint path"
-        );
+        assert_eq!(driver.commit_calls, 0, "no legacy commit on the Joint path");
         assert!(
             gaps(&mut driver)
                 .iter()
@@ -17064,8 +17046,7 @@ mod promotion_driver_tests {
             "the bound keeps its own cause, not a second stop"
         );
         driver.commit(false).expect("the stop commit runs");
-        let stalled =
-            committed_gaps_by_subject(&mut driver, "joint finish settle bound reached");
+        let stalled = committed_gaps_by_subject(&mut driver, "joint finish settle bound reached");
         assert_eq!(stalled.len(), 1, "the bound discloses the wedge");
         assert!(
             stalled[0].1.contains("did not complete within")
@@ -17081,8 +17062,7 @@ mod promotion_driver_tests {
             held[0].1, "joint finish settle bound reached",
             "the held gap names the bound cause, not a second stop"
         );
-        let machine_trips =
-            committed_gaps_by_subject(&mut driver, "joint finish made no progress");
+        let machine_trips = committed_gaps_by_subject(&mut driver, "joint finish made no progress");
         assert!(
             machine_trips.is_empty(),
             "the settle never borrows the machine trip's gap: {:?}",

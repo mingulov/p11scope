@@ -1752,11 +1752,9 @@ fn collect_job_off_thread(
     deadline: Option<Instant>,
 ) -> CollectedPass {
     match job {
-        CollectJob::Legacy(job) => {
-            CollectedPass::Legacy(
-                collect_off_thread_with_deadline(job, tick, service, deadline).map(Box::new),
-            )
-        }
+        CollectJob::Legacy(job) => CollectedPass::Legacy(
+            collect_off_thread_with_deadline(job, tick, service, deadline).map(Box::new),
+        ),
         CollectJob::Cgroup { control, task } => match task {
             Ok(job) => {
                 let _ = control.check();
@@ -2005,9 +2003,7 @@ fn collect_off_thread_inner<T: Send>(
                     // Name a passed run deadline once while the worker
                     // still runs; the wait keeps servicing until the
                     // value crosses back, never dropping the pass.
-                    if !deadline_noted
-                        && deadline.is_some_and(|end| Instant::now() >= end)
-                    {
+                    if !deadline_noted && deadline.is_some_and(|end| Instant::now() >= end) {
                         deadline_noted = true;
                         let _ = crate::sink::try_stderr_line(
                             "p11scope: the run deadline passed while this pass was still collecting; waiting for the collection to finish so the report keeps its evidence",

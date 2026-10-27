@@ -2190,11 +2190,7 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         reason: &'static str,
     ) -> Result<SemanticBatch, SemanticRefusal> {
-        self.abandon_finish_with_subject(
-            coordinator,
-            "joint finish abandoned for exit",
-            reason,
-        )
+        self.abandon_finish_with_subject(coordinator, "joint finish abandoned for exit", reason)
     }
 
     /// Abandon with an explicit gap subject: the exit hold keeps "for

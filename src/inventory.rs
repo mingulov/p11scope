@@ -13459,7 +13459,8 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the poll refusal"
         );
         // Later passes continue on the legacy path: no begin, no poll.
@@ -13559,8 +13560,126 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the latched tick refusal"
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_latched_lane_abandons_for_lane_stop_and_continues() {
+        // Production-shape conversion: a latched lane (latched via
+        // note_joint_finish_failure, as a machine latch leaves it)
+        // whose begin refuses DispositionRequired converts mid-run.
+        // The abandon runs (H0 stops) with a lane-stop subject, never
+        // "for exit": the run continues. The pass commits and
+        // publishes, and later passes continue on the legacy path.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.note_joint_finish_failure(crate::inventory_semantics::SemanticRefusal::Unavailable);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
+        )));
+        driver.semantic = Some(lane);
+        let outcome = driver.poll_commit(true);
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a refused begin publishes the pass past the held lane"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        assert!(
+            !driver.joint_commit_pending,
+            "a refused begin pends nothing"
+        );
+        assert_eq!(
+            driver.commit_calls, 1,
+            "the pass commits past the held lane"
+        );
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "joint finish abandoned for lane stop")
+            .collect();
+        assert_eq!(abandons.len(), 1, "the mid-run abandon is disclosed once");
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|gap| gap.0 != "joint finish abandoned for exit"),
+            "a mid-run abandon never says for exit"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        // Later passes continue on the legacy path: no panic, no
+        // re-hold, every pass commits its native evidence.
+        let second = driver.poll_commit(false);
+        assert!(
+            matches!(
+                second,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "later passes publish without the lane"
+        );
+        assert_eq!(driver.commit_calls, 2, "every pass commits");
+    }
+
+    #[test]
+    fn converted_commit_hold_reports_partial_summary() {
+        // A mid-run hold marks the seated summary Partial: the lane
+        // stopped with declared loss for the rest of the run, so the
+        // report must never read "active" past the hold.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
+        )));
+        driver.semantic = Some(lane);
+        driver.on_tick();
+        let outcome = driver.poll_commit(true);
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a refused begin publishes the pass past the held lane"
+        );
+        assert_eq!(
+            driver.semantic_summary().status,
+            crate::inventory_semantics::SemanticCaptureStatus::Partial,
+            "a held lane reads partial, never active"
+        );
+    }
+
+    #[test]
+    fn retained_tick_conversion_reports_partial_summary() {
+        // Stop-time parity: a Tick-cursor conversion marks the seated
+        // summary Partial, exactly like the Poll path.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.suspended = true;
+        driver.joint_commit_pending = true;
+        driver.on_tick();
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        assert_eq!(
+            driver.semantic_summary().status,
+            crate::inventory_semantics::SemanticCaptureStatus::Partial,
+            "a held lane reads partial, never active"
         );
     }
 
@@ -13610,7 +13729,8 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the poll refusal"
         );
     }
@@ -13677,7 +13797,8 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the latched tick refusal"
         );
         // Pass 3: broad inventory continues without the lane.
@@ -13741,7 +13862,8 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the commit refusal"
         );
         assert!(
@@ -13792,7 +13914,8 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
-            stops[0].1, "semantic_unavailable; broad inventory continues",
+            stops[0].1,
+            "semantic_unavailable; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the commit refusal"
         );
         assert!(

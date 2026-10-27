@@ -1336,15 +1336,43 @@ fn actual_slot_names(engine: &Engine) -> std::collections::BTreeMap<(String, u64
         .collect()
 }
 
-/// `(address, version, live_return, manifest_supported)` for every
-/// unlocated (heap/anonymous) table instance, sorted by address.
+/// Physical unlocated instances, including distinct retained allocations after
+/// address reuse. Compatible shorter extents are source observations of the
+/// same view/address/content, rather than additional physical allocations.
 fn live_instances(engine: &Engine) -> Vec<(u64, (u8, u8), bool, bool)> {
-    let mut live: Vec<(u64, (u8, u8), bool, bool)> = engine
+    let mut observations: Vec<_> = engine
         .modules
         .iter()
-        .flat_map(|module| &module.scanned.tables)
-        .filter(|table| table.file_offset.is_none())
-        .map(|table| {
+        .flat_map(|module| {
+            module
+                .scanned
+                .tables
+                .iter()
+                .filter(|table| table.file_offset.is_none())
+                .map(|table| (module.scanned.view, table.clone()))
+        })
+        .collect();
+    // Use the most informative content first so a common short prefix cannot
+    // merge two distinct retained allocations with different extended targets.
+    observations.sort_by_key(|(_, table)| std::cmp::Reverse(table.decoded_slot_count()));
+    let mut physical: Vec<(ProcessViewId, ScannedTable)> = Vec::new();
+    for (view, table) in observations {
+        if let Some((_, known)) = physical.iter_mut().find(|(known_view, known)| {
+            *known_view == view
+                && known.address == table.address
+                && known.entries.starts_with(&table.entries)
+                && known.null_entries.starts_with(&table.null_entries)
+                && known.unpinned.starts_with(&table.unpinned)
+        }) {
+            known.live_return |= table.live_return;
+            known.manifest_supported |= table.manifest_supported;
+        } else {
+            physical.push((view, table));
+        }
+    }
+    let mut live: Vec<_> = physical
+        .into_iter()
+        .map(|(_, table)| {
             (
                 table.address,
                 table.version,
@@ -1427,9 +1455,6 @@ fn template_linkage(engine: &Engine) -> std::collections::BTreeMap<u64, &'static
         .collect()
 }
 
-/// Case 1: no active wrappers. Only the legacy table is published; the
-/// heap path stays empty, templates stay heuristic inventory, and the
-/// anonymous-but-published legacy table admits with authorized names.
 #[test]
 fn same_allocation_observed_at_two_extents_is_one_live_instance() {
     let build = pub_build();
@@ -1437,27 +1462,56 @@ fn same_allocation_observed_at_two_extents_is_one_live_instance() {
     for want in 0..18 {
         assert_eq!(stage.alloc(0, -1).0, want);
     }
-    for index in 0..17 { stage.free(index); }
+    for index in 0..17 {
+        stage.free(index);
+    }
     let published = stage.publish();
-    let table = published.elements.iter().find(|table| table.index == 17).unwrap();
+    let table = published
+        .elements
+        .iter()
+        .find(|table| table.index == 17)
+        .unwrap();
     let maps = MapLite::snapshot(stage.pid);
     let hooks = HookRegistry::builtin();
     let mut engine = engine_over_pids(&[stage.pid]);
     // The two ABI origins can expose different known extents of the same
     // actual allocation. Each record still gets a fresh real memory read.
     drain_records(&mut engine, vec![gfl_record(stage.pid, table, &hooks)]);
-    drain_records(&mut engine, vec![element_record(stage.pid, table.addr, 0, 1, &hooks)]);
-    assert_eq!(live_instances(&engine), vec![(table.addr, (3, 2), true, false)],
-        "source observations do not manufacture another physical allocation");
-    let observations: Vec<_> = engine.modules.iter().flat_map(|module| &module.scanned.tables)
-        .filter(|observed| observed.address == table.addr).collect();
-    assert_eq!(observations.len(), 2, "different known extents remain source observations");
-    let targets: std::collections::BTreeSet<_> = observations.iter()
-        .flat_map(|observed| observed.entries.iter().map(|entry|
-            (entry.object_path.clone(), entry.file_offset))).collect();
+    drain_records(
+        &mut engine,
+        vec![element_record(stage.pid, table.addr, 0, 1, &hooks)],
+    );
+    assert_eq!(
+        live_instances(&engine),
+        vec![(table.addr, (3, 2), true, false)],
+        "source observations do not manufacture another physical allocation"
+    );
+    let observations: Vec<_> = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .filter(|observed| observed.address == table.addr)
+        .collect();
+    assert_eq!(
+        observations.len(),
+        2,
+        "different known extents remain source observations"
+    );
+    let targets: std::collections::BTreeSet<_> = observations
+        .iter()
+        .flat_map(|observed| {
+            observed
+                .entries
+                .iter()
+                .map(|entry| (entry.object_path.clone(), entry.file_offset))
+        })
+        .collect();
     assert_eq!(targets, printed_targets(&maps, std::slice::from_ref(table)));
 }
 
+/// Case 1: no active wrappers. Only the legacy table is published; the
+/// heap path stays empty, templates stay heuristic inventory, and the
+/// anonymous-but-published legacy table admits with authorized names.
 #[test]
 fn no_active_wrappers_admits_only_templates_and_published_legacy() {
     let build = pub_build();

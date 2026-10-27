@@ -21152,7 +21152,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
     };
     let mut budget = CaptureWorkBudget::new(limits);
     let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
-    let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
+    let (lowered, _) = lower_export_record(&view, &index, &hooks, &record, &mut budget)
         .expect("the structurally valid record lowers")
         .expect("one usable pointer gives one table");
     assert_eq!(
@@ -21172,7 +21172,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
     interface_record.interface_index = 3;
     interface_record.announced_count = 4;
     interface_record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
-    let interface = lower_export_record(&view, &index, &hooks, &interface_record, &mut budget)
+    let (interface, _) = lower_export_record(&view, &index, &hooks, &interface_record, &mut budget)
         .unwrap()
         .unwrap();
     assert_eq!(interface.decoder_abi, None);
@@ -51677,7 +51677,7 @@ fn facts_lowered_self_export() -> (ProcessView, ScannedModule) {
     };
     let mut budget = CaptureWorkBudget::new(limits);
     let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
-    let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
+    let (lowered, _) = lower_export_record(&view, &index, &hooks, &record, &mut budget)
         .expect("the structurally valid record lowers")
         .expect("one usable pointer gives one table");
     (view, lowered)
@@ -52132,7 +52132,7 @@ fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
         )
         .unwrap()
     };
-    let HeapLowerOutcome::Admitted(module) = lower(&record) else {
+    let HeapLowerOutcome::Admitted(module, _) = lower(&record) else {
         panic!("matching carried legacy pointers must validate");
     };
     assert_eq!(module.tables[0].entries.len(), 68);
@@ -52201,9 +52201,9 @@ fn compatibility_lower_self(record: &DiscoveryRecord) -> ScannedModule {
     )
     .unwrap()
     {
-        HeapLowerOutcome::Admitted(module) => module,
+        HeapLowerOutcome::Admitted(module, _) => module,
         HeapLowerOutcome::Refused(reason) => panic!("acquired table was discarded: {reason}"),
-        HeapLowerOutcome::Unowned(_) => panic!("the actual file owner is available"),
+        HeapLowerOutcome::Unowned(..) => panic!("the actual file owner is available"),
     }
 }
 
@@ -52656,7 +52656,10 @@ fn address_only_header_availability_distinguishes_observed_zero_from_placeholder
         words.fill(0);
         words[68] = target;
         if unavailable {
-            assert_eq!(unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) }, 0);
+            assert_eq!(
+                unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) },
+                0
+            );
         }
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
         record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
@@ -52669,18 +52672,38 @@ fn address_only_header_availability_distinguishes_observed_zero_from_placeholder
         let view = ProcessView::open(ProcessViewId(4306), std::process::id()).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
         let mut engine = Engine::empty();
-        let HeapLowerOutcome::Admitted(module) = lower_heap_publication_record(
-            &view, &MapIndex::new(&maps).unwrap(), &HookRegistry::builtin(), &record, &[],
-            &mut engine.budget, None,
-        ).unwrap() else { panic!("the complete readable body must survive"); };
+        let HeapLowerOutcome::Admitted(module, header_available) = lower_heap_publication_record(
+            &view,
+            &MapIndex::new(&maps).unwrap(),
+            &HookRegistry::builtin(),
+            &record,
+            &[],
+            &mut engine.budget,
+            None,
+        )
+        .unwrap() else {
+            panic!("the complete readable body must survive");
+        };
         assert_eq!(module.tables[0].version, (0, 0));
         assert_eq!(module.tables[0].entries.len(), 1);
         assert_eq!(module.tables[0].null_entries.len(), 67);
         assert_eq!(module.tables[0].walk, "full");
-        engine.note_publication_availability("live interface discovery", &record, module.tables[0].version);
-        assert_eq!(engine.counters.object_skips.iter().any(|skip|
-            skip.reason.contains("header metadata") && skip.reason.contains("unreadable")), unavailable,
-            "actual observed0.0 and unavailable metadata need distinct diagnostics");
+        engine.note_publication_availability(
+            "live interface discovery",
+            &record,
+            module.tables[0].version,
+            header_available,
+        );
+        assert_eq!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason.contains("header metadata")
+                    && skip.reason.contains("unreadable")),
+            unavailable,
+            "actual observed0.0 and unavailable metadata need distinct diagnostics"
+        );
     }
 }
 
@@ -52951,7 +52974,7 @@ fn acquired_ia32_sparse_table_uses_the_real_process_abi() {
         None,
     )
     .unwrap();
-    let HeapLowerOutcome::Admitted(module) = result else {
+    let HeapLowerOutcome::Admitted(module, _) = result else {
         panic!("the actual IA32 table must lower");
     };
     assert_eq!(module.tables[0].entries.len(), 1);

@@ -7972,9 +7972,9 @@ fn name_class(class: u8) -> &'static str {
 /// explicit refusal the caller publishes as live loss. Refusals degrade
 /// confidence — they never claim the table is absent.
 enum HeapLowerOutcome {
-    Admitted(ScannedModule),
+    Admitted(ScannedModule, bool),
     Refused(&'static str),
-    Unowned(ScannedTable),
+    Unowned(ScannedTable, bool),
 }
 
 /// Why one bounded exact-address validation failed. The selection path
@@ -8059,7 +8059,7 @@ fn lower_export_record(
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
-) -> Result<Option<ScannedModule>, String> {
+) -> Result<Option<(ScannedModule, bool)>, String> {
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return Err("selection record reached export lowering".into());
     }
@@ -8079,7 +8079,7 @@ fn lower_publication_record(
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
     gi_hook: Option<(&str, HookAbi)>,
-) -> Result<Option<ScannedModule>, String> {
+) -> Result<Option<(ScannedModule, bool)>, String> {
     if !valid_discovery_record(record) {
         return Err("malformed discovery record reached export lowering".into());
     }
@@ -8108,16 +8108,16 @@ fn lower_publication_record(
         return Ok(None);
     }
     match lower_heap_publication_record(view, maps, hooks, record, &[], budget, gi_hook)? {
-        HeapLowerOutcome::Admitted(mut module) => {
+        HeapLowerOutcome::Admitted(mut module, header_available) => {
             if record.kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
                 && record.name_class == DISCOVERY_NAME_EXACT_STANDARD
                 && record.usable_n > 0
             {
                 module.interfaces[0].table = Some(0);
             }
-            Ok(Some(module))
+            Ok(Some((module, header_available)))
         }
-        HeapLowerOutcome::Refused(_) | HeapLowerOutcome::Unowned(_) => Ok(None),
+        HeapLowerOutcome::Refused(_) | HeapLowerOutcome::Unowned(..) => Ok(None),
     }
 }
 
@@ -8193,7 +8193,7 @@ fn lower_heap_publication_record(
             Engine::read_acquired_table_bracketed(view, layout, index_a, budget, record)
                 .map(|table| (layout, table))
         });
-    let (layout, (mut table, bytes)) = match validated {
+    let (layout, (mut table, bytes, header_available)) = match validated {
         Ok(validated) => validated,
         Err(refusal) => {
             return Ok(HeapLowerOutcome::Refused(match refusal {
@@ -8259,7 +8259,7 @@ fn lower_heap_publication_record(
             match resolve_heap_table_owner(hook_name, view.id(), &table.entries, modules) {
                 Some(owner) => owner,
                 None => {
-                    return Ok(HeapLowerOutcome::Unowned(table));
+                    return Ok(HeapLowerOutcome::Unowned(table, header_available));
                 }
             }
         }
@@ -8279,7 +8279,7 @@ fn lower_heap_publication_record(
     if !view.still_the_same() {
         return Err("process generation changed during export lowering".into());
     }
-    Ok(HeapLowerOutcome::Admitted(module))
+    Ok(HeapLowerOutcome::Admitted(module, header_available))
 }
 
 fn publication_module(
@@ -14452,6 +14452,7 @@ impl Engine {
     fn apply_unowned_publication(
         &mut self,
         table: ScannedTable,
+        header_available: bool,
         position: usize,
         record: &DiscoveryRecord,
         session: &mut dyn EngineSession,
@@ -14459,7 +14460,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         subject: &str,
     ) -> Result<DiscoveryRecordOutcome> {
-        self.note_publication_availability(subject, record, table.version);
+        self.note_publication_availability(subject, record, table.version, header_available);
         self.note_unowned_publication(subject, &table);
         let mut targets = BTreeMap::<ObjectKey, String>::new();
         for entry in &table.entries {
@@ -14519,6 +14520,7 @@ impl Engine {
         subject: &str,
         record: &DiscoveryRecord,
         observed_version: (u8, u8),
+        header_available: bool,
     ) {
         let failed = record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0;
         let uncertain = failed
@@ -14534,6 +14536,13 @@ impl Engine {
         if uncertain {
             self.mark_partial(subject,
                 "captured table version metadata was unavailable or uncertain; 0.0 is only a placeholder when no fresh metadata can be read");
+        }
+        if !header_available {
+            self.mark_partial(subject, if record_prefix_version(record).is_none() || uncertain {
+                "table header metadata was unreadable during validation; displayed 0.0 is an unavailable-metadata placeholder"
+            } else {
+                "table header metadata was unreadable during validation; the displayed version retains the captured metadata"
+            });
         }
         if !uncertain
             && let Some(captured) = record_prefix_version(record)
@@ -14571,7 +14580,7 @@ impl Engine {
                 RecordRejection::ExportNoRetainedView,
             ));
         };
-        let lowered = {
+        let (lowered, header_available) = {
             let view = &self.views[position];
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
@@ -14593,10 +14602,13 @@ impl Engine {
                     None,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
-                    Ok(HeapLowerOutcome::Admitted(module)) => module,
-                    Ok(HeapLowerOutcome::Unowned(table)) => {
+                    Ok(HeapLowerOutcome::Admitted(module, header_available)) => {
+                        (module, header_available)
+                    }
+                    Ok(HeapLowerOutcome::Unowned(table, header_available)) => {
                         return self.apply_unowned_publication(
                             table,
+                            header_available,
                             position,
                             record,
                             session,
@@ -14618,6 +14630,7 @@ impl Engine {
             "live export discovery",
             record,
             lowered.tables[0].version,
+            header_available,
         );
         self.apply_lowered_module(
             lowered,
@@ -14738,7 +14751,7 @@ impl Engine {
                 RecordRejection::SelectionUnattributed,
             ));
         };
-        let lowered = {
+        let (lowered, header_available) = {
             let view = &self.views[position];
             let maps = Self::read_maps(view, &mut self.budget)?;
             let index =
@@ -14764,16 +14777,22 @@ impl Engine {
                     gi_hook,
                 ) {
                     Err(error) => return Err(anyhow!(error)),
-                    Ok(HeapLowerOutcome::Admitted(module)) => module,
-                    Ok(HeapLowerOutcome::Unowned(table)) => {
+                    Ok(HeapLowerOutcome::Admitted(module, header_available)) => {
+                        (module, header_available)
+                    }
+                    Ok(HeapLowerOutcome::Unowned(table, header_available)) => {
                         if let Some((key, path)) = binding_owner
                             .clone()
                             .filter(|_| self.pinned.check_unchanged().unwrap_or(false))
                         {
-                            publication_module(view, record, &hook_name, key, path, table)
+                            (
+                                publication_module(view, record, &hook_name, key, path, table),
+                                header_available,
+                            )
                         } else {
                             return self.apply_unowned_publication(
                                 table,
+                                header_available,
                                 position,
                                 record,
                                 session,
@@ -14794,6 +14813,7 @@ impl Engine {
             "live interface selection",
             record,
             lowered.tables[0].version,
+            header_available,
         );
         self.apply_lowered_module(
             lowered,
@@ -16248,7 +16268,7 @@ impl Engine {
         index_a: &MapIndex,
         budget: &mut CaptureWorkBudget,
         record: &DiscoveryRecord,
-    ) -> std::result::Result<(ScannedTable, Vec<u8>), ExactReadRefusal> {
+    ) -> std::result::Result<(ScannedTable, Vec<u8>, bool), ExactReadRefusal> {
         let address = record.table_ptr;
         let mem = view
             .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
@@ -16353,7 +16373,7 @@ impl Engine {
         {
             return Err(ExactReadRefusal::Unstable);
         }
-        Ok((table, bytes))
+        Ok((table, bytes, header.is_some()))
     }
 
     /// Raw exact-address validation brackets the complete decoded extent and

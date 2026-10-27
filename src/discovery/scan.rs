@@ -2123,8 +2123,8 @@ pub(crate) fn table_evidence_score(
     }
 }
 
-/// Opaque associations cannot supply the standard ordinal layout. Merge keeps
-/// these observations separate from a typed getter's stronger naming proof.
+/// Opaque associations cannot supply the standard ordinal layout. A matching
+/// typed return retains its stronger proof with opaque metadata unlinked.
 pub(crate) fn table_has_only_opaque_interfaces(
     index: usize,
     interfaces: &[ScannedInterface],

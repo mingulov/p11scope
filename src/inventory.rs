@@ -14222,6 +14222,59 @@ mod tests {
     }
 
     #[test]
+    fn joint_poll_commit_wedged_publication_names_semantic_cause() {
+        // Wedged-publication mitigation: the machine latched after
+        // physically preparing the commit, so the coordinator still
+        // holds the unfinished Joint publication and the conversion's
+        // plain commit refuses. The driver names the semantic cause
+        // on stderr and in the error — never the internal
+        // resume-original-frame message. A full hold-and-publish past
+        // this wedge needs a coordinator abandon API (reported
+        // residual); this twin pins the honest failure.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired,
+        )));
+        driver.semantic = Some(lane);
+        driver.on_tick();
+        fail_next_classic_commit_for_test(
+            "an unfinished Joint publication must resume its original frame",
+        );
+        super::take_warned_for_test();
+        let outcome = driver.poll_commit(true);
+        let error = outcome.expect_err("a wedged publication still fails the call");
+        assert!(
+            error.to_string().contains("semantic lane stopped"),
+            "the error names the semantic cause: {error:#}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("must resume its original frame"),
+            "never the internal message: {error:#}"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the lane is already held past the failure"
+        );
+        let warned = super::take_warned_for_test();
+        assert!(
+            warned
+                .iter()
+                .any(|line| line.contains("unfinished joint publication")),
+            "stderr names the wedge: {warned:?}"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the stop stages before the failed commit");
+    }
+
+    #[test]
     fn joint_poll_commit_legacy_lane_keeps_sync_commit() {
         // Lock-in: a legacy lane's poll_commit is today's sync commit
         // plus Published, with no Joint flag, begin or poll.

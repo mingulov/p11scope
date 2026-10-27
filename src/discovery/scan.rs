@@ -6735,6 +6735,74 @@ mod tests {
     }
 
     #[test]
+    fn raw_extended_export_anchor_is_not_gated_by_header_metadata() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 105 * 8];
+        snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
+        snapshot[104 * 8..105 * 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        let symbols = [(function_name(103).unwrap().to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            Some(&exports),
+            || Some(0),
+        );
+        assert!(skipped.is_empty());
+        let table = tables
+            .iter()
+            .find(|table| table.address == 0x7000)
+            .expect("the actual export position anchors the observed extension");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.entries[0].name, function_name(103).unwrap());
+        assert_eq!(table.decoded_slot_count(), 104);
+        assert_eq!(table.null_entries.len(), 103);
+    }
+
+    #[test]
+    fn runtime_fingerprint_is_not_reused_for_a_different_decoded_shape() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n6000-7000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessViewId(78);
+        let mut table = decode_observed_words(
+            (2, 40),
+            &[0x1500; 68],
+            68,
+            0x6000,
+            &index,
+            &mut budget,
+            Some(view),
+        )
+        .unwrap()
+        .unwrap();
+        let before =
+            observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                .unwrap();
+        table.entries[0].file_offset += 1;
+        let after =
+            observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                .unwrap();
+        assert_ne!(
+            before, after,
+            "a stale raw fingerprint cannot replace a changed current table shape"
+        );
+    }
+
+    #[test]
     fn retain_tables_ignores_unmapped_tail_words_beyond_the_decoded_prefix() {
         let maps = mislabelled_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();
@@ -6762,6 +6830,51 @@ mod tests {
             [&0x1000],
             "only the executable mapping is a dependency target"
         );
+    }
+
+    #[test]
+    fn raw_export_anchor_does_not_name_an_unproven_private_callback() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        for word in [0x2802u64, 0x0003, 0x0103, 0x0203, 0xe707] {
+            let mut snapshot = vec![0u8; 69 * 8];
+            snapshot[..8].copy_from_slice(&(0xa5a5_0000_0000_0000u64 | word).to_le_bytes());
+            snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+            snapshot[16..24].copy_from_slice(&0x1600u64.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let table = tables
+                .iter()
+                .find(|table| table.address == 0x7000)
+                .expect("valid targets remain observable");
+            assert_eq!(table.entries.len(), 2);
+            let score =
+                table_evidence_score(0, std::slice::from_ref(table), &[], &[], &[], &exports);
+            assert!(
+                !score.exports,
+                "{word:#x}: the private callback lacks ordinal/name proof"
+            );
+            assert!(
+                !table_name_authorized(&score),
+                "uncertain API names stay unknown/count-only"
+            );
+        }
     }
 
     #[test]

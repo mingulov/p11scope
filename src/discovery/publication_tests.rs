@@ -4183,7 +4183,13 @@ fn f_e15_partial_tables_retain_valid_targets() {
         for (label, engine) in [("element", &element_engine), ("GI", &gi_engine)] {
             assert!(
                 valid.is_subset(&slot_targets(engine)),
-                "mode {mode}: {label} retains every independently valid target"
+                "mode {mode}: {label} retains every independently valid target; version={}.{} physical={} slots={} missing={} reasons={:?}",
+                heap17.major,
+                heap17.minor,
+                heap17.entries.len(),
+                slot_targets(engine).len(),
+                valid.difference(&slot_targets(engine)).count(),
+                skip_reasons(engine),
             );
             let table = engine
                 .modules

@@ -52647,3 +52647,91 @@ fn empty_anonymous_publication_with_ambiguous_owner_is_handled_as_an_observation
                 .contains("68 observed positions, 68 NULL, 0 usable targets")
     }));
 }
+
+#[test]
+fn acquired_header_and_pointer_failure_keeps_completed_legacy_words() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0x0203, 1);
+    // The producer saw one word but could read neither the header metadata
+    // nor the next word. A later readable header is not a different payload.
+    let record = compatibility_publication_record(address, 0, 1);
+    let module = compatibility_lower_self(&record);
+    assert_eq!(module.tables[0].entries.len(), 1);
+    assert_eq!(module.tables[0].entries[0].name, "C_Initialize");
+    assert_eq!(module.tables[0].walk, "known_prefix");
+}
+
+#[test]
+fn acquired_ia32_sparse_table_uses_the_real_process_abi() {
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("ia32-provider");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/provider-compatibility-ia32.c");
+    assert!(
+        Command::new("cc")
+            .args(["-m32", "-fno-pie", "-no-pie", "-rdynamic"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success(),
+        "the required IA32 fixture must compile, never pass through a skip"
+    );
+    let mut child = ChildGuard(
+        Command::new(&program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let values: Vec<_> = line
+        .split_whitespace()
+        .map(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap())
+        .collect();
+    assert_eq!(values.len(), 2);
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = HookRegistry::builtin().id("C_GetFunctionList").unwrap();
+    record.pid_tgid = u64::from(child.0.id()) << 32;
+    record.table_ptr = values[0];
+    record.version_major = 2;
+    record.version_minor = 40;
+    record.pointers_attempted = 68;
+    record.completed_prefix = 68;
+    record.usable_n = 68;
+    record.pointers[67] = values[1];
+    assert!(valid_discovery_record(&record));
+    let view = ProcessView::open(ProcessViewId(4304), child.0.id()).unwrap();
+    let maps = parse_maps(&std::fs::read(format!("/proc/{}/maps", child.0.id())).unwrap()).unwrap();
+    let result = lower_heap_publication_record(
+        &view,
+        &MapIndex::new(&maps).unwrap(),
+        &HookRegistry::builtin(),
+        &record,
+        &[],
+        &mut CaptureWorkBudget::default(),
+        None,
+    )
+    .unwrap();
+    let HeapLowerOutcome::Admitted(module) = result else {
+        panic!("the actual IA32 table must lower");
+    };
+    assert_eq!(module.tables[0].entries.len(), 1);
+    assert_eq!(module.tables[0].entries[0].name, "C_WaitForSlotEvent");
+    assert_eq!(module.tables[0].null_entries.len(), 67);
+}

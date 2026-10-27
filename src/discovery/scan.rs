@@ -2764,6 +2764,7 @@ fn detect_tables(
     detect_tables_for_layout(LinuxLayout::Lp64, snapshot, base_address, maps, budget)
 }
 
+#[cfg(test)]
 fn detect_tables_for_layout(
     layout: LinuxLayout,
     snapshot: &[u8],

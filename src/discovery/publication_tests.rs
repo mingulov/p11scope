@@ -1730,8 +1730,8 @@ fn holes_admit_index_17_despite_free_0_to_3() {
     assert_eq!(engine.plan().slots.len(), 34);
     assert_eq!(slot_object_keys(&engine).len(), 1, "provider only");
 
-    // Provenance: both published tables carry live returns and authorize
-    // names; the live element interfaces link nothing (no widening).
+    // Both tables were published. Only the independent typed legacy return
+    // supplies standard layout names; the opaque wrapper keeps unknown names.
     assert_eq!(
         live_instances(&engine),
         sorted_live(vec![
@@ -1747,7 +1747,10 @@ fn holes_admit_index_17_despite_free_0_to_3() {
         .flat_map(|module| &module.scanned.interfaces)
         .filter(|interface| interface.table.is_none())
         .count();
-    assert_eq!(unlinked_live, 2, "both live elements stay unlinked");
+    assert_eq!(
+        unlinked_live, 1,
+        "the typed legacy proof retains its unlinked opaque metadata"
+    );
     let linkage_none: Vec<&str> = engine
         .plan()
         .modules
@@ -1756,14 +1759,12 @@ fn holes_admit_index_17_despite_free_0_to_3() {
         .filter(|table| table.file_offset.is_none())
         .map(|table| table.linkage)
         .collect();
-    assert_eq!(linkage_none, vec!["live_return", "live_return"]);
+    assert_eq!(linkage_none, vec!["heuristic", "live_return"]);
 
-    // Names: heap 17's closures authorize their ordinal labels; the
-    // swept templates carry no exact_standard interface link and no
-    // live-return or manifest evidence of their own, so none of them
-    // are authorized (U-15; F-T2-1).
+    // Opaque wrappers and raw templates carry no independent standard-layout
+    // proof. Their targets remain observable with unknown API names.
     let template_auth = |_index: i64| false;
-    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap17, true)];
+    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap17, false)];
     claimants.extend(
         visible
             .iter()
@@ -1875,8 +1876,8 @@ fn five_active_wrappers_admit_all_closure_sets() {
     assert_eq!(engine.plan().slots.len(), 34);
     assert_eq!(slot_object_keys(&engine).len(), 1, "provider only");
 
-    // Index 4's closures — beyond the heuristic window — are admitted
-    // with authorized names.
+    // Opaque index4 callbacks admit beyond the heuristic window while their
+    // standard API names remain unproven.
     let heap4 = publish
         .elements
         .iter()
@@ -1889,12 +1890,8 @@ fn five_active_wrappers_admit_all_closure_sets() {
         let names = &actual_slot_names(&engine)[&(path.clone(), offset)];
         assert_eq!(
             *names,
-            vec![
-                pkcs11_module::function_name(ord as usize)
-                    .unwrap()
-                    .to_string()
-            ],
-            "idx4 ord{ord} is authorized, never unknown"
+            vec!["unknown".to_string()],
+            "idx4 ord{ord} has no standard-layout naming proof"
         );
     }
 
@@ -1919,16 +1916,19 @@ fn five_active_wrappers_admit_all_closure_sets() {
         .filter(|table| table.file_offset.is_none())
         .map(|table| table.linkage)
         .collect();
-    assert_eq!(linkage_none, vec!["live_return"; 6]);
+    assert_eq!(
+        linkage_none,
+        [vec!["heuristic"; 5], vec!["live_return"]].concat()
+    );
 
-    let template_auth = |index: i64| index == 0;
+    let template_auth = |_index: i64| false;
     let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true)];
     claimants.extend(
         publish
             .elements
             .iter()
             .filter(|table| table.index >= 0)
-            .map(|table| (table, true)),
+            .map(|table| (table, false)),
     );
     claimants.extend(
         visible
@@ -2127,7 +2127,7 @@ fn two_processes_union_indices_of_one_inode() {
     assert_eq!(live_instances(&engine), sorted_live(expected_live));
 
     // Names from both views' claimants (template offsets coincide).
-    let template_auth = |index: i64| index == 0;
+    let template_auth = |_index: i64| false;
     let mut names_a = expected_slot_names(&maps_a, &{
         let mut claimants_a: Vec<(&TablePrint, bool)> = vec![(&publish_a.legacy, true)];
         claimants_a.extend(
@@ -2135,7 +2135,7 @@ fn two_processes_union_indices_of_one_inode() {
                 .elements
                 .iter()
                 .filter(|table| table.index >= 0)
-                .map(|table| (table, true)),
+                .map(|table| (table, false)),
         );
         claimants_a.extend(
             visible
@@ -2151,7 +2151,7 @@ fn two_processes_union_indices_of_one_inode() {
                 .elements
                 .iter()
                 .filter(|table| table.index >= 0)
-                .map(|table| (table, true)),
+                .map(|table| (table, false)),
         );
         claimants_b
     });
@@ -2331,7 +2331,7 @@ fn direct_backend_forwarding_admits_cross_object_targets() {
     // live-return or manifest evidence of their own, so none of them
     // are authorized (U-15; F-T2-1).
     let template_auth = |_index: i64| false;
-    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap0, true)];
+    let mut claimants: Vec<(&TablePrint, bool)> = vec![(&publish.legacy, true), (heap0, false)];
     claimants.extend(
         visible
             .iter()
@@ -2688,6 +2688,7 @@ fn unknown_build_admits_by_publication_without_layout() {
     let started = Instant::now();
     let mut engine = engine_over_pids(&[stage.pid]);
     let scan_baseline = engine.plan().slots.len();
+    let sweep_interface_records = engine.budget.interface_records_count();
     let baseline_targets = slot_targets(&engine);
     eprintln!("t8-stripped: scan-only baseline is {scan_baseline} slots");
     // The stripped fixture's file tail may decode incidental tables depending
@@ -2761,7 +2762,7 @@ fn unknown_build_admits_by_publication_without_layout() {
             .count(),
         engine.plan().uncorroborated_candidates,
     );
-    // Index 4's closures admit with authorized ordinal names.
+    // The stripped opaque interface admits callbacks with unknown API names.
     let heap4 = publish
         .elements
         .iter()
@@ -2772,12 +2773,8 @@ fn unknown_build_admits_by_publication_without_layout() {
         let names = &actual_slot_names(&engine)[&(path, offset)];
         assert_eq!(
             *names,
-            vec![
-                pkcs11_module::function_name(ord as usize)
-                    .unwrap()
-                    .to_string()
-            ],
-            "stripped idx4 ord{ord} is authorized, never unknown"
+            vec!["unknown".to_string()],
+            "stripped idx4 ord{ord} has no standard-layout naming proof"
         );
     }
     // The file-backed legacy merges (scan + live are one instance with
@@ -2819,15 +2816,12 @@ fn unknown_build_admits_by_publication_without_layout() {
         "every wrapper call is admitted"
     );
 
-    // Six live list elements plus whatever sweep triples this layout
-    // decoded (layout-unknown, so read the sweep's own count).
-    let sweep_triples: usize = engine
-        .modules
-        .iter()
-        .flat_map(|module| &module.scanned.interfaces)
-        .filter(|interface| interface.table.is_some())
-        .count();
-    assert_eq!(engine.budget.interface_records_count(), 6 + sweep_triples);
+    // Six real list-element records join the independently captured initial
+    // sweep count; opaque source associations do not fabricate sweep triples.
+    assert_eq!(
+        engine.budget.interface_records_count(),
+        6 + sweep_interface_records
+    );
     assert!(
         session.attached_slots.iter().sum::<usize>() == engine.plan().slots.len() - scan_baseline,
         "publication attaches exactly its new slots"
@@ -4226,10 +4220,10 @@ fn f_e15_partial_tables_retain_valid_targets() {
 }
 
 /// Case 19 (Package F, E15): a forged exact-standard name class on a
-/// `C_GetInterface` result changes nothing about authority. Admission
-/// still rests on byte validation alone, slot names still come from the
-/// ordinal catalog (never the record), and no selection claim authorizes
-/// a heap table. SYNTHETIC record: no fixture interface is exact-named.
+/// `C_GetInterface` result supplies no semantic or selection authority.
+/// Admission still rests on byte validation and names come from the catalog.
+/// No selection claim authorizes a heap table. SYNTHETIC record: no fixture
+/// interface is exact-named.
 #[test]
 fn f_e15_forged_exact_name_stays_count_only() {
     let build = pub_build();
@@ -4273,18 +4267,29 @@ fn f_e15_forged_exact_name_stays_count_only() {
             0,
         )],
     );
-    // The bytes validate, so the endpoints admit — exactly as the
-    // element route admits them. The name class grants nothing extra.
+    // Both sources admit the same verified endpoints. The synthetic standard
+    // class can supply ordinary catalog names, while opaque names stay unknown;
+    // neither source gains semantic or selection authority from that class.
     assert_eq!(
         slot_targets(&gi_engine),
         slot_targets(&element_engine),
-        "forged exact name: identical endpoint sets"
+        "forged exact name: identical endpoint sets",
     );
-    assert_eq!(
-        actual_slot_names(&gi_engine),
-        actual_slot_names(&element_engine),
-        "slot names come from the ordinal catalog, never the record"
-    );
+    for ordinal in EX_ORDS {
+        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[ordinal as usize].0);
+        assert_eq!(
+            actual_slot_names(&gi_engine)[&(path.clone(), offset)],
+            vec![
+                pkcs11_module::function_name(ordinal as usize)
+                    .unwrap()
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            actual_slot_names(&element_engine)[&(path, offset)],
+            vec!["unknown".to_string()]
+        );
+    }
     assert_instance_entries(&gi_engine, &maps, &heap17, true);
     // ... and no selection claim authorizes the heap table either: the
     // same-object authority guard holds against the forged class.

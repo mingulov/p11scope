@@ -52252,3 +52252,162 @@ fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
         )
     ));
 }
+
+fn compatibility_publication_record(address: u64, word: u64, slots: usize) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = HookRegistry::builtin().id("C_GetFunctionList").unwrap();
+    record.pid_tgid = u64::from(std::process::id()) << 32;
+    record.table_ptr = address;
+    record.version_major = word as u8;
+    record.version_minor = (word >> 8) as u8;
+    record.pointers_attempted = 68;
+    record.completed_prefix = slots as u8;
+    record.usable_n = slots as u8;
+    if slots < 68 {
+        record.status_flags = p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE;
+    }
+    record.pointers[..slots].copy_from_slice(unsafe {
+        std::slice::from_raw_parts((address as *const u64).add(1), slots)
+    });
+    assert!(valid_discovery_record(&record));
+    record
+}
+
+fn compatibility_lower_self(record: &DiscoveryRecord) -> ScannedModule {
+    let view = ProcessView::open(ProcessViewId(4300), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let index = MapIndex::new(&maps).unwrap();
+    match lower_heap_publication_record(
+        &view,
+        &index,
+        &HookRegistry::builtin(),
+        record,
+        &[],
+        &mut CaptureWorkBudget::default(),
+        None,
+    )
+    .unwrap()
+    {
+        HeapLowerOutcome::Admitted(module) => module,
+        HeapLowerOutcome::Refused(reason) => panic!("acquired table was discarded: {reason}"),
+    }
+}
+
+#[test]
+fn acquired_legacy_extent_is_independent_of_version_and_physical_tail() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    for word in [
+        0x2802u64,
+        0x0003,
+        0x0103,
+        0x0203,
+        0xe707,
+        0xa5a5_0000_0000_0203,
+    ] {
+        for physical in [68usize, 92, 104] {
+            let address = fixture.write_table(word, physical);
+            let record = compatibility_publication_record(address, word, 68);
+            let module = compatibility_lower_self(&record);
+            let table = &module.tables[0];
+            assert_eq!(table.version, (word as u8, (word >> 8) as u8));
+            assert_eq!(
+                table.entries.len(),
+                68,
+                "{word:#x}/{physical}: legacy extent"
+            );
+            assert_eq!(table.decoded_slot_count(), 68);
+            assert_eq!(table.walk, "full", "complete typed legacy observation");
+        }
+    }
+}
+
+#[test]
+fn acquired_sparse_legacy_keeps_first_middle_and_last_ordinals() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    for ordinal in [0usize, 27, 67] {
+        let address = fixture.write_table(0x2802, 68);
+        let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u64, 69) };
+        let target = words[ordinal + 1];
+        words[1..].fill(0);
+        words[ordinal + 1] = target;
+        let module =
+            compatibility_lower_self(&compatibility_publication_record(address, 0x2802, 68));
+        let table = &module.tables[0];
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(
+            table.entries[0].name,
+            pkcs11_module::function_name(ordinal).unwrap()
+        );
+        assert_eq!(table.null_entries.len(), 67);
+        assert!(table.unpinned.is_empty());
+    }
+}
+
+#[test]
+fn acquired_all_null_legacy_is_an_empty_table_observation() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0xe707, 68);
+    unsafe { std::slice::from_raw_parts_mut((address as *mut u64).add(1), 68) }.fill(0);
+    let module = compatibility_lower_self(&compatibility_publication_record(address, 0xe707, 68));
+    assert_eq!(module.tables.len(), 1);
+    assert!(module.tables[0].entries.is_empty());
+    assert_eq!(module.tables[0].null_entries.len(), 68);
+    assert!(module.tables[0].unpinned.is_empty());
+    assert_eq!(module.tables[0].walk, "full");
+}
+
+#[test]
+fn acquired_short_legacy_keeps_completed_words_without_inventing_null_tail() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    for count in [1usize, 3, 67] {
+        let address = fixture.write_table(0xe707, count);
+        let module =
+            compatibility_lower_self(&compatibility_publication_record(address, 0xe707, count));
+        let table = &module.tables[0];
+        assert_eq!(table.entries.len(), count);
+        assert_eq!(table.decoded_slot_count(), count);
+        assert!(table.null_entries.is_empty(), "missing words are not NULLs");
+        assert_eq!(table.walk, "known_prefix");
+    }
+}
+
+#[test]
+fn acquired_legacy_keeps_good_targets_around_invalid_words() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    for broken in [5usize, 67] {
+        let address = fixture.write_table(0x2802, 68);
+        unsafe { *(address as *mut u64).add(broken + 1) = 1 };
+        let module =
+            compatibility_lower_self(&compatibility_publication_record(address, 0x2802, 68));
+        let table = &module.tables[0];
+        assert_eq!(table.entries.len(), 67);
+        assert_eq!(table.unpinned.len(), 1);
+        assert_eq!(
+            table.unpinned[0].subject,
+            pkcs11_module::function_name(broken).unwrap()
+        );
+        assert!(table.null_entries.is_empty(), "invalid is not NULL");
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(|entry| entry.name == "C_Initialize")
+        );
+        if broken == 5 {
+            assert!(
+                table
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "C_WaitForSlotEvent")
+            );
+        }
+    }
+}

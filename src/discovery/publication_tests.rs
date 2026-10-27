@@ -4109,7 +4109,7 @@ fn f_e13_first_call_gap_and_precapture_boundary() {
 /// poisoned table admits nothing, not even a prefix. A NULL hole is the
 /// control: holes admit identically on both routes.
 #[test]
-fn f_e15_malicious_entries_refused_equally() {
+fn f_e15_partial_tables_retain_valid_targets() {
     let build = pub_build();
     let hooks = HookRegistry::builtin();
     // Modes: 1 unmapped, 2 file-backed provider data, 3 heap data.
@@ -4117,8 +4117,8 @@ fn f_e15_malicious_entries_refused_equally() {
         let dir = pub_tmp(&format!("f18-poison-{mode}"));
         let _ = &dir;
         let mut stage = StageChild::spawn(&build.workload, &build.provider);
-        // Index 17 sits beyond the template window: no sweep aliasing
-        // can admit its healthy ordinals, so refusal is total.
+        // Index 17 sits beyond the template window: the live result,
+        // rather than sweep aliasing, must admit its healthy ordinals.
         for want in 0..18 {
             let (idx, _) = stage.alloc(0, -1);
             assert_eq!(idx, want);
@@ -4159,37 +4159,37 @@ fn f_e15_malicious_entries_refused_equally() {
                 (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_V3_2, iface.flags),
             )],
         );
-        assert_eq!(
-            slot_targets(&element_engine),
-            element_baseline,
-            "mode {mode}: element admits nothing"
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            gi_baseline,
-            "mode {mode}: GI admits nothing"
-        );
-        // Whole-table refusal: even the healthy ordinals admit nothing.
-        let (path, offset, _) = MapLite::file_target(&maps, heap17.entries[0].0);
+        let valid: std::collections::BTreeSet<_> = heap17
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, _)| *ordinal != 5)
+            .map(|(_, (target, _))| {
+                let (path, offset, _) = MapLite::file_target(&maps, *target);
+                (path, offset)
+            })
+            .collect();
         assert!(
-            !slot_targets(&gi_engine).contains(&(path.clone(), offset)),
-            "mode {mode}: no prefix admission from a poisoned table"
+            valid
+                .iter()
+                .any(|target| !element_baseline.contains(target))
         );
-        assert!(
-            !slot_targets(&element_engine).contains(&(path, offset)),
-            "mode {mode}: no prefix admission from a poisoned table"
-        );
-        let omission = "a published table's bytes did not decode as a function table";
-        assert!(
-            skip_reasons(&element_engine)
-                .contains(&("live export discovery".to_string(), omission.to_string())),
-            "mode {mode}: element carries the explicit omission"
-        );
-        assert!(
-            skip_reasons(&gi_engine)
-                .contains(&("live interface selection".to_string(), omission.to_string())),
-            "mode {mode}: GI carries the same explicit omission"
-        );
+        assert!(valid.iter().any(|target| !gi_baseline.contains(target)));
+        for (label, engine) in [("element", &element_engine), ("GI", &gi_engine)] {
+            assert!(
+                valid.is_subset(&slot_targets(engine)),
+                "mode {mode}: {label} retains every independently valid target"
+            );
+            let table = engine
+                .modules
+                .iter()
+                .flat_map(|module| &module.scanned.tables)
+                .find(|table| table.address == heap17.addr)
+                .expect("the partial acquired table remains visible");
+            assert_eq!(table.entries.len(), heap17.entries.len() - 1);
+            assert_eq!(table.unpinned.len(), 1);
+            assert_eq!(table.walk, "known_prefix");
+        }
     }
 
     // Control: a NULL hole is not poison — both routes admit the table

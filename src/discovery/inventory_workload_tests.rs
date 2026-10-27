@@ -190,6 +190,43 @@ fn workload_fd_worker() {
             drop(accounted);
             scope.assert_delta(0);
         }
+        "oracle-owned-replacement" => {
+            use std::os::unix::fs::FileExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider");
+            let staging = dir.path().join("staging");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::write(&staging, b"new").unwrap();
+            let original = std::fs::File::open(&path).unwrap();
+            let fd = original.as_raw_fd();
+            let before = FdScope::open("before owned replacement");
+            std::fs::rename(&staging, &path).unwrap();
+            let scope = FdScope::open("after owned replacement");
+            let old = &before.before[&fd];
+            let retained = &scope.before[&fd];
+            assert_eq!(
+                (old.dev, old.ino, old.mode, old.rdev, old.pidfd_target),
+                (
+                    retained.dev,
+                    retained.ino,
+                    retained.mode,
+                    retained.rdev,
+                    retained.pidfd_target,
+                )
+            );
+            assert_eq!(old.link, path);
+            assert_eq!(
+                retained.link,
+                PathBuf::from(format!("{} (deleted)", path.display()))
+            );
+            assert_ne!(old, retained, "the oracle still checks the link annotation");
+            let mut bytes = [0; 3];
+            assert_eq!(original.read_at(&mut bytes, 0).unwrap(), bytes.len());
+            assert_eq!(&bytes, b"old");
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            scope.assert_delta(0);
+        }
         "oracle-retained" => {
             let scope = FdScope::open("isolated retained File");
             let retained = std::fs::File::open("/dev/zero").unwrap();
@@ -253,6 +290,11 @@ fn workload_fd_oracle_detects_retention_and_distinct_resource_replacement() {
             .expect_err("unaccounted resource must refuse");
         assert!(error.contains(reason), "{mode}: {error}");
     }
+}
+
+#[test]
+fn workload_fd_oracle_measures_after_owned_atomic_replacement() {
+    isolated_workload("oracle-owned-replacement");
 }
 
 #[test]
@@ -1942,14 +1984,14 @@ fn inject_provider_mutation() {
         .unwrap();
     coordinator.commit_batch(false).unwrap();
     // Atomic replace plus the driver's dlclose/dlopen: the same path
-    // resolves to a new physical instance. The FD scope covers the
-    // whole second pass — scans open files transiently and retain
-    // nothing new.
-    let scope = FdScope::open("provider mutation second pass");
+    // resolves to a new physical instance. The retained old pin acquires
+    // a deleted-path annotation; settle that intentional change before
+    // measuring the scan. The outer scope still checks its full lifetime.
     std::fs::copy(&v2, dir.join("mut-prov.staging")).unwrap();
     std::fs::rename(dir.join("mut-prov.staging"), &prov).unwrap();
     std::fs::write(&go, "go\n").unwrap();
     wait_for(&done, "mutate done");
+    let scope = FdScope::open("provider mutation second pass");
     let t1 = crate::discovery::caller_registry::now_ns();
     coordinator
         .scan_pass(
@@ -1962,7 +2004,42 @@ fn inject_provider_mutation() {
         )
         .unwrap();
     coordinator.commit_batch(false).unwrap();
-    scope.assert_delta(0);
+    // A second provider generation adds one coordinator-owned pin. Account
+    // for its exact new inode rather than allowing arbitrary FD growth;
+    // assert_delta also preserves every baseline pin, including the old one.
+    let after = FdScope::open("provider mutation retained pins");
+    let added: Vec<_> = after
+        .before
+        .iter()
+        .filter(|(fd, _)| !scope.before.contains_key(fd))
+        .collect();
+    assert_eq!(added.len(), 1, "only the new provider pin is retained");
+    let new_pin = added[0].1;
+    use std::os::unix::fs::MetadataExt as _;
+    let expected = std::fs::metadata(&prov).unwrap();
+    let old_link = PathBuf::from(format!("{} (deleted)", prov.display()));
+    assert!(scope.before.values().any(|old| {
+        old.link == old_link && (old.dev, old.ino) != (expected.dev(), expected.ino())
+    }));
+    assert_eq!(new_pin.link, prov);
+    assert_eq!(
+        (
+            new_pin.dev,
+            new_pin.ino,
+            new_pin.mode,
+            new_pin.rdev,
+            new_pin.pidfd_target,
+        ),
+        (
+            expected.dev(),
+            expected.ino(),
+            expected.mode(),
+            expected.rdev(),
+            None,
+        ),
+        "the added FD pins the replacement provider inode"
+    );
+    scope.assert_delta(1);
     let document = crate::inventory::render_json(&coordinator, "workload", t0, t1, 2);
     assert_settled(&document, 0);
     // One pid, one incarnation, still mapped: dlclose/dlopen is not exec.

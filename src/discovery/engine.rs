@@ -7935,8 +7935,8 @@ fn export_abi(kind: u8) -> Option<HookAbi> {
 /// The table version a record's carried prefix claims, when it claims
 /// one. Export records carry the raw word; selection records carry the
 /// probe's version class instead (their raw word fields stay zero by
-/// transport contract). An unknown class claims nothing: the prefix is
-/// unusable and the table must re-validate from memory alone.
+/// transport contract). An unknown class supplies no version claim; its
+/// observed function words still undergo fresh content validation.
 fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
     if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
         return match record.selection_version_class {
@@ -8213,17 +8213,6 @@ fn lower_heap_publication_record(
     // under us — refuse, never blend.
     let usable = usize::from(record.usable_n);
     if usable > 0 {
-        let header_unavailable =
-            record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0
-                && record.version_major == 0
-                && record.version_minor == 0;
-        if !header_unavailable
-            && record_prefix_version(record).is_some_and(|version| version != table.version)
-        {
-            return Ok(HeapLowerOutcome::Refused(
-                "a published table changed between the probe capture and validation",
-            ));
-        }
         let mut matches = true;
         for (ordinal, expected) in record.pointers.iter().take(usable).enumerate() {
             match read_function_pointer(&bytes, layout, ordinal) {
@@ -14448,6 +14437,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         subject: &str,
     ) -> Result<DiscoveryRecordOutcome> {
+        self.note_publication_availability(subject, record, table.version);
         self.note_unowned_publication(subject, &table);
         let mut targets = BTreeMap::<ObjectKey, String>::new();
         for entry in &table.entries {
@@ -14500,6 +14490,38 @@ impl Engine {
             "acquired table observation retained with uncertain provider ownership: version {}.{}, {} observed positions, {} NULL, {} usable targets, {} unusable targets",
             table.version.0, table.version.1, table.decoded_slot_count(), table.null_entries.len(), table.entries.len(), table.unpinned.len(),
         ));
+    }
+
+    fn note_publication_availability(
+        &mut self,
+        subject: &str,
+        record: &DiscoveryRecord,
+        observed_version: (u8, u8),
+    ) {
+        let failed = record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0;
+        let uncertain = failed
+            && (record_prefix_version(record) == Some((0, 0))
+                || (record.kind == DISCOVERY_KIND_INTERFACE_RETURN
+                    && record.selection_version_class == DISCOVERY_VERSION_UNREADABLE));
+        if failed {
+            self.mark_partial(subject, &format!(
+            "table acquisition reported a read failure after {} completed positions; uncaptured words were unavailable, not observed NULL",
+            record.completed_prefix,
+        ));
+        }
+        if uncertain {
+            self.mark_partial(subject,
+                "captured table version metadata was unavailable or uncertain; 0.0 is only a placeholder when no fresh metadata can be read");
+        }
+        if !uncertain
+            && let Some(captured) = record_prefix_version(record)
+            && captured != observed_version
+        {
+            self.mark_partial(subject, &format!(
+                "published table version metadata changed from {}.{} to {}.{}; all carried function words were revalidated unchanged",
+                captured.0, captured.1, observed_version.0, observed_version.1,
+            ));
+        }
     }
 
     fn process_export_record(
@@ -14570,6 +14592,11 @@ impl Engine {
                 },
             }
         };
+        self.note_publication_availability(
+            "live export discovery",
+            record,
+            lowered.tables[0].version,
+        );
         self.apply_lowered_module(
             lowered,
             position,
@@ -14741,6 +14768,11 @@ impl Engine {
                 },
             }
         };
+        self.note_publication_availability(
+            "live interface selection",
+            record,
+            lowered.tables[0].version,
+        );
         self.apply_lowered_module(
             lowered,
             position,

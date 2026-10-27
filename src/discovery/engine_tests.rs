@@ -52653,12 +52653,21 @@ fn version_only_change_keeps_matching_words_but_pointer_changes_refuse() {
     record.version_minor = 2;
     let mut changed_pointer = record;
     changed_pointer.pointers[0] += 1;
-    assert!(matches!(lower_heap_publication_record(
-        &view, &MapIndex::new(&maps).unwrap(), &HookRegistry::builtin(), &changed_pointer,
-        &[], &mut CaptureWorkBudget::default(), None,
-    ).unwrap(), HeapLowerOutcome::Refused(
-        "a published table changed between the probe capture and validation"
-    )));
+    assert!(matches!(
+        lower_heap_publication_record(
+            &view,
+            &MapIndex::new(&maps).unwrap(),
+            &HookRegistry::builtin(),
+            &changed_pointer,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .unwrap(),
+        HeapLowerOutcome::Refused(
+            "a published table changed between the probe capture and validation"
+        )
+    ));
     let mut engine = Engine::empty();
     engine.next_view_id = 1;
     engine.views.push(view);
@@ -52666,15 +52675,31 @@ fn version_only_change_keeps_matching_words_but_pointer_changes_refuse() {
         per_object_bytes: u64::MAX,
         total_bytes: u64::MAX,
     });
-    let outcome = engine.process_export_record(
-        &record, &mut ScriptedSession::default(), &mut true, &mut PendingViewRetirements::new(),
-    ).unwrap();
+    let outcome = engine
+        .process_export_record(
+            &record,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
     assert!(outcome.required_complete());
-    assert_eq!(engine.plan.slots.len(), 1, "matching observed words survive metadata changes");
+    assert_eq!(
+        engine.plan.slots.len(),
+        1,
+        "matching observed words survive metadata changes"
+    );
     assert_eq!(engine.modules[0].scanned.tables[0].version, (2, 40));
-    assert!(engine.counters.object_skips.iter().any(|skip|
-        skip.reason.contains("metadata changed") && skip.reason.contains("3.2") && skip.reason.contains("2.40")),
-        "the metadata change remains explicit");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("metadata changed")
+                && skip.reason.contains("3.2")
+                && skip.reason.contains("2.40")),
+        "the metadata change remains explicit"
+    );
 }
 
 #[test]

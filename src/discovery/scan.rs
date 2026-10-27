@@ -1789,7 +1789,8 @@ pub struct ScannedTable {
     /// are generation-local and never identify a table across remaps.
     pub file_offset: Option<u64>,
     /// True only when a live provider export returned this table: the address
-    /// came from an observed `C_GetFunctionList`/`C_GetInterfaceList` return,
+    /// came from an observed `C_GetFunctionList`, `C_GetInterfaceList` or
+    /// `C_GetInterface` return,
     /// not from heuristic memory decode. Recorded at lowering time, when the
     /// process generation brackets the address — never reconstructed later
     /// from a retained address, which would be generation-local garbage.
@@ -2022,10 +2023,9 @@ pub(crate) struct ExportAgreement {
 }
 
 impl ExportAgreement {
-    /// The table-level predicate (review follow-up (b)): at least one
-    /// exported standard name agrees and none disagrees. Per-slot naming
-    /// would split the single authorization predicate, so a contradiction
-    /// refuses the whole table.
+    /// At least one exported standard name agrees and none disagrees.
+    /// Name authorization additionally requires an exact witness for every
+    /// retained target; a failed name claim never discards valid targets.
     pub(crate) fn corroborates(self) -> bool {
         self.agreeing > 0 && self.disagreeing == 0
     }
@@ -2955,7 +2955,10 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     let mut kept: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
     for candidate in found {
         let overlaps = kept.iter().any(|(start, len, _, _)| {
-            candidate.0 < start.saturating_add(*len)
+            // An independently anchored extension at this exact base can
+            // retain additional targets alongside the stronger prefix proof.
+            candidate.0 != *start
+                && candidate.0 < start.saturating_add(*len)
                 && *start < candidate.0.saturating_add(candidate.1)
         });
         if !overlaps {
@@ -6814,7 +6817,10 @@ mod tests {
             (function_name(103).unwrap().to_string(), 0x700),
         ];
         let exports = ObjectExports {
-            object: ObjectKey { device: Device { major: 8, minor: 1 }, inode: 7 },
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
             symbols: &symbols,
         };
         for word in [0x2802u64, 0x0003, 0x0103] {
@@ -6824,22 +6830,50 @@ mod tests {
             snapshot[93 * 8..94 * 8].copy_from_slice(&0x1600u64.to_le_bytes());
             snapshot[104 * 8..105 * 8].copy_from_slice(&0x1700u64.to_le_bytes());
             let (tables, skipped) = detect_tables_with_clock(
-                LinuxLayout::Lp64, &snapshot, 0x7000, &index,
-                &mut CaptureWorkBudget::default(), Some(&exports), || Some(0),
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                || Some(0),
             );
             assert!(skipped.is_empty());
-            let targets: BTreeSet<_> = tables.iter().filter(|table| table.address == 0x7000)
-                .flat_map(|table| table.entries.iter().map(|entry| entry.file_offset)).collect();
-            assert_eq!(targets, [0x500, 0x600, 0x700].into_iter().collect(),
-                "{word:#x}: a shorter strict shape must not erase independently anchored targets");
-            assert!(tables.iter().enumerate().any(|(at, table)|
-                table.address == 0x7000 && table.decoded_slot_count() <= 92
-                    && table_evidence_score(at, &tables, &[], &[], &[], &exports).exports),
-                "the known prefix retains its exact own-export name evidence");
-            assert!(tables.iter().enumerate().any(|(at, table)|
-                table.address == 0x7000 && table.decoded_slot_count() == 104
-                    && !table_name_authorized(&table_evidence_score(at, &tables, &[], &[], &[], &exports))),
-                "unproven extension callbacks remain unknown/count-only");
+            let targets: BTreeSet<_> = tables
+                .iter()
+                .filter(|table| table.address == 0x7000)
+                .flat_map(|table| table.entries.iter().map(|entry| entry.file_offset))
+                .collect();
+            assert_eq!(
+                targets,
+                [0x500, 0x600, 0x700].into_iter().collect(),
+                "{word:#x}: a shorter strict shape must not erase independently anchored targets"
+            );
+            assert!(
+                tables
+                    .iter()
+                    .enumerate()
+                    .any(|(at, table)| table.address == 0x7000
+                        && table.decoded_slot_count() <= 92
+                        && table_evidence_score(at, &tables, &[], &[], &[], &exports).exports),
+                "the known prefix retains its exact own-export name evidence"
+            );
+            assert!(
+                tables
+                    .iter()
+                    .enumerate()
+                    .any(|(at, table)| table.address == 0x7000
+                        && table.decoded_slot_count() == 104
+                        && !table_name_authorized(&table_evidence_score(
+                            at,
+                            &tables,
+                            &[],
+                            &[],
+                            &[],
+                            &exports
+                        ))),
+                "unproven extension callbacks remain unknown/count-only"
+            );
         }
     }
 

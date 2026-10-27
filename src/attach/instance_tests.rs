@@ -766,7 +766,10 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
         ensure!(record.event.event_type == event_type::CALL && record.event.slot == 0);
         ensure!(record.event.pid_tgid == key.pid_tgid && record.event.rv == 0);
         ensure!(record.continuity.return_stamp == entry.entry_stamp);
-        ensure!(object.is_none(), "ordinary S1 grants no semantic object tail");
+        ensure!(
+            object.is_none(),
+            "ordinary S1 grants no semantic object tail"
+        );
         if missing_entry {
             ensure!(record.continuity.entry_ip == 0);
             ensure!(record.continuity.entry_stamp == InstanceStamp::default());

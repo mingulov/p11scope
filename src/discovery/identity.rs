@@ -1742,6 +1742,13 @@ impl PinnedObjects {
     /// stale id, a path the id never filed, an already-claimed maps key,
     /// and anything but exactly one owned fd raw all file nothing, and a
     /// refused re-key leaves the pins (including versions) untouched.
+    ///
+    /// No production caller on this line: the pin-time probe feeds
+    /// `Entry::probed_maps_key` and [`PinnedObjects::object_matches_key`]
+    /// proves both the fd key and the maps key, so the drain keeps the
+    /// fd raw primary. The helper and its tests stay pinned for the
+    /// re-key contract itself.
+    #[cfg(test)]
     pub(crate) fn refile_manifest_raw_onto_maps_key(
         &mut self,
         id: PinnedObjectId,
@@ -6537,14 +6544,6 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
             }
         };
         let key = object_key(mapping);
-        // Pre-6.8 overlayfs renders a different device for maps than for
-        // the opened fd; this path has no scan join and no refile pass,
-        // so probe the kernel-rendered key now and file it as an alias
-        // with the entry below. One fstatfs off overlay; the probe
-        // refuses fail-closed and returns None unless the kernel
-        // renders a genuinely different key. The entry proof below
-        // reuses this same rendering: one probe call feeds both.
-        let maps_alias = self_mapped_fallback_key(&file, key, budget, probe);
         let Some(raw) = RawObjectInstance::manifest(key, object.path.clone()) else {
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
@@ -6588,32 +6587,27 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         }
         // A pre-6.8 overlay fd renders in maps at a different key than
         // the mount table resolves; record the kernel rendering of this
-        // exact held fd (probed once above) on the entry so the provider
-        // proof matches it. The probe returns None (no split) whenever
-        // the rendering agrees or is inconclusive. Never a second
-        // manifest raw: the one-manifest-raw-per-path invariant behind
-        // `id_for_path` holds.
-        entry.probed_maps_key = maps_alias;
-        opened.insert(object.id, (entry, inspected, maps_alias));
+        // exact held fd on the entry so the provider proof matches it.
+        // The probe returns None (no split) whenever the rendering agrees
+        // or is inconclusive. Never a second manifest raw: the
+        // one-manifest-raw-per-path invariant behind `id_for_path` holds.
+        entry.probed_maps_key = self_mapped_fallback_key(&entry.file, key, budget, probe);
+        opened.insert(object.id, (entry, inspected));
     }
 
     if !problems.is_empty() {
         return Err(ManifestPinError::Fatal(problems));
     }
     let mut result = PinnedObjects::empty();
-    for (entry, _, maps_alias) in opened.into_values() {
+    for (entry, _) in opened.into_values() {
         let path = entry.path.clone();
         let mut skipped = Vec::new();
-        let Some(id) = result.insert_entry(entry, &mut skipped) else {
+        if result.insert_entry(entry, &mut skipped).is_none() {
             problems.extend(
                 skipped
                     .into_iter()
                     .map(|skip| format!("{path}: {}", skip.reason)),
             );
-            continue;
-        };
-        if let Some(maps_key) = maps_alias {
-            result.refile_manifest_raw_onto_maps_key(id, maps_key, &path);
         }
     }
     if !problems.is_empty() {

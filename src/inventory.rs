@@ -18701,7 +18701,9 @@ mod promotion_driver_tests {
         );
         // A bare abandon (no trip): the hold names what it cleared,
         // exactly once.
-        crate::inventory_semantics::AttestedSemanticLane::pose_audit_no_progress_trip_for_test(None);
+        crate::inventory_semantics::AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+            None,
+        );
         assert_eq!(
             scripted_lane().joint_audit_no_progress_trip(),
             None,

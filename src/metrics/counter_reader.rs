@@ -6005,18 +6005,34 @@ mod tests {
     /// Marker the owned child writes: must live where the
     /// privilege-dropped child can create it, like the other owned-run
     /// cells (CARGO_TARGET_TMPDIR), never under a root-owned TMPDIR.
+    /// `None` when the lookup has no CARGO_TARGET_TMPDIR: there is no
+    /// TMPDIR fallback.
+    fn counter_cli_run_marker_path_from(
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+        id: u32,
+    ) -> Option<std::path::PathBuf> {
+        lookup("CARGO_TARGET_TMPDIR").map(|base| {
+            std::path::PathBuf::from(base).join(format!("p11scope-counter-run-{id}.marker"))
+        })
+    }
+
+    /// The root cells run by hand with CARGO_TARGET_TMPDIR set (cargo
+    /// sets it only while compiling integration tests, never for this
+    /// lib test at run time).
     fn counter_cli_run_marker_path(id: u32) -> std::path::PathBuf {
-        std::path::PathBuf::from(
-            std::env::var_os("CARGO_TARGET_TMPDIR")
-                .expect("CARGO_TARGET_TMPDIR for owned-child marker"),
-        )
-        .join(format!("p11scope-counter-run-{id}.marker"))
+        counter_cli_run_marker_path_from(|name| std::env::var_os(name), id)
+            .expect("CARGO_TARGET_TMPDIR for owned-child marker")
     }
 
     #[test]
     fn counter_cli_run_marker_is_owned_child_writable() {
         let id = 424242;
-        let path = counter_cli_run_marker_path(id);
+        let lookup = |name: &str| match name {
+            "CARGO_TARGET_TMPDIR" => Some(std::ffi::OsString::from("/owned/target/tmp")),
+            "TMPDIR" => Some(std::ffi::OsString::from("/root-only")),
+            _ => None,
+        };
+        let path = counter_cli_run_marker_path_from(lookup, id).expect("marker path");
         assert!(
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -6024,12 +6040,19 @@ mod tests {
             "marker stays pid-unique: {}",
             path.display()
         );
-        let base = std::env::var_os("CARGO_TARGET_TMPDIR").expect("test tmpdir");
         assert_eq!(
             path.parent(),
-            Some(std::path::Path::new(&base)),
-            "marker must live in the owned-child-writable target tmpdir, not {}",
-            std::env::temp_dir().display()
+            Some(std::path::Path::new("/owned/target/tmp")),
+            "marker must live in the owned-child-writable target tmpdir, not TMPDIR"
+        );
+        let no_target_tmpdir = |name: &str| match name {
+            "TMPDIR" => Some(std::ffi::OsString::from("/root-only")),
+            _ => None,
+        };
+        assert_eq!(
+            counter_cli_run_marker_path_from(no_target_tmpdir, id),
+            None,
+            "without CARGO_TARGET_TMPDIR the marker never falls back to TMPDIR"
         );
     }
 

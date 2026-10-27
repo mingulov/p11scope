@@ -1038,6 +1038,60 @@ unsigned long C_GetFunctionList(void **out) {
 """
 
 
+SLOT_INDEX_PROVIDER = """/* Test-only slot-indexed stub: entries 40..44 return their table index. */
+#define _GNU_SOURCE
+#include <stddef.h>
+/* Width-dependent head like the tracked fixtures: function pointers
+ * follow CK_VERSION at the natural pointer alignment. */
+typedef struct {
+    unsigned char major, minor;
+#if __SIZEOF_POINTER__ == 8
+    unsigned char reserved[6];
+#else
+    unsigned char reserved[2];
+#endif
+    void *functions[104];
+} SlotIndexTable;
+_Static_assert(offsetof(SlotIndexTable, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
+int P11ScopeSlot68;
+#define SLOT_INDEX_FN(n) \\
+    static unsigned long slot_index_##n(void **out) { \\
+        (void)out; \\
+        return (n); \\
+    }
+SLOT_INDEX_FN(40)
+SLOT_INDEX_FN(41)
+SLOT_INDEX_FN(42)
+SLOT_INDEX_FN(43)
+SLOT_INDEX_FN(44)
+static unsigned long slot_index_noop(void **out) {
+    (void)out;
+    return 0;
+}
+static SlotIndexTable slot_index_table;
+__attribute__((constructor)) static void slot_index_init(void) {
+    slot_index_table.major = 3;
+    slot_index_table.minor = 2;
+    for (int i = 0; i < 104; i++) {
+        slot_index_table.functions[i] = (void *)slot_index_noop;
+    }
+    slot_index_table.functions[40] = (void *)slot_index_40;
+    slot_index_table.functions[41] = (void *)slot_index_41;
+    slot_index_table.functions[42] = (void *)slot_index_42;
+    slot_index_table.functions[43] = (void *)slot_index_43;
+    slot_index_table.functions[44] = (void *)slot_index_44;
+}
+unsigned long C_GetFunctionList(void **out) {
+    if (out == NULL) {
+        return 7;
+    }
+    *out = &slot_index_table;
+    return 0;
+}
+"""
+
+
 class FeedEmissionTests(unittest.TestCase):
     def build_provider(self, tmp, export_tables=1, m32=False):
         if not shutil.which("gcc"):
@@ -1071,6 +1125,48 @@ class FeedEmissionTests(unittest.TestCase):
 
     def build_pair(self, tmp):
         return self.build_provider(tmp), self.build_fixture(tmp)
+
+    def build_slot_provider(self, tmp, m32=False):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        source = Path(tmp) / ("slot32.c" if m32 else "slot.c")
+        source.write_text(SLOT_INDEX_PROVIDER, encoding="utf-8")
+        provider = Path(tmp) / ("slot32.so" if m32 else "slot.so")
+        command = ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
+        if m32:
+            command.append("-m32")
+        command += ["-fPIC", "-shared", "-Wl,-z,defs",
+                    "-o", str(provider), str(source)]
+        build = subprocess.run(command, capture_output=True, text=True,
+                               timeout=120)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return provider
+
+    def assert_slot_indexed_loss(self, tmp, provider, fixture):
+        """The loss script must call exactly the labeled slots.
+
+        Against the slot-indexed stub each call returns its own table
+        index, so a reader that is off by one slot records shifted
+        return values (exit 1 either way: nonzero returns are unhealthy
+        by two-feed design).
+        """
+        oracle = require_oracle(self)
+        env = dict(os.environ, P11SCOPE_FIXTURE_QUIET="1")
+        ledger_a = Path(tmp) / "slot-a.jsonl"
+        ledger_b = Path(tmp) / "slot-b.jsonl"
+        completed = subprocess.run(
+            [str(fixture), str(provider), str(provider), "loss", "1",
+             str(ledger_a), str(ledger_b)],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("READY pid=", completed.stdout)
+        for tag, ledger in (("ledger A", ledger_a), ("ledger B", ledger_b)):
+            with open(ledger, encoding="utf-8") as stream:
+                rows = oracle.read_ledger(stream)
+            oracle.validate_ledger(rows, tag)
+            calls = [(row["fn"], row["rv"]) for row in rows
+                     if row.get("kind") == "call"]
+            self.assertEqual(calls, [("table[40]", 40), ("table[42]", 42)])
 
     def test_live_modes_validate_and_compare(self):
         oracle = require_oracle(self)
@@ -1285,6 +1381,15 @@ class FeedEmissionTests(unittest.TestCase):
                 self.skipTest("32-bit execution is not supported here")
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("READY pid=", completed.stdout)
+            slot_provider = self.build_slot_provider(tmp, m32=True)
+            self.assert_slot_indexed_loss(tmp, slot_provider, fixture)
+
+    def test_slot_indexed_calls_match_labels(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            slot_provider = self.build_slot_provider(tmp)
+            fixture = self.build_fixture(tmp)
+            self.assert_slot_indexed_loss(tmp, slot_provider, fixture)
 
 
 def require_s1(test):

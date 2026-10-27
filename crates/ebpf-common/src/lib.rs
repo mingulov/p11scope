@@ -558,12 +558,18 @@ pub const R_STATE_OFFSET: u64 = 24;
 pub const STATE_DOMAIN_EXPORT: u64 = 1;
 pub const STATE_DOMAIN_SELECTION: u64 = 2;
 
-pub const fn discovery_table_slots(version_major: u8, version_minor: u8) -> u8 {
-    match (version_major, version_minor) {
-        (2, 0) => 67,
-        (2, _) => 68,
-        (3, 0 | 1) => 92,
-        (3, 2..) => 104,
+/// Bound acquisition by the getter's ABI. Version bytes may hint at known
+/// interface extensions, but never erase the common ordinal catalog.
+pub const fn discovery_table_slots(kind: u8, version_major: u8, version_minor: u8) -> u8 {
+    match kind {
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN => 68,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
+            match (version_major, version_minor) {
+                (3, 0 | 1) => 92,
+                (3, 2..) => 104,
+                _ => 68,
+            }
+        }
         _ => 0,
     }
 }
@@ -2462,11 +2468,27 @@ mod tests {
 
     #[test]
     fn discovery_producer_decisions_cover_the_finite_edges() {
-        assert_eq!(discovery_table_slots(2, 0), 67);
-        assert_eq!(discovery_table_slots(2, 40), 68);
-        assert_eq!(discovery_table_slots(3, 1), 92);
-        assert_eq!(discovery_table_slots(3, 2), 104);
-        assert_eq!(discovery_table_slots(4, 0), 0);
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 0),
+            68
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 40),
+            68
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, 3, 1),
+            92
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_RETURN, 3, 2),
+            104
+        );
+        assert_eq!(
+            discovery_table_slots(DISCOVERY_KIND_INTERFACE_RETURN, 4, 0),
+            68
+        );
+        assert_eq!(discovery_table_slots(DISCOVERY_KIND_EXEC, 3, 2), 0);
         assert_eq!(discovery_usable_prefix(false, 104), 104);
         assert_eq!(discovery_usable_prefix(true, 67), 67);
 
@@ -2486,6 +2508,56 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    /// A legacy acquisition describes the common ordinal catalog, independently
+    /// of the provider's version bytes, including sparse and empty tables.
+    #[test]
+    fn discovery_legacy_acquisition_width_ignores_version_metadata() {
+        for (major, minor) in [
+            (0, 0),
+            (2, 0),
+            (2, 40),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+            (4, 0),
+            (255, 255),
+        ] {
+            assert_eq!(
+                discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, major, minor),
+                68,
+                "{major}.{minor}"
+            );
+        }
+    }
+
+    /// Unrecognized metadata cannot erase the common prefix of a standard
+    /// interface; recognized extension hints stay within the known catalog.
+    #[test]
+    fn discovery_interface_acquisition_keeps_common_slots_for_unknown_metadata() {
+        for (major, minor, expected) in [
+            (0, 0, 68),
+            (2, 0, 68),
+            (2, 40, 68),
+            (3, 0, 92),
+            (3, 1, 92),
+            (3, 2, 104),
+            (3, 3, 104),
+            (4, 0, 68),
+            (255, 255, 68),
+        ] {
+            for kind in [
+                DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+                DISCOVERY_KIND_INTERFACE_RETURN,
+            ] {
+                assert_eq!(
+                    discovery_table_slots(kind, major, minor),
+                    expected,
+                    "{major}.{minor}"
+                );
+            }
+        }
     }
 
     #[test]

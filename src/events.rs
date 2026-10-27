@@ -3907,7 +3907,7 @@ mod tests {
         use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
 
         for (major, minor) in [(3, 0), (3, 1), (3, 2), (0, 0), (4, 0), (255, 255)] {
-            for populated in [0, 27, 67] {
+            for populated in [None, Some(0), Some(27), Some(67)] {
                 let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
                 record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
                 record.pid_tgid = (7u64 << 32) | 7;
@@ -3918,7 +3918,9 @@ mod tests {
                 record.usable_n = 68;
                 record.completed_prefix = 68;
                 record.pointers_attempted = 68;
-                record.pointers[populated] = 0x2000;
+                if let Some(ordinal) = populated {
+                    record.pointers[ordinal] = 0x2000;
+                }
                 let bytes = discovery_bytes(&record);
                 assert_eq!(bytes.len(), 920);
                 let decoded = decode_discovery(&bytes).expect("an acquired legacy prefix");
@@ -3926,10 +3928,12 @@ mod tests {
                     (decoded.version_major, decoded.version_minor),
                     (major, minor)
                 );
-                assert_eq!(decoded.pointers[populated], 0x2000);
+                if let Some(ordinal) = populated {
+                    assert_eq!(decoded.pointers[ordinal], 0x2000);
+                }
                 assert_eq!(
                     decoded.pointers.iter().filter(|word| **word != 0).count(),
-                    1
+                    usize::from(populated.is_some())
                 );
                 assert_eq!(decoded.usable_n, 68);
             }
@@ -4025,6 +4029,32 @@ mod tests {
                 assert_eq!(decoded.status_flags, DISCOVERY_STATUS_READ_FAILURE);
             }
         }
+    }
+
+    /// A usable prefix does not relabel unknown interface metadata as a known
+    /// version that could qualify for selection authority downstream.
+    #[test]
+    fn discovery_decode_keeps_unknown_interface_version_class() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_VERSION_OTHER,
+        };
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.binding_id = 9;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_OTHER;
+        record.table_ptr = 0x1000;
+        record.usable_n = 68;
+        record.completed_prefix = 68;
+        record.pointers_attempted = 68;
+        record.pointers[67] = 0x2000;
+        let decoded = decode_discovery(&discovery_bytes(&record))
+            .expect("unknown metadata retains the acquired common prefix");
+        assert_eq!(decoded.selection_version_class, DISCOVERY_VERSION_OTHER);
+        assert_eq!(decoded.usable_n, 68);
+        assert_eq!(decoded.pointers[67], 0x2000);
     }
 
     /// Partial prefixes do not relax private-hook, field ownership, or raw

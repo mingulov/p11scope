@@ -103,9 +103,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
     DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
-    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord,
-    EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
-    EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    DiscoveryRecord, EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
+    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
     Event, EventRecord, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
     FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
@@ -1051,24 +1050,22 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
         read_version = true;
     }
     if read_version {
+        // The getter has already published a table. An unreadable or unusual
+        // version cannot erase readable common slots; failures remain explicit.
+        if read_table {
+            walk_slots = discovery_table_slots(kind, 0, 0);
+        }
         match unsafe { helpers::bpf_probe_read_user(payload.table_ptr as *const [u8; 2]) } {
             Ok(version) => {
                 if selection.binding_id != 0 {
                     selection_version_class = discovery_version_class(version[0], version[1]);
-                    if name_class == DISCOVERY_NAME_EXACT_STANDARD
-                        && matches!(
-                            selection_version_class,
-                            DISCOVERY_VERSION_V3_0
-                                | DISCOVERY_VERSION_V3_1
-                                | DISCOVERY_VERSION_V3_2
-                        )
-                    {
-                        walk_slots = discovery_table_slots(version[0], version[1]);
+                    if name_class == DISCOVERY_NAME_EXACT_STANDARD {
+                        walk_slots = discovery_table_slots(kind, version[0], version[1]);
                     }
                 } else {
                     version_major = version[0];
                     version_minor = version[1];
-                    walk_slots = discovery_table_slots(version_major, version_minor);
+                    walk_slots = discovery_table_slots(kind, version_major, version_minor);
                 }
             }
             Err(_) => {

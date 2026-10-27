@@ -606,6 +606,9 @@ def table_bounds_object_contract(disassembly):
     if not all(re.search(rf"\br\d+ = 0x{bound:x}\b", export) for bound in (68, 92, 104)):
         return False
     insns, graph = instruction_graph(lines)
+    if not insns or not (insns[-1][1] == "exit"
+                         or re.fullmatch(r"goto [+-]0x[0-9a-f]+", insns[-1][1])):
+        return False
     memory_store = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = [rw]\d+")
     variable_add = re.compile(r"r(\d+) \+= r(\d+)")
     indexed_stores = set()
@@ -2282,6 +2285,7 @@ def _owned_self_test():
         ("wrong destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r7 + 0x0)"),
         ("stack destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r10 - 0x8)"),
         ("narrow destination", "*(u64 *)(r9 + 0x0)", "*(u32 *)(r9 + 0x0)"),
+        ("terminal call", "\texit", "\tcall 0x5"),
     ):
         if table_bounds_object_contract(mutate("fixture_emit_export", before, after)):
             raise AssertionError(f"table index mutation accepted: {label}")

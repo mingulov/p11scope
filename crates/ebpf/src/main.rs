@@ -1097,11 +1097,22 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
         };
         match read_word(address, layout) {
             Ok(pointer) => {
+                // Keep the destination bound visible after a probe read can
+                // make LLVM reload the spilled index in Inventory.
+                let slot_index = core::hint::black_box(slot_index);
+                if slot_index >= 104 {
+                    read_failed = true;
+                    break;
+                }
                 // SAFETY: slot_index is explicitly bounded below
                 // DISCOVERY_POINTERS and the record is initialized.
+                // Raw element arithmetic after that guard avoids an implicit
+                // array-bounds panic subprogram in the BPF object.
                 unsafe {
                     core::ptr::write_volatile(
-                        core::ptr::addr_of_mut!((*raw).pointers[slot_index]),
+                        core::ptr::addr_of_mut!((*raw).pointers)
+                            .cast::<u64>()
+                            .add(slot_index),
                         pointer,
                     );
                 }

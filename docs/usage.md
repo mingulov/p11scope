@@ -21,14 +21,20 @@ implementation limits are code contracts, not measurements.
 > and the [profile schema](schema/observed-profile-v3.md) define the capture
 > boundary and public evidence.
 
-`--counter-mode counts|timestamps|latency` selects kernel-aggregated
-capture for `profile` or `run` with `--mode metrics`, available on 6.6+
-(LP64). On 5.15 every mode refuses with the named
-`counter-mode-unavailable-on-kernel` reason before any counter program
-loads. On 6.1 the same named reason is reported when the kernel
-verifier rejects a counter program as too complex (E2BIG) at load.
-Either way `run` terminates its held child and never starts the
-program. Latency banks grow with the host possible-CPU count
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+`--counter-mode counts|timestamps|latency` selects kernel aggregation for
+`profile` or `run` with `--mode metrics` on eligible LP64 hosts, subject to
+mode-specific load and memory limits. Latency banks grow with the host possible-CPU count
 and refuse with `counter-memory-limit` past the per-capture kernel-map
 memory cap on hosts with many CPUs. Omit `--counter-mode` to keep
 existing metrics behavior.
@@ -41,7 +47,7 @@ existing metrics behavior.
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
 - [PID namespaces](#pid-namespaces)
-- [Kernel floor and unsupported environments](#kernel-floor-and-unsupported-environments)
+- [Live host capability and unsupported environments](#live-host-capability-and-unsupported-environments)
 - [Overhead (measured)](#overhead-measured)
 - [The evidence/completeness model](#the-evidencecompleteness-model)
 - [Honest claims](#honest-claims)
@@ -314,8 +320,9 @@ exits in milliseconds can be gone before attach completes, even with
 `--pause auto`. Measured FULL-default startup to the `capturing:` line on
 4 vCPUs is ~4–7 s on 6.6+ (6.6.157 4.5–4.9 s, 7.0 6.25–6.6 s) but
 ~15–22 s on 5.15/6.1 (6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s,
-0-probe 14.8–21.5 s under host load),
-where the kernel verifies each BPF program load sequentially; plan the
+0-probe 14.8–21.5 s under host load). These are historical measurements;
+stock non-Multi hosts are outside current live support, and none of these
+numbers is a product cold-start SLA. The kernel verifies BPF loads; plan the
 hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 `LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived
 daemons via `profile --pid`). Without `run --pause auto`, expect the
@@ -952,8 +959,9 @@ Limits that matter in pods:
   one immutable uprobe-multi link per provider object (one file
   descriptor instead of one per entry, and a stop that closes hundreds
   of entries in well under a second on 6.12 and 7.x, against 35-95 ms
-  per entry for per-offset links); otherwise (5.15) every entry gets its
-  own per-offset link. Under `--pid` the probe must also prove that the
+  per entry for per-offset links). General Multi host eligibility is required
+  before any live backend selection; a missing host capability never falls
+  through to scan, including empty plans and explicit Singles. Under `--pid` the probe must also prove that the
   kernel's uprobe-multi pid filter covers every thread of the named
   process: the links then name the target, so no other process — not one
   that later reuses the PID — traps or runs the probe, and the in-BPF PID
@@ -961,7 +969,8 @@ Limits that matter in pods:
   6.6 to 6.9.11 shipped a thread-exact filter; the probe also requires
   that a forked child process does not fire) `auto` keeps per-offset
   links bound to the target. `multi` forces uprobe-multi: where it is
-  unavailable the native lane does not start, naming why — under
+  unavailable for the scope on an eligible host the native lane does not
+  start, naming why — under
   `--capture native` that is an error, and under `--capture auto` (the
   default) the run continues on the scan lane with the gap `native usage
   feed unavailable: --attach-backend multi: …`. `singles` forces
@@ -1017,7 +1026,8 @@ Limits that matter in pods:
 - `--attach-backend auto|multi|singles` — the static probe backend. The
   decision comes from a functional probe, never from the kernel version.
   - `auto` (the default) uses one multi-uprobe link per attach group wherever
-    the probe links one, and per-offset links elsewhere. It also falls back to
+    the scoped probe links one, with safe scoped per-offset fallback on an
+    eligible host. It also falls back to
     per-offset links if the kernel then refuses multi.
   - Under `--pid`, `auto` uses multi only where the probe also proves that the
     kernel's uprobe-multi pid filter covers every thread of the named process
@@ -1026,9 +1036,10 @@ Limits that matter in pods:
     breakpoint. The in-BPF PID guard stays as a second check. Where the filter
     is not proven, `--pid` uses per-offset links bound to the target and never
     a process-wide link.
-  - `multi` forces multi. It needs 6.6+, and under `--pid` it also needs a
+  - `multi` forces multi. It needs a capable host and attachment scope
+    (including working backports), and under `--pid` it also needs a
     proven pid filter; without one it is refused.
-  - `singles` forces per-offset links everywhere.
+  - `singles` forces per-offset links after general host admission.
 
   Dynamic loader and export probes always use per-offset links. Each profile
   report discloses the backend that owned each link
@@ -1454,16 +1465,23 @@ cgroup. `scripts/matrix/verify-pidns.sh` reproduces all of this without kind:
 `unshare --pid --fork --mount-proc` for a nested observer, and
 `unshare --mount` with a foreign `/proc` for the stale-`/proc` case.
 
-## Kernel floor and unsupported environments
+<a id="kernel-floor-and-unsupported-environments"></a>
 
-Kernel floor: **≥ 5.15**, required by the attach-cookie design and validated
-by the supported cgroup-scoped BPF path. This tool does not runtime-check
-the kernel version; on an unsupported kernel or configuration it relies on
-the same clear-failure path described below. Caveat, stated plainly: the
-5.15 number itself was not re-derived against a live sub-5.15 kernel in
-this repo — no such kernel was available to test against
-(`docs/notes/phase5-unsupported.md`, case 5). It is inherited from the
-Phase 4 plan, not independently measured here.
+## Live host capability and unsupported environments
+
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+The following permission measurements are historical diagnostics. Their
+old floor hints do not define current host admission.
 
 What actually happens today, measured on a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,

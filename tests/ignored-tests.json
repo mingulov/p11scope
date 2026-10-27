@@ -53,7 +53,7 @@
     {
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
-      "reason": "pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
+      "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
       "cell": "privileged"
     },
     {
@@ -270,6 +270,12 @@
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_system_identity_anchor_preserves_watched_instance",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_object_continuity_refusal_preserves_s1_base",
+      "reason": "privileged: default FULL LP64, working uprobe_multi/native instance hooks; Session-owned INSTANCE_START deletion at a held object call, healthy 608/refused 368 S1 conservation twins",
       "cell": "privileged"
     },
     {
@@ -1107,7 +1113,7 @@
     {
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
-      "reason": "6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
+      "reason": "historical/private opt-in control outside current live-positive qualification: 6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
       "cell": "privileged"
     },
     {

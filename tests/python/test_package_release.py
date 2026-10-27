@@ -186,6 +186,8 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(release["p11scope_features"], [])
         self.assertIn("FULL", release["scope"])
         self.assertIn("object-attribute capture enabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("Offline/helper commands", release["scope"])
         for path in self.output.iterdir():
             self.assertEqual(path.read_bytes(), (second / path.name).read_bytes())
         checksums = (self.output / "SHA256SUMS").read_text()
@@ -220,6 +222,8 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(release["p11scope_features"], [])
         self.assertIn("FULL", release["scope"])
         self.assertIn("object-attribute capture enabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("Offline/helper commands", release["scope"])
         self.assertNotIn("stub-object-attributes", json.dumps(release))
         for name in ("p11scope-0.1.0-x86_64-linux-musl.tar.gz",
                      "p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz",
@@ -239,6 +243,7 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(release["p11scope_features"], ["stub-object-attributes"])
         self.assertIn("P0", release["scope"])
         self.assertIn("object-attribute capture disabled", release["scope"])
+        self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
 
     def test_receipt_capture_mode_must_match_the_flag(self):
         cases = (

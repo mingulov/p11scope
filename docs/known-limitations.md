@@ -3,34 +3,29 @@
 
 v0.5.0 release builds read object attributes by default (FULL); the P0
 build without attribute reads stays an explicit option. The entries
-under Prior releases below still apply unless this section says
-otherwise.
+under Prior releases below retain their historical context. Current host
+admission below supersedes their old kernel-floor and fallback claims.
 
-Strict scale and speed numbers apply only on kernels where the capture
-actually uses uprobe_multi (6.6 and later, decided by a functional
-probe, never a version check). On older kernels without uprobe_multi
-(5.15, 6.1, and `--pid` captures where the kernel pid filter is not
-proven) captures stay correct and stop in finite time, but slowly:
-teardown detaches one link at a time at about 18 ms per link (5.15
-guest) and tens of ms per link on newer kernels stopping one link at
-a time, and startup takes about 15–22 s on 5.15/6.1 versus about 4–7 s
-on 6.6+. When the expected stop reaches 2 s, one up-front estimate
-line is printed first. The declared startup readiness bound is 8 s on
-6.6+ and 30 s on 5.15/6.1. The report always discloses which backend
-was used (`observation.attach`, `evidence.attach_backend`). On 5.15,
-per-copy module attribution and calls held across a non-leader exec
-stay unqualified (see below).
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
 
-Measurement modes aggregate in the kernel on 6.6+ (LP64):
-`--counter-mode counts|timestamps|latency` for `profile`/`run` with
-`--mode metrics`. On 5.15 every mode refuses with the named
-`counter-mode-unavailable-on-kernel` reason before any counter
-program loads: the kernel lacks the bpf_loop helper the counters
-need. On 6.1 the same named reason is reported when the kernel
-verifier rejects a counter program as too complex (E2BIG) at load.
-Either way `run` never starts its program. A refused counter-mode or
-Detailed start prints its named reason on stderr, exits nonzero
-and writes no report (no `-o` file). Latency banks grow with
+Strict scale and speed limits apply to captures actually using Multi. Eligible
+scoped Singles stays correct, finite and disclosed in `observation.attach` and
+`evidence.attach_backend`; it does not establish Multi performance coverage.
+Readiness bounds are disclosed harness parameters, never a cold-start SLA.
+
+Measurement modes aggregate on eligible LP64 hosts, subject to independent
+feature/load limits. A refused counter-mode or Detailed start exits nonzero
+without writing a report or starting the requested `run` program. Latency
+banks grow with
 the host possible-CPU count and refuse with `counter-memory-limit`
 past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
@@ -299,6 +294,10 @@ capture behavior or establish the provenance of its input files.
 
 ### 5.15: per-offset links, slower detach, retirement unsettled at scale
 
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
+
 - What the user sees: every provider entry gets its own per-offset link.
   Detach costs about 18 ms per link, so a 546-link teardown runs about
   9.7 s in a 5.15 guest, and a thousand-endpoint system capture misses the
@@ -334,6 +333,10 @@ is available): attach 41 s, stop (link release) 339 s, about 41 ms per
 link.
 
 ### 5.15: physical-identity controls and non-leader exec unqualified
+
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
 
 - What the user sees: on 5.15 only, four privileged regression cells fail
   that pass on 6.8+. `privileged_task4_detailed_physical_identity_controls`
@@ -375,8 +378,8 @@ link.
 
 - What the user sees: classic `profile`/`trace --attach-backend auto` no
   longer reads the 6.9 version floor (DR-CLASSIC-PID0, fixed in v0.2.0).
-  On 5.15 it uses per-offset links with the reason disclosed; on 6.8+
-  with a proven kernel pid filter it uses uprobe-multi with pid = target
+  On an eligible host it can use scoped per-offset links with the reason
+  disclosed; with a proven kernel pid filter it uses uprobe-multi with pid = target
   (never pid 0); elsewhere under `--pid` it uses per-offset links bound
   to the target.
 - Kernels/conditions: classic `--pid` on any kernel; multi needs the
@@ -389,6 +392,10 @@ link.
   yet qualified on those kernels (DR-CLASSIC-F4-66-68, v0.3.0).
 
 ### Startup takes ~15–22 s on 5.15/6.1 (sequential BPF verifier), ~4–7 s on 6.6+
+
+Historical measurements below predate v0.5 host admission. Stock non-Multi
+hosts are outside current live support; these failures remain historical failures.
+The old bounds are measurements, not a product startup SLA.
 
 - What the user sees: the observer loads its BPF programs one at a time
   and the kernel verifies each load, so startup (discovery to the
@@ -1244,18 +1251,21 @@ a silent drop.
 
 ## Platform
 
-### Linux x86-64 only; 5.15 floor; parked platforms
+### Linux x86-64 and Multi-capable live hosts
 
-- What the user sees: AArch64, cgroup v1 and kernels below 5.15 are out
-  of scope. There is no runtime kernel-version check: an unsupported
-  kernel is expected to fail at BPF load with the generic hint (which
-  names the 5.15 floor, BTF and lockdown), but that path has not been
-  observed on a real sub-5.15, no-BTF or lockdown host. Release binaries
-  are x86-64 only.
-- Kernels/conditions: anything below 5.15 or off x86-64.
-- Disclosure: the load-failure hint; `doctor`.
-- Workaround: run on x86-64 Linux 5.15+ with BTF.
-- Planned: stays out of scope (owner-declined for v0.2.0; confirm in §7).
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
+BTF, permissions, scope, identity/ABI and required feature checks still apply.
+Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 
 ### `run` under `sudo` clears supplementary groups (DR-56)
 

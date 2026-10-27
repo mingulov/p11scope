@@ -1,6 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope on Kubernetes
 
+Live capture requires usable host `uprobe_multi` load/self-link capability
+(normally Linux 6.6+ or a working backport), BTF and appropriate pod/host
+privileges. A container cannot make an ineligible host eligible; even explicit
+Singles refuses with `uprobe-multi-required`. Safe scoped Singles remains
+valid after host admission. Offline/helper commands remain usable.
+
 A node observer DaemonSet: one idle agent pod per node that runs one-shot,
 operator-triggered captures of a target pod (`kubectl exec`). Nothing is
 copied into or out of the target container. The observer reads the target's

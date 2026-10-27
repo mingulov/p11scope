@@ -61,8 +61,6 @@ usage() {
 # on fedora, never through this runner (run_one refuses it).
 default_kernels() {
   printf '%s\n' \
-    "v5.15.221" \
-    "v6.1.188" \
     "v6.6.157" \
     "/home/user/.cache/virtme-ng/ubuntu-6.8.0-142/amd64/boot/vmlinuz-6.8.0-142-generic" \
     "v6.12.111" \
@@ -391,7 +389,7 @@ backend_probe() {
     return 1
   fi
   local -a scope_args
-  if [ "$scope" = pid ]; then scope_args=(--pid "$wl"); else scope_args=(--system); fi
+  if [ "$scope" = pid ]; then scope_args=(--pid "$wl"); else scope_args=(--system --attach-backend multi); fi
   "$P" inventory "${scope_args[@]}" --capture native --duration 10 \
     -o "$WORK/backend/inv-$scope.json" > "$WORK/backend/inv-$scope.stdout" 2> "$WORK/backend/inv-$scope.stderr" &
   observer=$!

@@ -8,13 +8,16 @@ revision, the exact candidate artifacts, lane custody and the remaining
 filesystem, identity, performance and real-application obligations are separate
 requirements. A hermetic self-test establishes the checker behavior only.
 
-The registered lanes are Linux 5.15.221, 6.1.188, 6.6.157, Ubuntu
-6.8.0-142-generic, 6.12.111, 7.2.6 and the host. Planning starts no build,
+The default positive lanes are Linux 6.6.157, Ubuntu 6.8.0-142-generic,
+6.12.111, 6.18.58, 7.2.6 and host; Fedora 7.2.9 has its separate owned live lane.
+Older registered labels remain usable for explicit backport/historical inputs,
+not stock old-kernel positive campaigns. Actual host proof is mandatory.
+Planning starts no build,
 guest, workload or probe:
 
 ```sh
 scripts/qualify-release-matrix.sh --dry-run
-python3 -I scripts/release-matrix-contract.py --plan --lane 6.1.188
+python3 -I scripts/release-matrix-contract.py --plan --lane 6.6.157
 ```
 
 The plan lists required IDs, literal full libtest names, public classifications,
@@ -23,7 +26,7 @@ unready obligations. Source registration does not establish that a candidate
 binary contains those tests. No historical curation count is an observed
 candidate count.
 
-Omitting the kernel selection uses all seven lanes. An explicitly empty
+Omitting the kernel selection uses the six default lanes. An explicitly empty
 positional lane, empty `--kernels` value or empty resolved selection fails
 before campaign directory creation, candidate enumeration or workloads.
 
@@ -86,16 +89,17 @@ backported kernels. PID Multi needs the executed
 `other=0`, `proves=true`, plus observed `uprobe-multi` and `kernel-pid+bpf`.
 Without that proof, the valid auto result is disclosed `per-offset` with
 `perf-task+bpf` and the PID-filter fallback reason. System Multi needs the
-doctor's functional self-link success plus observed `uprobe-multi`; its
-unsupported result needs a disclosed functional-probe fallback. System scope
+doctor's general load/self-link success plus observed `uprobe-multi`.
+Missing host eligibility refuses the whole live-positive judgment. System scope
 has no PID scope-filter. An unknown capability, inconsistent probe or
 unsupported mechanism cannot establish positive coverage. Version strings
 never substitute for these functional proofs.
 
 A successful scratch probe can still precede a refused native Multi
 preparation. The production `the uprobe-multi preparation failed: ...` reason
-plus the corresponding per-offset mechanism/scope-filter is an explicit
-`expected-fallback` assertion. It does not establish Multi coverage.
+plus the corresponding per-offset mechanism/scope-filter can establish a
+PID `expected-fallback` assertion on an eligible host. The required system
+Multi positive cannot be supplied by Singles or a preparation refusal.
 
 Each forced-Multi classic/capture libtest has its own capability probe. Its
 own `CLASSIC_PID_SCOPE`, `C3_PID_SCOPE` or `C3_LEADER_EXIT_PROBE` diagnostic
@@ -117,26 +121,18 @@ and generated guest refuse nonempty values before workloads. Retained opt-in
 headers and `LIFECYCLE_LOSS_REPORTED` diagnostics fail judgment. These settings
 are never silently cleared or promoted through a successful one-test summary.
 
-The 5.15 kernel-identity obligation is separate. Its selected positive identity
-subset excludes these strict eligible-kernel gates:
+Stock 5.15/6.1 positive and identity-tier obligations are retired. The private
+`privileged_identity_515_denial_is_disclosed` selector remains explicitly
+selectable for historical/helper diagnosis; it is not selected by default.
+Working backports must satisfy the same actual host and per-cell feature
+proofs as modern hosts. Saved Singles reports and historical failures retain
+their schema, vocabulary and original outcomes.
 
-- `attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none`
-- `attach::identity_iter::tests::whole_system_run_covers_all_children`
-- `attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm`
-
-The underlying eligibility authority is the BTF named-fix check, including
-`bpf_iter_seq_task_vma_info.mm`, rather than a version-derived attach rule.
-`identity:5.15-denied` is a distinct required refusal assertion bound to the
-executable selector
-`inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed`:
-the real BTF named-fix refusal through the production sink with zero `bpf()`
-calls through the instrumented identity-iterator wrapper (the cell's counter
-covers only that wrapper, not aya or other raw `bpf()` sites) and the
-disclosed `kernel_fix_missing` fallback. Pure denial
-fixtures do not prove live guest refusal. The judge mirrors the executed
-selector's strict lane classification (denial required on 5.15, eligible
-elsewhere); test success alone never classifies. The real anchor-map handle
-test remains selected.
+The CI kernel matrix runs modern positive load/cost lanes plus one combined
+stock 6.1 refusal guest via `scripts/check-multi-host-refusal.py`. That control
+checks Auto/Multi/Singles entry points, counter modes, unchanged existing
+sinks, an unstarted workload and offline twins. It is never Multi positive or
+verifier headroom evidence. Existing image checksums remain required.
 
 ## Receipts and results
 
@@ -181,7 +177,7 @@ preparation, input verification or judgment. For a separately produced candidate
 an owner-authorized manual invocation uses the producer's receipt explicitly:
 
 ```sh
-scripts/qualify-release-matrix.sh --rev ACCEPTED_REV --bin-dir CANDIDATE_DIR --candidate-receipt BUILD_RECEIPT --kernels 6.1.188
+scripts/qualify-release-matrix.sh --rev ACCEPTED_REV --bin-dir CANDIDATE_DIR --candidate-receipt BUILD_RECEIPT --kernels 6.6.157
 ```
 
 Raw process logs carry one exit and the run ID. Each required libtest needs

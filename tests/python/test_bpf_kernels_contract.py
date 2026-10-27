@@ -9,7 +9,7 @@ pin the two-way agreement instead of the values: whatever ci.yml pins
 for bpf-linker, the nightly and release toolchains, clang and the
 actions revisions, bpf-kernels.yml must carry the same. They also pin
 that every matrix kernel has a checked-in vng download sums file, and
-no sums file names a kernel outside the matrix.
+no unknown sums file escapes review. Historical 5.15 sums remain pinned.
 
 Run: python3 -I tests/python/test_bpf_kernels_contract.py -v
 """
@@ -124,9 +124,10 @@ def matrix_kernels(bpf_text):
 
 def check_kernel_sums(bpf_text, sums_dir):
     """Every matrix kernel has a well-formed sums file; no sums file
-    names a kernel outside the matrix."""
+    names an unknown kernel; historical 5.15 checksums are retained."""
     problems = []
     kernels = matrix_kernels(bpf_text)
+    kernels += re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", bpf_text)
     if not kernels:
         return ["bpf-kernels.yml names no matrix kernels"]
     for kernel in kernels:
@@ -157,7 +158,7 @@ def check_kernel_sums(bpf_text, sums_dir):
             problems.append(f"{path.name}: no deb sums recorded")
     if sums_dir.is_dir():
         extra = sorted(path.name for path in sums_dir.glob("*.sums")
-                       if path.stem not in kernels)
+                       if path.stem not in kernels and path.stem != "v5.15.221")
         for name in extra:
             problems.append(f"sums file outside the matrix: {name}")
     return problems
@@ -190,6 +191,24 @@ class BpfKernelsContractTests(unittest.TestCase):
 
     def test_kernel_sums_cover_the_matrix(self):
         self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR))
+
+    def test_active_positives_and_one_combined_stock_refusal_are_separate(self):
+        self.assertEqual(matrix_kernels(self.bpf),
+                         ["v6.6.157", "v6.12.111", "v6.18.58"])
+        controls = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", self.bpf)
+        self.assertEqual(controls, ["v6.1.188"])
+        self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)
+        self.assertIn("if: matrix.refusal_control != true", self.bpf)
+        self.assertIn("if: matrix.refusal_control == true", self.bpf)
+
+    def test_final_kernel_campaign_is_not_cancelled_by_successor_push(self):
+        self.assertIn("cancel-in-progress: false", self.bpf)
+
+    def test_positive_load_commands_request_multi(self):
+        driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()
+        self.assertIn("inventory --system --capture native --attach-backend multi", driver)
+        self.assertIn("--attach-backend multi --counter-mode $MODE", driver)
+        self.assertNotIn("v5.15.*|v6.1.*)", driver)
 
 
 if __name__ == "__main__":

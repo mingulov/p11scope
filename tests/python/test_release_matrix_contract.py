@@ -218,9 +218,7 @@ class MatrixContract(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         rows = {row["id"]: row for row in json.loads(result.stdout)["rows"]}
         self.assertEqual(rows["lib:" + DENIAL]["qualification"], "expected-refusal")
-        identity = rows["identity:5.15-denied"]
-        self.assertEqual(identity["qualification"], "expected-refusal")
-        self.assertTrue(identity["detail"].startswith("guest refusal disclosed: " + DENIED_MARKER))
+        self.assertNotIn("identity:5.15-denied", rows)
 
     def test_denial_cell_fabricated_denial_is_rejected_on_515(self):
         fabrications = {
@@ -2188,13 +2186,20 @@ class MatrixContract(unittest.TestCase):
         self.log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... n/a kernel lacks uprobe-multi\n", "doctor", 0)
         self.seal(); self.reject()
 
-    def test_proven_probe_with_disclosed_preparation_fallback_is_not_multi_coverage(self):
-        self.backend("sys", "per-offset", None, "the uprobe-multi preparation failed: owned preparation refusal")
+    def test_host_proof_is_load_self_link_without_delivery_claim(self):
+        self.log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok scratch program loaded; self-link attached and detached (delivery unmeasured)\n", "doctor", 0)
         self.seal()
         result = self.judge()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         rows = json.loads(result.stdout)["rows"]
-        self.assertEqual(next(r for r in rows if r["id"] == "backend-system")["qualification"], "expected-fallback")
+        self.assertEqual(next(r for r in rows if r["id"] == "backend-system")["qualification"], "positive-coverage")
+
+    def test_proven_probe_with_disclosed_preparation_fallback_is_not_multi_coverage(self):
+        self.backend("sys", "per-offset", None, "the uprobe-multi preparation failed: owned preparation refusal")
+        self.seal()
+        result = self.judge()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("system Multi positive cannot use", result.stdout + result.stderr)
 
     def test_backported_system_multi_with_pid_fallback_is_valid(self):
         self.log("pidflt.log", f"test {PID_TEST} ... ok\nPIDFLT_PROBE own=1 other=0 proves=false\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", "pidflt", 0)
@@ -2959,35 +2964,25 @@ int main(int argc, char **argv) {
 
 
 class Registration(unittest.TestCase):
-    def test_named_denied_identity_tier_is_explicit_without_static_skips(self):
+    def test_older_label_never_implies_a_denial_or_eligibility_tier(self):
         result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221")
         self.assertEqual(result.returncode, 0, result.stderr)
         execution = json.loads(result.stdout)["execution"]
-        forbidden = "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none"
-        self.assertNotIn(forbidden, execution["lib_tests"])
-        self.assertTrue(any(r["id"] == "identity:5.15-denied" for r in execution["obligations"]))
+        self.assertIn("attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none", execution["lib_tests"])
+        self.assertNotIn(DENIAL, execution["lib_tests"])
+        self.assertNotIn("identity:5.15-denied", execution["required_ids"])
+        self.assertEqual(execution["system_backend"], {"linked": ["uprobe-multi", None]})
 
-    def test_denied_identity_tier_selects_executable_libtest(self):
-        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        execution = json.loads(result.stdout)["execution"]
-        self.assertIn(DENIAL, execution["lib_tests"])
-        self.assertIn("lib:" + DENIAL, execution["required_ids"])
-        obligation = next(r for r in execution["obligations"] if r["id"] == "identity:5.15-denied")
-        self.assertEqual(obligation["status"], "selected")
-        self.assertEqual(obligation["libtest"], DENIAL)
-        self.assertEqual(execution["lib_outcomes"][DENIAL], "denial-with-zero-bpf-or-eligible-by-lane")
+    def test_private_identity_refusal_remains_explicitly_selectable(self):
         result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "5.15.221",
-                         "--lib-test", LIB_A)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        result = command(sys.executable, "-I", str(CHECKER), "--plan", "--lane", "6.1.188")
+                         "--lib-test", DENIAL)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(DENIAL, json.loads(result.stdout)["execution"]["lib_tests"])
+        self.assertEqual(json.loads(result.stdout)["execution"]["lib_tests"], [DENIAL])
 
     def test_dry_run_has_all_eight_lanes_mt12_and_exact_breadth_names(self):
         result = command(str(RUNNER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        for literal in ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142", "6.12.111", "7.2.6", "host", "THREADS=12", LIB_A, LIB_B, LIB_D, LIB_C, "unready"):
+        for literal in ("6.6.157", "6.8.0-142", "6.12.111", "7.2.6", "host", "THREADS=12", LIB_A, LIB_B, LIB_D, LIB_C, "unready"):
             with self.subTest(literal=literal):
                 self.assertIn(literal, result.stdout)
 
@@ -3054,7 +3049,7 @@ class MatrixLaneRegistration(unittest.TestCase):
     def test_dry_run_defaults_gain_618_without_fedora(self):
         result = command(str(RUNNER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("kernels (8):", result.stdout)
+        self.assertIn("kernels (6):", result.stdout)
         self.assertIn("v6.18.58 tag=v6.18.58", result.stdout)
         self.assertNotIn("tag=fedora", result.stdout)
 

@@ -8,7 +8,7 @@
 # OBSERVER is the prebuilt observer under test, PROBE the verifier-stats
 # probe built by `measure-verifier-headroom.py build`, OUTDIR a directory
 # under /home/user/.cache/p11scope-vng/<tag>/ shared with the guests.
-# Default kernels: v5.15.221 v6.1.188 v6.6.157 v6.12.111 v6.18.58.
+# Default kernels: v6.6.157 v6.12.111 v6.18.58.
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json
 # when that file exists, so a budgeted program with no probe row FAILs
 # without any flag. --counter-budgets defaults to the checked-in
@@ -61,13 +61,10 @@
 # kernel set, since the main file's shape pin requires one kernel set
 # for every program), so a missing program or growth FAILs. The probe
 # file's 16th load (the lone Detailed return) belongs to no counter
-# group and is ignored when scoring counter modes. 5.15 refuses before
-# loading (no bpf_loop, no counter program tried) and 6.1 refuses at
-# load with the named counter-mode-unavailable-on-kernel at-load refusal
-# (verifier E2BIG on a named counter program); the gate passes those
-# kernels only when the observer log names the token, no bank program
-# loaded, and (on 6.1) the probe file holds a non-auxiliary E2BIG row
-# for a named counter program. Known gaps, not gated:
+# group and is ignored when scoring counter modes. All positive capture
+# commands require Multi. Stock pre-Multi hosts use the separate combined
+# check-multi-host-refusal.py control, never this load/cost campaign.
+# Known gaps, not gated:
 # p11_selected_bootstrap (loads only for a promoted live process, which
 # needs a provider mapped in the guest), the dormant
 # p11_selected_cgroup_migrate (present in the object, no load call
@@ -119,7 +116,7 @@ PROBE=$2
 OUTDIR=$3
 shift 3
 if [ $# -eq 0 ]; then
-    set -- v5.15.221 v6.1.188 v6.6.157 v6.12.111 v6.18.58
+    set -- v6.6.157 v6.12.111 v6.18.58
 fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPORT="$SCRIPT_DIR/bpf-load-report.py"
@@ -182,7 +179,7 @@ for KERNEL in "$@"; do
     VNG_INV_LOG="$OUTDIR/vng-inv-$KERNEL.log"
     rm -f "$PROBE_JSON" "$DOCTOR_TXT" "$INV_PROBE_JSON" "$INV_TXT" "$VNG_LOG" "$VNG_INV_LOG"
     EXEC1="cd $(q "$OUTDIR") && $STAGE; LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") doctor 9>$(q "probe-$KERNEL.jsonl") >$(q "doctor-$KERNEL.txt") 2>&1; echo doctor-rc=\$?; echo guest-release=\$(uname -r)"
-    EXEC2="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 20 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") inventory --system --capture native --identity-backend userspace 9>$(q "inventory-probe-$KERNEL.jsonl") >$(q "inventory-$KERNEL.txt") 2>&1; echo inventory-rc=\$?; echo guest-release=\$(uname -r)"
+    EXEC2="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 20 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") inventory --system --capture native --attach-backend multi --identity-backend userspace 9>$(q "inventory-probe-$KERNEL.jsonl") >$(q "inventory-$KERNEL.txt") 2>&1; echo inventory-rc=\$?; echo guest-release=\$(uname -r)"
     # Fail fast past the kernel command line: 950 raw bytes encode to
     # ~1270 base64 bytes, which still fits the 2048 budget beside
     # virtme's own arguments; past it the guest silently never runs.
@@ -300,7 +297,7 @@ for KERNEL in "$@"; do
         C_TXT="$OUTDIR/counter-$MODE-$KERNEL.txt"
         C_VNG_LOG="$OUTDIR/vng-counter-$MODE-$KERNEL.log"
         rm -f "$C_PROBE_JSON" "$C_TXT" "$C_VNG_LOG"
-        EXEC_C="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --system --mode metrics --counter-mode $MODE --duration 5s 9>$(q "counter-$MODE-probe-$KERNEL.jsonl") >$(q "counter-$MODE-$KERNEL.txt") 2>&1; echo counter-rc=\$?; echo guest-release=\$(uname -r)"
+        EXEC_C="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --system --mode metrics --attach-backend multi --counter-mode $MODE --duration 5s 9>$(q "counter-$MODE-probe-$KERNEL.jsonl") >$(q "counter-$MODE-$KERNEL.txt") 2>&1; echo counter-rc=\$?; echo guest-release=\$(uname -r)"
         if [ "${#EXEC_C}" -gt 950 ]; then
             echo "# error: counter guest command exceeds the kernel-cmdline budget on $KERNEL"
             FAILED=1
@@ -334,93 +331,36 @@ for KERNEL in "$@"; do
                 ;;
         esac
         C_RC=$(grep '^counter-rc=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
-        case "$KERNEL" in
-            v5.15.*|v6.1.*)
-                # The specified refusal: the observer names the token, and
-                # the probe file holds refusal rows (6.1 E2BIG at load) or
-                # the bare summary (5.15 refuses before loading). A behavior
-                # flip (loads where none were specified) names no token and
-                # FAILs here, so new loads need new budgets before they pass.
-                if [ ! -f "$C_TXT" ] || ! grep -q 'counter-mode-unavailable-on-kernel' "$C_TXT"; then
-                    echo "# error: counter-$MODE on $KERNEL left no specified refusal (see $C_TXT)"
-                    FAILED=1
-                    continue
-                fi
-                if grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
-                    echo "# error: counter-$MODE profile crashed on $KERNEL (see $C_TXT)"
-                    FAILED=1
-                    continue
-                fi
-                if [ ! -f "$C_PROBE_JSON" ] || ! grep -q -E '"record": ?"probe-summary"' "$C_PROBE_JSON"; then
-                    echo "# error: counter-$MODE probe never finished on $KERNEL (see $C_VNG_LOG)"
-                    FAILED=1
-                    continue
-                fi
-                if grep 'p11_counter_bank' "$C_PROBE_JSON" | grep -q -E '"loaded": ?true'; then
-                    echo "# error: counter-$MODE on $KERNEL loaded where refusal was specified (see $C_PROBE_JSON)"
-                    FAILED=1
-                    continue
-                fi
-                REFUSED=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" | wc -l)
-                case "$KERNEL" in
-                    v6.1.*)
-                        # At-load proof: a non-auxiliary, non-unresolved row
-                        # refused with E2BIG (exactly errno 7, not 70+).
-                        # Auxiliary aya probes and the bpf_loop probe
-                        # (unresolved) do not count;
-                        # only a named counter program proves the specified
-                        # at-load path ran. Prints the program name.
-                        E2BIG_PROG=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" \
-                            | grep -E '"auxiliary": ?null' \
-                            | grep -v -E '"root": ?"unresolved"' \
-                            | grep -E '"errno": ?7([^0-9]|$)' \
-                            | sed -n 's/.*"root": *"\([^"]*\)".*/\1/p' \
-                            | sort -u | head -n 1)
-                        if [ -z "$E2BIG_PROG" ]; then
-                            echo "# error: counter-$MODE on $KERNEL left no at-load refusal rows (expected E2BIG from a named counter program)"
-                            FAILED=1
-                            continue
-                        fi
-                        echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED e2big-program=$E2BIG_PROG)"
-                        ;;
-                    *)
-                        echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED)"
-                        ;;
-                esac
+        # A failed counter run still falls through to per-program
+        # scoring like inventory does: the probe rows name the
+        # refused program. Only infrastructure failures above skip
+        # the mode; a wrong-kernel guest never reaches scoring.
+        case "$C_RC" in
+            0)
+                echo "# counter-$MODE rc=0 on $KERNEL"
                 ;;
             *)
-                # A failed counter run still falls through to per-program
-                # scoring like inventory does: the probe rows name the
-                # refused program. Only infrastructure failures above skip
-                # the mode; a wrong-kernel guest never reaches scoring.
-                case "$C_RC" in
-                    0)
-                        echo "# counter-$MODE rc=0 on $KERNEL"
-                        ;;
-                    *)
-                        echo "# error: counter-$MODE profile exited rc=$C_RC on $KERNEL (see $C_TXT)"
-                        [ -f "$C_TXT" ] && tail -n 20 "$C_TXT" | sed 's/^/#   /'
-                        FAILED=1
-                        ;;
-                esac
-                if [ ! -f "$C_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
-                    echo "# error: counter-$MODE profile crashed or left no log on $KERNEL (see $C_VNG_LOG)"
-                    FAILED=1
-                fi
-                if [ -n "$COUNTER_BUDGETS" ]; then
-                    # No word splitting: the budgets path stays quoted in its own arm.
-                    if ! python3 -I "$REPORT" --budgets "$COUNTER_BUDGETS" --object "counter-$MODE" --kernel "$KERNEL" \
-                        --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
-                        FAILED=1
-                    fi
-                else
-                    if ! python3 -I "$REPORT" --object "counter-$MODE" --kernel "$KERNEL" \
-                        --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
-                        FAILED=1
-                    fi
-                fi
+                echo "# error: counter-$MODE profile exited rc=$C_RC on $KERNEL (see $C_TXT)"
+                [ -f "$C_TXT" ] && tail -n 20 "$C_TXT" | sed 's/^/#   /'
+                FAILED=1
                 ;;
         esac
+        if [ ! -f "$C_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
+            echo "# error: counter-$MODE profile crashed or left no log on $KERNEL (see $C_VNG_LOG)"
+            FAILED=1
+        fi
+        if [ -n "$COUNTER_BUDGETS" ]; then
+            # No word splitting: the budgets path stays quoted in its own arm.
+            if ! python3 -I "$REPORT" --budgets "$COUNTER_BUDGETS" --object "counter-$MODE" --kernel "$KERNEL" \
+                --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
+                FAILED=1
+            fi
+        else
+            if ! python3 -I "$REPORT" --object "counter-$MODE" --kernel "$KERNEL" \
+                --observer-sha256 "$OBSERVER_SHA" "$C_PROBE_JSON"; then
+                FAILED=1
+            fi
+        fi
     done
 done
 

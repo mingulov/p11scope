@@ -26,7 +26,7 @@ OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
 # plus the 7.0 guest the budgets also cover.
 EXPECTED_BUDGET_KERNELS = frozenset({
-    "v5.15.221", "v6.1.188", "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
 })
 # Counter objects load only where the verifier accepts them (6.6+); the
 # old kernels keep the specified refusal, so the counter file pins its
@@ -557,7 +557,7 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(DRIVER.is_file(),
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
-        self.assertIn("profile --system --mode metrics --counter-mode", text)
+        self.assertIn("profile --system --mode metrics --attach-backend multi --counter-mode", text)
         self.assertIn("counter-$MODE-probe-", text)
 
     def test_driver_scores_counter_loads_per_object(self):
@@ -568,15 +568,11 @@ class ReportTests(unittest.TestCase):
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('--object "counter-$MODE"', text)
 
-    def test_driver_expects_the_named_counter_refusal_on_old_kernels(self):
-        # 5.15 refuses before loading (no bpf_loop), 6.1 refuses at load
-        # (verifier E2BIG); both keep the specified refusal token, and the
-        # gate passes those kernels only when the observer names it.
-        self.assertTrue(DRIVER.is_file(),
-                        "scripts/check-bpf-load-kernels.sh is missing")
+    def test_positive_driver_never_counts_old_refusals_as_loads(self):
         text = DRIVER.read_text(encoding="ascii")
-        self.assertIn("counter-mode-unavailable-on-kernel", text)
-        self.assertIn("v5.15.*|v6.1.*)", text)
+        self.assertNotIn("v5.15.*|v6.1.*)", text)
+        self.assertNotIn("counter-mode-unavailable-on-kernel", text)
+        self.assertIn("check-multi-host-refusal.py", text)
 
     def test_driver_comment_no_longer_calls_counter_mode_unwired(self):
         # Activation wired --counter-mode; the comment must describe the
@@ -599,33 +595,20 @@ class ReportTests(unittest.TestCase):
         self.assertIn('--budgets "$COUNTER_BUDGETS"', text)
         self.assertIn('--object "counter-$MODE"', text)
 
-    def test_driver_requires_at_load_refusal_rows_on_61(self):
-        # The 6.1 arm must prove the specified at-load E2BIG path ran:
-        # a before-load refusal or probe flake with zero refusal rows
-        # is not the specified behavior.
-        self.assertTrue(DRIVER.is_file(),
-                        "scripts/check-bpf-load-kernels.sh is missing")
-        text = DRIVER.read_text(encoding="ascii")
-        self.assertIn("at-load refusal rows", text)
+    def test_combined_refusal_control_uses_host_eligibility_reason(self):
+        text = (ROOT / "scripts/check-multi-host-refusal.py").read_text()
+        self.assertIn("uprobe-multi-required", text)
+        self.assertIn('"capture_positive": False', text)
 
-    def test_driver_requires_named_e2big_program_on_61(self):
-        # The 6.1 at-load proof must name a non-auxiliary, non-unresolved
-        # counter program refused with E2BIG: auxiliary aya rows and the
-        # bpf_loop probe alone do not prove the specified path ran. The
-        # driver prints the program name.
-        self.assertTrue(DRIVER.is_file(),
-                        "scripts/check-bpf-load-kernels.sh is missing")
+    def test_counter_positive_loads_force_multi(self):
         text = DRIVER.read_text(encoding="ascii")
-        self.assertIn('"auxiliary": ?null', text)
-        self.assertIn('"root": ?"unresolved"', text)
-        self.assertIn('"errno": ?7([^0-9]|$)', text)
-        self.assertIn("e2big-program=", text)
+        self.assertIn("--attach-backend multi --counter-mode $MODE", text)
 
     def e2big_program_via_driver_pipeline(self, probe_path):
-        # The driver's 6.1 at-load extraction, mirrored here so the twin
+        # Historical 6.1 at-load extraction, retained as a cheap errno twin
         # proves the grep logic distinguishes a real E2BIG counter row
-        # from auxiliary-only refused rows. The pin test above ensures
-        # the driver uses these same patterns.
+        # from auxiliary-only refused rows. This historical classifier does
+        # not create a current old-kernel positive obligation.
         pipeline = (
             f"grep -E '\"loaded\": ?false' {probe_path} "
             f"| grep -E '\"auxiliary\": ?null' "
@@ -653,9 +636,8 @@ class ReportTests(unittest.TestCase):
             "function_list_return")
 
     def test_61_e2big_extraction_with_only_auxiliary_rows_finds_nothing(self):
-        # Twin: auxiliary refused rows plus the bpf_loop probe, but no
-        # E2BIG counter row, yield nothing, so the driver's 6.1 arm
-        # FAILs instead of passing trivially.
+        # Twin: auxiliary probes alone do not prove a historical E2BIG
+        # counter-program refusal.
         aux = aux_row("aya-helper113", loaded=False, errno=13)
         probe = self.bpf_loop_probe_row(13)
         loaded = load_row("p11_return", processed=645449, btf_id=40)
@@ -677,27 +659,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(
             self.e2big_program_via_driver_pipeline(path), "")
 
-    def test_driver_checks_old_kernel_counter_runs_for_crashes(self):
-        # Old-kernel refusal arms carry the same crash grep as the 6.6+
-        # arm and inventory: three sites (inventory, counter new, counter
-        # old) name the crash markers.
-        self.assertTrue(DRIVER.is_file(),
-                        "scripts/check-bpf-load-kernels.sh is missing")
+    def test_positive_counter_and_inventory_runs_check_for_crashes(self):
         text = DRIVER.read_text(encoding="ascii")
-        self.assertGreaterEqual(
-            text.count("panicked at|traceback"), 3,
-            "counter old-kernel arms must grep for crashes",
-        )
+        self.assertGreaterEqual(text.count("panicked at|traceback"), 2)
 
-    def test_driver_refuses_counter_loads_where_refusal_is_specified(self):
-        # Two-sided token check: the observer naming the refusal token is
-        # not enough when a bank program loaded anyway. Aya auxiliary
-        # probes always load, so only bank rows count.
-        self.assertTrue(DRIVER.is_file(),
-                        "scripts/check-bpf-load-kernels.sh is missing")
-        text = DRIVER.read_text(encoding="ascii")
-        self.assertIn('"loaded": ?true', text)
-        self.assertIn("grep 'p11_counter_bank'", text)
+    def test_refusal_control_is_not_a_verifier_cost_measurement(self):
+        text = (ROOT / "scripts/check-multi-host-refusal.py").read_text()
+        self.assertNotIn("LD_PRELOAD", text)
+        self.assertNotIn("counter-mode-unavailable-on-kernel", text)
 
     def test_driver_never_quotes_doctor_counter_modes_footer(self):
         # Under the LD_PRELOAD probe the counter-modes footer is a gate
@@ -723,7 +692,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("FAILED=1", rc_case)
         self.assertNotIn("continue", rc_case)
         crash_idx = text.index("counter-$MODE profile crashed or left no log")
-        crash_end = text.index("\n                fi", crash_idx)
+        crash_end = text.index("\n        fi", crash_idx)
         crash_block = text[crash_idx:crash_end]
         self.assertIn("FAILED=1", crash_block)
         self.assertNotIn("continue", crash_block)

@@ -22,13 +22,20 @@ assessment and incident diagnostics.
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what
 > this release was qualified on.
 
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
 Omitting `--counter-mode` keeps existing metrics behavior. Explicit
-`counts`, `timestamps` and `latency` selections aggregate in the kernel
-on 6.6+ (LP64); on 5.15 they refuse with the named
-`counter-mode-unavailable-on-kernel` reason before any counter program
-loads, and on 6.1 the same named reason is reported when the kernel
-verifier rejects a counter program as too complex (E2BIG) at load.
-`run` never starts its program when a counter refusal happens.
+`counts`, `timestamps` and `latency` aggregate in the kernel on eligible LP64
+hosts, subject to mode-specific verifier and memory limits.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -218,11 +225,10 @@ sudo install -m 0755 target/release/p11scope-discover /usr/local/bin/
 The helper runs unprivileged and drops groups, IDs, and capabilities before
 loading provider code. Never give it capabilities or a set-id bit.
 
-**Kernel and privileges.** Linux 5.15 or newer with BTF
-(`/sys/kernel/btf/vmlinux`). Captures need root (`sudo p11scope ...`) or file
-capabilities on the observer. The attach backend is probe-decided: the
-default first attempts uprobe-multi links where a functional probe shows
-support and falls back to per-probe links elsewhere. With multi active,
+**Kernel and privileges.** Live capture requires a Multi-capable Linux x86-64
+host (normally 6.6+ or a working backport), BTF (`/sys/kernel/btf/vmlinux`) and
+root or appropriate capabilities. General host eligibility is separate from
+the safe scoped attachment backend. With multi active,
 `CAP_BPF`+`CAP_PERFMON` suffice for the static probes of an unconfined
 `--pid` target (measured 136/136 at `perf_event_paranoid=4`); full capture
 at paranoid ≥ 3 (live discovery, uretprobe self-probe) needs `CAP_SYS_ADMIN`,
@@ -373,9 +379,9 @@ report format.
   against a millisecond-scale network HSM
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
-- Requires elevated privileges, kernel-version-dependent, x86-64 first. The
-  default attempts uprobe-multi where a functional probe shows support,
-  with per-probe fallback if the kernel refuses multi. With multi active,
+- Requires elevated privileges, kernel-version-dependent, x86-64 first. Live
+  capture requires general Multi host capability; a safe scoped per-probe
+  backend can still be selected on an eligible host. With multi active,
   `CAP_BPF`+`CAP_PERFMON`
   suffice for the static probes of an unconfined `--pid` target at
   `kernel.perf_event_paranoid=4` (measured 136/136); full capture at
@@ -388,7 +394,8 @@ report format.
   still refuse capture.
   No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
   ([measured matrix](docs/usage.md#privileges-per-environment)).
-  Kernel floor ≥5.15; on an unsupported environment the tool fails with a
+  Live host capability is tested, with `uprobe-multi-required` on failure;
+  other unsupported configurations fail with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
 - `inspect` shows every provider-shaped module mapped by the target; an

@@ -126,6 +126,7 @@ attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
+attach::instance_tests::privileged_object_continuity_refusal_preserves_s1_base
 # Birth marker cells: live exec/fork/scope-gap marker words and admission
 # counts through the session's instance maps.
 attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
@@ -440,6 +441,7 @@ metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_gr
 metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64
 metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64
 attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel
+# Historical/private opt-in counter refusals; never current host positives.
 attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels
 metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64
 # Engine-driven counter growth and stop cells (cgroup/system scopes, timing

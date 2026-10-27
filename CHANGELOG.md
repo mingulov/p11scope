@@ -7,14 +7,29 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [0.5.0]
 
+Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
+self-link capability under the current credentials, normally Linux 6.6+ or a
+working backport. Capability is tested, never admitted by version. Missing
+capability refuses with `uprobe-multi-required` before capture, output changes
+or a user workload starts, including explicit `--attach-backend singles`.
+Safe scoped Singles remains available on eligible hosts; PID Multi additionally
+requires a proven kernel PID filter. Help, version, inspect, discovery, saved
+report read/diff and genuine `inventory --capture scan` remain usable without
+the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
+release commitment is made.
+
 v0.5.0: official release builds read object attributes by default (FULL),
 with the P0 build staying an explicit option. Text inventory snapshots
 carry a `key operations:` summary line, over-budget inventory plans name
 `--max-endpoints`, `--counter-mode` selections aggregate in the kernel
-on 6.6+ (LP64) and refuse by name on 5.15 and 6.1, and discovery handles
+on eligible LP64 hosts, and discovery handles
 kernel threads and processes whose main thread already exited.
 User-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
+
+The older startup/refusal numbers retained in this entry are historical
+measurements from before the host policy above, not current old-host support
+or a product startup SLA.
 
 ### Scale and --system
 
@@ -53,18 +68,11 @@ User-facing limits live in
   the result rules, retention table and publication section. Nothing
   else in v3 grants capture.
 - `--counter-mode counts|timestamps|latency` selects kernel-aggregated
-  capture for `profile`/`run` with `--mode metrics` on 6.6+ (LP64). On
-  5.15 every mode refuses with the named
-  `counter-mode-unavailable-on-kernel` reason before any counter
-  program loads; on 6.1 the same named reason is reported when the
-  kernel verifier rejects a counter program as too complex (E2BIG) at
-  load. Either way `run` never starts its program. Latency banks refuse
-  with `counter-memory-limit` past the per-capture kernel-map memory
-  cap on hosts with many possible CPUs. Omit the flag to keep existing
-  metrics behavior.
-- Startup readiness bounds are disclosed per kernel (8 s on 6.6+,
-  30 s on 5.15/6.1); see
-  [known limitations](docs/known-limitations.md#known-limitations-v050).
+  capture for `profile`/`run` with `--mode metrics` on eligible LP64 hosts,
+  subject to independent verifier, feature and memory limits. A refused
+  start exits nonzero without a report or starting the requested workload.
+- Startup readiness bounds are disclosed harness parameters, never a
+  product cold-start SLA; see [known limitations](docs/known-limitations.md).
 
 ### Packaging
 
@@ -97,18 +105,13 @@ The v0.5.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-v050).
 Known issues in this release:
 
-- Strict scale and speed numbers apply only on kernels with uprobe_multi
-  (6.6 and later); older kernels stay correct but stop slowly and start
-  slowly. When the expected stop reaches 2 s, one up-front estimate
-  line is printed first.
-- Startup takes about 15–22 s on 5.15/6.1, about 4–7 s on 6.6+; the
-  declared readiness bound is 8 s on 6.6+, 30 s on 5.15/6.1.
-- `--counter-mode` selections aggregate in the kernel on 6.6+ (LP64);
-  on 5.15 they refuse by name before any counter program loads, on 6.1
-  when the kernel verifier rejects a counter program (E2BIG) at load;
-  metrics behavior without the flag is unchanged. A refused
-  counter-mode or Detailed start prints its named reason on stderr,
-  exits nonzero and writes no report.
+- Strict scale and speed limits apply to captures actually using Multi.
+  Safe scoped Singles on an eligible host stays correct, finite and disclosed.
+- Historical startup measurements remain historical; declared readiness
+  bounds are harness parameters, not a product cold-start SLA.
+- Counter modes need an eligible LP64 host and independent load/feature/memory
+  checks. Stock pre-Multi hosts refuse early with `uprobe-multi-required`;
+  no user workload starts.
 - Per-call profile/trace capture stays fixed at 512 attach slots
   (2,112 only in the WIDE source build); counter banks share one
   65,536-entry return-value pool.

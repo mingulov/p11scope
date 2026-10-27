@@ -32,7 +32,7 @@ permissions:
   contents: read
 concurrency:
   group: bpf-kernels-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 # Tool versions, read by both the install step and the cache key (as in
 # ci.yml), so a version bump can never be served an older binary.
 env:
@@ -215,7 +215,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v5.15.221, v6.1.188, v6.6.157, v6.12.111, v6.18.58]
+        kernel: [v6.6.157, v6.12.111, v6.18.58]
+        include:
+          # One combined refusal control, never an old positive campaign.
+          - kernel: v6.1.188
+            refusal_control: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -275,6 +279,7 @@ jobs:
           # paths into the guest command.
           path: bpf-load-inputs
       - name: Run the load check for this kernel
+        if: matrix.refusal_control != true
         shell: bash
         run: |
           (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
@@ -288,12 +293,25 @@ jobs:
           test -s "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
           # Fail when the guest doctor exits nonzero, as the host job does.
           grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+      - name: Check one stock pre-Multi host refuses before capture side effects
+        if: matrix.refusal_control == true
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
+          python3 -I scripts/check-multi-host-refusal.py \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-out/refusal-${{ matrix.kernel }}" "${{ matrix.kernel }}" \
+            | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bpf-load-${{ matrix.kernel }}
           path: |
+            ${{ github.workspace }}/bpf-load-out/refusal-${{ matrix.kernel }}/result.json
+            ${{ github.workspace }}/bpf-load-out/refusal-${{ matrix.kernel }}/guest.log
             ${{ github.workspace }}/bpf-load-out/table-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-out/doctor-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-out/probe-${{ matrix.kernel }}.jsonl

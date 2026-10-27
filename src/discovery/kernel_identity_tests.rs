@@ -5462,4 +5462,223 @@ fn unvisited_and_below_threshold_classified_separately() {
     assert_eq!(watched.target_reads, 0);
     assert_eq!(unvisited.target_reads, 1);
     assert_eq!(below.attempts, 0);
+// Cached strict census for examined custody: one strict census per custody
+// phase plus a local ledger, instead of one census per offered object. The
+// safety rule is unchanged: an anchor is never taken below three
+// descriptors of headroom, a failed census closes custody, the cap and the
+// rank order are unchanged, replacement still drops the old file before
+// the new lease, and every refusal records its AnchorDeny reason.
+
+#[test]
+fn custody_many_offers_in_one_scan_take_constant_censuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let scan = custody.begin_scan();
+    let mut accepted = 0usize;
+    let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        for index in 0..25 {
+            let (file, examined) = opened(dir.path(), &format!("member-{index}.so"));
+            if custody.offer(scan, examined, file) {
+                accepted += 1;
+            }
+        }
+    });
+    assert_eq!(accepted, 25, "test hosts hold ample FD headroom");
+    assert!(calls <= 2, "25 offers took {calls} strict censuses");
+}
+
+#[test]
+fn custody_census_cache_survives_scan_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let mut accepted = 0usize;
+    let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        for member in 0..5 {
+            let scan = custody.begin_scan();
+            for index in 0..5 {
+                let (file, examined) = opened(dir.path(), &format!("m{member}-{index}.so"));
+                if custody.offer(scan, examined, file) {
+                    accepted += 1;
+                }
+            }
+        }
+    });
+    assert_eq!(accepted, 25, "test hosts hold ample FD headroom");
+    assert!(
+        calls <= 2,
+        "25 offers across 5 scans took {calls} strict censuses"
+    );
+}
+
+#[test]
+fn custody_high_census_is_trusted_for_later_offers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let scan = custody.begin_scan();
+    let calls = Cell::new(0usize);
+    for index in 0..61 {
+        let (file, examined) = opened(dir.path(), &format!("held-{index}.so"));
+        assert!(
+            custody.offer_with_census(scan, examined, file, || {
+                calls.set(calls.get() + 1);
+                Ok(SegmentPolicy::from_headroom(10_000, 0, 0))
+            }),
+            "offer {index} refused under vast headroom"
+        );
+    }
+    assert_eq!(calls.get(), 1, "every offer re-took the strict census");
+    assert_eq!(custody.candidates.len(), 61);
+}
+
+#[test]
+fn custody_recensus_refuses_fresh_low_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let scan = custody.begin_scan();
+    let calls = Cell::new(0usize);
+    let mut accepted = 0usize;
+    let mut refused_key = None;
+    for index in 0..61 {
+        let (file, examined) = opened(dir.path(), &format!("growth-{index}.so"));
+        if custody.offer_with_census(scan, examined, file, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(SegmentPolicy::from_headroom(64, 0, 0))
+            } else {
+                Ok(SegmentPolicy::from_headroom(2, 0, 0))
+            }
+        }) {
+            accepted += 1;
+        } else {
+            refused_key = Some(examined.key);
+            break;
+        }
+    }
+    assert!(
+        accepted >= 2,
+        "no offer trusted the cached census: {accepted}"
+    );
+    assert_eq!(calls.get(), 2, "refusal did not come from a fresh census");
+    assert!(!custody.failed(), "low headroom closed custody");
+    assert_eq!(custody.candidates.len(), accepted);
+    let refused = refused_key.expect("offers stopped without a refusal");
+    assert_eq!(
+        custody.missing.get(&(scan, refused)),
+        Some(&AnchorDeny::FdHeadroom)
+    );
+    let first = &custody.candidates[0].file;
+    assert!(first.metadata().is_ok(), "refusal dropped earlier custody");
+}
+
+#[test]
+fn custody_recensus_failure_still_closes_custody() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let owner = custody.owner.clone();
+    let scan = custody.begin_scan();
+    let (first_file, first_examined) = opened(dir.path(), "first.so");
+    let first_fd = FdToken::of(&first_file);
+    let calls = Cell::new(0usize);
+    assert!(custody.offer_with_census(scan, first_examined, first_file, || {
+        calls.set(calls.get() + 1);
+        Ok(SegmentPolicy::from_headroom(64, 0, 0))
+    }));
+    // Grow the ledger until the cached census no longer covers the next
+    // offer; that offer's fresh census then fails.
+    let mut failed_key = None;
+    for index in 1..61 {
+        let (file, examined) = opened(dir.path(), &format!("growth-{index}.so"));
+        let took = custody.offer_with_census(scan, examined, file, || {
+            calls.set(calls.get() + 1);
+            Err("injected census failure".into())
+        });
+        if !took {
+            failed_key = Some(examined.key);
+            break;
+        }
+    }
+    let failed_key = failed_key.expect("no offer re-took the census");
+    assert_eq!(calls.get(), 2);
+    assert!(custody.failed());
+    assert!(custody.candidates.is_empty());
+    assert_eq!(owner.examined_for_test().0, 0);
+    assert!(!fd_open(first_fd), "failed custody leaked its examined file");
+    assert_eq!(
+        custody.missing.get(&(scan, failed_key)),
+        Some(&AnchorDeny::FdHeadroom)
+    );
+    // Sticky failure: no further census is attempted.
+    let (file, examined) = opened(dir.path(), "later.so");
+    assert!(!custody.offer_with_census(scan, examined, file, || panic!(
+        "census failure was retried"
+    )));
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn custody_cached_census_keeps_rank_replacement_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let opened: Vec<_> = (0..6)
+        .map(|index| opened(dir.path(), &format!("rank-{index}.so")))
+        .collect();
+    let mut ranks = BTreeMap::new();
+    for (index, (_, object)) in opened.iter().enumerate() {
+        ranks.insert(object.key, index / 2);
+    }
+    let mut expected: Vec<_> = ranks.keys().copied().collect();
+    expected.sort_by_key(|key| (std::cmp::Reverse(ranks[key]), *key));
+    let mut custody = custody(2, ranks);
+    let owner = custody.owner.clone();
+    let calls = Cell::new(0usize);
+    for (file, object) in opened {
+        let scan = custody.begin_scan();
+        custody.offer_with_census(scan, object, file, || {
+            calls.set(calls.get() + 1);
+            Ok(SegmentPolicy::from_headroom(10_000, 0, 0))
+        });
+    }
+    assert_eq!(calls.get(), 1, "ranked offers re-took the census");
+    let mut actual: Vec<_> = custody
+        .candidates
+        .iter()
+        .map(|held| held.examined.key)
+        .collect();
+    actual.sort_unstable();
+    let mut wanted = expected[..2].to_vec();
+    wanted.sort_unstable();
+    assert_eq!(actual, wanted, "cached census changed the replacement order");
+    assert_eq!(owner.examined_for_test(), (2, 2));
+}
+
+#[test]
+fn custody_discarded_scan_returns_ledger_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    let owner = custody.owner.clone();
+    let scan = custody.begin_scan();
+    let calls = Cell::new(0usize);
+    for index in 0..45 {
+        let (file, examined) = opened(dir.path(), &format!("transient-{index}.so"));
+        assert!(
+            custody.offer_with_census(scan, examined, file, || {
+                calls.set(calls.get() + 1);
+                Ok(SegmentPolicy::from_headroom(64, 0, 0))
+            }),
+            "offer {index} refused under headroom 64"
+        );
+    }
+    assert_eq!(calls.get(), 1);
+    custody.discard_scan(scan);
+    assert_eq!(owner.examined_for_test().0, 0);
+    let fresh = custody.begin_scan();
+    let (file, examined) = opened(dir.path(), "after.so");
+    assert!(custody.offer_with_census(fresh, examined, file, || {
+        calls.set(calls.get() + 1);
+        Ok(SegmentPolicy::from_headroom(64, 0, 0))
+    }));
+    // The 45-offer count pins the take line: 64 - 44 - 1 stays covered
+    // while 64 - 45 - 1 would re-take, so without the discard the last
+    // offer would have been the second census.
+    assert_eq!(calls.get(), 1, "discard did not return ledger headroom");
+    assert_eq!(owner.examined_for_test().0, 1);
 }

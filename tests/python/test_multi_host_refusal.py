@@ -23,6 +23,9 @@ if a in [['--help'],['--version']]:
     print('p11scope help/version');sys.exit(0)
 if a[:2]==['inventory','diff']: print('{}');sys.exit(0)
 if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='scan':
+    if mode=='fails-scan':
+        print('x'*10000+'scan-stdout-marker')
+        print('y'*10000+'scan-stderr-marker',file=sys.stderr);sys.exit(7)
     pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps({'schema':'p11scope/inventory/v1'}));sys.exit(0)
 if mode=='accepts-singles' and 'singles' in a:sys.exit(0)
 if mode=='writes-sink' and '-o' in a:pathlib.Path(a[a.index('-o')+1]).write_text('TRUNCATED')
@@ -63,7 +66,7 @@ class CombinedRefusalTests(unittest.TestCase):
                     "sha256": {"p11scope": namespace["digest"](observer)}}
         (self.work / "inputs.json").write_text(json.dumps(metadata))
 
-        def check(observer, work):
+        def check(observer, work, progress=None):
             self.assertEqual(work.parent, self.work)
             self.assertEqual(work.stat().st_mode & 0o777, 0o700)
             self.assertEqual(os.environ["TMPDIR"], str(work))
@@ -71,7 +74,7 @@ class CombinedRefusalTests(unittest.TestCase):
                 self.assertEqual(os.environ["SUDO_UID"], str(metadata["runner_uid"]))
             else:
                 self.assertNotIn("SUDO_UID", os.environ)
-            return self.check(observer, work)
+            return self.check(observer, work, progress=progress)
 
         run = subprocess.run
 
@@ -96,6 +99,36 @@ class CombinedRefusalTests(unittest.TestCase):
         with patch("pwd.getpwuid", side_effect=KeyError), patch.dict(os.environ):
             with self.assertRaisesRegex(RuntimeError, "no account"):
                 trust(self.work, owner)
+
+    def test_guest_scan_failure_keeps_completed_rows_and_bounded_output(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        observer = self.work / "p11scope"
+        observer.write_text(FAKE)
+        observer.chmod(0o700)
+        metadata = {"kernel": "v" + os.uname().release,
+                    "runner_uid": self.work.stat().st_uid,
+                    "sha256": {"p11scope": namespace["digest"](observer)}}
+        (self.work / "inputs.json").write_text(json.dumps(metadata))
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "fails-scan"}), \
+                patch("os.geteuid", return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "inventory-scan"):
+                namespace["guest"](self.work)
+        progress = self.work / "case-results.json"
+        self.assertTrue(progress.is_file(), "failed19th case erased preceding receipts")
+        rows = json.loads(progress.read_text())["cases"]
+        self.assertEqual(len(rows), 19)
+        self.assertEqual(sum(row["outcome"] == "refused" for row in rows), 16)
+        self.assertEqual(sum(row["outcome"] == "offline-ok" for row in rows), 2)
+        failed = rows[-1]
+        self.assertEqual((failed["case"], failed["outcome"], failed["rc"]),
+                         ("inventory-scan", "failed", 7))
+        self.assertEqual(set(failed["failed_predicates"]), {"offline_exit", "report_exists"})
+        self.assertTrue(failed["stdout"].endswith("scan-stdout-marker\n"))
+        self.assertTrue(failed["stderr"].endswith("scan-stderr-marker\n"))
+        self.assertLessEqual(len(failed["stdout"]), 4096)
+        self.assertLessEqual(len(failed["stderr"]), 4096)
+        self.assertTrue(failed["stdout_truncated"] and failed["stderr_truncated"])
+        self.assertFalse(any(path.is_dir() for path in self.work.iterdir()))
 
     def test_singles_cannot_bypass_the_host_requirement(self):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "accepts-singles"}):

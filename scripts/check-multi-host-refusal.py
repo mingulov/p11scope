@@ -19,6 +19,7 @@ import sys
 import tempfile
 
 TOKEN = "uprobe-multi-required"
+OUTPUT_LIMIT = 4096
 
 
 def digest(path):
@@ -26,9 +27,43 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def check_commands(observer, work):
+def check_commands(observer, work, progress=None):
     """Exercise actual command/sink/workload boundaries; callable unprivileged."""
     rows = []
+
+    def complete(case, result, outcome, checks, reason=None):
+        failed = [(name, message) for name, passed, message in checks if not passed]
+        row = {"case": case, "outcome": "failed" if failed else outcome,
+               "rc": result.returncode, "command": result.args,
+               "failed_predicates": [name for name, _ in failed]}
+        for stream in ("stdout", "stderr"):
+            output = getattr(result, stream) or ""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            row[stream] = output[-OUTPUT_LIMIT:]
+            row[stream + "_truncated"] = len(output) > OUTPUT_LIMIT
+        if reason is not None and not failed:
+            row["reason"] = reason
+        rows.append(row)
+        # This path is outside the disposable work directory. Preserve every
+        # completed case and the failing result before raising or cleanup.
+        if progress is not None:
+            progress.write_text(json.dumps({"cases": rows}, indent=2) + "\n")
+        if failed:
+            raise RuntimeError(case + ": " + "; ".join(message for _, message in failed))
+
+    def run(case, argv, timeout):
+        args = [str(observer), *argv]
+        try:
+            return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            complete(case, subprocess.CompletedProcess(args, None, error.stdout, error.stderr),
+                     "failed", [("command_timeout", False, "command timed out")])
+        except OSError as error:
+            complete(case, subprocess.CompletedProcess(args, None, "", str(error)),
+                     "failed", [("command_spawn", False, "command could not start")])
+
     sentinel = work / "workload-ran"
     commands = [("doctor", ["doctor"])]
     for backend in ("auto", "multi", "singles"):
@@ -54,37 +89,43 @@ def check_commands(observer, work):
         if argv[0] == "run":
             argv += ["--", "/bin/sh", "-c", 'printf unexpected > "$1"',
                      "multi-refusal", str(sentinel)]
-        result = subprocess.run([str(observer), *argv], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=60 if case == "doctor" else 20)
-        if result.returncode == 0 or result.returncode < 0:
-            raise RuntimeError(case + ": expected nonzero setup refusal")
-        if TOKEN not in result.stdout + result.stderr:
-            raise RuntimeError(case + ": missing " + TOKEN + ": " + result.stderr[-1000:])
-        if case != "doctor" and (sink.read_bytes() != before or sink.stat().st_ino != identity):
-            raise RuntimeError(case + ": pre-existing sink changed")
-        if sentinel.exists():
-            raise RuntimeError(case + ": user workload executed before refusal")
-        rows.append({"case": case, "outcome": "refused", "rc": result.returncode,
-                     "reason": TOKEN})
+        result = run(case, argv, 60 if case == "doctor" else 20)
+        try:
+            sink_unchanged = case == "doctor" or (sink.read_bytes() == before and sink.stat().st_ino == identity)
+        except OSError:
+            sink_unchanged = False
+        complete(case, result, "refused", [
+            ("refusal_exit", result.returncode > 0, "expected nonzero setup refusal"),
+            ("named_refusal", TOKEN in result.stdout + result.stderr, "missing " + TOKEN),
+            ("sink_unchanged", sink_unchanged, "pre-existing sink changed"),
+            ("workload_not_run", not sentinel.exists(), "user workload executed before refusal"),
+        ], TOKEN)
     for case, argv in (("help", ["--help"]), ("version", ["--version"])):
-        result = subprocess.run([str(observer), *argv], capture_output=True, text=True, timeout=20)
-        if result.returncode != 0 or TOKEN in result.stdout + result.stderr:
-            raise RuntimeError(case + ": offline command blocked")
-        rows.append({"case": case, "outcome": "offline-ok", "rc": 0})
+        result = run(case, argv, 20)
+        complete(case, result, "offline-ok", [
+            ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
+            ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+        ])
     report = work / "scan.json"
-    result = subprocess.run([str(observer), "inventory", "--pid", str(os.getpid()),
-                             "--capture", "scan", "--json", "-o", str(report)],
-                            capture_output=True, text=True, timeout=30)
-    if result.returncode != 0 or not report.is_file() or TOKEN in result.stdout + result.stderr:
-        raise RuntimeError("inventory-scan: offline command blocked")
-    if json.loads(report.read_text()).get("schema") != "p11scope/inventory/v1":
-        raise RuntimeError("inventory-scan: invalid offline report")
-    rows.append({"case": "inventory-scan", "outcome": "offline-ok", "rc": 0})
-    result = subprocess.run([str(observer), "inventory", "diff", str(report), str(report)],
-                            capture_output=True, text=True, timeout=20)
-    if result.returncode != 0 or TOKEN in result.stdout + result.stderr:
-        raise RuntimeError("inventory-diff: offline command blocked")
-    rows.append({"case": "inventory-diff", "outcome": "offline-ok", "rc": 0})
+    result = run("inventory-scan", ["inventory", "--pid", str(os.getpid()),
+                                   "--capture", "scan", "--json", "-o", str(report)], 30)
+    checks = [
+        ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
+        ("report_exists", report.is_file(), "offline command blocked: missing report"),
+        ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+    ]
+    if all(passed for _, passed, _ in checks):
+        try:
+            valid_schema = json.loads(report.read_text()).get("schema") == "p11scope/inventory/v1"
+        except (OSError, ValueError, AttributeError):
+            valid_schema = False
+        checks.append(("report_schema", valid_schema, "invalid offline report"))
+    complete("inventory-scan", result, "offline-ok", checks)
+    result = run("inventory-diff", ["inventory", "diff", str(report), str(report)], 20)
+    complete("inventory-diff", result, "offline-ok", [
+        ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
+        ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+    ])
     return rows
 
 
@@ -117,10 +158,16 @@ def guest(stage):
         raise RuntimeError("wrong guest kernel: " + kernel)
     trust_stage_owner(stage, metadata.get("runner_uid"))
     os.umask(0o022)
+    context = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
+               "runner_uid": metadata["runner_uid"], "euid": os.geteuid(),
+               "sudo_uid": os.environ.get("SUDO_UID")}
     with tempfile.TemporaryDirectory(prefix="multi-refusal-", dir=stage) as temp:
         work = Path(temp)
         os.environ["TMPDIR"] = str(work)
-        rows = check_commands(stage / "p11scope", work)
+        context.update({"work": str(work), "work_uid": work.stat().st_uid,
+                        "work_mode": oct(work.stat().st_mode & 0o777)})
+        (stage / "guest-context.json").write_text(json.dumps(context, indent=2) + "\n")
+        rows = check_commands(stage / "p11scope", work, progress=stage / "case-results.json")
     result = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
               "qualification": "unsupported-host-refusal", "capture_positive": False,
               "cases": rows}

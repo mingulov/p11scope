@@ -164,10 +164,10 @@ explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
-return values and latency. They still carry standard names when the provider's
-own `.dynsym` exports every standard name exactly where its function table
-points (`discovery[].tables[].linkage: "exports"`, as SoftHSM2 does); a table
-with no such evidence stays unnamed, and its rows read `unknown#<ordinal>` in
+return values and latency. Standard names require a typed legacy return, an
+exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
+the provider's own `.dynsym` and every retained non-NULL target
+(`discovery[].tables[].linkage: "exports"`). Without name evidence, rows read `unknown#<ordinal>` in
 the live table and trace (`functions[].ordinals` and `functions[].target` in
 JSON), never a guessed name. Missing mechanism or session evidence does not mean
 the application used none. For those semantics, use the separate
@@ -767,8 +767,8 @@ Limits that matter in pods:
 - `inventory [--pid <n> | --system]` — answer "which module is used by
   whom": one snapshot pass, or a `--duration` observation window of
   rescanning passes, reporting callers (per process incarnation), modules
-  (per physical object, with scan-only admission verdicts), and the
-  caller/module edges between them with usage coverage, lifecycle, and
+  (per physical object, with admission verdicts for the validated count union),
+  and the caller/module edges between them with usage coverage, lifecycle, and
   explicit gaps; the native lane counts entries per edge (see
   `entries.coverage` below). Text snapshots begin with an application/module
   overview, followed by detailed retained paths, identities, states and
@@ -776,10 +776,13 @@ Limits that matter in pods:
   not a desktop or package identity: an interpreter remains `python3`,
   `java`, etc. Caller/module IDs and PID/incarnation are secondary detail;
   equal basenames remain separate rows for their existing identities.
-  Repeatable `--manifest <m.json>` retains explicit operator inputs for
-  preparation of a separate attested Detailed subset under `--capture auto`
-  or `native`. `scan` plus a manifest is an argument error before output
-  files open. Subset preparation preserves broad physical counting; this
+  Under `--capture auto` or `native`, repeatable `--manifest <m.json>` inputs
+  that match a provider mapped in the selected scope and pass identity/ABI
+  checks join the ordinary count union before shared admission. Count admission
+  grants no semantic, object or interface-selection authority. Eligible attested
+  inputs separately prepare a Detailed subset. `scan` plus a manifest is an
+  argument error before output files open. Subset preparation preserves broad
+  physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.

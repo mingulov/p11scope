@@ -280,10 +280,11 @@ If you installed the optional helper, also run
   only in runtime allocation. A manifest built with `p11scope-discover`
   supplies explicit targets when discovery has no observed publication (see
   [known limitations](docs/known-limitations.md#runtime-built-function-tables-need-publication-evidence-or-a-manifest)).
-  Rows carry standard function names
-  when the provider's own `.dynsym` exports every standard name exactly where
-  its function table points (`linkage: "exports"`, as SoftHSM2 does);
-  otherwise they read `unknown#<ordinal>`, never a guessed name. `doctor` and
+  Rows carry standard function names when a typed legacy return, an exact
+  `"PKCS 11"` interface or an accepted manifest establishes the ordinal layout,
+  or when the provider's own `.dynsym` agrees exactly with every retained
+  non-NULL target (`linkage: "exports"`). Without name evidence, rows read
+  `unknown#<ordinal>`, never a guessed name. `doctor` and
   `inspect` need the same privileges as a capture to assess or read another
   user's process:
 

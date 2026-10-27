@@ -2112,6 +2112,15 @@ pub(crate) fn table_name_authorized(score: &TableEvidenceScore) -> bool {
     score.linked || score.live_return || score.manifest || score.exports
 }
 
+/// A real publication can authorize observing targets without proving their
+/// API names. Raw opaque triples alone carry no live-return publication fact.
+pub(crate) fn table_observation_authorized(
+    table: &ScannedTable,
+    score: &TableEvidenceScore,
+) -> bool {
+    table.live_return || table_name_authorized(score)
+}
+
 /// Linkage kind for evidence: the strongest publication evidence behind the
 /// score, or `"heuristic"` when the table is bare decode with no linkage.
 /// Priority mirrors `TableEvidenceScore` field order.

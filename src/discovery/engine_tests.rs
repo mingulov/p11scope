@@ -52647,6 +52647,44 @@ fn failed_acquisition_keeps_targets_and_discloses_uncertain_metadata() {
 }
 
 #[test]
+fn address_only_header_availability_distinguishes_observed_zero_from_placeholder() {
+    for unavailable in [false, true] {
+        let fixture = LegacyPrefixBoundaryFixture::new();
+        let address = unsafe { fixture.base.cast::<u8>().add(fixture.page - 8) } as u64;
+        let target = self_export_fixture(ProcessViewId(4306)).2.pointers[0];
+        let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u64, 69) };
+        words.fill(0);
+        words[68] = target;
+        if unavailable {
+            assert_eq!(unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) }, 0);
+        }
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.pid_tgid = u64::from(std::process::id()) << 32;
+        record.table_ptr = address;
+        record.symbol_id = HookRegistry::builtin().id("C_GetInterfaceList").unwrap();
+        record.name_class = DISCOVERY_NAME_OTHER;
+        record.announced_count = 1;
+        assert!(valid_discovery_record(&record));
+        let view = ProcessView::open(ProcessViewId(4306), std::process::id()).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let mut engine = Engine::empty();
+        let HeapLowerOutcome::Admitted(module) = lower_heap_publication_record(
+            &view, &MapIndex::new(&maps).unwrap(), &HookRegistry::builtin(), &record, &[],
+            &mut engine.budget, None,
+        ).unwrap() else { panic!("the complete readable body must survive"); };
+        assert_eq!(module.tables[0].version, (0, 0));
+        assert_eq!(module.tables[0].entries.len(), 1);
+        assert_eq!(module.tables[0].null_entries.len(), 67);
+        assert_eq!(module.tables[0].walk, "full");
+        engine.note_publication_availability("live interface discovery", &record, module.tables[0].version);
+        assert_eq!(engine.counters.object_skips.iter().any(|skip|
+            skip.reason.contains("header metadata") && skip.reason.contains("unreadable")), unavailable,
+            "actual observed0.0 and unavailable metadata need distinct diagnostics");
+    }
+}
+
+#[test]
 fn version_only_change_keeps_matching_words_but_pointer_changes_refuse() {
     let (view, maps, mut record) = self_export_fixture(ProcessViewId(0));
     record.version_major = 3;

@@ -185,6 +185,30 @@ fn provider_object_for_key(pins: &PinnedObjects, module: &ModuleKey) -> Option<P
         .map(|pin| pin.id)
 }
 
+/// Joint-label pre-filter: whether a module key names this retained
+/// provider object. The third mirror of
+/// [`AttestedSubset::proves_provider_module`]: the SAME physical-key join
+/// through the single [`PinnedObjects::object_matches_key`] predicate —
+/// including the entry-carried maps rendering on a pre-6.8 overlay split —
+/// so a split-proved binding labels identically at admission, labeling,
+/// and selection. Key-only: a positive here still requires the full proof.
+pub(crate) fn module_key_names_object(
+    pins: &PinnedObjects,
+    object: PinnedObjectId,
+    key: &ModuleKey,
+) -> bool {
+    let ModuleKey::Physical {
+        dev_major,
+        dev_minor,
+        ino,
+        ..
+    } = key
+    else {
+        return false;
+    };
+    pins.object_matches_key(object, *dev_major, *dev_minor, *ino)
+}
+
 pub(crate) struct SubsetPreparation {
     pub(crate) subset: Option<AttestedSubset>,
     pub(crate) refusals: Vec<SemanticRefusal>,
@@ -5197,10 +5221,21 @@ mod promotion_lifecycle_tests {
         let pin = pinning.pins.pinned().next().expect("one object");
         let id = pin.id;
         assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
-        assert_eq!(
-            pin.probed_maps_key,
-            Some(split),
-            "the probe rendering rides on the entry"
+        // The probe rendering rides on the entry: the join matches the
+        // split key, while the raw keys still hold only the fd key (no
+        // second manifest raw was added for the rendering).
+        assert!(
+            pinning.pins.object_matches_key(
+                id,
+                split.device.major,
+                split.device.minor,
+                split.inode
+            ),
+            "the join matches the entry-carried probe rendering"
+        );
+        assert!(
+            !pinning.pins.raw_keys_for(id).contains(&split),
+            "the rendering is not a second raw key"
         );
         // The split must not add a second manifest raw: `id_for_path`
         // resolves exactly one raw per path, and a second raw refuses
@@ -5394,6 +5429,87 @@ mod promotion_lifecycle_tests {
             provider_object_for_key(&subset.pins, &absent_module),
             None,
             "the mirror finds no unprobed maps key"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_split_key_labels_through_the_joint_prefilter() {
+        use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let fixture = SelectedProviderFixture::new();
+        let fd_key = fixture
+            .pins
+            .pinned()
+            .next()
+            .expect("fixture pins one object")
+            .key;
+        // The same pre-6.8 overlay split as the proof test: the kernel
+        // renders this exact fd at a different device than the mount
+        // table resolves.
+        let split = ObjectKey {
+            device: Device {
+                major: fd_key.device.major,
+                minor: fd_key.device.minor.wrapping_add(1),
+            },
+            inode: fd_key.inode,
+        };
+        assert_ne!(split, fd_key, "the test needs a genuine split");
+        let mut budget = CaptureWorkBudget::default();
+        let probe = FakeSelfMappingProbe::new(true, Some(split));
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_probe(
+                &fixture.manifest,
+                &[],
+                &mut budget,
+                &probe,
+            )
+            .expect("split pinning succeeds");
+        let pin = pinning.pins.pinned().next().expect("one object");
+        let id = pin.id;
+        let path = pin.path.to_owned();
+        let sha256 = pin.sha256.to_owned();
+        // The joint-label pre-filter is the third mirror of the provider
+        // proof: it names the split-keyed module exactly like the fd-keyed
+        // one, through the same join predicate.
+        let split_module = ModuleKey::physical(
+            split.device.major,
+            split.device.minor,
+            split.inode,
+            Some(sha256.clone()),
+            &path,
+        );
+        assert!(
+            module_key_names_object(&pinning.pins, id, &split_module),
+            "the pre-filter names the split-keyed module"
+        );
+        let fd_module = ModuleKey::physical(
+            fd_key.device.major,
+            fd_key.device.minor,
+            fd_key.inode,
+            Some(sha256),
+            &path,
+        );
+        assert!(
+            module_key_names_object(&pinning.pins, id, &fd_module),
+            "the pre-filter keeps naming the fd-keyed module"
+        );
+        // ... but neither a recycled inode on the split device nor a key
+        // without comparable file identity.
+        let reused = ModuleKey::physical(
+            split.device.major,
+            split.device.minor,
+            split.inode.wrapping_add(1),
+            Some(pin.sha256.to_owned()),
+            &path,
+        );
+        assert!(
+            !module_key_names_object(&pinning.pins, id, &reused),
+            "the pre-filter refuses a different inode on the split device"
+        );
+        let unidentified = ModuleKey::Unidentified { path };
+        assert!(
+            !module_key_names_object(&pinning.pins, id, &unidentified),
+            "the pre-filter refuses a key without file identity"
         );
     }
 

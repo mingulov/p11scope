@@ -855,10 +855,6 @@ pub struct PinnedSummary<'a> {
     pub identity_source: &'static str,
     /// Reserved for bounded diagnostic context; ordinary comparable pins have none.
     pub note: Option<&'a str>,
-    /// The kernel's maps rendering of this entry's held fd when it splits
-    /// from the fd key (pre-6.8 overlayfs); `None` otherwise. Mirrors
-    /// `Entry::probed_maps_key` for the provider-proof join.
-    pub probed_maps_key: Option<ObjectKey>,
 }
 
 /// Claims retained per accepted process view. Vectors deliberately preserve duplicate
@@ -1518,7 +1514,6 @@ impl PinnedObjects {
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
             note: None,
-            probed_maps_key: entry.probed_maps_key,
         })
     }
 
@@ -1866,7 +1861,6 @@ impl PinnedObjects {
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
             note: None,
-            probed_maps_key: entry.probed_maps_key,
         })
     }
 

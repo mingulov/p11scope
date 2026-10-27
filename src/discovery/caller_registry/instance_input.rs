@@ -8,7 +8,9 @@ use super::{
     RegistryGap,
 };
 use crate::attach::capture::NativeDomainId;
-use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::discovery::engine::inventory_coordinator::semantics::{
+    SemanticCallerBinding, module_key_names_object,
+};
 use crate::discovery::instances::{InstanceId, Route};
 use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
 use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
@@ -57,20 +59,7 @@ impl CallerRegistry {
             return None;
         }
         let object = current.endpoint().object;
-        let names_object = |key: &ModuleKey| {
-            let ModuleKey::Physical {
-                dev_major,
-                dev_minor,
-                ino,
-                ..
-            } = key
-            else {
-                return false;
-            };
-            subset
-                .pins()
-                .object_matches_key(object, *dev_major, *dev_minor, *ino)
-        };
+        let names_object = |key: &ModuleKey| module_key_names_object(subset.pins(), object, key);
         let mut selected: Option<&ModuleKey> = None;
         // Positive catalog rows remain subject to ALL original prefix
         // negatives below; no first-positive/first-alias selection.

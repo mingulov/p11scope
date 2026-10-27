@@ -5190,7 +5190,24 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         {
             return self.poll_joint_commit_path(engine_changed);
         }
-        self.commit(engine_changed)?;
+        if let Err(error) = self.commit(engine_changed) {
+            // Terminal-commit wedge (soak shape): the lane is already
+            // held but the coordinator still holds its unfinished
+            // Joint publication, so the plain commit refuses. Name the
+            // semantic cause — never the internal message. A live
+            // lane keeps the raw failure: it is not stopped.
+            if self.semantic.is_none()
+                && Self::commit_hit_unfinished_joint_publication(&error, &*self.coordinator)
+            {
+                self.warn(
+                    "p11scope: the semantic lane is held but its unfinished joint publication still blocks the broad commit; the run cannot continue past it",
+                );
+                return Err(anyhow::anyhow!(
+                    "semantic lane held; the unfinished joint publication still blocks the broad commit and this run cannot continue past it"
+                ));
+            }
+            return Err(error);
+        }
         Ok(PassCommitProgress::Published)
     }
 
@@ -14308,6 +14325,60 @@ mod tests {
             .filter(|gap| gap.0 == "semantic lane stopped")
             .collect();
         assert_eq!(stops.len(), 1, "the stop stages before the failed commit");
+    }
+
+    #[test]
+    fn joint_poll_commit_held_lane_wedge_names_cause() {
+        // Terminal-commit twin (soak shape): the lane is already held
+        // but the coordinator still holds its unfinished Joint
+        // publication, so the plain commit refuses. The driver names
+        // the semantic cause on stderr and in the error — never the
+        // internal resume-original-frame message.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        assert!(driver.semantic.is_none(), "the lane is already held");
+        fail_next_classic_commit_for_test(
+            "an unfinished Joint publication must resume its original frame",
+        );
+        super::take_warned_for_test();
+        let outcome = driver.poll_commit(true);
+        let error = outcome.expect_err("a wedged publication still fails the call");
+        assert!(
+            error.to_string().contains("semantic lane held"),
+            "the error names the held lane: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("must resume its original frame"),
+            "never the internal message: {error:#}"
+        );
+        let warned = super::take_warned_for_test();
+        assert!(
+            warned
+                .iter()
+                .any(|line| line.contains("unfinished joint publication")),
+            "stderr names the wedge: {warned:?}"
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_live_legacy_wedge_propagates_raw() {
+        // No-lie guard: a live legacy lane that hits the wedge shape
+        // is NOT stopped, so its commit failure propagates unchanged.
+        // Only the already-held lane renames.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(wind_down_lane(WindDownIo::completing()));
+        fail_next_classic_commit_for_test(
+            "an unfinished Joint publication must resume its original frame",
+        );
+        let outcome = driver.poll_commit(true);
+        let error = outcome.expect_err("the failure still fails the call");
+        assert!(
+            error.to_string().contains("must resume its original frame"),
+            "a live lane keeps the raw failure: {error:#}"
+        );
     }
 
     #[test]

@@ -155,6 +155,9 @@ Known issues in this release:
   note, and callers mapping it may stay unbound.
 - Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
   are not qualified yet.
+- Fedora 44's SoftHSM 2.7.0 legacy-width table labelled 3.2 is not
+  decoded by ordinary inventory scanning. A manifest enables its
+  Detailed/S1 path, while ordinary scanned endpoints remain unavailable.
 
 ### Qualification of this release
 

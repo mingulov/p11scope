@@ -103,6 +103,16 @@ pin then carries the note `provider's maps rendering unproven;
 callers mapping it may stay unbound`, and callers mapping that provider
 may stay unbound. This key split does not happen on Linux 6.8 and later.
 
+Fedora 44's SoftHSM 2.7.0 exposes a file-backed 68-entry legacy
+function table labelled version 3.2. The automatic scanner expects
+the wider 3.2 layout and declines this table, so ordinary inventory
+reports zero endpoints for it with a named discovery gap. Calling
+`C_GetFunctionList` first does not change that result. An explicit
+manifest supplies addresses to `profile`, `trace` and inventory's S1
+semantic lane; it does not change inventory's scan-only ordinary
+admission. The 2.6.1 table layout is a separate qualification input.
+Support for this 2.7.0 scan layout remains planned for a later release.
+
 A `profile` or `trace` output has no per-run marker for calls made
 before a provider's probes landed, so a missed early burst reads the
 same as no calls. Inside a nested PID namespace (a kind node, a
@@ -1056,10 +1066,10 @@ a silent drop.
   provider's file-backed data, attaches 0 probes, and reports
   `discovery skipped <path> — no function table was found in its
   file-backed data; ...`. A table built at run time (in `.bss` or on
-  the heap) is outside the memory scan's reach. The known example is
-  SoftHSM 2.7.0 on Fedora 44 (`/usr/lib64/pkcs11/libsofthsm2.so`);
-  SoftHSM 2.6.1 on Ubuntu keeps its table in the file and needs no
-  manifest.
+  the heap) is outside the memory scan's reach. SoftHSM 2.6.1 on
+  Ubuntu keeps its table in the file and needs no manifest. Fedora's
+  SoftHSM 2.7.0 has a different, file-backed layout limitation described
+  in the current release section above.
 - Kernels/conditions: all kernels; any provider that builds its
   function table at run time instead of keeping it in the file.
 - Disclosure: the `discovery skipped` line above, which ends with the
@@ -1067,8 +1077,9 @@ a silent drop.
   0-probe attach count.
 - Workaround: build a manifest with the offline helper and pass it to
   the capture: `p11scope-discover --module <path> -o manifest.json`,
-  then `--manifest manifest.json` on the capture command. The Fedora
-  SoftHSM example then finds 68 functions and attaches 136 probes.
+  then `--manifest manifest.json` on the capture command. This supplies
+  explicit addresses to Detailed captures and inventory's S1 lane;
+  inventory's ordinary admission remains scan-only.
 - Planned: automatic discovery of run-time-built tables is planned for
   a later version.
 

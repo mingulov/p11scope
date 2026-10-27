@@ -226,30 +226,34 @@ fn selection_helper_conflicting_semantic_pair_is_truncated() {
     let provider = build_fixture(FixtureMode::Conflict);
     let m = discover(&provider).unwrap();
     assert!(m.selection_evidence.selection_truncated);
-    assert_eq!(m.selection_evidence.tables.len(), 1);
+    assert_eq!(m.selection_evidence.tables.len(), 2);
     assert!(m.selection_evidence.queries[2].selection_table.is_some());
-    assert!(m.selection_evidence.queries[3].selection_table.is_none());
+    assert!(m.selection_evidence.queries[3].selection_table.is_some());
+    assert_ne!(
+        m.selection_evidence.queries[2].selection_table,
+        m.selection_evidence.queries[3].selection_table
+    );
     assert_eq!(
         m.selection_evidence.queries[3].authority,
-        SelectionAuthority::None
+        SelectionAuthority::SelectionCountOnly
     );
     assert!(m.selection_evidence.queries[3].helper_failure.is_none());
 }
 
 #[test]
-fn selection_helper_records_post_success_helper_failure() {
+fn selection_helper_retains_a_resolved_dependency_neighbor() {
     let _guard = DISCOVER_LOCK.lock().unwrap();
     let provider = build_fixture(FixtureMode::PostFailure);
     let m = discover(&provider).unwrap();
     let query = &m.selection_evidence.queries[2];
     assert_eq!(query.rv, native_rv_u64(cryptoki_sys::CKR_OK));
     assert!(query.result.is_some());
-    assert_eq!(
-        query.helper_failure,
-        Some(SelectionFailure::UnresolvedFunction)
+    assert_eq!(query.helper_failure, None);
+    assert_eq!(query.authority, SelectionAuthority::SelectionCountOnly);
+    let table = &m.selection_evidence.tables[query.selection_table.unwrap() as usize];
+    assert!(
+        matches!(table.functions[0].resolution, Resolution::Resolved { object, .. } if object != 0)
     );
-    assert_eq!(query.authority, SelectionAuthority::None);
-    assert!(query.selection_table.is_none());
 }
 
 #[test]
@@ -331,7 +335,7 @@ fn selection_helper_preserves_unknown_returned_flags() {
 }
 
 #[test]
-fn selection_helper_rejects_short_known_table_without_authority() {
+fn selection_helper_retains_short_known_table_count_only() {
     let _guard = DISCOVER_LOCK.lock().unwrap();
     let provider = build_fixture(FixtureMode::ShortTable);
     let m = discover(&provider).unwrap();
@@ -340,8 +344,9 @@ fn selection_helper_rejects_short_known_table_without_authority() {
         query.helper_failure,
         Some(SelectionFailure::UnreadableTable)
     );
-    assert_eq!(query.authority, SelectionAuthority::None);
-    assert!(query.selection_table.is_none());
+    assert_eq!(query.authority, SelectionAuthority::SelectionCountOnly);
+    assert!(query.selection_table.is_some());
+    assert!(m.selection_evidence.selection_truncated);
 }
 
 #[test]

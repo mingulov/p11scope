@@ -146,7 +146,7 @@ pub fn discover_with_self_memory(
         module_path,
         module_file_key,
         &module_identity,
-        &objects,
+        &mut objects,
     );
     let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
@@ -961,9 +961,10 @@ fn native_ulong_u64(value: cryptoki_sys::CK_ULONG) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TableOrigin {
-    object: ObjectKey,
-    file_offset: u64,
+enum TableOrigin {
+    File { object: ObjectKey, file_offset: u64 },
+    // Used only within this helper invocation; never serialized.
+    ProcessLocal(usize),
 }
 
 struct RawSelectionResult {
@@ -1052,14 +1053,14 @@ fn selection_inventory_indices(inventory_tables: &[Option<usize>], pointer: usiz
         .collect()
 }
 
-fn selection_table_incomplete(
-    version: SelectionVersionClass,
-    snapshot: Option<&TableSnapshot>,
-) -> bool {
-    matches!(
-        version,
-        SelectionVersionClass::V3_0 | SelectionVersionClass::V3_1 | SelectionVersionClass::V3_2
-    ) && !snapshot.is_some_and(|snapshot| matches!(snapshot.walk, WalkOutcome::Full))
+fn selection_table_incomplete(table: &SelectionTable) -> bool {
+    matches!(table.walk, WalkOutcome::Unreadable { .. })
+        || table.functions.iter().any(|function| {
+            !matches!(
+                function.resolution,
+                Resolution::Resolved { .. } | Resolution::NullPointer
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1072,7 +1073,7 @@ fn selection_acquisition(
     module_path: &Path,
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
-    objects: &ObjectTable,
+    objects: &mut ObjectTable,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
     if raw_export.is_none() {
         return (SelectionAcquisition::ExportAbsent, Vec::new());
@@ -1119,6 +1120,7 @@ fn selection_acquisition(
                 (None, Some(SelectionFailure::NullOutput))
             } else {
                 let mut captured = None;
+                let mut candidate_objects = objects.clone();
                 let bracket = selection_bracket(
                     || stable_selection_maps(module_path, module_file_key, module_identity),
                     |maps_a| {
@@ -1131,65 +1133,67 @@ fn selection_acquisition(
                         let version_read = read_version(memory, table_pointer);
                         let name_class = selection_name_class(&name, name_pointer);
                         let version_class = selection_version_class(&version_read, table_pointer);
-                        let table_snapshot = match version_class {
-                            SelectionVersionClass::V3_0
-                            | SelectionVersionClass::V3_1
-                            | SelectionVersionClass::V3_2 => Some(snapshot_table(
+                        let table_snapshot = version_read.as_ref().ok().map(|version| {
+                            inventory_snapshot(
                                 memory,
                                 table_pointer,
-                                tables_for(Surface::StandardInterface {
-                                    version: cryptoki_sys::CK_VERSION {
-                                        major: 3,
-                                        minor: match version_class {
-                                            SelectionVersionClass::V3_0 => 0,
-                                            SelectionVersionClass::V3_1 => 1,
-                                            SelectionVersionClass::V3_2 => 2,
-                                            _ => unreachable!(),
-                                        },
-                                    },
-                                }),
-                            )),
-                            _ => None,
-                        };
+                                Ok(Surface::StandardInterface { version: *version }),
+                            )
+                        });
                         let mut helper_failure = if name_pointer == 0 || name.error.is_some() {
                             Some(SelectionFailure::UnreadableName)
                         } else if table_pointer == 0 {
                             Some(SelectionFailure::UnreadableTable)
                         } else if version_read.is_err() {
                             Some(SelectionFailure::UnreadableVersion)
-                        } else if selection_table_incomplete(version_class, table_snapshot.as_ref())
-                        {
+                        } else if table_snapshot.as_ref().is_some_and(|snapshot| {
+                            matches!(snapshot.walk, WalkOutcome::Unreadable { .. })
+                        }) {
                             Some(SelectionFailure::UnreadableTable)
                         } else {
                             None
                         };
                         let mut selection_table = None;
-                        if helper_failure.is_none()
-                            && request.name == SelectionNameClass::ExactStandard
-                            && inventory_matches.is_empty()
-                            && name_class == SelectionNameClass::ExactStandard
-                            && matches!(
-                                version_class,
-                                SelectionVersionClass::V3_0
-                                    | SelectionVersionClass::V3_1
-                                    | SelectionVersionClass::V3_2
-                            )
-                            && matches!(returned_flags, 0 | 1)
+                        if inventory_matches.is_empty()
+                            && let (Ok(version), Some(snapshot)) = (&version_read, &table_snapshot)
                         {
-                            match selection_table_for(
+                            let (table, origin) = selection_table_for(
                                 table_pointer,
-                                version_class,
-                                table_snapshot.as_ref(),
+                                manifest_version(*version),
+                                snapshot,
                                 maps_a,
-                                objects,
-                            ) {
-                                Ok((table, origin)) => {
-                                    selection_table = Some((table, origin));
-                                }
-                                Err(failure) => {
-                                    helper_failure = Some(failure);
-                                }
+                                &mut candidate_objects,
+                            );
+                            if helper_failure.is_none() && selection_table_incomplete(&table) {
+                                helper_failure = Some(SelectionFailure::UnresolvedFunction);
                             }
+                            selection_table = Some((table, origin));
+                        }
+                        // Compare every captured word, including invalid targets,
+                        // and metadata again before accepting a heap or file view.
+                        let confirmed_interface = read_interface(memory, output as usize)
+                            .map_err(|_| SelectionFailure::ProviderChanged)?;
+                        let confirmed_name = read_name(memory, name_pointer);
+                        let confirmed_version = read_version(memory, table_pointer);
+                        if confirmed_interface != (name_pointer, table_pointer, returned_flags)
+                            || confirmed_name.raw != name.raw
+                            || confirmed_name.error != name.error
+                            || confirmed_version.as_ref().ok().map(|v| (v.major, v.minor))
+                                != version_read.as_ref().ok().map(|v| (v.major, v.minor))
+                            || table_snapshot.as_ref().is_some_and(|snapshot| {
+                                let Ok(version) = &version_read else {
+                                    return true;
+                                };
+                                let confirmed = inventory_snapshot(
+                                    memory,
+                                    table_pointer,
+                                    Ok(Surface::StandardInterface { version: *version }),
+                                );
+                                confirmed.values != snapshot.values
+                                    || confirmed.walk != snapshot.walk
+                            })
+                        {
+                            return Err(SelectionFailure::ProviderChanged);
                         }
                         captured = Some((
                             RawSelectionResult {
@@ -1206,9 +1210,12 @@ fn selection_acquisition(
                     || stable_selection_maps(module_path, module_file_key, module_identity),
                 );
                 match bracket {
-                    Ok(()) => captured
-                        .map(|(result, helper_failure)| (Some(result), helper_failure))
-                        .unwrap_or((None, Some(SelectionFailure::UnreadableInterface))),
+                    Ok(()) => {
+                        *objects = candidate_objects;
+                        captured
+                            .map(|(result, helper_failure)| (Some(result), helper_failure))
+                            .unwrap_or((None, Some(SelectionFailure::UnreadableInterface)))
+                    }
                     Err(SelectionFailure::ProviderChanged) => captured
                         .map(|(mut result, _)| {
                             result.table = None;
@@ -1334,93 +1341,36 @@ fn inventory_version_class(surface: &SurfaceRecord) -> SelectionVersionClass {
     }
 }
 
-fn selection_resolve_values(
-    values: Vec<(&'static str, usize)>,
-    maps: &maps::MapIndex<'_>,
-    objects: &ObjectTable,
-) -> Result<Vec<FunctionRecord>, SelectionFailure> {
-    values
-        .into_iter()
-        .map(|(name, value)| {
-            let resolution = if value == 0 {
-                Resolution::NullPointer
-            } else {
-                match maps.resolve(value as u64) {
-                    maps::Resolved::File {
-                        file_offset,
-                        device,
-                        inode,
-                        permissions,
-                        ..
-                    } if ObjectKey { device, inode } == objects.module_key
-                        && permissions[2] == b'x' =>
-                    {
-                        Resolution::Resolved {
-                            object: 0,
-                            file_offset,
-                        }
-                    }
-                    maps::Resolved::File { .. } => {
-                        return Err(SelectionFailure::UnresolvedFunction);
-                    }
-                    maps::Resolved::Anonymous | maps::Resolved::Unmapped => {
-                        return Err(SelectionFailure::UnresolvedFunction);
-                    }
-                }
-            };
-            Ok(FunctionRecord {
-                name: name.to_string(),
-                resolution,
-            })
-        })
-        .collect()
-}
-
 fn selection_table_for(
     pointer: usize,
-    version: SelectionVersionClass,
-    snapshot: Option<&TableSnapshot>,
+    version: Version,
+    snapshot: &TableSnapshot,
     maps: &maps::MapIndex<'_>,
-    objects: &ObjectTable,
-) -> Result<(SelectionTable, TableOrigin), SelectionFailure> {
-    let version = match version {
-        SelectionVersionClass::V3_0 => Version { major: 3, minor: 0 },
-        SelectionVersionClass::V3_1 => Version { major: 3, minor: 1 },
-        SelectionVersionClass::V3_2 => Version { major: 3, minor: 2 },
-        _ => return Err(SelectionFailure::UnreadableTable),
-    };
-    let maps::Resolved::File {
-        device,
-        inode,
-        file_offset,
-        ..
-    } = maps.resolve(pointer as u64)
-    else {
-        return Err(SelectionFailure::OutsideProvider);
-    };
-    if (ObjectKey { device, inode }) != objects.module_key {
-        return Err(SelectionFailure::OutsideProvider);
-    }
-    let Some(snapshot) = snapshot else {
-        return Err(SelectionFailure::UnreadableTable);
-    };
-    if !matches!(snapshot.walk, WalkOutcome::Full) {
-        return Err(SelectionFailure::UnreadableTable);
-    }
-    let functions = selection_resolve_values(snapshot.values.clone(), maps, objects)?;
-    Ok((
-        SelectionTable {
-            id: 0,
-            version,
-            walk: WalkOutcome::Full,
-            functions,
-            semantic_authorized: false,
-        },
-        TableOrigin {
+    objects: &mut ObjectTable,
+) -> (SelectionTable, TableOrigin) {
+    let origin = match maps.resolve(pointer as u64) {
+        maps::Resolved::File {
+            device,
+            inode,
+            file_offset,
+            ..
+        } => TableOrigin::File {
             object: ObjectKey { device, inode },
             file_offset,
         },
-    ))
+        maps::Resolved::Anonymous | maps::Resolved::Unmapped => TableOrigin::ProcessLocal(pointer),
+    };
+    let functions = resolve_values(snapshot.values.clone(), maps, objects);
+    (
+        SelectionTable {
+            id: 0,
+            version,
+            walk: snapshot.walk.clone(),
+            functions,
+            semantic_authorized: false,
+        },
+        origin,
+    )
 }
 
 fn stable_selection_maps(
@@ -1486,8 +1436,8 @@ fn selection_records(
         };
     }
     let mut tables = Vec::<SelectionTable>::new();
-    let mut pair_tables = BTreeMap::<(SelectionVersionClass, u64), (TableOrigin, u8)>::new();
-    let mut table_pointers = BTreeMap::<(TableOrigin, SelectionVersionClass), u8>::new();
+    let mut pair_tables = BTreeMap::<(SelectionVersionClass, u64), u8>::new();
+    let mut table_observations = Vec::<(TableOrigin, SelectionTable)>::new();
     let mut selection_truncated = false;
     let mut queries = Vec::with_capacity(raw_queries.len());
     for raw in raw_queries {
@@ -1558,42 +1508,33 @@ fn selection_records(
         }
         let mut selection_table = None;
         let mut authority = SelectionAuthority::None;
-        if raw.helper_failure.is_none()
-            && raw.request.name == SelectionNameClass::ExactStandard
-            && let Some((mut table, origin)) = raw_result.table
+        if let Some((mut table, origin)) = raw_result.table
             && matches.is_empty()
-            && result.name == SelectionNameClass::ExactStandard
-            && matches!(
-                result.version,
-                SelectionVersionClass::V3_0
-                    | SelectionVersionClass::V3_1
-                    | SelectionVersionClass::V3_2
-            )
-            && matches!(result.flags, 0 | 1)
         {
-            let key = (origin, result.version);
+            selection_truncated |= selection_table_incomplete(&table);
             let pair = (result.version, result.flags);
-            if let Some((known_origin, table_id)) = pair_tables.get(&pair).copied() {
-                if known_origin != origin {
-                    selection_truncated = true;
-                } else {
-                    selection_table = Some(table_id);
-                    authority = SelectionAuthority::SelectionCountOnly;
-                }
+            let table_id = if let Some((_, known)) =
+                table_observations.iter().find(|(known_origin, known)| {
+                    *known_origin == origin
+                        && known.version == table.version
+                        && known.walk == table.walk
+                        && known.functions == table.functions
+                }) {
+                known.id
             } else {
-                let table_id = if let Some(table_id) = table_pointers.get(&key).copied() {
-                    table_id
-                } else {
-                    let table_id = tables.len() as u8;
-                    table.id = table_id;
-                    tables.push(table);
-                    table_pointers.insert(key, table_id);
-                    table_id
-                };
-                pair_tables.insert(pair, (origin, table_id));
-                selection_table = Some(table_id);
-                authority = SelectionAuthority::SelectionCountOnly;
+                let table_id = tables.len() as u8;
+                table.id = table_id;
+                table_observations.push((origin, table.clone()));
+                tables.push(table);
+                table_id
+            };
+            if let Some(known_id) = pair_tables.insert(pair, table_id)
+                && known_id != table_id
+            {
+                selection_truncated = true;
             }
+            selection_table = Some(table_id);
+            authority = SelectionAuthority::SelectionCountOnly;
         }
         if !matches.is_empty() && raw.helper_failure.is_none() && selection_result_readable(&result)
         {
@@ -1797,6 +1738,7 @@ fn resolve_values(
         .collect()
 }
 
+#[derive(Clone)]
 struct ObjectTable {
     module_key: ObjectKey,
     approved: BTreeSet<ObjectKey>,
@@ -2612,7 +2554,7 @@ mod tests {
                 ..anonymous
             },
         ];
-        let objects = ObjectTable {
+        let mut objects = ObjectTable {
             module_key,
             approved: BTreeSet::new(),
             ids: BTreeMap::new(),
@@ -2621,37 +2563,43 @@ mod tests {
 
         let valid_table_absence = selection_bracket(
             || Ok(valid.clone()),
-            |index| {
-                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
-                    .map(|_| ())
-            },
+            |_| Err::<(), _>(SelectionFailure::UnreadableTable),
             || Ok(valid.clone()),
         );
-        assert_eq!(valid_table_absence, Err(SelectionFailure::OutsideProvider));
+        assert_eq!(valid_table_absence, Err(SelectionFailure::UnreadableTable));
 
         let invalid_b_table = selection_bracket(
             || Ok(valid.clone()),
-            |index| {
-                selection_table_for(0x9000, SelectionVersionClass::V3_0, None, index, &objects)
-                    .map(|_| ())
-            },
+            |_| Err::<(), _>(SelectionFailure::UnreadableTable),
             || Ok(invalid.clone()),
         );
         assert_eq!(invalid_b_table, Err(SelectionFailure::ProviderChanged));
 
         let valid_function_absence = selection_bracket(
             || Ok(valid.clone()),
-            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            |index| {
+                Ok(resolve_values(
+                    vec![("C_Test", 0x9000)],
+                    index,
+                    &mut objects,
+                ))
+            },
             || Ok(valid.clone()),
         );
-        assert_eq!(
-            valid_function_absence,
-            Err(SelectionFailure::UnresolvedFunction)
-        );
+        assert!(matches!(
+            valid_function_absence.unwrap()[0].resolution,
+            Resolution::Unmapped
+        ));
 
         let invalid_b_function = selection_bracket(
             || Ok(valid.clone()),
-            |index| selection_resolve_values(vec![("C_Test", 0x9000)], index, &objects).map(|_| ()),
+            |index| {
+                Ok(resolve_values(
+                    vec![("C_Test", 0x9000)],
+                    index,
+                    &mut objects,
+                ))
+            },
             || Ok(invalid.clone()),
         );
         assert_eq!(invalid_b_function, Err(SelectionFailure::ProviderChanged));
@@ -2719,20 +2667,20 @@ mod tests {
 
     #[test]
     fn known_incomplete_selection_table_is_unreadable() {
-        let snapshot = TableSnapshot {
+        let table = SelectionTable {
+            id: 0,
+            version: Version { major: 3, minor: 0 },
             walk: WalkOutcome::Unreadable {
                 detail: "short table".into(),
             },
-            values: vec![],
+            functions: vec![],
+            semantic_authorized: false,
         };
-        assert!(selection_table_incomplete(
-            SelectionVersionClass::V3_0,
-            Some(&snapshot)
-        ));
+        assert!(selection_table_incomplete(&table));
     }
 
     #[test]
-    fn selector_zero_never_gets_selection_count_only_authority() {
+    fn selector_zero_retains_a_selected_count_only_observation() {
         let evidence = selection_records(
             (
                 SelectionAcquisition::Queried,
@@ -2752,7 +2700,7 @@ mod tests {
                                 functions: vec![],
                                 semantic_authorized: false,
                             },
-                            TableOrigin {
+                            TableOrigin::File {
                                 object: ObjectKey {
                                     device: Device { major: 1, minor: 1 },
                                     inode: 1,
@@ -2767,9 +2715,12 @@ mod tests {
             ),
             &[],
         );
-        assert_eq!(evidence.queries[0].authority, SelectionAuthority::None);
-        assert!(evidence.queries[0].selection_table.is_none());
-        assert!(evidence.tables.is_empty());
+        assert_eq!(
+            evidence.queries[0].authority,
+            SelectionAuthority::SelectionCountOnly
+        );
+        assert_eq!(evidence.queries[0].selection_table, Some(0));
+        assert_eq!(evidence.tables.len(), 1);
     }
 
     #[test]

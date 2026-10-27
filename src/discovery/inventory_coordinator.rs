@@ -13067,6 +13067,160 @@ exit 0
     }
 
     #[test]
+    fn an_exec_hook_under_a_mismatched_numbering_mints_no_successor() {
+        // The EXEC tgid is the kernel's initial-namespace number, but the
+        // registry lookup uses the observer's own /proc numbering. When the
+        // two numberings disagree (a nested or unknown observer), PID
+        // equality is a numeric coincidence with an unrelated caller: the
+        // hook must do nothing — no events, no mint, no gap — and leave the
+        // live caller untouched.
+        for numbering in [
+            crate::pidns::test_seam::nested(),
+            crate::pidns::PidNumbering {
+                observer: crate::pidns::ObserverPidNs::Unknown(
+                    "scripted unreadable namespace".into(),
+                ),
+                proc_view: crate::pidns::ProcView::Own,
+            },
+        ] {
+            let label = numbering.observer.label();
+            let (mut native, caller) = NativeScene::new();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            // NO rows: gen-0 never binds, so this is the unheld lost race
+            // the hook would mint under an agreeing numbering.
+            let at = native.stamps.tick();
+            assert!(at >= 50, "the hook is ordered against the admission");
+            assert!(
+                native.scene.coordinator.adapter.live_pin(7).is_some(),
+                "the live pin is held"
+            );
+            let drain = exec_hook_drain(native.domain, at, at);
+            let receipt = crate::pidns::test_seam::with_numbering(numbering, || {
+                assert!(
+                    !crate::pidns::numbering().agrees(),
+                    "the scene runs mismatched"
+                );
+                native.stage(NativeBatch::Lifecycle(drain))
+            });
+            assert!(receipt.events.is_empty(), "{label}: {:?}", receipt.events);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(!adapter.record(caller).unwrap().retired, "{label}");
+            assert_eq!(adapter.live_id(7), Some(caller), "{label}");
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let after = native.gap_subjects();
+            for subject in [
+                "exec successor minted without a held predecessor",
+                "successor admission refused without comparable clocks",
+                "successor admission refused without a live image",
+                "successor admission refused while stopped",
+                "successor admission refused with a stale staging clock",
+                "duplicate exec handoff refused",
+                "exec handoff without custody refused",
+            ] {
+                assert!(
+                    !after.iter().any(|gap| gap == subject),
+                    "{label}: no hook mint or refusal gap: {after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_leader_exit_under_a_mismatched_numbering_records_nothing() {
+        // The same cross-numbering lookup as the exec hook: the LEADER_EXIT
+        // tgid is the kernel's number, looked up as an observer-/proc pid.
+        // Under a mismatched numbering the exit must record nothing — no
+        // link-loss gap on the unrelated caller whose number coincides, and
+        // no tail uncertainty fencing it. (Scripted scenes cannot bind, so
+        // the gap is the discriminating half; the tail set is the cheap
+        // invariant for the fenced-caller concern.)
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 1_500;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let drain =
+            DiscoveryBatch::scripted(native.domain, vec![record], native.stamps.tick());
+        let receipt =
+            crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+                assert!(
+                    !crate::pidns::numbering().agrees(),
+                    "the scene runs mismatched"
+                );
+                native.stage(NativeBatch::Lifecycle(drain))
+            });
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            !native.scene.coordinator.tail_uncertain.contains(&caller),
+            "no fence on the unrelated caller"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"leader task link loss".to_string()),
+            "no link-loss gap: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    #[test]
+    fn an_exec_hook_with_a_stale_staging_clock_mints_no_successor() {
+        // The successor's binding safety needs the staging clock (its
+        // first_seen) to be later than the hook's timestamp: at or before
+        // it, binder Rule 4 would refuse every row the successor ever
+        // reads. When now_ns <= hook_ts_ns the hook refuses with a gap and
+        // the proved old incarnation retires without a successor. Both the
+        // boundary (equal) and a strictly stale clock refuse.
+        for (hook_ts_ns, now_ns) in [(1_500, 1_500), (1_500, 1_400)] {
+            let (mut native, caller) = NativeScene::new();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+            assert!(
+                hook_ts_ns >= 50,
+                "the hook is ordered against the admission"
+            );
+            assert!(
+                now_ns <= hook_ts_ns,
+                "the staging clock is not later than the hook"
+            );
+            let receipt = native.scene.coordinator.stage_native(
+                NativeBatch::Lifecycle(drain),
+                &mut native.cookies,
+                now_ns,
+            );
+            let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+                panic!(
+                    "the proved end retires without a successor: {:?}",
+                    receipt.events
+                );
+            };
+            assert_eq!(*id, caller);
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native.gap_subjects().contains(
+                    &"successor admission refused with a stale staging clock".to_string()
+                ),
+                "the staging-clock refusal is disclosed: {:?}",
+                native.gap_subjects()
+            );
+            assert!(
+                !native.gap_subjects().contains(
+                    &"exec successor minted without a held predecessor".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
     fn a_bound_caller_without_a_mapping_edge_stays_module_level() {
         let (mut native, _) = NativeScene::new();
         native.scene.source.spawn(8, 600);

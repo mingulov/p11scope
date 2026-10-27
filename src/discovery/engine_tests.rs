@@ -52663,6 +52663,69 @@ fn acquired_header_and_pointer_failure_keeps_completed_legacy_words() {
 }
 
 #[test]
+fn opaque_publication_retains_observation_without_standard_names_or_list_position() {
+    use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
+
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0x2802, 68);
+    let mut record = compatibility_publication_record(address, 0x2802, 68);
+    let legacy = compatibility_lower_self(&record);
+    let view = ProcessView::open(legacy.view, std::process::id()).unwrap();
+    for kind in [DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN] {
+        for class in [DISCOVERY_NAME_OTHER, DISCOVERY_NAME_NULL, DISCOVERY_NAME_UNREADABLE] {
+            record.kind = kind;
+            record.name_class = class;
+            record.interface_index = 3;
+            let module = publication_module(
+                &view, &record, "C_GetInterface", legacy.key, legacy.path.clone(),
+                legacy.tables[0].clone(),
+            );
+            let table = &module.tables[0];
+            let score = table_evidence_score(
+                0, &module.tables, &module.interfaces, &[], &[], &ObjectExports::NONE,
+            );
+            assert!(table.live_return, "the observed return is an acquisition fact");
+            assert!(table_observation_authorized(table, &score));
+            assert!(!table_name_authorized(&score), "an opaque ABI does not prove standard names");
+            assert_eq!(module.interfaces[0].table, Some(0));
+            assert_eq!(module.interfaces[0].index,
+                if kind == DISCOVERY_KIND_INTERFACE_RETURN { 0 } else { 3 },
+                "a selection request class is not an enumeration position");
+        }
+    }
+}
+
+#[test]
+fn mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof() {
+    use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
+
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0x2802, 68);
+    let mut record = compatibility_publication_record(address, 0x2802, 68);
+    let legacy = compatibility_lower_self(&record);
+    let view = ProcessView::open(legacy.view, std::process::id()).unwrap();
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.name_class = DISCOVERY_NAME_OTHER;
+    let opaque = publication_module(
+        &view, &record, "C_GetInterface", legacy.key, legacy.path.clone(), legacy.tables[0].clone(),
+    );
+    for (first, second) in [(legacy.clone(), opaque.clone()), (opaque.clone(), legacy.clone())] {
+        let mut merged = vec![first];
+        merge_scanned_module(&mut merged, second);
+        let module = &merged[0];
+        let scores: Vec<_> = (0..module.tables.len()).map(|index| table_evidence_score(
+            index, &module.tables, &module.interfaces, &[], &[], &ObjectExports::NONE,
+        )).collect();
+        assert!(scores.iter().any(table_name_authorized), "the typed getter proof survives either order");
+        assert!(module.tables.iter().zip(&scores).any(|(table, score)|
+            table_observation_authorized(table, score) && !table_name_authorized(score)),
+            "the opaque observation does not invent a standard-layout proof");
+    }
+}
+
+#[test]
 fn acquired_ia32_sparse_table_uses_the_real_process_abi() {
     use std::io::{BufRead as _, BufReader};
     use std::process::{Command, Stdio};

@@ -365,14 +365,15 @@ for KERNEL in "$@"; do
                 case "$KERNEL" in
                     v6.1.*)
                         # At-load proof: a non-auxiliary, non-unresolved row
-                        # refused with E2BIG (errno 7). Auxiliary aya probes
-                        # and the bpf_loop probe (unresolved) do not count;
+                        # refused with E2BIG (exactly errno 7, not 70+).
+                        # Auxiliary aya probes and the bpf_loop probe
+                        # (unresolved) do not count;
                         # only a named counter program proves the specified
                         # at-load path ran. Prints the program name.
                         E2BIG_PROG=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" \
                             | grep -E '"auxiliary": ?null' \
                             | grep -v -E '"root": ?"unresolved"' \
-                            | grep -E '"errno": ?7' \
+                            | grep -E '"errno": ?7([^0-9]|$)' \
                             | sed -n 's/.*"root": *"\([^"]*\)".*/\1/p' \
                             | sort -u | head -n 1)
                         if [ -z "$E2BIG_PROG" ]; then

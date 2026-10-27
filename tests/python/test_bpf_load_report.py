@@ -618,7 +618,7 @@ class ReportTests(unittest.TestCase):
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('"auxiliary": ?null', text)
         self.assertIn('"root": ?"unresolved"', text)
-        self.assertIn('"errno": ?7', text)
+        self.assertIn('"errno": ?7([^0-9]|$)', text)
         self.assertIn("e2big-program=", text)
 
     def e2big_program_via_driver_pipeline(self, probe_path):
@@ -630,7 +630,7 @@ class ReportTests(unittest.TestCase):
             f"grep -E '\"loaded\": ?false' {probe_path} "
             f"| grep -E '\"auxiliary\": ?null' "
             f"| grep -v -E '\"root\": ?\"unresolved\"' "
-            f"| grep -E '\"errno\": ?7' "
+            f"| grep -E '\"errno\": ?7([^0-9]|$)' "
             f"| sed -n 's/.*\"root\": *\"\\([^\"]*\\)\".*/\\1/p' "
             f"| sort -u | head -n 1"
         )
@@ -661,6 +661,19 @@ class ReportTests(unittest.TestCase):
         loaded = load_row("p11_return", processed=645449, btf_id=40)
         path = self.write_loads("probe-aux-only.jsonl",
                                 [aux, probe, loaded])
+        self.assertEqual(
+            self.e2big_program_via_driver_pipeline(path), "")
+
+    def test_61_e2big_extraction_ignores_errno_70(self):
+        # Twin: a named counter row refused with errno 70 is not E2BIG;
+        # the digit is anchored, so the extraction yields nothing.
+        aux = aux_row("aya-helper113", loaded=False, errno=13)
+        probe = self.bpf_loop_probe_row(13)
+        refused = load_row("function_list_return", loaded=False, errno=70,
+                           stats_present=True, processed=1000001,
+                           btf_id=41)
+        path = self.write_loads("probe-errno70.jsonl",
+                                [aux, probe, refused])
         self.assertEqual(
             self.e2big_program_via_driver_pipeline(path), "")
 

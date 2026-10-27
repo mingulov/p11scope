@@ -151,6 +151,34 @@ pub(crate) trait ShardableIo: ConfirmIo + Send {
 const DIVERGED: &str = "confirmation accounting journal diverged";
 const CANCELLED: &str = "confirmation preparation was cancelled";
 
+#[cfg(test)]
+thread_local! {
+    static PREVIEW_RECOMPUTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn count_preview_recomputes_for_test<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREVIEW_RECOMPUTES.set(self.0);
+        }
+    }
+    let restore = Restore(PREVIEW_RECOMPUTES.replace(Some(0)));
+    let result = body();
+    let count = PREVIEW_RECOMPUTES
+        .get()
+        .expect("preview-recompute counter is scoped");
+    drop(restore);
+    (result, count)
+}
+
+#[cfg(test)]
+fn record_preview_recompute_for_test() {
+    PREVIEW_RECOMPUTES.set(PREVIEW_RECOMPUTES.get().map(|count| count + 1));
+}
+
 /// All mutating calls, including failed spends and consumed stop reports,
 /// are transactions in their original order. A shadow is never transplanted.
 #[derive(Debug)]
@@ -479,6 +507,8 @@ fn preview<Io: ShardableIo>(
                     }
                 }),
                 Ok(entries) => {
+                    #[cfg(test)]
+                    record_preview_recompute_for_test();
                     let ranges = proof_ranges(&entries, prove);
                     let mut failed = None;
                     for _ in &ranges {

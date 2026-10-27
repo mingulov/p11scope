@@ -2023,3 +2023,54 @@ fn d3a_r1_prepare_spawn_refusal_keeps_segment() {
 fn d3a_r1_proof_spawn_refusal_keeps_segment() {
     d3a_r1_spawn_refusal_phase(false);
 }
+
+#[test]
+fn preview_reuses_worker_proof_ranges() {
+    let world = world(90);
+    let threads = Mutex::new(HashSet::new());
+    let make_io = || FakeIo {
+        world: &world,
+        exe_reads: Cell::new(0),
+        pid: Cell::new(0),
+        threads: &threads,
+    };
+    let sweep: Vec<(u32, Vec<MapEntry>)> = world
+        .iter()
+        .map(|(pid, script)| (*pid, script.phase_one.clone()))
+        .collect();
+    let selected: BTreeSet<u32> = sweep
+        .iter()
+        .map(|(pid, _)| *pid)
+        .filter(|pid| pid % 41 == 0)
+        .collect();
+    let unavailable: BTreeSet<u32> = sweep
+        .iter()
+        .map(|(pid, _)| *pid)
+        .filter(|pid| pid % 43 == 1)
+        .collect();
+    let index = index();
+    let mut budget = legacy(u64::MAX, u64::MAX)();
+    let policy = SegmentPolicy::from_headroom(64, 4, sweep.len());
+    let owner = ReservationOwner::new(policy);
+    let (out, recomputes) = count_preview_recomputes_for_test(|| {
+        attribute_unselected_with_policy(
+            &sweep,
+            &unavailable,
+            &selected,
+            &index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+        )
+    });
+    assert!(
+        out.members.len() > 10,
+        "the confirm arm must run: {out:?}"
+    );
+    assert_eq!(
+        recomputes, 0,
+        "preview must reuse worker proof ranges"
+    );
+}

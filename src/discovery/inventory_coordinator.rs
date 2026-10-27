@@ -13175,8 +13175,7 @@ exit 0
         record.hook_ts_ns = 1_500;
         record.pid_tgid = (7u64 << 32) | 7u64;
         record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
-        let drain =
-            DiscoveryBatch::scripted(native.domain, vec![record], native.stamps.tick());
+        let drain = DiscoveryBatch::scripted(native.domain, vec![record], native.stamps.tick());
         let receipt =
             crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
                 assert!(
@@ -13244,9 +13243,9 @@ exit 0
                 native.gap_subjects()
             );
             assert!(
-                !native.gap_subjects().contains(
-                    &"exec successor minted without a held predecessor".to_string()
-                )
+                !native
+                    .gap_subjects()
+                    .contains(&"exec successor minted without a held predecessor".to_string())
             );
         }
     }

@@ -348,11 +348,12 @@ fn live_survivor_tids(tgid: u32) -> Result<Vec<u32>, ColdRefusal> {
 /// Mint the lone survivor of an already-zombie leader from the held
 /// original: the TGID's own task listing selects exactly one non-leader
 /// candidate, then the retained-member proof (tgkill liveness, group
-/// anchor, birth brackets) admits it. No numeric-PID reopen anywhere:
-/// the listing and the mint both derive from `original`, whose pidfd
-/// stays non-ready while threads live. A bare TID never selects here —
-/// its own task listing holds no non-leader entry — and no parentage is
-/// consulted.
+/// anchor, birth brackets) admits it, then a post-mint task re-list
+/// refuses by the ambiguity name when the live set grew or changed.
+/// No numeric-PID reopen anywhere: the listings and the mint all
+/// derive from `original`, whose pidfd stays non-ready while threads
+/// live. A bare TID never selects here — its own task listing holds no
+/// non-leader entry — and no parentage is consulted.
 pub(crate) fn cold_admit_member(
     original: &Arc<PidPin>,
     work: &mut CaptureWorkBudget,
@@ -367,7 +368,7 @@ pub(crate) fn cold_admit_member(
 pub(crate) fn cold_admit_member_with_relist(
     original: &Arc<PidPin>,
     work: &mut CaptureWorkBudget,
-    _relist: &mut impl FnMut(u32) -> Result<Vec<u32>, ColdRefusal>,
+    relist: &mut impl FnMut(u32) -> Result<Vec<u32>, ColdRefusal>,
 ) -> Result<ColdMint, ColdRefusal> {
     let tgid = original.pid();
     work.spend(1).map_err(|_| ColdRefusal::Raced)?;
@@ -400,15 +401,35 @@ pub(crate) fn cold_admit_member_with_relist(
     };
     let owner = cold_member_owner();
     let deadline = cold_mint_deadline(work);
-    match RetainedGroupMember::acquire(original, tid, &owner, work, deadline) {
-        Ok(member) => Ok(ColdMint {
-            member,
-            minter: Arc::clone(original),
-        }),
+    let member = match RetainedGroupMember::acquire(original, tid, &owner, work, deadline) {
+        Ok(member) => member,
         // A raced or refused proof carries no admission signal: fail
         // closed to the ordinary gone refusal.
-        Err(_) => Err(ColdRefusal::Raced),
+        Err(_) => return Err(ColdRefusal::Raced),
+    };
+    // Post-mint re-list: the exactly-one decision above trusted one
+    // `read_dir` pass, but getdents skips entries under concurrent
+    // modification, so a survivor born (or missed) during the first
+    // listing would admit a two-survivor group. Refuse by the existing
+    // ambiguity name when the live set grew or changed; an empty
+    // re-list is an ordinary dead group, and an unreadable one is a
+    // raced proof (the mint just proved a survivor). The refused
+    // member drops here, releasing its mint slot with the refusal.
+    work.spend(1).map_err(|_| ColdRefusal::Raced)?;
+    let mut fresh = relist(tgid).map_err(|_| ColdRefusal::Raced)?;
+    fresh.sort();
+    if fresh.is_empty() {
+        return Err(ColdRefusal::Dead);
     }
+    if fresh != [tid] {
+        return Err(ColdRefusal::Ambiguous(format!(
+            "thread group {tgid} has more than one live survivor (ambiguous; refusing to pick one)"
+        )));
+    }
+    Ok(ColdMint {
+        member,
+        minter: Arc::clone(original),
+    })
 }
 
 /// What one `reconcile` concluded about a caller.

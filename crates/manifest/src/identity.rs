@@ -581,6 +581,48 @@ pub fn opened_file_matches_maps(
         .is_some_and(|probed| probed == maps_key)
 }
 
+/// What the self-mapping probe decided about one held fd: how the kernel
+/// renders this exact fd in maps against the fd's own key. The pin-time
+/// drain needs the full answer — a bare `None` cannot tell "the rendering
+/// agrees" from "the probe could not decide" — while the snapshot retry
+/// only needs the [`SelfMappedFallback::Split`] key.
+#[cfg(feature = "identify")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfMappedFallback {
+    /// The kernel renders this exact fd at a different key: retry there.
+    Split(ObjectKey),
+    /// The rendering agrees with the fd key, or no split is possible (not
+    /// overlayfs, or no mappable bytes to render): no retry, nothing to
+    /// disclose.
+    Agrees,
+    /// The fd may split but the probe could not decide (budget spent, mmap
+    /// or maps read failed): no retry, and the pin discloses it.
+    Inconclusive,
+}
+
+/// [`self_mapped_fallback_key`] with the full probe answer, so the caller
+/// can tell an agreeing rendering from an inconclusive probe. Same
+/// consultation order and budget charges as the key-only form.
+#[cfg(feature = "identify")]
+pub fn self_mapped_fallback_detailed(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut dyn ProbeBudget,
+    probe: &impl SelfMappingProbe,
+) -> SelfMappedFallback {
+    if !probe.fd_is_on_overlayfs(file) {
+        return SelfMappedFallback::Agrees;
+    }
+    if !has_mappable_bytes(file) {
+        return SelfMappedFallback::Agrees;
+    }
+    match probe.kernel_maps_key(file, budget) {
+        None => SelfMappedFallback::Inconclusive,
+        Some(probed) if probed != fd_key => SelfMappedFallback::Split(probed),
+        Some(_) => SelfMappedFallback::Agrees,
+    }
+}
+
 /// The maps key to retry a snapshot with when an overlay fd's own key found
 /// no mapping: `None` unless the kernel renders this exact fd at a
 /// *different* key, so a pointless same-key retry never runs.
@@ -591,14 +633,10 @@ pub fn self_mapped_fallback_key(
     budget: &mut dyn ProbeBudget,
     probe: &impl SelfMappingProbe,
 ) -> Option<ObjectKey> {
-    if !probe.fd_is_on_overlayfs(file) {
-        return None;
+    match self_mapped_fallback_detailed(file, fd_key, budget, probe) {
+        SelfMappedFallback::Split(probed) => Some(probed),
+        SelfMappedFallback::Agrees | SelfMappedFallback::Inconclusive => None,
     }
-    if !has_mappable_bytes(file) {
-        return None;
-    }
-    let probed = probe.kernel_maps_key(file, budget)?;
-    (probed != fd_key).then_some(probed)
 }
 
 #[cfg(feature = "identify")]
@@ -984,6 +1022,54 @@ mod tests {
             None,
             "a probe that repeats the fd key must not trigger a same-key retry"
         );
+    }
+
+    #[test]
+    fn self_mapped_fallback_detailed_names_split_agree_and_inconclusive() {
+        let (_dir, file) = probe_tempfile("fallback-detailed");
+        let mut budget = UnboundedProbeBudget;
+        let split = FakeSelfMappingProbe::new(true, Some(backing_key()));
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, overlay(41), &mut budget, &split),
+            SelfMappedFallback::Split(backing_key())
+        );
+        let same = FakeSelfMappingProbe::new(true, Some(overlay(41)));
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, overlay(41), &mut budget, &same),
+            SelfMappedFallback::Agrees
+        );
+        let inconclusive = FakeSelfMappingProbe::new(true, None);
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, overlay(41), &mut budget, &inconclusive),
+            SelfMappedFallback::Inconclusive
+        );
+        let off_overlay = FakeSelfMappingProbe::new(false, None);
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, overlay(41), &mut budget, &off_overlay),
+            SelfMappedFallback::Agrees,
+            "off overlayfs no split is possible, so there is nothing to disclose"
+        );
+        assert_eq!(off_overlay.probes.get(), 0);
+    }
+
+    #[test]
+    fn self_mapped_fallback_detailed_agrees_for_unmappable_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-manifest-probe-{}-detailed-empty",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.so");
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, overlay(41), &mut budget, &probe),
+            SelfMappedFallback::Agrees,
+            "a file with no mappable bytes has no rendering to leave unproven"
+        );
+        assert_eq!(probe.probes.get(), 0);
     }
 
     #[test]

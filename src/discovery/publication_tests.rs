@@ -1431,6 +1431,34 @@ fn template_linkage(engine: &Engine) -> std::collections::BTreeMap<u64, &'static
 /// heap path stays empty, templates stay heuristic inventory, and the
 /// anonymous-but-published legacy table admits with authorized names.
 #[test]
+fn same_allocation_observed_at_two_extents_is_one_live_instance() {
+    let build = pub_build();
+    let mut stage = StageChild::spawn(&build.workload, &build.provider);
+    for want in 0..18 {
+        assert_eq!(stage.alloc(0, -1).0, want);
+    }
+    for index in 0..17 { stage.free(index); }
+    let published = stage.publish();
+    let table = published.elements.iter().find(|table| table.index == 17).unwrap();
+    let maps = MapLite::snapshot(stage.pid);
+    let hooks = HookRegistry::builtin();
+    let mut engine = engine_over_pids(&[stage.pid]);
+    // The two ABI origins can expose different known extents of the same
+    // actual allocation. Each record still gets a fresh real memory read.
+    drain_records(&mut engine, vec![gfl_record(stage.pid, table, &hooks)]);
+    drain_records(&mut engine, vec![element_record(stage.pid, table.addr, 0, 1, &hooks)]);
+    assert_eq!(live_instances(&engine), vec![(table.addr, (3, 2), true, false)],
+        "source observations do not manufacture another physical allocation");
+    let observations: Vec<_> = engine.modules.iter().flat_map(|module| &module.scanned.tables)
+        .filter(|observed| observed.address == table.addr).collect();
+    assert_eq!(observations.len(), 2, "different known extents remain source observations");
+    let targets: std::collections::BTreeSet<_> = observations.iter()
+        .flat_map(|observed| observed.entries.iter().map(|entry|
+            (entry.object_path.clone(), entry.file_offset))).collect();
+    assert_eq!(targets, printed_targets(&maps, std::slice::from_ref(table)));
+}
+
+#[test]
 fn no_active_wrappers_admits_only_templates_and_published_legacy() {
     let build = pub_build();
     let dir = pub_tmp("t1-none");

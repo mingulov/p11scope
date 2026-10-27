@@ -637,6 +637,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_population_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
+      "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_zombie_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; zombie survivor collision parity, run by hand on a live kernel lane, outside the lib runner",

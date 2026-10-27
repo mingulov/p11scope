@@ -5238,3 +5238,228 @@ fn work_check_member_refusal_resets_target_before_ordinary_run() {
         out.fallback.first_reason
     );
 }
+
+// ---- Kernel-positive population with active-capture anchor exclusion ----
+
+/// A watched provider is refused as `CaptureWatched` at anchor admission
+/// and keeps its userspace edge through the same-pin fallback: zero kernel
+/// target runs, userspace range proofs, `AnchorNotInstalled` disclosure.
+/// The edge is userspace, never kernel-positive.
+#[test]
+fn watched_provider_is_capture_watched_plus_userspace_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "watched.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("watched.so"),
+        None,
+        1,
+        "watched-population-fixture",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let target = pins.retain_inventory_target(id).unwrap();
+    let exclusions = KernelAnchorExclusions::from_targets([&target]);
+    let alias = ObjectKey {
+        inode: examined.key.inode + 1,
+        ..examined.key
+    };
+    let pass = AnchorPass::prepare_excluding(
+        &pins,
+        [(examined.key, id), (alias, id)],
+        custody(0, BTreeMap::new()),
+        &exclusions,
+    );
+    assert!(
+        pass.arena.is_none(),
+        "watched aliases created an observer mmap"
+    );
+    assert!(pass.candidates.is_empty());
+    assert!(pass.expected_matches.is_empty());
+    assert_eq!(
+        pass.fallback[&examined.key],
+        AnchorDeny::CaptureWatched,
+        "watched key lacks its CaptureWatched refusal"
+    );
+    assert_eq!(
+        pass.fallback[&alias],
+        AnchorDeny::CaptureWatched,
+        "watched alias lacks its CaptureWatched refusal"
+    );
+    assert!(
+        pass.only_capture_excluded(),
+        "watched-only pass is not only-capture-excluded: {:?}",
+        pass.fallback
+    );
+
+    // Forced kernel shape (no auto threshold): the same-pin fallback
+    // proves the watched ranges in userspace without a target run.
+    let observation = adapter_cell(AdapterCell {
+        capture_watched: true,
+        target: complete_target(),
+        ..Default::default()
+    });
+    assert_eq!(
+        observation.target_reads, 0,
+        "watched request reached a kernel target run"
+    );
+    assert_eq!(
+        observation.trace.borrow().reads,
+        ADAPTER_RANGES.map(|(start, end)| (ADAPTER_PID, start, end)),
+        "watched fallback skipped its userspace range proofs"
+    );
+    assert_eq!(
+        observation.out.members.len(),
+        1,
+        "watched provider lost its userspace edge"
+    );
+    assert_eq!(
+        observation.fallback_reason,
+        Some(KernelFallbackReason::AnchorNotInstalled),
+        "watched fallback misclassified: {:?}",
+        observation.fallback_reason
+    );
+    assert!(
+        observation.target_reads == 0
+            && !observation.trace.borrow().reads.is_empty()
+            && observation.fallback_reason.is_some(),
+        "watched provider counted as kernel-positive"
+    );
+}
+
+/// An unwatched provider is a kernel positive under the forced backend:
+/// its anchor installs, one target run proves every range, no userspace
+/// read runs, and no fallback is disclosed.
+#[test]
+fn unwatched_provider_is_kernel_positive_with_nonzero_target_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "provider.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("provider.so"),
+        None,
+        1,
+        "unwatched-population-fixture",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let pass = AnchorPass::prepare(&pins, [(examined.key, id)], custody(0, BTreeMap::new()));
+    assert!(
+        pass.arena.is_some(),
+        "unwatched provider reserved no anchor"
+    );
+    assert_eq!(pass.candidates.len(), 1);
+    assert!(
+        pass.fallback.is_empty(),
+        "unwatched provider refused: {:?}",
+        pass.fallback
+    );
+    assert!(
+        !pass.only_capture_excluded(),
+        "unwatched pass claims capture exclusion"
+    );
+
+    let observation = adapter_cell(AdapterCell {
+        target: complete_target(),
+        ..Default::default()
+    });
+    assert_eq!(
+        observation.target_reads, 1,
+        "unwatched provider ran zero kernel targets"
+    );
+    assert!(
+        observation.trace.borrow().reads.is_empty(),
+        "kernel positive performed userspace range proofs: {:?}",
+        observation.trace.borrow().reads
+    );
+    assert_eq!(observation.out.members.len(), 1);
+    assert!(observation.out.losses.is_empty());
+    assert_eq!(
+        observation.fallback_reason, None,
+        "kernel positive disclosed fallback: {:?}",
+        observation.fallback_reason
+    );
+    assert_adapter_attempt(&observation, false);
+}
+
+/// `Unvisited` (attempted, then fell back) and `BelowThreshold` (never
+/// attempted, auto cost gate) classify separately from the watched
+/// `AnchorNotInstalled` fallback (refused before any run by capture
+/// exclusion). Three distinct reasons, three distinct run shapes.
+#[test]
+fn unvisited_and_below_threshold_classified_separately() {
+    let watched = adapter_cell(AdapterCell {
+        capture_watched: true,
+        target: complete_target(),
+        ..Default::default()
+    });
+    assert_eq!(watched.target_reads, 0);
+    assert_eq!(
+        watched.fallback_reason,
+        Some(KernelFallbackReason::AnchorNotInstalled),
+        "watched baseline misclassified: {:?}",
+        watched.fallback_reason
+    );
+
+    let unvisited = adapter_cell(AdapterCell {
+        target: target_stream(&[]),
+        ..Default::default()
+    });
+    assert_eq!(
+        unvisited.target_reads, 1,
+        "unvisited PID attempted no target run"
+    );
+    assert_eq!(
+        unvisited.out.members.len(),
+        1,
+        "unvisited PID silently disappeared"
+    );
+    assert_eq!(
+        unvisited.trace.borrow().reads,
+        ADAPTER_RANGES.map(|(start, end)| (ADAPTER_PID, start, end)),
+        "unvisited fallback skipped its userspace retry"
+    );
+    assert_eq!(
+        unvisited.fallback_reason,
+        Some(KernelFallbackReason::Unvisited),
+        "unvisited misclassified: {:?}",
+        unvisited.fallback_reason
+    );
+
+    let below = segment_cell_with_deadline(
+        &[(6301, vec![0]), (6302, vec![0]), (6303, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[6301], 0)),
+            FixtureTarget::Bytes(segment_target(&[6302], 0)),
+            FixtureTarget::Bytes(segment_target(&[6303], 0)),
+        ],
+        None,
+        Some(2),
+    );
+    assert_eq!(below.attempts, 0);
+    assert!(
+        below.runs.lock().unwrap().scopes.is_empty(),
+        "a sub-threshold segment attempted a kernel target run"
+    );
+    assert_eq!(
+        below.fallback.first_reason,
+        Some(KernelFallbackReason::BelowThreshold),
+        "sub-threshold misclassified: {:?}",
+        below.fallback
+    );
+
+    assert_ne!(
+        watched.fallback_reason, unvisited.fallback_reason,
+        "watched and unvisited share one fallback name"
+    );
+    assert_ne!(
+        watched.fallback_reason, below.fallback.first_reason,
+        "watched and below-threshold share one fallback name"
+    );
+    assert_ne!(
+        unvisited.fallback_reason, below.fallback.first_reason,
+        "unvisited and below-threshold share one fallback name"
+    );
+    assert_eq!(watched.target_reads, 0);
+    assert_eq!(unvisited.target_reads, 1);
+    assert_eq!(below.attempts, 0);
+}

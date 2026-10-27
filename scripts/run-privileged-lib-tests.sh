@@ -414,6 +414,9 @@ discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie
 # Cold zombie admission parity: needs root Btrfs disk TMPDIR and
 # eligible BTF/task_vma identity, run by hand.
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
+# Kernel-positive population excludes watched anchors: needs root Btrfs
+# disk TMPDIR and eligible BTF/task_vma identity, run by hand.
+discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
 attach::counter_banks::tests::counter_bank_mode_objects_load_lp64
 metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64
 metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64
@@ -489,6 +492,7 @@ SKIP_REASONS=(
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; zombie survivor collision parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; cold zombie admission parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
+"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; kernel-positive population excludes watched anchors; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs the default build with embedded counter objects; run exact --ignored as root in an authorized BPF lane with LP64 map/program load and uprobe_multi"
 "needs a default libtest build with embedded counter objects and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; runs counts/timestamps/latency held-return legs; run the exact ignored test as root in an authorized BPF lane"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; explicit Multi PID-filter capability and separately admitted 513-endpoint timestamps native staging"

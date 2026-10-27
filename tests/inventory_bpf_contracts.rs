@@ -1,6 +1,16 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use std::process::Command;
 
+/// Whether BPF rustflags carry an opt-level override. Flags arrive
+/// `\u{1f}`-separated (CARGO_ENCODED_RUSTFLAGS); the host environment can
+/// contribute a single-token `-Copt-level=` (no space), so the match is a
+/// substring, not a prefix.
+fn flags_carry_opt_level_override(flags: &str) -> bool {
+    flags
+        .split('\u{1f}')
+        .any(|token| token.contains("opt-level"))
+}
+
 /// Inventory verifier budget: both inventory flavors build the BPF crate
 /// with `-C opt-level=3`, restoring the pre-size-first code shape the
 /// 5.15/6.1 verifier accepts for `interface_list_worker` (the crate
@@ -108,12 +118,29 @@ fn effective_bpf_rustflags_keep_inventory_last_and_detailed_plain() {
     }
     for (name, flags) in plain {
         assert!(
-            !flags
-                .split('\u{1f}')
-                .any(|token| token.starts_with("opt-level")),
+            !flags_carry_opt_level_override(flags),
             "{name} BPF rustflags must carry no opt-level override: {flags:?}"
         );
     }
+}
+
+#[test]
+fn opt_level_override_detector_catches_single_token_from_host_environment() {
+    // A single-token `-Copt-level=` from CARGO_ENCODED_RUSTFLAGS (host
+    // environment, no space) must be caught; a prefix match misses it.
+    // Twin: the two-token `-C`, `opt-level=` shape is caught by both.
+    assert!(
+        flags_carry_opt_level_override("-Copt-level=3"),
+        "single-token -Copt-level= must be caught"
+    );
+    assert!(
+        flags_carry_opt_level_override("-C\u{1f}opt-level=3"),
+        "two-token -C opt-level= must be caught"
+    );
+    assert!(
+        !flags_carry_opt_level_override("-C\u{1f}debuginfo=2"),
+        "clean flags must not match"
+    );
 }
 
 #[test]

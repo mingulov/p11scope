@@ -39,6 +39,10 @@
 # finished) or rc 124 (bounded stop); any other exit, or a crash marker
 # in its log, is FAIL. Each counter run likewise raises the descriptor
 # limit and is bounded by `timeout -s INT` past its own --duration 5s.
+# The probe rewrites log_level, so doctor's counter-modes footer under
+# the probe is a gate artifact ("probe failed unexpectedly"), never
+# product behaviour: the gate checks only the host program preflight
+# line in doctor output and never scores or quotes that footer.
 #
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
 # defaults, p11_image_query, 4 instance hooks), scored from the Detailed

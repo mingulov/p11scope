@@ -191,8 +191,9 @@ class ReportTests(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="ascii")
         return path
 
-    def run_report(self, *jsonl, budgets=None, object_name=None):
-        command = [sys.executable, "-I", str(SCRIPT), "--kernel", KERNEL,
+    def run_report(self, *jsonl, budgets=None, object_name=None,
+                   kernel=KERNEL):
+        command = [sys.executable, "-I", str(SCRIPT), "--kernel", kernel,
                    "--observer-sha256", OBSERVER]
         if budgets is not None:
             command += ["--budgets", str(budgets)]
@@ -426,18 +427,36 @@ class ReportTests(unittest.TestCase):
         return row
 
     def test_expected_bpf_loop_probe_refusal_passes(self):
-        for errno in (22, 13):
+        # The probe errno is tied to the kernel: EINVAL (22) only on
+        # v5.15.*, EACCES (13) everywhere else. Each passes on its own
+        # kernel.
+        for kernel, errno in (("v5.15.221", 22), (KERNEL, 13)):
             loads = [self.bpf_loop_probe_row(errno),
                      load_row("p11_entry", processed=472892)]
-            result = self.run_report(self.write_loads("probe.jsonl", loads))
+            result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                     kernel=kernel)
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("result=PASS", result.stdout)
             self.assertIn("EXPECTED", result.stdout)
             self.assertIn("expected bpf_loop probe refusal", result.stdout)
             self.assertIn(f"errno={errno}", result.stdout)
 
+    def test_bpf_loop_probe_errno_on_the_wrong_kernel_still_fails(self):
+        # EINVAL on 6.1+ (helper 181 exists there) and EACCES on 5.15
+        # (helper 181 is unknown there) are not the expected probe
+        # refusals; each fails like any other refused load.
+        for kernel, errno in (("v5.15.221", 13), (KERNEL, 22)):
+            loads = [self.bpf_loop_probe_row(errno),
+                     load_row("p11_entry", processed=472892)]
+            result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                     kernel=kernel)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("result=FAIL", result.stdout)
+            self.assertIn("unresolved", result.stdout)
+            self.assertNotIn("EXPECTED", result.stdout)
+
     def test_expected_bpf_loop_probe_refusal_passes_namespaced(self):
-        loads = [self.bpf_loop_probe_row(22),
+        loads = [self.bpf_loop_probe_row(13),
                  load_row("p11_entry", processed=472892)]
         budgets = self.write_budgets({"detailed/p11_entry": {KERNEL: 800000}})
         result = self.run_report(self.write_loads("probe.jsonl", loads),
@@ -449,6 +468,10 @@ class ReportTests(unittest.TestCase):
     def test_nearby_unresolved_refusals_still_fail(self):
         # The allowlist is exact: any drift in fingerprint, program type,
         # instruction count, or errno fails like any other refused load.
+        # The base uses the 5.15 kernel with its EINVAL probe, so every
+        # errno variant (including EACCES and the log-exhaustion ENOSPC
+        # plus ENOMEM/EFAULT) fails there; the kernel-tie test above
+        # covers the 6.1 side.
         base = self.bpf_loop_probe_row(22)
         variants = []
         for key, value in (("relocated_fnv1a64", "27ef27a73ecc6271"),
@@ -456,13 +479,18 @@ class ReportTests(unittest.TestCase):
                            ("program_type", 5),
                            ("insn_count", 3),
                            ("errno", 7),
-                           ("errno", 1)):
+                           ("errno", 1),
+                           ("errno", 13),
+                           ("errno", 28),
+                           ("errno", 12),
+                           ("errno", 14)):
             variant = dict(base)
             variant[key] = value
             variants.append(variant)
         for variant in variants:
             loads = [variant, load_row("p11_entry", processed=472892)]
-            result = self.run_report(self.write_loads("probe.jsonl", loads))
+            result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                     kernel="v5.15.221")
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertIn("result=FAIL", result.stdout)
             self.assertIn("unresolved", result.stdout)
@@ -473,14 +501,29 @@ class ReportTests(unittest.TestCase):
         # same refused shape under a real root fails like any other
         # refused load instead of hiding as EXPECTED. The healthy
         # companion uses another root so the refused group holds the
-        # probe shape alone.
-        variant = self.bpf_loop_probe_row(22)
+        # probe shape alone. Uses the 6.1 kernel's EACCES errno so the
+        # root alone decides.
+        variant = self.bpf_loop_probe_row(13)
         variant["root"] = "p11_entry"
         loads = [variant, load_row("p11_return", processed=472892)]
         result = self.run_report(self.write_loads("probe.jsonl", loads))
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("result=FAIL", result.stdout)
         self.assertIn("p11_entry", result.stdout)
+        self.assertNotIn("EXPECTED", result.stdout)
+
+    def test_probe_plus_foreign_unresolved_refusal_still_fails(self):
+        # The allowlist quantifier is all(): a group holding the probe
+        # plus a foreign BTF-less refused load must FAIL, not hide the
+        # foreign refusal behind the probe. Kills the all->any mutant.
+        probe = self.bpf_loop_probe_row(13)
+        foreign = self.bpf_loop_probe_row(1)
+        foreign["relocated_fnv1a64"] = "0" * 16
+        loads = [probe, foreign, load_row("p11_entry", processed=472892)]
+        result = self.run_report(self.write_loads("probe.jsonl", loads))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("unresolved", result.stdout)
         self.assertNotIn("EXPECTED", result.stdout)
 
     def test_probe_fingerprint_matches_the_attached_source_bytes(self):
@@ -642,6 +685,18 @@ class ReportTests(unittest.TestCase):
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('"loaded": ?true', text)
         self.assertIn("grep 'p11_counter_bank'", text)
+
+    def test_driver_never_quotes_doctor_counter_modes_footer(self):
+        # Under the LD_PRELOAD probe the counter-modes footer is a gate
+        # artifact (the probe rewrites log_level, breaking bpf_loop
+        # detection), never product behaviour. The gate checks only the
+        # host program preflight line in doctor output; the footer prefix
+        # must not appear anywhere in the driver.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertNotIn("counter modes:", text)
+        self.assertIn("never scores or quotes that footer", text)
 
     def test_driver_scores_counter_on_failure(self):
         # A failed 6.6+ counter run still falls through to per-program

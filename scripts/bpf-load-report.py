@@ -30,9 +30,10 @@ one mixed probe file.
 
 One refused shape is expected, never a failure: the 2-instruction
 ``bpf_loop`` (helper 181) capability probe that ``doctor`` runs for its
-counter-modes footer. It is allowlisted by exact shape (fingerprint and
-program type) and reported as ``EXPECTED``; any other refused load
-still fails.
+counter-modes footer. It is allowlisted by exact shape (fingerprint,
+program type) and kernel-tied errno (EINVAL on v5.15.*, EACCES
+elsewhere), reported as ``EXPECTED``; any other refused load still
+fails.
 """
 
 import argparse
@@ -48,14 +49,14 @@ DEFAULT_MIN_HEADROOM_PERCENT = 5.0
 # Expected bpf_loop (helper 181) functional-probe shape: `call 181; exit`
 # (src/attach.rs BPF_LOOP_PROBE_INSNS), plain kprobe type, never attached.
 # doctor runs it for the counter-modes footer; 5.15 refuses the unknown
-# helper (EINVAL) and 6.1 and later refuse the uninitialized registers (EACCES).
-# Both are expected product behavior, reported as EXPECTED. The fingerprint
-# is pinned against the source bytes by the gate suite; any drift in shape
-# or errno fails like any other refused load.
+# helper (EINVAL) and 6.1 and later refuse the uninitialized registers
+# (EACCES). The expected errno is tied to the kernel by
+# bpf_loop_expected_errno(); any other errno fails like any other refused
+# load. The fingerprint is pinned against the source bytes by the gate
+# suite; any drift in shape fails too.
 BPF_LOOP_PROBE_FNV1A64 = "27ef27a73ecc6270"
 BPF_LOOP_PROBE_PROGRAM_TYPE = 2  # BPF_PROG_TYPE_KPROBE, linux/bpf.h.
 BPF_LOOP_PROBE_INSN_COUNT = 2
-BPF_LOOP_PROBE_EXPECTED_ERRNOS = frozenset({22, 13})  # EINVAL, EACCES.
 
 # Object identity for BTF-grouped scoring (doctor loads Detailed and
 # Inventory in one probed process; counter runs load a counter object
@@ -208,16 +209,29 @@ def assign_btf_group(entries):
     return None, None
 
 
-def is_expected_bpf_loop_probe(entries):
+def bpf_loop_expected_errno(kernel):
+    """The one errno the bpf_loop probe may refuse with on this kernel.
+
+    5.15 kernels lack helper 181, so the verifier reports EINVAL for the
+    unknown helper; 6.1 and later know the helper and refuse the
+    uninitialized registers with EACCES. Any other errno is unexpected.
+    """
+    if kernel.startswith("v5.15."):
+        return 22  # EINVAL: unknown helper 181.
+    return 13  # EACCES: uninitialized registers.
+
+
+def is_expected_bpf_loop_probe(entries, kernel):
     """True only when every entry is the exact allowlisted probe refusal."""
     if not entries:
         return False
+    expected = bpf_loop_expected_errno(kernel)
     return all(entry["root"] == "unresolved"
                and entry["loaded"] is False
                and entry["program_type"] == BPF_LOOP_PROBE_PROGRAM_TYPE
                and entry["insn_count"] == BPF_LOOP_PROBE_INSN_COUNT
                and entry["fingerprint"] == BPF_LOOP_PROBE_FNV1A64
-               and entry["errno"] in BPF_LOOP_PROBE_EXPECTED_ERRNOS
+               and entry["errno"] == expected
                for entry in entries)
 
 
@@ -347,7 +361,7 @@ def evaluate(loads, kernel, budgets, object_name=None):
                        detail=f"bad count processed={processed} limit={row['limit']}")
         elif any(not entry["loaded"] for entry in entries):
             errnos = sorted({entry["errno"] for entry in entries if not entry["loaded"]})
-            if is_expected_bpf_loop_probe(entries):
+            if is_expected_bpf_loop_probe(entries, kernel):
                 row.update(status="EXPECTED",
                            detail=f"expected bpf_loop probe refusal errno={errnos[0]}")
             else:

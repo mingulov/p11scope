@@ -55,6 +55,17 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
+# Gate-run step (not a curated cell): doctor::tests::
+# no_bpf_program_link_or_map_survives_a_doctor_probe is a non-ignored test,
+# so it cannot be listed below without a product edit adding #[ignore];
+# unprivileged it passes without loading anything. Its success path (doctor
+# loads the Inventory object and releases it with no program, link, or map
+# surviving) is exercised by running it once as root in a v6.6+ guest with
+# the qualification libtest binary, e.g.:
+#   <libtest> doctor::tests::no_bpf_program_link_or_map_survives_a_doctor_probe \
+#     --exact --nocapture --test-threads=1
+# Expect "test result: ok. 1 passed" and exit 0.
+#
 # DISCOVERY loss: cells that assert health under system scope require zero
 # lifecycle-ring loss by default, a quiet-host property (vng guests, idle
 # hosts). On a loaded host, P11SCOPE_PRIV_LIFECYCLE_LOSS=report (pass it

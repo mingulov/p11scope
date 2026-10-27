@@ -15,10 +15,9 @@
 # and the script fails naming the refusal. Exits 0 only when every
 # report matches its workload LEDGER exactly and every parity
 # comparison passes. Runs are gated on their reports, not their exit
-# codes: `run` currently exits 1 from a teardown race after writing a
-# complete report (pre-existing, outside counter scope), so a valid
-# exact report with a nonzero exit warns instead of failing, while a
-# missing or inexact report always fails.
+# codes: on this tree all runs exit 0 (the run-teardown race is fixed),
+# so a valid exact report with a nonzero exit warns as unexpected
+# instead of failing, while a missing or inexact report always fails.
 set -eu
 
 if [ $# -lt 3 ]; then
@@ -94,7 +93,7 @@ check_report() {
         return 1
     fi
     if [ "$LAST_RC" -ne 0 ]; then
-        echo "# warning: $name exit $LAST_RC with a valid exact report (known run-teardown race)"
+        echo "# warning: $name exit $LAST_RC with a valid exact report (unexpected on this tree; the run-teardown race is fixed)"
     fi
 }
 

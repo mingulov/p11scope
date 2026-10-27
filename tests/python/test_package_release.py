@@ -130,7 +130,11 @@ class PackageReleaseTests(unittest.TestCase):
         self.output = self.base / "release"
 
     def git(self, *args):
-        return subprocess.check_output(["git", *args], cwd=self.root, stderr=subprocess.DEVNULL)
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        return subprocess.check_output(
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+            cwd=self.root, stderr=subprocess.DEVNULL)
 
     def write_notice_manifest(self):
         (self.notices / "notices.json").write_text(json.dumps(self.notice_manifest))

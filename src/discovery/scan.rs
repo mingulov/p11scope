@@ -9338,6 +9338,175 @@ mod tests {
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
     }
+
+    /// A scan-IO double that serves canned maps bytes but never stashes
+    /// a cold member: the default `note_cold_member` (drop) and
+    /// `cold_member_for` (`None`) are exactly the shape every scripted
+    /// fixture IO has.
+    struct NoStashScriptedIo {
+        maps: Vec<u8>,
+    }
+
+    impl ScanIo for NoStashScriptedIo {
+        type Memory = File;
+
+        fn open_maps(
+            &mut self,
+            _view: &ProcessView,
+            _budget: &CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+
+        fn open_mem(&mut self, _view: &ProcessView) -> std::io::Result<File> {
+            Err(std::io::Error::other("scripted IO serves no mem"))
+        }
+
+        fn final_generation(&mut self, _view: &ProcessView) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The raw-clone survivor for the scan cold-route twin: parks in
+    /// `pause()`. Raw syscalls only (it runs on a COW-inherited stack).
+    extern "C" fn pause_survivor_main(_arg: *mut std::ffi::c_void) -> libc::c_int {
+        loop {
+            // SAFETY: `pause()` takes no arguments and only returns on a signal.
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    /// A warm view of a group whose leader the test then turns into a
+    /// zombie with one live survivor: the forked child blocks on a go
+    /// pipe so the parent opens the view while the leader lives, then
+    /// the child raw-clones one survivor and exits its leader thread.
+    /// Killed and reaped on drop. The stack box stays alive here
+    /// because the survivor runs on the child's copy of it for the
+    /// survivor's whole life.
+    struct WarmZombieView {
+        view: ProcessView,
+        tgid: u32,
+        _stack: Box<[u8; 65536]>,
+    }
+
+    impl WarmZombieView {
+        fn spawn() -> Self {
+            let mut stack = Box::new([0u8; 65536]);
+            let top = stack.as_mut_ptr_range().end as *mut std::ffi::c_void;
+            let mut go = [0; 2];
+            // SAFETY: a valid two-element array for pipe2.
+            assert_eq!(
+                unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: the child only closes one end, reads one go byte,
+            // clones, and exits its leader thread; no allocator, no
+            // pthread, no locks.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "warm-view fork failed");
+            if pid == 0 {
+                unsafe {
+                    libc::close(go[1]);
+                    let mut byte = [0u8; 1];
+                    let got = libc::read(go[0], byte.as_mut_ptr().cast(), byte.len());
+                    if got != byte.len() as isize {
+                        libc::_exit(1);
+                    }
+                    const FLAGS: libc::c_int = libc::CLONE_VM
+                        | libc::CLONE_FS
+                        | libc::CLONE_FILES
+                        | libc::CLONE_SIGHAND
+                        | libc::CLONE_THREAD
+                        | libc::CLONE_SYSVSEM;
+                    let cloned =
+                        libc::clone(pause_survivor_main, top, FLAGS, std::ptr::null_mut());
+                    if cloned < 0 {
+                        libc::_exit(1);
+                    }
+                    // The main thread exits alone; the survivor keeps the group.
+                    libc::syscall(libc::SYS_exit, 0);
+                    libc::_exit(0);
+                }
+            }
+            // SAFETY: the parent keeps the write end and closes its read
+            // copy, so the child reads EOF (never hangs) if the parent dies.
+            unsafe {
+                libc::close(go[0]);
+            }
+            let tgid = pid as u32;
+            let view =
+                ProcessView::open(ProcessViewId(7501), tgid).expect("a warm view opens while alive");
+            // Release the child only after the view pins the live leader.
+            let byte = [1u8; 1];
+            // SAFETY: writing one byte to the owned pipe.
+            let wrote = unsafe { libc::write(go[1], byte.as_ptr().cast(), byte.len()) };
+            assert_eq!(wrote, byte.len() as isize, "the go byte releases the child");
+            // SAFETY: the write end served its single write.
+            unsafe {
+                libc::close(go[1]);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::process::process_is_zombie(tgid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "leader {tgid} never reached zombie state"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Self {
+                view,
+                tgid,
+                _stack: stack,
+            }
+        }
+    }
+
+    impl Drop for WarmZombieView {
+        fn drop(&mut self) {
+            unsafe {
+                // SIGKILL to the TGID stops the survivor; the leader is dead.
+                libc::kill(self.tgid as libc::pid_t, libc::SIGKILL);
+                let mut status = 0;
+                while libc::waitpid(self.tgid as libc::pid_t, &mut status, 0) < 0 {
+                    let err = std::io::Error::last_os_error().raw_os_error();
+                    if err == Some(libc::ECHILD) {
+                        break;
+                    }
+                    assert_eq!(err, Some(libc::EINTR));
+                }
+            }
+        }
+    }
+
+    /// A scripted IO never mints a real cold member: with a warm view
+    /// of a real zombie-with-survivor group, the cold attempt keeps the
+    /// exited outcome (`None`) and spends no mint budget. Control: the
+    /// production IO on the same view DOES mint, proving the group is
+    /// cold-admittable (so the `None` above is the gate, not a dead group).
+    #[test]
+    fn scripted_scan_io_never_mints_cold_member_for_real_zombie() {
+        let warm = WarmZombieView::spawn();
+        let mut scripted = NoStashScriptedIo {
+            maps: b"00400000-00401000 r-xp 00000000 08:01 1234 /bin/true\n".to_vec(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            acquire_cold_survivor_maps(&warm.view, &mut budget, &mut scripted).is_none(),
+            "a scripted IO keeps the exited outcome for a real zombie with a survivor"
+        );
+        assert_eq!(
+            budget.work_units_count(),
+            0,
+            "a scripted IO spends no mint budget"
+        );
+        let mut production = ProcScanIo { cold: None };
+        let mut control_budget = CaptureWorkBudget::default();
+        let maps = acquire_cold_survivor_maps(&warm.view, &mut control_budget, &mut production)
+            .expect("the production IO mints the same group's survivor");
+        assert!(!maps.is_empty(), "the control serves real survivor maps");
+    }
 }
 
 #[cfg(test)]

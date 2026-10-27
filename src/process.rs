@@ -515,6 +515,10 @@ pub struct ProcessView {
     admitted_ns: u64,
 }
 
+#[cfg(test)]
+#[path = "process/cold_view_tests.rs"]
+pub(crate) mod cold_view_tests;
+
 fn validated_with_admission_time<T>(
     validate: impl FnOnce() -> Result<T, String>,
     now_ns: impl FnOnce() -> Option<u64>,

@@ -3,6 +3,8 @@ use super::session_fixture::ScriptedSession;
 use super::*;
 #[path = "async_global_tests.rs"]
 mod async_global;
+#[path = "cold_view_tests.rs"]
+mod cold_view;
 use crate::discovery::test_subject::{OwnedMapper, poll_fd as system_scope_poll_fd};
 
 #[path = "engine_cancellation_tests.rs"]

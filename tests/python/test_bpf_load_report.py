@@ -821,7 +821,9 @@ class DriverHarnessTests(unittest.TestCase):
     """Run the real driver/helper/scorers with owned fake guest devices."""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="bpf-driver-")
+        # Fake guests share host paths: their owned workspace must satisfy
+        # the guest's /var/tmp contract, regardless of CI's outer TMPDIR.
+        self.temp = tempfile.TemporaryDirectory(prefix="bpf-driver-", dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
         self.bin = self.work / "bin"

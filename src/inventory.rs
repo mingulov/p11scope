@@ -3182,8 +3182,24 @@ impl ClassicDriver<'_> {
         // shed counts land before the disclosure below), and stages
         // its named loss gap, so the abandon commit succeeds and the
         // staged gaps publish. Nothing pending is a quiet no-op.
+        let publication_stood = coordinator.publication_pending();
         let frame = lane.take_joint_frame_for_abandon();
         coordinator.abandon_unfinished_joint_publication(&mut lane, frame, reason.to_string());
+        // Name a wedged live publication on stderr: a running
+        // no-progress trip fired, or the abandon above cleared a
+        // standing publication. One line per hold: the trip latches
+        // once in the machine and the hold runs once per lane, so
+        // this never repeats per poll. Outside the counts once-gate,
+        // beside the finish wedge above: the wedge is new
+        // information even past a counts disclosure.
+        let running_trip = lane.joint_audit_no_progress_trip();
+        let abandoned = publication_stood && !coordinator.publication_pending();
+        if let Some(line) = Self::held_live_publication_line(
+            running_trip.map(|trip| trip.stalled.as_secs()),
+            abandoned,
+        ) {
+            warn.emit(&line);
+        }
         let counts = SemanticStopCounts::read(&lane, coordinator);
         match winding_disclosed {
             // A stop path already disclosed this winding: stay silent.

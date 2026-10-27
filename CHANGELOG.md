@@ -101,8 +101,8 @@ Known issues in this release:
   on 5.15 they refuse by name before any counter program loads, on 6.1
   when the kernel verifier rejects a counter program (E2BIG) at load;
   metrics behavior without the flag is unchanged. A refused
-  counter-mode or Detailed start shows the refused state in text
-  output; the full reason is in the JSON report.
+  counter-mode or Detailed start prints its named reason on stderr,
+  exits nonzero and writes no report.
 - Per-call profile/trace capture stays fixed at 512 attach slots
   (2,112 only in the WIDE source build); counter banks share one
   65,536-entry return-value pool.

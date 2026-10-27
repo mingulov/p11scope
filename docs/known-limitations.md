@@ -28,9 +28,9 @@ Measurement modes aggregate in the kernel on 6.6+ (LP64):
 program loads: the kernel lacks the bpf_loop helper the counters
 need. On 6.1 the same named reason is reported when the kernel
 verifier rejects a counter program as too complex (E2BIG) at load.
-Either way `run` never starts its program. If a counter-mode or
-Detailed start is refused, the text output shows the refused state
-and the full reason is in the JSON report. Latency banks grow with
+Either way `run` never starts its program. A refused counter-mode or
+Detailed start prints its named reason on stderr, exits nonzero
+and writes no report (no `-o` file). Latency banks grow with
 the host possible-CPU count and refuse with `counter-memory-limit`
 past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
@@ -94,8 +94,8 @@ unwatched window in the JSON (`first_seen_ns` earlier than
 A process that loads a provider, makes one call within about a
 millisecond, and unloads is not observed without `run --pause auto`.
 On Linux 7.0.14, for the four provider shapes measured under `p11scope
-run --trace` (32 runs at 0/10/100/1000 us load-to-call delays), all 32
-runs missed the single call (1 of 1 missed, 0 caller-attributed),
+run --trace` (32 runs at 0/10/100/1000 us load-to-call delays) with
+the default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
 each reporting PARTIAL with a proven drain and zero event loss: the
 transient exits before discovery attaches anything (0 slots, no
 modules). With `run --pause auto`, which holds the child at each

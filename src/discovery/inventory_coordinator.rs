@@ -75,6 +75,8 @@ use count_eligibility::{
     ReceiptView, ReceiptWork, RecoveryWorkBudget,
 };
 
+#[path = "inventory_coordinator/leader_exit.rs"]
+mod leader_exit;
 #[path = "inventory_coordinator/metadata.rs"]
 mod metadata;
 #[path = "inventory_coordinator/semantics.rs"]
@@ -337,6 +339,8 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Leader exits already recorded as link loss (H6 slice 2): one entry
     /// per incarnation at most, never cleared (IDs never reuse).
     leader_link_loss_noted: BTreeSet<CallerId>,
+    pending_leader_exits: BTreeMap<CallerId, leader_exit::PendingLeaderExit<Source::Pin>>,
+    leader_exit_cursor: Option<CallerId>,
     /// Whether BPF hook timestamps and observer admission stamps share
     /// a clock (F7): `bpf_ktime_get_ns` is never time-namespace
     /// offset, while the observer's `CLOCK_MONOTONIC` is. The stale
@@ -499,6 +503,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_owners: BTreeMap::new(),
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
+            pending_leader_exits: BTreeMap::new(),
+            leader_exit_cursor: None,
             exit_clocks_comparable: exit_clocks_comparable(),
             exit_clock_gap_noted: false,
             staged_retirements: BTreeSet::new(),
@@ -2934,6 +2940,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn retire_caller_in_registry(&mut self, id: CallerId, now_ns: u64) {
+        self.pending_leader_exits.remove(&id);
+        self.adapter.mark_leader_exit_pending(id, false);
         self.semantic_bindings.release_successor(id);
         // Each retirement stages once: held handoffs report the old
         // incarnation at mint and again at commit, and the second report
@@ -3518,29 +3526,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 continue;
             }
-            let holds = self
-                .adapter
-                .live_pin(pid)
-                .is_some_and(|(_, pin)| self.adapter.source().still_the_same(pin));
-            if !holds || !self.leader_link_loss_noted.insert(caller) {
-                continue;
-            }
-            self.registry.record_gap(RegistryGap {
-                caller: Some(caller),
-                module: None,
-                pid: Some(pid),
-                subject: "leader task link loss".into(),
-                reason: "the leader task exited while the generation pin holds (live \
-                     threads); original custody is retained with no tombstone, and a \
-                     later EXEC may renew recovery"
-                    .into(),
-                budget: None,
-            });
-            // Bound callers carry the loss into the commit tail, where H3's
-            // once-per-gap cut fences unpublished semantic positives.
-            if self.semantic_bindings.get(caller).is_some() {
-                self.tail_uncertain.insert(caller);
-            }
+            self.defer_leader_exit(caller, pid, record.hook_ts_ns, batch.domain);
         }
     }
 
@@ -5858,6 +5844,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             start_time: old.start_time,
             exe: old.exe.clone(),
         };
+        if !old.retired
+            && old.pid == transition.pid()
+            && self.adapter.share_caller_pin(caller).is_some()
+        {
+            self.resolve_leader_exit_for_exec(caller);
+        }
         let pending_exact = self
             .pending_successors
             .values()
@@ -6107,6 +6099,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         self.stopped = true;
+        self.stop_pending_leader_exits();
         let held = self.pending_successors.len();
         self.pending_successors.clear();
         self.semantic_bindings.release_unused_successors();
@@ -6252,6 +6245,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         engine_changed: bool,
         mut lane: Option<&mut AttestedSemanticLane>,
     ) -> Result<PublicationCompletion> {
+        self.retry_pending_leader_exits();
         // Original cgroup custody is still in self during the fallible engine
         // tail. Scoped preparation/staging then has no later fallible tail.
         self.engine.publish_batch_tail(engine_changed)?;
@@ -12396,6 +12390,12 @@ exit 0
         pub(super) fn new() -> (Self, CallerId) {
             let mut scene = CaptureScene::new(2);
             scene.source.spawn(7, 500);
+            // Ordinary synthetic leader-loss scenes explicitly supply the
+            // fresh worker proof. A held pin alone now supplies none.
+            scene.source.set_leader_exit_observation(
+                7,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
             let caller = scene
                 .coordinator
                 .adapter
@@ -17713,6 +17713,10 @@ exit 0
     #[test]
     fn automatic_exec_single_thread_exit_before_pidfd_ready_has_no_link_loss() {
         let (mut native, caller) = NativeScene::boxed();
+        native.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::Unresolved,
+        );
         native.scene.source.poison_reopen();
         let opens_before = native.scene.source.reopen_attempts();
         // SAFETY: DiscoveryRecord contains only integer fields.
@@ -18071,6 +18075,10 @@ exit 0
             .apply_reconcile_events(&events, 2_000);
         reused.scene.coordinator.commit_batch(false).unwrap();
         reused.scene.source.spawn(7, 900);
+        reused.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
         let observed: BTreeSet<u32> = [7].into_iter().collect();
         let events = reused.scene.coordinator.adapter.reconcile(
             &observed,
@@ -18139,6 +18147,10 @@ exit 0
         let (mut reused, _leader) = NativeScene::new();
         reused.scene.source.kill(7);
         reused.scene.source.spawn(7, 900);
+        reused.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
         let observed: BTreeSet<u32> = [7].into_iter().collect();
         let events = reused.scene.coordinator.adapter.reconcile_detected(
             &observed,
@@ -18219,6 +18231,10 @@ exit 0
 
         let (mut scene, _leader) = NativeScene::new();
         scene.scene.source.spawn(8, 600);
+        scene.scene.source.set_leader_exit_observation(
+            8,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
         let observed8: BTreeSet<u32> = [7, 8].into_iter().collect();
         let events = scene.scene.coordinator.adapter.reconcile(
             &observed8,
@@ -18231,6 +18247,10 @@ exit 0
         // execs (same generation, new image). The sweep meets 7 first.
         scene.scene.source.kill(7);
         scene.scene.source.spawn(7, 900);
+        scene.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
         scene.scene.source.exec(8, 200, "/bin/driver2");
         let observed: BTreeSet<u32> = [7, 8].into_iter().collect();
         // The detection clock advances mid-sweep: pid 7's successor
@@ -18313,6 +18333,10 @@ exit 0
         let (mut scene, _leader) = NativeScene::new();
         scene.scene.source.kill(7);
         scene.scene.source.spawn(7, 900);
+        scene.scene.source.set_leader_exit_observation(
+            7,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
         let observed: BTreeSet<u32> = [7].into_iter().collect();
         let events = scene.scene.coordinator.adapter.reconcile_detected(
             &observed,

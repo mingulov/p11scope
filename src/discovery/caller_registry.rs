@@ -178,6 +178,15 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
+    /// A leader-exit hook plus a held process pin is not proof of a live
+    /// worker. Sources without fresh original-custody task evidence defer.
+    fn leader_exit_observation(
+        &self,
+        _pin: &Self::Pin,
+        _work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> crate::process::leader_exit::LeaderExitObservation {
+        crate::process::leader_exit::LeaderExitObservation::Unresolved
+    }
     /// Cold-admit an already-zombie leader: when `pin` names a zombie
     /// thread group with exactly one live survivor, mint the survivor
     /// from this same pin and return its exe identity for the record.
@@ -244,6 +253,14 @@ impl ProcessSource for OsProcessSource {
 
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
+    }
+
+    fn leader_exit_observation(
+        &self,
+        pin: &PidPin,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> crate::process::leader_exit::LeaderExitObservation {
+        pin.leader_exit_observation(work)
     }
 
     fn cold_zombie_exe(&self, pin: &Arc<PidPin>) -> Result<Option<ExeIdentity>, String> {
@@ -533,6 +550,7 @@ impl<Pin> SharedCallerPin<Pin> {
 struct TrackedCaller<Pin> {
     record: CallerRecord,
     pin: Option<SharedCallerPin<Pin>>,
+    leader_exit_pending: bool,
 }
 
 /// Tracks caller incarnations: admission, exit/exec/reuse retirement with
@@ -720,6 +738,25 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         Some((&tracked.record, &**tracked.pin.as_ref()?))
     }
 
+    pub(crate) fn share_caller_pin(
+        &self,
+        caller: CallerId,
+    ) -> Option<SharedCallerPin<Source::Pin>> {
+        Some(self.callers.get(&caller)?.pin.as_ref()?.share())
+    }
+
+    pub(crate) fn mark_leader_exit_pending(&mut self, caller: CallerId, pending: bool) {
+        if let Some(tracked) = self.callers.get_mut(&caller) {
+            tracked.leader_exit_pending = pending;
+        }
+    }
+
+    pub(crate) fn leader_exit_pending(&self, caller: CallerId) -> bool {
+        self.callers
+            .get(&caller)
+            .is_some_and(|tracked| tracked.leader_exit_pending)
+    }
+
     fn mint(&mut self) -> Result<CallerId> {
         let id = CallerId(self.next_id);
         self.next_id = self
@@ -787,6 +824,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.insert(
             id,
             TrackedCaller {
+                leader_exit_pending: false,
                 record: CallerRecord {
                     id,
                     pid,
@@ -940,6 +978,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.insert(
             id,
             TrackedCaller {
+                leader_exit_pending: false,
                 record: CallerRecord {
                     id,
                     pid: prepared.pid,
@@ -1045,6 +1084,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.insert(
             id,
             TrackedCaller {
+                leader_exit_pending: false,
                 record: CallerRecord {
                     id,
                     pid,
@@ -1347,6 +1387,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.insert(
             id,
             TrackedCaller {
+                leader_exit_pending: false,
                 record: CallerRecord {
                     id,
                     pid,
@@ -5431,6 +5472,7 @@ pub(crate) mod tests {
         /// False simulates an unreadable `/proc` (a race or a permission
         /// wall): liveness answers but identity reads fail.
         readable: bool,
+        leader_exit: crate::process::leader_exit::LeaderExitObservation,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -5442,6 +5484,7 @@ pub(crate) mod tests {
         /// retained custody works.
         reopen_poisoned: bool,
         reopen_attempts: usize,
+        leader_exit_queries: usize,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -5471,6 +5514,7 @@ pub(crate) mod tests {
                         path: Some("/bin/driver".into()),
                     }),
                     readable: true,
+                    leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
         }
@@ -5483,6 +5527,7 @@ pub(crate) mod tests {
                     start_time: process_start_time(pid).unwrap(),
                     exe: read_exe_identity(pid),
                     readable: true,
+                    leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
         }
@@ -5496,6 +5541,16 @@ pub(crate) mod tests {
         pub(crate) fn kill(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.alive = false;
+            }
+        }
+
+        pub(crate) fn set_leader_exit_observation(
+            &self,
+            pid: u32,
+            observation: crate::process::leader_exit::LeaderExitObservation,
+        ) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.leader_exit = observation;
             }
         }
 
@@ -5525,6 +5580,10 @@ pub(crate) mod tests {
         /// Numeric-PID reopen attempts so far, poisoned or not.
         pub(crate) fn reopen_attempts(&self) -> usize {
             self.state.borrow().reopen_attempts
+        }
+
+        pub(crate) fn leader_exit_queries(&self) -> usize {
+            self.state.borrow().leader_exit_queries
         }
     }
 
@@ -5578,6 +5637,26 @@ pub(crate) mod tests {
                 .processes
                 .get(&pid)
                 .is_some_and(|process| process.alive)
+        }
+
+        fn leader_exit_observation(
+            &self,
+            pin: &Self::Pin,
+            _: &mut crate::process::leader_exit::LeaderExitReadBudget,
+        ) -> crate::process::leader_exit::LeaderExitObservation {
+            use crate::process::leader_exit::LeaderExitObservation;
+            let mut state = self.state.borrow_mut();
+            state.leader_exit_queries += 1;
+            let Some(process) = state.processes.get(&pin.0) else {
+                return LeaderExitObservation::GroupExited;
+            };
+            if !process.alive || process.start_time != pin.1 {
+                LeaderExitObservation::GroupExited
+            } else if !process.readable {
+                LeaderExitObservation::Unresolved
+            } else {
+                process.leader_exit
+            }
         }
     }
 

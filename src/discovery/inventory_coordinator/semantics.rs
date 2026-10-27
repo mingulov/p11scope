@@ -1416,7 +1416,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         share_first_custody: impl FnOnce() -> Option<Arc<PidPin>>,
     ) -> Option<SemanticAdmissionCandidate> {
         let record = self.adapter.record(caller)?;
-        if record.retired
+        if self.adapter.leader_exit_pending(caller)
+            || record.retired
             || self.adapter.live_id(record.pid) != Some(caller)
             || record.pid != pin.pid()
             || record.start_time.is_none()
@@ -2861,7 +2862,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let context = self
                 .semantic_bindings
                 .find_by_image(receipt.domain(), receipt.image())
-                .filter(|binding| binding.provider_for_endpoint(receipt.endpoint()).is_none())
+                .filter(|binding| {
+                    !self.adapter.leader_exit_pending(binding.caller())
+                        && binding.provider_for_endpoint(receipt.endpoint()).is_none()
+                })
                 .and_then(|binding| {
                     self.registry
                         .joint_current_provider_module(receipt, binding, lane.subset())
@@ -3128,6 +3132,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let Some(binding) = self
                     .semantic_bindings
                     .find_by_image(coverage.domain(), coverage.image())
+                    .filter(|binding| !self.adapter.leader_exit_pending(binding.caller()))
                 else {
                     continue;
                 };
@@ -3188,6 +3193,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     return (None, token, Err(ConversionRefusal::Custody));
                 };
                 let caller = binding.caller();
+                if self.adapter.leader_exit_pending(caller) {
+                    return (Some(caller), token, Err(ConversionRefusal::Custody));
+                }
                 let coverage = coverages.iter().find(|coverage| {
                     binding.scope_current()
                         && coverage.domain() == evidence.domain()
@@ -3608,6 +3616,20 @@ mod finalizer_history_tests {
 
     #[test]
     fn receiptless_joined_call_admits_as_history() {
+        receiptless_joined_case(false, false);
+    }
+
+    #[test]
+    fn pending_leader_exit_refuses_receiptless_semantic_history() {
+        receiptless_joined_case(true, false);
+    }
+
+    #[test]
+    fn pending_leader_exit_refuses_already_prepared_admission() {
+        receiptless_joined_case(true, true);
+    }
+
+    fn receiptless_joined_case(pending_exit: bool, already_prepared: bool) {
         let pid = std::process::id();
         let mut coordinator = InventoryCoordinator::new(
             Scope::Pid(pid),
@@ -3734,9 +3756,52 @@ mod finalizer_history_tests {
         )
         .unwrap();
         coordinator.stage_semantic_batch(batch);
+        if already_prepared {
+            coordinator
+                .prepare_staged_semantic_batch(&mut lane, None)
+                .unwrap();
+        }
+        if pending_exit {
+            coordinator.adapter.mark_leader_exit_pending(caller, true);
+        }
+        if already_prepared {
+            coordinator.dispose_prepared_claims_s1();
+            while coordinator.stage_next_prepared_admission() {}
+            assert!(coordinator.finish_prepared_semantic_batch(&lane));
+        }
         coordinator
             .commit_batch_with_semantics(false, Some(&mut lane))
             .unwrap();
+        if pending_exit {
+            let refused: u64 = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .zip(coordinator.registry().gap_repeats())
+                .filter(|(gap, _)| {
+                    gap.caller == Some(caller)
+                        && gap.subject == "semantic input refused"
+                        && gap.reason == "custody"
+                })
+                .map(|(_, count)| *count)
+                .sum();
+            let api: u64 = coordinator
+                .registry()
+                .instance_semantic_edges()
+                .map(|row| row.api_returns.unwrap_or(0))
+                .sum();
+            let historical: u64 = coordinator
+                .registry()
+                .instance_semantic_edges()
+                .map(|row| row.historical_only_returns)
+                .sum();
+            assert_eq!(
+                (api, historical, refused),
+                (0, 0, 1),
+                "the one raw joined call is conserved as custody refusal, with no semantic positive"
+            );
+            return;
+        }
         let gaps: Vec<(String, String)> = coordinator
             .registry()
             .gaps()

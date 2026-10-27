@@ -14,6 +14,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 // Staged DR04 backend; no live caller metadata publication is wired yet.
 #[allow(dead_code)]
 pub(crate) mod cgroup_context;
+pub(crate) mod leader_exit;
 use std::sync::{Arc, Weak};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
@@ -1796,6 +1797,93 @@ mod tests {
             "the test needs a pidfd pin: a /proc fallback never EINTRs, so it cannot prove the retry"
         );
         (pin, SleepChild(child))
+    }
+
+    #[test]
+    fn leader_exit_probe_real_single_thread_and_fallback_stay_unresolved_until_exit() {
+        use leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+        let (pin, mut child) = live_pin_and_child();
+        assert_eq!(
+            pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::Unresolved
+        );
+        let fallback = PidPin {
+            pid: pin.pid(),
+            pidfd: None,
+            start_time: pin.start_time(),
+            shared_charge: None,
+        };
+        assert_eq!(
+            fallback.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::Unresolved
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+            LeaderExitObservation::GroupExited
+        );
+    }
+
+    #[test]
+    fn leader_exit_probe_real_zombie_leader_keeps_one_or_two_live_workers() {
+        use leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("workers.c");
+        let executable = dir.path().join("workers");
+        std::fs::write(
+            &source,
+            r#"
+#include <pthread.h>
+#include <unistd.h>
+static void *worker(void *unused) {
+    (void)unused;
+    for (;;) pause();
+    return 0;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    pthread_t threads[2];
+    int n = argc > 1 ? 2 : 1;
+    for (int i = 0; i < n; i++)
+        if (pthread_create(&threads[i], 0, worker, 0) != 0) return 2;
+    pthread_exit(0);
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            Command::new("gcc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-O1"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for two in [false, true] {
+            let mut command = Command::new(&executable);
+            if two {
+                command.arg("two");
+            }
+            let child = SleepChild(command.spawn().unwrap());
+            let pin = PidPin::open(child.0.id()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !process_is_zombie(pin.pid()) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                process_is_zombie(pin.pid()),
+                "fixture reaches the real zombie-leader boundary"
+            );
+            assert_eq!(
+                pin.leader_exit_observation(&mut LeaderExitReadBudget::for_test(128)),
+                LeaderExitObservation::LiveNonleader,
+                "two_workers={two}"
+            );
+            assert_eq!(pin.original_exited(), Ok(false));
+        }
     }
 
     /// A signal landing in a finite pidfd wait retries to the deadline

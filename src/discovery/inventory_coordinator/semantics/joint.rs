@@ -775,6 +775,7 @@ impl PreparedSemanticBatch {
         &mut self,
         registry: &mut CallerRegistry,
         seal_admission: &mut Option<AdmittedInstanceCall>,
+        pending_exit: impl Fn(CallerId) -> bool,
     ) -> bool {
         if self.claim_cursor != self.entries.len() || self.stage_cursor >= self.claim_cursor {
             return false;
@@ -786,6 +787,11 @@ impl PreparedSemanticBatch {
             .input
             .take()
             .expect("only the original staging cursor moves an input");
+        let input = if input.is_ok() && entry.caller.is_some_and(pending_exit) {
+            Err(ConversionRefusal::Custody)
+        } else {
+            input
+        };
         match input {
             Ok(input) => {
                 if seal_admission.is_none() {
@@ -1244,7 +1250,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(PendingSemanticBatch::Prepared(batch)) = state.pending_semantic.as_mut() else {
             return false;
         };
-        batch.stage_next(&mut self.registry, &mut state.seal_admission)
+        batch.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {
+            self.adapter.leader_exit_pending(caller)
+        })
     }
 
     /// Preserve the actual negative subject before moving the original
@@ -1283,7 +1291,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .disposition_s1only_original(adapter, producers, input)?
                 .consume_for(input)?;
         }
-        Ok(batch.stage_next(&mut self.registry, &mut state.seal_admission))
+        Ok(
+            batch.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {
+                self.adapter.leader_exit_pending(caller)
+            }),
+        )
     }
 
     pub(crate) fn finish_prepared_semantic_batch(&mut self, lane: &AttestedSemanticLane) -> bool {
@@ -1310,7 +1322,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .semantic_finalizer
             .as_mut()
             .expect("matching finalizer namespace retained");
-        while prepared.stage_next(&mut self.registry, &mut state.seal_admission) {}
+        while prepared.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {
+            self.adapter.leader_exit_pending(caller)
+        }) {}
     }
 }
 

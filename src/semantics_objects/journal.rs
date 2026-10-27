@@ -2252,13 +2252,15 @@ impl H3DispositionEvidence {
             return Self::StagedLoss { barrier: *barrier };
         }
         // The certified maximum is monotone over previous evidence; a
-        // voided loss barrier restarts it above itself (positions at or
-        // below the barrier were disposed as loss). The pending floor
+        // voided loss barrier restarts it through the seal's acknowledged
+        // interval (those positions were disposed as loss, not success).
+        // A quiet next batch need not issue a new position to cover that
+        // already disposed interval. The pending floor
         // is the current minimum over route-waiting and unpublished
         // positions.
         let base = match previous {
             Self::Clean { staged_max, .. } => *staged_max,
-            Self::StagedLoss { barrier } => *barrier,
+            Self::StagedLoss { barrier } => (*barrier).max(acked_below.saturating_sub(1)),
             Self::Exhausted => return Self::Exhausted,
         };
         let mut staged_max = base;
@@ -14404,6 +14406,113 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_h3_acknowledged_loss_covers_a_quiet_voided_interval() {
+        let loss = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(7), Some(9)],
+            None,
+            Some(7),
+            None,
+            false,
+            &H3DispositionEvidence::genesis(),
+            0,
+        );
+        assert!(matches!(
+            loss,
+            H3DispositionEvidence::StagedLoss { barrier: 7 }
+        ));
+
+        // The actual seal's exclusive acknowledgement disposes the whole
+        // interval below12. No fresh outcome is needed to dispose it again.
+        let recovered = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            &loss,
+            12,
+        );
+        assert!(
+            matches!(
+                recovered,
+                H3DispositionEvidence::Clean {
+                    staged_max: 11,
+                    pending_floor: None
+                }
+            ),
+            "an acknowledged quiet interval must not await new calls: {recovered:?}"
+        );
+    }
+
+    #[test]
+    fn object_journal_h3_void_recovery_retains_pending_floors_and_new_loss() {
+        let loss = H3DispositionEvidence::StagedLoss { barrier: 7 };
+        let pending = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[],
+            Some(8),
+            None,
+            Some(10),
+            false,
+            &loss,
+            12,
+        );
+        assert!(
+            matches!(
+                pending,
+                H3DispositionEvidence::Clean {
+                    staged_max: 11,
+                    pending_floor: Some(8)
+                }
+            ),
+            "a void acknowledgement cannot erase retained work: {pending:?}"
+        );
+
+        let unacknowledged = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            &loss,
+            7,
+        );
+        assert!(matches!(
+            unacknowledged,
+            H3DispositionEvidence::StagedLoss { barrier: 7 }
+        ));
+
+        let new_loss = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(13)],
+            None,
+            Some(13),
+            None,
+            false,
+            &loss,
+            12,
+        );
+        assert!(matches!(
+            new_loss,
+            H3DispositionEvidence::StagedLoss { barrier: 13 }
+        ));
+        let exhausted = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            true,
+            &loss,
+            12,
+        );
+        assert!(matches!(exhausted, H3DispositionEvidence::Exhausted));
+    }
+
+    #[test]
     fn object_journal_h3_loss_acknowledgement_gates_clean_transition() {
         // N1: loss at position 1, then a clean batch through 2. Without
         // the seal's acknowledgement the barrier persists (never a
@@ -14565,6 +14674,25 @@ pub(crate) mod tests {
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
         assert_eq!(failure.h3_voided, Some(3));
+        // A real void already disposed every position below3. With no
+        // further calls, an empty finalizer batch must cover that exact
+        // acknowledged prefix instead of waiting for a new position.
+        commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(Vec::new(), Vec::new(), None, None, false),
+        );
+        let quiet = coordinator.take_h3_disposition();
+        assert!(
+            matches!(
+                quiet,
+                H3DispositionEvidence::Clean {
+                    staged_max: 2,
+                    pending_floor: None
+                }
+            ),
+            "the actual seal acknowledgement must release quiet coverage: {quiet:?}"
+        );
         // Quantum 2: a clean finalizer batch releases into Clean past
         // the acknowledged barrier, and genuinely new journal history
         // seals above the void fence. The void cleared admission

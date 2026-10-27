@@ -62,14 +62,21 @@
 #define IDX_WRAP_B 44
 
 /* Mirrors P11ScopeTable in tests/fixtures/live-discovery-provider.c:
- * CK_VERSION (2 bytes), 6 reserved bytes, 104 function pointers. */
+ * CK_VERSION (2 bytes) followed by the 104 function pointers at the
+ * natural pointer alignment (offset 8 on LP64, 4 on ILP32), per the OASIS
+ * CK_FUNCTION_LIST layout. */
 typedef struct {
     unsigned char major, minor;
+#if __SIZEOF_POINTER__ == 8
     unsigned char reserved[6];
+#else
+    unsigned char reserved[2];
+#endif
     void *functions[TABLE_SLOTS];
 } ProviderTable;
 
-_Static_assert(offsetof(ProviderTable, functions) == 8, "table layout");
+_Static_assert(offsetof(ProviderTable, functions) == sizeof(void *),
+               "function pointers follow CK_VERSION at pointer alignment");
 
 typedef unsigned long (*TableEntry)(void **);
 typedef unsigned long (*GetFunctionList)(void **);

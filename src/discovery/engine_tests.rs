@@ -20953,58 +20953,41 @@ fn incomplete_rescan_preserves_double_load_detection() {
     }
 }
 
-/// The valid self-export fixture: a retained view of this process, its own
-/// `/proc/self/maps`, and one structurally valid FUNCTION_LIST record whose
-/// table owner is a file-backed readable data mapping of the test
-/// executable and whose single pointer is the matching code mapping —
-/// exactly the shape `engine_lowers_export_table_owner_and_prefix` proves
-/// lowers whole.
-fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, DiscoveryRecord) {
-    use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+/// Actual file-backed tables keep the fresh read and every carried word honest.
+fn self_export_table_address(index: usize) -> u64 {
+    use std::sync::{
+        Once,
+        atomic::{AtomicU64, Ordering},
+    };
+    static INITIALIZED: Once = Once::new();
+    // Nonzero initialization keeps the complete arrays in file-backed .data.
+    static TABLES: [[AtomicU64; 69]; 2] = [const { [const { AtomicU64::new(1) }; 69] }; 2];
+    extern "C" fn target() -> u64 {
+        0
+    }
+    INITIALIZED.call_once(|| {
+        for table in &TABLES {
+            for word in table {
+                word.store(0, Ordering::Relaxed);
+            }
+            table[0].store(0x2802, Ordering::Relaxed);
+            table[1].store(target as *const () as usize as u64, Ordering::Relaxed);
+        }
+    });
+    TABLES[index].as_ptr() as u64
+}
 
+fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, DiscoveryRecord) {
     let pid = std::process::id();
+    let address = self_export_table_address(0);
     let view = ProcessView::open(id, pid).unwrap();
     let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
-    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-    let executable = std::env::current_exe().unwrap();
-    let executable = executable.canonicalize().unwrap_or(executable);
-    let owner = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode != 0
-                && mapping.permissions[0] == b'r'
-                && mapping.permissions[2] != b'x'
-                && matches!(
-                    map_index.resolve(mapping.start),
-                    Resolved::File {
-                        path: MappedPath::Usable(ref path),
-                        ..
-                    } if path == &executable
-                )
-        })
-        .expect("the test executable has a file-backed data mapping")
-        .clone();
-    let code = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode == owner.inode
-                && mapping.device == owner.device
-                && mapping.permissions[2] == b'x'
-        })
-        .expect("the test executable has a matching code mapping")
-        .clone();
-
-    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
-    record.symbol_id = 1;
-    record.pid_tgid = u64::from(pid) << 32;
-    record.table_ptr = owner.start;
-    record.version_major = 2;
-    record.version_minor = 40;
-    record.pointers[0] = code.start;
-    record.pointers_attempted = 1;
-    record.completed_prefix = 1;
-    record.usable_n = 1;
+    let index = MapIndex::new(&maps).unwrap();
+    assert!(
+        matches!(index.resolve(address), Resolved::File { inode, permissions, .. }
+        if inode != 0 && permissions[0] == b'r')
+    );
+    let record = compatibility_publication_record(address, 0x2802, 68);
     (view, maps, record)
 }
 
@@ -21158,45 +21141,10 @@ fn engine_lowers_export_table_owner_and_prefix() {
         DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord,
     };
 
-    let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let (view, maps, mut record) = self_export_fixture(ProcessViewId(41));
     let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-    let executable = std::env::current_exe().unwrap();
-    let executable = executable.canonicalize().unwrap_or(executable);
-    let owner = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode != 0
-                && mapping.permissions[0] == b'r'
-                && mapping.permissions[2] != b'x'
-                && matches!(
-                    map_index.resolve(mapping.start),
-                    Resolved::File {
-                        path: MappedPath::Usable(ref path),
-                        ..
-                    } if path == &executable
-                )
-        })
-        .expect("the test executable has a file-backed data mapping");
-    let code = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode == owner.inode
-                && mapping.device == owner.device
-                && mapping.permissions[2] == b'x'
-        })
-        .expect("the test executable has a matching code mapping");
-
-    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
-    record.symbol_id = 1;
-    record.table_ptr = owner.start;
-    record.version_major = 2;
-    record.version_minor = 40;
-    record.pointers[0] = code.start;
-    record.pointers_attempted = 1;
-    record.completed_prefix = 1;
-    record.usable_n = 1;
+    let owner = map_index.containing(record.table_ptr).unwrap();
+    let code = map_index.containing(record.pointers[0]).unwrap();
 
     let hooks = crate::discovery::hooks::HookRegistry::builtin();
     let limits = ScanLimits {
@@ -21221,7 +21169,7 @@ fn engine_lowers_export_table_owner_and_prefix() {
     let mut interface_record = record;
     interface_record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
     interface_record.symbol_id = 2;
-    interface_record.table_ptr += 8;
+    interface_record.table_ptr = self_export_table_address(1);
     interface_record.interface_index = 3;
     interface_record.announced_count = 4;
     interface_record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
@@ -21255,12 +21203,14 @@ fn engine_lowers_export_table_owner_and_prefix() {
     );
 
     record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
-    record.usable_n = 0;
+    record.completed_prefix = 1;
+    record.usable_n = 1;
+    record.pointers[1..].fill(0);
     assert!(
         lower_export_record(&view, &index, &hooks, &record, &mut budget)
             .expect("the completed raw prefix is structurally valid")
-            .is_none(),
-        "a read-failed completed prefix is not target authority"
+            .is_some(),
+        "an unavailable tail does not erase the completed word"
     );
 
     record.status_flags = 0;
@@ -52228,7 +52178,7 @@ fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
         panic!("matching carried legacy pointers must validate");
     };
     assert_eq!(module.tables[0].entries.len(), 68);
-    assert_eq!(module.tables[0].walk, "known_prefix");
+    assert_eq!(module.tables[0].walk, "full");
 
     let mut changed = record;
     changed.pointers[67] += 1;
@@ -52672,26 +52622,54 @@ fn opaque_publication_retains_observation_without_standard_names_or_list_positio
     let mut record = compatibility_publication_record(address, 0x2802, 68);
     let legacy = compatibility_lower_self(&record);
     let view = ProcessView::open(legacy.view, std::process::id()).unwrap();
-    for kind in [DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN] {
-        for class in [DISCOVERY_NAME_OTHER, DISCOVERY_NAME_NULL, DISCOVERY_NAME_UNREADABLE] {
+    for kind in [
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+        DISCOVERY_KIND_INTERFACE_RETURN,
+    ] {
+        for class in [
+            DISCOVERY_NAME_OTHER,
+            DISCOVERY_NAME_NULL,
+            DISCOVERY_NAME_UNREADABLE,
+        ] {
             record.kind = kind;
             record.name_class = class;
             record.interface_index = 3;
             let module = publication_module(
-                &view, &record, "C_GetInterface", legacy.key, legacy.path.clone(),
+                &view,
+                &record,
+                "C_GetInterface",
+                legacy.key,
+                legacy.path.clone(),
                 legacy.tables[0].clone(),
             );
             let table = &module.tables[0];
             let score = table_evidence_score(
-                0, &module.tables, &module.interfaces, &[], &[], &ObjectExports::NONE,
+                0,
+                &module.tables,
+                &module.interfaces,
+                &[],
+                &[],
+                &ObjectExports::NONE,
             );
-            assert!(table.live_return, "the observed return is an acquisition fact");
+            assert!(
+                table.live_return,
+                "the observed return is an acquisition fact"
+            );
             assert!(table_observation_authorized(table, &score));
-            assert!(!table_name_authorized(&score), "an opaque ABI does not prove standard names");
+            assert!(
+                !table_name_authorized(&score),
+                "an opaque ABI does not prove standard names"
+            );
             assert_eq!(module.interfaces[0].table, Some(0));
-            assert_eq!(module.interfaces[0].index,
-                if kind == DISCOVERY_KIND_INTERFACE_RETURN { 0 } else { 3 },
-                "a selection request class is not an enumeration position");
+            assert_eq!(
+                module.interfaces[0].index,
+                if kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                    0
+                } else {
+                    3
+                },
+                "a selection request class is not an enumeration position"
+            );
         }
     }
 }
@@ -52709,19 +52687,45 @@ fn mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof() {
     record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
     record.name_class = DISCOVERY_NAME_OTHER;
     let opaque = publication_module(
-        &view, &record, "C_GetInterface", legacy.key, legacy.path.clone(), legacy.tables[0].clone(),
+        &view,
+        &record,
+        "C_GetInterface",
+        legacy.key,
+        legacy.path.clone(),
+        legacy.tables[0].clone(),
     );
-    for (first, second) in [(legacy.clone(), opaque.clone()), (opaque.clone(), legacy.clone())] {
+    for (first, second) in [
+        (legacy.clone(), opaque.clone()),
+        (opaque.clone(), legacy.clone()),
+    ] {
         let mut merged = vec![first];
         merge_scanned_module(&mut merged, second);
         let module = &merged[0];
-        let scores: Vec<_> = (0..module.tables.len()).map(|index| table_evidence_score(
-            index, &module.tables, &module.interfaces, &[], &[], &ObjectExports::NONE,
-        )).collect();
-        assert!(scores.iter().any(table_name_authorized), "the typed getter proof survives either order");
-        assert!(module.tables.iter().zip(&scores).any(|(table, score)|
-            table_observation_authorized(table, score) && !table_name_authorized(score)),
-            "the opaque observation does not invent a standard-layout proof");
+        let scores: Vec<_> = (0..module.tables.len())
+            .map(|index| {
+                table_evidence_score(
+                    index,
+                    &module.tables,
+                    &module.interfaces,
+                    &[],
+                    &[],
+                    &ObjectExports::NONE,
+                )
+            })
+            .collect();
+        assert!(
+            scores.iter().any(table_name_authorized),
+            "the typed getter proof survives either order"
+        );
+        assert!(
+            module
+                .tables
+                .iter()
+                .zip(&scores)
+                .any(|(table, score)| table_observation_authorized(table, score)
+                    && !table_name_authorized(score)),
+            "the opaque observation does not invent a standard-layout proof"
+        );
     }
 }
 

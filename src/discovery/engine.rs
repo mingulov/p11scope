@@ -32,12 +32,12 @@ use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistr
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
-    ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
-    decode_exact_table, decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
+    ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
+    decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
     exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
     read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
-    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score, table_linkage,
-    target_layout,
+    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
+    table_has_only_opaque_interfaces, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -8025,14 +8025,13 @@ fn resolve_heap_table_owner(
     None
 }
 
-/// Decoder layouts for one heap-table exact read, strongest first: the
-/// scanned hook exporters' ABI when they agree, both widths otherwise.
-/// At most two bounded reads; a wrong width fails fast on the version word.
-fn heap_table_layouts(
+/// An independently known exporter ABI can be used when the process executable
+/// cannot be opened. Table metadata and sparse contents never select a width.
+fn known_heap_table_layout(
     hook: &str,
     view: ProcessViewId,
     modules: &[ReconciledModule],
-) -> Vec<LinuxLayout> {
+) -> Option<LinuxLayout> {
     let mut abis = BTreeSet::new();
     for module in modules.iter().map(|module| &module.scanned) {
         if module.view == view
@@ -8043,9 +8042,9 @@ fn heap_table_layouts(
         }
     }
     if let Some(abi) = abis.iter().next().filter(|_| abis.len() == 1) {
-        return vec![target_layout(*abi)];
+        return Some(target_layout(*abi));
     }
-    vec![LinuxLayout::Lp64, LinuxLayout::Ilp32]
+    None
 }
 
 /// Lowers one already-decoded export record through the same table-layout and
@@ -8107,7 +8106,10 @@ fn lower_publication_record(
     }
     match lower_heap_publication_record(view, maps, hooks, record, &[], budget, gi_hook)? {
         HeapLowerOutcome::Admitted(mut module) => {
-            if record.kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN && record.usable_n > 0 {
+            if record.kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                && record.name_class == DISCOVERY_NAME_EXACT_STANDARD
+                && record.usable_n > 0
+            {
                 module.interfaces[0].table = Some(0);
             }
             Ok(Some(module))
@@ -8176,43 +8178,34 @@ fn lower_heap_publication_record(
     }
     budget.spend(1)?;
 
-    // Strongest layout first, at most two bounded reads; the wrong width
-    // fails fast on the version word.
-    let mut refusals = Vec::new();
-    let mut validated = None;
-    for layout in heap_table_layouts(hook_name, view.id(), modules) {
-        match Engine::read_acquired_table_bracketed(view, layout, index_a, budget, record) {
-            Ok(valid) => {
-                validated = Some((layout, valid));
-                break;
+    let validated = Engine::read_process_table_layout(view, budget)
+        .or_else(|refusal| {
+            if refusal == ExactReadRefusal::Unreadable {
+                known_heap_table_layout(hook_name, view.id(), modules).ok_or(refusal)
+            } else {
+                Err(refusal)
             }
-            Err(refusal) => refusals.push(refusal),
+        })
+        .and_then(|layout| {
+            Engine::read_acquired_table_bracketed(view, layout, index_a, budget, record)
+                .map(|table| (layout, table))
+        });
+    let (layout, (mut table, bytes)) = match validated {
+        Ok(validated) => validated,
+        Err(refusal) => {
+            return Ok(HeapLowerOutcome::Refused(match refusal {
+                ExactReadRefusal::Budget => {
+                    "a published table validation stopped at a decode budget ceiling"
+                }
+                ExactReadRefusal::Unstable => {
+                    "a published table moved or the process generation changed during validation"
+                }
+                ExactReadRefusal::Unreadable => {
+                    "a published table address was unreadable when validated"
+                }
+                _ => "a published table's bytes did not decode as a function table",
+            }));
         }
-    }
-    let Some((layout, (mut table, bytes))) = validated else {
-        // The most actionable refusal first: a capture stop, then
-        // instability (the world moved mid-read), then undecodability.
-        let refusal = refusals
-            .iter()
-            .find(|refusal| **refusal == ExactReadRefusal::Budget)
-            .or_else(|| {
-                refusals
-                    .iter()
-                    .find(|refusal| **refusal == ExactReadRefusal::Unstable)
-            })
-            .or(refusals.first());
-        return Ok(HeapLowerOutcome::Refused(match refusal {
-            Some(ExactReadRefusal::Budget) => {
-                "a published table validation stopped at a decode budget ceiling"
-            }
-            Some(ExactReadRefusal::Unstable) => {
-                "a published table moved or the process generation changed during validation"
-            }
-            Some(ExactReadRefusal::Unreadable) => {
-                "a published table address was unreadable when validated"
-            }
-            _ => "a published table's bytes did not decode as a function table",
-        }));
     };
 
     // A carried prefix is the probe's observation; the mem read above is
@@ -8222,7 +8215,8 @@ fn lower_heap_publication_record(
     if usable > 0 {
         let header_unavailable =
             record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0
-                && record.completed_prefix == record.pointers_attempted;
+                && record.version_major == 0
+                && record.version_minor == 0;
         if !header_unavailable
             && record_prefix_version(record).is_some_and(|version| version != table.version)
         {
@@ -8304,22 +8298,25 @@ fn publication_module(
     path: String,
     mut table: ScannedTable,
 ) -> ScannedModule {
-    // The provider returned this table through a live export: its ordinal
-    // names carry publication evidence, unlike heuristic decode. Manifest
-    // agreement is derived per rebuild by fallback binding, never here.
-    table.live_return = record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN
-        || record.name_class == DISCOVERY_NAME_EXACT_STANDARD;
+    // The return is an observation fact even when an opaque interface does
+    // not prove a standard ordinal layout. Naming is scored separately.
+    table.live_return = true;
     table.manifest_supported = false;
     let interfaces = match record.kind {
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
             vec![ScannedInterface {
-                index: usize::from(record.interface_index),
+                index: if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                    0
+                } else {
+                    usize::from(record.interface_index)
+                },
                 name_class: name_class(record.name_class),
                 name_lossy: None,
                 name_private: None,
                 flags: record.interface_flags,
-                // Unlinked by contract (see above): no widening.
-                table: None,
+                // Opaque source context limits naming without conferring
+                // standard linkage or a selection enumeration position.
+                table: (record.name_class != DISCOVERY_NAME_EXACT_STANDARD).then_some(0),
             }]
         }
         _ => Vec::new(),
@@ -8389,8 +8386,16 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         }
     }
     let mut table_indices = Vec::new();
-    for table in incoming.tables.drain(..) {
-        let index = existing.tables.iter().position(|known| *known == table);
+    for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
+        let opaque = table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
+        let index = existing
+            .tables
+            .iter()
+            .enumerate()
+            .position(|(index, known)| {
+                *known == table
+                    && table_has_only_opaque_interfaces(index, &existing.interfaces) == opaque
+            });
         table_indices.push(match index {
             Some(index) => {
                 // Same table seen twice: publication evidence unions —
@@ -16138,19 +16143,51 @@ impl Engine {
             .map_err(|_| ())
     }
 
-    /// Bounded exact-address table validation, shared by the selection path
-    /// and heap-wrapper export lowering: maps-A membership, one bounded mem
-    /// read (version word first, then the readable table extent), same-decoder
-    /// decode against index A, then the maps-B stability bracket plus the
-    /// generation check. Returns the containing mapping, the decoded table,
-    /// and the raw table bytes (publication cross-checks need them).
-    ///
-    /// `allow_span` (broad fixed-family only) permits the table extent to
-    /// cover a run of contiguous readable mappings instead of one: a fixed
-    /// pool legitimately crosses the file-tail/anonymous-BSS split. The run
-    /// is contiguity-checked mapping by mapping, fully decoded (the
-    /// validated entries stay the content anchor), and every touched
-    /// mapping is stability-bracketed — same contract, wider extent.
+    /// Read the process ELF class under file and generation brackets before
+    /// interpreting acquired words. Sparse or empty tables cannot prove ABI.
+    fn read_process_table_layout(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<LinuxLayout, ExactReadRefusal> {
+        if budget.stopped_now().is_some() || !budget.charge(1) {
+            return Err(ExactReadRefusal::Budget);
+        }
+        let open = || File::open(format!("/proc/{}/exe", view.pid()));
+        let file = view
+            .run_while_same(open)
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        let before = FileSnapshot::read(&file).map_err(|_| ExactReadRefusal::Unreadable)?;
+        let mut header = [0u8; 20];
+        if budget.allowed_io(0, header.len()) < header.len() {
+            return Err(ExactReadRefusal::Budget);
+        }
+        let read = file
+            .read_at(&mut header, 0)
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        budget.record_io(read);
+        let current = view
+            .run_while_same(open)
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unstable)?;
+        if FileSnapshot::read(&file).ok() != Some(before)
+            || FileSnapshot::read(&current).ok() != Some(before)
+            || !view.still_the_same()
+        {
+            return Err(ExactReadRefusal::Unstable);
+        }
+        if read != header.len() || &header[..4] != b"\x7fELF" || header[5] != 1 || header[6] != 1 {
+            return Err(ExactReadRefusal::Unreadable);
+        }
+        match (header[4], little_u16(&header[18..20])) {
+            (1, 3) => Ok(LinuxLayout::Ilp32),
+            (2, 62) => Ok(LinuxLayout::Lp64),
+            _ => Err(ExactReadRefusal::Unreadable),
+        }
+    }
+
+    /// Bounded acquired-word validation. Only readable words enter the
+    /// decoded prefix, and every read mapping and valid target is bracketed.
     fn read_acquired_table_bracketed(
         view: &ProcessView,
         layout: LinuxLayout,
@@ -16265,6 +16302,9 @@ impl Engine {
         Ok((table, bytes))
     }
 
+    /// Raw exact-address validation brackets the complete decoded extent and
+    /// targets with maps A/B and the process generation. `allow_span` permits
+    /// a contiguous readable run across a file-tail/anonymous-BSS split.
     fn read_exact_table_bracketed(
         view: &ProcessView,
         address: u64,

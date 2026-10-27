@@ -40,13 +40,12 @@
 //! 15. `f_e08_null_default_and_failure_request_matrix`
 //! 16. `f_e08_version_shape_matrix`
 //! 17. `f_e13_first_call_gap_and_precapture_boundary`
-//! 18. `f_e15_malicious_entries_refused_equally`
+//! 18. `f_e15_partial_tables_retain_valid_targets`
 //! 19. `f_e15_forged_exact_name_stays_count_only`
 //! 20. `f_e21_gi_public_output_carries_no_raw_pointers`
 //!
-//! Supported equivalent factory forms must yield the same exact count-only
-//! endpoint set; unsupported forms must refuse with the same specific
-//! omission on every route. Selection authority guards stay intact: the
+//! Equivalent factory forms retain the same observed count-only endpoint set.
+//! Partial reads and unusable entries disclose the coverage actually obtained. Selection authority guards stay intact: the
 //! `C_GetInterface` tuple/claim path is unchanged, and publication lowers
 //! through the shared bounded ownership-validation path.
 use super::session_fixture::ScriptedSession;
@@ -3836,11 +3835,16 @@ fn f_e08_version_shape_matrix() {
         stage.free(idx);
     }
 
-    // Walked shapes: GI and element admit the identical walked set.
+    // The acquired known extent is complete independently of its metadata label.
     for (major, minor, version_class, walked) in [
         (3u8, 2u8, DISCOVERY_VERSION_V3_2, 104usize),
         (3, 1, DISCOVERY_VERSION_V3_1, 92),
         (3, 0, DISCOVERY_VERSION_V3_0, 92),
+        (2, 39, DISCOVERY_VERSION_OTHER, 68),
+        (2, 41, DISCOVERY_VERSION_OTHER, 68),
+        (3, 3, DISCOVERY_VERSION_OTHER, 104),
+        (4, 0, DISCOVERY_VERSION_OTHER, 68),
+        (7, 231, DISCOVERY_VERSION_OTHER, 68),
     ] {
         stage.set_version(17, major, minor);
         let publish = stage.publish();
@@ -3896,126 +3900,6 @@ fn f_e08_version_shape_matrix() {
             );
         }
         assert_count_only(&gi_engine);
-    }
-
-    // Non-listed minors: both routes admit the same known prefix with
-    // the explicit known-prefix marker — the shared export contract for
-    // shapes past the fully known list (owner-approved 2026-09-27: the
-    // live-export path follows the helper's versioning rule, so `{2,41}`
-    // and `{3,3}` prefix instead of refusing).
-    for (major, minor, walked) in [(2u8, 39u8, 68usize), (2, 41, 68), (3, 3, 104)] {
-        stage.set_version(17, major, minor);
-        let publish = stage.publish();
-        let heap17 = publish
-            .elements
-            .iter()
-            .find(|table| table.index == 17)
-            .expect("heap 17 published")
-            .clone();
-        assert_eq!((heap17.major, heap17.minor), (major, minor));
-        let iface = stage.gi(Some("P11Scope-MW-17"), None);
-        assert_eq!(iface.rv, 0);
-        let mut element_engine = engine_over_pids(&[stage.pid]);
-        drain_records(
-            &mut element_engine,
-            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
-        );
-        let mut gi_engine = engine_over_pids(&[stage.pid]);
-        let view = gi_engine.views[0].id();
-        let object = gi_provider_object(&gi_engine);
-        let binding = gi_binding(&mut gi_engine, view, object);
-        drain_records(
-            &mut gi_engine,
-            vec![gi_record(
-                stage.pid,
-                binding.id,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
-                iface.table,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
-            )],
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            slot_targets(&element_engine),
-            "{{{major},{minor}}}: identical known-prefix endpoint sets"
-        );
-        for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
-            let tables: Vec<_> = engine
-                .modules
-                .iter()
-                .flat_map(|module| &module.scanned.tables)
-                .filter(|table| table.address == heap17.addr)
-                .collect();
-            assert_eq!(tables.len(), 1, "{label} {{{major},{minor}}}: one instance");
-            assert_eq!(tables[0].version, (major, minor));
-            assert_eq!(tables[0].walk, "known_prefix", "{label}: explicit bound");
-            assert_eq!(
-                tables[0].entries.len(),
-                walked,
-                "{label} {{{major},{minor}}}: the walked prefix only"
-            );
-        }
-    }
-
-    // Unwalkable shapes: both routes refuse with the explicit decode
-    // omission and admit nothing beyond the scan baseline. Only the new
-    // major refuses now (owner-approved 2026-09-27).
-    {
-        let (major, minor) = (4u8, 0u8);
-        stage.set_version(17, major, minor);
-        let publish = stage.publish();
-        let heap17 = publish
-            .elements
-            .iter()
-            .find(|table| table.index == 17)
-            .expect("heap 17 published")
-            .clone();
-        assert_eq!((heap17.major, heap17.minor), (major, minor));
-        let iface = stage.gi(Some("P11Scope-MW-17"), None);
-        assert_eq!(iface.rv, 0, "the factory still returns the table");
-
-        let mut element_engine = engine_over_pids(&[stage.pid]);
-        let element_baseline = slot_targets(&element_engine);
-        drain_records(
-            &mut element_engine,
-            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
-        );
-        let mut gi_engine = engine_over_pids(&[stage.pid]);
-        let gi_baseline = slot_targets(&gi_engine);
-        let view = gi_engine.views[0].id();
-        let object = gi_provider_object(&gi_engine);
-        let binding = gi_binding(&mut gi_engine, view, object);
-        drain_records(
-            &mut gi_engine,
-            vec![gi_record(
-                stage.pid,
-                binding.id,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
-                iface.table,
-                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
-            )],
-        );
-        assert_eq!(
-            slot_targets(&element_engine),
-            element_baseline,
-            "{{{major},{minor}}}: element admits nothing"
-        );
-        assert_eq!(
-            slot_targets(&gi_engine),
-            gi_baseline,
-            "{{{major},{minor}}}: GI admits nothing"
-        );
-        let omission = "a published table's bytes did not decode as a function table";
-        assert!(
-            skip_reasons(&element_engine)
-                .contains(&("live export discovery".to_string(), omission.to_string())),
-            "{{{major},{minor}}}: element carries the explicit omission"
-        );
-        assert!(
-            skip_reasons(&gi_engine)
-                .contains(&("live interface selection".to_string(), omission.to_string())),
-            "{{{major},{minor}}}: GI carries the same explicit omission"
-        );
     }
 }
 

@@ -779,12 +779,13 @@ fn observed_interface_identity(
     let mut identity =
         interface_identity(table, name_class, name_private, flags, maps, runtime_view)?;
     if let InterfaceTableKey::Runtime(key) = &mut identity.table
-        && let Some(content) = budget.runtime_table_contents.get(&(
+        && let Some((shape, content)) = budget.runtime_table_contents.get(&(
             key.view,
             key.address,
             key.version_word,
             key.usable,
         ))
+        && key.content == *shape
     {
         key.content = *content;
     }
@@ -907,7 +908,7 @@ pub struct CaptureWorkBudget {
     // One current fingerprint per admitted runtime table position. This
     // map is bounded by admitted_runtime_tables, including invalid words
     // without placing their values in diagnostic/output records.
-    runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), u64>,
+    runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), (u64, u64)>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
     interface_records: usize,
@@ -2071,9 +2072,8 @@ pub(crate) struct TableEvidenceScore {
     pub(crate) linked: bool,
     pub(crate) live_return: bool,
     pub(crate) manifest: bool,
-    /// A fully walked table whose ordinals agree with the object's exported
-    /// standard names (`ExportAgreement::corroborates`). Names only: scan
-    /// targets stay count-only whatever their linkage.
+    /// Every retained target agrees with the object's own exported standard
+    /// name. Names only: scan targets stay count-only whatever their linkage.
     pub(crate) exports: bool,
     pub(crate) full_walk: bool,
 }
@@ -2092,6 +2092,8 @@ pub(crate) fn table_evidence_score(
     exports: &ObjectExports<'_>,
 ) -> TableEvidenceScore {
     let table = &tables[index];
+    let opaque_only = table_has_only_opaque_interfaces(index, interfaces);
+    let agreement = export_agreement(table, exports);
     TableEvidenceScore {
         // Only the standard `"PKCS 11"` interface implies the standard
         // function-list layout: a vendor ("other"), "null" or "unreadable"
@@ -2102,9 +2104,10 @@ pub(crate) fn table_evidence_score(
         linked: interfaces.iter().any(|interface| {
             interface.table == Some(index) && interface.name_class == "exact_standard"
         }),
-        // Either the export lowering recorded a live return at decode time, or
-        // a caller-held generation-safe address matches this table instance.
-        live_return: table.live_return || live_return_addresses.contains(&table.address),
+        // An opaque interface return proves an observation, not the standard
+        // layout. Typed legacy and exact-standard returns keep their proof.
+        live_return: !opaque_only
+            && (table.live_return || live_return_addresses.contains(&table.address)),
         // Either a bound fallback proof recorded manifest agreement, or a
         // caller-held manifest table offset matches this table instance.
         manifest: table.manifest_supported
@@ -2113,17 +2116,32 @@ pub(crate) fn table_evidence_score(
                 .is_some_and(|offset| manifest_offsets.contains(&offset)),
         // Corroboration concerns the positions actually observed. A label
         // suggesting an unavailable extension cannot erase their evidence.
-        exports: table.file_offset.is_some() && export_agreement(table, exports).corroborates(),
+        exports: table.file_offset.is_some()
+            && agreement.corroborates()
+            && agreement.agreeing == table.entries.len(),
         full_walk: table.walk == "full",
     }
+}
+
+/// Opaque associations cannot supply the standard ordinal layout. Merge keeps
+/// these observations separate from a typed getter's stronger naming proof.
+pub(crate) fn table_has_only_opaque_interfaces(
+    index: usize,
+    interfaces: &[ScannedInterface],
+) -> bool {
+    interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index))
+        && !interfaces.iter().any(|interface| {
+            interface.table == Some(index) && interface.name_class == "exact_standard"
+        })
 }
 
 /// Whether a score authorizes presenting the table's ordinal names as PKCS#11
 /// names: some publication evidence (linkage, live return, manifest, export
 /// agreement) said this table is the provider's — bare size/version
-/// plausibility never does. This is the single authorization predicate:
-/// admission bypass and name gating both read it, so a table cannot be
-/// published-but-unnamed or named-but-heuristic.
+/// plausibility never does. Observation admission also accepts an actual
+/// opaque publication without promoting its API names.
 pub(crate) fn table_name_authorized(score: &TableEvidenceScore) -> bool {
     score.linked || score.live_return || score.manifest || score.exports
 }
@@ -2690,13 +2708,7 @@ pub(crate) fn decode_observed_words(
             return Err(());
         }
     }
-    if let Some(id) = runtime_identity {
-        budget.runtime_table_contents.insert(
-            (id.view, id.address, id.version_word, id.usable),
-            id.content,
-        );
-    }
-    Ok(Some(ScannedTable {
+    let table = ScannedTable {
         version,
         walk: if usable == limit && unpinned.is_empty() {
             "full"
@@ -2710,7 +2722,17 @@ pub(crate) fn decode_observed_words(
         file_offset: file_owner.map(|(_, _, offset)| offset),
         live_return: false,
         manifest_supported: false,
-    }))
+    };
+    if let Some(id) = runtime_identity {
+        budget.runtime_table_contents.insert(
+            (id.view, id.address, id.version_word, id.usable),
+            (
+                stored_table_content_hash(&table, version_word, usable),
+                id.content,
+            ),
+        );
+    }
+    Ok(Some(table))
 }
 
 /// Only validated targets become dependencies. Invalid observed words remain
@@ -2771,7 +2793,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     mut now: F,
 ) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
-    let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    let mut found: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
     let mut anchors: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     if let Some(exports) = export_evidence {
         if let Err(reason) = budget.spend(maps.entries().len() as u64) {
@@ -2787,16 +2809,31 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             })
             .collect();
         for (name, file_offset) in exports.symbols {
+            if let Some(reason) = budget.check_deadline(now()) {
+                return (Vec::new(), vec![reason.to_string()]);
+            }
+            if let Err(reason) = budget.spend(1) {
+                return (Vec::new(), vec![reason.to_string()]);
+            }
             let Some(ordinal) = standard_ordinal(name).map(usize::from) else {
                 continue;
             };
             for mapping in &executable {
+                if let Some(reason) = budget.check_deadline(now()) {
+                    return (Vec::new(), vec![reason.to_string()]);
+                }
+                if let Err(reason) = budget.spend(1) {
+                    return (Vec::new(), vec![reason.to_string()]);
+                }
                 if let Some(address) = file_offset
                     .checked_sub(mapping.file_offset)
                     .and_then(|delta| mapping.start.checked_add(delta))
                     .filter(|address| *address < mapping.end)
                 {
-                    anchors.entry(address).or_default().push(ordinal);
+                    let ordinals = anchors.entry(address).or_default();
+                    if !ordinals.contains(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
                 }
             }
         }
@@ -2829,7 +2866,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
             Ok(Some((table, len))) => {
                 seen.insert(offset, table.decoded_slot_count());
-                found.push((offset, len, table));
+                found.push((offset, len, true, table));
             }
             // Owner-approved 2026-09-27: F-14's version skip is retired —
             // future minors walk as known prefixes, and anything else the
@@ -2868,9 +2905,6 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 let version = (header as u8, (header >> 8) as u8);
                 // Extended positions need their own export witness. A legacy
                 // label/common extent never turns following data into 3.x APIs.
-                if ordinal >= 68 && version.0 != 3 {
-                    continue;
-                }
                 let limit = if ordinal < 68 {
                     68
                 } else if ordinal < 92 {
@@ -2897,6 +2931,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                         found.push((
                             candidate,
                             table_bytes(layout, count).expect("bounded catalog"),
+                            false,
                             table,
                         ));
                     }
@@ -2914,11 +2949,12 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         }
         offset += width;
     }
-    // Longest first, then drop anything overlapping an already-kept match.
-    found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut kept: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    // Fully validated shapes outrank weaker export-anchored recovery. Within
+    // one evidence class keep the longest nonoverlapping match.
+    found.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+    let mut kept: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
     for candidate in found {
-        let overlaps = kept.iter().any(|(start, len, _)| {
+        let overlaps = kept.iter().any(|(start, len, _, _)| {
             candidate.0 < start.saturating_add(*len)
                 && *start < candidate.0.saturating_add(candidate.1)
         });
@@ -2926,9 +2962,9 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             kept.push(candidate);
         }
     }
-    kept.sort_by_key(|(start, _, _)| *start);
+    kept.sort_by_key(|(start, _, _, _)| *start);
     (
-        kept.into_iter().map(|(_, _, table)| table).collect(),
+        kept.into_iter().map(|(_, _, _, table)| table).collect(),
         skipped,
     )
 }
@@ -7557,12 +7593,10 @@ mod tests {
         assert!(table_name_authorized(&score));
     }
 
-    /// U-15: a table with a vendor-only interface link is not authorized by
-    /// that link, but stays authorized when live-return or manifest evidence
-    /// also names it — linkage alone never authorizes names, but it never
-    /// takes away authorization another evidence source already gave.
+    /// An opaque return is observable without layout names; independently
+    /// bound manifest evidence can still supply those names.
     #[test]
-    fn vendor_linked_table_stays_authorized_via_live_return_or_manifest_evidence() {
+    fn opaque_publication_needs_independent_layout_evidence_for_names() {
         let live_returned = ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -7604,9 +7638,10 @@ mod tests {
         let live_score =
             table_evidence_score(0, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
         assert!(!live_score.linked, "the vendor interface must not link");
-        assert!(live_score.live_return);
-        assert_eq!(table_linkage(&live_score), "live_return");
-        assert!(table_name_authorized(&live_score));
+        assert!(!live_score.live_return);
+        assert_eq!(table_linkage(&live_score), "heuristic");
+        assert!(!table_name_authorized(&live_score));
+        assert!(table_observation_authorized(&tables[0], &live_score));
 
         let manifest_score =
             table_evidence_score(1, &tables, &interfaces, &[], &[], &ObjectExports::NONE);

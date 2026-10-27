@@ -245,8 +245,10 @@ fn scan_empty_maps_exited_view_is_never_absence() {
     // A child pinned alive, then killed and reaped before the scan: the
     // pinned generation is provably gone, so even scripted kernel-thread
     // bytes bound to its old start time must not classify.
+    // A held stdin pipe keeps `cat` waiting; a null stdin lets it exit
+    // before the pin, which then fails on the dead mount namespace.
     let mut child = std::process::Command::new("cat")
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("spawn a child that waits to be killed");
     let pid = child.id();

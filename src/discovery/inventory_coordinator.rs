@@ -12754,10 +12754,13 @@ exit 0
 
     #[test]
     fn an_exec_without_a_live_answer_mints_no_successor() {
-        // No live cookie answers through the held pin: the current image
-        // is unproven, so the old incarnation retires (the hook proved its
-        // end) without a successor, disclosed.
+        // The cookie query through the held pin cannot answer: the current
+        // image is unproven, so the old incarnation retires (the hook
+        // proved its end) without a successor, disclosed. (A `NoCookie`
+        // answer is liveness, not this case: see
+        // `an_exec_hook_mints_while_the_leader_holds_no_ticket_yet`.)
         let (mut native, caller) = NativeScene::new();
+        native.unavailable_answer(7, 500);
         native.scene.coordinator.exit_clocks_comparable = true;
         let at = native.stamps.tick();
         let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
@@ -12830,6 +12833,116 @@ exit 0
         let second = native.stage(NativeBatch::Lifecycle(replay));
         assert!(second.events.is_empty(), "{:?}", second.events);
         assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+    }
+
+    /// One `EXEC` lifecycle record for pid 7 stamped `hook_ts_ns`, drained
+    /// at `at`.
+    fn exec_hook_drain(domain: NativeDomainId, at: u64, hook_ts_ns: u64) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = hook_ts_ns;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain
+    }
+
+    #[test]
+    fn an_exec_hook_mints_while_the_leader_holds_no_ticket_yet() {
+        // Fedora's lost race: the EXEC record drains before the new image
+        // enters any instrumented endpoint, so its leader holds no ticket
+        // in this domain yet (`NoCookie`: the pidfd was live before and
+        // after the lookup). Liveness through the held pin plus the
+        // ordered hook prove the turnover: the successor mints, disclosed,
+        // and the new image's first row binds to it. Refusing here retired
+        // the caller and left the pid to a later scalar-PID re-admission.
+        let (mut native, caller) = NativeScene::new();
+        native.query_answer(7, 500, CookieQuery::NoCookie);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, at);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+            panic!(
+                "a live pin without a ticket must still mint: {:?}",
+                receipt.events
+            );
+        };
+        assert_eq!(*old, caller);
+        let successor = *new;
+        assert_ne!(successor, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(successor));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = native.gap_subjects();
+        assert!(
+            subjects.contains(&"exec successor minted without a held predecessor".to_string()),
+            "the unheld predecessor is disclosed: {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"successor admission refused without a live image".to_string()),
+            "a live pin is not refused: {subjects:?}"
+        );
+        // The new image's first entry mints its ticket after the hook; its
+        // row binds to the minted successor, never to the retired image.
+        native.answer(7, 500, 41);
+        let t0 = native.stamps.tick();
+        let row = native.row(41, 2, 7, t0, 0);
+        native.witness(vec![row]);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, successor),
+            "the successor's own row binds: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+    }
+
+    #[test]
+    fn an_exec_hook_for_an_exited_process_mints_no_successor() {
+        // Twin: the held pin reports the process exited during the query,
+        // so no current image exists. The hook still proved the old image
+        // ended: it retires without a successor, and the refusal names the
+        // exit.
+        let (mut native, caller) = NativeScene::new();
+        native.query_answer(7, 500, CookieQuery::Exited);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, at);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!("an exited pin mints nothing: {:?}", receipt.events);
+        };
+        assert_eq!(*id, caller);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let refusal = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .find(|gap| gap.subject == "successor admission refused without a live image")
+            .map(|gap| gap.reason.clone())
+            .expect("the refusal is disclosed");
+        assert!(refusal.contains("exited"), "{refusal}");
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"exec successor minted without a held predecessor".to_string())
+        );
     }
 
     #[test]

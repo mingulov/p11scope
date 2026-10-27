@@ -777,6 +777,15 @@ pub(crate) struct AttestedSemanticLane {
     /// the lane wrapper, or a driver-noted terminal refusal. The machine
     /// holds its own latch; the lane query reports either.
     joint_finish_failure: Option<SemanticRefusal>,
+    /// The lane's stop certification: Quiesced only when a finish
+    /// proved its own drain (Q observed, discovery drained to Q,
+    /// the retained original sealed and delivered at Q, producers
+    /// frozen). Lane-level, not session-level: the joint finish
+    /// completes the lane, and substituted lanes prove the same
+    /// drain without a live Session.
+    stop_state: StopState,
+    /// True only beside a Quiesced stop: the final drain is proven.
+    final_drain: bool,
     /// Set by the I2 abandon: the lane finished without a published
     /// Finish and stays retained for process exit. Wound-down and take
     /// refuse forever; the Session never begins owned detach.
@@ -1235,8 +1244,6 @@ pub(crate) struct LiveLane {
     attached: AttachedSemanticSet,
     gated: bool,
     finished: bool,
-    stop_state: StopState,
-    final_drain: bool,
     ticks: u64,
     scan_refusals: u64,
     /// CALL records drained across ticks and the terminal drain.
@@ -1346,6 +1353,8 @@ impl AttestedSemanticLane {
             startup_failed: false,
             collected_finish_requested: false,
             joint_finish_failure: None,
+            stop_state: StopState::Running,
+            final_drain: false,
             exit_retained: false,
             wound_down_complete: false,
             staged_at: None,
@@ -1478,8 +1487,6 @@ impl AttestedSemanticLane {
                 attached,
                 gated: false,
                 finished: false,
-                stop_state: StopState::Running,
-                final_drain: false,
                 ticks: 0,
                 scan_refusals: 0,
                 collected_calls: 0,
@@ -1494,6 +1501,8 @@ impl AttestedSemanticLane {
             startup_failed: false,
             collected_finish_requested: false,
             joint_finish_failure: None,
+            stop_state: StopState::Running,
+            final_drain: false,
             exit_retained: false,
             wound_down_complete: false,
             staged_at: None,
@@ -1697,6 +1706,7 @@ impl AttestedSemanticLane {
                 return Err(SemanticRefusal::Unavailable);
             }
             self.test_finished = true;
+            self.certify_joint_stop();
             return Ok(());
         }
         let live = self
@@ -1715,7 +1725,18 @@ impl AttestedSemanticLane {
         }
         live.finished = true;
         live.continuity_cuts = live.capture.continuity_cuts();
+        self.certify_joint_stop();
         Ok(())
+    }
+
+    /// Record the joint finish's own drain proof: reaching here
+    /// means Q was observed, discovery drained to Q, the retained
+    /// original sealed and delivered at Q, and producers frozen
+    /// (the checks above). Only completion certifies; a refusal
+    /// anywhere above leaves the drain unproven.
+    fn certify_joint_stop(&mut self) {
+        self.stop_state = StopState::Quiesced { at: Instant::now() };
+        self.final_drain = true;
     }
 
     /// Begin native closes only after the driver's H0 Finish publication.
@@ -3732,7 +3753,7 @@ impl AttestedSemanticLane {
         };
         live.session.stop_gate().request_stop();
         live.gated = true;
-        live.stop_state = StopState::StopRequested;
+        self.stop_state = StopState::StopRequested;
     }
 
     /// Tests-only composed terminal sequence over the live lane: drain
@@ -3812,14 +3833,6 @@ impl AttestedSemanticLane {
             now,
             on_batch,
         );
-        live.stop_state = if summary.quiesced {
-            StopState::Quiesced { at: Instant::now() }
-        } else {
-            StopState::QuiescenceUnproven {
-                waited: summary.waited,
-            }
-        };
-        live.final_drain = summary.final_drain;
         live.unrouted_returns = live
             .unrouted_returns
             .saturating_add(summary.unrouted_returns);
@@ -3828,6 +3841,14 @@ impl AttestedSemanticLane {
             .saturating_add(summary.drain_batches as u64);
         live.semantic_loss = summary.semantic_loss;
         live.continuity_cuts = summary.continuity_cuts;
+        self.stop_state = if summary.quiesced {
+            StopState::Quiesced { at: Instant::now() }
+        } else {
+            StopState::QuiescenceUnproven {
+                waited: summary.waited,
+            }
+        };
+        self.final_drain = summary.final_drain;
         if summary.post_q_events {
             eprintln!(
                 "p11scope: terminal semantic EVENTS drain: post-quiescence record past the Q \
@@ -3896,15 +3917,7 @@ impl AttestedSemanticLane {
             TERMINAL_DRAIN_QUANTUM,
             now,
         );
-        if let Some(live) = self.live.as_mut() {
-            live.stop_state = if summary.quiesced {
-                StopState::Quiesced { at: Instant::now() }
-            } else {
-                StopState::QuiescenceUnproven {
-                    waited: summary.waited,
-                }
-            };
-            live.final_drain = summary.final_drain;
+        let drained = if let Some(live) = self.live.as_mut() {
             live.unrouted_returns = live
                 .unrouted_returns
                 .saturating_add(summary.unrouted_returns);
@@ -3916,6 +3929,19 @@ impl AttestedSemanticLane {
             // so the end value reads the capture fresh.
             live.continuity_cuts = live.capture.continuity_cuts();
             summary.continuity_cuts = live.continuity_cuts;
+            true
+        } else {
+            false
+        };
+        if drained {
+            self.stop_state = if summary.quiesced {
+                StopState::Quiesced { at: Instant::now() }
+            } else {
+                StopState::QuiescenceUnproven {
+                    waited: summary.waited,
+                }
+            };
+            self.final_drain = summary.final_drain;
         }
         summary
     }
@@ -4024,6 +4050,11 @@ impl AttestedSemanticLane {
             .values()
             .map(|slots| slots.len() as u64)
             .sum();
+        let stop_quiescence = match self.stop_state {
+            StopState::Quiesced { .. } => SemanticStopQuiescence::Quiesced,
+            StopState::QuiescenceUnproven { .. } => SemanticStopQuiescence::Unproven,
+            StopState::Running | StopState::StopRequested => SemanticStopQuiescence::NotRequested,
+        };
         let Some(live) = self.live.as_ref() else {
             return SemanticCaptureSummary {
                 status: if self.startup_failed {
@@ -4035,8 +4066,8 @@ impl AttestedSemanticLane {
                 refused_endpoints: 0,
                 continuity_cuts: 0,
                 unrouted_returns: 0,
-                stop_quiescence: SemanticStopQuiescence::NotRequested,
-                final_drain: None,
+                stop_quiescence,
+                final_drain: self.is_finished().then_some(self.final_drain),
             };
         };
         SemanticCaptureSummary {
@@ -4051,14 +4082,8 @@ impl AttestedSemanticLane {
             refused_endpoints: live.scan_refusals,
             continuity_cuts: live.continuity_cuts,
             unrouted_returns: live.unrouted_returns,
-            stop_quiescence: match live.stop_state {
-                StopState::Quiesced { .. } => SemanticStopQuiescence::Quiesced,
-                StopState::QuiescenceUnproven { .. } => SemanticStopQuiescence::Unproven,
-                StopState::Running | StopState::StopRequested => {
-                    SemanticStopQuiescence::NotRequested
-                }
-            },
-            final_drain: live.finished.then_some(live.final_drain),
+            stop_quiescence,
+            final_drain: live.finished.then_some(self.final_drain),
         }
     }
 }

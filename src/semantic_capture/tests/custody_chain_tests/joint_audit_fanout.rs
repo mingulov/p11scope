@@ -2907,9 +2907,7 @@ fn joint_finish_completion_certifies_the_final_drain() {
     // instead of leaving the lane's drain unproven.
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture
-        .scene
-        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     fixture.published_labeled("drain prefix", None);
     fixture.enable_finish_fixture(vec![]);
     fixture.begin_finish().unwrap();
@@ -2930,9 +2928,7 @@ fn joint_finish_refusal_certifies_no_drain() {
     // fabricated settlement).
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture
-        .scene
-        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     fixture.published_labeled("drain prefix", None);
     fixture.enable_finish_fixture(vec![]);
     fixture.begin_finish().unwrap();

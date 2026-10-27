@@ -1474,6 +1474,9 @@ fn retain_refused_to_unselected(
     sweep: &[(u32, Vec<MapEntry>)],
     selected: &BTreeSet<u32>,
 ) {
+    if refused.is_empty() {
+        return;
+    }
     let unselected_keys: BTreeSet<ObjectKey> = sweep
         .iter()
         .filter(|(pid, _)| !selected.contains(pid))

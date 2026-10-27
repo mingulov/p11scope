@@ -7947,6 +7947,9 @@ fn record_prefix_version(record: &DiscoveryRecord) -> Option<(u8, u8)> {
             _ => None,
         };
     }
+    if record.pointers_attempted == 0 && record.version_major == 0 && record.version_minor == 0 {
+        return None;
+    }
     Some((record.version_major, record.version_minor))
 }
 
@@ -8375,27 +8378,39 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         }
     }
     let mut table_indices = Vec::new();
+    let mut typed_live_tables = BTreeSet::new();
     for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
-        let opaque = table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
-        let index = existing
-            .tables
-            .iter()
-            .enumerate()
-            .position(|(index, known)| {
-                *known == table
-                    && table_has_only_opaque_interfaces(index, &existing.interfaces) == opaque
-            });
+        let typed_live = table.live_return
+            && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
+        let index = existing.tables.iter().position(|known| *known == table);
         table_indices.push(match index {
             Some(index) => {
-                // Same table seen twice: publication evidence unions —
-                // whichever instance observed it, the table was observed.
+                if typed_live
+                    || (existing.tables[index].live_return
+                        && !table_has_only_opaque_interfaces(index, &existing.interfaces))
+                {
+                    typed_live_tables.insert(index);
+                    for interface in &mut existing.interfaces {
+                        if interface.table == Some(index)
+                            && interface.name_class != "exact_standard"
+                        {
+                            // Keep opaque metadata without revoking the
+                            // independent typed getter's stronger name proof.
+                            interface.table = None;
+                        }
+                    }
+                }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
                 index
             }
             None => {
                 existing.tables.push(table);
-                existing.tables.len() - 1
+                let index = existing.tables.len() - 1;
+                if typed_live {
+                    typed_live_tables.insert(index);
+                }
+                index
             }
         });
     }
@@ -8403,6 +8418,13 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         interface.table = interface
             .table
             .and_then(|index| table_indices.get(index).copied());
+        if interface.name_class != "exact_standard"
+            && interface
+                .table
+                .is_some_and(|index| typed_live_tables.contains(&index))
+        {
+            interface.table = None;
+        }
         if let Some(known) = existing.interfaces.iter_mut().find(|known| {
             known.index == interface.index
                 && known.name_class == interface.name_class

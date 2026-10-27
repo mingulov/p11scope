@@ -52712,12 +52712,18 @@ fn address_only_publication_has_no_captured_zero_version() {
     record.name_class = DISCOVERY_NAME_OTHER;
     record.announced_count = 1;
     assert!(valid_discovery_record(&record));
-    assert_eq!(record_prefix_version(&record), None,
-        "address-only transport does not assert observed version0.0");
+    assert_eq!(
+        record_prefix_version(&record),
+        None,
+        "address-only transport does not assert observed version0.0"
+    );
     record.version_major = 3;
     record.version_minor = 2;
-    assert_eq!(record_prefix_version(&record), Some((3, 2)),
-        "actual carried version metadata remains available");
+    assert_eq!(
+        record_prefix_version(&record),
+        Some((3, 2)),
+        "actual carried version metadata remains available"
+    );
 }
 
 #[test]
@@ -52825,11 +52831,19 @@ fn mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof() {
             scores.iter().any(table_name_authorized),
             "the typed getter proof survives either order"
         );
-        assert_eq!(module.tables.len(), 1, "one physical table has one row for identical contents");
+        assert_eq!(
+            module.tables.len(),
+            1,
+            "one physical table has one row for identical contents"
+        );
         assert!(table_observation_authorized(&module.tables[0], &scores[0]));
-        assert!(module.interfaces.iter().any(|interface|
-            interface.name_class == "other" && interface.table.is_none()),
-            "opaque metadata is retained without revoking an independent typed proof");
+        assert!(
+            module
+                .interfaces
+                .iter()
+                .any(|interface| interface.name_class == "other" && interface.table.is_none()),
+            "opaque metadata is retained without revoking an independent typed proof"
+        );
     }
 }
 

@@ -24540,10 +24540,7 @@ fn counter_start_readmits_retained_plan_under_its_budget_after_stale_removal() {
         false,
         |_| {
             checks.set(checks.get() + 1);
-            (checks.get() == 1)
-                .then_some(stale)
-                .into_iter()
-                .collect()
+            (checks.get() == 1).then_some(stale).into_iter().collect()
         },
         |_, _| {
             log.borrow_mut().push("start");

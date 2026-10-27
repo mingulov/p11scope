@@ -5179,8 +5179,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // ends observation, it does not unprove the sole owner. Refusals,
             // domain loss and capture loss still cancel.
             let exit_clean = self.retirement_exit_clean(key, &recovery);
+            // Native service ticks run between catalog reconciliations. A
+            // dead original pin can therefore precede the adapter's Exited
+            // classification. Keep an unarmed ordinary pair pending until
+            // that classification, rather than permanently treating this
+            // scheduling race as an ownership change. This stages no count
+            // and grants no current-image proof. Stop and every independent
+            // refusal below still cancel, even before another catalog pass.
+            let classification_pending = live.is_none()
+                && !self.stopped
+                && recovery.ordinary_checkpoint != 0
+                && !recovery.blocked
+                && !Self::retirement_armed(&recovery)
+                && self.adapter.record(recovery.caller).is_some_and(|record| {
+                    !record.retired
+                        && self.adapter.live_id(record.pid) == Some(recovery.caller)
+                        && self.adapter.live_pin(record.pid).is_some()
+                });
             let canceled = recovery.receipt_refused
-                || (live.is_none() && !exit_clean)
+                || (live.is_none() && !exit_clean && !classification_pending)
                 || !self.binder.domain_active(key.image.domain())
                 || self.capture.as_ref().is_some_and(|capture| {
                     capture.stopped
@@ -5208,6 +5225,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     DiagnosticReason::IdentityChanged
                 };
                 self.cancel_retirement_candidate(key, &mut recovery, held, reason);
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if classification_pending {
+                self.diagnostic_recovery_wait(
+                    key,
+                    &mut recovery,
+                    DiagnosticReason::IdentityChanged,
+                    held,
+                );
                 self.recoveries.insert(key, recovery);
                 continue;
             }

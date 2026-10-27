@@ -5222,6 +5222,157 @@ fn cnt1_terminal_growth_of_exited_sole_owner_attributes() {
     );
 }
 
+fn dead_pin_tick_then_terminal_count(abandon_pending: bool) {
+    let mut scene = Cnt1Steady::new();
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    scene.pass_count(230, 161950);
+    assert_eq!(scene.edge_count(), 161950);
+
+    // Between catalog passes the native lane services lifecycle quanta. The
+    // original pin may already prove death, while reconcile has not yet
+    // changed the retained caller's lifecycle to Exited.
+    scene.native.scene.source.kill(7);
+    scene.drain();
+    assert!(
+        !scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(scene.caller)
+            .unwrap()
+            .retired,
+        "the service tick precedes catalog exit classification"
+    );
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "cannot inventory pid 7: the process could not be read",
+        2000,
+    );
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, 162003)]);
+
+    if abandon_pending {
+        // Exercise the real abandonment entrypoint over the coordinator's
+        // retained-publication seam. This pose supplies no semantic frame or
+        // new authority; the ordinary physical count must survive it.
+        let lowering = scene.catalog(2100).lowering.unwrap();
+        let subset =
+            semantics::AttestedSubset::scripted(lowering.plan, lowering.pins, BTreeMap::new());
+        let mut lane = AttestedSemanticLane::start(
+            subset,
+            &crate::attach::Scope::System,
+            crate::attach::BackendSelection::Auto,
+        )
+        .unwrap();
+        let coordinator = &mut scene.native.scene.coordinator;
+        coordinator.pose_pending_joint_publication_for_test();
+        assert!(coordinator.publication_pending());
+        coordinator.abandon_unfinished_joint_publication(
+            &mut lane,
+            None,
+            "test publication stopped after caller exit".into(),
+        );
+        assert!(!coordinator.publication_pending());
+    }
+    scene.commit();
+    assert_eq!(
+        scene.edge_count(),
+        162003,
+        "the final absolute read retains the complete proven-exited sole owner history; gaps={:?}",
+        scene.owner_unproven_gaps(),
+    );
+    assert!(scene.owner_unproven_gaps().is_empty());
+}
+
+#[test]
+fn cnt1_dead_pin_tick_before_exit_classification_retains_terminal_count() {
+    dead_pin_tick_then_terminal_count(false);
+}
+
+#[test]
+fn cnt1_dead_pin_tick_and_publication_abandon_retain_terminal_count() {
+    dead_pin_tick_then_terminal_count(true);
+}
+
+#[test]
+fn cnt1_exec_transition_does_not_authorize_late_old_image_count() {
+    let mut scene = Cnt1Steady::new();
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    scene.pass_count(230, 161950);
+    // An executable change retires the old image, rather than proving a
+    // continuous sole-owner exit. Its late count cannot borrow the new
+    // image's still-live process custody.
+    scene.native.scene.source.exec(7, 600, "/bin/new-image");
+    scene.drain();
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "the original executable image is no longer current",
+        2000,
+    );
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(scene.caller)
+            .unwrap()
+            .lifecycle,
+        crate::discovery::caller_registry::CallerLifecycle::ExecRetired,
+    );
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, 162003)]);
+    scene.commit();
+    assert_eq!(scene.edge_count(), 161950);
+    assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    assert!(scene.owner_unproven_gaps()[0].contains("(161950, 162003]"));
+}
+
+#[test]
+fn cnt1_dead_pin_tick_keeps_capture_loss_cancellation() {
+    let mut scene = Cnt1Steady::new();
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    scene.pass_count(230, 161950);
+    let coordinator = &mut scene.native.scene.coordinator;
+    coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+    coordinator.note_lifecycle_loss(&crate::attach::capture::LifecycleLoss {
+        at_ns: 1800,
+        reason: "fixture: lifecycle evidence was lost before exit".into(),
+    });
+    scene.native.scene.source.kill(7);
+    scene.drain();
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "cannot inventory pid 7: the process could not be read",
+        2000,
+    );
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, 162003)]);
+    scene.commit();
+    assert_eq!(scene.edge_count(), 161950);
+    assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    assert!(scene.owner_unproven_gaps()[0].contains("(161950, 162003]"));
+}
+
 /// The production pass order for one steady `--pid` caller
 /// (`inventory_capture.rs`, `run_classic_finalizing`): read the pass
 /// clock, collect (the deep scan, while collection ticks drain and hold

@@ -112,8 +112,11 @@ def main(argv):
         "modules": [{"id": module_id, "paths": [path]}
                     for path, module_id in sorted(module_ids.items(), key=lambda kv: kv[1])],
         "edges": [{"caller": caller_of[pid], "module": module_ids[modules[pid]],
-                   "entries": {"count": totals[pid]},
-                   "coverage": {"state": "counted", "lossy": False}}
+                   "entries": {
+                       "count": totals[pid],
+                       "coverage": {"state": "counted", "since_ns": started_ns,
+                                    "until_ns": None, "first_ns": None,
+                                    "lossy": False, "reason": None, "detail": None}}}
                   for pid in sorted(totals)],
         "semantic_edges": [],
         "object_observations": {"status": "unavailable", "reason": "journal_unavailable"},

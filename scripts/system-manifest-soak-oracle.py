@@ -233,7 +233,7 @@ def gate_workload_ledger(evidence):
                 continue
             entries = edge.get("entries") or {}
             observed += strict_int(entries.get("count"), "edge entries count")
-            coverage = edge.get("coverage") or {}
+            coverage = entries.get("coverage") or {}
             if coverage.get("state") != "counted" or coverage.get("lossy") not in (False, None):
                 return False, (f"workload pid={pid} edge coverage is not counted "
                                f"clean: {coverage!r}")

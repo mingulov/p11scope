@@ -31,6 +31,8 @@ gate so a passing suite proves every gate measures.
 import importlib.util
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,8 +109,12 @@ def make_green(root, *, horizon=1800, callers=PIDS, mode="live",
         caller_rows.append({"id": f"c{index}", "pid": pid})
         edge_rows.append({
             "caller": f"c{index}", "module": "m0",
-            "entries": {"count": CALLS_MAIN + CALLS_TEARDOWN},
-            "coverage": {"state": "counted", "lossy": False},
+            "entries": {
+                "count": CALLS_MAIN + CALLS_TEARDOWN,
+                "coverage": {"state": "counted", "since_ns": GO,
+                             "until_ns": end, "first_ns": None,
+                             "lossy": False, "reason": None, "detail": None},
+            },
         })
     joined = len(callers) * 40
     collected = joined + shed
@@ -236,6 +242,27 @@ class SoakOracleTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
         self.assertFalse(verdict["qualifying"])
 
+    def test_stub_emits_entry_coverage_for_ledger_join(self):
+        dry = make_green(self.base / "stub", horizon=8, mode="dry-run")
+        manifest = dry / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts" / "fixtures" /
+                                       "system-manifest-soak-stub.py"),
+             "inventory", "--system", "--manifest", str(manifest),
+             "--duration", "1", "--attach-delay", "0", "--json",
+             "-o", str(dry / "report.json"),
+             "--loopback-log", str(dry / "workload-0.log"),
+             "--loopback-log", str(dry / "workload-1.log")],
+            capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads((dry / "report.json").read_text(encoding="utf-8"))
+        for edge in report["edges"]:
+            self.assertNotIn("coverage", edge)
+            self.assertEqual(edge["entries"]["coverage"]["state"], "counted")
+        passed, detail = self.oracle.gate_workload_ledger(self.oracle.Evidence(dry))
+        self.assertTrue(passed, detail)
+
     def test_vehicle_supports_fedora_softhsm_layout(self):
         vehicle = ROOT / "scripts" / "system-manifest-soak.sh"
         text = vehicle.read_text(encoding="utf-8")
@@ -266,6 +293,42 @@ class SoakOracleTest(unittest.TestCase):
         self.assert_red_only(self.evaluate(mutate_copy(self.green, "leg-mismatch", inflate)),
                              "workload_ledger")
 
+    def test_green_entry_coverage_ignores_unrelated_edge_copy(self):
+        rewrite_json(self.green / "report.json", lambda report: report["edges"][0].update(
+            {"coverage": {"state": "unknown", "lossy": True}}))
+        self.assert_gate(self.evaluate(self.green), "workload_ledger", True)
+
+    def test_red_ledger_entry_coverage_cannot_be_masked_by_edge_copy(self):
+        for state in ("unknown", "refused", "witnessed", "watched_no_use"):
+            with self.subTest(state=state):
+                def change_coverage(target):
+                    def change(report):
+                        for edge in report["edges"]:
+                            edge["coverage"] = {"state": "counted", "lossy": False}
+                        report["edges"][0]["entries"]["coverage"].update(
+                            {"state": state, "lossy": None, "reason": "loss"})
+                    rewrite_json(target / "report.json", change)
+                target = mutate_copy(self.green, f"leg-coverage-{state}", change_coverage)
+                verdict = self.evaluate(target)
+                self.assert_red_only(verdict, "workload_ledger")
+                self.assertIn(state, verdict["gates"]["workload_ledger"]["detail"])
+
+    def test_red_ledger_lossy_entry_coverage(self):
+        def mark_lossy(report):
+            for edge in report["edges"]:
+                edge["coverage"] = {"state": "counted", "lossy": False}
+            report["edges"][0]["entries"]["coverage"]["lossy"] = True
+        rewrite_json(self.green / "report.json", mark_lossy)
+        self.assert_red_only(self.evaluate(self.green), "workload_ledger")
+
+    def test_red_ledger_missing_entry_coverage_ignores_edge_copy(self):
+        def drop_coverage(report):
+            for edge in report["edges"]:
+                edge["coverage"] = {"state": "counted", "lossy": False}
+            report["edges"][0]["entries"].pop("coverage")
+        rewrite_json(self.green / "report.json", drop_coverage)
+        self.assert_red_only(self.evaluate(self.green), "workload_ledger")
+
     def test_red_ledger_missing_done(self):
         def drop_done(target):
             path = target / "workload-0.log"
@@ -279,7 +342,7 @@ class SoakOracleTest(unittest.TestCase):
         def add_foreign(target):
             rewrite_json(target / "report.json", lambda report: report["edges"].append({
                 "caller": "c9", "module": "m0",
-                "entries": {"count": 5}, "coverage": {"state": "counted"}}))
+                "entries": {"count": 5, "coverage": {"state": "counted", "lossy": False}}}))
         self.assert_red_only(self.evaluate(mutate_copy(self.green, "leg-foreign", add_foreign)),
                              "workload_ledger")
 

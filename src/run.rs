@@ -4429,6 +4429,18 @@ fn target_exit_marker(ticks: u64) -> String {
     format!("p11scope: capture ended: target exited after {ticks} ticks")
 }
 
+/// The plain-words stderr line emitted beside the target-exit marker when
+/// the expected-target-exit wait tripped its no-progress bound: the target
+/// exited but its cleanup never drained, so the capture ends with the
+/// calls collected so far. `None` on the ordinary all-clear path.
+fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
+    tripped.then(|| {
+        "p11scope: the target exited but its cleanup was still pending after 6 s; \
+         the capture ends with the calls collected so far"
+            .to_string()
+    })
+}
+
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
 const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
@@ -5164,6 +5176,10 @@ fn capture_profile(
     };
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
+        {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending (an Err result is an
@@ -6061,6 +6077,10 @@ fn capture_trace(
     );
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
+        {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
 
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
@@ -14335,6 +14355,18 @@ mod tests {
             target_exit_marker(12),
             "p11scope: capture ended: target exited after 12 ticks"
         );
+    }
+
+    #[test]
+    fn target_exit_cleanup_pending_line_shows_only_on_trip() {
+        assert_eq!(
+            target_exit_cleanup_pending_line(true).as_deref(),
+            Some(
+                "p11scope: the target exited but its cleanup was still pending after 6 s; \
+                 the capture ends with the calls collected so far"
+            )
+        );
+        assert_eq!(target_exit_cleanup_pending_line(false), None);
     }
 
     /// The sink watches the same observation the loop polls: the first

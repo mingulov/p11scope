@@ -566,11 +566,18 @@ pub struct Engine {
     /// restarted whenever the drain makes progress, so only a stall with
     /// no progress at all trips the bound.
     expected_target_exit_since: Option<std::time::Instant>,
-    /// Blocking-set baseline the wait above compares against: snapshotted
-    /// at the arm, refreshed on every observation, cleared whenever the
-    /// wait disarms. A wait whose pending was set directly snapshots its
-    /// baseline on its first observation instead.
+    /// Per-field low-water marks the wait above compares against:
+    /// snapshotted at the arm, set to the current snapshot on every clock
+    /// reset, left alone on stalls, cleared whenever the wait disarms. A
+    /// wait whose pending was set directly snapshots its marks on its
+    /// first observation instead.
     expected_target_exit_blocked: Option<ExpectedTargetExitBlocked>,
+    /// Whether the expected-target-exit wait ended by tripping the
+    /// no-progress bound (a stall) rather than by draining clear. Set once
+    /// on the trip; the capture keeps it so the stop can name the stall on
+    /// stderr beside the target-exit marker. Never set on the ordinary
+    /// all-clear path.
+    expected_target_exit_tripped: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     // Kernel lifecycle timestamps only, bounded by pending retained views.
     // None means at least one pending EXIT has unknown ordering.
@@ -3642,13 +3649,16 @@ const EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT: std::time::Duration =
 
 /// Blocking-set fingerprint behind the expected-target-exit no-progress
 /// clock: one entry per all-clear conjunct in
-/// `finalize_expected_target_exit`. Any entry shrinking between two
-/// observations is drain progress and restarts the clock. The three
-/// progress signals are: a retirement settled (`views`,
-/// `retirement_intents` or `pending_retirements` shrank, or
-/// `ended_pid_retirement` cleared); a loader id cleared
-/// (`loader_registry.ids_for_view` shrank); a parked record finalized
-/// (`pending_rejected_keys` or `pending_discovery_records` shrank, or
+/// `finalize_expected_target_exit`. The stored snapshot is a per-field
+/// low-water mark kept since the last clock reset: any entry dropping
+/// below its mark is drain progress and restarts the clock with the marks
+/// set to the current snapshot. An out-and-back cycle that never drops
+/// below its marks is a stall and trips. The three progress signals are:
+/// a retirement settled (`views`, `retirement_intents` or
+/// `pending_retirements` shrank, or `ended_pid_retirement` cleared); a
+/// loader id cleared (`loader_registry.ids_for_view` shrank); a parked
+/// record finalized (`pending_rejected_keys` or
+/// `pending_discovery_records` shrank, or
 /// `terminal_journal`/`terminal_batch` cleared).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExpectedTargetExitBlocked {
@@ -3664,9 +3674,24 @@ struct ExpectedTargetExitBlocked {
 }
 
 impl ExpectedTargetExitBlocked {
-    /// True when any blocking entry shrank since `previous`: the drain
-    /// moved, even if another entry grew (newly queued work never erases
-    /// observed progress).
+    /// The empty blocking set: every all-clear conjunct clear. The
+    /// all-clear compares the snapshot against this, so the two lists
+    /// cannot drift apart.
+    const CLEAR: Self = Self {
+        views: 0,
+        intents: 0,
+        retirements: 0,
+        ended: false,
+        rejected: 0,
+        loader_ids: 0,
+        journal: false,
+        batch: false,
+        records: 0,
+    };
+
+    /// True when any blocking entry dropped below its low-water mark in
+    /// `previous`: the drain moved, even if another entry grew (newly
+    /// queued work never erases observed progress).
     fn drained_since(&self, previous: &Self) -> bool {
         self.views < previous.views
             || self.intents < previous.intents
@@ -9616,6 +9641,7 @@ impl Engine {
             expected_target_exit: false,
             expected_target_exit_since: None,
             expected_target_exit_blocked: None,
+            expected_target_exit_tripped: false,
             pending_leader_exit_views: BTreeSet::new(),
             pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
@@ -10554,6 +10580,13 @@ impl Engine {
     /// cgroup capture, which continues when one member exits.
     pub fn expected_target_exit(&self) -> bool {
         self.expected_target_exit
+    }
+
+    /// True once the expected-target-exit wait tripped its no-progress
+    /// bound: the target exited but its cleanup never drained. False on
+    /// the ordinary all-clear path and when the wait never armed.
+    pub fn expected_target_exit_tripped(&self) -> bool {
+        self.expected_target_exit_tripped
     }
 
     /// The one immutable public view of capture facts (plan Task 8 Step 2).
@@ -18499,16 +18532,8 @@ impl Engine {
         let Some(view) = self.expected_target_exit_pending else {
             return;
         };
-        if self.views.is_empty()
-            && self.retirement_intents.is_empty()
-            && self.pending_retirements.is_empty()
-            && self.ended_pid_retirement.is_none()
-            && self.pending_rejected_keys.is_empty()
-            && self.loader_registry.ids_for_view(view).is_empty()
-            && self.terminal_journal.is_none()
-            && self.terminal_batch.is_none()
-            && self.pending_discovery_records.is_empty()
-        {
+        let blocked = self.snapshot_expected_target_exit_blocked(view);
+        if blocked == ExpectedTargetExitBlocked::CLEAR {
             self.expected_target_exit_pending = None;
             self.expected_target_exit_blocked = None;
             self.expected_target_exit = true;
@@ -18523,17 +18548,28 @@ impl Engine {
         }
         // Drain progress restarts the no-progress clock: a retirement
         // settled, a loader id cleared, or a parked record finalized (see
-        // `ExpectedTargetExitBlocked`). Only a stall with none of those
-        // trips the bound below.
-        let blocked = self.snapshot_expected_target_exit_blocked(view);
+        // `ExpectedTargetExitBlocked`). Progress drops below the low-water
+        // marks and sets them to the current snapshot; a stall leaves the
+        // marks alone, so an out-and-back cycle cannot keep resetting the
+        // clock. Only a stall with no progress trips the bound below.
         let now = std::time::Instant::now();
-        if self
-            .expected_target_exit_blocked
-            .is_some_and(|previous| blocked.drained_since(&previous))
-        {
-            self.expected_target_exit_since = Some(now);
+        match self.expected_target_exit_blocked {
+            Some(previous) if blocked.drained_since(&previous) => {
+                self.expected_target_exit_since = Some(now);
+                self.expected_target_exit_blocked = Some(blocked);
+            }
+            None => {
+                self.expected_target_exit_blocked = Some(blocked);
+            }
+            Some(_) => {}
         }
-        self.expected_target_exit_blocked = Some(blocked);
+        // The trip only ever ends an outstanding live wait: once the
+        // operator asked the capture to stop, or the collected finish has
+        // started, the stop owns the ending and no trip mark is added. The
+        // all-clear latch above still runs everywhere.
+        if self.cancellation_requested() || self.collected_finish_actions.is_some() {
+            return;
+        }
         // A retirement cleanup that stays queued must not hold a
         // `profile --pid` capture open past its target's exit forever:
         // when the armed wait makes no drain progress for the whole
@@ -18555,6 +18591,7 @@ impl Engine {
             self.expected_target_exit_pending = None;
             self.expected_target_exit_blocked = None;
             self.expected_target_exit = true;
+            self.expected_target_exit_tripped = true;
         }
     }
 

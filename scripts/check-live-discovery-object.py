@@ -609,15 +609,43 @@ def table_bounds_object_contract(disassembly):
     if not insns or not (insns[-1][1] == "exit"
                          or re.fullmatch(r"goto [+-]0x[0-9a-f]+", insns[-1][1])):
         return False
-    memory_store = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = [rw]\d+")
+    memory_store = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = (?:[rw]\d+|-?0x[0-9a-f]+)")
     variable_add = re.compile(r"r(\d+) \+= r(\d+)")
     indexed_stores = set()
     guarded_stores = set()
-    for position, (pc, op) in enumerate(insns[1:], 1):
+    previous = {pc: [] for pc, _ in insns}
+    for pc, successors in graph.items():
+        for successor in successors:
+            previous[successor].append(pc)
+    texts = dict(insns)
+    for store_pc, op in insns:
         store = memory_store.fullmatch(op)
-        add = variable_add.fullmatch(insns[position - 1][1])
-        if store and store[1] != "10" and add and store[1] == add[1]:
-            indexed_stores.add(pc)
+        if not store or store[1] == "10":
+            continue
+        # Follow every reaching address definition, even across unrelated
+        # payload loads, register copies or branches. An unsupported indexed
+        # lowering must remain a candidate beside other recognized stores.
+        pending = [(pc, store[1]) for pc in previous[store_pc]]
+        seen = set()
+        while pending:
+            pc, register = pending.pop()
+            if (pc, register) in seen:
+                continue
+            seen.add((pc, register))
+            text = texts[pc]
+            if re.match(rf"[rw]{register} (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text):
+                add = variable_add.fullmatch(text)
+                if add and add[1] == register:
+                    indexed_stores.add(store_pc)
+                    break
+                move = re.fullmatch(rf"[rw]{register} = [rw](\d+)", text)
+                if move:
+                    register = move[1]
+                elif re.match(rf"[rw]{register} = ", text):
+                    continue
+            elif text.startswith("call ") and int(register) < 6:
+                continue
+            pending.extend((predecessor, register) for predecessor in previous[pc])
     # Check the actual indexed store lowering, not just the presence of width
     # constants or a backwards branch. The same checked index must supply the
     # eight-byte offset. This supplements, and does not replace, kernel loading.
@@ -1946,7 +1974,7 @@ def _pause_disassembly():
     return "\n".join(block.format(index=name) for name in ("_emit_export", "_emit_lifecycle", "_dl_debug_state")).replace("pause_dl_debug_state", "dl_debug_state")
 
 
-def _owned_disassembly():
+def _owned_disassembly(indexed_gap=None):
     """Small instruction/relocation fixtures for the native caller ABI."""
     starts = {"p11_owner_discovery_get": 5000, "p11_owner_discovery_insert": 5100,
               "p11_owner_discovery_remove": 5200, "classify_direct_interface": 6000,
@@ -2050,7 +2078,9 @@ def _owned_disassembly():
                 "*(u64 *)(r9 + 0x0) = r0", "label:bounded_done",
                 "r3 <<= 0x3", "*(u64 *)(r10 - 0x10) = r3",
                 "*(u64 *)(r6 + 0x10) = r3", "r3 += r4",
-                "*(u64 *)(r6 + 0x18) = r3"]
+                "*(u64 *)(r6 + 0x18) = r3", "*(u64 *)(r6 + 0x18) = 0x0"]
+        if indexed_gap is not None and name == "fixture_emit_export":
+            tail.insert(tail.index("r9 += r8") + 1, indexed_gap)
         if name == "dl_debug_state":
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
@@ -2285,10 +2315,15 @@ def _owned_self_test():
         ("wrong destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r7 + 0x0)"),
         ("stack destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r10 - 0x8)"),
         ("narrow destination", "*(u64 *)(r9 + 0x0)", "*(u32 *)(r9 + 0x0)"),
+        ("unsupported immediate value", "*(u64 *)(r9 + 0x0) = r0", "*(u64 *)(r9 + 0x0) = 0x0"),
         ("terminal call", "\texit", "\tcall 0x5"),
     ):
         if table_bounds_object_contract(mutate("fixture_emit_export", before, after)):
             raise AssertionError(f"table index mutation accepted: {label}")
+    for gap in ("r0 = r0", "r9 = r9", "r9 += 0x0",
+                "r0 = *(u64 *)(r10 - 0x10)", "goto +0x0"):
+        if table_bounds_object_contract(_owned_disassembly(indexed_gap=gap)):
+            raise AssertionError(f"unsupported indexed store skipped across {gap}")
     width_constants_only = """00000000 <fixture_emit_export>:
 0: r1 = 0x43
 1: r2 = 0x44

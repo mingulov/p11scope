@@ -3542,17 +3542,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// (the lost race): the hook fired before any row of the old image
     /// bound, so the row-proven transition path can never emit (Rules 4+5
     /// refuse both generations under the pre-exec admission, and the live
-    /// cookie has moved on). The hook plus a live cookie answer through
-    /// the held pin still prove the turnover: retire the unheld
-    /// predecessor and mint the successor, disclosed, without exact
-    /// old/new images. A caller the binder holds is the row-proven
-    /// path's: the hook stays out, so the two paths are mutually
-    /// exclusive by construction and never double-mint. Stale hooks and
-    /// missing callers skip silently (mirroring `note_leader_exits`);
-    /// every refusal to mint is a named gap, and the mint itself is
-    /// disclosed: nothing here is silent. No `ExecProof` is synthesized
-    /// (only the binder proves exact transitions); the old owner's image
-    /// invalidates through the normal guard revalidation instead.
+    /// cookie has moved on). The hook plus liveness through the held pin
+    /// (a cookie answer with or without a ticket) still prove the
+    /// turnover: retire the unheld predecessor and mint the successor,
+    /// disclosed, without exact old/new images. A caller the binder holds
+    /// is the row-proven path's: the hook stays out, so the two paths are
+    /// mutually exclusive by construction and never double-mint. Stale
+    /// hooks and missing callers skip silently (mirroring
+    /// `note_leader_exits`); every refusal to mint is a named gap, and the
+    /// mint itself is disclosed: nothing here is silent. No `ExecProof` is
+    /// synthesized (only the binder proves exact transitions); the old
+    /// owner's image invalidates through the normal guard revalidation
+    /// instead.
     fn apply_exec_hook(
         &mut self,
         domain: NativeDomainId,
@@ -3599,23 +3600,45 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             return Vec::new();
         }
-        // The live guard: a current image must answer through the held
-        // pin. Without it the successor is unproven; the hook still proved
-        // the old image ended, so the predecessor retires honestly without
-        // a successor rather than being claimed current.
-        let live = self.adapter.live_pin(pid).is_some_and(|(_, pin)| {
-            matches!(identity.query_cookie(domain, pin), CookieQuery::Cookie(_))
-        });
-        if !live {
+        // The live guard is liveness through the held pin: the cookie
+        // query checks the pidfd before and after its lookup, so a ticket
+        // (`Cookie`) and no ticket yet (`NoCookie`) both prove the pinned
+        // process lives on. `NoCookie` is the expected answer when the hook
+        // drains before the new image's first instrumented call and its
+        // leader never entered one here (or a nonleader exec replaced the
+        // ticketed leader): the ticket is a task lifetime token, never an
+        // image proof, so requiring one refused the common lost race. An
+        // exited or unanswerable pin leaves the successor unproven; the
+        // hook still proved the old image ended, so the predecessor
+        // retires honestly without a successor rather than being claimed
+        // current, and the refusal names which answer it got.
+        let query = self
+            .adapter
+            .live_pin(pid)
+            .map(|(_, pin)| identity.query_cookie(domain, pin));
+        let refusal = match query {
+            Some(CookieQuery::Cookie(_) | CookieQuery::NoCookie) => None,
+            Some(CookieQuery::Exited) => Some(
+                "the held pin reports the process exited, so no current image \
+                 exists; the proved old incarnation retires without a successor",
+            ),
+            Some(CookieQuery::Unavailable(_)) => Some(
+                "the cookie query through the held pin was unavailable, so the \
+                 current image is unproven; the proved old incarnation retires \
+                 without a successor",
+            ),
+            None => Some(
+                "no pin is held for the live caller, so the current image is \
+                 unproven; the proved old incarnation retires without a successor",
+            ),
+        };
+        if let Some(reason) = refusal {
             self.registry.record_gap(RegistryGap {
                 caller: Some(caller),
                 module: None,
                 pid: Some(pid),
                 subject: "successor admission refused without a live image".into(),
-                reason: "no live cookie answered through the held pin, so the current \
-                     image is unproven; the proved old incarnation retires without a \
-                     successor"
-                    .into(),
+                reason: reason.into(),
                 budget: None,
             });
             return self.adapter.exec_transition_scoped(caller, now_ns);
@@ -3626,9 +3649,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pid: Some(pid),
             subject: "exec successor minted without a held predecessor".into(),
             reason: "an exec hook fired for a caller whose image the binder never held \
-                 (its rows were refused under the pre-exec admission); the hook proves \
-                 the old image ended and the live guard proves a current image, so the \
-                 successor is minted without exact old/new images"
+                 (its rows were refused under the pre-exec admission, or none were \
+                 read); the hook proves the old image ended and the held pin proves the \
+                 process lives on, so the successor is minted without exact old/new \
+                 images"
                 .into(),
             budget: None,
         });

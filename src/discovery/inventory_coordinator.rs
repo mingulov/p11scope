@@ -9906,10 +9906,16 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // The ready file appears at fopen, so the running driver may
+        // still be closing it while its table is listed: an fd gone
+        // before readlink is not the inherited marker.
         let mut leaked = Vec::new();
         for entry in std::fs::read_dir(format!("/proc/{}/fd", child.0.id())).unwrap() {
-            if std::fs::read_link(entry.unwrap().path()).unwrap() == target {
-                leaked.push(target.clone());
+            match std::fs::read_link(entry.unwrap().path()) {
+                Ok(found) if found == target => leaked.push(target.clone()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot read the driver's fd table: {error}"),
             }
         }
         assert!(

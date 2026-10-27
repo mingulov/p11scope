@@ -4084,6 +4084,22 @@ impl SleepChild {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("sleep spawns");
+        // A vfork-style spawn returns before the child switches to the new
+        // program's mm, so /proc/<pid>/exe can still name this test binary
+        // for a moment under load; a confirm read across that switch sees
+        // an exec. Wait until the child's exe is no longer ours.
+        let ours = std::fs::metadata("/proc/self/exe").expect("own exe");
+        let exe = format!("/proc/{}/exe", child.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(theirs) = std::fs::metadata(&exe)
+                && (theirs.dev(), theirs.ino()) != (ours.dev(), ours.ino())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sleep never finished its exec");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         Self { child }
     }
 

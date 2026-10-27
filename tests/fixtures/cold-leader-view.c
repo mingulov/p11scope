@@ -52,6 +52,14 @@ static void *worker(void *argument) {
                 if (table->functions[0](NULL)) _exit(17);
             printf("CALLS tid=%u total=3\n", tids[index]);
             if (fflush(stdout)) _exit(18);
+        } else if (command == 'x') {
+            execl("/bin/sleep", "sleep", "30", (char *)NULL);
+            _exit(25);
+        } else if (command == 'e') {
+            printf("EXIT tid=%u\n", tids[index]);
+            if (fflush(stdout)) _exit(23);
+            (void)syscall(SYS_exit, 0);
+            _exit(24);
         } else {
             _exit(19);
         }
@@ -70,8 +78,8 @@ int main(int argc, char **argv) {
     if (pthread_mutex_lock(&gate)) return 5;
     while (ready != count)
         if (pthread_cond_wait(&changed, &gate)) return 6;
-    printf("READY tgid=%u count=%u tid0=%u tid1=%u\n",
-           (unsigned)getpid(), count, tids[0], tids[1]);
+    printf("READY tgid=%u count=%u tid0=%u tid1=%u table=%p callback=%p\n",
+           (unsigned)getpid(), count, tids[0], tids[1], (void *)&sparse, (void *)C_Initialize);
     if (fflush(stdout)) return 7;
     if (pthread_mutex_unlock(&gate)) return 8;
     char command;

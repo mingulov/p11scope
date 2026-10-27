@@ -13,6 +13,8 @@ pub(crate) struct ColdLeaderSubject {
     child: Child,
     pub(crate) program: std::path::PathBuf,
     pub(crate) tids: Vec<u32>,
+    pub(crate) table_address: u64,
+    pub(crate) callback_address: u64,
     _directory: tempfile::TempDir,
 }
 
@@ -56,6 +58,8 @@ impl ColdLeaderSubject {
             child,
             program,
             tids: Vec::new(),
+            table_address: 0,
+            callback_address: 0,
             _directory: directory,
         };
         let ready = fixture.line();
@@ -63,6 +67,10 @@ impl ColdLeaderSubject {
         assert_eq!(words[0], "READY");
         assert_eq!(words[1], format!("tgid={}", fixture.pid()));
         assert_eq!(words[2], format!("count={workers}"));
+        fixture.table_address =
+            u64::from_str_radix(words[5].strip_prefix("table=0x").unwrap(), 16).unwrap();
+        fixture.callback_address =
+            u64::from_str_radix(words[6].strip_prefix("callback=0x").unwrap(), 16).unwrap();
         fixture.tids = words[3..3 + workers as usize]
             .iter()
             .map(|word| word.split_once('=').unwrap().1.parse().unwrap())
@@ -114,14 +122,59 @@ impl ColdLeaderSubject {
     }
 
     pub(crate) fn call_three(&mut self) {
-        assert_eq!(self.tids.len(), 1);
+        assert!(!self.tids.is_empty());
         self.input.write_all(b"c").unwrap();
         let line = self.line();
-        assert_eq!(line, format!("CALLS tid={} total=3", self.tids[0]));
+        assert!(
+            self.tids
+                .iter()
+                .any(|tid| line == format!("CALLS tid={tid} total=3")),
+            "{line}"
+        );
+    }
+
+    pub(crate) fn exit_one_worker(&mut self) {
+        assert_eq!(self.tids.len(), 2);
+        self.input.write_all(b"e").unwrap();
+        let line = self.line();
+        let tid: u32 = line.strip_prefix("EXIT tid=").unwrap().parse().unwrap();
+        assert!(self.tids.contains(&tid));
+        let path = format!("/proc/{}/task/{tid}", self.pid());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while std::fs::metadata(&path).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the commanded worker did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.tids.retain(|member| *member != tid);
+    }
+
+    fn exec_worker(&mut self) {
+        self.input.write_all(b"x").unwrap();
+        let expected = std::fs::metadata("/bin/sleep").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if std::fs::metadata(format!("/proc/{}/exe", self.pid())).is_ok_and(|actual| {
+                (actual.dev(), actual.ino()) == (expected.dev(), expected.ino())
+            }) {
+                break;
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "worker exec exited early"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "worker exec did not become the new image"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn member_namespace(&self) -> MountNamespaceId {
-        assert_eq!(self.tids.len(), 1);
+        assert!(!self.tids.is_empty());
         let metadata =
             std::fs::metadata(format!("/proc/{}/task/{}/ns/mnt", self.pid(), self.tids[0],))
                 .unwrap();
@@ -173,11 +226,57 @@ fn cold_group_view_refuses_whole_group_exit() {
 }
 
 #[test]
-fn cold_group_view_refuses_two_survivors_by_name() {
+fn cold_group_view_opens_shared_filesystem_multiworker_group() {
     let mut group = ColdLeaderSubject::spawn(2);
     group.leave_leader();
-    let error = ProcessView::open(ProcessViewId(34), group.pid())
-        .err()
-        .expect("a cold view must not pick an ambiguous survivor");
-    assert!(error.contains("ambiguous"), "{error}");
+    let view = ProcessView::open(ProcessViewId(34), group.pid())
+        .expect("matching live worker filesystems provide an unambiguous cold route");
+    assert_eq!(view.pid(), group.pid());
+    assert_eq!(view.mount_namespace(), group.member_namespace());
+    group.call_three();
+}
+
+#[test]
+fn cold_view_does_not_reuse_a_readable_leader_after_worker_exec() {
+    let mut group = ColdLeaderSubject::spawn(2);
+    group.leave_leader();
+    let view = ProcessView::open(ProcessViewId(35), group.pid()).unwrap();
+    group.exec_worker();
+    let mut work = CaptureWorkBudget::default();
+    assert!(
+        view.with_filesystem(&mut work, |_, _| Ok(())).is_err(),
+        "a readable successor cannot turn old cold custody into ordinary leader authority"
+    );
+    let successor = ProcessView::open(ProcessViewId(36), group.pid()).unwrap();
+    assert_eq!(successor.pid(), view.pid());
+    assert_ne!(successor.id(), view.id());
+    successor.with_filesystem(&mut work, |_, _| Ok(())).unwrap();
+}
+
+#[test]
+fn cold_target_object_and_cached_mountinfo_use_the_same_retained_filesystem() {
+    for workers in [1, 2] {
+        let mut group = ColdLeaderSubject::spawn(workers);
+        group.leave_leader();
+        let view = ProcessView::open(ProcessViewId(38), group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let mut cache = MountTableCache::default();
+        for _ in 0..2 {
+            let (file, mountinfo) = view
+                .open_then_cached_mountinfo(
+                    |filesystem| filesystem.open_rooted(&group.program),
+                    &mut cache,
+                    &mut work,
+                )
+                .unwrap();
+            assert!(!mountinfo.is_empty());
+            let metadata = file.metadata().unwrap();
+            let expected = group.program.metadata().unwrap();
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (expected.dev(), expected.ino())
+            );
+        }
+        group.call_three();
+    }
 }

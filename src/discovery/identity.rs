@@ -6005,8 +6005,52 @@ pub(crate) fn open_view_object_cached(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, ObjectKey), String> {
-    let (file, mountinfo) =
-        view.open_then_cached_mountinfo(|| open_regular(path), mounts, budget)?;
+    open_view_object_with(
+        view,
+        |_: &crate::process::ViewFilesystem<'_>| open_regular(path),
+        mounts,
+        budget,
+    )
+}
+
+pub(crate) fn open_view_rooted_object_cached(
+    view: &ProcessView,
+    path: &Path,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    open_view_object_with(
+        view,
+        |filesystem| filesystem.open_rooted(path),
+        mounts,
+        budget,
+    )
+}
+
+pub(crate) fn open_view_executable_cached(
+    view: &ProcessView,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    open_view_object_with(
+        view,
+        |filesystem| {
+            filesystem
+                .open_executable()
+                .map_err(|error| error.to_string())
+        },
+        mounts,
+        budget,
+    )
+}
+
+fn open_view_object_with(
+    view: &ProcessView,
+    open: impl FnOnce(&crate::process::ViewFilesystem<'_>) -> Result<std::fs::File, String>,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    let (file, mountinfo) = view.open_then_cached_mountinfo(open, mounts, budget)?;
     let first = identity_of_in_mountinfo(&file, mountinfo);
     let key = object_key(identity_in_cached_table(
         view, &file, first, mounts, budget,
@@ -6022,15 +6066,6 @@ pub fn view_object_key(
     Ok(open_view_object(view, path, budget)?.1)
 }
 
-pub(crate) fn view_object_key_cached(
-    view: &ProcessView,
-    path: &Path,
-    mounts: &mut MountTableCache,
-    budget: &mut CaptureWorkBudget,
-) -> Result<ObjectKey, String> {
-    Ok(open_view_object_cached(view, path, mounts, budget)?.1)
-}
-
 /// The cached-table form of the rule above: a missing mount row still forces
 /// exactly one fresh read of the table, under the same retained view checks.
 fn identity_in_cached_table(
@@ -6043,7 +6078,7 @@ fn identity_in_cached_table(
     reread_on_missing_mount(first, file, || {
         mounts.invalidate();
         Ok(view
-            .open_then_cached_mountinfo(|| Ok(()), mounts, budget)?
+            .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?
             .1
             .to_owned())
     })
@@ -6094,7 +6129,7 @@ pub(crate) fn retained_object_key_cached(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ObjectKey, String> {
-    let ((), mountinfo) = view.open_then_cached_mountinfo(|| Ok(()), mounts, budget)?;
+    let ((), mountinfo) = view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?;
     let first = identity_of_in_mountinfo(file, mountinfo);
     Ok(object_key(identity_in_cached_table(
         view, file, first, mounts, budget,
@@ -6511,7 +6546,7 @@ fn pin_manifest_objects_with_read_policy(
         let (opened, mountinfo) = match retained {
             Some(view) => {
                 match view
-                    .open_then_mountinfo(|| Ok::<_, String>(open_manifest_locator(path)), budget)
+                    .open_then_mountinfo(|_| Ok::<_, String>(open_manifest_locator(path)), budget)
                 {
                     Ok((opened, mountinfo)) => (opened, Some(mountinfo)),
                     Err(error) => {
@@ -7066,7 +7101,7 @@ fn pin_scanned_object(
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let (file, mountinfo) = view.open_then_cached_mountinfo(
-        || open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path))),
+        |filesystem| filesystem.open_rooted(Path::new(&raw.path)),
         mounts,
         budget,
     )?;

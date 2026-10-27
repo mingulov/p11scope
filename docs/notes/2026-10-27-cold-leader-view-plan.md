@@ -28,7 +28,7 @@ passed; cold one-worker admission and the named two-worker refusal failed
 at the expected namespace ENOENT. This is actual constructor RED, not a
 full product build or live capture qualification.
 
-The three engine controls are not compiled or run yet. They require a
+The four engine controls are not compiled or run yet. They require a
 nonempty advisory TGID sweep snapshot, a deep scan with the actual sparse
 provider target and file pins, and an unavailable rather than successful
 empty snapshot for an ended group. No Cargo-heavy command has started;
@@ -38,9 +38,11 @@ the release's quiet window takes priority.
 
 1. Open a cold view only through the original TGID pidfd, retained leader
    birth, Z boundary, and a fresh same-group nonleader birth/Tgid witness
-   whose task is live and lacks PF_EXITING. Exactly one member is eligible;
-   ambiguity is a named refusal. Missing, stale, unreadable, exhausted,
-   whole-group-dead, and pre-Z evidence grants no cold route.
+   whose task is live and lacks PF_EXITING. Multiple workers are eligible
+   when a bounded complete census and fresh held-member reads establish
+   one common mount namespace and root (device, inode, mount ID). Differing
+   or unprovable filesystems are a named refusal. Missing, stale, unreadable,
+   exhausted, whole-group-dead, and pre-Z evidence grants no cold route.
 2. Use a private transient filesystem proof for namespace, root, mountinfo,
    exe, and maps, preserving the TGID, scope, view admission, mapping and
    mount-namespace checks. A bare TID is never group authority. Re-prove the
@@ -65,3 +67,63 @@ the native retirement barrier and collected-Finish propagation. The next
 checkpoint is coherent source review plus actual V1 cold/warm/dead/
 ambiguous/reuse/unreadable controls and affected scan/scope neighbors.
 Full product checks and installed count usefulness remain separate work.
+
+## Source implementation checkpoint
+
+The private `process/view_filesystem.rs` proof now routes fixed proc-owned
+maps, memory, executable, mountinfo, and range identities. Target-root object
+opens reject parent traversal and use `openat2` with `RESOLVE_IN_ROOT` and
+`RESOLVE_NO_MAGICLINKS`; an unavailable/denied syscall is an explicit refusal.
+No arbitrary proc-path rewrite or numeric kernel gate is added. Namespace
+and root descriptors stay held during the operation, and each live member,
+the complete member set, and the original leader are bracketed again.
+
+`ProcessView` retains a monotonic atomic cold-boundary marker. Once the
+original leader was proved Z, a worker EXEC cannot make a readable successor
+renew the old view through the ordinary leader path. The marker also stays
+set if later member metadata fails. The existing EXEC replacement admits a
+fresh view. This grants no caller or image semantics.
+
+Initial and reconciliation map snapshots preserve the existing fast shard
+reader. Unavailable Z-leader rows get a serial cold proof against the passed
+capture budget and one shared stage cutoff; each refusal remains unavailable.
+Reconciliation uses its existing quantum. Deep scans and acquired-table
+readers keep their own retained process view and existing decoder/ABI checks.
+The private ScanIo budget arguments now reach metadata operations; canned IOs
+accept the new argument without gaining a native filesystem bypass.
+
+Twelve source/native controls now pass (zero skipped): warm/dead/lone/shared
+two-worker views; native sparse-table and target-object reads; second-worker
+namespace/root/mount-ID mismatch and unreadable facts; changed birth; real
+member exit while the group pidfd stays non-ready; parent traversal; cached
+mountinfo and object opens; and actual nonleader EXEC with old-view refusal
+a fresh successor control, and an expired shared-stage cutoff that cannot renew itself. GCC is strict and rustfmt passes. The source
+harness compiles the actual view, pidfd, proc-custody, filesystem, mount-cache,
+and monotonic-clock functions. Its dependency adapters cover temporary dirs,
+capture-budget plumbing, PID-numbering facts and bounded mountinfo text reads.
+The native host was Linux 7.0.0-38-generic x86_64 with Rust 1.99.1.
+It does not validate the full product's budget/window/resource integration.
+
+Limits still to verify or retain explicitly:
+
+- Cargo compile/check/clippy and the four engine regressions are **UNRUN**
+  under the release resource/quiet hold. No full product, live capture,
+  mapping-identity backend parity, pressure or installed claim is made.
+- The proof admits at most 128 observed members per operation. A larger,
+  changed or incomplete census refuses with an unproven-capacity/census
+  reason. Descriptor pressure also refuses; all added descriptors are owned
+  and transient. Product pressure behavior remains unqualified.
+- Common-filesystem multiworker views do not broaden the separate
+  `CallerRegistry::cold_admit_member` semantic mint, which still requires
+  exactly one survivor. Multiworker caller/S1 admission remains a separate
+  limitation. This checkpoint is filesystem/discovery work, not a claim that
+  every R56 behavior is complete.
+- A thread group alone does not prove one filesystem view. Linux permits
+  per-task filesystem/namespace changes; the kernel paths used to check this
+  boundary are `ksys_unshare`/`unshare_fs` and `mntns_install`:
+  https://raw.githubusercontent.com/torvalds/linux/v6.6/kernel/fork.c
+  and https://raw.githubusercontent.com/torvalds/linux/v6.6/fs/namespace.c .
+
+Next: controller-scheduled V1 compile and the exact cold/process/scan/loader
+neighbors, then one coherent future-branch peer review. The R48 retirement
+barrier/Finish lane and v0.5.0 candidate stay separate.

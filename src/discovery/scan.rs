@@ -5868,6 +5868,22 @@ mod tests {
             assert_eq!(tables[0].entries.len(), fields, "{version:#x}");
 
             snapshot.truncate(4 + fields * 4 - 1);
+            let truncated = detect_tables_for_layout(
+                LinuxLayout::Ilp32,
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            )
+            .0;
+            if fields > 68 {
+                assert_eq!(truncated.len(), 1, "the legacy prefix is complete");
+                assert_eq!(truncated[0].walk, "known_prefix");
+                assert_eq!(truncated[0].entries.len(), 68);
+                snapshot.truncate(4 + 68 * 4 - 1);
+            } else {
+                assert!(truncated.is_empty(), "an incomplete legacy layout refuses");
+            }
             assert!(
                 detect_tables_for_layout(
                     LinuxLayout::Ilp32,
@@ -5878,7 +5894,7 @@ mod tests {
                 )
                 .0
                 .is_empty(),
-                "a truncated final target word is never decoded"
+                "a truncated final legacy target word is never decoded"
             );
         }
     }

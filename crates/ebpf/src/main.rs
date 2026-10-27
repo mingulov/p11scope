@@ -1076,27 +1076,32 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
             }
         }
     }
+    // Keep the width and address index opaque so LLVM cannot remove the
+    // constant bound or advance a separate output pointer. Older verifiers
+    // cannot recover the maximum width from every classifier lowering.
+    let walk_slots = core::hint::black_box(walk_slots);
     let mut pointer_index = 0usize;
     while pointer_index < 104 {
-        if pointer_index >= walk_slots as usize {
+        let slot_index = core::hint::black_box(pointer_index);
+        if slot_index >= 104 || slot_index >= walk_slots as usize {
             break;
         }
         attempted += 1;
         let Some(address) = payload
             .table_ptr
             .checked_add(layout.word_bytes() as u64)
-            .and_then(|base| base.checked_add(pointer_index as u64 * layout.word_bytes() as u64))
+            .and_then(|base| base.checked_add(slot_index as u64 * layout.word_bytes() as u64))
         else {
             read_failed = true;
             break;
         };
         match read_word(address, layout) {
             Ok(pointer) => {
-                // SAFETY: pointer_index is statically bounded below
+                // SAFETY: slot_index is explicitly bounded below
                 // DISCOVERY_POINTERS and the record is initialized.
                 unsafe {
                     core::ptr::write_volatile(
-                        core::ptr::addr_of_mut!((*raw).pointers[pointer_index]),
+                        core::ptr::addr_of_mut!((*raw).pointers[slot_index]),
                         pointer,
                     );
                 }

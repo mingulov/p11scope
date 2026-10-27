@@ -601,14 +601,60 @@ def pause_object_contract(disassembly):
 
 def table_bounds_object_contract(disassembly):
     blocks = function_blocks(disassembly)
-    export = next(
-        ("\n".join(lines) for name, lines in blocks.items() if name.endswith("emit_export")),
-        "",
-    )
-    return bool(export) and all(
-        re.search(rf"\br\d+ = 0x{bound:x}\b", export)
-        for bound in (67, 68, 92, 104)
-    ) and bool(re.search(r"\bif r\d+ > r\d+ goto -0x", export))
+    lines = next((lines for name, lines in blocks.items() if name.endswith("emit_export")), [])
+    export = "\n".join(lines)
+    if not all(re.search(rf"\br\d+ = 0x{bound:x}\b", export) for bound in (68, 92, 104)):
+        return False
+    insns, graph = instruction_graph(lines)
+    stores = 0
+    # Check the actual indexed store lowering, not just the presence of width
+    # constants or a backwards branch. The same checked index must supply the
+    # eight-byte offset. This supplements, and does not replace, kernel loading.
+    for position, (_, op) in enumerate(insns):
+        scale = re.fullmatch(r"r(\d+) <<= 0x([0-9a-f]+)", op)
+        if not scale or position + 3 >= len(insns):
+            continue
+        index, shift = scale.groups()
+        base = re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)", insns[position + 1][1])
+        if not base or insns[position + 2][1] != f"r{base[1]} += r{index}":
+            continue
+        if not re.fullmatch(rf"\*\(u64 \*\)\(r{base[1]} \+ 0x0\) = r\d+", insns[position + 3][1]):
+            continue
+        if shift != "3" or not _table_index_guard(insns, graph, position, index):
+            return False
+        stores += 1
+    return stores > 0
+
+
+def _table_index_guard(insns, graph, scale_position, index):
+    scale_pc = insns[scale_position][0]
+    for position, (guard_pc, op) in enumerate(insns[:scale_position]):
+        if op.startswith(f"if r{index} > 0x67 goto "):
+            allowed, denied = insns[position + 1][0], relative_target(guard_pc, op)
+        elif (position and (match := re.fullmatch(rf"if r(\d+) > r{index} goto [+-]0x[0-9a-f]+", op))
+              and insns[position - 1][1] == f"r{match[1]} = 0x68"):
+            allowed, denied = relative_target(guard_pc, op), insns[position + 1][0]
+        else:
+            continue
+        blocked = {guard_pc}
+        if (scale_pc in reachable(graph, [insns[0][0]], blocked)
+                or scale_pc in reachable(graph, [denied], blocked)):
+            continue
+        # Stop at the next visit to this guard so a later loop iteration does
+        # not count as a clobber of the current iteration's checked index.
+        local = {pc: ([] if pc == guard_pc else successors) for pc, successors in graph.items()}
+        path = nodes_on_paths(local, allowed, scale_pc)
+        if scale_pc not in path:
+            continue
+        clobbered = any(
+            pc != scale_pc and pc in path
+            and (re.match(rf"[rw]{index} (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text)
+                 or (int(index) < 6 and text.startswith("call ")))
+            for pc, text in insns
+        )
+        if not clobbered:
+            return True
+    return False
 
 
 def instruction_entries(lines):
@@ -1977,7 +2023,10 @@ def _owned_disassembly():
             parts.append(assemble(name, ["exit"], starts[name]))
     parts.append(assemble("classify_direct_interface", call("fixture_emit_export") + ["exit"], 6000))
     for index, name in enumerate(("fixture_emit_export", "fixture_emit_lifecycle", "dl_debug_state")):
-        tail = ["r1 = 0x43", "r2 = 0x44", "r3 = 0x5c", "r4 = 0x68", "if r1 > r2 goto -0x1"]
+        tail = ["r1 = 0x44", "r2 = 0x5c", "r4 = 0x68", "r8 = 0x0",
+                "if r8 > 0x67 goto @bounded_done", "r7 = r7", "r8 <<= 0x3",
+                "r9 = *(u64 *)(r10 - 0x8)", "r9 += r8",
+                "*(u64 *)(r9 + 0x0) = r0", "label:bounded_done"]
         if name == "dl_debug_state":
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
@@ -2195,9 +2244,31 @@ def _owned_self_test():
             raise AssertionError(f"producer edge mutation accepted: {before}")
     if not table_bounds_object_contract(good):
         raise AssertionError("valid table bounds rejected")
-    for bound in ("0x43", "0x44", "0x5c", "0x68"):
+    for bound in ("0x44", "0x5c", "0x68"):
         if table_bounds_object_contract(mutate("fixture_emit_export", " = " + bound, " = 0x42")):
             raise AssertionError(f"table bound mutation accepted: {bound}")
+    for label, before, after in (
+        ("guard removed", "if r8 > 0x67 goto", "if r8 > 0x68 goto"),
+        ("guard inverted", "if r8 > 0x67 goto", "if r8 <= 0x67 goto"),
+        ("guard bypassed", "if r8 > 0x67 goto +0x5", "if r8 > 0x67 goto +0x0"),
+        ("unrelated index", "if r8 > 0x67 goto", "if r7 > 0x67 goto"),
+        ("index clobbered", "r7 = r7", "r8 += 0x1"),
+        ("wrong stride", "r8 <<= 0x3", "r8 <<= 0x4"),
+        ("wrong address index", "r9 += r8", "r9 += r7"),
+        ("wrong destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r7 + 0x0)"),
+    ):
+        if table_bounds_object_contract(mutate("fixture_emit_export", before, after)):
+            raise AssertionError(f"table index mutation accepted: {label}")
+    width_constants_only = """00000000 <fixture_emit_export>:
+0: r1 = 0x43
+1: r2 = 0x44
+2: r3 = 0x5c
+3: r4 = 0x68
+4: if r1 > r2 goto -0x1
+5: exit
+"""
+    if table_bounds_object_contract(width_constants_only):
+        raise AssertionError("width constants and an unrelated loop accepted as an index bound")
 
 
 def _reject(action, label):

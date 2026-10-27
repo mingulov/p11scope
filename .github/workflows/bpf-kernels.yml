@@ -298,6 +298,9 @@ jobs:
             ${{ github.workspace }}/bpf-load-out/doctor-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-out/probe-${{ matrix.kernel }}.jsonl
             ${{ github.workspace }}/bpf-load-out/vng-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-out/inventory-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/inventory-probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-out/vng-inv-${{ matrix.kernel }}.log
             ${{ github.workspace }}/bpf-load-out/counter-*-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-out/counter-*-probe-${{ matrix.kernel }}.jsonl
             ${{ github.workspace }}/bpf-load-out/vng-counter-*-${{ matrix.kernel }}.log

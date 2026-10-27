@@ -15,6 +15,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_p11scope")
 }
@@ -914,12 +917,13 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
-/// SE-09: profile without --duration prints one stderr line at start
-/// saying it captures until Ctrl-C (trace already warns).
+/// SE-09: an eligible profile without --duration names Ctrl-C at startup;
+/// an ineligible host refuses by name before that notice.
 #[test]
 fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
     use std::io::Read as _;
     use std::process::Stdio;
+    let host_refusal = multi_host::refusal();
     let target = SleepTarget::spawn();
     let mut child = Command::new(bin())
         .args(["profile", "--pid", &target.pid()])
@@ -927,9 +931,8 @@ fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn p11scope profile");
-    // The notice prints before discovery; give it time to land, then stop
-    // the capture the way an operator would. Without privilege it has
-    // already exited 1 at the BPF preflight and the signal is a no-op.
+    // On eligible hosts the notice precedes discovery; give it time to land,
+    // then stop like an operator. A host refusal has already exited 1.
     std::thread::sleep(std::time::Duration::from_secs(3));
     let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
     let mut waited = 0;
@@ -949,18 +952,29 @@ fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
         .expect("piped stderr")
         .read_to_string(&mut stderr)
         .expect("read profile stderr");
-    assert!(
-        stderr.contains("profile captures until interrupted (Ctrl-C)"),
-        "{stderr}"
-    );
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.contains("no --duration given"))
-            .count(),
-        1,
-        "exactly one no-duration line: {stderr}"
-    );
+    match host_refusal {
+        Some(reason) => {
+            assert_eq!(
+                child.try_wait().expect("profile status").unwrap().code(),
+                Some(1)
+            );
+            assert_eq!(stderr, format!("p11scope: {reason}\n"));
+        }
+        None => {
+            assert!(
+                stderr.contains("profile captures until interrupted (Ctrl-C)"),
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.contains("no --duration given"))
+                    .count(),
+                1,
+                "exactly one no-duration line: {stderr}"
+            );
+        }
+    }
 }
 
 /// SE-08: `-o -` never creates a file literally named `-`. Trace

@@ -2,11 +2,11 @@
 //! Capture diagnostics must not park the observer on a stalled stderr,
 //! nor let diagnostic delivery change the exit status (Sol-full F3).
 //!
-//! The refusal below fails fast before discovery runs — the privilege
-//! preflight refuses `--system` without BPF rights, and the bad `-o`
-//! path refuses where the preflight proceeds — so the only stderr
-//! traffic is the startup notice plus the refusal itself: under a full
-//! or closed (EPIPE) stderr the notice must shed instead of parking,
+//! The refusal below fails fast before discovery runs — the required
+//! host gate refuses without proven Multi capability, and the bad `-o`
+//! path refuses where the gate proceeds — so the only stderr traffic is
+//! the refusal itself plus a startup notice on eligible hosts. Under a full
+//! or closed (EPIPE) stderr these diagnostics must shed instead of parking,
 //! and the exit stays the refusal's 1 on every host. (A capture that
 //! reaches discovery additionally prints discovery's own summary, whose
 //! blocking writes live in `discovery/engine.rs`, outside this change;
@@ -19,6 +19,9 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "support/multi_host.rs"]
+mod multi_host;
 
 // The pipe belongs only to this test and its child. Fill it, then restore its
 // original blocking flags: production must avoid waiting without changing them.
@@ -68,13 +71,14 @@ fn refusal_args(kind: &str, out: &std::path::Path) -> Vec<String> {
 
 #[test]
 fn full_or_closed_stderr_preserves_capture_exit_status() {
+    let host_refusal = multi_host::refusal();
     let out = unopenable_output();
     let mut observed = Vec::new();
     for kind in ["profile", "trace"] {
         // Baseline: the same refusal with a healthy stderr. It exits 1 on
-        // every host (pre-discovery, so privileges cannot matter), and its
-        // stderr still carries the startup notice (the bounded transport
-        // must not drop anything a draining reader accepts).
+        // every host before discovery. The required Multi gate precedes
+        // the startup notice; a draining reader must receive the exact
+        // named host refusal or the eligible-host startup notice.
         let baseline = Command::new(env!("CARGO_BIN_EXE_p11scope"))
             .args(refusal_args(kind, &out))
             .stdin(Stdio::null())
@@ -82,10 +86,13 @@ fn full_or_closed_stderr_preserves_capture_exit_status() {
             .expect("run baseline refusal");
         assert_eq!(baseline.status.code(), Some(1), "{kind} baseline");
         let baseline_stderr = String::from_utf8(baseline.stderr).expect("stderr is UTF-8");
-        assert!(
-            baseline_stderr.contains("no --duration given"),
-            "{kind} baseline lost its startup notice: {baseline_stderr}"
-        );
+        match &host_refusal {
+            Some(reason) => assert_eq!(baseline_stderr, format!("p11scope: {reason}\n")),
+            None => assert!(
+                baseline_stderr.contains("no --duration given"),
+                "{kind} baseline lost its startup notice: {baseline_stderr}"
+            ),
+        }
         for full in [false, true] {
             let (reader, writer) = diagnostic_pipe(full);
             let retained_writer = writer.try_clone().unwrap();

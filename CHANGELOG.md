@@ -127,9 +127,8 @@ Known issues in this release:
   `no complete collection pass` gap.
 - Short-lived processes missed at system scale are counted only as
   gaps; their calls through attached providers still count.
-- Key operations cover only processes started after the observer
-  attached (already-running processes keep mechanism and API-result
-  reporting only); this version reports no key operations at all.
+- This version reports no key operations (planned for 0.5.1);
+  mechanisms and API results are reported as before.
 - If probes failed to detach cleanly during a `--manifest` capture,
   stopping needs a second Ctrl-C to write the report.
 - A process whose main thread had already exited when first met is not

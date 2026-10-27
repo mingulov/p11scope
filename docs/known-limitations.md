@@ -69,11 +69,9 @@ instance; per-caller call totals are unaffected. Finalizing and
 re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
 is also one instance.
 
-Key operations (`--manifest`) cover only processes started (or exec'd)
-after the observer attached; processes already running keep mechanism
-and API-result reporting only. This version reports no key operations
-at all, so the `key operations:` line always reads `not reported by
-this version (planned for 0.5.1)`. If probes failed to detach cleanly
+This version reports no key operations, so the `key operations:`
+line always reads `not reported by this version (planned for 0.5.1)`;
+mechanisms and API results are reported as before. If probes failed to detach cleanly
 during a `--manifest` capture, stopping needs a second Ctrl-C: the
 first begins the stop and the second interrupts the wait so the report
 is written.

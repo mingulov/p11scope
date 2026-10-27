@@ -52703,6 +52703,24 @@ fn version_only_change_keeps_matching_words_but_pointer_changes_refuse() {
 }
 
 #[test]
+fn address_only_publication_has_no_captured_zero_version() {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+    record.pid_tgid = u64::from(std::process::id()) << 32;
+    record.table_ptr = 0x7000;
+    record.symbol_id = HookRegistry::builtin().id("C_GetInterfaceList").unwrap();
+    record.name_class = DISCOVERY_NAME_OTHER;
+    record.announced_count = 1;
+    assert!(valid_discovery_record(&record));
+    assert_eq!(record_prefix_version(&record), None,
+        "address-only transport does not assert observed version0.0");
+    record.version_major = 3;
+    record.version_minor = 2;
+    assert_eq!(record_prefix_version(&record), Some((3, 2)),
+        "actual carried version metadata remains available");
+}
+
+#[test]
 fn opaque_publication_retains_observation_without_standard_names_or_list_position() {
     use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
 
@@ -52807,15 +52825,11 @@ fn mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof() {
             scores.iter().any(table_name_authorized),
             "the typed getter proof survives either order"
         );
-        assert!(
-            module
-                .tables
-                .iter()
-                .zip(&scores)
-                .any(|(table, score)| table_observation_authorized(table, score)
-                    && !table_name_authorized(score)),
-            "the opaque observation does not invent a standard-layout proof"
-        );
+        assert_eq!(module.tables.len(), 1, "one physical table has one row for identical contents");
+        assert!(table_observation_authorized(&module.tables[0], &scores[0]));
+        assert!(module.interfaces.iter().any(|interface|
+            interface.name_class == "other" && interface.table.is_none()),
+            "opaque metadata is retained without revoking an independent typed proof");
     }
 }
 

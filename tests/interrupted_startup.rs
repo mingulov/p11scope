@@ -3,8 +3,10 @@
 //! must leave no temp file and name the interruption. Inotify alone does
 //! not synchronize the sender: startup may finish before it is scheduled.
 //! Stop the real observer at syscall boundaries until IN_CREATE arrives,
-//! then deliver SIGINT before allowing startup to continue. No BPF privilege
-//! or production test hook is needed.
+//! then deliver SIGINT before allowing startup to continue. If OD36 refuses
+//! host admission first, verify that exact real-doctor refusal and the absence
+//! of output side effects. Eligible hosts retain the syscall-boundary signal
+//! control; no production test hook is needed.
 
 use std::ffi::CString;
 use std::io::{Read as _, Seek as _};
@@ -14,6 +16,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "support/multi_host.rs"]
+mod multi_host;
 
 // libc's ptrace request type differs between the supported host libcs.
 #[cfg(target_env = "musl")]
@@ -152,6 +157,7 @@ fn temp_was_created(inotify: &OwnedFd) -> bool {
 
 #[test]
 fn a_stop_signal_during_startup_leaves_no_temp_file_and_names_the_interruption() {
+    let host_refusal = multi_host::refusal();
     let target = OwnedChild::new(
         Command::new("sleep")
             .arg("311.27")
@@ -182,6 +188,27 @@ fn a_stop_signal_during_startup_leaves_no_temp_file_and_names_the_interruption()
         .arg(&out)
         .stdout(Stdio::null())
         .stderr(diagnostics.try_clone().unwrap());
+    if let Some(reason) = host_refusal {
+        // This is the earlier admission contract, not an interruption claim:
+        // exercise the real command and prove that it never opened its sink.
+        let mut observer = OwnedChild::new(command.spawn().expect("spawn refused p11scope"));
+        let status = observer.wait_exit(Instant::now() + Duration::from_secs(30));
+        diagnostics.rewind().unwrap();
+        let mut stderr = String::new();
+        diagnostics.read_to_string(&mut stderr).unwrap();
+        assert_eq!(status.signal(), None, "{stderr}");
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert_eq!(stderr, format!("p11scope: {reason}\n"));
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "host refusal left output side effects: {left:?}"
+        );
+        return;
+    }
     // SAFETY: the child only makes an async-signal-safe ptrace syscall before
     // exec; no allocation or synchronization with another parent thread.
     unsafe {

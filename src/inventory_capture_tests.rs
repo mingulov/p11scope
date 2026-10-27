@@ -22,6 +22,29 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+#[test]
+fn host_refusal_precedes_every_inventory_backend_and_preparation() {
+    use crate::attach::{MultiHostRefusal, MultiHostStage};
+    for selection in [
+        BackendSelection::Auto,
+        BackendSelection::Multi,
+        BackendSelection::Singles,
+    ] {
+        for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+            let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+            let error = prepare_scoped_on_backend::<()>(
+                Err(refusal),
+                selection,
+                &CaptureScope::System,
+                |_| panic!("scoped probe after failed host admission"),
+                |_, _| panic!("capture preparation after failed host admission"),
+            )
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<MultiHostRefusal>(), Some(&refusal));
+        }
+    }
+}
+
 type Pin = (u32, u64);
 type Log = Rc<RefCell<Vec<String>>>;
 
@@ -3558,6 +3581,7 @@ mod cgroup_backend_selection {
         let tried = RefCell::new(Vec::new());
         let probes = RefCell::new(Vec::new());
         let (prepared, chosen) = prepare_scoped_on_backend(
+            Ok(crate::attach::MultiCapableHost::for_test()),
             BackendSelection::Auto,
             &scope,
             |probe| {
@@ -3595,6 +3619,7 @@ mod cgroup_backend_selection {
         let tree = tempfile::tempdir().unwrap();
         let scope = CaptureScope::cgroup(crate::scope::cgroup(tree.path()).unwrap()).unwrap();
         let (_, chosen) = prepare_scoped_on_backend(
+            Ok(crate::attach::MultiCapableHost::for_test()),
             BackendSelection::Singles,
             &scope,
             |_| panic!("Singles must not probe"),
@@ -3614,6 +3639,7 @@ mod cgroup_backend_selection {
         let scope = CaptureScope::cgroup(crate::scope::cgroup(tree.path()).unwrap()).unwrap();
         let tried = RefCell::new(Vec::new());
         let outcome = prepare_scoped_on_backend(
+            Ok(crate::attach::MultiCapableHost::for_test()),
             BackendSelection::Multi,
             &scope,
             |probe| {
@@ -3766,7 +3792,7 @@ mod backend_selection {
         }
         let budget = crate::capacity::InventoryBudget::new(4, 32).unwrap();
         let pin = crate::process::PidPin::open(std::process::id()).unwrap();
-        let error = InventoryCapture::prepare(
+        let error = InventoryCapture::prepare_for_proof(
             CaptureScope::Pid(pin),
             budget,
             caller_budget(budget, 2).unwrap(),

@@ -698,6 +698,7 @@ fn run_public_selection(
             second_signal: &|| false,
         },
         None,
+        &|| Ok(crate::attach::MultiCapableHost::for_test()),
         None,
         None,
     )

@@ -282,8 +282,9 @@ impl LaneBackend {
     }
 }
 
-/// Picks the capture's backend and prepares it, before anything loads
-/// (session granularity, the classic rule). `probe` links a uprobe-multi
+/// After required host admission, picks the scoped backend and prepares it
+/// before capture object loads (session granularity, the classic rule).
+/// This selector alone grants no host proof. `probe` links a uprobe-multi
 /// probe once (the capability check: no kernel-version policy); `prepare`
 /// builds the capture on one backend.
 ///
@@ -322,6 +323,13 @@ pub(crate) fn prepare_on_backend<T>(
                 Err(reason) => format!("the uprobe-multi functional probe failed: {reason}"),
                 Ok(()) => match prepare(AttachBackend::Multi) {
                     Ok(capture) => return Ok((capture, chosen(AttachBackend::Multi, None))),
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::attach::MultiHostRefusal>()
+                            .is_some() =>
+                    {
+                        return Err(error);
+                    }
                     Err(error) => format!("the uprobe-multi preparation failed: {error:#}"),
                 },
             };
@@ -342,11 +350,13 @@ enum MultiScopeProbe {
 /// every attempt. Cgroup uses the general probe and never becomes System on
 /// retry; only PID links need the functional kernel PID-filter probe.
 fn prepare_scoped_on_backend<T>(
+    host: crate::attach::MultiHostVerdict,
     selection: BackendSelection,
     scope: &CaptureScope,
     mut probe: impl FnMut(MultiScopeProbe) -> std::result::Result<(), String>,
     mut prepare: impl FnMut(CaptureScope, AttachBackend) -> Result<T>,
 ) -> Result<(T, LaneBackend)> {
+    let _host = host?;
     let coverage = scope.scope_coverage();
     let probe_kind = match coverage {
         CaptureScopeCoverage::Pid(_) => MultiScopeProbe::PidFilter,
@@ -3696,6 +3706,7 @@ impl FacadeLane {
     ) -> Result<Self> {
         let callers = default_caller_budget(endpoints)?;
         let (capture, backend) = prepare_scoped_on_backend(
+            crate::attach::require_multi_capable_host(),
             selection,
             &scope,
             |probe| match probe {

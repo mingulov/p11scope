@@ -54,8 +54,12 @@ mod counter_generation;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
+mod multi_host;
 #[allow(dead_code)] // Collected carrier is staged before its coordinator activation.
 mod native_retirement;
+#[cfg(test)]
+pub(crate) use multi_host::{MultiCapableHost, MultiHostStage};
+pub(crate) use multi_host::{MultiHostRefusal, MultiHostVerdict, require_multi_capable_host};
 mod object_stop;
 #[cfg(test)]
 pub(crate) use native_retirement::fixture::RetirementFixture;
@@ -1008,28 +1012,6 @@ impl std::error::Error for BackendFallbackRequired {
     }
 }
 
-/// Release floor the doctor's diagnostics still quote: `uprobe_multi`
-/// landed in 6.6 and the session once attempted it only on 6.9+. The
-/// capture no longer reads it: [`select_session_backend`] decides by
-/// functional probes (owner directive "kernel tiers", DR-CLASSIC-PID0).
-pub(crate) const MULTI_KERNEL_FLOOR: (u32, u32) = (6, 9);
-
-/// Pure predicate over a `/proc/sys/kernel/osrelease` release string: at
-/// or above [`MULTI_KERNEL_FLOOR`]; an unparseable release is below it.
-/// Doctor diagnostics only.
-pub(crate) fn multi_allowed_on(release: &str) -> bool {
-    crate::doctor::parse_major_minor(release).is_some_and(|version| version >= MULTI_KERNEL_FLOOR)
-}
-
-/// The running release against [`MULTI_KERNEL_FLOOR`], for the doctor's
-/// `perf_event_paranoid` row hint only (it may run unprivileged, where no
-/// functional probe can answer). The capture never consults it.
-pub(crate) fn kernel_supports_multi() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|release| multi_allowed_on(release.trim()))
-        .unwrap_or(false)
-}
-
 /// Whether the running kernel's uprobe_multi pid filter covers every
 /// thread of the named process, proven once per run by a functional probe
 /// (`p11scope_bpf_multi::probe_pid_filter_hits`: a counting link with
@@ -1076,23 +1058,9 @@ pub(crate) struct SessionBackend {
 /// one-offset uprobe-multi probe at the observer's own anchor (the doctor
 /// row's self-link), dropped at once. It never fires a capture program.
 pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
-    // The anchor error names local paths (libc, the observer's own
-    // executable); the published reason stays pathless (the doctor's row
-    // keeps the detail).
-    let (path, offset) = crate::doctor::self_probe_anchor()
-        .map_err(|_| "the self-probe anchor is unavailable".to_string())?;
-    let program = p11scope_bpf_multi::prog_load_scratch_multi()
-        .map_err(|error| format!("loading the scratch uprobe-multi program: {error}"))?;
-    p11scope_bpf_multi::attach_group(
-        program.as_raw_fd(),
-        std::process::id(),
-        &path,
-        &[offset],
-        &[1],
-        false,
-    )
-    .map(drop)
-    .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
+    require_multi_capable_host()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Verdict of the functional bpf_loop (helper 181) probe that gates counter
@@ -1354,6 +1322,8 @@ pub(crate) fn kernel_bpf_loop_probe() -> BpfLoopVerdict {
 
 /// First backend attempted for a classic session, decided by functional
 /// probes, never by the kernel version (owner directive "kernel tiers").
+/// Public live callers establish required host eligibility before this
+/// separate scoped backend decision, including for explicit Singles.
 ///
 /// - `singles`: per-offset links, never probed.
 /// - PID scope (`pid_scope`): uprobe-multi only where `pid_probe` proves
@@ -5929,7 +5899,7 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// not the cause.
 pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
-lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
+lockdown mode, unavailable required BPF features, missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
 docs/notes/phase5-unsupported.md for what each looks like when observed. Run \
 `p11scope doctor` to see which cause applies on this host.";
@@ -6106,6 +6076,7 @@ impl Session {
             selection,
             None,
             None,
+            require_multi_capable_host(),
         )
     }
 
@@ -6136,6 +6107,7 @@ impl Session {
             selection,
             None,
             Some(counter),
+            require_multi_capable_host(),
         )
     }
 
@@ -6151,12 +6123,14 @@ impl Session {
         selection: BackendSelection,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        host: MultiHostVerdict,
     ) -> Result<Self> {
+        let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
+        let _host = host?;
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
         let _ = crate::process::raise_nofile();
-        let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let SessionBackend { backend, fallback } = select_session_backend(
             selection,
             matches!(scope, Scope::Pid(_)) || selected.is_some(),
@@ -9868,6 +9842,45 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    #[test]
+    fn empty_live_session_requires_host_admission_for_every_backend() {
+        use super::{
+            BackendSelection, CapturePolicy, MultiHostRefusal, MultiHostStage, Scope, Session,
+        };
+        let objects = crate::discovery::identity::PinnedObjects::empty();
+        let plan = crate::plan::build_from_sources(&[], &[], &objects);
+        assert!(plan.slots.is_empty());
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = Session::start_with_selected(
+                    &plan,
+                    &Scope::System,
+                    &objects,
+                    CapturePolicy::Allowlisted,
+                    None,
+                    None,
+                    None,
+                    selection,
+                    None,
+                    None,
+                    Err(refusal),
+                )
+                .err()
+                .expect("even an empty live plan requires a Multi-capable host");
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
     /// A real STOP_GATE mapping, with a second mapping standing in only for
     /// native atomic updates. No Q receipt is constructed by the fixture.
     struct FinishQGate {
@@ -10639,29 +10652,6 @@ mod tests {
             assert!(
                 BackendSelection::from_cli(bad).is_err(),
                 "{bad:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn multi_policy_follows_the_6_9_floor_and_rejects_garbage() {
-        use super::multi_allowed_on;
-        for release in [
-            "6.9.0",
-            "6.9.12-1-generic",
-            "6.10.0",
-            "6.15.0-100-generic",
-            "7.0.0",
-        ] {
-            assert!(multi_allowed_on(release), "{release} must allow multi");
-        }
-        for release in ["6.8.0", "6.6.0", "6.5.0-15-generic", "5.15.0", "4.19.0", ""] {
-            assert!(!multi_allowed_on(release), "{release:?} must stay singles");
-        }
-        for release in ["not-a-release", "6", "6.x", "v6.9.0-"] {
-            assert!(
-                !multi_allowed_on(release),
-                "{release:?} must conservatively stay singles"
             );
         }
     }

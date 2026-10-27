@@ -2044,6 +2044,40 @@ impl InventoryCapture {
         callers: CallerBudget,
         backend: AttachBackend,
     ) -> Result<Self> {
+        Self::prepare_with_host(
+            scope,
+            endpoints,
+            callers,
+            backend,
+            crate::attach::require_multi_capable_host(),
+        )
+    }
+
+    /// Private proof controls exercise preparation independently of live host admission.
+    #[cfg(test)]
+    pub(crate) fn prepare_for_proof(
+        scope: CaptureScope,
+        endpoints: InventoryBudget,
+        callers: CallerBudget,
+        backend: AttachBackend,
+    ) -> Result<Self> {
+        Self::prepare_with_host(
+            scope,
+            endpoints,
+            callers,
+            backend,
+            Ok(crate::attach::MultiCapableHost::for_test()),
+        )
+    }
+
+    fn prepare_with_host(
+        scope: CaptureScope,
+        endpoints: InventoryBudget,
+        callers: CallerBudget,
+        backend: AttachBackend,
+        host: crate::attach::MultiHostVerdict,
+    ) -> Result<Self> {
+        let _host = host?;
         let domain = NativeDomainId::try_mint()?;
         if backend == AttachBackend::Multi && matches!(scope, CaptureScope::Pid(_)) {
             crate::attach::kernel_multi_pid_filter().map_err(|reason| {

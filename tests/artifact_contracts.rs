@@ -12964,25 +12964,37 @@ fn the_uretprobe_hazard_row_is_not_a_capability_tier_input() {
     );
 }
 
-/// Multi is optional with a whole-session singles fallback, so the
-/// self-link row is informational: it must never feed the tier (which
-/// would offline capable-but-old kernels) nor the exit code.
+/// Host eligibility is independent of the selected static backend and version.
 #[test]
-fn the_multi_self_link_row_is_not_a_capability_tier_input() {
-    let source = read("src/doctor.rs");
-    let tier = source
-        .split_once("fn capability_tier(")
-        .expect("doctor.rs must define capability_tier")
-        .1;
-    let tier = tier.split_once("\nfn ").map_or(tier, |(body, _)| body);
-    assert!(
-        !tier.contains("uprobe-multi"),
-        "capability_tier must not read the multi row: an old kernel is fully capable on singles"
-    );
-    assert!(
-        source.contains("\"uprobe-multi attach (own libc)\""),
-        "doctor must still report the row"
-    );
+fn the_multi_host_row_gates_capability_tier_and_exit() {
+    use p11scope::doctor::{Check, Status, render, verdict};
+    let mut checks = [
+        "BPF map create",
+        "uprobe attach (self)",
+        "host program preflight",
+        "target readability",
+        "lifecycle preflight",
+        "scope preflight",
+        "uprobe-multi attach (own libc)",
+    ]
+    .map(|name| Check {
+        name: name.into(),
+        status: Status::Ok("proven".into()),
+    })
+    .to_vec();
+    checks.push(Check {
+        name: "kernel release".into(),
+        status: Status::Ok("5.14 with a working Multi backport".into()),
+    });
+    assert_eq!(verdict(&checks), 0);
+    assert!(render(&checks).contains("capability tier: T4 current full"));
+    for cause in ["unavailable", "permission or policy denied", "unproven"] {
+        checks[6].status = Status::Fail(format!("uprobe-multi-required: {cause}"));
+        assert_eq!(verdict(&checks), 1);
+        let text = render(&checks);
+        assert!(text.contains("capability tier: T0 offline"));
+        assert!(text.contains("capture unavailable"));
+    }
 }
 
 fn run_native_python_suite(script: &str, class: &str) {

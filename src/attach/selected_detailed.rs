@@ -11,6 +11,29 @@ mod activation_tests {
     use std::os::fd::FromRawFd as _;
     use std::os::unix::fs::FileExt as _;
 
+    #[test]
+    fn selected_backend_refuses_host_before_any_backend_or_links() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let original =
+            std::sync::Arc::new(crate::process::PidPin::open(std::process::id()).unwrap());
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error =
+                    select_selected_backend(&original, selection, &|| Err(refusal)).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
     fn state_cell(initial: u64) -> (StateControl, std::fs::File) {
         // SAFETY: valid NUL-terminated name, no pointers escape the syscall.
         let fd =
@@ -1032,6 +1055,29 @@ impl PreparedSelectedSession {
 /// Runs on the preparation worker. Auto can retry only after the failed Multi
 /// attempt's original worker has joined successfully. A deadline or uncertain
 /// close returns the same retained failure owner instead of starting Singles.
+fn select_selected_backend(
+    original: &std::sync::Arc<crate::process::PidPin>,
+    selection: super::BackendSelection,
+    host: &dyn Fn() -> super::MultiHostVerdict,
+) -> Result<super::SessionBackend> {
+    original
+        .pidfd()
+        .context("selected preparation requires original pidfd")?;
+    original.open_proc_dir().map_err(anyhow::Error::msg)?;
+    ensure!(
+        !original.original_exited().map_err(anyhow::Error::msg)?,
+        "selected original exited"
+    );
+    let _host = host()?;
+    let _ = crate::process::raise_nofile();
+    super::select_session_backend(
+        selection,
+        true,
+        super::multi_functional_probe,
+        super::kernel_multi_pid_filter,
+    )
+}
+
 #[allow(clippy::result_large_err)] // Cold preparation path: the failure retains the native owner for joined cleanup.
 fn start_selected(
     plan: &super::AttachPlan,
@@ -1041,24 +1087,9 @@ fn start_selected(
     selection: super::BackendSelection,
     window: super::capture::ReadWindow,
 ) -> std::result::Result<super::Session, SelectedPreparationFailure> {
-    let preliminary = (|| -> Result<_> {
-        original
-            .pidfd()
-            .context("selected preparation requires original pidfd")?;
-        original.open_proc_dir().map_err(anyhow::Error::msg)?;
-        ensure!(
-            !original.original_exited().map_err(anyhow::Error::msg)?,
-            "selected original exited"
-        );
-        let _ = crate::process::raise_nofile();
-        super::select_session_backend(
-            selection,
-            true,
-            super::multi_functional_probe,
-            super::kernel_multi_pid_filter,
-        )
-    })()
-    .map_err(SelectedPreparationFailure::before_links)?;
+    let preliminary =
+        select_selected_backend(original, selection, &super::require_multi_capable_host)
+            .map_err(SelectedPreparationFailure::before_links)?;
     let super::SessionBackend { backend, fallback } = preliminary;
     let mut session = match start_selected_attempt(plan, objects, parent, original, backend) {
         Ok(session) => session,

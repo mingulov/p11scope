@@ -757,6 +757,7 @@ pub fn run(
             second_signal: &|| stop.signal_count() >= 2,
         },
         Some(stop.signal_source()),
+        &crate::attach::require_multi_capable_host,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -962,6 +963,7 @@ fn run_with_terminal_diagnostics(
         terminal,
         request,
         None,
+        &|| Ok(crate::attach::MultiCapableHost::for_test()),
         event_fault,
         None,
     )
@@ -1126,6 +1128,7 @@ fn run_with_terminal_budget(
     terminal: &DashboardIo,
     request: DiagnosticRequest<'_>,
     operator_stop_source: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    host: &dyn Fn() -> crate::attach::MultiHostVerdict,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
     #[cfg(test)] identity_checks: Option<Box<dyn crate::inspect_system::IdentityChecks>>,
 ) -> Result<i32> {
@@ -1152,6 +1155,13 @@ fn run_with_terminal_budget(
     }
     if request.path.is_some() && capture == CaptureMode::Scan {
         anyhow::bail!("--diagnostics requires native capture or auto fallback");
+    }
+    if !manifests.is_empty() && capture == CaptureMode::Scan {
+        anyhow::bail!("--manifest requires --capture auto or native");
+    }
+    validate_primary_destinations(out, event_log)?;
+    if capture != CaptureMode::Scan {
+        let _host = host()?;
     }
     // D3d: forced-kernel preflight before any sink exists. A refused
     // kernel is a named nonzero error, never a successful empty
@@ -1190,7 +1200,6 @@ fn run_with_terminal_budget(
     // finished stream (or a retained rotation). Refuse them before the
     // diagnostics setup and before either sink opens (the event open
     // truncates).
-    validate_primary_destinations(out, event_log)?;
     let mut diagnostics = request
         .path
         .map(|path| DiagnosticsState::prepare(path, out, event_log))
@@ -5749,6 +5758,13 @@ fn open_native_lane_with(
         attach_backend,
     ) {
         Ok(capture) => capture,
+        Err(error)
+            if error
+                .downcast_ref::<crate::attach::MultiHostRefusal>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
         Err(error) => {
             return unavailable(
                 coordinator,
@@ -7790,6 +7806,138 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn refused_multi_host_precedes_inventory_sinks_and_auto_fallback() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let dir = private_tempdir();
+        let report = dir.path().join("report.json");
+        let events = dir.path().join("events.jsonl");
+        let diagnostics = dir.path().join("diagnostics.jsonl");
+        for mode in [CaptureMode::Auto, CaptureMode::Native] {
+            for backend in [
+                BackendSelection::Auto,
+                BackendSelection::Multi,
+                BackendSelection::Singles,
+            ] {
+                for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                    for path in [&report, &events, &diagnostics] {
+                        std::fs::write(path, b"keep existing sink\n").unwrap();
+                    }
+                    let attempted = std::cell::Cell::new(false);
+                    let mut stdout = Vec::new();
+                    let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                    let error = run_with_terminal_budget(
+                        InspectScope::System,
+                        &[],
+                        &[],
+                        &HookRegistry::builtin(),
+                        true,
+                        Some(1),
+                        None,
+                        inventory_endpoint_budget(None).unwrap(),
+                        None,
+                        Some(&report),
+                        false,
+                        Some(&events),
+                        None,
+                        None,
+                        mode,
+                        backend,
+                        None,
+                        false,
+                        &|| false,
+                        &|| attempted.set(true),
+                        false,
+                        &mut WriterStdout(&mut stdout),
+                        &DashboardIo::stdio(),
+                        DiagnosticRequest {
+                            path: Some(&diagnostics),
+                            pid_filter: None,
+                            second_signal: &|| false,
+                        },
+                        None,
+                        &|| Err(refusal),
+                        None,
+                        None,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.downcast_ref::<MultiHostRefusal>(),
+                        Some(&refusal),
+                        "{error:#}"
+                    );
+                    assert!(!attempted.get() && stdout.is_empty());
+                    for path in [&report, &events, &diagnostics] {
+                        assert_eq!(std::fs::read(path).unwrap(), b"keep existing sink\n");
+                    }
+                    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_inventory_scan_never_requests_live_host_admission() {
+        let mut stdout = Vec::new();
+        let code = run_with_terminal_budget(
+            InspectScope::Pid(std::process::id()),
+            &[PathBuf::from("/missing/p11scope-provider")],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            Some(1),
+            None,
+            inventory_endpoint_budget(None).unwrap(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Singles,
+            None,
+            false,
+            &|| false,
+            &|| {},
+            false,
+            &mut WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            DiagnosticRequest::disabled(),
+            None,
+            &|| panic!("a genuine scan must not probe or load capture BPF"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(document["observation"]["passes"], 1);
+    }
+
+    #[test]
+    fn typed_multi_host_refusal_never_becomes_native_auto_scan_success() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        for mode in [CaptureMode::Auto, CaptureMode::Native] {
+            let refusal =
+                MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+            let error = open_native_lane_with(
+                mode,
+                BackendSelection::Singles,
+                Scope::System,
+                &mut coordinator(),
+                |_, _, _| Err(refusal.into()),
+            )
+            .err()
+            .expect("host refusal must be fatal before automatic scan fallback");
+            assert_eq!(
+                error.downcast_ref::<MultiHostRefusal>(),
+                Some(&refusal),
+                "{error:#}"
+            );
+        }
     }
 
     /// Extract one top-level function body from this file's source for the

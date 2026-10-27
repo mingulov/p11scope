@@ -2189,6 +2189,13 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
 /// discover and pin what is in scope, install the stop flag, then run the same
 /// loop `run` runs — with no owned child, so no pause is ever possible.
 pub fn capture(a: &CaptureArgs) -> Result<()> {
+    capture_with_host(a, &crate::attach::require_multi_capable_host)
+}
+
+fn capture_with_host(
+    a: &CaptureArgs,
+    host: &dyn Fn() -> crate::attach::MultiHostVerdict,
+) -> Result<()> {
     let kind = a.kind;
     let policy = capture_policy(kind, a.metrics, a.unsafe_requested, a.counter_mode)?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
@@ -2204,6 +2211,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
+    let _host = host()?;
     match (kind, a.duration) {
         (Kind::Trace, None) => emit_capture_diagnostic(&no_duration_notice()),
         (Kind::Profile, None) => emit_capture_diagnostic(&no_profile_duration_notice()),
@@ -3148,6 +3156,14 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 }
 
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
+    run_owned_inner_with_host(args, stop, &crate::attach::require_multi_capable_host)
+}
+
+fn run_owned_inner_with_host(
+    args: &RunArgs,
+    stop: Arc<SignalState>,
+    host: &dyn Fn() -> crate::attach::MultiHostVerdict,
+) -> Result<OwnedRunOutcome> {
     let policy = capture_policy(
         args.kind,
         args.metrics,
@@ -3172,6 +3188,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     // consulted, exactly as `spawn` would refuse it at the fork.
     check_owned_target_runnable(&program)
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
+    let _host = host()?;
     // Before the fork: the owned child can install a seccomp filter after
     // attach, so no startup /proc reading can qualify it — only a kernel
     // proven to exempt the trampoline proceeds by default (F-01). An
@@ -12136,6 +12153,157 @@ mod tests {
     }
 
     #[test]
+    fn refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing-trace.jsonl");
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                std::fs::write(&output, b"keep existing output\n").unwrap();
+                let mut args = capture_args(ScopeArg::System);
+                args.kind = Kind::Trace;
+                args.duration = Some(Duration::from_millis(1));
+                args.out = Some(output.clone());
+                args.attach_backend = selection;
+                args.allow_confined_uretprobe = true;
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = capture_with_host(&args, &|| Err(refusal)).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&output).unwrap(), b"keep existing output\n");
+                assert_eq!(
+                    std::fs::read_dir(dir.path()).unwrap().count(),
+                    1,
+                    "no sink temp or discovery artifact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refused_multi_host_precedes_owned_workload_and_output() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("workload-ran");
+        let output = dir.path().join("existing-profile.json");
+        let script = format!("printf ran > '{}'", sentinel.display());
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+                std::fs::write(&output, b"keep existing report\n").unwrap();
+                let mut args = run_args(cli::PausePolicy::Never, &["/bin/sh", "-c", &script]);
+                args.duration = Some(Duration::from_millis(1));
+                args.out = Some(output.clone());
+                args.attach_backend = selection;
+                args.allow_confined_uretprobe = true;
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
+                    // Include an unreleased fork child; do not merely wait
+                    // for its sentinel command to execute. Other test
+                    // threads' children are excluded and none is reaped.
+                    // SAFETY: siginfo_t is a zeroable C output structure.
+                    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid output pointer; WNOWAIT is read-only.
+                    let waited = unsafe {
+                        libc::waitid(
+                            libc::P_ALL,
+                            0,
+                            &mut status,
+                            libc::WEXITED
+                                | libc::WSTOPPED
+                                | libc::WNOHANG
+                                | libc::WNOWAIT
+                                | libc::__WNOTHREAD,
+                        )
+                    };
+                    assert_eq!(
+                        (waited, io::Error::last_os_error().raw_os_error()),
+                        (-1, Some(libc::ECHILD)),
+                        "user workload was forked before host admission",
+                    );
+                    Err(refusal)
+                })
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+                assert!(!sentinel.exists(), "the user workload must not execute");
+                assert_eq!(std::fs::read(&output).unwrap(), b"keep existing report\n");
+            }
+        }
+    }
+
+    #[test]
+    fn counter_capture_and_run_require_host_after_build_policy_validation() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        use p11scope_ebpf_common::CounterMode;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            for backend in [
+                BackendSelection::Auto,
+                BackendSelection::Multi,
+                BackendSelection::Singles,
+            ] {
+                for owned in [false, true] {
+                    let probes = std::cell::Cell::new(0);
+                    let refusal =
+                        MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+                    let host = || {
+                        probes.set(probes.get() + 1);
+                        Err(refusal)
+                    };
+                    let error = if owned {
+                        let mut args = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+                        args.metrics = true;
+                        args.counter_mode = Some(mode);
+                        args.attach_backend = backend;
+                        run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &host)
+                            .err()
+                            .unwrap()
+                    } else {
+                        let mut args = capture_args(ScopeArg::System);
+                        args.metrics = true;
+                        args.counter_mode = Some(mode);
+                        args.attach_backend = backend;
+                        capture_with_host(&args, &host).unwrap_err()
+                    };
+                    if cfg!(p11scope_counter_objects) {
+                        assert_eq!(
+                            error.downcast_ref::<MultiHostRefusal>(),
+                            Some(&refusal),
+                            "{error:#}"
+                        );
+                        assert_eq!(probes.get(), 1);
+                    } else {
+                        assert!(
+                            error
+                                .to_string()
+                                .starts_with("counter-mode-unavailable-in-build:"),
+                            "{error:#}"
+                        );
+                        assert_eq!(probes.get(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn counter_modes_pass_the_cli_gate_into_capture_setup() {
         // Builds without counter objects (WIDE, SMALL) refuse every mode
         // by name at the policy gate instead of reaching setup.
@@ -12469,9 +12637,8 @@ mod tests {
         // it never replaces it, and it never attaches to an unrelated failure.
         let capture_available = crate::doctor::verdict(&crate::doctor::probe(None, None)) == 0;
         if !capture_available {
-            // The hazard preflight refuses first: without BPF the kernel
-            // cannot be proven to exempt the trampoline, so an owned
-            // child is refused before anything is forked (F-01).
+            // Required host admission now precedes the hazard preflight.
+            // Both are finite environment refusals before a child is forked.
             let never = format!(
                 "{:#}",
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
@@ -12483,6 +12650,7 @@ mod tests {
             let environment = |text: &str| {
                 text.contains("refusing to attach")
                     || text.contains("cannot load p11scope's BPF programs")
+                    || text.contains("uprobe-multi-required:")
             };
             assert!(environment(&never), "{never}");
             assert!(
@@ -12499,7 +12667,8 @@ mod tests {
             );
             assert!(
                 behind_override.contains("attach session")
-                    || behind_override.contains("cannot load p11scope's BPF programs"),
+                    || behind_override.contains("cannot load p11scope's BPF programs")
+                    || behind_override.contains("uprobe-multi-required:"),
                 "{behind_override}"
             );
             assert!(

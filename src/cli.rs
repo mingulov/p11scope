@@ -409,10 +409,13 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
+working backports qualify by probe), including with --attach-backend singles.
+Offline inspect/diff and inventory --capture scan do not require live capability.
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group wherever a functional probe links one (under
 --pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+the target) and safe per-offset fallback on an eligible host, multi forces multi (under
 --pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
@@ -422,7 +425,7 @@ BPF, kernel validates numbering/BTF, strict load and functional probe before cap
 (system scope only; explicit use under --pid/--cgroup is refused).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
+every descendant. --system requests whole-machine capture with
 no cgroup path. Aggregate across the selected scope; counts are not per application.
 Inventory usage entries and trace completed events have separate attribution rules.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
@@ -3743,8 +3746,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 7210);
-        assert_eq!(hash, 0x8615a171ea1f168b);
+        assert_eq!(USAGE.len(), 7439);
+        assert_eq!(hash, 0x0d750e3cbc700f55);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

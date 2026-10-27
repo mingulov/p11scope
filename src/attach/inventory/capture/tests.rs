@@ -606,7 +606,7 @@ fn zero_windows_refuse() {
 #[test]
 fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
     // A start-time fallback pin is never PID-scope custody.
-    let error = InventoryCapture::prepare(
+    let error = InventoryCapture::prepare_for_proof(
         CaptureScope::Pid(PidPin::test_proc_only(std::process::id())),
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
@@ -620,7 +620,7 @@ fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
     let mut child = std::process::Command::new("true").spawn().unwrap();
     let pin = PidPin::open(child.id()).unwrap();
     child.wait().unwrap();
-    let error = InventoryCapture::prepare(
+    let error = InventoryCapture::prepare_for_proof(
         CaptureScope::Pid(pin),
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
@@ -632,13 +632,37 @@ fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
 
     // C5.11: the facade admits Multi; an unprivileged run fails only at
     // the object load, never at a backend refusal.
-    if let Err(error) = InventoryCapture::prepare(
+    if let Err(error) = InventoryCapture::prepare_for_proof(
         CaptureScope::System,
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
         AttachBackend::Multi,
     ) {
         assert!(!format!("{error:#}").contains("Singles"), "{error:#}");
+    }
+}
+
+#[test]
+fn low_level_capture_cannot_bypass_live_host_admission() {
+    use crate::attach::{MultiHostRefusal, MultiHostStage};
+    for backend in [AttachBackend::Multi, AttachBackend::Singles] {
+        for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+            let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+            let error = InventoryCapture::prepare_with_host(
+                CaptureScope::System,
+                budget(1),
+                caller_budget(budget(1), 1).unwrap(),
+                backend,
+                Err(refusal),
+            )
+            .err()
+            .expect("low-level live constructor must refuse before object preparation");
+            assert_eq!(
+                error.downcast_ref::<MultiHostRefusal>(),
+                Some(&refusal),
+                "{error:#}"
+            );
+        }
     }
 }
 

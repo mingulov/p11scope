@@ -633,6 +633,17 @@ fn bounded_error_text(message: &str) -> String {
     escaped[..end].to_string()
 }
 
+/// Pushes a chain fragment unless its text is already present: wrappers
+/// such as aya's `map error: {0}` repeat their source's Display, and
+/// joining the whole chain would print it twice. Only verbatim-present
+/// text is skipped, so no information is lost.
+fn push_chain_fragment(context: &mut Vec<String>, fragment: String) {
+    if fragment.is_empty() || context.join(": ").ends_with(&fragment) {
+        return;
+    }
+    context.push(fragment);
+}
+
 fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> String {
     let mut context = Vec::new();
     let detail = loop {
@@ -676,7 +687,7 @@ fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> Stri
         let Some(source) = error.source() else {
             break format_operation_error(error);
         };
-        context.push(bounded_error_detail(error));
+        push_chain_fragment(&mut context, bounded_error_detail(error));
         error = source;
     };
     if context.is_empty() {
@@ -685,7 +696,12 @@ fn format_preflight_error(mut error: &(dyn std::error::Error + 'static)) -> Stri
         // Bound the whole stage prefix as well as each individual fragment.
         // The errno or verifier excerpt retains its own budget and cannot be
         // crowded out by a long outer context.
-        format!("{}: {detail}", bounded_error_text(&context.join(": ")))
+        let stages = context.join(": ");
+        if stages.ends_with(&detail) {
+            bounded_error_text(&stages)
+        } else {
+            format!("{}: {detail}", bounded_error_text(&stages))
+        }
     }
 }
 
@@ -1455,6 +1471,38 @@ fn capability_tier_line(capability: CapabilityTierResult) -> String {
     )
 }
 
+/// The inventory part of the verdict line names the failure's reason, not
+/// the BPF map the loader happened to attempt first: aya drains its map
+/// table (a per-process `HashMap`) in an unspecified order, so two runs
+/// on one host fail on different maps for the same refusal. Backticked
+/// spans carry those unstable map names; the per-row diagnostic keeps
+/// them, while the verdict drops them and stays categorical. The output
+/// is always shorter than the input, so the row's bound still holds.
+fn verdict_inventory_reason(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(open) = rest.find('`') {
+        let (head, tail) = rest.split_at(open);
+        let Some(close) = tail[1..].find('`') else {
+            // Unbalanced backtick: keep the remainder verbatim.
+            out.push_str(rest);
+            rest = "";
+            break;
+        };
+        let after = &tail[1 + close + 1..];
+        // Drop a space left dangling before ':' or the end, so
+        // "create map `X`:" reads "create map:".
+        let head = head
+            .strip_suffix(' ')
+            .filter(|_| after.starts_with(':') || after.is_empty())
+            .unwrap_or(head);
+        out.push_str(head);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn verdict_line(checks: &[Check]) -> String {
     // The inventory lane gets its own part below: an inventory-only
     // failure must not read as "capture unavailable" when the Detailed
@@ -1476,7 +1524,10 @@ fn verdict_line(checks: &[Check]) -> String {
     if let Some(check) = checks.iter().find(|c| c.name == INVENTORY_PREFLIGHT_ROW)
         && let Status::Fail(detail) = &check.status
     {
-        parts.push(format!("inventory capture unavailable ({detail})"));
+        parts.push(format!(
+            "inventory capture unavailable ({})",
+            verdict_inventory_reason(detail)
+        ));
     }
 
     if let Some(check) = checks.iter().find(|c| is_scan_row(&c.name)) {
@@ -2711,6 +2762,26 @@ mod tests {
         assert!(rendered.contains("R1 invalid mem access"), "{rendered}");
     }
 
+    /// A nested map-creation refusal renders once: aya's outer
+    /// `EbpfError::MapError` Display (`map error: {0}`) already contains
+    /// the inner `MapError` Display, so joining the whole chain must not
+    /// print the `failed to create map` phrase twice. The row keeps
+    /// the map name; only the repeat goes.
+    #[test]
+    fn preflight_skips_chain_fragments_already_present() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPERM))
+            .context("failed to create map `DISCOVERY`")
+            .context("map error: failed to create map `DISCOVERY`")
+            .context("loading fresh Inventory object with exact capacity")
+            .context("preparing Inventory: LoadObject");
+        let rendered = format_preflight_error(error.as_ref());
+        assert_eq!(
+            rendered,
+            "preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: \
+             map error: failed to create map `DISCOVERY`: Operation not permitted (os error 1)"
+        );
+    }
+
     #[test]
     fn preflight_names_numeric_errno_when_name_unknown() {
         // Errnos outside the short-name table stay numeric rather than
@@ -2861,6 +2932,51 @@ mod tests {
             "verdict: capture unavailable; inventory capture unavailable \
              (verifier budget refused the program (E2BIG); verifier: denied)"
         );
+    }
+
+    /// The verdict's inventory part stays categorical across loader runs:
+    /// aya drains its map table (a per-process `HashMap`) in an
+    /// unspecified order, so the same EPERM names `DISCOVERY` in one run
+    /// and `STACK_GUARD` in the next. The verdict drops the backticked
+    /// map name; the per-row diagnostic keeps it.
+    #[test]
+    fn verdict_inventory_part_drops_unstable_map_names() {
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let detail = |map: &str| {
+            format!(
+                "preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: \
+                 map error: failed to create map `{map}`: Operation not permitted (os error 1)"
+            )
+        };
+        let line = |map: &str| {
+            verdict_line(&[
+                row("BPF map create", Status::Ok("available".into())),
+                row("host program preflight", Status::Ok("available".into())),
+                row("inventory program preflight", Status::Fail(detail(map))),
+            ])
+        };
+        assert_eq!(line("DISCOVERY"), line("STACK_GUARD"));
+        assert!(
+            line("DISCOVERY").contains(
+                "inventory capture unavailable (preparing Inventory: LoadObject: \
+                 loading fresh Inventory object with exact capacity: map error: \
+                 failed to create map: Operation not permitted (os error 1))"
+            ),
+            "{}",
+            line("DISCOVERY")
+        );
+        // Details without a map name pass through untouched.
+        assert_eq!(
+            verdict_inventory_reason(
+                "verifier budget refused the program (E2BIG); verifier: denied"
+            ),
+            "verifier budget refused the program (E2BIG); verifier: denied"
+        );
+        // An unbalanced backtick keeps the remainder verbatim.
+        assert_eq!(verdict_inventory_reason("broken `map"), "broken `map");
     }
 
     // ---- Slice 1b-2 doctor contract (design §10.1) ------------------------

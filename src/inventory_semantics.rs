@@ -3333,14 +3333,8 @@ impl SemanticStopIo for LiveStopIo<'_> {
     }
 
     fn service_quantum(&mut self) -> Result<Option<SemanticBatch>, SemanticRefusal> {
-        // The lane's own DISCOVERY cursor is serviced and discarded:
-        // quiescence needs a flowing ring, not Inventory authority.
-        for _ in 0..TERMINAL_DRAIN_QUANTA {
-            match self.session.discovery_dequeue() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
+        // H0 services this lane's bounded DISCOVERY and EVENTS prefixes through
+        // the same retained readers during both live and terminal collection.
         let mut report = self
             .capture
             .tick(&mut *self.session, &self.pins)

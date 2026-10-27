@@ -12,7 +12,7 @@ use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
     Route, RouterLimits, UnknownReason,
 };
-use crate::events::DecodedEventRecord;
+use crate::events::{DecodedEventRecord, DiscoveryItem};
 use crate::process::{PidPin, process_start_time};
 use crate::semantics_objects::journal::joint_driver::{CollectedCallOrigin, H0Delivery};
 use crate::semantics_objects::journal::{
@@ -1145,14 +1145,41 @@ trait CaptureIo {
     }
 }
 
-// Private H0 collection keeps the lane's retained readers together.
+const LIVE_DISCOVERY_QUANTUM: usize = 16;
+
+// Private H0 collection services the lane's own retained DISCOVERY cursor
+// without applying publications or granting Inventory authority.
 fn collect_attested_with<T>(
     owner: &mut T,
     limit: usize,
-    _dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<crate::events::DiscoveryItem>>,
+    mut dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<DiscoveryItem>>,
     collect_events: impl FnOnce(&mut T, usize) -> Collection,
 ) -> Collection {
-    collect_events(owner, limit)
+    let mut discovery_status = CollectionStatus::Complete;
+    for _ in 0..LIVE_DISCOVERY_QUANTUM {
+        match dequeue(owner) {
+            Ok(Some(DiscoveryItem::Record(_))) => {}
+            Ok(Some(DiscoveryItem::Malformed)) => discovery_status = CollectionStatus::Malformed,
+            Ok(None) => break,
+            Err(_) => {
+                discovery_status = CollectionStatus::ReadError;
+                break;
+            }
+        }
+    }
+    // Even an unavailable DISCOVERY reader must not starve the genuine EVENTS
+    // prefix. Preserve it and let H0's existing failure path forbid routing.
+    let mut collection = collect_events(owner, limit);
+    collection.status = match (collection.status, discovery_status) {
+        (CollectionStatus::ReadError, _) | (_, CollectionStatus::ReadError) => {
+            CollectionStatus::ReadError
+        }
+        (CollectionStatus::Malformed, _) | (_, CollectionStatus::Malformed) => {
+            CollectionStatus::Malformed
+        }
+        _ => CollectionStatus::Complete,
+    };
+    collection
 }
 
 fn collect_session_events(session: &mut Session, limit: usize) -> Collection {

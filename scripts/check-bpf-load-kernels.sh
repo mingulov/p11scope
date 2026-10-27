@@ -17,7 +17,9 @@
 # is FAIL.
 #
 # Per kernel five throwaway guests run one command each under the probe:
-# `doctor` (Detailed object, probe-K.jsonl), a bounded
+# `doctor` (Detailed plus Inventory objects in one file, probe-K.jsonl,
+# grouped by BTF id and scored as detailed; the Inventory groups in
+# that file are ignored there), a bounded
 # `inventory --system --capture native` (Inventory object,
 # inventory-probe-K.jsonl), and one bounded `profile --system --mode
 # metrics --counter-mode <mode>` per mode (that mode's counter bank
@@ -39,11 +41,14 @@
 # limit and is bounded by `timeout -s INT` past its own --duration 5s.
 #
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
-# defaults, p11_image_query, 4 instance hooks), scored against their
-# per-kernel per-object budgets, and the 12 Inventory programs the
-# system inventory loads, scored against their own per-kernel
-# per-object budgets. Both sides fail on a refused load, a missing
-# probe row, or a count over budget. Per counter mode the 2 bank
+# defaults, p11_image_query, 4 instance hooks), scored from the Detailed
+# BTF groups in doctor's probe file against their per-kernel per-object
+# budgets, and the 12 Inventory programs the system inventory loads,
+# scored against their own per-kernel per-object budgets. Doctor's file
+# also holds its Inventory preflight loads under other BTF ids; those
+# groups never supply Detailed coverage, so a Detailed program doctor
+# stops loading is still reported missing. Both sides fail on a refused
+# load, a missing probe row, or a count over budget. Per counter mode the 2 bank
 # roots the profile run loads, scored per object (counter-<mode>) against
 # the numeric per-kernel bank budgets in
 # tests/counter-bpf-verifier-budgets.json (a separate file with its own

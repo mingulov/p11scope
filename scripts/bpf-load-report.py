@@ -14,11 +14,19 @@ no row, or an observed root with no budget FAILs. Without it the gate is
 loaded + stats + 5% headroom. A repeated root (doctor loads twice) keeps
 its largest count. Auxiliary rows never supply coverage and are ignored.
 
-With ``--object NAME`` every observed root is scored as ``NAME/<root>``
-against budget keys of that form, and the budgeted-but-missing check is
-scoped to ``NAME/`` keys, so two BPF objects sharing program names (the
-Detailed and Inventory objects share ten) are gated from separate probe
-files without mixing their counts.
+With ``--object NAME`` loads are grouped by BTF id first and each
+group is assigned to one object by its unique roots (Inventory-only
+``p11_usage_entry_*``, Detailed-only image/instance roots, counter
+``p11_counter_bank_*``); only the requested object's groups supply
+coverage. Shared-only groups of known roots belong to Detailed (the
+lone Detailed return), and to Inventory only when every root sits in
+its program set; counter modes take only bank-carrying groups. A group
+matching two objects or no known object FAILs naming its BTF id. Every
+observed root is scored as ``NAME/<root>`` against budget keys of that
+form, and the budgeted-but-missing check is scoped to ``NAME/`` keys,
+so two BPF objects sharing program names (the Detailed and Inventory
+objects share ten) are gated without mixing their counts, even from
+one mixed probe file.
 
 One refused shape is expected, never a failure: the 2-instruction
 ``bpf_loop`` (helper 181) capability probe that ``doctor`` runs for its
@@ -48,6 +56,48 @@ BPF_LOOP_PROBE_FNV1A64 = "27ef27a73ecc6270"
 BPF_LOOP_PROBE_PROGRAM_TYPE = 2  # BPF_PROG_TYPE_KPROBE, linux/bpf.h.
 BPF_LOOP_PROBE_INSN_COUNT = 2
 BPF_LOOP_PROBE_EXPECTED_ERRNOS = frozenset({22, 13})  # EINVAL, EACCES.
+
+# Object identity for BTF-grouped scoring (doctor loads Detailed and
+# Inventory in one probed process; counter runs load a counter object
+# plus a lone Detailed return). Each BTF id holds one object's loads;
+# the group is assigned by the roots only that object has. Shared roots
+# (the 13 defaults) never identify a group alone.
+# Sources: src/attach.rs DEFAULT_PROGRAMS, src/attach/instance.rs
+# INSTANCE_PROGRAMS, src/attach/selected_detailed.rs PROGRAMS,
+# src/attach/counter_banks.rs PROGRAMS, and the 12 inventory budgets keys.
+INVENTORY_UNIQUE_ROOTS = frozenset({
+    "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+})
+COUNTER_UNIQUE_ROOTS = frozenset({
+    "p11_counter_bank_entry", "p11_counter_bank_return",
+})
+DETAILED_UNIQUE_ROOTS = frozenset({
+    "p11_image_query", "p11_image_exec_release",
+    "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+    "p11_selected_bootstrap", "p11_selected_cgroup_migrate",
+})
+# Every root any shipped object loads (for foreign-group detection).
+# The 13 defaults are shared by Detailed and counter; 10 of them are
+# also shared by Inventory (which lacks p11_entry/p11_return/task_newtask).
+KNOWN_SHARED_ROOTS = frozenset({
+    "p11_entry", "p11_return", "task_newtask", "dl_debug_state",
+    "function_list_entry", "function_list_return",
+    "interface_list_entry", "interface_list_return",
+    "interface_list_worker", "interface_entry", "interface_return",
+    "sched_process_exec", "sched_process_exit",
+})
+KNOWN_ROOTS = (KNOWN_SHARED_ROOTS | INVENTORY_UNIQUE_ROOTS
+               | COUNTER_UNIQUE_ROOTS | DETAILED_UNIQUE_ROOTS)
+# Inventory's 12 loaded programs (for partial-group compatibility: a
+# shared-only group whose roots all sit in this set is an Inventory
+# partial that failed before its usage roots loaded).
+INVENTORY_PROGRAMS = frozenset({
+    "dl_debug_state", "function_list_entry", "function_list_return",
+    "interface_entry", "interface_list_entry", "interface_list_return",
+    "interface_list_worker", "interface_return",
+    "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+    "sched_process_exec", "sched_process_exit",
+})
 
 
 class ReportError(RuntimeError):
@@ -115,12 +165,47 @@ def checked_load(row):
     program_type = row.get("program_type")
     insn_count = row.get("insn_count")
     fingerprint = row.get("relocated_fnv1a64")
+    btf_id = row.get("btf_id")
     return {"root": root, "loaded": loaded, "errno": row["errno"],
             "stats": stats, "processed": processed, "limit": limit,
             "auxiliary": row.get("auxiliary"),
+            "btf_id": btf_id if type(btf_id) is int else 0,
             "program_type": program_type if type(program_type) is int else None,
             "insn_count": insn_count if type(insn_count) is int else None,
             "fingerprint": fingerprint if type(fingerprint) is str else None}
+
+
+def assign_btf_group(entries):
+    """One object's name for a BTF group, or None when shared-only.
+
+    Returns (object, error) where object is "inventory", "counter",
+    "detailed", or None, and error names an ambiguous (two objects) or
+    foreign (no known root) group. Shared-only groups of known roots
+    (the lone Detailed return, partial loads that failed before their
+    unique roots) return (None, None); the caller decides by the
+    requested object whether they belong.
+    """
+    roots = {entry["root"] for entry in entries}
+    has_inventory = bool(roots & INVENTORY_UNIQUE_ROOTS)
+    has_counter = bool(roots & COUNTER_UNIQUE_ROOTS)
+    has_detailed = bool(roots & DETAILED_UNIQUE_ROOTS)
+    hits = sum((has_inventory, has_counter, has_detailed))
+    if hits > 1:
+        kinds = sorted(kind for kind, has in
+                       (("counter", has_counter),
+                        ("detailed", has_detailed),
+                        ("inventory", has_inventory)) if has)
+        return None, f"matches two objects ({','.join(kinds)})"
+    if has_inventory:
+        return "inventory", None
+    if has_counter:
+        return "counter", None
+    if has_detailed:
+        return "detailed", None
+    if not roots <= KNOWN_ROOTS:
+        foreign = sorted(roots - KNOWN_ROOTS)
+        return None, f"matches no object (foreign {','.join(foreign)})"
+    return None, None
 
 
 def is_expected_bpf_loop_probe(entries):
@@ -161,16 +246,88 @@ def read_budgets(path):
             "programs": programs}
 
 
+def select_object_loads(parsed_loads, object_name, group_errors):
+    """Loads belonging to one object, grouped by BTF id.
+
+    Unresolved refused loads (BTF id 0, the bpf_loop probe shape) pass
+    through untouched for the allowlist. Every other load must carry a
+    nonzero BTF id; its group is assigned by unique roots. Ambiguous
+    (two objects) and foreign (no known root) groups append a FAIL
+    naming the BTF id. Shared-only groups of known roots (the lone
+    Detailed return; partial loads that failed before their unique
+    roots) belong to Detailed, and to Inventory only when every root
+    sits in Inventory's program set; counter objects always carry
+    their bank roots, so shared-only groups never belong to them.
+    """
+    unresolved = [entry for entry in parsed_loads
+                  if entry["root"] == "unresolved"]
+    real = [entry for entry in parsed_loads
+            if entry["root"] != "unresolved"]
+    by_btf = {}
+    for entry in real:
+        by_btf.setdefault(entry["btf_id"], []).append(entry)
+    selected = list(unresolved)
+    want_counter = object_name.startswith("counter-")
+    for btf_id in sorted(by_btf):
+        entries = by_btf[btf_id]
+        if btf_id == 0:
+            roots = sorted({entry["root"] for entry in entries})
+            group_errors.append(
+                {"root": f"btf-{btf_id}-unknown",
+                 "detail": f"matches no object (no BTF for {','.join(roots)})"})
+            continue
+        assigned, error = assign_btf_group(entries)
+        if error is not None:
+            group_errors.append(
+                {"root": f"btf-{btf_id}-ambiguous"
+                 if "two objects" in error else f"btf-{btf_id}-unknown",
+                 "detail": f"btf {btf_id} {error}"})
+            continue
+        if assigned == "inventory":
+            if object_name == "inventory":
+                selected.extend(entries)
+        elif assigned == "counter":
+            if want_counter:
+                selected.extend(entries)
+        elif assigned == "detailed":
+            if object_name == "detailed":
+                selected.extend(entries)
+        else:
+            roots = {entry["root"] for entry in entries}
+            if object_name == "detailed":
+                selected.extend(entries)
+            elif object_name == "inventory" and roots <= INVENTORY_PROGRAMS:
+                selected.extend(entries)
+            # Counter modes take only bank-carrying groups; shared-only
+            # groups (the lone Detailed return) never belong to them.
+    return selected
+
+
 def evaluate(loads, kernel, budgets, object_name=None):
-    """Rows keyed by root plus an overall verdict. Duplicates keep the max."""
+    """Rows keyed by root plus an overall verdict. Duplicates keep the max.
+
+    With --object, loads are grouped by BTF id first: each group holds
+    one object's programs, assigned by its unique roots. Only groups
+    belonging to the requested object supply coverage, so an Inventory
+    copy never masks a missing Detailed program and a lone Detailed
+    return never inflates a counter table. Without --object the legacy
+    by-name scoring applies (the focused unit tests use it).
+    """
     prefix = f"{object_name}/" if object_name else ""
-    by_root = {}
+    parsed_loads = []
     for row in loads:
         parsed = checked_load(row)
         if parsed["auxiliary"] is not None:
             continue
         if parsed["root"] == "unresolved" and parsed["loaded"]:
             continue
+        parsed_loads.append(parsed)
+    group_errors = []
+    if object_name is not None:
+        parsed_loads = select_object_loads(parsed_loads, object_name,
+                                            group_errors)
+    by_root = {}
+    for parsed in parsed_loads:
         by_root.setdefault(prefix + parsed["root"], []).append(parsed)
     rows = []
     for root in sorted(by_root):
@@ -219,7 +376,11 @@ def evaluate(loads, kernel, budgets, object_name=None):
                 rows.append({"root": root, "processed": None, "limit": None,
                              "budget": budgets["programs"][root][kernel],
                              "status": "FAIL", "detail": "missing from probe rows"})
-        rows.sort(key=lambda row: row["root"])
+    for error in group_errors:
+        rows.append({"root": error["root"], "processed": None, "limit": None,
+                     "budget": None, "status": "FAIL",
+                     "detail": error["detail"]})
+    rows.sort(key=lambda row: row["root"])
     return rows
 
 

@@ -125,13 +125,15 @@ next_program_id = 100
 
 
 def load_row(root, *, loaded=True, errno=0, stats_present=True,
-             processed=1000, limit=1000000, auxiliary=None, pid=111):
+             processed=1000, limit=1000000, auxiliary=None, pid=111,
+             btf_id=77):
     global next_program_id
     next_program_id += 1
     return {
         "record": "load", "pid": pid, "root": root,
         "btf_resolved": auxiliary is None and root != "unresolved",
-        "btf_fd": 4, "btf_id": 77, "returned_btf_id": 77, "root_type_id": 1,
+        "btf_fd": 4, "btf_id": btf_id, "returned_btf_id": btf_id,
+        "root_type_id": 1,
         "returned_fd": 5 if loaded else -1,
         "program_id": next_program_id if loaded else 0,
         "program_type": 2, "returned_program_type": 2 if loaded else 0,
@@ -590,6 +592,118 @@ class ReportTests(unittest.TestCase):
         crash_block = text[crash_idx:crash_end]
         self.assertIn("FAILED=1", crash_block)
         self.assertNotIn("continue", crash_block)
+
+    def mixed_doctor_loads(self, *, drop_detailed_worker=False):
+        # One file holding Detailed rows (BTF 45, with a Detailed-only
+        # root) and Inventory rows (BTF 48, with an Inventory-only root)
+        # under different BTF ids, as doctor's probe file does now that
+        # doctor loads both objects. The shared names carry different
+        # counts per object so cross-object max mixing is visible.
+        detailed = [
+            load_row("p11_image_query", processed=445, btf_id=45),
+            load_row("interface_entry", processed=83350, btf_id=45),
+            load_row("interface_return", processed=750806, btf_id=45),
+        ]
+        if not drop_detailed_worker:
+            detailed.append(
+                load_row("interface_list_worker", processed=527020,
+                         btf_id=45))
+        inventory = [
+            load_row("p11_usage_entry_lp64", processed=873, btf_id=48),
+            load_row("interface_entry", processed=84937, btf_id=48),
+            load_row("interface_return", processed=453148, btf_id=48),
+            load_row("interface_list_worker", processed=404787, btf_id=48),
+        ]
+        return detailed + inventory
+
+    def mixed_doctor_budgets(self):
+        # Test-only budgets above the fixture counts (grouping, not the
+        # real per-kernel pins, is under test here).
+        return self.write_budgets({
+            "detailed/p11_image_query": {KERNEL: 512},
+            "detailed/interface_entry": {KERNEL: 95853},
+            "detailed/interface_return": {KERNEL: 863427},
+            "detailed/interface_list_worker": {KERNEL: 606073},
+            "inventory/p11_usage_entry_lp64": {KERNEL: 1025},
+            "inventory/interface_entry": {KERNEL: 97386},
+            "inventory/interface_return": {KERNEL: 520000},
+            "inventory/interface_list_worker": {KERNEL: 465000},
+        })
+
+    def test_mixed_doctor_file_scores_each_object_correctly(self):
+        # Doctor loads Detailed and Inventory in one probed process; the
+        # scorer must group by BTF id and score each object from its own
+        # rows only. Detailed keeps its own counts (not the Inventory
+        # max), Inventory keeps its own, and neither side fails on the
+        # other's unique roots.
+        loads = self.mixed_doctor_loads()
+        budgets = self.mixed_doctor_budgets()
+        result = self.run_report(self.write_loads("doctor.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("detailed/interface_entry", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("84937", result.stdout)
+        self.assertNotIn("p11_usage_entry", result.stdout)
+        result = self.run_report(self.write_loads("doctor.jsonl", loads),
+                                 budgets=budgets, object_name="inventory")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("inventory/interface_entry", result.stdout)
+        self.assertIn("84937", result.stdout)
+        self.assertNotIn("83350", result.stdout)
+        self.assertNotIn("p11_image_query", result.stdout)
+
+    def test_missing_detailed_program_is_not_masked_by_inventory_copy(self):
+        # Detailed stopped loading interface_list_worker but Inventory
+        # still carries it: scoring as detailed must FAIL missing, not
+        # silently use the Inventory count.
+        loads = self.mixed_doctor_loads(drop_detailed_worker=True)
+        budgets = self.mixed_doctor_budgets()
+        result = self.run_report(self.write_loads("doctor.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("detailed/interface_list_worker", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+
+    def test_group_matching_two_objects_fails_by_btf_id(self):
+        # A BTF group holding both Inventory-only and counter-only roots
+        # matches two objects: it FAILs naming its BTF id, whichever
+        # object is scored.
+        loads = [
+            load_row("p11_usage_entry_lp64", processed=873, btf_id=48),
+            load_row("p11_counter_bank_entry", processed=4125, btf_id=48),
+            load_row("p11_image_query", processed=445, btf_id=45),
+        ]
+        budgets = self.write_budgets({
+            "detailed/p11_image_query": {KERNEL: 512},
+        })
+        result = self.run_report(self.write_loads("mixed.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("btf-48-ambiguous", result.stdout)
+        self.assertIn("matches two objects", result.stdout)
+
+    def test_group_matching_no_object_fails_by_btf_id(self):
+        # A BTF group holding only a foreign root matches no object: it
+        # FAILs naming its BTF id instead of silently passing.
+        loads = [
+            load_row("p11_image_query", processed=445, btf_id=45),
+            load_row("p11_foreign_probe", processed=100, btf_id=49),
+        ]
+        budgets = self.write_budgets({
+            "detailed/p11_image_query": {KERNEL: 512},
+        })
+        result = self.run_report(self.write_loads("mixed.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("btf-49-unknown", result.stdout)
+        self.assertIn("matches no object", result.stdout)
+        self.assertIn("p11_foreign_probe", result.stdout)
 
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked

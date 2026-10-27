@@ -52411,3 +52411,112 @@ fn acquired_legacy_keeps_good_targets_around_invalid_words() {
         }
     }
 }
+
+#[test]
+fn raw_scan_recovers_sparse_partial_table_with_independent_exports() {
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("provider.so");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-compatibility.c");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-std=c11", "-O0"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let loader_source = dir.path().join("loader.c");
+    std::fs::write(
+        &loader_source,
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 1;
+    unsigned long (*get)(void **) = dlsym(h, "C_GetFunctionList");
+    void *table = 0;
+    if (!get || get(&table)) return 2;
+    printf("%p\n", table);
+    fflush(stdout);
+    char byte;
+    (void)read(STDIN_FILENO, &byte, 1);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&loader_source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut address = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut address)
+        .unwrap();
+    let address = u64::from_str_radix(address.trim().trim_start_matches("0x"), 16).unwrap();
+    let view = ProcessView::open(ProcessViewId(4301), child.0.id()).unwrap();
+    let hooks = HookRegistry::builtin();
+    let outcome = crate::discovery::scan::scan_process_view(
+        &ScanRequest {
+            pid: child.0.id(),
+            hints: &[],
+            hooks: &hooks,
+        },
+        &view,
+        &mut CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    let table = outcome
+        .modules()
+        .iter()
+        .flat_map(|module| &module.tables)
+        .find(|table| table.address == address)
+        .unwrap_or_else(|| {
+            panic!(
+                "independently exported sparse table was discarded: {:?}",
+                outcome.skipped()
+            )
+        });
+    assert_eq!(
+        table
+            .entries
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        ["C_Initialize", "C_WaitForSlotEvent"]
+    );
+    assert_eq!(table.unpinned.len(), 1);
+    assert_eq!(table.null_entries.len(), 65);
+    assert_eq!(table.walk, "known_prefix");
+    assert!(!table.live_return && !table.manifest_supported);
+}

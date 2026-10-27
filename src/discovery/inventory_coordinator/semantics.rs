@@ -112,6 +112,11 @@ impl AttestedSubset {
     /// The watched endpoint must be this attested provider's physical
     /// file, with its retained whole-file digest. Paths and matching
     /// content in another inode cannot supply this association.
+    ///
+    /// The key-and-digest match below is a selector: the maps key is not
+    /// unique, so a colliding file can pass it. Binding authority is the
+    /// H0 receipt, which keeps only ranges whose `map_files` identity
+    /// matches the observer's own self-mapping of the held fd.
     pub(crate) fn proves_provider_module(
         &self,
         object: PinnedObjectId,

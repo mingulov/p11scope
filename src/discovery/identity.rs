@@ -1255,6 +1255,13 @@ impl PinnedObjects {
     /// fd. The single join predicate behind the provider proof and its
     /// mirrors, so a split-proved binding resolves identically at
     /// admission, labeling, and selection.
+    ///
+    /// A selector, not file identity: the maps key is not unique (inode
+    /// numbers repeat across btrfs subvolumes and overlay layers), so a
+    /// different file with the same bytes can pass this match. The binding
+    /// authority is the H0 receipt, which keeps only ranges whose
+    /// `map_files` identity matches the observer's own self-mapping of
+    /// the held fd and refuses on zero kept ranges.
     pub(crate) fn object_matches_key(
         &self,
         object: PinnedObjectId,

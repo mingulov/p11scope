@@ -820,8 +820,9 @@ link.
   exactly like the warm path. In a live capture today this reaches
   only groups the observer already held a view of (their scans now
   read the survivor's maps); a group first met after its leader died
-  is still not admitted. Two or more live survivors refuse by
-  name (never a pick); a fully dead group keeps the generic gone
+  is still not admitted. Two or more live survivors are refused
+  (admission names the ambiguity; a live scan reports such a group
+  like an exited one); a fully dead group keeps the generic gone
   refusal. Cold callers make no native-use claim (they stay unproven
   for native binding). Live-capture enumeration of a group first met
   after its leader died still needs its follow-up.
@@ -832,7 +833,8 @@ link.
   live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
   other threads keep running (a zombie leader), and that the capture never
-  observed before the exit, is still not admitted as a caller: it has no
+  observed before the exit, or left with two or more running threads,
+  is still not admitted as a caller: it has no
   `callers[]` record and no edge, and its provider use appears at most as
   module-level `modules[].unbound_use` (only when another process got the
   provider attached, with the `used by an unidentified caller image` gap);
@@ -840,6 +842,9 @@ link.
   exec within one pass likewise binds no image: its rows are unbound as
   `exec_after_admission`, `no_live_caller` or `before_admission`, and the
   retired callers' edges read `unknown`/`use_before_admission`.
+  A caller that execs into a different binary while a pass collects can
+  bind no image for the rest of the capture: its native calls survive
+  only as module-level `exec_after_admission`.
 - Kernels/conditions: all; `--system` scope (for `--pid`
   see DR-C3-2).
 - Disclosure: the pid-less `process view` gap ("a process in scope could

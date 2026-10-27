@@ -431,16 +431,9 @@ fn record<Io: ShardableIo, F: Fn() -> Io>(
                         // list is carried, and only for a clean read.
                         // Unclean reads keep the exact previous behavior:
                         // charged here, recomputed from the replay there.
-                        let (ranges, carry) = match (
-                            &unclean,
-                            transcript.clean_result(),
-                        ) {
-                            (_, Some(Ok(entries))) => {
-                                (proof_ranges(entries, prove), true)
-                            }
-                            (Some(Ok(entries)), _) => {
-                                (proof_ranges(entries, prove), false)
-                            }
+                        let (ranges, carry) = match (&unclean, transcript.clean_result()) {
+                            (_, Some(Ok(entries))) => (proof_ranges(entries, prove), true),
+                            (Some(Ok(entries)), _) => (proof_ranges(entries, prove), false),
                             _ => (Vec::new(), false),
                         };
                         for _ in &ranges {

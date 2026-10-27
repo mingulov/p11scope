@@ -2065,12 +2065,6 @@ fn preview_reuses_worker_proof_ranges() {
             &make_io,
         )
     });
-    assert!(
-        out.members.len() > 10,
-        "the confirm arm must run: {out:?}"
-    );
-    assert_eq!(
-        recomputes, 0,
-        "preview must reuse worker proof ranges"
-    );
+    assert!(out.members.len() > 10, "the confirm arm must run: {out:?}");
+    assert_eq!(recomputes, 0, "preview must reuse worker proof ranges");
 }

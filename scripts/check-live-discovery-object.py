@@ -600,6 +600,7 @@ def pause_object_contract(disassembly):
 
 
 def table_bounds_object_contract(disassembly):
+    """Certify regular destinations; table words need the checked-index lowering."""
     blocks = function_blocks(disassembly)
     lines = next((lines for name, lines in blocks.items() if name.endswith("emit_export")), [])
     export = "\n".join(lines)
@@ -613,39 +614,28 @@ def table_bounds_object_contract(disassembly):
     variable_add = re.compile(r"r(\d+) \+= r(\d+)")
     indexed_stores = set()
     guarded_stores = set()
-    previous = {pc: [] for pc, _ in insns}
-    for pc, successors in graph.items():
-        for successor in successors:
-            previous[successor].append(pc)
-    texts = dict(insns)
+    facts = _table_destination_facts(lines, insns, graph)
     for store_pc, op in insns:
         store = memory_store.fullmatch(op)
-        if not store or store[1] == "10":
+        if not store:
             continue
-        # Follow every reaching address definition, even across unrelated
-        # payload loads, register copies or branches. An unsupported indexed
-        # lowering must remain a candidate beside other recognized stores.
-        pending = [(pc, store[1]) for pc in previous[store_pc]]
-        seen = set()
-        while pending:
-            pc, register = pending.pop()
-            if (pc, register) in seen:
-                continue
-            seen.add((pc, register))
-            text = texts[pc]
-            if re.match(rf"[rw]{register} (?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text):
-                add = variable_add.fullmatch(text)
-                if add and add[1] == register:
-                    indexed_stores.add(store_pc)
-                    break
-                move = re.fullmatch(rf"[rw]{register} = [rw](\d+)", text)
-                if move:
-                    register = move[1]
-                elif re.match(rf"[rw]{register} = ", text):
-                    continue
-            elif text.startswith("call ") and int(register) < 6:
-                continue
-            pending.extend((predecessor, register) for predecessor in previous[pc])
+        address = facts.get(store_pc, {}).get("r" + store[1])
+        detail = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r\d+ ([+-]) 0x([0-9a-f]+)\) = .*", op)
+        size, sign, offset = detail.groups()
+        offset = int(offset, 16) * (1 if sign == "+" else -1)
+        size = int(size) // 8
+        if address is None:
+            return False
+        kind, starts = address
+        if kind == "indexed":
+            if starts != frozenset({32}) or offset != 0:
+                return False
+            indexed_stores.add(store_pc)
+        elif kind not in ("stack", "record") or not all(
+                (-512 if kind == "stack" else 0) <= start + offset
+                and start + offset + size <= (0 if kind == "stack" else 920)
+                for start in starts):
+            return False
     # Check the actual indexed store lowering, not just the presence of width
     # constants or a backwards branch. The same checked index must supply the
     # eight-byte offset. This supplements, and does not replace, kernel loading.
@@ -659,6 +649,11 @@ def table_bounds_object_contract(disassembly):
         store_pc, store_op = insns[position + 3]
         if not memory_store.fullmatch(store_op) or (not base and not add):
             continue
+        spill = re.fullmatch(r"\*\(u64 \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = r(\d+)", store_op)
+        state = facts.get(store_pc, {})
+        if (spill and state.get("r" + spill[1], (None,))[0] == "stack"
+                and state.get("r" + spill[2], (None,))[0] == "indexed"):
+            continue
         # A malformed indexed path must not disappear while another ABI path
         # still supplies a recognized store. Ordinary fixed metadata/stack
         # stores have no such address calculation and remain outside this set.
@@ -670,6 +665,136 @@ def table_bounds_object_contract(disassembly):
             return False
         guarded_stores.add(store_pc)
     return bool(guarded_stores) and indexed_stores == guarded_stores
+
+
+def _table_destination_facts(lines, insns, graph):
+    """Finite provenance for this emitter's registers and eight-byte spills.
+
+    Unknown destinations cannot certify a bounds-positive. Stack aliases,
+    overlapping writes and probe-read footprints participate in the same flow;
+    a spill never makes an indexed address become ordinary metadata.
+    Sets widen to unknown after eight choices, so loops cannot invent a safe
+    constant bound or keep the analysis growing indefinitely.
+    """
+    def fact(kind, values):
+        values = frozenset(values)
+        return (kind, values) if values and len(values) <= 8 else None
+
+    def merged(left, right):
+        return fact(left[0], left[1] | right[1]) if left and right and left[0] == right[0] else None
+
+    def operand(state, value):
+        if value[0] in "rw":
+            result = state.get("r" + value[1:])
+            if value[0] == "w":
+                return fact("constant", [number & 0xffffffff for number in result[1]]) if result and result[0] == "constant" else None
+            return result
+        return fact("constant", [int(value, 16)])
+
+    def address(state, base, sign, offset):
+        value = state.get("r" + base)
+        if not value or value[0] not in ("stack", "record", "indexed", "other"):
+            return None
+        delta = int(offset, 16) * (1 if sign == "+" else -1)
+        return fact(value[0], [start + delta for start in value[1]])
+
+    def write(state, destination, sizes):
+        if destination and destination[0] in ("record", "indexed", "other"):
+            return
+        if destination and destination[0] != "stack":
+            destination = None
+        for key in list(state):
+            if isinstance(key, int) and (not destination or not sizes or any(
+                    key < start + size and start < key + 8
+                    for start in destination[1] for size in sizes)):
+                state.pop(key)
+
+    raw = dict((pc, text) for _, pc, text in instruction_entries(lines))
+    encoded = any(re.match(r"(?:[0-9a-f]{2}\s+){8}", text) for text in raw.values())
+    texts = dict(insns)
+    incoming = {insns[0][0]: {"r10": fact("stack", [0])}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        store = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = ([rw]\d+|-?0x[0-9a-f]+)", text)
+        load = re.fullmatch(r"([rw]\d+) = \*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)", text)
+        move = re.fullmatch(r"([rw]\d+) (=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text)
+        atomic = re.search(r"(?:lock \*\(u64 \*\)\(|cmpxchg_64\()r(\d+) ([+-]) 0x([0-9a-f]+)", text)
+        if store:
+            width, base, sign, offset, source = store.groups()
+            target = address(state, base, sign, offset)
+            value = operand(state, source)
+            write(state, target, [int(width) // 8])
+            if target and target[0] == "stack" and len(target[1]) == 1 and width == "64" and value:
+                state[next(iter(target[1]))] = value
+        elif load:
+            dest, width, base, sign, offset = load.groups()
+            target = address(state, base, sign, offset)
+            value = None
+            if target and target[0] == "stack" and width == "64":
+                values = [state.get(start) for start in target[1]]
+                value = values[0]
+                for other in values[1:]:
+                    value = merged(value, other)
+            state.pop("r" + dest[1:], None)
+            if value and (dest[0] == "r" or value[0] == "constant"):
+                if dest[0] == "w":
+                    value = fact("constant", [number & 0xffffffff for number in value[1]])
+                state["r" + dest[1:]] = value
+        elif text.startswith("call "):
+            helper = not encoded or raw[pc].startswith("85 00 ")
+            if helper and text == "call 0x70":
+                length = state.get("r2")
+                write(state, state.get("r1"), length[1] if length and length[0] == "constant" else None)
+            elif not helper or text not in ("call 0x1", "call 0x5", "call 0xe", "call 0x6d", "call 0x83", "call 0x84"):
+                write(state, None, None)
+            reserve = helper and text == "call 0x83" and state.get("r2") == fact("constant", [920])
+            for register in range(6):
+                state.pop("r" + str(register), None)
+            if reserve:
+                state["r0"] = fact("record", [0])
+            elif helper and text == "call 0x1":
+                state["r0"] = fact("other", [0])
+        elif atomic:
+            write(state, address(state, *atomic.groups()), [8])
+            if text.startswith("r0 = "):
+                state.pop("r0", None)
+        elif move:
+            dest, op, source = move.groups()
+            register = "r" + dest[1:]
+            before, value = state.get(register), operand(state, source)
+            if op != "=":
+                if op == "+=" and before and before[0] == "record" and source[0] in "rw":
+                    value = fact("indexed", before[1])
+                elif op in ("+=", "-=") and before and value and value[0] == "constant" and before[0] in ("stack", "record", "indexed", "other", "constant"):
+                    deltas = [delta - (1 << 64) if delta >= 1 << 63 else delta for delta in value[1]]
+                    value = fact(before[0], [start + delta * (1 if op == "+=" else -1)
+                                             for start in before[1] for delta in deltas])
+                else:
+                    value = None
+            state.pop(register, None)
+            if value and (dest[0] == "r" or value[0] == "constant"):
+                if dest[0] == "w":
+                    value = fact("constant", [number & 0xffffffff for number in value[1]])
+                state[register] = value
+        elif (text.startswith(("if ", "goto ")) or text == "exit"):
+            pass
+        else:
+            # Unmodeled memory effects cannot preserve a spilled destination.
+            write(state, None, None)
+            if dest := re.match(r"([rw]\d+) = ", text):
+                state.pop("r" + dest[1][1:], None)
+        for successor in graph[pc]:
+            joined = state.copy() if successor not in incoming else {
+                key: value for key in state.keys() | incoming[successor].keys()
+                if (value := merged(state.get(key), incoming[successor].get(key))) is not None
+            }
+            if incoming.get(successor) != joined:
+                incoming[successor] = joined
+                pending.append(successor)
+    return incoming
 
 
 def _table_index_guard(insns, graph, scale_position, index):
@@ -1974,7 +2099,7 @@ def _pause_disassembly():
     return "\n".join(block.format(index=name) for name in ("_emit_export", "_emit_lifecycle", "_dl_debug_state")).replace("pause_dl_debug_state", "dl_debug_state")
 
 
-def _owned_disassembly(indexed_gap=None):
+def _owned_disassembly(indexed_gap=None, metadata_spill=()):
     """Small instruction/relocation fixtures for the native caller ABI."""
     starts = {"p11_owner_discovery_get": 5000, "p11_owner_discovery_insert": 5100,
               "p11_owner_discovery_remove": 5200, "classify_direct_interface": 6000,
@@ -2079,8 +2204,11 @@ def _owned_disassembly(indexed_gap=None):
                 "r3 <<= 0x3", "*(u64 *)(r10 - 0x10) = r3",
                 "*(u64 *)(r6 + 0x10) = r3", "r3 += r4",
                 "*(u64 *)(r6 + 0x18) = r3", "*(u64 *)(r6 + 0x18) = 0x0"]
+        tail = ["r9 = r6", "r9 += 0x20", "*(u64 *)(r10 - 0x8) = r9"] + tail
+        tail += list(metadata_spill)
         if indexed_gap is not None and name == "fixture_emit_export":
-            tail.insert(tail.index("r9 += r8") + 1, indexed_gap)
+            position = tail.index("r9 += r8") + 1
+            tail[position:position] = [indexed_gap] if isinstance(indexed_gap, str) else list(indexed_gap)
         if name == "dl_debug_state":
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
@@ -2324,6 +2452,70 @@ def _owned_self_test():
                 "r0 = *(u64 *)(r10 - 0x10)", "goto +0x0"):
         if table_bounds_object_contract(_owned_disassembly(indexed_gap=gap)):
             raise AssertionError(f"unsupported indexed store skipped across {gap}")
+    spilled_destination = """0000000000000000 <fixture_emit_export>:
+0: r1 = 0x44
+1: r2 = 0x5c
+2: r4 = 0x68
+3: r8 = 0x400
+4: r8 <<= 0x3
+5: r9 = *(u64 *)(r10 - 0x8)
+6: r9 += r8
+7: r0 = r0
+8: *(u64 *)(r10 - 0x18) = r9
+9: r9 = *(u64 *)(r10 - 0x18)
+10: *(u64 *)(r9 + 0x0) = r0
+11: r5 = 0x0
+12: if r5 > 0x67 goto +0x4
+13: r5 <<= 0x3
+14: r9 = *(u64 *)(r10 - 0x8)
+15: r9 += r5
+16: *(u64 *)(r9 + 0x0) = r0
+17: exit
+"""
+    if table_bounds_object_contract(spilled_destination):
+        raise AssertionError("unbounded spilled destination hidden by a healthy indexed store")
+    saved = ["*(u64 *)(r10 - 0x18) = r6"]
+    restored = ["r9 = *(u64 *)(r10 - 0x18)", "*(u64 *)(r9 + 0x18) = 0x0"]
+    probe = ["r1 = r10", "r1 += -0x28", "r2 = 0x8", "call 0x70"]
+    for between in ([], ["*(u64 *)(r10 - 0x28) = 0x0"], ["call 0x5"], probe):
+        if not table_bounds_object_contract(_owned_disassembly(metadata_spill=saved + between + restored)):
+            raise AssertionError(f"healthy fixed metadata spill rejected: {between}")
+    aliased = ["r1 = r10", "r1 += -0x18", "*(u64 *)(r1 + 0x0) = r6",
+               "r2 = r10", "r2 += -0x18", "r9 = *(u64 *)(r2 + 0x0)", "*(u64 *)(r9 + 0x18) = 0x0"]
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=aliased)):
+        raise AssertionError("fixed metadata stack alias rejected")
+    for between in (
+        ["*(u32 *)(r10 - 0x18) = 0x0"],
+        ["r1 = r10", "r1 += -0x14", "*(u32 *)(r1 + 0x0) = 0x0"],
+        ["r1 = r10", "r1 += -0x18", "r2 = 0x8", "call 0x70"],
+        ["r1 = r10", "r1 += -0x14", "r2 = 0x4", "call 0x70"],
+        ["*(u64 *)(r10 - 0x18) = r0"], ["call 0x99"],
+    ):
+        if table_bounds_object_contract(_owned_disassembly(metadata_spill=saved + between + restored)):
+            raise AssertionError(f"unknown/overwritten spilled destination accepted: {between}")
+    for gap in (
+        ["r0 = r0", "*(u64 *)(r10 - 0x18) = r9", "r9 = *(u64 *)(r10 - 0x18)"],
+        ["r1 = r10", "r1 += -0x18", "*(u64 *)(r1 + 0x0) = r9", "r9 = *(u64 *)(r10 - 0x18)"],
+    ):
+        # These use a known reservation/base, so rejection exercises indexed
+        # provenance across the spill rather than just an unknown fixture base.
+        # Reuse the fixture assembler to retain exact PCs/branch destinations.
+        if table_bounds_object_contract(_owned_disassembly(indexed_gap=gap)):
+            raise AssertionError(f"indexed pointer spill hidden beside healthy path: {gap}")
+    indexed = ["r8 = 0x400", "r8 <<= 0x3", "r9 = *(u64 *)(r10 - 0x8)",
+               "r9 += r8", "*(u64 *)(r10 - 0x18) = r9"]
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=indexed + saved + restored)):
+        raise AssertionError("complete fixed-metadata overwrite did not replace the old spilled value")
+    joined_safe = saved + ["if r0 == 0x0 goto @metadata_join", *saved, "label:metadata_join"] + restored
+    if not table_bounds_object_contract(_owned_disassembly(metadata_spill=joined_safe)):
+        raise AssertionError("matching fixed-metadata branch spills lost provenance")
+    joined_bad = saved + ["if r0 == 0x0 goto @metadata_join", *indexed, "label:metadata_join"] + restored
+    if table_bounds_object_contract(_owned_disassembly(metadata_spill=joined_bad)):
+        raise AssertionError("an indexed branch spill was hidden by a fixed-metadata branch")
+    looped = saved + ["label:metadata_again", "r9 = *(u64 *)(r10 - 0x18)", "r9 += 0x8",
+                      "*(u64 *)(r10 - 0x18) = r9", "if r0 != 0x0 goto @metadata_again"] + restored
+    if table_bounds_object_contract(_owned_disassembly(metadata_spill=looped)):
+        raise AssertionError("loop-carried spilled address acquired a false fixed bound")
     width_constants_only = """00000000 <fixture_emit_export>:
 0: r1 = 0x43
 1: r2 = 0x44

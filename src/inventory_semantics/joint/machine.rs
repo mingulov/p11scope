@@ -954,10 +954,11 @@ impl std::fmt::Display for StagingDetail {
 }
 
 /// The recorded Audited no-progress trip: the wall-time bound fired on a
-/// wedged finish. Commit-free by necessity: the wedged publication stands
-/// in front of the commit, so the staged gap cannot commit while the
-/// wedge stands; the exit hold reads this flag and names the wedge on
-/// stderr instead. Counts only; no identities, paths or payloads.
+/// wedged finish or a wedged running publication. Commit-free by
+/// necessity: the wedged publication stands in front of the commit, so
+/// the staged gap cannot commit while the wedge stands; the exit hold
+/// reads this flag and names the wedge on stderr instead. Counts only;
+/// no identities, paths or payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FinishNoProgressTrip {
     /// Consecutive no-progress Audited polls observed when the bound fired.
@@ -3729,6 +3730,11 @@ thread_local! {
     /// the accessor returns it. Cleared by the twin when done.
     static POSED_NO_PROGRESS_TRIP: std::cell::Cell<Option<FinishNoProgressTrip>> =
         const { std::cell::Cell::new(None) };
+    /// Posed running-commit no-progress trip for the exit-hold twin: a
+    /// separate override from the finish trip above, so posing one never
+    /// names the other. Cleared by the twin when done.
+    static POSED_AUDIT_NO_PROGRESS_TRIP: std::cell::Cell<Option<FinishNoProgressTrip>> =
+        const { std::cell::Cell::new(None) };
 }
 
 impl AttestedSemanticLane {
@@ -3892,6 +3898,34 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn pose_no_progress_trip_for_test(trip: Option<(u32, Duration)>) {
         POSED_NO_PROGRESS_TRIP.with(|posed| {
+            posed.set(trip.map(|(polls, stalled)| FinishNoProgressTrip { polls, stalled }));
+        });
+    }
+
+    /// The recorded running-commit Audited no-progress trip, if the
+    /// wall-time bound fired on this lane's machine. The exit hold
+    /// names it on stderr beside the finish wedge: the wedged live
+    /// publication stands in front of the commit, so the staged gap
+    /// cannot commit while the wedge stands. In tests, a posed trip
+    /// wins (substituted lanes carry no live machine).
+    pub(crate) fn joint_audit_no_progress_trip(&self) -> Option<FinishNoProgressTrip> {
+        #[cfg(test)]
+        if let Some(posed) = POSED_AUDIT_NO_PROGRESS_TRIP.with(|posed| posed.get()) {
+            return Some(posed);
+        }
+        self.live.as_deref().and_then(|live| {
+            live.joint_machine
+                .as_ref()
+                .and_then(|machine| machine.audit_no_progress_trip)
+        })
+    }
+
+    /// Pose (or clear) the running-commit no-progress trip the audit
+    /// accessor returns. Separate from the finish pose above: the two
+    /// trips name independently. The twin clears it when done.
+    #[cfg(test)]
+    pub(crate) fn pose_audit_no_progress_trip_for_test(trip: Option<(u32, Duration)>) {
+        POSED_AUDIT_NO_PROGRESS_TRIP.with(|posed| {
             posed.set(trip.map(|(polls, stalled)| FinishNoProgressTrip { polls, stalled }));
         });
     }

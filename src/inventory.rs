@@ -3113,6 +3113,27 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// One stderr line for a held lane whose live Joint publication
+    /// wedged or was abandoned: a running no-progress trip names its
+    /// stall, the abandon its outcome. Counts only; no identities,
+    /// paths or payloads. `None` without an abandon means the hold
+    /// owes no line (no trip fired, nothing stood to abandon).
+    fn held_live_publication_line(stalled_secs: Option<u64>, abandoned: bool) -> Option<String> {
+        match (stalled_secs, abandoned) {
+            (None, false) => None,
+            (Some(secs), true) => Some(format!(
+                "p11scope: live publication made no progress for {secs} s; abandoned it, coverage is partial"
+            )),
+            (Some(secs), false) => Some(format!(
+                "p11scope: live publication made no progress for {secs} s; the lane is held for exit, coverage is partial"
+            )),
+            (None, true) => Some(
+                "p11scope: abandoned the unfinished live publication, coverage is partial"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Hold a Joint lane for exit after its finish failed (item 7,
     /// §6.4): disclose the lane's stop counts once, abandon where
     /// admitted (best-effort commit, whose failure is kept as its
@@ -18534,6 +18555,177 @@ mod promotion_driver_tests {
             take_warned_for_test(),
             vec![expected_stop_line()],
             "the untripped hold discloses only its stop line"
+        );
+    }
+
+    #[test]
+    fn held_wedged_live_publication_names_stall_and_abandon_on_stderr() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A lane whose live publication tripped the running
+        // no-progress bound, or whose unfinished publication the hold
+        // abandons, names it on stderr: the wedged publication stands
+        // in front of the commit, so the staged gap cannot commit,
+        // and the hold's warning is the user-visible name. One line
+        // per trip: the hold runs once per lane and the trip latches
+        // once in the machine, so the line never repeats per poll.
+        // The expectations read the real formatter; the literals pin
+        // its wording.
+        assert_eq!(
+            ClassicDriver::held_live_publication_line(Some(6), true).as_deref(),
+            Some(
+                "p11scope: live publication made no progress for 6 s; abandoned it, coverage is partial"
+            ),
+            "the formatter names the stall and the abandon"
+        );
+        assert_eq!(
+            ClassicDriver::held_live_publication_line(Some(6), false).as_deref(),
+            Some(
+                "p11scope: live publication made no progress for 6 s; the lane is held for exit, coverage is partial"
+            ),
+            "the formatter claims no abandon it did not run"
+        );
+        assert_eq!(
+            ClassicDriver::held_live_publication_line(None, true).as_deref(),
+            Some("p11scope: abandoned the unfinished live publication, coverage is partial"),
+            "the formatter names a bare abandon"
+        );
+        assert_eq!(
+            ClassicDriver::held_live_publication_line(None, false),
+            None,
+            "a quiet hold owes no line"
+        );
+        let scripted_lane = || {
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+            lane.note_shed_calls(7);
+            lane
+        };
+        // Clear the posed trip even if an assertion panics: the
+        // override is thread-local and must not leak into the next
+        // test on this thread.
+        struct ClearPosedAuditTrip;
+        impl Drop for ClearPosedAuditTrip {
+            fn drop(&mut self) {
+                crate::inventory_semantics::AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+                    None,
+                );
+            }
+        }
+        let _clear = ClearPosedAuditTrip;
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        // Substituted lanes carry no live machine to trip, so the
+        // trip is posed (like the lane's `scripted_*` seams stage
+        // machine behavior); the hold still reads it through the
+        // production accessor. Posing the audit trip names nothing
+        // through the finish accessor.
+        crate::inventory_semantics::AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+            Some((1163, std::time::Duration::from_secs(6))),
+        );
+        let staged = scripted_lane()
+            .joint_audit_no_progress_trip()
+            .expect("the posed trip is observable");
+        assert_eq!(staged.polls, 1163, "the posed poll count is observable");
+        assert_eq!(
+            staged.stalled,
+            std::time::Duration::from_secs(6),
+            "the posed stall duration is observable"
+        );
+        assert_eq!(
+            scripted_lane().joint_finish_no_progress_trip(),
+            None,
+            "the audit pose stays out of the finish accessor"
+        );
+        // Trip plus a standing publication: the hold abandons it and
+        // names both exactly once, before the stop line.
+        let mut coordinator = coordinator();
+        coordinator.pose_pending_joint_publication_for_test();
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "tripped",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert!(
+            !coordinator.publication_pending(),
+            "the hold abandons the posed publication"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![
+                ClassicDriver::held_live_publication_line(Some(6), true).expect("a line is owed"),
+                expected_stop_line(),
+            ],
+            "the hold names the wedge once, before the stop line"
+        );
+        // Trip with nothing standing: the hold names the stall
+        // without claiming an abandon, exactly once. The coordinator
+        // carries over: the first hold cleared its posed publication.
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "tripped",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![
+                ClassicDriver::held_live_publication_line(Some(6), false).expect("a line is owed"),
+                expected_stop_line(),
+            ],
+            "a tripped hold without an abandon names only the stall"
+        );
+        // A bare abandon (no trip): the hold names what it cleared,
+        // exactly once.
+        crate::inventory_semantics::AttestedSemanticLane::pose_audit_no_progress_trip_for_test(None);
+        assert_eq!(
+            scripted_lane().joint_audit_no_progress_trip(),
+            None,
+            "clearing the pose records no trip"
+        );
+        coordinator.pose_pending_joint_publication_for_test();
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "wedged",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert!(
+            !coordinator.publication_pending(),
+            "the hold abandons the posed publication"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![
+                ClassicDriver::held_live_publication_line(None, true).expect("a line is owed"),
+                expected_stop_line(),
+            ],
+            "an abandoned hold without a trip names the abandon"
+        );
+        // Neither: the hold discloses only its stop line. The
+        // coordinator carries over: the third hold cleared its pose.
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            scripted_lane(),
+            &mut coordinator,
+            "quiet",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "the quiet hold discloses only its stop line"
         );
     }
 

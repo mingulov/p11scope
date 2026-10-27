@@ -164,7 +164,7 @@ pub fn discover_with_self_memory(
             module_path.display()
         ));
     }
-    let provenance_objects = provenance_objects(&final_map_index)?;
+    let provenance_objects = provenance_objects(&final_map_index, &objects)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
@@ -211,93 +211,148 @@ fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>,
     maps::MapIndex::new(entries).map_err(|error| format!("invalid /proc maps snapshot: {error}"))
 }
 
-fn provenance_objects(index: &maps::MapIndex<'_>) -> Result<Vec<ProvenanceObject>, String> {
+/// Provider and resolved-target provenance is required. Other executable
+/// mappings are useful context, retained best effort within the same bounds.
+fn provenance_objects(
+    index: &maps::MapIndex<'_>,
+    objects: &ObjectTable,
+) -> Result<Vec<ProvenanceObject>, String> {
+    const MAX_OPTIONAL_DIAGNOSTICS: u64 = 8;
+    const MAX_DIAGNOSTIC_CHARS: usize = 256;
+    let mut required = BTreeMap::new();
+    for (key, id) in &objects.ids {
+        let record = objects
+            .records
+            .get(*id as usize)
+            .filter(|record| record.id == *id)
+            .ok_or_else(|| "resolved object has no identity record".to_string())?;
+        required.insert(*key, &record.identity);
+    }
     let mut by_key: BTreeMap<ObjectKey, ProvenanceObject> = BTreeMap::new();
     let mut opened_paths = BTreeMap::new();
     let mut total_bytes = 0u64;
+    let mut omitted = 0u64;
 
-    for mapping in index
-        .entries()
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-    {
-        let raw_path = mapping
-            .raw_path
-            .as_deref()
-            .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
-        let path = match index.resolve(mapping.start) {
-            maps::Resolved::File {
-                path: MappedPath::Usable(path),
-                ..
-            } => path,
-            maps::Resolved::File {
-                path: MappedPath::Unusable { reason },
-                ..
-            } => {
-                return Err(format!(
-                    "executable mapping {} is unusable: {reason}",
-                    identity::hex(raw_path)
-                ));
+    // Optional runtime mappings cannot consume the object/byte budget before
+    // the provider and every individually resolved target have been checked.
+    for required_pass in [true, false] {
+        for mapping in index.entries().iter().filter(|mapping| {
+            mapping.permissions[2] == b'x'
+                && mapping.inode != 0
+                && required.contains_key(&ObjectKey::of(mapping)) == required_pass
+        }) {
+            let result = (|| -> Result<(), String> {
+                let raw_path = mapping
+                    .raw_path
+                    .as_deref()
+                    .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
+                let path = match index.resolve(mapping.start) {
+                    maps::Resolved::File {
+                        path: MappedPath::Usable(path),
+                        ..
+                    } => path,
+                    maps::Resolved::File {
+                        path: MappedPath::Unusable { reason },
+                        ..
+                    } => {
+                        return Err(format!(
+                            "executable mapping {} is unusable: {reason}",
+                            identity::hex(raw_path)
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "file-backed executable mapping {} has no usable absolute path",
+                            identity::hex(raw_path)
+                        ));
+                    }
+                };
+                let key = ObjectKey::of(mapping);
+                if let Some(previous) = opened_paths.insert(path.clone(), key) {
+                    if previous != key {
+                        return Err(format!(
+                            "executable mapping path {} changed device/inode within one pass",
+                            path.display()
+                        ));
+                    }
+                    return Ok(());
+                }
+                if !by_key.contains_key(&key) && by_key.len() >= MAX_OBJECTS {
+                    return Err(format!(
+                        "executable provenance object cap {MAX_OBJECTS} reached"
+                    ));
+                }
+                let file = identity::open_object(&path).map_err(|error| {
+                    format!("cannot open executable mapping {}: {error}", path.display())
+                })?;
+                let len = file
+                    .metadata()
+                    .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
+                    .len();
+                let next_bytes = total_bytes
+                    .checked_add(len)
+                    .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
+                if next_bytes > MAX_TOTAL_OBJECT_BYTES {
+                    return Err(format!(
+                        "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                    ));
+                }
+                // Charge before hashing, including unsuccessful inspections
+                // and different pathname aliases, so best effort stays bounded.
+                total_bytes = next_bytes;
+                let object_identity = validated_file_identity(&path, &file, key)?;
+                if required
+                    .get(&key)
+                    .is_some_and(|expected| **expected != object_identity)
+                {
+                    return Err(format!(
+                        "required executable provenance identity changed for {}",
+                        path.display()
+                    ));
+                }
+                if let Some(previous) = by_key.get(&key) {
+                    if previous.identity != object_identity {
+                        return Err(format!(
+                            "executable mapping aliases for {key:?} disagree on whole-file identity"
+                        ));
+                    }
+                    return Ok(());
+                }
+                by_key.insert(
+                    key,
+                    ProvenanceObject {
+                        path: path.display().to_string(),
+                        device_major: key.device.major,
+                        device_minor: key.device.minor,
+                        inode: key.inode,
+                        identity: object_identity,
+                    },
+                );
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if required_pass {
+                    return Err(error);
+                }
+                omitted = omitted.saturating_add(1);
+                if omitted <= MAX_OPTIONAL_DIAGNOSTICS {
+                    let detail: String = error.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+                    eprintln!(
+                        "p11scope-discover: optional executable provenance omitted: {detail}"
+                    );
+                }
             }
-            _ => {
-                return Err(format!(
-                    "file-backed executable mapping {} has no usable absolute path",
-                    identity::hex(raw_path)
-                ));
-            }
-        };
-        let key = ObjectKey::of(mapping);
-        if let Some(previous) = opened_paths.insert(path.clone(), key) {
-            if previous != key {
-                return Err(format!(
-                    "executable mapping path {} changed device/inode within one pass",
-                    path.display()
-                ));
-            }
-            continue;
         }
-
-        let file = identity::open_object(&path).map_err(|error| {
-            format!("cannot open executable mapping {}: {error}", path.display())
-        })?;
-        let object_identity = validated_file_identity(&path, &file, key)?;
-        if let Some(previous) = by_key.get(&key) {
-            if previous.identity != object_identity {
-                return Err(format!(
-                    "executable mapping aliases for {key:?} disagree on whole-file identity"
-                ));
-            }
-            continue;
+        if required_pass && required.keys().any(|key| !by_key.contains_key(key)) {
+            return Err("required executable provenance has no validated mapping".into());
         }
-        if by_key.len() >= MAX_OBJECTS {
-            return Err(format!(
-                "executable provenance object cap {MAX_OBJECTS} reached"
-            ));
-        }
-        let len = file
-            .metadata()
-            .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
-            .len();
-        total_bytes = total_bytes
-            .checked_add(len)
-            .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
-        if total_bytes > MAX_TOTAL_OBJECT_BYTES {
-            return Err(format!(
-                "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-            ));
-        }
-        by_key.insert(
-            key,
-            ProvenanceObject {
-                path: path.display().to_string(),
-                device_major: key.device.major,
-                device_minor: key.device.minor,
-                inode: key.inode,
-                identity: object_identity,
-            },
+    }
+    if omitted > MAX_OPTIONAL_DIAGNOSTICS {
+        eprintln!(
+            "p11scope-discover: optional executable provenance: {} further omissions",
+            omitted - MAX_OPTIONAL_DIAGNOSTICS
         );
     }
-
     if by_key.is_empty() {
         return Err("discovery found no file-backed executable mappings".into());
     }

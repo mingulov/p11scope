@@ -12345,12 +12345,73 @@ mod tests {
     }
 
     #[test]
+    fn counter_root_refusal_names_the_program_from_its_loading_context() {
+        // Counter-root loads name the program as `loading private counter
+        // root {program}` (src/attach/counter_banks.rs:2485,
+        // `validate_and_load`); a non-budget refusal there must name the
+        // program, not "unknown program". Fails while the extractor misses
+        // that shape.
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+                verifier_log: aya_obj::VerifierLog::new("denied".to_string()),
+            })
+            .context("loading private counter root function_list_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(r#"program "function_list_return" refused"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unknown program"), "{rendered}");
+    }
+
+    /// The production wrappers the CLI-level stderr mirror reproduces: `run`
+    /// adds the start context (`run.rs`), `main` adds the `p11scope: ` prefix
+    /// (`main.rs`). Both the mirror and the pin below read these constants,
+    /// so drift in either direction fails a test.
+    const STDERR_MIRROR_START_CONTEXT: &str = "starting attach session";
+    const STDERR_MIRROR_MAIN_PREFIX: &str = "p11scope: ";
+
+    fn production_wrappers_match(main: &str, run: &str) -> bool {
+        main.contains(&format!("\"{STDERR_MIRROR_MAIN_PREFIX}{{e:#}}\""))
+            && run.contains(&format!(".context(\"{STDERR_MIRROR_START_CONTEXT}\")"))
+    }
+
+    #[test]
+    fn stderr_bound_mirror_pins_production_wrappers() {
+        // The CLI-level bound test mirrors the `run`/`main` wrappers as
+        // literals because the binary entry point is not callable from a
+        // unit test; this pin fails if production or the mirror drifts. The
+        // mutants prove the pin itself is non-vacuous.
+        let main = include_str!("main.rs");
+        let run = include_str!("run.rs");
+        assert!(
+            production_wrappers_match(main, run),
+            "the mirror must track the production wrappers"
+        );
+        let main_mutant = main.replacen("p11scope: {e:#}", "p11scope!", 1);
+        assert_ne!(main_mutant, main);
+        assert!(
+            !production_wrappers_match(&main_mutant, run),
+            "a changed main wrapper must fail the pin"
+        );
+        let run_mutant = run.replace("starting attach session", "beginning");
+        assert_ne!(run_mutant, run);
+        assert!(
+            !production_wrappers_match(main, &run_mutant),
+            "a changed run context must fail the pin"
+        );
+    }
+
+    #[test]
     fn refused_program_start_stays_within_the_stderr_bound() {
         // CLI level: the same wrappers `run`/`capture` (run.rs "starting
         // attach session") and `main` ("p11scope: {e:#}") apply, mirrored
         // here because the binary entry point is not callable from a unit
-        // test. If those wrappers change, this mirror must change with
-        // them. The exit code stays 1.
+        // test. The mirror reads the pinned constants above, so drift fails
+        // `stderr_bound_mirror_pins_production_wrappers`. The exit code
+        // stays 1.
         let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
         let error = unsupported_environment_context(
             anyhow::Error::new(aya::programs::ProgramError::LoadError {
@@ -12359,8 +12420,8 @@ mod tests {
             })
             .context("loading p11_return"),
         );
-        let error = error.context("starting attach session");
-        let stderr = format!("p11scope: {error:#}");
+        let error = error.context(STDERR_MIRROR_START_CONTEXT);
+        let stderr = format!("{STDERR_MIRROR_MAIN_PREFIX}{error:#}");
         assert!(
             stderr.len() <= 1024,
             "stderr must stay bounded: {} bytes",
@@ -12382,7 +12443,11 @@ mod tests {
         // fixed `main`/`run` wrappers must leave room for the bounded
         // refusal summary within 1024 bytes. Lengthening a hint past this
         // fails here instead of silently breaking the bound.
-        let wrappers = "p11scope: ".len() + "starting attach session: ".len() + ": ".len() + 1;
+        let wrappers = STDERR_MIRROR_MAIN_PREFIX.len()
+            + STDERR_MIRROR_START_CONTEXT.len()
+            + ": ".len()
+            + ": ".len()
+            + 1;
         for hint in [
             UNSUPPORTED_ENV_HINT,
             VERIFIER_BUDGET_HINT,

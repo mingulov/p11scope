@@ -1072,6 +1072,83 @@ mod tests {
         }
     }
 
+    /// A refused self-probe program load must not dump the verifier log
+    /// into the verdict: the self-probe loads the real Detailed program
+    /// `p11_return`, and the verdict reaches stderr and doctor as a plain
+    /// string no later seam can bound. The verdict routes through the same
+    /// bounded formatter the attach seam uses. Fails while the verdict
+    /// formats the whole chain (~300 KB).
+    #[test]
+    fn a_refused_self_probe_load_binds_the_verdict_to_the_shared_bound() {
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            verifier_log: aya_obj::VerifierLog::new(log),
+        })
+        .context("loading p11_return");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::Unknown(why) = verdict else {
+            panic!("a verifier E2BIG is an unknown kernel, not a privilege fact: {verdict:?}");
+        };
+        assert!(
+            why.len() <= 1024,
+            "verdict must stay bounded: {} bytes",
+            why.len()
+        );
+        assert!(why.contains(r#"program "p11_return" refused"#), "{why}");
+        assert!(why.contains("E2BIG (os error 7)"), "{why}");
+        assert!(why.contains("TAIL-MARKER"), "{why}");
+        assert!(why.contains("307200 verifier-log bytes"), "{why}");
+        assert!(
+            !why.contains(&"f".repeat(1024)),
+            "the raw log must not survive classification"
+        );
+    }
+
+    /// The same bound on the not-permitted arm: a permission load refusal
+    /// with a long log stays a privilege fact, but a bounded one. Fails
+    /// while that arm formats the whole chain.
+    #[test]
+    fn a_forbidden_self_probe_load_binds_the_verdict_to_the_shared_bound() {
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = anyhow::Error::new(aya::programs::ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+            verifier_log: aya_obj::VerifierLog::new(log),
+        })
+        .context("loading p11_return");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::NotPermitted(why) = verdict else {
+            panic!("an EPERM load refusal stays not-permitted: {verdict:?}");
+        };
+        assert!(
+            why.len() <= 1024,
+            "verdict must stay bounded: {} bytes",
+            why.len()
+        );
+        assert!(why.contains(r#"program "p11_return" refused"#), "{why}");
+        assert!(why.contains("EPERM (os error 1)"), "{why}");
+        assert!(why.contains("307200 verifier-log bytes"), "{why}");
+        assert!(
+            !why.contains(&"f".repeat(1024)),
+            "the raw log must not survive classification"
+        );
+    }
+
+    /// A small non-load self-probe failure keeps its text verbatim: only a
+    /// genuine program-load refusal is summarized.
+    #[test]
+    fn a_small_self_probe_failure_keeps_its_text_verbatim() {
+        let error = io_chain(libc::EINVAL, "loading the BPF object");
+        let expected = format!("{error:#}");
+        let verdict = classify_probe_error(&error);
+        let KernelVerdict::Unknown(why) = verdict else {
+            panic!("an EINVAL load failure stays an unknown kernel: {verdict:?}");
+        };
+        assert_eq!(why, expected);
+    }
+
     /// A not-permitted self-probe is never a hazard verdict and never
     /// something the override can accept, for any target that needed it.
     #[test]

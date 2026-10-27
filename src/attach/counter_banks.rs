@@ -10372,6 +10372,32 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn counter_load_refusal_keeps_map_create_e2big() {
+        // A map-create E2BIG is not a program-load refusal: the preflight
+        // must not take the verifier-budget token for it. Fails while the
+        // preflight matches any io E2BIG in the chain.
+        let map_create =
+            anyhow::Error::new(aya::EbpfError::MapError(aya::maps::MapError::CreateError {
+                name: "COUNTS".to_string(),
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            }))
+            .context("creating counter map");
+        let text = super::counter_load_refusal(&map_create);
+        assert!(text.starts_with("counter object load failed ("), "{text}");
+        assert!(!text.contains("counter-mode-"), "{text}");
+    }
+
+    #[test]
+    fn counter_load_refusal_keeps_bare_io_e2big() {
+        // A bare io E2BIG with no program load behind it is unproven, never
+        // a verifier verdict. Fails while the preflight matches any io E2BIG.
+        let bare: anyhow::Error = std::io::Error::from_raw_os_error(libc::E2BIG).into();
+        let text = super::counter_load_refusal(&bare.context("loading BPF object"));
+        assert!(text.starts_with("counter object load failed ("), "{text}");
+        assert!(!text.contains("counter-mode-"), "{text}");
+    }
+
     /// The C producer's bucket index must equal the shared `bucket_of` over
     /// the full equality boundary set, in both timing modes.
     #[test]

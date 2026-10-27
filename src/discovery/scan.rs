@@ -2943,7 +2943,28 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
             break;
         }
-        match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
+        let value = read_word_le(snapshot, layout, offset).expect("one complete word");
+        // A plausible header inside this object's proven ELF metadata is
+        // not an independent table witness. In particular, a GNU property
+        // word followed by padding and init/fini pointers must not acquire
+        // decoded-table capacity or become a legacy-prefix surface. Keep
+        // the independently exported anchor recovery below separate: its
+        // existing credibility rule concerns the actual anchor word.
+        let metadata_header = !excluded_anchor_ranges.is_empty()
+            && spans_for(value).is_some()
+            && export_evidence.is_some_and(|exports| {
+                base_address.checked_add(offset as u64).is_some_and(|address| {
+                    matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
+                        if (ObjectKey { device, inode }) == exports.object
+                            && raw_anchor_overlaps_metadata(excluded_anchor_ranges, file_offset, width))
+                })
+            });
+        let decoded = if metadata_header {
+            Ok(None)
+        } else {
+            decode_candidate(layout, snapshot, offset, base_address, maps, budget, None)
+        };
+        match decoded {
             Ok(Some((table, len))) => {
                 seen.insert(offset, table.decoded_slot_count());
                 found.push((offset, len, true, table));
@@ -2965,7 +2986,6 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         // partial recovery. Merely being in a provider mapping (or being
         // all-zero data) is not such a witness. This is a single pass over
         // pointer words, rather than rewalking 104 words at every offset.
-        let value = read_word_le(snapshot, layout, offset).expect("one complete word");
         if let Some(ordinals) = anchors.get(&value).filter(|_| {
             if excluded_anchor_ranges.is_empty() {
                 return true;
@@ -7076,6 +7096,139 @@ mod tests {
             assert!(
                 !table_name_authorized(&score),
                 "uncertain API names stay unknown/count-only"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_raw_metadata_header_does_not_admit_gnu_property_padding_and_arrays() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x900)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        // Actual ABI26 LP64 rv64 shape: GNU property value 3 looks like
+        // version 3.0, 66 padding words are NULL, and .init_array/.fini_array
+        // pointers look like ordinals 66/67. The dynamic tail is not a table.
+        // The installed b58 failure admitted its two unknown targets and
+        // counted an extra destructor call. None has an own-export anchor.
+        let mut snapshot = vec![0u8; 93 * 8];
+        snapshot[..8].copy_from_slice(&3u64.to_le_bytes());
+        snapshot[(67 * 8)..(68 * 8)].copy_from_slice(&0x1500u64.to_le_bytes());
+        snapshot[(68 * 8)..(69 * 8)].copy_from_slice(&0x1600u64.to_le_bytes());
+        snapshot[(69 * 8)..(70 * 8)].copy_from_slice(&0xcu64.to_le_bytes());
+        let ranges = [(0x2000, 0x2008), (0x2218, 0x2228)];
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &ranges,
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "metadata is not a provider refusal");
+        assert!(
+            tables.is_empty(),
+            "ELF metadata cannot anchor a strict raw table: {tables:?}"
+        );
+        assert_eq!(
+            budget.table_candidates, 0,
+            "reject before admitting decoded table capacity"
+        );
+
+        // The same sparse/private layout in ordinary data remains useful:
+        // neither NULL count, version label nor target names are filters.
+        for word in [0x2802u64, 0x0003, 0x0203] {
+            snapshot[..8].copy_from_slice(&word.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &[],
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let table = tables.iter().find(|table| table.address == 0x7000).unwrap();
+            assert_eq!(table.entries.len(), 2);
+            assert_eq!(table.null_entries.len(), 66);
+            assert_eq!(table.decoded_slot_count(), 68);
+            assert_eq!(
+                table.walk,
+                if word == 0x2802 {
+                    "full"
+                } else {
+                    "known_prefix"
+                }
+            );
+        }
+        // Explicitly acquired words retain their bounded observation even
+        // when the returned address happens to lie in ELF metadata. All-NULL
+        // acquisition is different from an unanchored all-zero memory scan.
+        for words in [vec![0; 68], vec![0x1500; 68]] {
+            let table = decode_observed_words(
+                (3, 2),
+                &words,
+                68,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.decoded_slot_count(), 68);
+            assert_eq!(table.walk, "full");
+            assert_eq!(table.null_entries.len(), if words[0] == 0 { 68 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn strict_raw_metadata_header_requires_exact_elf_owner_provenance() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
+        snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+        for (inode, ranges, retained) in [
+            (7, vec![(0x2000, 0x2008)], false),
+            (8, vec![(0x2000, 0x2008)], true),
+            (7, vec![(0x1ff8, 0x2000)], true),
+            (7, vec![(0x2008, 0x2010)], true),
+            (7, vec![(0x1fff, 0x2001)], false),
+        ] {
+            let exports = ObjectExports {
+                object: ObjectKey {
+                    device: Device { major: 8, minor: 1 },
+                    inode,
+                },
+                symbols: &[],
+            };
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(
+                tables.iter().any(|table| table.address == 0x7000),
+                retained,
+                "inode={inode}, ranges={ranges:?}"
             );
         }
     }

@@ -1486,6 +1486,14 @@ pub(super) struct InstanceState {
     /// that reached registration despite the Births guard. Exact even
     /// though the disclosure stays one gap.
     joint_backstop_routed: u64,
+    /// Per-caller calls refused before application for an unproven or
+    /// unbound instance: the fourth q2 conservation term (R-59). Gap
+    /// rows cannot serve this count — one refused-instance row mixes
+    /// per-call pushes with registration pushes — so refused calls
+    /// count here, exactly once each, at the pre-`api_returns`
+    /// returns of `apply_instance_call`. Read only by the
+    /// conservation check; no report output carries it.
+    instance_calls_refused: BTreeMap<CallerId, u64>,
 }
 
 impl Default for InstanceState {
@@ -1513,6 +1521,7 @@ impl Default for InstanceState {
             journal_linked: cfg!(test),
             journal_unavailable_disclosed: false,
             joint_backstop_routed: 0,
+            instance_calls_refused: BTreeMap::new(),
         }
     }
 }
@@ -1949,6 +1958,17 @@ impl CallerRegistry {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn joint_backstop_routed(&self) -> u64 {
         self.instance_state.joint_backstop_routed
+    }
+
+    /// Calls refused for this caller before application for an unproven
+    /// or unbound instance: the fourth q2 conservation term (R-59).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn instance_calls_refused(&self, caller: CallerId) -> u64 {
+        self.instance_state
+            .instance_calls_refused
+            .get(&caller)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn joint_feed_targets(&self) -> impl Iterator<Item = JointFeedTarget> + '_ {
@@ -4169,6 +4189,120 @@ mod journal_unavailable_tests {
         assert_eq!(scene.registry.gaps().len(), 1);
         assert_eq!(scene.registry.gaps()[0].reason, "joint_journal_unavailable");
         assert_eq!(scene.registry.gaps()[0].subject, PLAN_TEXT);
+    }
+
+    /// R-59: one call refused for an unproven instance balances q2 only
+    /// with the per-call instance-refusal term. A registration refusal
+    /// pushes the same named gap row but counts nothing: gap repeats
+    /// are not a call counter.
+    #[test]
+    fn refused_instance_call_balances_q2_only_with_the_instance_term() {
+        let mut scene = UnlinkedScene::new();
+        // A registration refusal pushes the refused-instance row yet
+        // counts no call: the row mixes registration and per-call
+        // pushes, so it can never serve the equation.
+        let stranger = CallerId(99);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(scene.key(3), stranger));
+        scene.registry.publish();
+        assert!(
+            scene.registry.gaps().iter().any(|gap| {
+                gap.subject == "instance semantics refused" && gap.caller == Some(stranger)
+            }),
+            "the refused registration discloses its gap"
+        );
+        assert_eq!(
+            scene.registry.instance_calls_refused(stranger),
+            0,
+            "a refused registration counts no refused call"
+        );
+        assert_eq!(
+            scene.registry.instance_calls_refused(scene.caller),
+            0,
+            "no call refused yet"
+        );
+        // The one entered call: no instance was ever admitted under its
+        // key, so the call refuses for an unproven instance.
+        let missing = scene.key(9);
+        scene.observe(&missing, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        let caller = scene.caller;
+        assert!(
+            scene.registry.gaps().iter().any(|gap| {
+                gap.subject == "instance semantics refused"
+                    && gap.reason == "instance_unproven"
+                    && gap.caller == Some(caller)
+            }),
+            "the refused call discloses instance_unproven"
+        );
+        let entered = 1u64;
+        let api: u64 = scene
+            .registry
+            .instance_semantic_edges()
+            .map(|record| record.api_returns.unwrap_or(0))
+            .sum();
+        // No lane drains in this scene, so nothing sheds; the equation
+        // still names the term it would occupy.
+        let shed = 0u64;
+        let slot = scene
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "semantic input refused" && gap.reason == "slot")
+            .count() as u64;
+        let inst = scene.registry.instance_calls_refused(caller);
+        assert_eq!(api, 0, "the refused call never applies");
+        assert_eq!(slot, 0, "no slot refusal staged");
+        assert_eq!(inst, 1, "the refused call counts exactly once");
+        assert_ne!(
+            entered,
+            api + shed + slot,
+            "without the instance term the call is lost"
+        );
+        assert_eq!(
+            entered,
+            api + shed + slot + inst,
+            "every entered call is attributed, slot-refused, disclosed-shed or instance-refused"
+        );
+    }
+
+    /// The second pre-application refusal: a call for an instance bound
+    /// to another caller refuses without applying and counts once.
+    #[test]
+    fn caller_mismatched_call_counts_as_an_instance_refusal() {
+        let mut scene = UnlinkedScene::new();
+        let (key, _) = scene.register(1);
+        let other = CallerId(11);
+        scene.registry.scripted_module_edge(scene.module.clone(), other);
+        scene.registry.observe_instance_semantic(
+            AdmittedInstanceCall::scripted(key, other, 1, s1_call("C_Sign", RV_OK, MECHANISM)),
+        );
+        scene.registry.publish();
+        assert!(
+            scene.registry.gaps().iter().any(|gap| {
+                gap.subject == "instance semantics refused"
+                    && gap.reason == "caller_unbound"
+                    && gap.caller == Some(other)
+            }),
+            "the mismatched call discloses caller_unbound"
+        );
+        let api: u64 = scene
+            .registry
+            .instance_semantic_edges()
+            .map(|record| record.api_returns.unwrap_or(0))
+            .sum();
+        assert_eq!(api, 0, "the mismatched call never applies");
+        assert_eq!(
+            scene.registry.instance_calls_refused(other),
+            1,
+            "the mismatched call counts exactly once"
+        );
+        assert_eq!(
+            scene.registry.instance_calls_refused(scene.caller),
+            0,
+            "the bound caller counts nothing"
+        );
     }
 
     /// The exp-h8-born shape (bare CALL rows, no journal seals) on an

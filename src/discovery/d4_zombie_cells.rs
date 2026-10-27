@@ -1834,10 +1834,13 @@ fn cold_admission_two_survivors_refuses_ambiguity() {
 }
 
 /// A cold-minted member handed into the confirm routes the confirm
-/// through the survivor. Non-vacuity: while the handed member lives,
-/// its slot refuses a fresh mint — so the prepare below can only carry
-/// the HANDED member, never a silent re-mint. A handoff for another pid
-/// drops and the ordinary mint runs (control).
+/// through the survivor. Routing — not just carriage — is pinned with
+/// the work budget: the handed path spends 0 mint units while an
+/// ordinary mint spends 1 (listing) + 4 (mint), so with the ceiling set
+/// to the handed prepare's own spend only the handed path can still
+/// carry. Non-vacuity: while the handed member lives, its slot refuses
+/// a fresh mint. A handoff for another pid drops and cannot carry under
+/// the handed ceiling (control).
 #[test]
 fn cold_member_handoff_routes_confirm_through_survivor() {
     use crate::discovery::caller_registry::{cold_admit_member, cold_member_owner};
@@ -1883,28 +1886,59 @@ fn cold_member_handoff_routes_confirm_through_survivor() {
         .expect("carried member selects");
     assert_eq!(selector.tgid(), group.tgid);
     assert_eq!(selector.tid(), group.survivor);
+    // The handed path spends 0 mint units, so this ceiling admits no
+    // fresh mint (an ordinary mint needs 1 for the listing plus 4 for
+    // the mint itself). Pinned at 0 — not just measured — so a dropped
+    // handoff cannot inflate the ceiling by silently re-minting: a
+    // re-mint would spend 5 here and fail this assert first.
+    let handed_spend = budget.work_units_count();
+    assert_eq!(
+        handed_spend, 0,
+        "the handed prepare spends no mint units (a silent re-mint would spend 5)"
+    );
     drop(prepared);
     drop(io);
-    // Control: a handoff for another pid drops and the ordinary mint runs.
+    // Routing pin: under a ceiling of exactly the handed spend, the
+    // matching handoff still carries (only the 0-mint-unit handed path
+    // fits; a dropped handoff would need 5 more units for a fresh mint).
+    // The survivor parks in `pause()` on frozen post-fork mappings, so
+    // the maps spend cannot drift between these back-to-back prepares.
     let pin = Arc::new(PidPin::open(group.tgid).expect("second cold pin opens"));
     let mut work = CaptureWorkBudget::default();
     let minted = cold_admit_member(&pin, &mut work).expect("second cold mint");
     let mut io = OsConfirmIo::default();
+    io.hand_cold_member(group.tgid, minted);
+    drop(pin);
+    let mut budget = CaptureWorkBudget::with_work_ceiling(handed_spend);
+    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+        .expect("the handed path fits its own ceiling");
+    let selector = prepared
+        .member
+        .as_ref()
+        .expect("the handed path carries under its own ceiling")
+        .selector()
+        .expect("carried member selects");
+    assert_eq!(selector.tgid(), group.tgid);
+    assert_eq!(selector.tid(), group.survivor);
+    drop(prepared);
+    drop(io);
+    // Control: a handoff for another pid drops, and the fallback mint
+    // cannot carry under the handed ceiling (it needs 5 more units) —
+    // while a wrongly accepted handoff WOULD carry (0 mint units).
+    let pin = Arc::new(PidPin::open(group.tgid).expect("third cold pin opens"));
+    let mut work = CaptureWorkBudget::default();
+    let minted = cold_admit_member(&pin, &mut work).expect("third cold mint");
+    let mut io = OsConfirmIo::default();
     io.hand_cold_member(group.tgid.wrapping_add(1), minted);
     drop(pin);
-    let mut budget = CaptureWorkBudget::default();
-    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
-        .expect("a mismatched handoff falls back to the ordinary mint");
-    assert_eq!(
-        prepared
-            .member
-            .as_ref()
-            .expect("the ordinary mint carries")
-            .selector()
-            .expect("carried member selects")
-            .tid(),
-        group.survivor
-    );
+    let mut budget = CaptureWorkBudget::with_work_ceiling(handed_spend);
+    match prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None) {
+        Ok(prepared) => assert!(
+            prepared.member.is_none(),
+            "a dropped handoff carries nothing under the handed ceiling"
+        ),
+        Err(_) => {}
+    }
 }
 
 /// A zombie-leader group whose view the test opens while the leader

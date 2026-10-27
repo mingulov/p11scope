@@ -7411,3 +7411,51 @@ mod refused_filter_tests {
         assert_eq!(refused, vec![refused_object(1, key(42))]);
     }
 }
+
+/// Pins the `take_anchors` flag -> builder wiring at the nearest testable
+/// seam: `collect_members_identity` must forward its flag to
+/// `build_identity_custody`, so explicit userspace (`false`) gets
+/// zero-capacity custody and auto/kernel (`true`) gets full capacity.
+/// Capacity is fixed at construction, so the asserts hold unprivileged
+/// with zero deep scans (`max_scan_pids = Some(0)`): map_files EPERM can
+/// only affect offers, of which there are none. The selection -> flag
+/// line in `collect_system_with_identity` still needs the Fedora
+/// 2-census/pass floor as its last-mile proof.
+#[cfg(test)]
+mod take_anchors_wiring_tests {
+    use super::{
+        CaptureWorkBudget, EXAMINED_ANCHOR_CAP, HookRegistry, StageTimings,
+        collect_members_identity,
+    };
+
+    #[test]
+    fn collect_members_identity_forwards_take_anchors_to_custody_capacity() {
+        for take_anchors in [false, true] {
+            let mut timings = StageTimings::new();
+            let (collection, custody) = collect_members_identity(
+                &[],
+                &HookRegistry::builtin(),
+                Some(0),
+                &mut timings,
+                true,
+                CaptureWorkBudget::default(),
+                take_anchors,
+            );
+            assert!(
+                collection.selected.is_empty(),
+                "cap 0 must select nothing (take_anchors={take_anchors})"
+            );
+            let held = custody.expect("identity scan owns custody");
+            assert!(
+                !held.failed(),
+                "creation census must succeed unprivileged (take_anchors={take_anchors})"
+            );
+            let expected = if take_anchors { EXAMINED_ANCHOR_CAP } else { 0 };
+            assert_eq!(
+                held.owner.examined_capacity(),
+                expected,
+                "take_anchors={take_anchors} must build capacity {expected}"
+            );
+        }
+    }
+}

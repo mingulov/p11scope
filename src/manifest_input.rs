@@ -106,64 +106,70 @@ fn validate_identity(label: &str, identity: &ObjectIdentity, problems: &mut Vec<
     }
 }
 
-fn expected_surface(surface: &SurfaceRecord) -> Result<(Vec<&'static str>, &'static str), String> {
-    let version = surface
-        .version
-        .ok_or_else(|| "walked surface has no version".to_string())?;
-    let version = cryptoki_sys::CK_VERSION {
-        major: version.major,
-        minor: version.minor,
-    };
-    let source = match surface.source {
-        SurfaceSource::LegacyFunctionList => Surface::LegacyFunctionList { version },
-        SurfaceSource::Interface { .. } => Surface::StandardInterface { version },
-    };
-    if matches!(surface.source, SurfaceSource::LegacyFunctionList) {
-        // The typed getter identifies the bounded 68-position ABI. Its label
-        // controls the recorded walk metadata, never the acquired positions.
-        return Ok((
-            pkcs11_module::FUNCTION_LIST_FIELDS
-                .iter()
-                .map(|field| field.name)
-                .collect(),
-            if matches!(tables_for(source), TableSet::Walk(_)) {
-                "full"
-            } else {
-                "known_prefix"
+fn surface_spans(surface: &SurfaceRecord) -> &'static [pkcs11_module::TableSpan] {
+    if matches!(surface.source, SurfaceSource::Interface { .. })
+        && let Some(version) = surface.version
+    {
+        match tables_for(Surface::StandardInterface {
+            version: cryptoki_sys::CK_VERSION {
+                major: version.major,
+                minor: version.minor,
             },
-        ));
+        }) {
+            TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => return spans,
+            TableSet::Refuse => {}
+        }
     }
-    let (spans, normal_walk) = match tables_for(source) {
-        TableSet::Walk(spans) => (spans, "full"),
-        TableSet::WalkKnownPrefix(spans) => (spans, "known_prefix"),
-        TableSet::Refuse => {
-            return Ok((
-                pkcs11_module::FUNCTION_LIST_FIELDS
-                    .iter()
-                    .map(|field| field.name)
-                    .collect(),
-                "known_prefix",
-            ));
-        }
-    };
-    let forced_prefix = matches!(
-        surface.source,
-        SurfaceSource::Interface {
-            classification: InterfaceClassification::CorroboratedStandardPrefix,
-            ..
-        }
-    );
-    Ok((
-        spans
-            .iter()
-            .flat_map(|span| span.fields().iter().map(|field| field.name))
-            .collect(),
-        if forced_prefix {
-            "known_prefix"
-        } else {
-            normal_walk
+    // This selects the fixed common catalogue, never replacement metadata.
+    let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
         },
-    ))
+    }) else {
+        unreachable!("the legacy ABI has a bounded field catalogue");
+    };
+    spans
+}
+
+fn expected_surface(surface: &SurfaceRecord) -> Vec<&'static str> {
+    surface_spans(surface)
+        .iter()
+        .flat_map(|span| span.fields().iter().map(|field| field.name))
+        .collect()
+}
+
+/// Function-word completeness for a structurally validated surface. An
+/// unreadable metadata header is independent of the observed ordinal extent.
+pub(crate) fn surface_function_inventory_complete(surface: &SurfaceRecord) -> bool {
+    matches!(surface.acquisition, Acquisition::Ok)
+        && surface.functions.len()
+            == surface_spans(surface)
+                .iter()
+                .map(|span| span.fields().len())
+                .sum::<usize>()
+        && match surface.walk {
+            WalkOutcome::Full | WalkOutcome::KnownPrefix => true,
+            WalkOutcome::Unreadable { .. } => surface.version.is_none(),
+            WalkOutcome::Refused | WalkOutcome::NotWalked => false,
+        }
+}
+
+/// Normalize obsolete `Full` claims without dropping their observed prefix.
+pub(crate) fn effective_surface_walk(surface: &SurfaceRecord) -> String {
+    if matches!(surface.walk, WalkOutcome::Full)
+        && surface.functions.len()
+            < surface_spans(surface)
+                .iter()
+                .map(|span| span.fields().len())
+                .sum::<usize>()
+    {
+        return "known_prefix".into();
+    }
+    match &surface.walk {
+        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
+        walk => walk_name(walk).into(),
+    }
 }
 
 fn walk_name(walk: &WalkOutcome) -> &'static str {
@@ -278,7 +284,7 @@ fn selection_version_agrees(result: &SelectionResult, surface: &SurfaceRecord) -
 }
 
 pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
-    if !matches!(surface.acquisition, Acquisition::Ok) {
+    if !surface_function_inventory_complete(surface) {
         return false;
     }
     let Some(version) = surface.version else {
@@ -295,13 +301,7 @@ pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
     if matches!(tables_for(source), TableSet::Refuse) {
         return false;
     }
-    let Ok((_, expected_walk)) = expected_surface(surface) else {
-        return false;
-    };
-    matches!(
-        (&surface.walk, expected_walk),
-        (WalkOutcome::Full, "full") | (WalkOutcome::KnownPrefix, "known_prefix")
-    )
+    matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
 }
 
 fn validate_selection_table(
@@ -961,20 +961,17 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
         }
         if matches!(surface.walk, WalkOutcome::Unreadable { .. }) {
             if !surface.functions.is_empty() {
-                match expected_surface(surface) {
-                    Ok((expected, _)) => {
-                        let actual: Vec<_> = surface
-                            .functions
-                            .iter()
-                            .map(|function| function.name.as_str())
-                            .collect();
-                        if actual.len() >= expected.len()
-                            || expected.get(..actual.len()) != Some(actual.as_slice())
-                        {
-                            problems.push(format!("unreadable surface {surface_index} does not match canonical partial function order"));
-                        }
-                    }
-                    Err(error) => problems.push(format!("surface {surface_index}: {error}")),
+                let expected = expected_surface(surface);
+                let actual: Vec<_> = surface
+                    .functions
+                    .iter()
+                    .map(|function| function.name.as_str())
+                    .collect();
+                if actual.len() > expected.len()
+                    || (actual.len() == expected.len() && surface.version.is_some())
+                    || expected.get(..actual.len()) != Some(actual.as_slice())
+                {
+                    problems.push(format!("unreadable surface {surface_index} does not match canonical partial function order"));
                 }
             }
             continue;
@@ -987,28 +984,23 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             }
             continue;
         }
-        match expected_surface(surface) {
-            Ok((expected, expected_walk)) => {
-                if walk_name(&surface.walk) != expected_walk {
-                    problems.push(format!(
-                        "surface {surface_index} walk {:?} disagrees with its source/version; expected {expected_walk}",
-                        surface.walk
-                    ));
-                }
-                let actual: Vec<&str> = surface
-                    .functions
-                    .iter()
-                    .map(|function| function.name.as_str())
-                    .collect();
-                if actual != expected {
-                    problems.push(format!(
-                        "surface {surface_index} does not match canonical function order (got {}, expected {})",
-                        actual.len(),
-                        expected.len()
-                    ));
-                }
+        if matches!(surface.walk, WalkOutcome::Refused) {
+            if !surface.functions.is_empty() {
+                problems.push(format!("refused surface {surface_index} must be empty"));
             }
-            Err(error) => problems.push(format!("surface {surface_index}: {error}")),
+            continue;
+        }
+        let expected = expected_surface(surface);
+        let actual: Vec<_> = surface
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        if expected.get(..actual.len()) != Some(actual.as_slice()) {
+            problems.push(format!(
+                "surface {surface_index} does not match canonical function order (got {}, maximum {})",
+                actual.len(), expected.len()
+            ));
         }
     }
 

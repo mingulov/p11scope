@@ -678,16 +678,6 @@ pub(crate) fn source_label(s: &SurfaceSource) -> String {
     }
 }
 
-fn walk_label(w: &WalkOutcome) -> String {
-    match w {
-        WalkOutcome::Full => "full".into(),
-        WalkOutcome::KnownPrefix => "known_prefix".into(),
-        WalkOutcome::Refused => "refused".into(),
-        WalkOutcome::NotWalked => "not_walked".into(),
-        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
-    }
-}
-
 fn acquisition_label(a: &Acquisition) -> String {
     match a {
         Acquisition::Ok => "ok".into(),
@@ -3266,7 +3256,7 @@ pub(crate) fn semantic_source_claims(
         if let Some(piece) = &piece {
             if manifest.surfaces.iter().any(|surface| {
                 (matches!(surface.acquisition, Acquisition::Ok)
-                    && !matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix))
+                    && !crate::manifest_input::surface_function_inventory_complete(surface))
                     || surface.functions.iter().any(|function| {
                         affecting(&function.name)
                             && !matches!(
@@ -3698,7 +3688,7 @@ fn lower_manifest(
     for surface in &m.surfaces {
         surfaces.push(SurfaceSummary {
             source: source_label(&surface.source),
-            walk: walk_label(&surface.walk),
+            walk: crate::manifest_input::effective_surface_walk(surface),
             acquisition: acquisition_label(&surface.acquisition),
             functions: surface.functions.len(),
         });
@@ -5990,8 +5980,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn manifest_missing_tail_prevents_provider_completeness_but_metadata_does_not() {
+    fn pinnable_null_manifest() -> Manifest {
         let path = "/bin/true";
         let file = p11scope_manifest::identity::open_object(std::path::Path::new(path)).unwrap();
         let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
@@ -6014,6 +6003,57 @@ mod tests {
             inode: key.inode,
             identity,
         };
+        manifest.surfaces[0].version = Some(Version {
+            major: 2,
+            minor: 40,
+        });
+        manifest
+    }
+
+    #[test]
+    fn normalized_historical_full_prefix_has_partial_walk_and_no_complete_authority() {
+        let mut manifest = pinnable_null_manifest();
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        manifest.surfaces[0].version = Some(Version { major: 2, minor: 0 });
+        manifest.surfaces[0].functions.truncate(67);
+        let plan = build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert_eq!(plan.surfaces[0].walk, "known_prefix");
+        assert_eq!(plan.entries_seen, 67);
+        assert!(!crate::manifest_input::selection_surface_usable(
+            &manifest.surfaces[0]
+        ));
+        let claims = semantic_source_claims(&[], &[manifest], &pins);
+        assert_eq!(claims.incomplete.len(), 1);
+    }
+
+    #[test]
+    fn normalized_header_uncertainty_does_not_invent_missing_function_demand() {
+        let mut manifest = pinnable_null_manifest();
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        manifest.surfaces[0].version = None;
+        manifest.surfaces[0].walk = WalkOutcome::Unreadable {
+            detail: "version header unavailable".into(),
+        };
+        let claims = semantic_source_claims(&[], std::slice::from_ref(&manifest), &pins);
+        assert!(
+            claims.incomplete.is_empty(),
+            "all 68 function words are observed"
+        );
+        assert!(!crate::manifest_input::selection_surface_usable(
+            &manifest.surfaces[0]
+        ));
+        manifest.surfaces[0].functions.pop();
+        let claims = semantic_source_claims(&[], &[manifest], &pins);
+        assert_eq!(
+            claims.incomplete.len(),
+            1,
+            "a missing function word remains unknown"
+        );
+    }
+
+    #[test]
+    fn manifest_missing_tail_prevents_provider_completeness_but_metadata_does_not() {
+        let mut manifest = pinnable_null_manifest();
         manifest.surfaces[0].version = Some(Version {
             major: 0,
             minor: 255,
@@ -6645,11 +6685,11 @@ mod tests {
 
     #[test]
     fn surface_summaries_are_populated_from_the_manifest() {
-        let m = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let m = manifest_with(vec![resolved("C_Initialize", 0x10)]);
         let p = build(&m);
         assert_eq!(p.surfaces.len(), 1);
         assert_eq!(p.surfaces[0].source, "legacy_function_list");
-        assert_eq!(p.surfaces[0].walk, "full");
+        assert_eq!(p.surfaces[0].walk, "known_prefix");
         assert_eq!(p.surfaces[0].acquisition, "ok");
         assert_eq!(p.surfaces[0].functions, 1);
         assert_eq!(p.vendor_interfaces, 0);

@@ -351,8 +351,6 @@ fn unreadable_manifest_prefix_requires_canonical_order_without_selection_authori
     for mutation in [
         "reorder",
         "unknown",
-        "missing-version",
-        "complete-walk",
         "full-prefix",
         "empty-detail",
         "missing-object",
@@ -363,8 +361,6 @@ fn unreadable_manifest_prefix_requires_canonical_order_without_selection_authori
         match mutation {
             "reorder" => changed.surfaces[0].functions.swap(0, 1),
             "unknown" => changed.surfaces[0].functions[1].name = "C_Unknown".into(),
-            "missing-version" => changed.surfaces[0].version = None,
-            "complete-walk" => changed.surfaces[0].walk = WalkOutcome::KnownPrefix,
             "full-prefix" => {
                 changed.surfaces[0].functions = pkcs11_module::FUNCTION_LIST_FIELDS
                     .iter()
@@ -408,6 +404,20 @@ fn unreadable_manifest_prefix_requires_canonical_order_without_selection_authori
             !p11scope::manifest_input::validate_structure(&changed).is_empty(),
             "{mutation} unexpectedly accepted"
         );
+    }
+    for missing_metadata in [false, true] {
+        let mut prefix = manifest.clone();
+        if missing_metadata {
+            prefix.surfaces[0].version = None;
+        } else {
+            prefix.surfaces[0].walk = WalkOutcome::KnownPrefix;
+        }
+        assert!(p11scope::manifest_input::validate_structure(&prefix).is_empty());
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&prefix).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], &[prefix], &pins);
+        assert_eq!(plan.entries_seen, 3);
+        assert_eq!(plan.slots.len(), 1);
+        assert_ne!(plan.surfaces[0].walk, "full");
     }
     let mut changed_hash = manifest.clone();
     changed_hash.objects[0].identity.sha256 = Some("00".repeat(32));

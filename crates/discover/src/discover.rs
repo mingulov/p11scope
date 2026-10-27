@@ -700,6 +700,38 @@ fn inventory_tables(source: Surface) -> TableSet {
     }
 }
 
+fn inventory_snapshot(
+    memory: &ProcessMemory,
+    base: usize,
+    source: Result<Surface, &str>,
+) -> TableSnapshot {
+    match source {
+        Ok(source) => snapshot_table(memory, base, inventory_tables(source)),
+        Err(header_error) => {
+            // An unavailable header gives no extension evidence, but does not
+            // prevent bounded reads of the independently acquired common ABI.
+            let mut snapshot = snapshot_table(
+                memory,
+                base,
+                inventory_tables(Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }),
+            );
+            let detail = match &snapshot.walk {
+                WalkOutcome::Unreadable { detail } => {
+                    format!("version header unreadable: {header_error}; functions: {detail}")
+                }
+                _ => format!("version header unreadable: {header_error}"),
+            };
+            snapshot.walk = WalkOutcome::Unreadable { detail };
+            snapshot
+        }
+    }
+}
+
 fn selection_inventory_usable(source: Surface, walk: &WalkOutcome) -> bool {
     // Common-prefix recovery does not widen the fixed selection contract.
     !matches!(tables_for(source), TableSet::Refuse)
@@ -759,36 +791,36 @@ fn legacy_surface(
             );
         }
     };
-    let version = match read_version(memory, base) {
-        Ok(version) => version,
-        Err(detail) => {
-            return (
-                SurfaceRecord {
-                    source,
-                    acquisition: Acquisition::Ok,
-                    version: None,
-                    walk: WalkOutcome::Unreadable { detail },
-                    functions: vec![],
-                },
-                None,
-                None,
-            );
-        }
-    };
-    let source_abi = Surface::LegacyFunctionList { version };
-    let snapshot = snapshot_table(memory, base, inventory_tables(source_abi));
-    let legacy_240 = (version.major == 2
-        && version.minor == 40
+    let version = read_version(memory, base);
+    let snapshot = inventory_snapshot(
+        memory,
+        base,
+        version
+            .as_ref()
+            .map(|version| Surface::LegacyFunctionList { version: *version })
+            .map_err(String::as_str),
+    );
+    let legacy_240 = (version
+        .as_ref()
+        .is_ok_and(|version| version.major == 2 && version.minor == 40)
         && matches!(&snapshot.walk, WalkOutcome::Full)
         && snapshot.values.len() == 68)
         .then(|| snapshot.values.iter().map(|(_, value)| *value).collect());
-    let inventory_pointer = selection_inventory_usable(source_abi, &snapshot.walk).then_some(base);
+    let inventory_pointer = version
+        .as_ref()
+        .is_ok_and(|version| {
+            selection_inventory_usable(
+                Surface::LegacyFunctionList { version: *version },
+                &snapshot.walk,
+            )
+        })
+        .then_some(base);
     let functions = resolve_values(snapshot.values, maps, objects);
     (
         SurfaceRecord {
             source,
             acquisition: Acquisition::Ok,
-            version: Some(manifest_version(version)),
+            version: version.ok().map(manifest_version),
             walk: snapshot.walk,
             functions,
         },
@@ -883,7 +915,7 @@ fn interface_records(
                     index,
                     &entry,
                     name,
-                    version_value,
+                    Some(version_value),
                     InterfaceClassification::CorroboratedStandardPrefix,
                     snapshot,
                     true,
@@ -1598,31 +1630,28 @@ fn interface_surface(
     maps: &maps::MapIndex<'_>,
     objects: &mut ObjectTable,
 ) -> SurfaceRecord {
-    let Ok(version) = version else {
+    if entry.func_list.is_null() {
         return SurfaceRecord {
             source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
             acquisition: Acquisition::Ok,
             version: None,
-            walk: if entry.func_list.is_null() {
-                WalkOutcome::NotWalked
-            } else {
-                WalkOutcome::Unreadable {
-                    detail: version.unwrap_err(),
-                }
-            },
+            walk: WalkOutcome::NotWalked,
             functions: vec![],
         };
-    };
-    let snapshot = snapshot_table(
+    }
+    let snapshot = inventory_snapshot(
         memory,
         entry.func_list as usize,
-        inventory_tables(Surface::StandardInterface { version }),
+        version
+            .as_ref()
+            .map(|version| Surface::StandardInterface { version: *version })
+            .map_err(String::as_str),
     );
     interface_surface_from_snapshot(
         index,
         entry,
         name,
-        version,
+        version.ok(),
         classification,
         snapshot,
         force_prefix,
@@ -1636,7 +1665,7 @@ fn interface_surface_from_snapshot(
     index: usize,
     entry: &RawInterface,
     name: NameRead,
-    version: cryptoki_sys::CK_VERSION,
+    version: Option<cryptoki_sys::CK_VERSION>,
     classification: InterfaceClassification,
     snapshot: TableSnapshot,
     force_prefix: bool,
@@ -1651,7 +1680,7 @@ fn interface_surface_from_snapshot(
     SurfaceRecord {
         source: interface_source(index, native_ulong_u64(entry.flags), name, classification),
         acquisition: Acquisition::Ok,
-        version: Some(manifest_version(version)),
+        version: version.map(manifest_version),
         walk,
         functions: resolve_values(snapshot.values, maps, objects),
     }

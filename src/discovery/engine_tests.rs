@@ -52030,3 +52030,162 @@ fn exact_read_accepts_a_mislabelled_68_slot_prefix() {
         "every entry resolves into one executable object"
     );
 }
+
+struct LegacyPrefixBoundaryFixture {
+    _scratch: tempfile::NamedTempFile,
+    base: *mut libc::c_void,
+    page: usize,
+}
+
+impl LegacyPrefixBoundaryFixture {
+    fn new() -> Self {
+        use std::os::fd::AsRawFd as _;
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        assert!(page >= 8 + 104 * 8);
+        let scratch = tempfile::NamedTempFile::new().unwrap();
+        scratch.as_file().set_len((2 * page) as u64).unwrap();
+        // SAFETY: map two pages of a held private writable file. Drop
+        // releases the mapping before the held file is closed.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                scratch.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        Self {
+            _scratch: scratch,
+            base,
+            page,
+        }
+    }
+
+    fn protect_tail(&self) {
+        // SAFETY: the second page belongs to this live mapping.
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    self.base.cast::<u8>().add(self.page).cast(),
+                    self.page,
+                    libc::PROT_NONE,
+                )
+            },
+            0
+        );
+    }
+
+    fn write_table(&self, version_word: u64, slots: usize) -> u64 {
+        fn anchor() {}
+        let len = 8 + slots * 8;
+        assert!(len <= self.page);
+        // SAFETY: the table fits entirely within the first writable
+        // page, ending exactly where the protected second page begins.
+        let address = unsafe { self.base.cast::<u8>().add(self.page - len) } as u64;
+        let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u64, slots + 1) };
+        words[0] = version_word;
+        words[1..].fill(anchor as *const () as usize as u64);
+        address
+    }
+}
+
+impl Drop for LegacyPrefixBoundaryFixture {
+    fn drop(&mut self) {
+        // SAFETY: this fixture exclusively owns these two live pages.
+        assert_eq!(unsafe { libc::munmap(self.base, 2 * self.page) }, 0);
+    }
+}
+
+#[test]
+fn exact_read_recovers_legacy_prefix_at_readable_mapping_boundary() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let view = ProcessView::open(ProcessViewId(4243), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).unwrap();
+    for allow_span in [false, true] {
+        let address = fixture.write_table(0x0203, 68);
+        let (_, table, bytes) = Engine::read_exact_table_bracketed(
+            &view,
+            address,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            allow_span,
+        )
+        .expect("a complete legacy table needs no readable extended tail");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "known_prefix");
+        assert_eq!(table.entries.len(), 68);
+        assert_eq!(bytes.len(), 552);
+
+        for broken in [0usize, 67] {
+            let word = unsafe { (address as *mut u64).add(broken + 1) };
+            let original = unsafe { *word };
+            unsafe { *word = 1 };
+            let result = Engine::read_exact_table_bracketed(
+                &view,
+                address,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                allow_span,
+            );
+            unsafe { *word = original };
+            assert!(matches!(result, Err(ExactReadRefusal::Undecodable)));
+        }
+        let incomplete = fixture.write_table(0x0203, 67);
+        assert!(matches!(
+            Engine::read_exact_table_bracketed(
+                &view,
+                incomplete,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                allow_span,
+            ),
+            Err(ExactReadRefusal::Undecodable)
+        ));
+        for (word, version, slots) in [(0x0003, (3, 0), 92), (0x0203, (3, 2), 104)] {
+            let address = fixture.write_table(word, slots);
+            let (_, table, bytes) = Engine::read_exact_table_bracketed(
+                &view,
+                address,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                allow_span,
+            )
+            .expect("the complete extended layout remains a full table");
+            assert_eq!((table.version, table.walk), (version, "full"));
+            assert_eq!(table.entries.len(), slots);
+            assert_eq!(bytes.len(), 8 + slots * 8);
+        }
+    }
+}
+
+#[test]
+fn exact_read_refuses_an_extended_mapping_changed_after_maps_a() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    let address = fixture.write_table(0x0203, 68);
+    let view = ProcessView::open(ProcessViewId(4244), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).unwrap();
+    fixture.protect_tail();
+    // /proc/self/mem can read through PROT_NONE; the maps-B bracket,
+    // rather than a content-read failure, must reject this changed map.
+    assert!(matches!(
+        Engine::read_exact_table_bracketed(
+            &view,
+            address,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            false,
+        ),
+        Err(ExactReadRefusal::Unstable)
+    ));
+}

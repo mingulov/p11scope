@@ -5977,6 +5977,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mislabelled_3x_prefix_decodes_without_an_extended_snapshot() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let width = layout.word_bytes();
+            for minor in [0u8, 1, 2, 255] {
+                let mut snapshot = vec![0u8; 69 * width];
+                snapshot[0] = 3;
+                snapshot[1] = minor;
+                for slot in snapshot[width..].chunks_exact_mut(width) {
+                    slot.copy_from_slice(&0x1500u64.to_le_bytes()[..width]);
+                }
+                let (table, len) = decode_candidate(
+                    layout,
+                    &snapshot,
+                    0,
+                    0x7000,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    None,
+                )
+                .expect("the prefix fits the budget")
+                .expect("a complete legacy prefix does not need extended bytes");
+                assert_eq!(table.version, (3, minor));
+                assert_eq!(table.walk, "known_prefix");
+                assert_eq!(table.entries.len(), 68);
+                assert_eq!(table.decoded_slot_count(), 68);
+                assert_eq!(len, 69 * width);
+                assert_eq!(
+                    exact_table_addresses_n(&snapshot, layout, table.decoded_slot_count()),
+                    Some(vec![0x1500; 68])
+                );
+                let mut dependencies = ScanDependencies::default();
+                dependencies.retain_tables(
+                    std::slice::from_ref(&table),
+                    &snapshot,
+                    0x7000,
+                    layout,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                );
+                assert!(!dependencies.invalid_span);
+                assert_eq!(dependencies.targets.keys().copied().collect::<Vec<_>>(), [0x1000]);
+                let identity = interface_identity(&table, "null", &None, 0, &map_index, None)
+                    .expect("the prefix has its file identity");
+                let InterfaceTableKey::File(identity) = identity.table else {
+                    panic!("the table is file-backed");
+                };
+                assert_eq!(identity.usable, 68);
+            }
+        }
+    }
+
+    #[test]
+    fn mislabelled_3x_short_snapshots_refuse_incomplete_or_invalid_legacy_prefixes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let width = layout.word_bytes();
+            let mut snapshot = vec![0u8; 69 * width];
+            snapshot[0] = 3;
+            snapshot[1] = 2;
+            for slot in snapshot[width..].chunks_exact_mut(width) {
+                slot.copy_from_slice(&0x1500u64.to_le_bytes()[..width]);
+            }
+            for len in 0..snapshot.len() {
+                assert!(
+                    decode_exact_table(
+                        &snapshot[..len],
+                        0x7000,
+                        layout,
+                        &map_index,
+                        &mut CaptureWorkBudget::default(),
+                        None,
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "{layout:?}: incomplete legacy prefix at {len} bytes"
+                );
+            }
+            for broken in [0usize, 67] {
+                for pointer in [0x4500u64, 0x6000, u64::MAX] {
+                    let mut invalid = snapshot.clone();
+                    let at = width + broken * width;
+                    invalid[at..at + width].copy_from_slice(&pointer.to_le_bytes()[..width]);
+                    assert!(
+                        decode_exact_table(
+                            &invalid,
+                            0x7000,
+                            layout,
+                            &map_index,
+                            &mut CaptureWorkBudget::default(),
+                            None,
+                        )
+                        .unwrap()
+                        .is_none(),
+                        "{layout:?}: invalid legacy slot {broken} ({pointer:#x})"
+                    );
+                }
+            }
+            snapshot[0] = 4;
+            assert!(
+                decode_exact_table(
+                    &snapshot,
+                    0x7000,
+                    layout,
+                    &map_index,
+                    &mut CaptureWorkBudget::default(),
+                    None,
+                )
+                .unwrap()
+                .is_none(),
+                "unknown major versions remain refused"
+            );
+        }
+    }
+
     /// Fedora's stock SoftHSM labels its 68-slot 2.x table {3,2}. The scan
     /// accepts the complete 68-slot prefix instead of rejecting the table
     /// for its unusable 3.x tail.
@@ -6074,9 +6192,9 @@ mod tests {
             .is_none(),
             "an all-NULL 68 prefix is not a table"
         );
-        // The full 3.2 extent must be present: 68 valid slots with the
-        // tail cut off stay refused, never a short accept.
-        let snapshot = mislabelled_snapshot(0x0203, 68, 0);
+        // The complete legacy prefix must be present, independently of
+        // the declared extended layout. A 67-slot prefix stays refused.
+        let snapshot = mislabelled_snapshot(0x0203, 67, 0);
         assert!(
             decode_exact_table(
                 &snapshot,
@@ -6088,7 +6206,7 @@ mod tests {
             )
             .expect("budget must admit the attempt")
             .is_none(),
-            "a truncated 3.2 extent is not a table"
+            "an incomplete legacy prefix is not a table"
         );
     }
 

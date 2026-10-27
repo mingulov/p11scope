@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -48,6 +49,12 @@ class CombinedRefusalTests(unittest.TestCase):
         self.observer.chmod(0o700)
         self.check = runpy.run_path(str(SCRIPT))["check_commands"]
 
+    @contextmanager
+    def simulated_guest_disk(self, stage):
+        self.assertEqual(stage, self.work)
+        with tempfile.TemporaryDirectory(prefix="guest-disk-", dir=self.work.parent) as temp:
+            yield Path(temp)
+
     def test_combined_capture_refusals_and_offline_twins(self):
         rows = self.check(self.observer, self.work)
         self.assertGreaterEqual(sum(r["outcome"] == "refused" for r in rows), 12)
@@ -67,7 +74,7 @@ class CombinedRefusalTests(unittest.TestCase):
         (self.work / "inputs.json").write_text(json.dumps(metadata))
 
         def check(observer, work, progress=None):
-            self.assertEqual(work.parent, self.work)
+            self.assertNotEqual(work.parent, self.work, "product work must leave the 9p stage")
             self.assertEqual(work.stat().st_mode & 0o777, 0o700)
             self.assertEqual(os.environ["TMPDIR"], str(work))
             if metadata["runner_uid"]:
@@ -84,7 +91,8 @@ class CombinedRefusalTests(unittest.TestCase):
 
         with patch.dict(os.environ), patch("os.geteuid", return_value=0), \
                 patch("subprocess.run", side_effect=unprivileged_run), \
-                patch.dict(guest.__globals__, {"check_commands": check}):
+                patch.dict(guest.__globals__, {"check_commands": check,
+                                              "guest_disk_work": self.simulated_guest_disk}):
             guest(self.work)
         self.assertEqual(len(json.loads((self.work / "result.json").read_text())["cases"]), 20)
         self.assertFalse(any(path.is_dir() for path in self.work.iterdir()))
@@ -100,6 +108,68 @@ class CombinedRefusalTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no account"):
                 trust(self.work, owner)
 
+    def test_guest_disk_is_fresh_bounded_and_private(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        with patch("subprocess.run") as run:
+            namespace["prepare_guest_disk"](self.work)
+            image = self.work / "work.img"
+            self.assertEqual(image.stat().st_size, 128 * 1024 * 1024)
+            self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+            run.assert_called_once_with(["mkfs.ext4", "-q", "-F", str(image)], check=True)
+            with self.assertRaises(FileExistsError):
+                namespace["prepare_guest_disk"](self.work)
+
+    def test_guest_disk_cleanup_runs_after_case_failure(self):
+        workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "/dev/loop23\n", "")
+
+        with patch("subprocess.run", side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, "owned case failure"):
+                with workspace(self.work) as work:
+                    mount = work.parent
+                    self.assertNotEqual(mount, self.work)
+                    self.assertEqual(work.stat().st_uid, os.geteuid())
+                    self.assertEqual(work.stat().st_mode & 0o777, 0o700)
+                    raise RuntimeError("owned case failure")
+        self.assertEqual([argv[0] for argv in commands], ["losetup", "mount", "umount", "losetup"])
+        self.assertEqual(commands[1][1:6], ["-t", "ext4", "-o", "nodev,nosuid", "/dev/loop23"])
+        self.assertEqual(commands[-1], ["losetup", "-d", "/dev/loop23"])
+        self.assertFalse(mount.exists())
+
+    def test_failed_disk_mount_detaches_only_the_owned_loop(self):
+        workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            if argv[0] == "mount":
+                raise subprocess.CalledProcessError(1, argv)
+            return subprocess.CompletedProcess(argv, 0, "/dev/loop23\n", "")
+
+        with patch("subprocess.run", side_effect=run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                with workspace(self.work):
+                    self.fail("failed mount cannot run a control")
+        self.assertEqual([argv[0] for argv in commands], ["losetup", "mount", "losetup"])
+        self.assertEqual(commands[-1], ["losetup", "-d", "/dev/loop23"])
+        self.assertFalse(Path(commands[1][-1]).exists())
+
+    def test_guest_disk_refuses_an_unexpected_work_owner(self):
+        workspace = runpy.run_path(str(SCRIPT))["guest_disk_work"]
+        owner = os.geteuid()
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                [], 0, "/dev/loop23\n", "")) as run, \
+                patch("os.geteuid", return_value=owner + 1):
+            with self.assertRaisesRegex(RuntimeError, "owned by the effective UID"):
+                with workspace(self.work):
+                    self.fail("a different owner cannot run a control")
+        self.assertEqual([call.args[0][0] for call in run.call_args_list],
+                         ["losetup", "mount", "umount", "losetup"])
+
     def test_guest_scan_failure_keeps_completed_rows_and_bounded_output(self):
         namespace = runpy.run_path(str(SCRIPT))
         observer = self.work / "p11scope"
@@ -110,7 +180,9 @@ class CombinedRefusalTests(unittest.TestCase):
                     "sha256": {"p11scope": namespace["digest"](observer)}}
         (self.work / "inputs.json").write_text(json.dumps(metadata))
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "fails-scan"}), \
-                patch("os.geteuid", return_value=0):
+                patch("os.geteuid", return_value=0), \
+                patch.dict(namespace["guest"].__globals__,
+                           {"guest_disk_work": self.simulated_guest_disk}):
             with self.assertRaisesRegex(RuntimeError, "inventory-scan"):
                 namespace["guest"](self.work)
         progress = self.work / "case-results.json"

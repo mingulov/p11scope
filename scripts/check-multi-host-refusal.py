@@ -6,6 +6,7 @@ The caller reserves the guest lane. Image checksums belong to the workflow;
 this driver verifies the transferred observer/script and actual kernel.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import tempfile
 
 TOKEN = "uprobe-multi-required"
 OUTPUT_LIMIT = 4096
+WORK_IMAGE_BYTES = 128 * 1024 * 1024
 
 
 def digest(path):
@@ -145,6 +147,46 @@ def trust_stage_owner(stage, runner_uid):
         os.environ.pop("SUDO_UID", None)
 
 
+def prepare_guest_disk(stage):
+    image = stage / "work.img"
+    fd = os.open(image, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        output.truncate(WORK_IMAGE_BYTES)
+    subprocess.run(["mkfs.ext4", "-q", "-F", str(image)], check=True)
+
+
+@contextmanager
+def guest_disk_work(stage):
+    # A non-root runner's 9p stage can map guest-root creations to its UID.
+    # Atomic output
+    # correctly requires its retained private file to belong to guest root.
+    # Keep shared-stage diagnostics, but run real sink checks on a fresh disk.
+    with tempfile.TemporaryDirectory(prefix="p11scope-multi-mount-", dir="/var/tmp") as mount:
+        loop = None
+        mounted = False
+        try:
+            candidate = subprocess.run(["losetup", "-f", "--show", str(stage / "work.img")],
+                                       capture_output=True, text=True, check=True).stdout.strip()
+            if re.fullmatch(r"/dev/loop[0-9]+", candidate) is None:
+                raise RuntimeError("unexpected owned guest loop device")
+            loop = candidate
+            subprocess.run(["mount", "-t", "ext4", "-o", "nodev,nosuid", loop, mount], check=True)
+            mounted = True
+            with tempfile.TemporaryDirectory(prefix="work-", dir=mount) as temp:
+                work = Path(temp)
+                metadata = work.stat()
+                if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o777 != 0o700:
+                    raise RuntimeError("guest work must be private and owned by the effective UID")
+                yield work
+        finally:
+            try:
+                if mounted:
+                    subprocess.run(["umount", mount], check=True)
+            finally:
+                if loop is not None:
+                    subprocess.run(["losetup", "-d", loop], check=True)
+
+
 def guest(stage):
     if os.geteuid() != 0:
         raise RuntimeError("guest root required")
@@ -161,11 +203,11 @@ def guest(stage):
     context = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
                "runner_uid": metadata["runner_uid"], "euid": os.geteuid(),
                "sudo_uid": os.environ.get("SUDO_UID")}
-    with tempfile.TemporaryDirectory(prefix="multi-refusal-", dir=stage) as temp:
-        work = Path(temp)
+    with guest_disk_work(stage) as work:
         os.environ["TMPDIR"] = str(work)
         context.update({"work": str(work), "work_uid": work.stat().st_uid,
-                        "work_mode": oct(work.stat().st_mode & 0o777)})
+                        "work_mode": oct(work.stat().st_mode & 0o777),
+                        "work_filesystem": "ext4"})
         (stage / "guest-context.json").write_text(json.dumps(context, indent=2) + "\n")
         rows = check_commands(stage / "p11scope", work, progress=stage / "case-results.json")
     result = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
@@ -196,6 +238,7 @@ def main():
     stage.mkdir(mode=0o700)
     shutil.copy2(observer, stage / "p11scope")
     shutil.copy2(Path(__file__).resolve(), stage / "guest.py")
+    prepare_guest_disk(stage)
     metadata = {"kernel": kernel, "runner_uid": stage.stat().st_uid,
                 "sha256": {name: digest(stage / name) for name in ("p11scope", "guest.py")}}
     (stage / "inputs.json").write_text(json.dumps(metadata) + "\n")

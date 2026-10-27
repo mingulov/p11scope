@@ -219,6 +219,7 @@ where
 /// A previously retained file may already be watched by the instance hooks.
 /// Read its exports without mapping it in the observer's shared mm. The
 /// ordinary byte/deadline limits and the caller's post-read pin check remain.
+#[cfg(test)]
 fn read_retained_export_facts_budgeted(
     file: &File,
     wanted: &[&str],
@@ -239,6 +240,7 @@ fn read_retained_export_facts_budgeted(
 /// reads to avoid invalidating the very instances the observer is watching.
 /// Detailed mode otherwise preserves its sparse structural post-read charge.
 /// Inventory pre-debits the unretained file's conservative mapped-byte bound.
+#[cfg(test)]
 fn read_export_facts_budgeted(
     file: &File,
     wanted: &[&str],
@@ -264,6 +266,74 @@ fn read_export_facts_budgeted(
     }
     budget.record_io(usize::try_from(charged).unwrap_or(usize::MAX));
     Ok((abi, exports))
+}
+
+fn read_raw_scan_facts_budgeted(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<ElfExportFacts, String> {
+    let (abi, exports, excluded_anchor_ranges, work_units) = if budget
+        .retained_mapped_identity(file)
+        .is_some()
+    {
+        let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
+        (
+            facts.abi,
+            facts.exports,
+            facts.excluded_anchor_ranges,
+            facts.work_units,
+        )
+    } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+        let mut metadata = None;
+        let (abi, exports) = read_inventory_export_facts_budgeted_with(
+            file,
+            wanted,
+            budget,
+            crate::attach::monotonic_ns,
+            |file, wanted, reservation| {
+                let facts =
+                    p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, reservation)?;
+                metadata = Some((facts.excluded_anchor_ranges, facts.work_units));
+                Ok((facts.abi, facts.exports, facts.structural_bytes))
+            },
+        )?;
+        let (ranges, work) = metadata.expect("successful raw ELF query returned metadata");
+        (abi, exports, ranges, work)
+    } else {
+        // Detailed retains its demand-paged structural post-read debit;
+        // no new whole-file gate is introduced for sparse objects.
+        let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+        let remaining = budget.remaining_window_io().unwrap_or(0);
+        if facts.structural_bytes > remaining {
+            budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+            return Err(format!("read failed: {IO_CEILING_REASON}"));
+        }
+        budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
+        (
+            facts.abi,
+            facts.exports,
+            facts.excluded_anchor_ranges,
+            facts.work_units,
+        )
+    };
+    budget.spend(work_units).map_err(str::to_string)?;
+    if let Some(reason) = budget.check_deadline_now() {
+        return Err(reason.into());
+    }
+    Ok(ElfExportFacts {
+        abi,
+        exports,
+        excluded_anchor_ranges,
+    })
+}
+
+fn raw_anchor_overlaps_metadata(ranges: &[(u64, u64)], offset: u64, width: usize) -> bool {
+    let Some(end) = offset.checked_add(width as u64) else {
+        return true;
+    };
+    let next = ranges.partition_point(|(_, end)| *end <= offset);
+    ranges.get(next).is_some_and(|(start, _)| *start < end)
 }
 
 pub(crate) fn read_mountinfo<R: Read>(
@@ -814,6 +884,7 @@ pub(crate) struct InspectedFileKey {
 pub(crate) struct ElfExportFacts {
     pub(crate) abi: ElfAbi,
     pub(crate) exports: Vec<(String, u64)>,
+    pub(crate) excluded_anchor_ranges: Vec<(u64, u64)>,
 }
 
 fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
@@ -857,7 +928,13 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
                     .len()
                     .saturating_mul(std::mem::size_of::<(String, u64)>()),
             )
-            .saturating_add(dynamic),
+            .saturating_add(dynamic)
+            .saturating_add(
+                value
+                    .excluded_anchor_ranges
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+            ),
     )
     .unwrap_or(u64::MAX)
 }
@@ -2779,6 +2856,7 @@ fn detect_tables_for_layout(
         maps,
         budget,
         None,
+        &[],
         crate::attach::monotonic_ns,
     )
 }
@@ -2791,6 +2869,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
     export_evidence: Option<&ObjectExports<'_>>,
+    excluded_anchor_ranges: &[(u64, u64)],
     mut now: F,
 ) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
@@ -2887,7 +2966,20 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         // all-zero data) is not such a witness. This is a single pass over
         // pointer words, rather than rewalking 104 words at every offset.
         let value = read_word_le(snapshot, layout, offset).expect("one complete word");
-        if let Some(ordinals) = anchors.get(&value) {
+        if let Some(ordinals) = anchors.get(&value).filter(|_| {
+            if excluded_anchor_ranges.is_empty() {
+                return true;
+            }
+            let Some(exports) = export_evidence else {
+                return true;
+            };
+            let Some(address) = base_address.checked_add(offset as u64) else {
+                return false;
+            };
+            !matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
+                if (ObjectKey { device, inode }) == exports.object
+                    && raw_anchor_overlaps_metadata(excluded_anchor_ranges, file_offset, width))
+        }) {
             for &ordinal in ordinals {
                 if !budget.charge(1) {
                     if let Some(reason) = budget.take_scan_stop_reason() {
@@ -4845,28 +4937,21 @@ fn scan_view_examined_mode(
         let cached = budget
             .elf_export_facts_for(&cache_key)
             .filter(|_| pin_of(&file).is_ok_and(|after| after == before));
-        let (abi, exports) = match cached {
-            Some(facts) => (facts.abi, facts.exports),
+        let facts = match cached {
+            Some(facts) => facts,
             None => {
-                let (abi, exports) = match read_export_facts_budgeted(&file, &wanted, budget) {
+                let facts = match read_raw_scan_facts_budgeted(&file, &wanted, budget) {
                     Ok(facts) => facts,
                     Err(reason) => {
                         skipped.push(Skipped { subject, reason });
                         continue;
                     }
                 };
-                // The pin was taken before the bytes were read; a write that lands
-                // during the read must not become the facts the capture trusts.
+                // File-derived anchor exclusions share the export pin bracket.
                 match check_pin_after_read(pin_of(&file), &before) {
                     Ok(()) => {
-                        budget.note_elf_export_facts(
-                            cache_key,
-                            ElfExportFacts {
-                                abi,
-                                exports: exports.clone(),
-                            },
-                        );
-                        (abi, exports)
+                        budget.note_elf_export_facts(cache_key, facts.clone());
+                        facts
                     }
                     Err(reason) => {
                         skipped.push(Skipped { subject, reason });
@@ -4875,6 +4960,11 @@ fn scan_view_examined_mode(
                 }
             }
         };
+        let ElfExportFacts {
+            abi,
+            exports,
+            excluded_anchor_ranges,
+        } = facts;
         let layout = target_layout(abi);
         let hook_exports: Vec<_> = exports
             .iter()
@@ -4979,6 +5069,7 @@ fn scan_view_examined_mode(
                 &map_index,
                 budget,
                 Some(&evidence),
+                &excluded_anchor_ranges,
                 crate::attach::monotonic_ns,
             );
             dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
@@ -6796,6 +6887,7 @@ mod tests {
             &index,
             &mut CaptureWorkBudget::default(),
             Some(&exports),
+            &[],
             || Some(0),
         );
         assert!(skipped.is_empty());
@@ -6837,6 +6929,7 @@ mod tests {
                 &index,
                 &mut CaptureWorkBudget::default(),
                 Some(&exports),
+                &[],
                 || Some(0),
             );
             assert!(skipped.is_empty());
@@ -6965,6 +7058,7 @@ mod tests {
                 &index,
                 &mut CaptureWorkBudget::default(),
                 Some(&exports),
+                &[],
                 || Some(0),
             );
             assert!(skipped.is_empty());
@@ -6984,6 +7078,215 @@ mod tests {
                 "uncertain API names stay unknown/count-only"
             );
         }
+    }
+
+    #[test]
+    fn raw_metadata_exclusion_uses_the_anchor_word_not_header_or_target() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
+        snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+        snapshot[16..24].copy_from_slice(&0x1600u64.to_le_bytes());
+        // The actual anchor is file word [0x2008,0x2010). Header-only
+        // overlap and adjacent metadata cannot discard a normal data array.
+        for (ranges, retained) in [
+            (vec![], true),
+            (vec![(0x2000, 0x2008)], true),
+            (vec![(0x2010, 0x2020)], true),
+            (vec![(0x2008, 0x2010)], false),
+            (vec![(0x2007, 0x2009)], false),
+            (vec![(0x200f, 0x2011)], false),
+        ] {
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(
+                tables.iter().any(|table| table.address == 0x7000),
+                retained,
+                "{ranges:?}"
+            );
+            // The same readable acquired words remain useful even if an
+            // explicit caller actually returned an address in metadata.
+            let table = decode_observed_words(
+                (7, 231),
+                &[0x1500, 0x1600],
+                68,
+                0x7000,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.entries.len(), 2);
+        }
+        assert!(raw_anchor_overlaps_metadata(&[(0x100, 0x108)], 0x104, 4));
+        assert!(!raw_anchor_overlaps_metadata(&[(0x100, 0x108)], 0x108, 4));
+        assert!(raw_anchor_overlaps_metadata(&[], u64::MAX, 8));
+    }
+
+    #[test]
+    fn private_capacity_tail_exposes_shared_reserve_without_api_name_proof() {
+        use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
+        use crate::plan::{
+            AdmissionPolicy, AdmissionScope, build_from_sources_for_policy_scoped,
+            classify_scanned_object,
+        };
+
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        // Exactly the CAPACITY_UNIQUE=32 layout:31 private bodies plus
+        // GFL at ordinal3, with remaining observed words aliasing GFL.
+        let mut words = vec![0x1500u64; 68];
+        for ordinal in 0..31 {
+            words[if ordinal < 3 { ordinal } else { ordinal + 1 }] = 0x1600 + ordinal as u64 * 8;
+        }
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for word in words {
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(table.entries.len(), 68);
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .map(|entry| entry.file_offset)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            32
+        );
+        let key = table.entries[0].object;
+        let make = |object: u32, mut tables: Vec<ScannedTable>, exports: Vec<(String, u64)>| {
+            let path = format!("/owned/{object}.so");
+            let key = ObjectKey {
+                inode: u64::from(object),
+                ..key
+            };
+            for table in &mut tables {
+                for entry in &mut table.entries {
+                    entry.object = key;
+                    entry.object_path = path.clone();
+                }
+            }
+            ReconciledModule {
+                entry_objects: tables
+                    .iter()
+                    .map(|table| vec![PinnedObjectId(object); table.entries.len()])
+                    .collect(),
+                object: PinnedObjectId(object),
+                exports: exports.into(),
+                scanned: ScannedModule {
+                    mapped_identity: None,
+                    view: ProcessViewId(object),
+                    mount_namespace: MountNamespaceId {
+                        device: 0,
+                        inode: 1,
+                    },
+                    key,
+                    double_loaded: false,
+                    path,
+                    decoder_abi: Some(ElfAbi::Lp64),
+                    exports: Vec::new(),
+                    tables,
+                    interfaces: Vec::new(),
+                },
+            }
+        };
+        let mut tail = make(
+            2,
+            vec![table.clone()],
+            vec![("C_GetFunctionList".into(), 0x500)],
+        );
+        assert_eq!(
+            classify_scanned_object(std::slice::from_ref(&tail)).0,
+            "heuristic"
+        );
+        let score = table_evidence_score(
+            0,
+            &tail.scanned.tables,
+            &[],
+            &[],
+            &[],
+            &ObjectExports {
+                object: tail.scanned.key,
+                symbols: &tail.exports,
+            },
+        );
+        assert!(!table_name_authorized(&score));
+        let background = make(
+            1,
+            (0..120)
+                .map(|row| {
+                    let mut known = table.clone();
+                    known.live_return = true;
+                    known.file_offset = Some(0x4000 + row * 1024);
+                    for (ordinal, entry) in known.entries.iter_mut().enumerate() {
+                        entry.file_offset = row * 1024 + ordinal as u64 * 8;
+                    }
+                    known
+                })
+                .collect(),
+            Vec::new(),
+        );
+        let plan = |tail: &ReconciledModule| {
+            build_from_sources_for_policy_scoped(
+                &[background.clone(), tail.clone()],
+                &[],
+                &PinnedObjects::empty(),
+                AdmissionPolicy::inventory(
+                    crate::capacity::InventoryBudget::new(8192, 65536).unwrap(),
+                ),
+                AdmissionScope::Shared,
+            )
+        };
+        let refused = plan(&tail);
+        assert_eq!(refused.slots.len(), 8160);
+        assert!(
+            refused
+                .modules_skipped
+                .iter()
+                .any(|skip| skip.subject == "/owned/2.so"
+                    && skip.reason.contains("2048 are reserved")),
+            "{:?}",
+            refused.modules_skipped
+        );
+        tail.scanned.tables[0].live_return = true;
+        assert_eq!(
+            classify_scanned_object(std::slice::from_ref(&tail)).0,
+            "corroborated"
+        );
+        assert_eq!(
+            plan(&tail).slots.len(),
+            8192,
+            "actual publication takes the reserve"
+        );
     }
 
     #[test]
@@ -7009,6 +7312,7 @@ mod tests {
             &index,
             &mut budget,
             Some(&exports),
+            &[],
             || Some(0),
         );
         assert!(tables.is_empty());
@@ -8428,6 +8732,7 @@ mod tests {
             &map_index,
             &mut budget,
             None,
+            &[],
             || {
                 polls += 1;
                 Some(if polls == 1 { 0 } else { 10 })
@@ -10507,6 +10812,7 @@ mod tests {
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            excluded_anchor_ranges: Vec::new(),
         };
         assert!(budget.note_elf_export_facts(key(1), facts.clone()));
         assert!(!budget.note_elf_export_facts(key(2), facts));
@@ -10533,6 +10839,7 @@ mod tests {
         let exact = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            excluded_anchor_ranges: Vec::new(),
         };
         let exact_bytes = export_cache_bytes(&key, &exact);
         let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
@@ -10548,6 +10855,7 @@ mod tests {
         let one_over = ElfExportFacts {
             abi: exact.abi,
             exports: vec![("C_GetFunctionList_".into(), 7)],
+            excluded_anchor_ranges: Vec::new(),
         };
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);
         assert!(!budget.note_elf_export_facts(key, one_over));

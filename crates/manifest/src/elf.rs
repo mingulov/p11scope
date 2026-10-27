@@ -7,6 +7,7 @@
 use std::ops::Range;
 
 use crate::identity::{read_object_bytes, read_object_bytes_with};
+use object::read::elf::FileHeader as _;
 use object::read::elf::ProgramHeader as _;
 use object::read::elf::SectionHeader as _;
 use object::{Architecture, BinaryFormat, Object as _, ObjectSegment as _, ObjectSymbol as _, elf};
@@ -23,6 +24,17 @@ pub struct SymbolFact {
 pub enum ElfAbi {
     Lp64,
     Ilp32,
+}
+
+/// File-derived facts for raw memory scanning. Structural metadata may
+/// contain function addresses, but those words are not ordinal anchors.
+#[derive(Debug)]
+pub struct RawScanElfFacts {
+    pub abi: ElfAbi,
+    pub exports: Vec<(String, u64)>,
+    pub excluded_anchor_ranges: Vec<(u64, u64)>,
+    pub structural_bytes: u64,
+    pub work_units: u64,
 }
 
 /// One bounded read of an already-opened ELF, retained for every later query.
@@ -310,6 +322,122 @@ impl ElfSnapshot {
         let (object, _, _) = classified_validated_object(&self.data)?;
         Ok(exports_matching_in_object(&object, wanted))
     }
+
+    pub fn raw_scan_facts(&self, wanted: &[&str]) -> Result<RawScanElfFacts, String> {
+        raw_scan_facts_from_bytes(&self.data, wanted)
+    }
+}
+
+fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfFacts, String> {
+    let (object, abi, _) = classified_validated_object(data)?;
+    let mut ranges = Vec::new();
+    macro_rules! collect {
+        ($elf:expr) => {{
+            let elf = $elf;
+            let endian = elf.endian();
+            let sections = elf.elf_section_table();
+            // The existing parser handles ELF32/64 and extended indexes.
+            // Only exact GOT names need strings, and each check examines
+            // at most nine bytes rather than searching an unbounded name.
+            let names = elf
+                .elf_header()
+                .section_strings_index(endian, elf.data())
+                .ok()
+                .and_then(|index| sections.section(index).ok())
+                .and_then(|section| section.data(endian, elf.data()).ok())
+                .unwrap_or(&[]);
+            for section in sections.iter() {
+                let kind = section.sh_type(endian);
+                let got = kind == elf::SHT_PROGBITS
+                    && names
+                        .get(section.sh_name(endian) as usize..)
+                        .is_some_and(|name| {
+                            name.starts_with(b".got\0") || name.starts_with(b".got.plt\0")
+                        });
+                let metadata = matches!(
+                    kind,
+                    elf::SHT_SYMTAB
+                        | elf::SHT_STRTAB
+                        | elf::SHT_RELA
+                        | elf::SHT_HASH
+                        | elf::SHT_DYNAMIC
+                        | elf::SHT_NOTE
+                        | elf::SHT_REL
+                        | elf::SHT_DYNSYM
+                        | elf::SHT_INIT_ARRAY
+                        | elf::SHT_FINI_ARRAY
+                        | elf::SHT_PREINIT_ARRAY
+                        | elf::SHT_GROUP
+                        | elf::SHT_SYMTAB_SHNDX
+                        | elf::SHT_RELR
+                        | elf::SHT_GNU_HASH
+                        | elf::SHT_GNU_VERDEF
+                        | elf::SHT_GNU_VERNEED
+                        | elf::SHT_GNU_VERSYM
+                );
+                if !metadata && !got {
+                    continue;
+                }
+                // Exclude only proven file ranges. A malformed unrelated
+                // section must not suppress usable provider observations.
+                if let Some((start, len)) = section.file_range(endian)
+                    && let Some(end) = start.checked_add(len)
+                    && start < end
+                    && end <= data.len() as u64
+                {
+                    ranges.push((start, end));
+                }
+            }
+            (names.len() as u64, sections.len() as u64)
+        }};
+    }
+    let (names_bytes, work_units) = match &object {
+        object::File::Elf32(elf) => collect!(elf),
+        object::File::Elf64(elf) => collect!(elf),
+        _ => unreachable!("classified ELF"),
+    };
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    Ok(RawScanElfFacts {
+        abi,
+        exports: exports_matching_in_object(&object, wanted),
+        excluded_anchor_ranges: merged,
+        structural_bytes: export_table_bytes(&object, data.len() as u64)
+            .saturating_add(names_bytes)
+            .min(data.len() as u64),
+        work_units,
+    })
+}
+
+/// The raw-scan companion to `read_export_facts_bounded`, using the same
+/// object parser and mapping bound. Existing export-only APIs are unchanged.
+pub fn read_raw_scan_facts_bounded(
+    file: &std::fs::File,
+    wanted: &[&str],
+    max_mapped_bytes: u64,
+) -> Result<RawScanElfFacts, String> {
+    let len = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .len();
+    if len > max_mapped_bytes {
+        return Err(format!(
+            "file length {len} exceeds reserved mapped-byte bound {max_mapped_bytes}"
+        ));
+    }
+    let len = usize::try_from(len).map_err(|_| "ELF file length does not fit address space")?;
+    // SAFETY: read-only and no longer than the current file/reservation;
+    // the caller retains the existing pin-before/after discipline.
+    let bytes = unsafe { memmap2::MmapOptions::new().len(len).map(file) }
+        .map_err(|error| format!("read failed: {error}"))?;
+    raw_scan_facts_from_bytes(&bytes, wanted)
 }
 
 /// The shared exports walk: names from `wanted` that the image exports in

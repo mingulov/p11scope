@@ -922,3 +922,124 @@ fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
     );
     assert_sparse_matches_oracle(&empty, REGISTRY);
 }
+
+#[test]
+fn raw_scan_metadata_ranges_preserve_data_tables_for_both_abis() {
+    use object::{Object as _, ObjectSection as _};
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+
+    let dir = tmp("elf-raw-anchor-sections");
+    for bits in [32u8, 64] {
+        let source = dir.join(format!("raw-metadata-{bits}.c"));
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+int private_callback(void) { return 0; }
+int (*const ordinary_table[])(void) __attribute__((section(".data.rel.ro"))) = { private_callback };
+unsigned long C_GetFunctionList(void **out) { *out = (void *)ordinary_table; return 0; }
+int main(void) { return puts("metadata fixture"); }
+"#,
+        )
+        .unwrap();
+        let path = dir.join(format!("raw-metadata-{bits}"));
+        // Explicit lazy binding retains a separate actual .got.plt on both
+        // ABIs; this host otherwise merges it into .got under full RELRO.
+        assert!(
+            Command::new("gcc")
+                .arg(format!("-m{bits}"))
+                .args(["-rdynamic", "-Wl,-z,lazy", "-o"])
+                .arg(&path)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let file = p11scope_manifest::identity::open_object(&path).unwrap();
+        let snapshot = ElfSnapshot::read(&file).unwrap();
+        let facts = snapshot.raw_scan_facts(&["C_GetFunctionList"]).unwrap();
+        let mapped =
+            read_raw_scan_facts_bounded(&file, &["C_GetFunctionList"], bytes.len() as u64).unwrap();
+        assert_eq!(facts.excluded_anchor_ranges, mapped.excluded_anchor_ranges);
+        assert_eq!(facts.exports, mapped.exports);
+        assert_eq!(facts.work_units, object.sections().count() as u64 + 1);
+        assert!(facts.structural_bytes <= bytes.len() as u64);
+        assert!(read_raw_scan_facts_bounded(&file, &[], bytes.len() as u64 - 1).is_err());
+        let overlaps = |start: u64, len: u64| {
+            facts
+                .excluded_anchor_ranges
+                .iter()
+                .any(|(a, b)| start < *b && *a < start + len)
+        };
+        let mut covered = std::collections::BTreeSet::new();
+        for section in object.sections() {
+            let name = section.name().unwrap();
+            let Some((start, len)) = section.file_range().filter(|(_, len)| *len > 0) else {
+                continue;
+            };
+            if matches!(
+                name,
+                ".gnu.hash"
+                    | ".dynsym"
+                    | ".dynamic"
+                    | ".init_array"
+                    | ".fini_array"
+                    | ".got"
+                    | ".got.plt"
+            ) {
+                assert!(overlaps(start, len), "{bits}: metadata {name}");
+                covered.insert(name);
+            }
+            if matches!(name, ".data" | ".data.rel.ro" | ".rodata") {
+                assert!(!overlaps(start, len), "{bits}: ordinary {name}");
+            }
+        }
+        for required in [
+            ".gnu.hash",
+            ".dynsym",
+            ".dynamic",
+            ".init_array",
+            ".fini_array",
+            ".got",
+            ".got.plt",
+        ] {
+            assert!(
+                covered.contains(required),
+                "{bits}: the actual fixture must contain {required}"
+            );
+        }
+        let table = snapshot
+            .defined_symbol("ordinary_table")
+            .unwrap()
+            .unwrap()
+            .file_offset;
+        assert!(
+            !overlaps(table, u64::from(bits / 8)),
+            "relocated constant table stays eligible"
+        );
+
+        // No section headers is uncertainty, not a blanket raw-source ban.
+        let mut no_sections = bytes;
+        let fields = if bits == 64 {
+            [(40, 8), (60, 2), (62, 2)]
+        } else {
+            [(32, 4), (48, 2), (50, 2)]
+        };
+        for (at, len) in fields {
+            no_sections[at..at + len].fill(0);
+        }
+        let bare_path = dir.join(format!("raw-no-sections-{bits}"));
+        std::fs::write(&bare_path, no_sections).unwrap();
+        let bare =
+            ElfSnapshot::read(&p11scope_manifest::identity::open_object(&bare_path).unwrap())
+                .unwrap();
+        assert!(
+            bare.raw_scan_facts(&[])
+                .unwrap()
+                .excluded_anchor_ranges
+                .is_empty()
+        );
+    }
+}

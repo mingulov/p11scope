@@ -5624,30 +5624,31 @@ pub(crate) mod tests {
 
     #[test]
     fn shared_process_custody_refuses_before_any_arc_allocation() {
-        use std::os::fd::AsRawFd as _;
         let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
         let reserve = registry.semantic_storage_reserver();
         let before = registry.semantic_resource_snapshot().charged_bytes;
         registry.reference_semantic_resource_limit(before);
         let pin = PidPin::open(std::process::id()).unwrap();
-        let fd = pin.pidfd().unwrap().as_raw_fd();
+        // The dup succeeding proves the pidfd is open; the witness proves
+        // the failed preparation closed it without depending on the fd
+        // number staying free (a parallel test may reuse it at once, and
+        // every pidfd to one pid shares one identity).
+        let witness = crate::discovery::identity::test_fixture::PidfdClosureWitness::record(
+            pin.pidfd().unwrap(),
+        );
         let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
             SharedCallerPin::new(pin, &OsProcessSource, &reserve)
         });
         assert!(result.is_err());
         assert_eq!((allocations, bytes), (0, 0));
-        // SAFETY: query only; the just-failed owned preparation closed this FD.
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        // The just-failed owned preparation closed this pidfd: the number
+        // is free (EBADF) or names a different open file description.
+        witness.assert_closed();
         assert_eq!(registry.semantic_resource_snapshot().charged_bytes, before);
     }
 
     #[test]
     fn shared_process_custody_strong_and_paired_weak_lifetimes() {
-        use std::os::fd::AsRawFd as _;
         let registry = CallerRegistry::new(RegistryLimits::default_limits());
         let before = registry.semantic_resource_snapshot().charged_bytes;
         let held = SharedCallerPin::new(
@@ -5660,7 +5661,13 @@ pub(crate) mod tests {
         let second = Arc::clone(&original);
         let weak = PidPin::downgrade_shared(&original).unwrap();
         let weak_second = PidPin::downgrade_shared(&original).unwrap();
-        let fd = original.pidfd().unwrap().as_raw_fd();
+        // The dup succeeding proves the pidfd is open; the witness proves
+        // the last Arc drop closed it without depending on the fd number
+        // staying free (a parallel test may reuse it at once, and every
+        // pidfd to one pid shares one identity).
+        let witness = crate::discovery::identity::test_fixture::PidfdClosureWitness::record(
+            original.pidfd().unwrap(),
+        );
         assert!(weak.matches_original(&original));
         let charged = registry.semantic_resource_snapshot().charged_bytes;
         drop(held);
@@ -5668,12 +5675,9 @@ pub(crate) mod tests {
         assert!(weak.matches_original(&second));
         assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
         drop(second);
-        // SAFETY: query only, with no intervening FD acquisition after drop.
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        // The paired Weak retains the memory charge, never the pidfd: the
+        // number is free (EBADF) or names a different open file description.
+        witness.assert_closed();
         assert_eq!(
             registry.semantic_resource_snapshot().charged_bytes,
             charged,

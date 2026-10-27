@@ -16,6 +16,11 @@ mod tests {
     #[test]
     fn partial_bisect_success_then_unsupported_or_exhausted_retains_actual_fd() {
         for errno in [libc::EOPNOTSUPP, libc::EMFILE] {
+            // A pinned unique object: the live link keeps this inode from
+            // being recycled, so the post-drop identity check cannot meet
+            // another test's fd with the same (dev, ino). Every open of
+            // /dev/null would share one identity across the parallel suite.
+            let anchor = tempfile::NamedTempFile::new().unwrap();
             let mut owned: Vec<OwnedFd> = Vec::new();
             let mut calls = 0;
             let sites = [(0, 0), (1, 1), (2, 2), (3, 3)];
@@ -25,7 +30,7 @@ mod tests {
                     let acquired = if slice.len() == 4 {
                         Err(std::io::Error::from_raw_os_error(libc::EINVAL))
                     } else if slice[0].0 == 0 {
-                        Ok(std::fs::File::open("/dev/null").unwrap().into())
+                        Ok(std::fs::File::open(anchor.path()).unwrap().into())
                     } else {
                         Err(std::io::Error::from_raw_os_error(errno))
                     };
@@ -44,8 +49,13 @@ mod tests {
                 unsafe { libc::fcntl(original_fd, libc::F_GETFD) } >= 0,
                 "bisect halt must not close an acquired native owner"
             );
+            // The fd number may be reused by a parallel test the moment
+            // `owned` drops, so prove closure by object identity instead:
+            // afterwards the number is free or names a different object.
+            let identity = crate::discovery::identity::test_fixture::record_open_fd(original_fd);
             drop(owned);
-            assert_eq!(unsafe { libc::fcntl(original_fd, libc::F_GETFD) }, -1);
+            crate::discovery::identity::test_fixture::assert_fd_closed(original_fd, identity);
+            drop(anchor);
         }
     }
 

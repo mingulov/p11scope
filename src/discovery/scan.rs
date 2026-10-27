@@ -4710,9 +4710,12 @@ mod tests {
                 let fd = custody.file_for_test(scan).unwrap().as_raw_fd();
                 std::fs::remove_file(&fixture.path).unwrap();
                 assert!(custody.file_for_test(scan).unwrap().metadata().is_ok());
+                // The fd number may be reused by a parallel test the moment
+                // custody drops, so prove closure by object identity instead:
+                // afterwards the number is free or names a different object.
+                let identity = crate::discovery::identity::test_fixture::record_open_fd(fd);
                 drop(custody);
-                // SAFETY: descriptor observation only, after custody drop.
-                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                crate::discovery::identity::test_fixture::assert_fd_closed(fd, identity);
             } else {
                 assert!(!outcome.mapping_scan_completed());
                 assert!(examined.is_empty());

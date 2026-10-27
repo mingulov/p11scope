@@ -7073,6 +7073,109 @@ pub(crate) mod test_fixture {
         }
     }
 
+    /// Records the object an open `fd` names, so a later check can prove
+    /// the descriptor was closed without depending on the number staying
+    /// free: parallel tests in the same process reuse fd numbers
+    /// immediately, so `fcntl(fd, F_GETFD) == -1` after a drop is a race.
+    /// Panics when `fd` is not open; call before the close/drop.
+    pub(crate) fn record_open_fd(fd: std::os::fd::RawFd) -> (u64, u64) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat only reads; `fd` is open by contract.
+        assert_eq!(
+            unsafe { libc::fstat(fd, &mut stat) },
+            0,
+            "record_open_fd needs an open fd, got {fd}"
+        );
+        (stat.st_dev as u64, stat.st_ino as u64)
+    }
+
+    /// Proves `fd` was closed after `record_open_fd`: the number is either
+    /// free (fstat fails EBADF) or names a different object. Panics when
+    /// the number still names the recorded object, which is exactly the
+    /// skipped-close shape.
+    ///
+    /// Sound only while no other live object shares the recorded
+    /// (st_dev, st_ino): record a unique object, e.g. a pinned
+    /// `NamedTempFile` whose live link keeps its inode from being
+    /// recycled. Never use this for pidfds: every pidfd to one pid
+    /// shares one identity (see `PidfdClosureWitness`).
+    pub(crate) fn assert_fd_closed(fd: std::os::fd::RawFd, recorded: (u64, u64)) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat only reads; `fd` may be closed or reused by now.
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF),
+                "fstat on fd {fd} failed without EBADF"
+            );
+            return;
+        }
+        assert_ne!(
+            (stat.st_dev as u64, stat.st_ino as u64),
+            recorded,
+            "fd {fd} still names the recorded object; the close was skipped"
+        );
+    }
+
+    /// Proves a pidfd was closed without depending on the number staying
+    /// free. Every pidfd to one pid shares one (st_dev, st_ino), so
+    /// `assert_fd_closed` cannot tell the original from another test's
+    /// pidfd to the same process; instead this holds a duplicate of the
+    /// same open file description and compares with `kcmp KCMP_FILE`
+    /// (same-process, needs no privilege): afterwards the number is
+    /// either free (EBADF) or names a different description.
+    pub(crate) struct PidfdClosureWitness {
+        fd: std::os::fd::RawFd,
+        witness: std::os::fd::OwnedFd,
+    }
+
+    impl PidfdClosureWitness {
+        /// Duplicates `fd` as the comparison witness; the dup succeeding
+        /// proves `fd` is open. Call before the close/drop.
+        pub(crate) fn record(fd: std::os::fd::BorrowedFd<'_>) -> Self {
+            use std::os::fd::AsRawFd as _;
+            let raw = fd.as_raw_fd();
+            let witness = fd
+                .try_clone_to_owned()
+                .expect("witness dup needs an open fd");
+            Self { fd: raw, witness }
+        }
+
+        /// Proves the recorded pidfd was closed: panics when the number
+        /// still names the same open file description (the skipped-close
+        /// shape), or when the probe itself fails.
+        pub(crate) fn assert_closed(&self) {
+            use std::os::fd::AsRawFd as _;
+            const KCMP_FILE: libc::c_long = 0;
+            let pid = std::process::id() as libc::c_long;
+            // SAFETY: a pure same-process comparison; sends nothing.
+            let compared = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    pid,
+                    pid,
+                    KCMP_FILE,
+                    self.fd as libc::c_long,
+                    self.witness.as_raw_fd() as libc::c_long,
+                )
+            };
+            assert_ne!(
+                compared, 0,
+                "fd {} still names the same open file description; the close was skipped",
+                self.fd
+            );
+            if compared < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "the kcmp probe itself failed"
+                );
+            }
+            // compared > 0: the number now names a different open file
+            // description, so the recorded pidfd was closed.
+        }
+    }
+
     /// Attaches the scan-time ownership a `real_scan_pin` + `absorb` fixture
     /// bypasses: the view's `ownership.pins` entry and its `raw_ownership`
     /// row. Runs exactly the two inserts `record_scanned_candidate` performs

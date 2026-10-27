@@ -7,6 +7,9 @@
 //! multi-user edges, fork/exec incarnations, unload/reload history,
 //! SIGKILL evidence freezing, and `-o`/stdout document identity.
 
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -194,7 +197,7 @@ fn e1_dance(dir: &Path) -> E1Dance {
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe.sh"))
         .arg("--system")
-        .args(["--json", "--max-scan-pids", "4096"])
+        .args(["--capture", "scan", "--json", "--max-scan-pids", "4096"])
         .env("INV_DRIVER", &driver)
         .env("INV_SET", "e1")
         .env("INV_P1", &p1)
@@ -321,6 +324,7 @@ fn pid_dance(
     let _ = std::fs::remove_file(&out);
     let mut cmd = Command::new("sh");
     cmd.arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", mode)
         .env("INV_PROV", &prov)
@@ -498,6 +502,7 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let text_path = dir.join("edges.txt");
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "reload")
         .env("INV_PROV", &prov)
@@ -806,6 +811,7 @@ fn out_file_matches_stdout_document() {
     let _ = std::fs::remove_file(&out);
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .arg("--json")
         .arg("-o")
         .arg(&file)
@@ -874,6 +880,7 @@ fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
     let _ = std::fs::remove_file(&out);
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan"])
         .arg("--json")
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "plain")
@@ -1134,7 +1141,7 @@ fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1");
     let driver = LiveDriver::spawn(&dir, "s1", &["s1-p1.so", "s1-p2.so"]);
-    let output = observe(driver.pid, &["--json"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "s1 observe failed: {stderr}");
     assert!(
@@ -1198,7 +1205,7 @@ fn s1_command_degraded_run_keeps_stderr_honest() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1-degrade");
     let driver = LiveDriver::spawn(&dir, "s1d", &["s1d-p1.so"]);
-    let output = observe(driver.pid, &["--dashboard"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--dashboard"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "degraded run exits 0: {stderr}");
     assert!(
@@ -1230,8 +1237,8 @@ fn max_gaps_knob_defaults_to_1024_and_binds_retention() {
     let dir = tmp("inventory-command-max-gaps");
     let driver = LiveDriver::spawn(&dir, "mg", &["mg-p1.so"]);
     for (args, expected_limit) in [
-        (vec!["--json"], 1024),
-        (vec!["--json", "--max-gaps", "3"], 3),
+        (vec!["--capture", "scan", "--json"], 1024),
+        (vec!["--capture", "scan", "--json", "--max-gaps", "3"], 3),
     ] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1331,15 +1338,21 @@ fn capture_native_without_privilege_is_an_error_naming_why() {
     let output = observe(driver.pid, &["--capture", "native", "--json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("--capture native: the native usage lane cannot run:"),
-        "{stderr}"
-    );
+    match multi_host::refusal() {
+        Some(reason) => assert_eq!(
+            stderr,
+            format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
+        ),
+        None => assert!(
+            stderr.contains("--capture native: the native usage lane cannot run:"),
+            "{stderr}"
+        ),
+    }
     assert!(output.stdout.is_empty(), "no document on a refused lane");
 }
 
 #[test]
-fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
+fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
     if running_as_root() {
         eprintln!("skipped: root runs the native lane under auto");
         return;
@@ -1347,9 +1360,22 @@ fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-auto-fallback");
     let driver = LiveDriver::spawn(&dir, "af", &["af-p1.so"]);
+    let host_refusal = multi_host::refusal();
     for args in [vec!["--json"], vec!["--capture", "auto", "--json"]] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(reason) = &host_refusal {
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert_eq!(
+                stderr,
+                format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "no scan fallback on an ineligible host"
+            );
+            continue;
+        }
         assert!(output.status.success(), "{args:?}: {stderr}");
         assert!(
             stderr.contains("native usage feed unavailable, continuing with the scan lane"),

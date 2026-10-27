@@ -239,6 +239,7 @@ fn dance(fixtures: &FixtureSet, json_out: bool, max_gaps: Option<usize>) -> Danc
     let child = Command::new("sh")
         .arg(&script)
         .arg("--system")
+        .args(["--capture", "scan"])
         .args(&extra)
         .env("INV_DRIVER", &fixtures.driver)
         .env("INV_SET", "contract")

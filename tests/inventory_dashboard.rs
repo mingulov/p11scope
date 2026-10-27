@@ -135,6 +135,7 @@ impl Drop for Driver {
 fn observer(pid: u32, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .arg("inventory")
+        .args(["--capture", "scan"])
         .arg("--pid")
         .arg(pid.to_string())
         .args(args)
@@ -231,6 +232,7 @@ fn dashboard_multi_caller_system_subset_over_owned_fixtures() {
     // machine may appear freely.
     let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .arg("inventory")
+        .args(["--capture", "scan"])
         .arg("--system")
         .arg("--max-scan-pids")
         .arg("4096")

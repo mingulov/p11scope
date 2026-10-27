@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Drive `p11scope inventory --dashboard` under a pty and verify it.
 
-Waits for a dashboard frame, scrolls once with `j` (asserting the
-footer scroll marker advances — the stdin→key→scroll→render path),
+All modes exercise the scan dashboard explicitly; they do not need live BPF
+host admission. Waits for a dashboard frame, scrolls once with `j` (asserting
+the footer scroll marker advances — the stdin→key→scroll→render path),
 sends `q`, then asserts: exit 0 well before `--duration` (the key
 quit the run), alternate-screen enter and exit sequences bracket
 the frames (terminal restored), and the stderr frame accounting
@@ -110,7 +111,10 @@ def main() -> int:
         float(sys.argv[4]),
     )
     duration_secs = float(duration)
-    argv = [binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration]
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration,
+    ]
     child, master = pty.fork()
     if child == 0:
         os.execv(binary, argv)
@@ -437,7 +441,8 @@ def stall_mode() -> int:
     binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
     stall_secs, report = float(sys.argv[6]), sys.argv[7]
     argv = [
-        binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration, "-o", report,
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration, "-o", report,
     ]
     child, master = pty.fork()
     if child == 0:
@@ -531,7 +536,8 @@ def stderr_mode() -> int:
     path = sys.argv[7] if route == "file" else None
     sleeper = subprocess.Popen(["sleep", "3"])
     argv = [
-        binary, "inventory", "--pid", str(sleeper.pid), "--dashboard", "--duration", duration,
+        binary, "inventory", "--pid", str(sleeper.pid), "--capture", "scan",
+        "--dashboard", "--duration", duration,
     ]
     child, master = pty.fork()
     if child == 0:
@@ -599,7 +605,10 @@ def stderr_mode() -> int:
 
 def xoff_mode() -> int:
     binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-    argv = [binary, "inventory", "--pid", pid, "--dashboard", "--duration", duration]
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan",
+        "--dashboard", "--duration", duration,
+    ]
     child, master = pty.fork()
     if child == 0:
         os.execv(binary, argv)

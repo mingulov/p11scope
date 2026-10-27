@@ -33,10 +33,10 @@ use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
     ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
-    decode_exact_table, exact_table_addresses_n, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
-    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
-    table_evidence_score, table_linkage, target_layout,
+    decode_exact_table, exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes,
+    export_agreement, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
+    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
+    scan_skip_truncates, spans_for, table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -16177,7 +16177,7 @@ impl Engine {
 
     /// Bounded exact-address table validation, shared by the selection path
     /// and heap-wrapper export lowering: maps-A membership, one bounded mem
-    /// read (version word first, then the exact table extent), same-decoder
+    /// read (version word first, then the readable table extent), same-decoder
     /// decode against index A, then the maps-B stability bracket plus the
     /// generation check. Returns the containing mapping, the decoded table,
     /// and the raw table bytes (publication cross-checks need them).
@@ -16238,32 +16238,42 @@ impl Engine {
             };
         read_exact(&mut bytes, address)?;
         let table_bytes = exact_table_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
-        let table_end = address
-            .checked_add(table_bytes as u64)
-            .ok_or(ExactReadRefusal::Undecodable)?;
-        // Mappings the table extent touches: one, or a contiguous readable
-        // run when the caller allows a span. Every touched mapping joins
-        // the maps-B stability check below.
-        let mut span = vec![mapping_a.clone()];
-        if table_end > mapping_a.end {
-            if !allow_span {
-                return Err(ExactReadRefusal::Undecodable);
-            }
-            let mut cursor = mapping_a.end;
-            while cursor < table_end {
-                let Some(next) = index_a.containing(cursor).cloned() else {
-                    return Err(ExactReadRefusal::Undecodable);
-                };
-                if next.start != cursor || next.permissions[0] != b'r' {
-                    return Err(ExactReadRefusal::Undecodable);
+        // Prefer the complete declared extent when maps A proves it
+        // readable under this reader's span policy. Otherwise a plausible
+        // 3.x table may expose its complete legacy prefix alone. This is
+        // an acquisition choice, never recovery from a failed read or a
+        // budget/stability refusal. Every mapping actually read remains
+        // in the maps-B bracket, including a fully read unusable tail.
+        let readable_span = |len: usize| -> Option<Vec<MapEntry>> {
+            let table_end = address.checked_add(len as u64)?;
+            let mut span = vec![mapping_a.clone()];
+            if table_end > mapping_a.end {
+                if !allow_span {
+                    return None;
                 }
-                cursor = next.end;
-                span.push(next);
-                if span.len() > index_a.entries().len() {
-                    return Err(ExactReadRefusal::Undecodable);
+                let mut cursor = mapping_a.end;
+                while cursor < table_end {
+                    let next = index_a.containing(cursor)?.clone();
+                    if next.start != cursor || next.permissions[0] != b'r' {
+                        return None;
+                    }
+                    cursor = next.end;
+                    span.push(next);
+                    if span.len() > index_a.entries().len() {
+                        return None;
+                    }
                 }
             }
-        }
+            Some(span)
+        };
+        let (table_bytes, span) = if let Some(span) = readable_span(table_bytes) {
+            (table_bytes, span)
+        } else {
+            let prefix_bytes =
+                exact_legacy_prefix_bytes(&bytes, layout).ok_or(ExactReadRefusal::Undecodable)?;
+            let span = readable_span(prefix_bytes).ok_or(ExactReadRefusal::Undecodable)?;
+            (prefix_bytes, span)
+        };
         bytes.resize(table_bytes, 0);
         if table_bytes > width {
             read_exact(

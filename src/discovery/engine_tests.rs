@@ -52189,3 +52189,66 @@ fn exact_read_refuses_an_extended_mapping_changed_after_maps_a() {
         Err(ExactReadRefusal::Unstable)
     ));
 }
+
+#[test]
+fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0x0203, 68);
+    let view = ProcessView::open(ProcessViewId(4245), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let map_index = MapIndex::new(&maps).unwrap();
+    let hooks = HookRegistry::builtin();
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.symbol_id = hooks.id("C_GetFunctionList").unwrap();
+    record.pid_tgid = u64::from(std::process::id()) << 32;
+    record.table_ptr = address;
+    record.version_major = 3;
+    record.version_minor = 2;
+    record.pointers_attempted = 68;
+    record.completed_prefix = 68;
+    record.usable_n = 68;
+    record.pointers[..68]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts((address as *const u64).add(1), 68) });
+    assert!(valid_discovery_record(&record));
+    let lower = |record: &DiscoveryRecord| {
+        lower_heap_publication_record(
+            &view,
+            &map_index,
+            &hooks,
+            record,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .unwrap()
+    };
+    let HeapLowerOutcome::Admitted(module) = lower(&record) else {
+        panic!("matching carried legacy pointers must validate");
+    };
+    assert_eq!(module.tables[0].entries.len(), 68);
+    assert_eq!(module.tables[0].walk, "known_prefix");
+
+    let mut changed = record;
+    changed.pointers[67] += 1;
+    assert!(valid_discovery_record(&changed));
+    assert!(matches!(
+        lower(&changed),
+        HeapLowerOutcome::Refused(
+            "a published table changed between the probe capture and validation"
+        )
+    ));
+
+    let mut overlong = record;
+    overlong.pointers_attempted = 104;
+    overlong.completed_prefix = 104;
+    overlong.usable_n = 104;
+    assert!(valid_discovery_record(&overlong));
+    assert!(matches!(
+        lower(&overlong),
+        HeapLowerOutcome::Refused(
+            "a published table changed between the probe capture and validation"
+        )
+    ));
+}

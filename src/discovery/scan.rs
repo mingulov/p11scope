@@ -2201,6 +2201,20 @@ pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<us
     span_bytes(layout, spans)
 }
 
+/// The minimum extent a plausible 3.x table can expose when its extension
+/// is unavailable. This only bounds acquisition; every legacy slot still
+/// has to pass the normal decoder before the prefix can be admitted.
+pub(crate) fn exact_legacy_prefix_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
+    let word = read_word_le(header, layout, 0).ok()?;
+    let (version, spans, _) = spans_for(word)?;
+    if version.0 != 3
+        || spans.iter().map(|span| span.fields().len()).sum::<usize>() < LEGACY_PREFIX_SLOTS
+    {
+        return None;
+    }
+    table_bytes(layout, LEGACY_PREFIX_SLOTS).ok()
+}
+
 /// Returns every non-NULL function pointer in one complete table snapshot.
 /// Addresses are capture-local and are used only to close the maps-A/maps-B
 /// stability bracket; callers must not persist them as identity.
@@ -2255,9 +2269,10 @@ fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: 
 /// `base_address` in the target). Returns the table only when every published slot
 /// is either NULL or points into a file-backed executable mapping — the criterion
 /// that makes a run of pointers a function table rather than data that looks like one.
-/// A 3.x table whose full layout fails past a complete validated 68-slot
-/// prefix decodes as that prefix, labelled with its declared version and a
-/// `known_prefix` walk; anything less is still rejected.
+/// A 3.x table whose extension is unavailable or fails validation after a
+/// complete validated 68-slot prefix decodes as that prefix, labelled with
+/// its declared version and a `known_prefix` walk. An incomplete or invalid
+/// legacy prefix is still rejected.
 /// `runtime_view` scopes the cardinality identity for tables without a stable
 /// file owner (heap/anonymous exact reads): `None` keeps the memory sweep's
 /// file-identity-only charging bit for bit.
@@ -2297,26 +2312,35 @@ fn decode_candidate(
         _ => None,
     };
     let file_offset = table_owner.map(|(_, _, file_offset)| file_offset);
-    let Some(bytes) = offset
-        .checked_add(len)
-        .and_then(|end| snapshot.get(offset..end))
-    else {
-        return Ok(None);
+    let available = &snapshot[offset..];
+    let (bytes, mut short_prefix) = if let Some(bytes) = available.get(..len) {
+        (bytes, false)
+    } else {
+        let Some(prefix_len) = exact_legacy_prefix_bytes(raw_word, layout) else {
+            return Ok(None);
+        };
+        let Some(bytes) = available.get(..prefix_len) else {
+            return Ok(None);
+        };
+        (bytes, true)
     };
 
-    // Validate the whole candidate before reserving or allocating decoded records.
+    // Validate the readable candidate before reserving decoded records.
     // Each validated slot is retained: file-backed entries as their normalized
     // (device, inode, file offset), NULLs as holes. The entry builder below
     // consumes this instead of re-resolving, and the runtime identity hashes it.
     // A 3.x candidate that fails past a complete validated 68-slot prefix
-    // stops there and decodes as that prefix; the full extent above must
-    // still be present, so a truncated table never becomes a short accept.
+    // stops there and decodes as that prefix. When the extension is not
+    // completely available, only the complete legacy prefix is walked.
     let mut non_null = 0usize;
     let mut prefix_non_null = 0usize;
-    let field_count = spans.iter().map(|span| span.fields().len()).sum();
+    let field_count = if short_prefix {
+        LEGACY_PREFIX_SLOTS
+    } else {
+        spans.iter().map(|span| span.fields().len()).sum()
+    };
     let mut slots: Vec<Option<(String, Device, u64, u64)>> = Vec::with_capacity(field_count);
     let mut names: Vec<&'static str> = Vec::with_capacity(field_count);
-    let mut short_prefix = false;
     for ordinal in 0..field_count {
         if !budget.charge(1) {
             return Err(());
@@ -6006,6 +6030,24 @@ mod tests {
                 assert_eq!(table.entries.len(), 68);
                 assert_eq!(table.decoded_slot_count(), 68);
                 assert_eq!(len, 69 * width);
+                let declared_slots = if minor < 2 { 92 } else { 104 };
+                for extra in [1, width, (declared_slots - 68) * width - 1] {
+                    let mut partial_tail = snapshot.clone();
+                    partial_tail.resize(snapshot.len() + extra, 0xa5);
+                    let partial = decode_exact_table(
+                        &partial_tail,
+                        0x7000,
+                        layout,
+                        &map_index,
+                        &mut CaptureWorkBudget::default(),
+                        None,
+                    )
+                    .unwrap()
+                    .expect("an unproven partial extension cannot discard the legacy prefix");
+                    assert_eq!(partial.walk, "known_prefix");
+                    assert_eq!(partial.entries, table.entries);
+                    assert_eq!(partial.decoded_slot_count(), 68);
+                }
                 assert_eq!(
                     exact_table_addresses_n(&snapshot, layout, table.decoded_slot_count()),
                     Some(vec![0x1500; 68])
@@ -6020,7 +6062,10 @@ mod tests {
                     &mut CaptureWorkBudget::default(),
                 );
                 assert!(!dependencies.invalid_span);
-                assert_eq!(dependencies.targets.keys().copied().collect::<Vec<_>>(), [0x1000]);
+                assert_eq!(
+                    dependencies.targets.keys().copied().collect::<Vec<_>>(),
+                    [0x1000]
+                );
                 let identity = interface_identity(&table, "null", &None, 0, &map_index, None)
                     .expect("the prefix has its file identity");
                 let InterfaceTableKey::File(identity) = identity.table else {

@@ -384,7 +384,10 @@ class BuildDriverTests(unittest.TestCase):
         self.candidate = self.commit("candidate")
 
     def git(self, *args):
-        return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                               "-C", str(self.repo), *args], check=True,
                               capture_output=True, text=True).stdout.strip()
 
     def commit(self, message):

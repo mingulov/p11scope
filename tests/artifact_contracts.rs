@@ -2582,6 +2582,9 @@ fn task7_pristine_driver_repo() -> tempfile::TempDir {
         let status = Command::new("git")
             .arg("-C")
             .arg(repo.path())
+            // No auto maintenance: git >= 2.47 runs it detached after a
+            // commit, and its lock files race the temp-dir cleanup.
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(&arguments)
             .status()
             .unwrap_or_else(|error| panic!("run git {arguments:?}: {error}"));

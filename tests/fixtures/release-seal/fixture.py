@@ -82,9 +82,12 @@ class ReleaseSealFixture:
         (self.repo / "scripts/fixtures").mkdir()
         shutil.copy2(ROOT / "scripts/fixtures/hammer.c", self.repo / "scripts/fixtures/hammer.c")
         shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
         for arguments in (
             ["init", "--quiet", "-b", "task7"], ["add", "-A"],
-            ["-c", "user.email=task7@example.invalid", "-c", "user.name=task7",
+            ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.email=task7@example.invalid", "-c", "user.name=task7",
              "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "pristine release driver"],
         ):
             result = self.command(["git", "-C", str(self.repo), *arguments])

@@ -124,8 +124,11 @@ class ExportFixture:
         ]
         if force:
             commands.append(["git", "add", "--force", "--", *force])
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
         commands.append(
-            ["git", "-c", "user.name=Source Export Test", "-c", "user.email=test.invalid",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Source Export Test", "-c", "user.email=test.invalid",
              "commit", "--quiet", "-m", "fixture"]
         )
         for command in commands:
@@ -205,7 +208,8 @@ class ExportSourceTests(unittest.TestCase):
         commands = (
             ["git", "init", "--quiet", "--template="],
             ["git", "add", "--all"],
-            ["git", "-c", "user.name=Bundle Source Test", "-c",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Bundle Source Test", "-c",
              "user.email=test.invalid", "commit", "--quiet", "-m", "parent"],
         )
         (bundle_source / "README.md").write_text("committed parent source\n", encoding="utf-8")
@@ -216,7 +220,8 @@ class ExportSourceTests(unittest.TestCase):
         (bundle_source / "README.md").write_text("committed tip source\n", encoding="utf-8")
         for command in (
             ["git", "add", "README.md"],
-            ["git", "-c", "user.name=Bundle Source Test", "-c",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Bundle Source Test", "-c",
              "user.email=test.invalid", "commit", "--quiet", "-m", "tip"],
         ):
             result = subprocess.run(command, cwd=bundle_source, env=git_environment,
@@ -241,7 +246,8 @@ class ExportSourceTests(unittest.TestCase):
         commands = (
             ["git", "init", "--quiet", "--template="],
             ["git", "add", "--all"],
-            ["git", "-c", "user.name=Full Export Test", "-c",
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "-c", "user.name=Full Export Test", "-c",
              "user.email=test.invalid", "commit", "--quiet", "-m", "fixture"],
         )
         for command in commands:
@@ -665,7 +671,8 @@ class ExportSourceTests(unittest.TestCase):
         subprocess.run(["git", "add", "--force", str(collision)], cwd=fixture.root,
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run([
-            "git", "-c", "user.name=Full Export Test", "-c", "user.email=test.invalid",
+            "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+            "-c", "user.name=Full Export Test", "-c", "user.email=test.invalid",
             "commit", "--quiet", "-m", "collision",
         ], cwd=fixture.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         collided = fixture.root.parent / "collision.tar.gz"
@@ -762,7 +769,8 @@ class ExportSourceTests(unittest.TestCase):
                 path.write_text("[net]\noffline = false\n")
                 subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
                 subprocess.run([
-                    "git", "-c", "user.name=Full Export Test", "-c",
+                    "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                    "-c", "user.name=Full Export Test", "-c",
                     "user.email=test.invalid", "commit", "--quiet", "-m", "config",
                 ], cwd=fixture.root, check=True)
                 output = fixture.root.parent / f"config-{index}.tar.gz"
@@ -780,7 +788,8 @@ class ExportSourceTests(unittest.TestCase):
         path.write_text("committed descendant\n")
         subprocess.run(["git", "add", relative], cwd=fixture.root, check=True)
         subprocess.run([
-            "git", "-c", "user.name=Full Export Test", "-c",
+            "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+            "-c", "user.name=Full Export Test", "-c",
             "user.email=test.invalid", "commit", "--quiet", "-m", "config directory",
         ], cwd=fixture.root, check=True)
         module = load_module(

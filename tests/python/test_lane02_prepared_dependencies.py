@@ -86,7 +86,10 @@ class Lane02Fixture:
             cwd=self.root, check=True,
         )
         subprocess.run(["git", "add", "."], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=self.root, check=True)
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "commit", "-qm", "fixture"], cwd=self.root, check=True)
 
         self.bin = temporary / "controlled path"
         self.bin.mkdir()

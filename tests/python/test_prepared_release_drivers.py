@@ -215,7 +215,9 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                     if path.name not in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
                                          "lane-build-release-oracle-3.py"):
                         shutil.rmtree(path) if path.is_dir() else path.unlink()
-                for args in (["add", "-A"], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "minimal early-refusal fixture"]):
+                # No auto maintenance: git >= 2.47 runs it detached after a
+                # commit, and its lock files race the temp-dir cleanup.
+                for args in (["add", "-A"], ["-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "minimal early-refusal fixture"]):
                     result = fixture.command(["git", "-C", str(fixture.repo), *args])
                     self.assertEqual(result.returncode, 0, result.stderr)
                 extra = {}

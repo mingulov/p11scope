@@ -428,7 +428,10 @@ else:
             (self.bin / name).symlink_to("dispatch.py")
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Fixture",
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "-C", str(self.repo), "-c", "user.name=Fixture",
                         "-c", "user.email=fixture@example.invalid", "commit", "-qm", "owned source"], check=True)
         self.configure([])
 

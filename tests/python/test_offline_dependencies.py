@@ -205,9 +205,12 @@ class OfflineFixture:
             "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
         })
 
+        # No auto maintenance: git >= 2.47 runs it detached after a
+        # commit, and its lock files race the temp-dir cleanup.
         def git(*arguments):
             return subprocess.run(
-                ["git", *arguments], cwd=shared_repository, env=git_environment,
+                ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *arguments],
+                cwd=shared_repository, env=git_environment,
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ).stdout
 

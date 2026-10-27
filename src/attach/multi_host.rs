@@ -270,6 +270,76 @@ mod tests {
     }
 
     #[test]
+    fn denied_guidance_names_the_failed_stage_and_offline_next_steps() {
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, libc::EPERM),
+            (MultiHostStage::SelfLink, libc::EPERM),
+            (MultiHostStage::SelfLink, libc::EACCES),
+        ] {
+            let refusal = MultiHostRefusal::at(stage, Some(errno));
+            assert_eq!(refusal.cause, MultiHostCause::Denied);
+            let text = refusal.to_string();
+            assert!(text.starts_with("uprobe-multi-required: "), "{text}");
+            assert!(text.contains("requires root"), "{text}");
+            assert!(text.contains("appropriate capabilities"), "{text}");
+            assert!(text.contains("policy") && text.contains("sudo"), "{text}");
+            assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
+            assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
+            assert!(text.contains("without live capture"), "{text}");
+            assert_eq!(
+                text.contains("cannot load p11scope's BPF programs"),
+                stage == MultiHostStage::ProgramLoad,
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("cannot attach p11scope's required Multi probe"),
+                stage == MultiHostStage::SelfLink,
+                "{text}"
+            );
+            assert!(!text.contains("--allow-uretprobe-on-confined-target"));
+            assert!(!text.contains("seccomp") && !text.contains("trampoline"));
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.len() < 1_024, "{text}");
+        }
+    }
+
+    #[test]
+    fn unproven_or_unavailable_guidance_does_not_guess_privilege_or_kernel_age() {
+        for (stage, errno) in [
+            (MultiHostStage::Anchor, None),
+            (MultiHostStage::Anchor, Some(libc::EPERM)),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS)),
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::ProgramLoad, Some(libc::EACCES)),
+            (MultiHostStage::ProgramLoad, Some(libc::EINVAL)),
+            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL)),
+            (MultiHostStage::SelfLink, Some(libc::EMFILE)),
+        ] {
+            let refusal = MultiHostRefusal::at(stage, errno);
+            assert_ne!(refusal.cause, MultiHostCause::Denied);
+            let text = refusal.to_string();
+            assert!(text.starts_with("uprobe-multi-required: "), "{text}");
+            assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
+            assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
+            assert!(text.contains("without live capture"), "{text}");
+            for unsupported_claim in [
+                "requires root",
+                "sudo",
+                "cannot load p11scope's BPF programs",
+                "upgrade",
+                "6.6",
+                "unsupported kernel",
+                "--allow-uretprobe-on-confined-target",
+            ] {
+                assert!(!text.contains(unsupported_claim), "{text}");
+            }
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.len() < 1_024, "{text}");
+        }
+    }
+
+    #[test]
     fn invocation_reuses_only_a_successful_actual_probe() {
         let invocation = InvocationAdmission::new();
         let calls = Cell::new(0);

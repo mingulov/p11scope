@@ -601,28 +601,40 @@ fn t3_f6_typo_and_exited_pids_read_differently() {
 
 #[test]
 fn t3_f7_attach_refusal_points_at_doctor() {
-    // F7 fixed (Task 3): the attach hint keeps its cause list and doc
-    // pointer, and now names `p11scope doctor` as the command that knows
-    // which cause applies. Exit 1 unchanged.
+    // OD36's host admission can refuse before an attach session starts.
+    // Both stages keep actionable guidance and exit 1; only a failure that
+    // actually reaches Session has the attach context and its cause-list doc.
     if !capture_available() && unsafe { libc::geteuid() } != 0 {
-        // HIGH-1: `run` now stops at the self-probe with the missing
-        // privilege (pinned in b7), so the attach hint is pinned where it is
-        // still reached: an unconfined `--pid` target needs no self-probe.
+        let host_refusal = multi_host::refusal();
         let target = SleepTarget::spawn();
         let refused = run(&["profile", "--pid", &target.pid(), "--duration", "1"]);
         assert_eq!(refused.code, Some(1));
-        assert!(
-            refused.stderr.contains("starting attach session"),
-            "{}",
-            refused.stderr
-        );
+        if let Some(reason) = host_refusal {
+            assert_eq!(refused.stderr, format!("p11scope: {reason}\n"));
+            assert!(
+                !refused.stderr.contains("starting attach session"),
+                "{}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("p11scope inspect --pid"),
+                "{}",
+                refused.stderr
+            );
+        } else {
+            assert!(
+                refused.stderr.contains("starting attach session"),
+                "{}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("phase5-unsupported.md"),
+                "{}",
+                refused.stderr
+            );
+        }
         assert!(
             refused.stderr.contains("p11scope doctor"),
-            "{}",
-            refused.stderr
-        );
-        assert!(
-            refused.stderr.contains("phase5-unsupported.md"),
             "{}",
             refused.stderr
         );

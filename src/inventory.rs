@@ -3747,7 +3747,10 @@ impl ClassicDriver<'_> {
     /// on purpose: the gap carries the disclosure, and
     /// `joint_first_error` stays for the finish path, so a continued
     /// run never surfaces this stale refusal as a later retained
-    /// error. A broad commit failure still fails the call.
+    /// error. A broad commit failure still fails the call; a
+    /// wedged-publication failure (the machine latched after
+    /// physically preparing) names the semantic cause instead of the
+    /// internal message.
     fn hold_joint_commit_lane_and_publish(
         &mut self,
         engine_changed: bool,
@@ -3774,8 +3777,45 @@ impl ClassicDriver<'_> {
             "semantic lane stopped".to_string(),
             format!("{reason}; broad inventory continues; semantic probes stay attached until exit"),
         );
-        self.commit(engine_changed)?;
-        Ok(PassCommitProgress::Published)
+        match self.commit(engine_changed) {
+            Ok(()) => Ok(PassCommitProgress::Published),
+            Err(error)
+                if Self::commit_hit_unfinished_joint_publication(
+                    &error,
+                    &self.coordinator,
+                ) =>
+            {
+                // The machine latched after physically preparing the
+                // commit: the coordinator still holds the unfinished
+                // Joint publication, so this plain commit (and every
+                // later one) refuses. Name the semantic cause on
+                // stderr and in the error — never the internal
+                // resume-original-frame message. A full
+                // hold-and-publish past this wedge needs a coordinator
+                // abandon API (no inventory-side call clears the
+                // prepared publication); until then the run fails
+                // honestly with its cause named.
+                self.warn(&format!(
+                    "p11scope: the semantic lane stopped ({reason}) but its unfinished joint publication still blocks the broad commit; the run cannot continue past it",
+                ));
+                Err(anyhow::anyhow!(
+                    "semantic lane stopped ({reason}); the unfinished joint publication still blocks the broad commit and this run cannot continue past it"
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether a conversion-commit failure is the wedged-publication
+    /// shape: the coordinator still holds an unfinished Joint
+    /// publication, or the failure names it (fault-injected tests
+    /// pose the message without preparing a real publication).
+    fn commit_hit_unfinished_joint_publication(
+        error: &anyhow::Error,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+    ) -> bool {
+        coordinator.publication_pending()
+            || format!("{error:#}").contains("unfinished Joint publication")
     }
 
     /// One NotBegun promotion step (item 7): poll the pending commit.

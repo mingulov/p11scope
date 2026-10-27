@@ -399,6 +399,7 @@ for KERNEL in "$@"; do
                         ;;
                     *)
                         echo "# error: counter-$MODE profile exited rc=$C_RC on $KERNEL (see $C_TXT)"
+                        [ -f "$C_TXT" ] && tail -n 20 "$C_TXT" | sed 's/^/#   /'
                         FAILED=1
                         ;;
                 esac

@@ -298,6 +298,9 @@ jobs:
             ${{ github.workspace }}/bpf-load-out/doctor-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-out/probe-${{ matrix.kernel }}.jsonl
             ${{ github.workspace }}/bpf-load-out/vng-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-out/counter-*-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-out/counter-*-probe-${{ matrix.kernel }}.jsonl
+            ${{ github.workspace }}/bpf-load-out/vng-counter-*-${{ matrix.kernel }}.log
           if-no-files-found: error
           retention-days: 7
   # No VM: load every BPF program on the runner kernel itself with sudo

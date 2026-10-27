@@ -157,19 +157,23 @@ pub(crate) fn surface_function_inventory_complete(surface: &SurfaceRecord) -> bo
 
 /// Normalize obsolete `Full` claims without dropping their observed prefix.
 pub(crate) fn effective_surface_walk(surface: &SurfaceRecord) -> String {
-    if matches!(surface.walk, WalkOutcome::Full)
+    let normalized_prefix = matches!(surface.walk, WalkOutcome::Full)
         && surface.functions.len()
             < surface_spans(surface)
                 .iter()
                 .map(|span| span.fields().len())
-                .sum::<usize>()
-    {
-        return "known_prefix".into();
-    }
-    match &surface.walk {
+                .sum::<usize>();
+    let mut label = match &surface.walk {
+        WalkOutcome::Full if normalized_prefix => "known_prefix".into(),
         WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
         walk => walk_name(walk).into(),
+    };
+    if surface.version.is_none()
+        && matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+    {
+        label.push_str("; version metadata unavailable");
     }
+    label
 }
 
 fn walk_name(walk: &WalkOutcome) -> &'static str {
@@ -221,22 +225,73 @@ fn selection_result_readable(result: &SelectionRequest) -> bool {
     )
 }
 
-fn selection_table_names(version: Version) -> Option<Vec<&'static str>> {
+fn selection_table_names(version: Version) -> Vec<&'static str> {
     let cryptoki_version = cryptoki_sys::CK_VERSION {
         major: version.major,
         minor: version.minor,
     };
-    match tables_for(Surface::StandardInterface {
+    let spans = match tables_for(Surface::StandardInterface {
         version: cryptoki_version,
     }) {
-        TableSet::Walk(spans) => Some(
+        TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => spans,
+        TableSet::Refuse => {
+            let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+                version: cryptoki_sys::CK_VERSION {
+                    major: 2,
+                    minor: 40,
+                },
+            }) else {
+                unreachable!("fixed common ABI catalogue");
+            };
             spans
-                .iter()
-                .flat_map(|span| span.fields().iter().map(|field| field.name))
-                .collect(),
-        ),
-        TableSet::WalkKnownPrefix(_) | TableSet::Refuse => None,
-    }
+        }
+    };
+    spans
+        .iter()
+        .flat_map(|span| span.fields().iter().map(|field| field.name))
+        .collect()
+}
+
+pub(crate) fn selection_table_inventory_incomplete(table: &SelectionTable) -> bool {
+    table.functions.len() != selection_table_names(table.version).len()
+        || !matches!(table.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+        || table.functions.iter().any(|function| {
+            !matches!(
+                function.resolution,
+                Resolution::Resolved { .. } | Resolution::NullPointer
+            )
+        })
+}
+
+/// Naming stays at the existing fixed-query witness strength; count-only
+/// observation admission is deliberately independent of this predicate.
+pub(crate) fn selection_table_name_authorized(manifest: &Manifest, table_id: u8) -> bool {
+    manifest.selection_evidence.queries.iter().any(|query| {
+        query.selection_table == Some(table_id)
+            && query.authority == SelectionAuthority::SelectionCountOnly
+            && query.request.name == SelectionNameClass::ExactStandard
+            && query.result.is_some_and(|result| {
+                result.name == SelectionNameClass::ExactStandard
+                    && matches!(
+                        result.version,
+                        SelectionVersionClass::V3_0
+                            | SelectionVersionClass::V3_1
+                            | SelectionVersionClass::V3_2
+                    )
+                    && matches!(result.flags, 0 | 1)
+            })
+    })
+}
+
+fn selection_version_matches(version: Version, class: SelectionVersionClass) -> bool {
+    let expected = match (version.major, version.minor) {
+        (2, 40) => SelectionVersionClass::V2_40,
+        (3, 0) => SelectionVersionClass::V3_0,
+        (3, 1) => SelectionVersionClass::V3_1,
+        (3, 2) => SelectionVersionClass::V3_2,
+        _ => SelectionVersionClass::Other,
+    };
+    class == expected
 }
 
 fn selection_name_agrees(result: &SelectionResult, surface: &SurfaceRecord) -> bool {
@@ -312,15 +367,9 @@ fn validate_selection_table(
     if table.id as usize >= MAX_SELECTION_TABLES {
         problems.push(format!("selection table id {} is out of range", table.id));
     }
-    if table.version.major != 3 || table.version.minor > 2 {
+    if matches!(table.walk, WalkOutcome::Refused | WalkOutcome::NotWalked) {
         problems.push(format!(
-            "selection table {} has unsupported version {}.{}",
-            table.id, table.version.major, table.version.minor
-        ));
-    }
-    if !matches!(table.walk, WalkOutcome::Full) {
-        problems.push(format!(
-            "selection table {} must have a full walk outcome",
+            "selection table {} has no acquired function inventory",
             table.id
         ));
     }
@@ -330,18 +379,32 @@ fn validate_selection_table(
             table.id
         ));
     }
-    if let Some(expected) = selection_table_names(table.version) {
-        let actual: Vec<&str> = table
-            .functions
-            .iter()
-            .map(|function| function.name.as_str())
-            .collect();
-        if actual != expected {
+    let expected = selection_table_names(table.version);
+    let actual: Vec<&str> = table
+        .functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    if expected.get(..actual.len()) != Some(actual.as_slice()) {
+        problems.push(format!(
+            "selection table {} does not match its canonical function layout",
+            table.id
+        ));
+    }
+    if let WalkOutcome::Unreadable { detail } = &table.walk {
+        bounded("selection walk error", detail, MAX_DETAIL_BYTES, problems);
+        if detail.trim().is_empty() || actual.len() >= expected.len() {
             problems.push(format!(
-                "selection table {} does not match its canonical function layout",
+                "selection table {} has an invalid unreadable prefix",
                 table.id
             ));
         }
+    }
+    if matches!(table.walk, WalkOutcome::Full) && actual.len() != expected.len() {
+        problems.push(format!(
+            "selection table {} full walk is shorter than its bounded layout",
+            table.id
+        ));
     }
     if table.functions.len() > 104 {
         problems.push(format!(
@@ -351,18 +414,23 @@ fn validate_selection_table(
     }
     for function in &table.functions {
         bounded("selection function name", &function.name, 128, problems);
-        match function.resolution {
-            Resolution::NullPointer => {}
-            Resolution::Resolved { object, .. } if object_ids.contains(&object) && object == 0 => {}
+        match &function.resolution {
+            Resolution::NullPointer | Resolution::NonFileBacked | Resolution::Unmapped => {}
+            Resolution::Resolved { object, .. } if object_ids.contains(object) => {}
             Resolution::Resolved { object, .. } => problems.push(format!(
-                "selection function {} refers to dependency object {}",
+                "selection function {} refers to missing object {}",
                 function.name, object
             )),
-            Resolution::NonFileBacked | Resolution::Unmapped | Resolution::UnusableFile { .. } => {
-                problems.push(format!(
-                    "selection function {} has an unresolved resolution",
-                    function.name
-                ));
+            Resolution::UnusableFile { reason, path_hex } => {
+                bounded(
+                    "selection unusable-file reason",
+                    reason,
+                    MAX_DETAIL_BYTES,
+                    problems,
+                );
+                if path_hex.len() > MAX_PATH_BYTES * 2 || !valid_hex(path_hex) {
+                    problems.push("selection unusable file has invalid path_hex".into());
+                }
             }
         }
     }
@@ -504,7 +572,10 @@ fn validate_selection_evidence(
                     continue;
                 };
                 if query.helper_failure.is_some()
-                    && !matches!(query.authority, SelectionAuthority::None)
+                    && !matches!(
+                        query.authority,
+                        SelectionAuthority::None | SelectionAuthority::SelectionCountOnly
+                    )
                 {
                     problems.push(format!(
                         "selection query {position} with helper failure has authority"
@@ -537,6 +608,8 @@ fn validate_selection_evidence(
                         if !matches!(
                             result.version,
                             SelectionVersionClass::Null
+                                | SelectionVersionClass::V2_40
+                                | SelectionVersionClass::Other
                                 | SelectionVersionClass::V3_0
                                 | SelectionVersionClass::V3_1
                                 | SelectionVersionClass::V3_2
@@ -546,12 +619,9 @@ fn validate_selection_evidence(
                             "selection query {position} unreadable-table failure disagrees with result"
                         ));
                     }
-                    Some(
-                        SelectionFailure::UnreadableTable
-                        | SelectionFailure::OutsideProvider
-                        | SelectionFailure::UnresolvedFunction
-                        | SelectionFailure::ProviderChanged,
-                    ) if query.selection_table.is_some() => {
+                    Some(SelectionFailure::OutsideProvider | SelectionFailure::ProviderChanged)
+                        if query.selection_table.is_some() =>
+                    {
                         problems.push(format!(
                             "selection query {position} helper failure has a selection table"
                         ));
@@ -567,29 +637,22 @@ fn validate_selection_evidence(
                         continue;
                     };
                     if !query.inventory_matches.is_empty()
-                        || query.helper_failure.is_some()
-                        || query.request.name != SelectionNameClass::ExactStandard
                         || !matches!(query.authority, SelectionAuthority::SelectionCountOnly)
-                        || result.name != SelectionNameClass::ExactStandard
-                        || !matches!(
-                            result.version,
-                            SelectionVersionClass::V3_0
-                                | SelectionVersionClass::V3_1
-                                | SelectionVersionClass::V3_2
+                        || matches!(
+                            query.helper_failure,
+                            Some(
+                                SelectionFailure::NullOutput
+                                    | SelectionFailure::UnreadableInterface
+                                    | SelectionFailure::ProviderChanged
+                                    | SelectionFailure::OutsideProvider
+                            )
                         )
-                        || !matches!(result.flags, 0 | 1)
                     {
                         problems.push(format!(
                             "selection query {position} has invalid selection-table authority"
                         ));
                     }
-                    let result_version = match result.version {
-                        SelectionVersionClass::V3_0 => Some(Version { major: 3, minor: 0 }),
-                        SelectionVersionClass::V3_1 => Some(Version { major: 3, minor: 1 }),
-                        SelectionVersionClass::V3_2 => Some(Version { major: 3, minor: 2 }),
-                        _ => None,
-                    };
-                    if result_version != Some(table.version) {
+                    if !selection_version_matches(table.version, result.version) {
                         problems.push(format!(
                             "selection query {position} table version disagrees with result"
                         ));
@@ -600,9 +663,6 @@ fn validate_selection_evidence(
                         && previous != table_id
                     {
                         conflict_pair = true;
-                        problems.push(format!(
-                            "selection query {position} conflicts for version/flags pair"
-                        ));
                     }
                 } else if matches!(query.authority, SelectionAuthority::Inventory)
                     && (query.inventory_matches.is_empty()
@@ -668,12 +728,24 @@ fn validate_selection_evidence(
     if conflict_pair && !evidence.selection_truncated {
         problems.push("selection semantic-pair conflict is not truncated".into());
     }
+    if evidence
+        .tables
+        .iter()
+        .any(selection_table_inventory_incomplete)
+        && !evidence.selection_truncated
+    {
+        problems.push("incomplete selection table is not marked truncated".into());
+    }
     if evidence.selection_truncated
         && !conflict_pair
         && !evidence
             .queries
             .iter()
             .any(|query| query.inventory_matches.len() == MAX_SELECTION_MATCHES)
+        && !evidence
+            .tables
+            .iter()
+            .any(selection_table_inventory_incomplete)
     {
         problems
             .push("selection truncation has no bounded alias or semantic conflict evidence".into());

@@ -131,6 +131,40 @@ fn reported_zero_version_stays_distinct_from_the_public_unknown_placeholder() {
 }
 
 #[test]
+fn imported_missing_version_is_explicit_without_changing_function_authority() {
+    let provider = provider("imported-missing-version", &[]);
+    let complete = discover(&provider).unwrap();
+    for walk in [WalkOutcome::Full, WalkOutcome::KnownPrefix] {
+        for words in [67, 68] {
+            for version in [None, Some(Version { major: 0, minor: 0 })] {
+                let mut manifest = complete.clone();
+                manifest.surfaces[0].version = version;
+                manifest.surfaces[0].walk = walk.clone();
+                manifest.surfaces[0].functions.truncate(words);
+                assert!(validate_structure(&manifest).is_empty());
+                let pins = pin_manifest_objects(&manifest).unwrap();
+                let plan = build_from_sources(&[], &[manifest], &pins);
+                assert_eq!(plan.modules[0].tables[0].version, (0, 0));
+                assert_eq!(plan.entries_seen, words);
+                assert_eq!(plan.slots.len(), 2);
+                assert!(plan.slots.iter().all(|slot| slot.semantic_authorized));
+                assert_eq!(
+                    plan.surfaces[0]
+                        .walk
+                        .contains("version metadata unavailable"),
+                    version.is_none(),
+                    "walk={walk:?}, words={words}, version={version:?}"
+                );
+                assert_eq!(
+                    plan.surfaces[0].walk.starts_with("known_prefix"),
+                    words < 68 || matches!(walk, WalkOutcome::KnownPrefix)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unreadable_header_and_missing_word_controls_keep_only_observed_rows() {
     for (name, defines, observed) in [
         ("healthy", vec![], 68),

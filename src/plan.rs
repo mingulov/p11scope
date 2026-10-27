@@ -872,6 +872,48 @@ pub(crate) struct SelectionTableTarget {
     pub(crate) object_path: String,
     pub(crate) file_offset: u64,
     pub(crate) name: &'static str,
+    pub(crate) ordinal: Option<u16>,
+    // Foreign targets can acquire this binding only through comparable pins.
+    provider: PinnedObjectId,
+}
+
+impl SelectionTableTarget {
+    pub(crate) fn provider_local(
+        object: PinnedObjectId,
+        object_path: String,
+        file_offset: u64,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            object,
+            object_path,
+            file_offset,
+            name,
+            ordinal: standard_ordinal(name),
+            provider: object,
+        }
+    }
+
+    pub(crate) fn from_pinned(
+        provider: PinnedObjectId,
+        object: PinnedObjectId,
+        object_path: String,
+        file_offset: u64,
+        name: &'static str,
+        ordinal: u16,
+        pinned: &PinnedObjects,
+    ) -> Option<Self> {
+        matches!((pinned.abi_for(provider), pinned.abi_for(object)),
+            (Some(provider), Some(target)) if provider == target)
+        .then_some(Self {
+            object,
+            object_path,
+            file_offset,
+            name,
+            ordinal: Some(ordinal),
+            provider,
+        })
+    }
 }
 
 /// The finite link work induced by one complete rebuilt-plan snapshot.
@@ -1405,24 +1447,26 @@ impl AttachPlan {
         let Some(provider) = self.modules.iter().find(|known| known.id == module) else {
             return Err(format!("selection table names missing module {}", module.0));
         };
-        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>)> = BTreeMap::new();
+        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>, BTreeSet<u16>)> =
+            BTreeMap::new();
         for target in targets {
-            if target.object != provider.object {
+            if target.provider != provider.object {
                 return Err(format!(
                     "selection table module {} names object {:?}, got {:?}",
                     module.0, provider.object, target.object
                 ));
             }
-            let (path, names) = grouped
+            let (path, names, ordinals) = grouped
                 .entry(AttachKey {
                     object: target.object,
                     file_offset: target.file_offset,
                 })
-                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new()));
+                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new(), BTreeSet::new()));
             if target.object_path < *path {
                 *path = target.object_path;
             }
             names.insert(target.name);
+            ordinals.extend(target.ordinal);
         }
 
         let candidate_additions = self
@@ -1452,29 +1496,27 @@ impl AttachPlan {
             ));
         }
 
-        for (key, (object_path, names)) in grouped {
+        for (key, (object_path, names, ordinals)) in grouped {
             // Selection tables carry no table location, only positions.
-            self.slot_ordinals.entry(key).or_default().extend(
-                names
-                    .iter()
-                    .filter_map(|name| standard_ordinal(name))
-                    .map(|ordinal| SlotOrdinal {
-                        table_file_offset: None,
-                        ordinal,
-                    }),
-            );
+            self.slot_ordinals
+                .entry(key)
+                .or_default()
+                .extend(ordinals.into_iter().map(|ordinal| SlotOrdinal {
+                    table_file_offset: None,
+                    ordinal,
+                }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
                 let slot = &mut self.slots[position];
                 slot.names.extend(names.into_iter().map(str::to_string));
                 slot.names.sort();
                 slot.names.dedup();
-                // Selection names are interface-selected and authorized: they
-                // displace a prior `unknown`, never alias with it.
+                // An available naming witness displaces a prior `unknown`.
                 drop_transparent_unknown(&mut slot.names);
                 slot.aliased |= slot.names.len() >= 2;
                 continue;
             }
-            let names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            let mut names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            drop_transparent_unknown(&mut names);
             let slot = Slot {
                 index: self.slots.len() as u32,
                 descriptor_index: 0,
@@ -3287,9 +3329,35 @@ pub(crate) fn semantic_source_claims(
                 // diagnostic strings cannot stand in for either fact.
                 incomplete.insert(piece.object);
             }
-            for (_, targets) in
+            if manifest
+                .selection_evidence
+                .tables
+                .iter()
+                .any(crate::manifest_input::selection_table_inventory_incomplete)
+            {
+                incomplete.insert(piece.object);
+            }
+            for (table_id, targets) in
                 crate::discovery::engine::manifest_selection_targets(manifest, pinned)
             {
+                if manifest
+                    .selection_evidence
+                    .tables
+                    .iter()
+                    .find(|table| table.id == table_id)
+                    .is_some_and(|table| {
+                        table
+                            .functions
+                            .iter()
+                            .filter(|function| {
+                                matches!(function.resolution, Resolution::Resolved { .. })
+                            })
+                            .count()
+                            != targets.len()
+                    })
+                {
+                    incomplete.insert(piece.object);
+                }
                 selection_claims.extend(targets.into_iter().map(|target| (piece.object, target)));
             }
         }
@@ -7125,12 +7193,12 @@ mod tests {
         file_offset: u64,
         name: &'static str,
     ) -> SelectionTableTarget {
-        SelectionTableTarget {
+        SelectionTableTarget::provider_local(
             object,
-            object_path: format!("/proc/self/fd/{}", object.0),
+            format!("/proc/self/fd/{}", object.0),
             file_offset,
             name,
-        }
+        )
     }
 
     #[test]

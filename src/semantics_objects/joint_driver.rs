@@ -132,9 +132,11 @@ pub(crate) struct H0Delivery<'a> {
     pub(crate) failed: bool,
     /// The quantum audit proves the failure is unrecoverable: the fault
     /// cell itself is unreadable or saturated, so no later era can be
-    /// proven either. Any other failure is a bounded per-quantum loss
-    /// (malformed/discard/counter/era move) that H0 fails scoped and
-    /// recovers from; the failed quantum's own content still sheds.
+    /// proven either, or a reader counter regressed, saturated, or
+    /// could not be read, so the lost-history bound is unprovable. Any
+    /// other failure is a bounded per-quantum loss (exact
+    /// malformed/discard deltas or an era move) that H0 fails scoped
+    /// and recovers from; the failed quantum's own content still sheds.
     pub(crate) failed_permanent: bool,
     pub(crate) positions: H0Positions<'a>,
     pub(crate) birth_cut: Option<super::JournalBirthCut>,
@@ -1249,12 +1251,15 @@ impl RawJointQuantum {
 
     /// A failed collection that no later quantum can recover from: the
     /// fault cell itself is unreadable or saturated, so fault eras are
-    /// unprovable from here on. Every other failure is a bounded loss
-    /// inside this quantum (the drain bracket proves the eras around
-    /// it), which H0 fails scoped: this quantum's content sheds, the
-    /// fault era advances, and later quanta audit normally.
+    /// unprovable from here on, or a reader counter regressed,
+    /// saturated, or could not be read, so the lost-history bound is
+    /// unprovable. Every other failure is a bounded loss inside this
+    /// quantum (exact malformed/discard deltas or an era move within
+    /// the drain bracket), which H0 fails scoped: this quantum's
+    /// content sheds, the fault era advances, and later quanta audit
+    /// normally.
     fn collection_failed_permanent(&self) -> bool {
-        self.audit.fault_error.is_some()
+        self.audit.fault_error.is_some() || self.audit.counter_error
     }
 
     fn contiguous_stream(&self, adapter: &JournalAdapter) -> bool {

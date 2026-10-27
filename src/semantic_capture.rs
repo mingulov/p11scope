@@ -2881,9 +2881,15 @@ impl SemanticCapture {
     /// is disclosed), but nothing latches, so the next tick audits
     /// normally and fresh scans re-prove. Legacy drain failures keep the
     /// permanent path: without the quantum audit the scope is unknowable.
+    /// The scoped argument needs the era advance: when the raise itself
+    /// fails, old-era stamps stay routable, so this falls back to
+    /// [`Self::fail_coverage`] instead of recovering.
     fn fail_quantum_coverage(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) {
+        if io.raise_fault().is_err() {
+            self.fail_coverage(io, report);
+            return;
+        }
         self.invalidate(InvalidationScope::CoverageFailed, report);
-        let _ = io.raise_fault();
         let resolved = self.router.fail_quantum_coverage();
         self.resolve(resolved, report);
         self.jobs.clear();

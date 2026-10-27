@@ -5292,9 +5292,21 @@ mod promotion_lifecycle_tests {
         let pin = pinning.pins.pinned().next().expect("one object");
         let id = pin.id;
         assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
-        assert_eq!(
-            pin.probed_maps_key, None,
-            "no fabricated maps rendering rides the entry"
+        // No fabricated maps rendering rides the entry: the join must not
+        // match the absent key, and the absent key must file no raw either.
+        // Uses only the surviving join accessors, not the summary mirror.
+        assert!(
+            !pinning.pins.object_matches_key(
+                id,
+                absent.device.major,
+                absent.device.minor,
+                absent.inode
+            ),
+            "no fabricated maps rendering joins the entry"
+        );
+        assert!(
+            !pinning.pins.raw_keys_for(id).contains(&absent),
+            "the absent key files no raw either"
         );
         let path = pin.path.to_owned();
         let sha256 = pin.sha256.to_owned();

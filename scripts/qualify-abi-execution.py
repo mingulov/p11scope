@@ -51,8 +51,22 @@ Usage (as root; the observer refuses otherwise):
   python3 -I scripts/qualify-abi-execution.py --observer ./p11scope --out DIR \\
       --fixtures PREBUILT --loader32 /lib/ld-linux.so.2
 
-Exit 0 when every run cell passes, 1 otherwise. results.jsonl carries one
-record per cell plus the overall record.
+A cell carrying exactly the ruled exit-time loader signature (R-57:
+exactly one discovery_truncated, counts exact through the oracle join,
+every skipped row the exit-time discovery subject, nothing else
+deviating) is reported as KNOWN-ISSUE, never as a pass; any other
+deviation stays a failure, and the blocked cell never qualifies (its
+capture ends before the workload exits, so no exit-time signature can
+arise there).
+
+Exit 0 when no run cell fails (passes and known-issues), 1 when any
+cell fails, 2 on a driver refusal (bad paths, build failure, broken
+judging scripts). results.jsonl carries one record per cell plus the
+overall record. Every execution also appends to the per-cell
+cell_dir/runs.jsonl and the campaign out_dir/runs.jsonl logs, so reruns
+that reuse one --out keep every run and its rate reconstructible;
+verdict.json and results.jsonl keep the latest run's own verdict only.
+The driver never retries: each record is its own run's result.
 """
 
 import argparse
@@ -157,6 +171,16 @@ PINNED_OBSERVATION_CAUSES = frozenset({"unprotected_live_windows",
                                        "loader_discovery",
                                        "interface_selection"})
 
+# The ruled (R-57) exit-time loader signature: the pinned attach-late
+# disclosure plus exactly the two causes one discovery truncation
+# entails. Anything beyond this set is another deviation and stays a
+# failure.
+KNOWN_ISSUE_RULE = "r57-exit-time-loader-truncation"
+KNOWN_ISSUE_OBSERVATION_CAUSES = frozenset(
+    set(PINNED_OBSERVATION_CAUSES) | {"skipped", "discovery_truncated"})
+DISCOVERY_SKIP_NAME = "discovery subject"
+DISCOVERY_SKIP_REASON = "discovery unavailable"
+
 RV_KEY_PATTERN = re.compile(r"(?:0[xX])?[0-9a-fA-F]{1,16}\Z")
 
 
@@ -181,6 +205,26 @@ def load_evidence(scripts_dir):
 
 def load_pin(scripts_dir):
     return _load("mapped_provider_pin", Path(scripts_dir) / PIN_NAME)
+
+
+def load_scripts(scripts_dir):
+    """Import the judging scripts, refusing honestly when one is broken.
+
+    A missing file raises OSError from the import machinery, but other
+    breakage (syntax errors, bad loaders) raises other exceptions, so
+    anything the loader raises becomes the refusal reason, naming the
+    script. Returns (oracle, pin).
+    """
+    try:
+        oracle = load_oracle(scripts_dir)
+    except Exception as error:
+        raise DriverRefusal(f"oracle script unavailable: {error}") from None
+    try:
+        pin = load_pin(scripts_dir)
+    except Exception as error:
+        raise DriverRefusal(
+            f"provider-pin script unavailable: {error}") from None
+    return oracle, pin
 
 
 def gcc_fixture_cmd(cc, src, out, m32):
@@ -461,6 +505,7 @@ def _ownership(row):
 
 def check_s1_report(report, pin, *, verdict_module=None,
                     expected_in_flight_at_end=0,
+                    expected_discovery_truncated=0,
                     expected_observation_causes=None):
     """The S1 proof for a scan-only pid profile: loss-free and healthy,
     with the attach-late disclosure pinned.
@@ -477,6 +522,8 @@ def check_s1_report(report, pin, *, verdict_module=None,
     never sees the exit-time loader evidence: it pins in_flight_at_end to
     exactly 1 with exactly {interface_selection, in_flight_at_end} instead
     of the three-cause set. Either way the values are exact, never floors.
+    Strict callers leave expected_discovery_truncated at 0; only the
+    exit-time-truncation matcher passes 1, with the entailed cause set.
     """
     verdict = verdict_module
     if verdict is None:
@@ -496,7 +543,8 @@ def check_s1_report(report, pin, *, verdict_module=None,
     for key in LOSS_COUNTERS:
         if key == "in_flight_at_end":
             continue
-        if type(evidence.get(key)) is not int or evidence[key] != 0:
+        want = expected_discovery_truncated if key == "discovery_truncated" else 0
+        if type(evidence.get(key)) is not int or evidence[key] != want:
             raise DriverRefusal(f"loss or unknown {key}")
     if (type(evidence.get("in_flight_at_end")) is not int
             or evidence["in_flight_at_end"] != expected_in_flight_at_end):
@@ -578,6 +626,44 @@ def check_s1_report(report, pin, *, verdict_module=None,
             "functions": len(rows), "active_rows": active}
 
 
+def match_exit_time_truncation(report, pin, *, verdict_module=None):
+    """Match the ruled exit-time loader signature (R-57), or refuse.
+
+    The signature proved for v0.5.0: exactly one discovery_truncated,
+    every skipped row the exit-time discovery subject (the loader
+    object the dead process left unvalidated), nothing else skipped,
+    and the whole S1 proof otherwise exact, including the pinned
+    causes plus exactly the two the truncation entails. Counts
+    exactness is the oracle join further down run_cell, not this
+    report-level half: a report match alone never classifies the cell.
+    Returns the matched signature summary.
+    """
+    if type(report) is not dict or not isinstance(report.get("evidence"), dict):
+        raise DriverRefusal("known-issue signature needs a profile report")
+    evidence = report["evidence"]
+    if evidence.get("discovery_truncated") != 1:
+        raise DriverRefusal(
+            "known-issue signature needs exactly one discovery_truncated")
+    skipped = evidence.get("skipped")
+    if not isinstance(skipped, list) or not skipped:
+        raise DriverRefusal("known-issue signature needs skipped discovery rows")
+    for row in skipped:
+        if (not isinstance(row, dict) or set(row) != {"name", "reason"}
+                or row["name"] != DISCOVERY_SKIP_NAME
+                or row["reason"] != DISCOVERY_SKIP_REASON):
+            raise DriverRefusal("known-issue signature needs the exit-time "
+                                "loader subject only")
+    if evidence.get("modules_skipped") != []:
+        raise DriverRefusal("known-issue signature allows no module skips")
+    s1 = check_s1_report(
+        report, pin, verdict_module=verdict_module,
+        expected_discovery_truncated=1,
+        expected_observation_causes=set(KNOWN_ISSUE_OBSERVATION_CAUSES))
+    return {"rule": KNOWN_ISSUE_RULE, "s1": s1, "discovery_truncated": 1,
+            "skipped_rows": len(skipped),
+            "observation_causes": sorted(KNOWN_ISSUE_OBSERVATION_CAUSES)}
+
+
 def judge_with_oracle(oracle_py, ledger_path, counts_path):
     """Judge saved artifacts through the oracle CLI. Returns (code, out, err)."""
     try:
@@ -591,11 +677,41 @@ def judge_with_oracle(oracle_py, ledger_path, counts_path):
 
 
 def aggregate(results):
-    """Overall verdict over per-cell results."""
+    """Overall verdict over per-cell results.
+
+    Known-issue cells are reported, never passed and never failed: the
+    campaign is green exactly when no cell failed.
+    """
     failed = [f"{item['cell']}/{item['arch']}" for item in results
-              if not item.get("passed")]
+              if not item.get("passed") and not item.get("known_issue")]
+    known = [f"{item['cell']}/{item['arch']}" for item in results
+             if not item.get("passed") and item.get("known_issue")]
     return {"passed": bool(results) and not failed,
-            "cells": len(results), "failed": failed}
+            "cells": len(results), "failed": failed, "known_issue": known}
+
+
+def append_run_log(path, record):
+    """Append one cell execution to an append-only run log (JSONL).
+
+    Both the per-cell log (cell_dir/runs.jsonl) and the campaign log
+    (out_dir/runs.jsonl) grow this way, so every rerun and its rate
+    stay reconstructible; verdict.json keeps the latest run only.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def cell_rate(records, cell, arch):
+    """Count every recorded run of one cell exactly as it happened."""
+    runs = [row for row in records
+            if row.get("cell") == cell and row.get("arch") == arch]
+    passed = sum(1 for row in runs if row.get("passed"))
+    known = sum(1 for row in runs
+                if not row.get("passed") and row.get("known_issue"))
+    return {"runs": len(runs), "passed": passed, "known_issue": known,
+            "failed": len(runs) - passed - known}
 
 
 def entry_detail(rows, counts):
@@ -698,9 +814,15 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
     """Run one installed cell; return its result record (never raises)."""
     from datetime import datetime, timezone
     spec = CELLS[cond]
-    oracle = load_oracle(scripts_dir)
-    pin_mod = load_pin(scripts_dir)
     started = datetime.now(timezone.utc).isoformat()
+    result = {"cell": cond, "arch": arch, "passed": False, "reason": "",
+              "known_issue": None, "started": started,
+              "dir": str(cell_dir)}
+    try:
+        oracle, pin_mod = load_scripts(scripts_dir)
+    except DriverRefusal as error:
+        result["reason"] = str(error)
+        return result
     ledger_path = cell_dir / "ledger.jsonl"
     gate_path = cell_dir / "gate"
     wl_path = cell_dir / "workload.log"
@@ -715,8 +837,6 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
             path.unlink()
         except FileNotFoundError:
             pass
-    result = {"cell": cond, "arch": arch, "passed": False, "reason": "",
-              "started": started, "dir": str(cell_dir)}
     fixture_argv = [str(fixture), str(provider), str(ledger_path),
                     str(gate_path), spec["mode"]]
     if spec["arg"] is not None:
@@ -889,6 +1009,7 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
     except (OSError, UnicodeError, json.JSONDecodeError):
         result["reason"] = "profile report unreadable"
         return result
+    known = None
     try:
         if cond == "blocked":
             s1 = check_s1_report(
@@ -897,9 +1018,18 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
                                              "in_flight_at_end"})
         else:
             s1 = check_s1_report(report, pin)
-    except DriverRefusal as error:
-        result["reason"] = f"S1 proof refused: {error}"
-        return result
+    except DriverRefusal as strict_error:
+        # The blocked capture ends before the workload exits, so no
+        # exit-time signature can arise there: its refusals stay failures.
+        if cond == "blocked":
+            result["reason"] = f"S1 proof refused: {strict_error}"
+            return result
+        try:
+            known = match_exit_time_truncation(report, pin)
+        except DriverRefusal:
+            result["reason"] = f"S1 proof refused: {strict_error}"
+            return result
+        s1 = known["s1"]
     result["s1"] = s1
     try:
         converted = counts_from_profile(report, ledger_rows, pin,
@@ -946,6 +1076,19 @@ def run_cell(*, observer, fixture, provider, scripts_dir, cond, arch,
                          "ledger_complete": True,
                          "observer_exit": observer_rc,
                          "workload_exit": workload_rc}
+    if known is not None:
+        # The oracle accepted the exact join above, so counts are exact
+        # and the report half already matched: this run is the ruled
+        # signature, reported as a known issue, never as a pass.
+        result["known_issue"] = known["rule"]
+        result["known_signature"] = {
+            "rule": known["rule"],
+            "discovery_truncated": known["discovery_truncated"],
+            "skipped_rows": known["skipped_rows"],
+            "observation_causes": known["observation_causes"]}
+        result["reason"] = ("known issue r57-exit-time-loader-truncation: "
+                            "one exit-time discovery truncation, counts exact")
+        return result
     result["passed"] = True
     result["reason"] = "oracle accepted the installed population"
     return result
@@ -1008,9 +1151,9 @@ def _prebuilt(fixtures_dir, archs):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--observer", required=True,
+    parser.add_argument("--observer", required=False, default=None,
                         help="installed observer binary under test")
-    parser.add_argument("--out", required=True,
+    parser.add_argument("--out", required=False, default=None,
                         help="output directory for per-cell records")
     parser.add_argument("--arch", default="both",
                         choices=("lp64", "ia32", "both"))
@@ -1036,6 +1179,8 @@ def main(argv=None):
             print(f"{cond}: mode={spec['mode']} provider={spec['provider']} "
                   f"exit={spec['workload_exit']} population={spec['cell']}")
         return 0
+    if not args.observer or not args.out:
+        parser.error("--observer and --out are required to run cells")
     conds = args.cell or COND_ORDER
     unknown = [cond for cond in conds if cond not in CELLS]
     if unknown:
@@ -1058,6 +1203,7 @@ def main(argv=None):
         return 2
     scripts_dir = DRIVER_DIR
     try:
+        load_scripts(scripts_dir)
         if args.fixtures is not None:
             built = _prebuilt(args.fixtures, archs)
         else:
@@ -1089,30 +1235,60 @@ def main(argv=None):
                     json.dump(record, stream, indent=2, sort_keys=True)
                     stream.write("\n")
             except OSError:
-                record = dict(record, passed=False,
+                record = dict(record, passed=False, known_issue=None,
                               reason="verdict unwritable")
+            run_entry = {"started": record.get("started"),
+                         "cell": record["cell"], "arch": record["arch"],
+                         "passed": record["passed"],
+                         "known_issue": record.get("known_issue"),
+                         "reason": record["reason"],
+                         "workload_exit": record.get("workload_exit"),
+                         "observer_exit": record.get("observer_exit")}
+            for log_path in (cell_dir / "runs.jsonl",
+                             out_dir / "runs.jsonl"):
+                try:
+                    append_run_log(log_path, run_entry)
+                except OSError as error:
+                    print(f"abi execution: run log unwritable: {log_path}: "
+                          f"{error}", file=sys.stderr, flush=True)
             results.append(record)
-            status = "PASS" if record["passed"] else "FAIL"
+            if record["passed"]:
+                status = "PASS"
+            elif record.get("known_issue"):
+                status = "KNOWN-ISSUE"
+            else:
+                status = "FAIL"
             print(f"abi execution: cell {cond}/{arch}: {status}: "
                   f"{record['reason']}", flush=True)
     overall = aggregate(results)
-    line = {"overall": overall["passed"], "cells": overall["cells"],
-            "failed": overall["failed"]}
+    if overall["failed"]:
+        campaign = "FAIL"
+    elif overall["known_issue"]:
+        campaign = "KNOWN-ISSUE"
+    else:
+        campaign = "PASS"
+    line = {"overall": overall["passed"], "status": campaign.lower(),
+            "cells": overall["cells"], "failed": overall["failed"],
+            "known_issue": overall["known_issue"]}
     try:
         with open(out_dir / "results.jsonl", "w", encoding="utf-8") as stream:
             for record in results:
                 stream.write(json.dumps({"cell": record["cell"],
                                          "arch": record["arch"],
                                          "passed": record["passed"],
+                                         "known_issue": record.get(
+                                             "known_issue"),
                                          "reason": record["reason"]},
                                         sort_keys=True) + "\n")
             stream.write(json.dumps(line, sort_keys=True) + "\n")
     except OSError:
         print("abi execution refused: results unwritable", file=sys.stderr)
         return 2
-    print(f"abi execution: overall {'PASS' if overall['passed'] else 'FAIL'}: "
-          f"{overall['cells'] - len(overall['failed'])}/{overall['cells']} "
-          f"cells passed", flush=True)
+    passed = overall["cells"] - len(overall["failed"]) - len(overall["known_issue"])
+    print(f"abi execution: overall {campaign}: "
+          f"{passed}/{overall['cells']} cells passed, "
+          f"{len(overall['known_issue'])} known-issue, "
+          f"{len(overall['failed'])} failed", flush=True)
     return 0 if overall["passed"] else 1
 
 

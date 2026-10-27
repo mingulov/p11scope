@@ -4435,7 +4435,7 @@ fn target_exit_marker(ticks: u64) -> String {
 /// calls collected so far. `None` on the ordinary all-clear path.
 fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
     tripped.then(|| {
-        "p11scope: the target exited but its cleanup was still pending after 6 s; \
+        "p11scope: the target exited but its cleanup was still pending with no progress for 6 s; \
          the capture ends with the calls collected so far"
             .to_string()
     })
@@ -14362,7 +14362,7 @@ mod tests {
         assert_eq!(
             target_exit_cleanup_pending_line(true).as_deref(),
             Some(
-                "p11scope: the target exited but its cleanup was still pending after 6 s; \
+                "p11scope: the target exited but its cleanup was still pending with no progress for 6 s; \
                  the capture ends with the calls collected so far"
             )
         );

@@ -18563,9 +18563,11 @@ impl Engine {
             }
             Some(_) => {}
         }
-        // The trip only ever ends an outstanding live wait: once the
-        // operator asked the capture to stop, or the collected finish has
-        // started, the stop owns the ending and no trip mark is added. The
+        // The trip is suppressed after an operator stop and during the
+        // collected finish: once the operator asked the capture to stop, or
+        // the collected finish has started, no trip mark is added. A stop
+        // at `--duration` expiry sets no cancel flag, so it can still
+        // trip: the target really exited and the stall is real. The
         // all-clear latch above still runs everywhere.
         if self.cancellation_requested() || self.collected_finish_actions.is_some() {
             return;

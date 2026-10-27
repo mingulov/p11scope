@@ -4804,9 +4804,9 @@ fn expected_target_exit_drain_counts_shrink_only() {
     );
 }
 
-/// Twin: once cancellation is requested, a stalled wait never trips. The
-/// stop owns the ending; the bound only ever ends an outstanding live wait.
-/// The all-clear latch still runs everywhere.
+/// Twin: once cancellation is requested, a stalled wait never trips: the
+/// trip is suppressed after an operator stop. The all-clear latch still
+/// runs everywhere.
 #[test]
 fn stalled_wait_with_cancellation_requested_does_not_trip() {
     let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
@@ -4873,9 +4873,9 @@ fn stalled_wait_with_cancellation_requested_does_not_trip() {
     );
 }
 
-/// Twin: once the collected finish has started, a stalled wait never trips.
-/// The finish owns the ending; the bound only ever ends an outstanding live
-/// wait. The all-clear latch still runs everywhere.
+/// Twin: once the collected finish has started, a stalled wait never trips:
+/// the trip is suppressed during the collected finish. The all-clear latch
+/// still runs everywhere.
 #[test]
 fn stalled_wait_during_collected_finish_does_not_trip() {
     let (mut engine, context) = Engine::retiring_loader_context(std::process::id());

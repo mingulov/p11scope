@@ -1343,6 +1343,13 @@ impl CaptureWorkBudget {
         allowed
     }
 
+    /// A metadata reader could not obtain its complete proof within the
+    /// allowance returned by allowed_io. Keep the actual resource refusal
+    /// distinct from a target read/identity error, preserving any earlier stop.
+    pub(crate) fn note_io_refusal(&mut self) {
+        self.set_scan_stop(IO_CEILING_REASON);
+    }
+
     pub(crate) fn record_io(&mut self, bytes: usize) {
         // Bound input/parse amplification as well as decoded work. Existing
         // I/O ceilings remain independent. Checks cannot interrupt a read.
@@ -3454,8 +3461,14 @@ pub(crate) fn duplicate_exec_coverage(group: &[&MapEntry]) -> bool {
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
 /// `map_files` is never required, and a container's own file is never copied out).
-fn open_in_target(view: &ProcessView, path: &str) -> Result<File, String> {
-    view.run_while_same(|| open_object(Path::new(&format!("/proc/{}/root{path}", view.pid()))))?
+fn open_in_target(
+    view: &ProcessView,
+    path: &str,
+    budget: &mut CaptureWorkBudget,
+) -> Result<File, String> {
+    view.with_filesystem(budget, |filesystem, _| {
+        filesystem.open_rooted_object(Path::new(path))
+    })
 }
 
 /// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
@@ -3589,12 +3602,13 @@ fn mapped_file_guard(
     scanned: Option<crate::discovery::identity::FileIdentity>,
     key: ObjectKey,
     group: &[&MapEntry],
+    budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
     let Some(expected) = scanned else {
         return Ok(());
     };
     for entry in group {
-        let mapped = io.range_identity(view, entry.start, entry.end)?;
+        let mapped = io.range_identity(view, entry.start, entry.end, budget)?;
         match mapped {
             Ok(identity) if identity == expected => {}
             Ok(identity) => {
@@ -4141,8 +4155,38 @@ pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let view = ProcessView::open(ProcessViewId(0), request.pid)?;
+    let started = Instant::now();
+    let view = match ProcessView::open_with_budget(ProcessViewId(0), request.pid, budget) {
+        Ok(view) => view,
+        Err(error) => {
+            // Construction uses this scan's allowance too. Only the actual
+            // budget stop state changes the public result scope; ordinary
+            // identity/read failures remain errors. A deadline may have passed
+            // inside the failed proof before its next budget clock poll.
+            if let Some(reason) = budget
+                .check_deadline_now()
+                .or_else(|| budget.stopped_reason())
+            {
+                return Ok(scan_stopped_before_view(started, reason));
+            }
+            return Err(error);
+        }
+    };
     scan_process_view(request, &view, budget)
+}
+
+fn scan_stopped_before_view(started: Instant, reason: &'static str) -> ScanOutcome {
+    ScanOutcome::Scanned {
+        modules: Vec::new(),
+        skipped: vec![
+            scan_skip(
+                "capture discovery",
+                format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: process view construction stopped"),
+            ),
+            scan_skip("capture discovery", reason.into()),
+        ],
+        scan_ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 // Private I/O seam: production and mutation tests share the entire acquisition loop.
@@ -4161,10 +4205,18 @@ trait ScanIo {
     fn open_maps(
         &mut self,
         view: &ProcessView,
-        budget: &CaptureWorkBudget,
+        budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<Box<dyn Read>>;
-    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<Self::Memory>;
-    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String>;
+    fn open_mem(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::io::Result<Self::Memory>;
+    fn final_generation(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), String>;
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
     }
@@ -4192,6 +4244,7 @@ trait ScanIo {
         view: &ProcessView,
         start: u64,
         end: u64,
+        _budget: &mut CaptureWorkBudget,
     ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
         view.run_while_same(|| {
             crate::discovery::identity::map_files_identity(view.pid(), start, end)
@@ -4231,22 +4284,37 @@ impl ScanIo for ProcScanIo {
     fn open_maps(
         &mut self,
         view: &ProcessView,
-        _: &CaptureWorkBudget,
+        budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<Box<dyn Read>> {
         // The survivor's maps for a cold scan, not the dead leader's
         // empty ones; live scans see the ordinary open unchanged.
         if let Some(member) = self.cold_member_for(view.pid()) {
             return Ok(Box::new(member.open_maps()?));
         }
-        Ok(Box::new(File::open(format!("/proc/{}/maps", view.pid()))?))
+        view.with_filesystem(budget, |filesystem, _| {
+            filesystem.open_maps().map_err(|error| error.to_string())
+        })
+        .map(|file| Box::new(file) as Box<dyn Read>)
+        .map_err(std::io::Error::other)
     }
 
-    fn open_mem(&mut self, view: &ProcessView) -> std::io::Result<File> {
-        File::open(format!("/proc/{}/mem", view.pid()))
+    fn open_mem(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::io::Result<File> {
+        view.with_filesystem(budget, |filesystem, _| {
+            filesystem.open_memory().map_err(|error| error.to_string())
+        })
+        .map_err(std::io::Error::other)
     }
 
-    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
-        view.run_while_same(|| ())
+    fn final_generation(
+        &mut self,
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
+        view.with_filesystem(budget, |_, _| Ok(()))
     }
 
     fn range_identity(
@@ -4254,6 +4322,7 @@ impl ScanIo for ProcScanIo {
         view: &ProcessView,
         start: u64,
         end: u64,
+        budget: &mut CaptureWorkBudget,
     ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
         // One range through the stashed survivor when this scan holds
         // it: sequential cold-scan proofs (zombie scans are rare). The
@@ -4264,8 +4333,16 @@ impl ScanIo for ProcScanIo {
                 .stat_map_file(start, end)
                 .map_err(std::io::Error::other));
         }
-        view.run_while_same(|| {
-            crate::discovery::identity::map_files_identity(view.pid(), start, end)
+        view.with_filesystem(budget, |filesystem, budget| {
+            Ok(filesystem
+                .mapped_file_metadata(start, end, budget)
+                .map(|metadata| {
+                    use std::os::unix::fs::MetadataExt;
+                    crate::discovery::identity::FileIdentity {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    }
+                }))
         })
     }
 
@@ -4803,7 +4880,7 @@ fn scan_view_examined_mode(
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
     let (mem, unavailable) = if scan_memory {
-        let mem = match view.run_while_same(|| io.open_mem(view)) {
+        let mem = match view.run_while_same(|| io.open_mem(view, budget)) {
             Ok(mem) => mem,
             Err(reason) => {
                 return Ok(refused_initial(format!(
@@ -4897,7 +4974,7 @@ fn scan_view_examined_mode(
         };
         let path = usable.display().to_string();
 
-        let file = match open_in_target(view, &path) {
+        let file = match open_in_target(view, &path, budget) {
             Ok(file) => file,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
@@ -4912,7 +4989,7 @@ fn scan_view_examined_mode(
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
-        if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group) {
+        if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group, budget) {
             skipped.push(Skipped { subject, reason });
             continue;
         }
@@ -5181,7 +5258,7 @@ fn scan_view_examined_mode(
         }
         Ok::<_, String>(accepted)
     })();
-    let generation = io.final_generation(view);
+    let generation = io.final_generation(view, budget);
     match (validation, generation) {
         (Ok(accepted), Ok(())) => {
             modules = modules
@@ -5403,7 +5480,7 @@ mod tests {
         fn open_maps(
             &mut self,
             _: &ProcessView,
-            budget: &CaptureWorkBudget,
+            budget: &mut CaptureWorkBudget,
         ) -> std::io::Result<Box<dyn Read>> {
             self.maps_reads += 1;
             if self.maps_reads == 2 {
@@ -5434,7 +5511,11 @@ mod tests {
                 .to_vec(),
             )))
         }
-        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<BracketMemory> {
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<BracketMemory> {
             Ok(BracketMemory {
                 file: self.mem.try_clone()?,
                 log: self.log.clone(),
@@ -5461,6 +5542,7 @@ mod tests {
             view: &ProcessView,
             start: u64,
             end: u64,
+            _: &mut CaptureWorkBudget,
         ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
             match self.mapped {
                 Some((_, range)) => Ok(Ok(range)),
@@ -5469,7 +5551,11 @@ mod tests {
                 }),
             }
         }
-        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
             self.log.borrow_mut().push("final generation".into());
             if self.fail_generation {
                 Err("injected generation loss".into())
@@ -6082,12 +6168,15 @@ mod tests {
             outcome.skipped()
         );
 
-        // The preprocessing itself is charged, one unit per snapshot entry.
-        // Leave one unit: every live process has multiple mappings, so the scan
-        // stops there without racing a separate read of this process's map count.
-        let mut budget = CaptureWorkBudget::default();
-        assert!(budget.charge(DEFAULT_WORK_CEILING - 1));
-        let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
+        // Isolate map preprocessing from constructor work: the retained view
+        // predates exhaustion, and this existing I/O fixture serves five real
+        // authored map rows without spending filesystem-proof work first.
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        let (outcome, examined) =
+            scan_view_with_examined(&request, &view, &mut budget, &mut fixture, true)
+                .expect("a bounded retained-view scan");
         assert!(
             outcome
                 .skipped()
@@ -6098,6 +6187,96 @@ mod tests {
             outcome.skipped()
         );
         assert!(outcome.modules().is_empty());
+        assert_eq!(
+            fixture.maps_reads, 1,
+            "the initial snapshot reached preprocessing"
+        );
+        assert!(
+            examined.is_empty(),
+            "a stopped snapshot grants no examined-object evidence"
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    #[test]
+    fn scan_pid_constructor_budget_stops_are_structured_partial_results() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+
+        for cold in [false, true] {
+            let mut group = ColdLeaderSubject::spawn(1);
+            if cold {
+                group.leave_leader();
+            }
+            let hooks = HookRegistry::builtin();
+            let request = ScanRequest {
+                pid: group.pid(),
+                hints: &[],
+                hooks: &hooks,
+            };
+            let mut sticky = CaptureWorkBudget::default();
+            assert!(!sticky.charge(u64::MAX));
+            let mut expired = CaptureWorkBudget::default();
+            expired.set_deadline(Some(0));
+            let mut cancelled = CaptureWorkBudget::default();
+            cancelled.set_collection_work(CollectionWork::new(|_| false));
+            let mut budgets = vec![
+                sticky,
+                CaptureWorkBudget::with_work_ceiling(1),
+                expired,
+                cancelled,
+            ];
+            if cold {
+                budgets.push(CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: 0,
+                    total_bytes: 0,
+                }));
+            }
+            for mut budget in budgets {
+                let outcome = scan_pid(&request, &mut budget)
+                    .expect("a capture budget stop is partial, not an unreadable-provider error");
+                assert!(outcome.modules().is_empty());
+                assert!(
+                    !outcome.mapping_scan_completed(),
+                    "no accepted current maps proof exists"
+                );
+                let reason = budget
+                    .stopped_reason()
+                    .expect("the actual budget records the refusal");
+                assert!(
+                    outcome
+                        .skipped()
+                        .iter()
+                        .any(|skip| skip.subject == "capture discovery" && skip.reason == reason),
+                    "actual stop reason is retained: {:?}",
+                    outcome.skipped()
+                );
+                if !cold {
+                    assert_eq!(budget.attempted_io_bytes(), 0);
+                }
+            }
+            let mut healthy = CaptureWorkBudget::default();
+            let outcome = scan_pid(&request, &mut healthy).unwrap();
+            assert!(
+                outcome
+                    .modules()
+                    .iter()
+                    .any(|module| Path::new(&module.path) == group.program)
+            );
+            if !cold {
+                group.leave_leader();
+            }
+            group.call_three();
+        }
+        let hooks = HookRegistry::builtin();
+        let missing = ScanRequest {
+            pid: u32::MAX,
+            hints: &[],
+            hooks: &hooks,
+        };
+        assert!(
+            scan_pid(&missing, &mut CaptureWorkBudget::default()).is_err(),
+            "ordinary identity failures retain the public error scope"
+        );
     }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its
@@ -9800,16 +9979,24 @@ mod tests {
         fn open_maps(
             &mut self,
             _: &ProcessView,
-            _: &CaptureWorkBudget,
+            _: &mut CaptureWorkBudget,
         ) -> std::io::Result<Box<dyn Read>> {
             Ok(Box::new(std::io::Cursor::new(
                 self.maps.clone().into_bytes(),
             )))
         }
-        fn open_mem(&mut self, _: &ProcessView) -> std::io::Result<File> {
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
             self.mem.try_clone()
         }
-        fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
             view.run_while_same(|| ())
         }
     }
@@ -11482,16 +11669,24 @@ mod tests {
         fn open_maps(
             &mut self,
             _view: &ProcessView,
-            _budget: &CaptureWorkBudget,
+            _budget: &mut CaptureWorkBudget,
         ) -> std::io::Result<Box<dyn Read>> {
             Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
         }
 
-        fn open_mem(&mut self, _view: &ProcessView) -> std::io::Result<File> {
+        fn open_mem(
+            &mut self,
+            _view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
             Err(std::io::Error::other("scripted IO serves no mem"))
         }
 
-        fn final_generation(&mut self, _view: &ProcessView) -> Result<(), String> {
+        fn final_generation(
+            &mut self,
+            _view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
             Ok(())
         }
     }

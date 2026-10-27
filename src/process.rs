@@ -15,7 +15,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 #[allow(dead_code)]
 pub(crate) mod cgroup_context;
 pub(crate) mod leader_exit;
+mod view_filesystem;
 use std::sync::{Arc, Weak};
+pub(crate) use view_filesystem::{
+    ViewFilesystem, cold_filesystem_deadline, snapshot_leader_is_zombie,
+    with_cold_snapshot_filesystem,
+};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
 #[cfg(test)]
@@ -352,9 +357,9 @@ pub(crate) fn mountinfo_reads_for_test() -> u64 {
 fn read_view_mountinfo(
     pid: u32,
     budget: &mut CaptureWorkBudget,
+    open: impl FnOnce() -> io::Result<std::fs::File>,
 ) -> Result<(std::fs::File, String), String> {
-    let table = std::fs::File::open(format!("/proc/{pid}/mountinfo"))
-        .map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
+    let table = open().map_err(|error| format!("cannot open pid {pid}'s mount table: {error}"))?;
     #[cfg(test)]
     MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
     let text = read_mountinfo(&table, budget)
@@ -446,6 +451,7 @@ impl MountTableCache {
         &mut self,
         owner: (ProcessViewId, u32),
         budget: &mut CaptureWorkBudget,
+        open: impl FnOnce() -> io::Result<std::fs::File>,
     ) -> Result<(), String> {
         if let Some(table) = &self.table
             && table.owner == owner
@@ -454,7 +460,7 @@ impl MountTableCache {
             return Ok(());
         }
         self.table = None;
-        let (file, text) = read_view_mountinfo(owner.1, budget)?;
+        let (file, text) = read_view_mountinfo(owner.1, budget, open)?;
         self.table = Some(CachedMountTable { owner, file, text });
         Ok(())
     }
@@ -513,7 +519,12 @@ pub struct ProcessView {
     mount_namespace: MountNamespaceId,
     pin: PidPin,
     admitted_ns: u64,
+    cold_filesystem_observed: std::sync::atomic::AtomicBool,
 }
+
+#[cfg(test)]
+#[path = "process/cold_view_tests.rs"]
+pub(crate) mod cold_view_tests;
 
 fn validated_with_admission_time<T>(
     validate: impl FnOnce() -> Result<T, String>,
@@ -527,16 +538,57 @@ fn validated_with_admission_time<T>(
 
 impl ProcessView {
     pub fn open(id: ProcessViewId, pid: u32) -> Result<Self, String> {
-        let ((pin, mount_namespace), admitted_ns) = validated_with_admission_time(
+        Self::open_with_budget(id, pid, &mut CaptureWorkBudget::default())
+    }
+
+    /// Original leader metadata only, for native-owner custody before an
+    /// Inventory scan window exists. This never starts a cold task census or
+    /// allocates a default discovery allowance. Cold discovery requires the
+    /// separate constructor with its caller's actual budget.
+    pub(crate) fn open_warm_only(id: ProcessViewId, pid: u32) -> Result<Self, String> {
+        Self::open_with_filesystem(id, pid, |pin| {
+            mount_namespace_id(pin.pid())
+                .map(|namespace| (namespace, false))
+                .map_err(|error| {
+                    format!(
+                        "warm-only process view lacks original leader filesystem metadata: \
+                         {error}; cold filesystem proof requires an active capture allowance"
+                    )
+                })
+        })
+    }
+
+    pub(crate) fn open_with_budget(
+        id: ProcessViewId,
+        pid: u32,
+        work: &mut CaptureWorkBudget,
+    ) -> Result<Self, String> {
+        if let Some(reason) = work.check_deadline_now() {
+            return Err(reason.into());
+        }
+        work.spend(1).map_err(str::to_owned)?;
+        Self::open_with_filesystem(id, pid, |pin| {
+            let filesystem = ViewFilesystem::open(pin, work)?;
+            filesystem.validate(work)?;
+            Ok((filesystem.namespace(), filesystem.is_cold()))
+        })
+    }
+
+    fn open_with_filesystem(
+        id: ProcessViewId,
+        pid: u32,
+        identify: impl FnOnce(&PidPin) -> Result<(MountNamespaceId, bool), String>,
+    ) -> Result<Self, String> {
+        let ((pin, mount_namespace, cold_filesystem), admitted_ns) = validated_with_admission_time(
             || {
                 let pin = PidPin::open(pid)?;
-                let mount_namespace = mount_namespace_id(pid)?;
-                if !pin.still_the_same() {
+                let (mount_namespace, cold_filesystem) = identify(&pin)?;
+                if pin.original_exited()? {
                     return Err(format!(
                         "pid {pid} exited while its mount namespace was identified"
                     ));
                 }
-                Ok((pin, mount_namespace))
+                Ok((pin, mount_namespace, cold_filesystem))
             },
             crate::attach::monotonic_ns,
         )?;
@@ -546,6 +598,7 @@ impl ProcessView {
             mount_namespace,
             pin,
             admitted_ns,
+            cold_filesystem_observed: std::sync::atomic::AtomicBool::new(cold_filesystem),
         })
     }
 
@@ -604,21 +657,52 @@ impl ProcessView {
         run_while_same_with(|| self.still_the_same(), action)
     }
 
-    fn ensure_retained(&self) -> Result<(), String> {
-        let exited = || {
-            format!(
-                "pid {} exited while its mount namespace was being checked",
-                self.pid()
-            )
-        };
-        if !self.still_the_same() {
-            return Err(exited());
+    fn filesystem(&self, work: &mut CaptureWorkBudget) -> Result<ViewFilesystem<'_>, String> {
+        let filesystem = ViewFilesystem::open_for_view(
+            &self.pin,
+            self.cold_filesystem_observed
+                .load(std::sync::atomic::Ordering::Acquire),
+            work,
+            || {
+                self.cold_filesystem_observed
+                    .store(true, std::sync::atomic::Ordering::Release)
+            },
+        )?;
+        if filesystem.is_cold() {
+            self.cold_filesystem_observed
+                .store(true, std::sync::atomic::Ordering::Release);
         }
-        let current = mount_namespace_id(self.pid())?;
-        if !self.still_the_same() {
-            return Err(exited());
+        Ok(filesystem)
+    }
+
+    fn ensure_filesystem(
+        &self,
+        filesystem: &ViewFilesystem<'_>,
+        work: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
+        if self
+            .cold_filesystem_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !filesystem.is_cold()
+        {
+            return Err(
+                "a retained view crossed leader exit and requires fresh member custody".into(),
+            );
         }
-        ensure_same_mount_namespace(self.mount_namespace, current)
+        ensure_same_mount_namespace(self.mount_namespace, filesystem.namespace())?;
+        filesystem.validate(work)
+    }
+
+    pub(crate) fn with_filesystem<T>(
+        &self,
+        work: &mut CaptureWorkBudget,
+        action: impl FnOnce(&ViewFilesystem<'_>, &mut CaptureWorkBudget) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let filesystem = self.filesystem(work)?;
+        self.ensure_filesystem(&filesystem, work)?;
+        let outcome = action(&filesystem, work);
+        self.ensure_filesystem(&filesystem, work)?;
+        outcome
     }
 
     /// Opens one object through this retained process view before reading the
@@ -626,13 +710,20 @@ impl ProcessView {
     /// is resolved, and both process generation and mount namespace are rechecked.
     pub(crate) fn open_then_mountinfo<T>(
         &self,
-        open: impl FnOnce() -> Result<T, String>,
+        open: impl FnOnce(&ViewFilesystem<'_>) -> Result<T, String>,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(T, String), String> {
+        let filesystem = self.filesystem(budget)?;
+        let work = std::cell::RefCell::new(budget);
         open_then_mountinfo_checked(
-            || self.ensure_retained(),
-            open,
-            || read_view_mountinfo(self.pid(), budget).map(|(_, text)| text),
+            || self.ensure_filesystem(&filesystem, &mut work.borrow_mut()),
+            || open(&filesystem),
+            || {
+                read_view_mountinfo(self.pid(), &mut work.borrow_mut(), || {
+                    filesystem.open_mountinfo()
+                })
+                .map(|(_, text)| text)
+            },
         )
     }
 
@@ -640,15 +731,21 @@ impl ProcessView {
     /// table once and proves it unchanged — after `open` — on every later use.
     pub(crate) fn open_then_cached_mountinfo<'c, T>(
         &self,
-        open: impl FnOnce() -> Result<T, String>,
+        open: impl FnOnce(&ViewFilesystem<'_>) -> Result<T, String>,
         mounts: &'c mut MountTableCache,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(T, &'c str), String> {
         let owner = (self.id(), self.pid());
+        let filesystem = self.filesystem(budget)?;
+        let work = std::cell::RefCell::new(budget);
         let (opened, ()) = open_then_mountinfo_checked(
-            || self.ensure_retained(),
-            open,
-            || mounts.refresh(owner, budget),
+            || self.ensure_filesystem(&filesystem, &mut work.borrow_mut()),
+            || open(&filesystem),
+            || {
+                mounts.refresh(owner, &mut work.borrow_mut(), || {
+                    filesystem.open_mountinfo()
+                })
+            },
         )?;
         Ok((opened, mounts.text()))
     }

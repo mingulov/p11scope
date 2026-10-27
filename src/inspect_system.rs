@@ -539,7 +539,7 @@ fn scan_member_identity(
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
-    let opened = ProcessView::open(view, pid);
+    let opened = ProcessView::open_with_budget(view, pid, budget);
     let view_handle = match opened {
         Ok(view_handle) => view_handle,
         Err(error) => {
@@ -1551,7 +1551,8 @@ fn prepare_count_manifests(collection: &mut Collection, bound: &mut Bound, paths
                     .generation
                     .as_ref()
                     .context("manifest locator generation unavailable")?;
-                let view = ProcessView::open(member.view, pid).map_err(anyhow::Error::msg)?;
+                let view = ProcessView::open_with_budget(member.view, pid, &mut collection.budget)
+                    .map_err(anyhow::Error::msg)?;
                 ensure!(
                     generation.start_time.is_some()
                         && generation.exe.is_some()

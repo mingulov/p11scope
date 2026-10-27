@@ -8711,6 +8711,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cold_owner_refusal_preserves_scan_pinned_counter_target() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use p11scope_manifest::maps::{MapIndex, parse_maps};
+
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        let maps =
+            parse_maps(&std::fs::read(format!("/proc/{pid}/task/{}/maps", group.tids[0])).unwrap())
+                .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mapping = index.containing(group.callback_address).unwrap();
+        let callback_offset = mapping.file_offset + group.callback_address - mapping.start;
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            vec![group.program.clone()],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut FixtureImages,
+                &mut OwnerImages(fixture_image),
+                u64::MAX,
+                crate::discovery::caller_registry::now_ns(),
+            )
+            .unwrap();
+        assert_eq!(report.native_callers, 0);
+        assert_eq!(report.scan_callers, 1);
+        let caller = coordinator.adapter().live_id(pid).unwrap();
+        assert_eq!(
+            coordinator.adapter().record(caller).unwrap().authority,
+            ImageAuthority::ScanPinned
+        );
+        assert!(coordinator.owner_of(caller).is_none());
+        let endpoint = coordinator
+            .attach_set
+            .endpoints()
+            .find(|endpoint| {
+                endpoint.file_offset == callback_offset
+                    && coordinator
+                        .attach_set
+                        .target(endpoint.object)
+                        .is_some_and(|target| std::path::Path::new(target.path()) == group.program)
+            })
+            .expect("the actual sparse-provider callback remains a counter target");
+        assert!(
+            coordinator
+                .attach_set
+                .target(endpoint.object)
+                .unwrap()
+                .check_unchanged()
+                .unwrap()
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            coordinator
+                .registry()
+                .edges()
+                .any(|edge| edge.caller == caller)
+        );
+        assert!(coordinator.registry().gaps().iter().any(|gap| {
+            gap.pid == Some(pid)
+                && gap.subject == "native inventory owner unavailable"
+                && gap.reason.contains("warm-only")
+        }));
+        group.call_three();
+    }
+
+    #[test]
     fn commit_revalidates_after_prepare_and_refuses_changed_images() {
         struct FlipGuard {
             exact: Cell<bool>,

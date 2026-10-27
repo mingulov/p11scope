@@ -37,15 +37,23 @@ fn scripted<T: Clone>(value: &Result<T, io::ErrorKind>, what: &'static str) -> i
 impl ScanIo for EmptyMapsFixture {
     type Memory = DummyMem;
 
-    fn open_maps(&mut self, _: &ProcessView, _: &CaptureWorkBudget) -> io::Result<Box<dyn Read>> {
+    fn open_maps(
+        &mut self,
+        _: &ProcessView,
+        _: &mut CaptureWorkBudget,
+    ) -> io::Result<Box<dyn Read>> {
         Ok(Box::new(Cursor::new(self.maps.clone())))
     }
 
-    fn open_mem(&mut self, _: &ProcessView) -> io::Result<DummyMem> {
+    fn open_mem(&mut self, _: &ProcessView, _: &mut CaptureWorkBudget) -> io::Result<DummyMem> {
         Err(io::Error::other("mem not scripted in empty-maps fixture"))
     }
 
-    fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
+    fn final_generation(
+        &mut self,
+        view: &ProcessView,
+        _: &mut CaptureWorkBudget,
+    ) -> Result<(), String> {
         view.run_while_same(|| ())
     }
 

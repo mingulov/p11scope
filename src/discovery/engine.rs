@@ -23,10 +23,10 @@ use crate::discovery::identity::{
     KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
     PinnedObjects, PinnedTimingKey, ReconciledModule, RetainedScannedInputs, RetiredFileHandoff,
     ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe, StaleManifestObject,
-    bind_scanned_modules, canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
-    preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
-    view_object_key_cached,
+    bind_scanned_modules, canonicalize_scanned_overlays, open_view_executable_cached,
+    open_view_rooted_object_cached, pin_manifest_objects_deferred_in_views_with_budget,
+    pin_scanned_view_objects, preexec_object_key, retained_object_key_cached,
+    self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -74,6 +74,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd as _;
@@ -5704,8 +5705,13 @@ fn broad_fixed_pool_module(
         Some(relative) => relative,
         None => return,
     };
-    let rooted = PathBuf::from(format!("/proc/{}/root", view.pid())).join(relative);
-    let (file, key) = match open_view_object(view, &rooted, budget) {
+    let rooted = Path::new("/").join(relative);
+    let (file, key) = match open_view_rooted_object_cached(
+        view,
+        &rooted,
+        &mut crate::process::MountTableCache::default(),
+        budget,
+    ) {
         Ok(opened) => opened,
         Err(_) => return,
     };
@@ -6179,14 +6185,71 @@ impl MapsSweep {
 /// serial loop itself.
 pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
     let shards = sweep_shards::shard_count(pids.len(), sweep_shards::shard_threads());
-    sweep_process_maps_with(
+    let mut sweep = sweep_process_maps_with(
         pids,
         budget,
         shards,
         MapsReadLimits::LIVE,
         &|pid| std::fs::File::open(format!("/proc/{pid}/maps")),
         &crate::attach::monotonic_ns,
-    )
+    );
+    // Keep the sharded common path untouched. An empty leader read may be
+    // a Z boundary too. Every such row starts unknown before the serial,
+    // globally charged classification/proof; stop never leaves empty success.
+    let deadline = process::cold_filesystem_deadline(budget);
+    for (pid, snapshot) in &mut sweep.snapshots {
+        if matches!(snapshot, MapsSnapshot::Read(maps) if !maps.is_empty()) {
+            continue;
+        }
+        let initial = match std::mem::replace(snapshot, MapsSnapshot::Unavailable) {
+            MapsSnapshot::Read(maps) => Ok(maps),
+            MapsSnapshot::Unavailable => Err("initial process maps unavailable".into()),
+        };
+        if let Ok(maps) = complete_maps_snapshot(*pid, initial, budget, deadline) {
+            *snapshot = MapsSnapshot::Read(maps);
+        }
+    }
+    sweep
+}
+
+/// Shared initial/reconcile completion. Generic successful empty snapshots
+/// stay valid for a noncold leader, but a Z leader needs actual survivor maps.
+/// Stopped or unclassifiable rows remain unknown, without uncharged metadata.
+fn complete_maps_snapshot(
+    pid: u32,
+    initial: Result<Vec<MapEntry>, String>,
+    budget: &mut CaptureWorkBudget,
+    deadline: std::time::Instant,
+) -> Result<Vec<MapEntry>, String> {
+    if matches!(&initial, Ok(maps) if !maps.is_empty()) {
+        return initial;
+    }
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("cold maps snapshot stage deadline exhausted".into());
+    }
+    if !process::snapshot_leader_is_zombie(pid, budget, deadline)? {
+        return initial;
+    }
+    // No path below can recover the original empty snapshot on refusal.
+    let maps = read_cold_maps_snapshot(pid, budget, deadline)?;
+    if maps.is_empty() {
+        return Err("cold member maps remain unavailable or empty".into());
+    }
+    Ok(maps)
+}
+
+fn read_cold_maps_snapshot(
+    pid: u32,
+    budget: &mut CaptureWorkBudget,
+    deadline: std::time::Instant,
+) -> Result<Vec<MapEntry>, String> {
+    process::with_cold_snapshot_filesystem(pid, budget, deadline, |filesystem, budget| {
+        let maps = filesystem.open_maps().map_err(|error| error.to_string())?;
+        read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
+    })
 }
 
 /// [`sweep_process_maps`] with its shard count, read bounds, opener and
@@ -6312,7 +6375,8 @@ fn discover_plan(
             // Allocated but never admitted: a member that ended before
             // discovery reached it fails open below, and its ID returns
             // to the pool instead of burning for the capture lifetime.
-            ProcessView::open(id, *pid).inspect_err(|_| discovered.release_view_id(id))
+            ProcessView::open_with_budget(id, *pid, &mut discovered.budget)
+                .inspect_err(|_| discovered.release_view_id(id))
         };
         let view = match opened {
             Ok(view) => view,
@@ -11357,13 +11421,10 @@ impl Engine {
     /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused
     /// record or an unarmed view, never into a decision on a shorter map.
     fn read_maps(view: &ProcessView, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>> {
-        let pid = view.pid();
-        view.run_while_same(|| {
-            let maps = std::fs::File::open(format!("/proc/{pid}/maps"))
-                .map_err(|error| error.to_string())?;
+        view.with_filesystem(budget, |filesystem, budget| {
+            let maps = filesystem.open_maps().map_err(|error| error.to_string())?;
             read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
         })
-        .map_err(anyhow::Error::msg)?
         .map_err(anyhow::Error::msg)
     }
 
@@ -11371,16 +11432,11 @@ impl Engine {
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> Result<Option<LoaderLocator>> {
-        let pid = view.pid();
         // One mount-table read serves every identity below (H-3).
         let mut mounts = crate::process::MountTableCache::default();
         let before_maps = Self::read_maps(view, budget)?;
-        let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let before_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
-            .map_err(anyhow::Error::msg)?;
-        let executable = view
-            .run_while_same(|| std::fs::File::open(&executable_path))
-            .map_err(anyhow::Error::msg)??;
+        let (executable, before_executable) =
+            open_view_executable_cached(view, &mut mounts, budget).map_err(anyhow::Error::msg)?;
         let before_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
         let (interpreter, executable_abi) =
             read_bounded_interpreter(&executable, before_file.size).map_err(anyhow::Error::msg)?;
@@ -11393,13 +11449,9 @@ impl Engine {
                 .map_err(anyhow::Error::msg)?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
-            let path = PathBuf::from(format!("/proc/{pid}/root")).join(
-                interpreter
-                    .strip_prefix("/")
-                    .expect("bounded PT_INTERP paths are absolute"),
-            );
-            let (file, key) = open_view_object_cached(view, &path, &mut mounts, budget)
-                .map_err(anyhow::Error::msg)?;
+            let (file, key) =
+                open_view_rooted_object_cached(view, Path::new(interpreter), &mut mounts, budget)
+                    .map_err(anyhow::Error::msg)?;
             let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
             if object.abi() != executable_abi {
                 bail!("retained executable and PT_INTERP have different target ABIs");
@@ -11411,8 +11463,9 @@ impl Engine {
         };
 
         let after_maps = Self::read_maps(view, budget)?;
-        let after_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
-            .map_err(anyhow::Error::msg)?;
+        let after_executable = open_view_executable_cached(view, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?
+            .1;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
@@ -16193,9 +16246,10 @@ impl Engine {
         if budget.stopped_now().is_some() || !budget.charge(1) {
             return Err(ExactReadRefusal::Budget);
         }
-        let open = || File::open(format!("/proc/{}/exe", view.pid()));
-        let file = view
-            .run_while_same(open)
+        let open = |budget: &mut CaptureWorkBudget| {
+            view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_executable()))
+        };
+        let file = open(budget)
             .map_err(|_| ExactReadRefusal::Unstable)?
             .map_err(|_| ExactReadRefusal::Unreadable)?;
         let before = FileSnapshot::read(&file).map_err(|_| ExactReadRefusal::Unreadable)?;
@@ -16207,8 +16261,7 @@ impl Engine {
             .read_at(&mut header, 0)
             .map_err(|_| ExactReadRefusal::Unreadable)?;
         budget.record_io(read);
-        let current = view
-            .run_while_same(open)
+        let current = open(budget)
             .map_err(|_| ExactReadRefusal::Unstable)?
             .map_err(|_| ExactReadRefusal::Unstable)?;
         if FileSnapshot::read(&file).ok() != Some(before)
@@ -16238,7 +16291,7 @@ impl Engine {
     ) -> std::result::Result<(ScannedTable, Vec<u8>, bool), ExactReadRefusal> {
         let address = record.table_ptr;
         let mem = view
-            .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
+            .with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
             .map_err(|_| ExactReadRefusal::Unstable)?
             .map_err(|_| ExactReadRefusal::Unreadable)?;
         let width = layout.word_bytes();
@@ -16362,7 +16415,7 @@ impl Engine {
             return Err(ExactReadRefusal::Unreadable);
         }
         let mem = view
-            .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
+            .with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
             .map_err(|_| ExactReadRefusal::Unreadable)?
             .map_err(|_| ExactReadRefusal::Unreadable)?;
         let width = layout.word_bytes();
@@ -16982,7 +17035,10 @@ impl Engine {
             return Ok(false);
         }
         let pid = self.views[position].pid();
-        if Self::loader_exe_is_gone(pid) {
+        if Self::loader_exe_is_gone(pid)
+            && !(process::process_is_zombie(pid)
+                && self.views[position].original_exited() == Ok(false))
+        {
             return Err(LoaderArmFailure::NotArmable);
         }
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
@@ -21191,6 +21247,7 @@ impl Engine {
         let mut revalidated = 0u64;
         let mut quantum_stopped = false;
         let mut clock_failed = start.is_none();
+        let cold_deadline = std::time::Instant::now() + std::time::Duration::from_nanos(quantum_ns);
         for pid in order.into_iter().take(slice_pids) {
             let elapsed = match (start, crate::attach::monotonic_ns()) {
                 (Some(start), Some(now)) => now.saturating_sub(start),
@@ -21223,7 +21280,10 @@ impl Engine {
                         &mut bufs,
                     )
                 });
-            slice.record(pid, result);
+            slice.record(
+                pid,
+                complete_maps_snapshot(pid, result, &mut self.budget, cold_deadline),
+            );
             self.scheduler.advance_cursor(pid);
         }
         let attempted = slice.attempted();
@@ -21284,7 +21344,11 @@ impl Engine {
     /// never complete another generation's work. Returns the verdict plus
     /// the scan's skips.
     fn probe_newcomer_provider_free(&mut self, pid: u32) -> (bool, Vec<Skipped>) {
-        let view = match ProcessView::open(Self::PROBATIONARY_VIEW_ID, pid) {
+        let view = match ProcessView::open_with_budget(
+            Self::PROBATIONARY_VIEW_ID,
+            pid,
+            &mut self.budget,
+        ) {
             Ok(view) => view,
             Err(_) => return (false, Vec::new()),
         };
@@ -21384,7 +21448,7 @@ impl Engine {
             };
             self.scheduler.note_new_view_attempt(pid);
             let open_start = crate::attach::monotonic_ns();
-            let opened = ProcessView::open(id, pid);
+            let opened = ProcessView::open_with_budget(id, pid, &mut self.budget);
             self.stage_timings.span(
                 crate::timing::StageKind::Scan,
                 "open_view",

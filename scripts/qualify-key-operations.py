@@ -165,6 +165,14 @@ S1_PER_FUNCTION = {"C_Sign": {0x0: 8, 0x150: 1},
                    "C_Verify": {0x0: 10, 0xC0: 2}}
 S1_OPERATIONS = {"calls": 65, "started": 23, "completed": 21, "cancelled": 0,
                  "failed": 2, "unknown": 0, "orphans": 0, "dropped": 0}
+# Published counterexamples cannot be erased by the R59 stopped-child pair.
+# These are existing producer subjects, not a substring/unknown-text policy.
+S1_INCOMPATIBLE_GAPS = frozenset({
+    "semantic capture loss", "native capture lifecycle evidence lost",
+    "native capture retirement unsettled", "joint machine unavailable",
+    "native capture scope custody unproven", "native capture refused an extend",
+    "rejected demoted count", "semantic admission refused",
+})
 S1_MECHANISMS = (
     {"id": 0x0, "name": "CKM_RSA_PKCS_KEY_PAIR_GEN",
      "operations": ("generate_key_pair",), "calls": 1, "errors": 0,
@@ -767,6 +775,26 @@ def _s1_singleton(doc, name):
     return rows[0]
 
 
+def _check_s1_current_gaps(doc, caller, module, pid):
+    gaps = doc.get("gaps")
+    _require(type(gaps) is list, "S1 current gaps are missing or malformed")
+    for gap in gaps:
+        _require(type(gap) is dict and type(gap.get("subject")) is str
+                 and gap["subject"] and type(gap.get("reason")) is str
+                 and gap["reason"] and _u64(gap.get("repeats"))
+                 and gap["repeats"] > 0, "S1 current gap row is malformed")
+        _require(gap.get("caller") in (None, caller) and gap.get("module") in (None, module)
+                 and (gap.get("pid") is None or (_u64(gap["pid"]) and gap["pid"] == pid)),
+                 "S1 gap references another caller/module/PID")
+        _require(gap["subject"] not in S1_INCOMPATIBLE_GAPS
+                 and gap["reason"] != "joint machine unavailable",
+                 "published S1 loss or retirement contradicts the stopped exception")
+        _require(gap["subject"] != "semantic input refused" or gap["reason"] == "slot",
+                 "S1 semantic input refusal is not the fixed count-only setup")
+        # Repeats mix call and admission pushes. They never derive 65/68 or
+        # replace the independent ledger/API/stop-accounting denominators.
+
+
 def _s1_current_child(doc):
     """Validate the single PID-scoped RSA population without mixing authorities.
 
@@ -797,6 +825,8 @@ def _s1_current_child(doc):
              and admission.get("class") == "operator" and admission.get("reasons") == []
              and _u64(admission.get("endpoints")) and admission["endpoints"] > 0,
              "S1 module lacks validated manifest admission")
+    _require(module.get("lifecycle") == "mapped" and module.get("unloaded_observed") is False,
+             "S1 module unload contradicts the held physical mapping")
     mapping = edge.get("mapping")
     _require(type(mapping) is dict and mapping.get("state") == "mapped"
              and _u64(mapping.get("interruptions")) and mapping["interruptions"] == 0,
@@ -837,6 +867,7 @@ def _s1_current_child(doc):
              "S1 terminal semantic drain or continuity is unproven")
     _require(_u64(doc.get("gaps_suppressed")) and doc["gaps_suppressed"] == 0,
              "S1 suppressed gaps are unknown or nonzero")
+    _check_s1_current_gaps(doc, caller["id"], module["id"], pid)
     coverage = child.get("coverage")
     _require(type(coverage) is dict, "S1 child coverage missing")
     if coverage.get("lossy") is False and coverage.get("reasons") == []:

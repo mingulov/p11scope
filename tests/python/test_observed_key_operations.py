@@ -684,12 +684,24 @@ def s1_current_doc():
                 operations=None, mechanisms=None)
     doc.update(scope="pid:41", callers=[{"id": "c0", "pid": 41,
                                        "start_time": 110, "retired": False}],
-               modules=[{"id": "m0", "admission": {"state": "admitted",
+               modules=[{"id": "m0", "lifecycle": "mapped", "unloaded_observed": False,
+                         "admission": {"state": "admitted",
                          "class": "operator", "endpoints": 68, "reasons": []}}],
                instances=[{"id": "i0", "caller": "c0", "module": "m0",
                            "state": "uncertain", "reason": "semantic_loss",
                            "first_seen_ns": 110, "last_seen_ns": 190}],
                semantic_edges=[child], gaps_suppressed=0,
+               gaps=[{"subject": "exact image authority unavailable",
+                      "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
+                      "caller": None, "module": None, "pid": None, "repeats": 1},
+                     {"subject": "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results",
+                      "reason": "joint_journal_unavailable", "caller": None,
+                      "module": None, "pid": None, "repeats": 1},
+                     {"subject": "semantic input refused", "reason": "slot",
+                      "caller": "c0", "module": None, "pid": None, "repeats": 3},
+                     {"subject": "physical provider use preceded first observed semantic registration",
+                      "reason": "before_semantic_boundary", "caller": "c0",
+                      "module": "m0", "pid": None, "repeats": 1}],
                observation={"lane": "native", "lifecycle": {
                    "ring_loss": 0, "malformed": 0, "failed_quanta": 0},
                    "semantic_capture": {"status": "stopped", "admitted_endpoints": 68,
@@ -898,6 +910,63 @@ class CurrentS1ModeTests(unittest.TestCase):
             doc = s1_current_doc()
             doc["observation"][group][key] = False
             with self.subTest(group=group, key=key), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_published_loss_or_retirement_gaps_are_never_waived(self):
+        subjects = ("semantic capture loss", "native capture lifecycle evidence lost",
+                        "native capture retirement unsettled", "joint machine unavailable",
+                        "native capture scope custody unproven", "native capture refused an extend",
+                        "rejected demoted count", "semantic admission refused")
+        cases = [(subject, "coverage_fault") for subject in subjects]
+        cases += [("semantic capture loss", "joint_journal_unavailable"),
+                  ("semantic input refused", "binding"), ("other", "joint machine unavailable")]
+        for subject, reason in cases:
+            with self.subTest(subject=subject, reason=reason):
+                doc = s1_current_doc()
+                doc["gaps"].append({"subject": subject, "reason": reason,
+                                    "caller": "c0", "module": "m0", "repeats": 1})
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    self.check(doc)
+
+    def test_current_gap_shapes_references_and_refusals_are_finite(self):
+        for value in (None, {}, [None], [{"subject": "x", "reason": None, "repeats": 1}],
+                      [{"subject": "", "reason": "x", "repeats": 1}],
+                      [{"subject": "x", "reason": "", "repeats": 1}]):
+            doc = s1_current_doc()
+            doc["gaps"] = value
+            with self.subTest(value=value), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        doc = s1_current_doc()
+        del doc["gaps"]
+        with self.assertRaises(ORACLE.OracleRefusal):
+            self.check(doc)
+        for key, value in (("caller", "c1"), ("module", "m1"), ("pid", 42)):
+            doc = s1_current_doc()
+            doc["gaps"][2][key] = value
+            with self.subTest(key=key), self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+        doc = s1_current_doc()
+        doc["gaps"].append({"subject": "semantic capture loss",
+                            "reason": "HOSTILE-UNTRUSTED-REASON", "repeats": 1})
+        with self.assertRaises(ORACLE.OracleRefusal) as caught:
+            self.check(doc)
+        self.assertNotIn("HOSTILE-UNTRUSTED-REASON", str(caught.exception))
+
+    def test_gap_repeats_are_not_the_RSA_call_denominator(self):
+        for repeats in (1, 300):
+            doc = s1_current_doc()
+            doc["gaps"][2]["repeats"] = repeats
+            self.assertTrue(self.check(doc)["match"])
+            doc["semantic_edges"][0]["api_returns"]["count"] = 64
+            with self.assertRaises(ORACLE.OracleRefusal):
+                self.check(doc)
+
+    def test_current_held_module_cannot_be_unloaded_or_unknown(self):
+        for key, value in (("lifecycle", "unloaded"), ("lifecycle", None),
+                           ("unloaded_observed", True), ("unloaded_observed", None)):
+            doc = s1_current_doc()
+            doc["modules"][0][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ORACLE.OracleRefusal):
                 self.check(doc)
 
     def test_current_child_cli_positive_and_loss_negative(self):

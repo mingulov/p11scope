@@ -606,7 +606,15 @@ def table_bounds_object_contract(disassembly):
     if not all(re.search(rf"\br\d+ = 0x{bound:x}\b", export) for bound in (68, 92, 104)):
         return False
     insns, graph = instruction_graph(lines)
-    stores = 0
+    memory_store = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = [rw]\d+")
+    variable_add = re.compile(r"r(\d+) \+= r(\d+)")
+    indexed_stores = set()
+    guarded_stores = set()
+    for position, (pc, op) in enumerate(insns[1:], 1):
+        store = memory_store.fullmatch(op)
+        add = variable_add.fullmatch(insns[position - 1][1])
+        if store and store[1] != "10" and add and store[1] == add[1]:
+            indexed_stores.add(pc)
     # Check the actual indexed store lowering, not just the presence of width
     # constants or a backwards branch. The same checked index must supply the
     # eight-byte offset. This supplements, and does not replace, kernel loading.
@@ -616,14 +624,21 @@ def table_bounds_object_contract(disassembly):
             continue
         index, shift = scale.groups()
         base = re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)", insns[position + 1][1])
-        if not base or insns[position + 2][1] != f"r{base[1]} += r{index}":
+        add = variable_add.fullmatch(insns[position + 2][1])
+        store_pc, store_op = insns[position + 3]
+        if not memory_store.fullmatch(store_op) or (not base and not add):
             continue
-        if not re.fullmatch(rf"\*\(u64 \*\)\(r{base[1]} \+ 0x0\) = r\d+", insns[position + 3][1]):
-            continue
+        # A malformed indexed path must not disappear while another ABI path
+        # still supplies a recognized store. Ordinary fixed metadata/stack
+        # stores have no such address calculation and remain outside this set.
+        indexed_stores.add(store_pc)
+        if (not base or insns[position + 2][1] != f"r{base[1]} += r{index}"
+                or not re.fullmatch(rf"\*\(u64 \*\)\(r{base[1]} \+ 0x0\) = r\d+", store_op)):
+            return False
         if shift != "3" or not _table_index_guard(insns, graph, position, index):
             return False
-        stores += 1
-    return stores > 0
+        guarded_stores.add(store_pc)
+    return bool(guarded_stores) and indexed_stores == guarded_stores
 
 
 def _table_index_guard(insns, graph, scale_position, index):
@@ -2024,9 +2039,15 @@ def _owned_disassembly():
     parts.append(assemble("classify_direct_interface", call("fixture_emit_export") + ["exit"], 6000))
     for index, name in enumerate(("fixture_emit_export", "fixture_emit_lifecycle", "dl_debug_state")):
         tail = ["r1 = 0x44", "r2 = 0x5c", "r4 = 0x68", "r8 = 0x0",
-                "if r8 > 0x67 goto @bounded_done", "r7 = r7", "r8 <<= 0x3",
+                "if r8 > 0x67 goto @first_done", "r7 = r7", "r8 <<= 0x3",
                 "r9 = *(u64 *)(r10 - 0x8)", "r9 += r8",
-                "*(u64 *)(r9 + 0x0) = r0", "label:bounded_done"]
+                "*(u64 *)(r9 + 0x0) = r0", "label:first_done",
+                "r5 = 0x0", "if r5 > 0x67 goto @bounded_done", "r5 <<= 0x3",
+                "r9 = *(u64 *)(r10 - 0x8)", "r9 += r5",
+                "*(u64 *)(r9 + 0x0) = r0", "label:bounded_done",
+                "r3 <<= 0x3", "*(u64 *)(r10 - 0x10) = r3",
+                "*(u64 *)(r6 + 0x10) = r3", "r3 += r4",
+                "*(u64 *)(r6 + 0x18) = r3"]
         if name == "dl_debug_state":
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
@@ -2254,8 +2275,13 @@ def _owned_self_test():
         ("unrelated index", "if r8 > 0x67 goto", "if r7 > 0x67 goto"),
         ("index clobbered", "r7 = r7", "r8 += 0x1"),
         ("wrong stride", "r8 <<= 0x3", "r8 <<= 0x4"),
+        ("unsupported scale", "r8 <<= 0x3", "r8 *= 0x8"),
+        ("unsupported base", "r9 = *(u64 *)(r10 - 0x8)", "r9 = r6"),
         ("wrong address index", "r9 += r8", "r9 += r7"),
+        ("constant address increment", "r9 += r8", "r9 += 0x8"),
         ("wrong destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r7 + 0x0)"),
+        ("stack destination", "*(u64 *)(r9 + 0x0)", "*(u64 *)(r10 - 0x8)"),
+        ("narrow destination", "*(u64 *)(r9 + 0x0)", "*(u32 *)(r9 + 0x0)"),
     ):
         if table_bounds_object_contract(mutate("fixture_emit_export", before, after)):
             raise AssertionError(f"table index mutation accepted: {label}")

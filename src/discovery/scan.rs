@@ -6878,6 +6878,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_anchor_preparation_honors_the_small_remaining_work_budget() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols: Vec<_> = (0..256)
+            .map(|_| ("C_Initialize".to_string(), 0x500))
+            .collect();
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(DEFAULT_WORK_CEILING - 8));
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &[],
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            || Some(0),
+        );
+        assert!(tables.is_empty());
+        assert!(
+            !skipped.is_empty(),
+            "anchor preparation must stop, even with an empty snapshot"
+        );
+        assert!(budget.work_units_count() <= DEFAULT_WORK_CEILING);
+    }
+
+    #[test]
     fn retain_tables_ignores_mapped_data_tail_words_beyond_the_decoded_prefix() {
         let maps = mislabelled_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();

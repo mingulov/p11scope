@@ -77,18 +77,16 @@ missed, with no marker in the output; restarting such processes is the
 workaround, and the kernel identity backend does not help (full entry
 below).
 
-Identity checks through the userspace backend are slower than in
-v0.4.0 on hosts with many processes mapping providers from btrfs:
-each file needs extra per-file checks for btrfs to identify it
-correctly. This affects `inventory --system --identity-backend
-userspace`, and the userspace path when kernel identity is
-unavailable. Earlier v0.5.0 candidate runs on Fedora (Linux 7.2.9; 10 rounds, 400
-processes by 8 providers on btrfs), the confirm stage's slowest 5%
-ran about 7–14% slower and the whole scan about 5–10% slower, but
-host noise is large: it moved an unchanged comparison run by 17%.
-The default `--identity-backend auto` uses kernel identity where
-available. The release notes carry the final candidate's measurement;
-a speed-up is planned for a later 0.5.x.
+Identity checks through the userspace backend need extra per-file checks on
+btrfs to identify mapped providers correctly. This affects
+`inventory --system --identity-backend userspace` and the userspace fallback
+when kernel identity is unavailable. A Fedora Linux 7.2.9 comparison of GNU
+builds using Rust 1.99.1, 400 processes and 8 mock providers on btrfs completed 10
+matched rounds with equal coverage. Against the earlier identity implementation,
+confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%); whole-pass p95 rose from
+255.444 to 288.012 ms (+12.75%). These are measured costs for that workload, not
+bounds for every host. The default `--identity-backend auto` uses kernel
+identity where available. Further userspace speed work is planned for 0.5.x.
 
 On some overlayfs setups before Linux 6.8, p11scope may be unable to
 prove how a provider file appears in /proc maps: the opened file and

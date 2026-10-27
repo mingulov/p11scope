@@ -18450,13 +18450,14 @@ mod promotion_driver_tests {
     }
 
     #[test]
-    fn joint_driver_commit_error_takes_finite_stop() {
+    fn joint_driver_commit_refusal_converts_within_one_hook() {
         use crate::inventory_semantics::SemanticRefusal;
         // Item 7 runs on the retained final lane: the winding always
         // begins or transfers, so no winding polls a commit. A
-        // non-retryable commit refusal in NotBegun abandons within
-        // one hook: the step notes the failure and takes the finite
-        // stop instead of beginning.
+        // non-retryable commit refusal in NotBegun converts within one
+        // hook (controller ruling E1, like the Poll path): the step
+        // holds the lane and names the stop, keeping no run error,
+        // instead of beginning or failing.
         let mut coord = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coord, headless.display);
@@ -18476,8 +18477,16 @@ mod promotion_driver_tests {
         assert!(driver.semantic.is_none(), "the abandoned lane is held");
         assert_eq!(drops.get(), 0, "held means never dropped");
         assert!(
-            driver.joint_first_error.is_some(),
-            "the first error is kept"
+            driver.joint_first_error.is_none(),
+            "a converted refusal keeps no run error"
+        );
+        assert_eq!(
+            gaps(&mut driver)
+                .into_iter()
+                .filter(|gap| gap.0 == "semantic lane stopped")
+                .count(),
+            1,
+            "the conversion discloses the stop once"
         );
         // B stays blocked behind an abandoned winding: a
         // dispositioned lane winds down into a held Abandoned finish

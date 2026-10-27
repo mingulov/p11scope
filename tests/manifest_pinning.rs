@@ -794,13 +794,12 @@ fn selection_validation_rejects_review_mutations() {
     assert!(
         problems
             .iter()
-            .any(|problem| problem.contains("unsupported version"))
+            .any(|problem| problem.contains("no acquired function inventory"))
     );
-    assert!(problems.iter().any(|problem| problem.contains("full walk")));
     assert!(
         problems
             .iter()
-            .any(|problem| problem.contains("dependency object"))
+            .any(|problem| problem.contains("missing object"))
     );
     assert!(
         problems
@@ -983,6 +982,8 @@ fn helper_failure_cross_fields_are_exact() {
             (!matches!(
                 version,
                 SelectionVersionClass::Null
+                    | SelectionVersionClass::V2_40
+                    | SelectionVersionClass::Other
                     | SelectionVersionClass::V3_0
                     | SelectionVersionClass::V3_1
                     | SelectionVersionClass::V3_2
@@ -998,9 +999,7 @@ fn helper_failure_cross_fields_are_exact() {
         check(failure, null, none, None, None);
     }
     for failure in [
-        SelectionFailure::UnreadableTable,
         SelectionFailure::OutsideProvider,
-        SelectionFailure::UnresolvedFunction,
         SelectionFailure::ProviderChanged,
     ] {
         check(
@@ -1009,6 +1008,18 @@ fn helper_failure_cross_fields_are_exact() {
             none,
             Some(0),
             Some("helper failure has a selection table"),
+        );
+    }
+    for failure in [
+        SelectionFailure::UnreadableTable,
+        SelectionFailure::UnresolvedFunction,
+    ] {
+        check(
+            failure,
+            null,
+            none,
+            Some(0),
+            Some("invalid selection-table authority"),
         );
     }
     for (failure, valid_result) in [

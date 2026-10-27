@@ -62,9 +62,11 @@ use p11scope_ebpf_common::{
     valid_discovery_record,
 };
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+#[cfg(test)]
+use p11scope_manifest::manifest::WalkOutcome;
 use p11scope_manifest::manifest::{
     Acquisition, Manifest, Resolution, SCHEMA, SelectionAcquisition, SelectionAuthority,
-    SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource, WalkOutcome,
+    SelectionNameClass, SelectionRequest, SelectionVersionClass, SurfaceSource,
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use pkcs11_module::{LinuxLayout, read_function_pointer};

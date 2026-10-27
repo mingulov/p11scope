@@ -22,6 +22,9 @@
 #ifndef SELECT_PARTIAL_WORD
 #define SELECT_PARTIAL_WORD 0
 #endif
+#ifndef SELECT_HEADER_UNREADABLE
+#define SELECT_HEADER_UNREADABLE 0
+#endif
 #ifndef SELECT_FLAGS
 #define SELECT_FLAGS 0
 #endif
@@ -97,7 +100,15 @@ static void fill(void) {
 #endif
     other = table;
     other.functions[67] = alternate;
-#if SELECT_WORDS >= 0
+#if SELECT_HEADER_UNREADABLE
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *region = mmap(0, page * 2, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) __builtin_trap();
+    memcpy(region + page, table.functions, sizeof(table.functions));
+    published = region + page - offsetof(Table, functions);
+    if (munmap(region, page) != 0) __builtin_trap();
+#elif SELECT_WORDS >= 0
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t available = offsetof(Table, functions) + SELECT_WORDS * sizeof(void *);
     if (SELECT_PARTIAL_WORD) available += sizeof(void *) - 1;

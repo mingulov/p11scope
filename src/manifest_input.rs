@@ -252,9 +252,64 @@ fn selection_table_names(version: Version) -> Vec<&'static str> {
         .collect()
 }
 
-pub(crate) fn selection_table_inventory_incomplete(table: &SelectionTable) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMetadata {
+    Observed,
+    Unavailable,
+    Changed,
+}
+
+fn selection_table_metadata(
+    evidence: &SelectionEvidence,
+    table: &SelectionTable,
+) -> SelectionMetadata {
+    let WalkOutcome::Unreadable { detail } = &table.walk else {
+        return SelectionMetadata::Observed;
+    };
+    let references: Vec<_> = evidence
+        .queries
+        .iter()
+        .filter(|query| query.selection_table == Some(table.id))
+        .collect();
+    if references.is_empty()
+        || !references.iter().all(|query| {
+            query.rv == 0
+                && query.authority == SelectionAuthority::SelectionCountOnly
+                && query.helper_failure == Some(SelectionFailure::UnreadableVersion)
+                && query.inventory_matches.is_empty()
+        })
+    {
+        return SelectionMetadata::Observed;
+    }
+    if table.version == (Version { major: 0, minor: 0 })
+        && detail.starts_with("version header unreadable:")
+        && references.iter().all(|query| {
+            query
+                .result
+                .is_some_and(|result| result.version == SelectionVersionClass::Unreadable)
+        })
+    {
+        return SelectionMetadata::Unavailable;
+    }
+    if detail.starts_with("version metadata changed:")
+        && references.iter().all(|query| {
+            query
+                .result
+                .is_some_and(|result| selection_version_matches(table.version, result.version))
+        })
+    {
+        return SelectionMetadata::Changed;
+    }
+    SelectionMetadata::Observed
+}
+
+pub(crate) fn selection_table_inventory_incomplete(
+    evidence: &SelectionEvidence,
+    table: &SelectionTable,
+) -> bool {
     table.functions.len() != selection_table_names(table.version).len()
-        || !matches!(table.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+        || (!matches!(table.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+            && selection_table_metadata(evidence, table) == SelectionMetadata::Observed)
         || table.functions.iter().any(|function| {
             !matches!(
                 function.resolution,
@@ -266,6 +321,18 @@ pub(crate) fn selection_table_inventory_incomplete(table: &SelectionTable) -> bo
 /// Naming stays at the existing fixed-query witness strength; count-only
 /// observation admission is deliberately independent of this predicate.
 pub(crate) fn selection_table_name_authorized(manifest: &Manifest, table_id: u8) -> bool {
+    if manifest
+        .selection_evidence
+        .tables
+        .iter()
+        .find(|table| table.id == table_id)
+        .is_none_or(|table| {
+            selection_table_metadata(&manifest.selection_evidence, table)
+                != SelectionMetadata::Observed
+        })
+    {
+        return false;
+    }
     manifest.selection_evidence.queries.iter().any(|query| {
         query.selection_table == Some(table_id)
             && query.authority == SelectionAuthority::SelectionCountOnly
@@ -361,6 +428,7 @@ pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
 
 fn validate_selection_table(
     table: &SelectionTable,
+    evidence: &SelectionEvidence,
     object_ids: &BTreeSet<u32>,
     problems: &mut Vec<String>,
 ) {
@@ -380,6 +448,7 @@ fn validate_selection_table(
         ));
     }
     let expected = selection_table_names(table.version);
+    let metadata = selection_table_metadata(evidence, table);
     let actual: Vec<&str> = table
         .functions
         .iter()
@@ -393,9 +462,20 @@ fn validate_selection_table(
     }
     if let WalkOutcome::Unreadable { detail } = &table.walk {
         bounded("selection walk error", detail, MAX_DETAIL_BYTES, problems);
-        if detail.trim().is_empty() || actual.len() >= expected.len() {
+        if detail.trim().is_empty()
+            || (actual.len() >= expected.len() && metadata == SelectionMetadata::Observed)
+        {
             problems.push(format!(
                 "selection table {} has an invalid unreadable prefix",
+                table.id
+            ));
+        }
+        if metadata == SelectionMetadata::Observed
+            && (detail.starts_with("version header unreadable:")
+                || detail.starts_with("version metadata changed:"))
+        {
+            problems.push(format!(
+                "selection table {} has inconsistent version-metadata evidence",
                 table.id
             ));
         }
@@ -453,7 +533,7 @@ fn validate_selection_evidence(
         if !table_ids.insert(table.id) {
             problems.push(format!("duplicate selection table id {}", table.id));
         }
-        validate_selection_table(table, object_ids, problems);
+        validate_selection_table(table, evidence, object_ids, problems);
     }
 
     match evidence.acquisition {
@@ -598,7 +678,14 @@ fn validate_selection_evidence(
                         ));
                     }
                     Some(SelectionFailure::UnreadableVersion)
-                        if result.version != SelectionVersionClass::Unreadable =>
+                        if result.version != SelectionVersionClass::Unreadable
+                            && !query
+                                .selection_table
+                                .and_then(|id| evidence.tables.iter().find(|table| table.id == id))
+                                .is_some_and(|table| {
+                                    selection_table_metadata(evidence, table)
+                                        == SelectionMetadata::Changed
+                                }) =>
                     {
                         problems.push(format!(
                             "selection query {position} unreadable-version failure disagrees with result"
@@ -652,7 +739,11 @@ fn validate_selection_evidence(
                             "selection query {position} has invalid selection-table authority"
                         ));
                     }
-                    if !selection_version_matches(table.version, result.version) {
+                    if !(selection_version_matches(table.version, result.version)
+                        || (selection_table_metadata(evidence, table)
+                            == SelectionMetadata::Unavailable
+                            && result.version == SelectionVersionClass::Unreadable))
+                    {
                         problems.push(format!(
                             "selection query {position} table version disagrees with result"
                         ));
@@ -731,7 +822,7 @@ fn validate_selection_evidence(
     if evidence
         .tables
         .iter()
-        .any(selection_table_inventory_incomplete)
+        .any(|table| selection_table_inventory_incomplete(evidence, table))
         && !evidence.selection_truncated
     {
         problems.push("incomplete selection table is not marked truncated".into());
@@ -745,7 +836,7 @@ fn validate_selection_evidence(
         && !evidence
             .tables
             .iter()
-            .any(selection_table_inventory_incomplete)
+            .any(|table| selection_table_inventory_incomplete(evidence, table))
     {
         problems
             .push("selection truncation has no bounded alias or semantic conflict evidence".into());

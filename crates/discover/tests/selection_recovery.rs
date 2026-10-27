@@ -70,6 +70,12 @@ fn only_table(manifest: &Manifest, words: usize) -> &SelectionTable {
     let table = &evidence.tables[0];
     assert_eq!(table.functions.len(), words);
     assert!(!table.semantic_authorized);
+    if let WalkOutcome::Unreadable { detail } = &table.walk {
+        assert!(
+            !detail.contains("0x") && !detail.contains("pread"),
+            "{detail}"
+        );
+    }
     assert_eq!(
         table.functions.first().map(|f| f.name.as_str()),
         (words > 0).then_some("C_Initialize")
@@ -235,4 +241,92 @@ fn failed_or_null_selection_has_no_observed_table() {
         );
         assert!(manifest_input::validate_structure(&manifest).is_empty());
     }
+}
+
+#[test]
+fn selected_unreadable_header_keeps_body_and_an_unambiguous_placeholder() {
+    let manifest = observe(&["-DSELECT_HEADER_UNREADABLE=1"]);
+    let table = only_table(&manifest, 68);
+    assert_eq!(table.version, Version { major: 0, minor: 0 });
+    assert!(
+        matches!(&table.walk, WalkOutcome::Unreadable { detail } if detail.starts_with("version header unreadable:"))
+    );
+    assert!(manifest.selection_evidence.queries.iter().all(|query| {
+        query.result.unwrap().version == SelectionVersionClass::Unreadable
+            && query.helper_failure == Some(SelectionFailure::UnreadableVersion)
+    }));
+    assert!(
+        !manifest.selection_evidence.selection_truncated,
+        "header uncertainty is not missing function demand"
+    );
+    let mut imported_short = manifest.clone();
+    imported_short.selection_evidence.tables[0]
+        .functions
+        .truncate(67);
+    imported_short.selection_evidence.selection_truncated = true;
+    assert!(manifest_input::validate_structure(&imported_short).is_empty());
+    for mutation in 0..4 {
+        let mut invalid = manifest.clone();
+        match mutation {
+            0 => {
+                invalid.selection_evidence.queries[0]
+                    .result
+                    .as_mut()
+                    .unwrap()
+                    .version = SelectionVersionClass::Other
+            }
+            1 => invalid.selection_evidence.queries[0].helper_failure = None,
+            2 => invalid.selection_evidence.tables[0].version.major = 3,
+            _ => {
+                invalid.selection_evidence.tables[0].walk = WalkOutcome::Unreadable {
+                    detail: "function word unavailable".into(),
+                }
+            }
+        }
+        assert!(
+            !manifest_input::validate_structure(&invalid).is_empty(),
+            "mutation{mutation}"
+        );
+    }
+    let real_zero = observe(&["-DSELECT_MAJOR=0", "-DSELECT_MINOR=0"]);
+    let table = only_table(&real_zero, 68);
+    assert_eq!(table.version, Version { major: 0, minor: 0 });
+    assert!(matches!(table.walk, WalkOutcome::KnownPrefix));
+    assert!(
+        real_zero
+            .selection_evidence
+            .queries
+            .iter()
+            .all(|query| query.result.unwrap().version == SelectionVersionClass::Other)
+    );
+}
+
+#[test]
+fn selected_drift_evidence_retains_the_observed_extent_without_naming_authority() {
+    let mut manifest = observe(&["-DSELECT_MINOR=2"]);
+    manifest.selection_evidence.tables[0].walk = WalkOutcome::Unreadable {
+        detail: "version metadata changed: 104 complete function words retained".into(),
+    };
+    for query in &mut manifest.selection_evidence.queries {
+        query.helper_failure = Some(SelectionFailure::UnreadableVersion);
+    }
+    only_table(&manifest, 104);
+    assert!(!manifest_input::selection_table_name_authorized(
+        &manifest, 0
+    ));
+    assert!(!manifest_input::selection_table_inventory_incomplete(
+        &manifest.selection_evidence,
+        &manifest.selection_evidence.tables[0]
+    ));
+    assert!(!manifest.selection_evidence.selection_truncated);
+    let mut inconsistent = manifest.clone();
+    inconsistent.selection_evidence.queries[0].helper_failure = None;
+    assert!(!manifest_input::validate_structure(&inconsistent).is_empty());
+    manifest.selection_evidence.tables[0].functions.truncate(67);
+    manifest.selection_evidence.selection_truncated = true;
+    only_table(&manifest, 67);
+    assert!(manifest_input::selection_table_inventory_incomplete(
+        &manifest.selection_evidence,
+        &manifest.selection_evidence.tables[0]
+    ));
 }

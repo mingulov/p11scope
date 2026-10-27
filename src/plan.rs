@@ -47,6 +47,10 @@ use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+#[path = "plan_selection_recovery_tests.rs"]
+mod selection_recovery_tests;
+
 /// Immutable admission contract carried by one planner for its whole capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionPolicy {
@@ -1513,6 +1517,21 @@ impl AttachPlan {
                 // An available naming witness displaces a prior `unknown`.
                 drop_transparent_unknown(&mut slot.names);
                 slot.aliased |= slot.names.len() >= 2;
+                if !slot.module_ids.contains(&module) {
+                    slot.module_ids.push(module);
+                    slot.module_ids.sort();
+                    let previous = self.aggregate_owners[position];
+                    let merged = previous.merge(AggregateOwner::Sole(module));
+                    self.aggregate_owners[position] = merged;
+                    self.module_ambiguous += usize::from(
+                        previous != AggregateOwner::Ambiguous
+                            && merged == AggregateOwner::Ambiguous,
+                    );
+                    slot.descriptor_index = 0;
+                    slot.semantics = SlotSemantics::COUNT_ONLY;
+                    slot.semantic_authorized = false;
+                    slot.semantic_ambiguous = true;
+                }
                 continue;
             }
             let mut names: Vec<_> = names.into_iter().map(str::to_string).collect();
@@ -3329,12 +3348,12 @@ pub(crate) fn semantic_source_claims(
                 // diagnostic strings cannot stand in for either fact.
                 incomplete.insert(piece.object);
             }
-            if manifest
-                .selection_evidence
-                .tables
-                .iter()
-                .any(crate::manifest_input::selection_table_inventory_incomplete)
-            {
+            if manifest.selection_evidence.tables.iter().any(|table| {
+                crate::manifest_input::selection_table_inventory_incomplete(
+                    &manifest.selection_evidence,
+                    table,
+                )
+            }) {
                 incomplete.insert(piece.object);
             }
             for (table_id, targets) in
@@ -3875,6 +3894,52 @@ fn lower_manifest(
         return (None, skipped);
     };
 
+    // Selection activation remains a separate count-only path. Keep its
+    // observation and target-admission gaps visible in the ordinary summary.
+    let mut selection_gaps = Vec::new();
+    for table in &m.selection_evidence.tables {
+        if crate::manifest_input::selection_table_inventory_incomplete(&m.selection_evidence, table)
+        {
+            selection_gaps.push(Skipped {
+                subject: format!("selection table {}", table.id),
+                reason: format!(
+                    "partial function inventory; {} words observed",
+                    table.functions.len()
+                ),
+            });
+        }
+        for (ordinal, function) in table.functions.iter().enumerate() {
+            let reason = match &function.resolution {
+                Resolution::Resolved { object, .. } => {
+                    match m.objects.iter().find(|record| record.id == *object) {
+                        None => Some(format!("object id {object} missing from manifest")),
+                        Some(record) => match object_key(m, record)
+                            .and_then(|key| pinned_id(key, &record.path))
+                        {
+                            None => Some(format!(
+                                "object id {object} has no comparable pinned identity"
+                            )),
+                            Some(target) if !compatible(module_object, target) => Some(format!(
+                                "object id {object} has a different target ABI from the provider"
+                            )),
+                            Some(_) => None,
+                        },
+                    }
+                }
+                Resolution::NullPointer => None,
+                Resolution::NonFileBacked => Some("non-file-backed".into()),
+                Resolution::Unmapped => Some("unmapped".into()),
+                Resolution::UnusableFile { reason, .. } => Some(reason.clone()),
+            };
+            if let Some(reason) = reason {
+                selection_gaps.push(Skipped {
+                    subject: format!("selection table {} ordinal {ordinal}", table.id),
+                    reason,
+                });
+            }
+        }
+    }
+
     (
         Some(Discovered {
             object: module_object,
@@ -3895,7 +3960,7 @@ fn lower_manifest(
             skipped,
             scan_evidence: None,
         }),
-        Vec::new(),
+        selection_gaps,
     )
 }
 
@@ -6774,7 +6839,10 @@ mod tests {
         let p = build(&m);
         assert_eq!(p.surfaces.len(), 1);
         assert_eq!(p.surfaces[0].source, "legacy_function_list");
-        assert_eq!(p.surfaces[0].walk, "known_prefix");
+        assert_eq!(
+            p.surfaces[0].walk,
+            "known_prefix; version metadata unavailable"
+        );
         assert_eq!(p.surfaces[0].acquisition, "ok");
         assert_eq!(p.surfaces[0].functions, 1);
         assert_eq!(p.vendor_interfaces, 0);
@@ -6834,7 +6902,10 @@ mod tests {
             func_list_null: true,
         }];
         let p = build(&m);
-        assert_eq!(p.surfaces[0].walk, "known_prefix");
+        assert_eq!(
+            p.surfaces[0].walk,
+            "known_prefix; version metadata unavailable"
+        );
         assert_eq!(p.surfaces[0].acquisition, "error: partial read");
         assert_eq!(p.vendor_interfaces, 1);
         assert_eq!(p.interface_list, "error: boom");
@@ -7164,7 +7235,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let manifest = p11scope_discover::discover::discover(&provider).unwrap();
+        let manifest = selection_recovery_tests::acquire_manifest(&provider);
         assert_eq!(manifest.interface_list, Acquisition::Absent);
         assert_eq!(manifest.surfaces[0].acquisition, Acquisition::Absent);
         assert!(crate::manifest_input::validate_structure(&manifest).is_empty());

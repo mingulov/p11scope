@@ -1053,14 +1053,60 @@ fn selection_inventory_indices(inventory_tables: &[Option<usize>], pointer: usiz
         .collect()
 }
 
-fn selection_table_incomplete(table: &SelectionTable) -> bool {
-    matches!(table.walk, WalkOutcome::Unreadable { .. })
+fn selection_table_incomplete(table: &SelectionTable, metadata_uncertain: bool) -> bool {
+    let expected = match inventory_tables(Surface::StandardInterface {
+        version: cryptoki_sys::CK_VERSION {
+            major: table.version.major,
+            minor: table.version.minor,
+        },
+    }) {
+        TableSet::Walk(spans) | TableSet::WalkKnownPrefix(spans) => {
+            spans.iter().map(|span| span.fields().len()).sum()
+        }
+        TableSet::Refuse => unreachable!("inventory always retains the common ABI"),
+    };
+    table.functions.len() != expected
+        || (matches!(table.walk, WalkOutcome::Unreadable { .. }) && !metadata_uncertain)
         || table.functions.iter().any(|function| {
             !matches!(
                 function.resolution,
                 Resolution::Resolved { .. } | Resolution::NullPointer
             )
         })
+}
+
+fn confirm_selection_snapshot(
+    memory: &ProcessMemory,
+    pointer: usize,
+    snapshot: &TableSnapshot,
+    version: Option<(u8, u8)>,
+) -> Result<Option<String>, SelectionFailure> {
+    let width = std::mem::size_of::<usize>();
+    let start = pointer
+        .checked_add(pkcs11_module::FUNCTION_LIST_FIELDS[0].offset)
+        .ok_or(SelectionFailure::ProviderChanged)?;
+    let bytes = snapshot
+        .values
+        .len()
+        .checked_mul(width)
+        .and_then(|length| memory.read_exact(start, length).ok())
+        .ok_or(SelectionFailure::ProviderChanged)?;
+    if !bytes
+        .chunks_exact(width)
+        .zip(&snapshot.values)
+        .all(|(word, (_, expected))| usize::from_ne_bytes(word.try_into().unwrap()) == *expected)
+    {
+        return Err(SelectionFailure::ProviderChanged);
+    }
+    let confirmed_version = read_version(memory, pointer)
+        .ok()
+        .map(|version| (version.major, version.minor));
+    Ok((confirmed_version != version).then(|| {
+        format!(
+            "version metadata changed: {} complete function words retained",
+            snapshot.values.len()
+        )
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1132,20 +1178,20 @@ fn selection_acquisition(
                         let name = read_name(memory, name_pointer);
                         let version_read = read_version(memory, table_pointer);
                         let name_class = selection_name_class(&name, name_pointer);
-                        let version_class = selection_version_class(&version_read, table_pointer);
-                        let table_snapshot = version_read.as_ref().ok().map(|version| {
-                            inventory_snapshot(
-                                memory,
-                                table_pointer,
-                                Ok(Surface::StandardInterface { version: *version }),
-                            )
-                        });
-                        let mut helper_failure = if name_pointer == 0 || name.error.is_some() {
-                            Some(SelectionFailure::UnreadableName)
-                        } else if table_pointer == 0 {
+                        let mut version_class =
+                            selection_version_class(&version_read, table_pointer);
+                        let source = version_read
+                            .as_ref()
+                            .map(|version| Surface::StandardInterface { version: *version })
+                            .map_err(String::as_str);
+                        let table_snapshot = (table_pointer != 0)
+                            .then(|| inventory_snapshot(memory, table_pointer, source));
+                        let mut helper_failure = if table_pointer == 0 {
                             Some(SelectionFailure::UnreadableTable)
                         } else if version_read.is_err() {
                             Some(SelectionFailure::UnreadableVersion)
+                        } else if name_pointer == 0 || name.error.is_some() {
+                            Some(SelectionFailure::UnreadableName)
                         } else if table_snapshot.as_ref().is_some_and(|snapshot| {
                             matches!(snapshot.walk, WalkOutcome::Unreadable { .. })
                         }) {
@@ -1155,16 +1201,23 @@ fn selection_acquisition(
                         };
                         let mut selection_table = None;
                         if inventory_matches.is_empty()
-                            && let (Ok(version), Some(snapshot)) = (&version_read, &table_snapshot)
+                            && let Some(snapshot) = &table_snapshot
                         {
                             let (table, origin) = selection_table_for(
                                 table_pointer,
-                                manifest_version(*version),
+                                version_read
+                                    .as_ref()
+                                    .ok()
+                                    .map_or(Version { major: 0, minor: 0 }, |version| {
+                                        manifest_version(*version)
+                                    }),
                                 snapshot,
                                 maps_a,
                                 &mut candidate_objects,
                             );
-                            if helper_failure.is_none() && selection_table_incomplete(&table) {
+                            if helper_failure.is_none()
+                                && selection_table_incomplete(&table, version_read.is_err())
+                            {
                                 helper_failure = Some(SelectionFailure::UnresolvedFunction);
                             }
                             selection_table = Some((table, origin));
@@ -1174,26 +1227,44 @@ fn selection_acquisition(
                         let confirmed_interface = read_interface(memory, output as usize)
                             .map_err(|_| SelectionFailure::ProviderChanged)?;
                         let confirmed_name = read_name(memory, name_pointer);
-                        let confirmed_version = read_version(memory, table_pointer);
                         if confirmed_interface != (name_pointer, table_pointer, returned_flags)
                             || confirmed_name.raw != name.raw
                             || confirmed_name.error != name.error
-                            || confirmed_version.as_ref().ok().map(|v| (v.major, v.minor))
-                                != version_read.as_ref().ok().map(|v| (v.major, v.minor))
-                            || table_snapshot.as_ref().is_some_and(|snapshot| {
-                                let Ok(version) = &version_read else {
-                                    return true;
-                                };
-                                let confirmed = inventory_snapshot(
-                                    memory,
-                                    table_pointer,
-                                    Ok(Surface::StandardInterface { version: *version }),
-                                );
-                                confirmed.values != snapshot.values
-                                    || confirmed.walk != snapshot.walk
-                            })
                         {
                             return Err(SelectionFailure::ProviderChanged);
+                        }
+                        if let Some(snapshot) = &table_snapshot
+                            && let Some(diagnostic) = confirm_selection_snapshot(
+                                memory,
+                                table_pointer,
+                                snapshot,
+                                version_read
+                                    .as_ref()
+                                    .ok()
+                                    .map(|version| (version.major, version.minor)),
+                            )?
+                        {
+                            helper_failure = Some(SelectionFailure::UnreadableVersion);
+                            if let Some((table, _)) = &mut selection_table {
+                                table.walk = WalkOutcome::Unreadable {
+                                    detail: match &snapshot.walk {
+                                        WalkOutcome::Unreadable { .. } if version_read.is_err() => {
+                                            format!(
+                                                "version header unreadable: metadata unavailable; {diagnostic}"
+                                            )
+                                        }
+                                        WalkOutcome::Unreadable { .. } => {
+                                            format!("{diagnostic}; function tail unavailable")
+                                        }
+                                        _ => diagnostic,
+                                    },
+                                };
+                            } else {
+                                // Ordinary inventory retains its observed version;
+                                // the unstable query gets no agreement authority.
+                                version_class = SelectionVersionClass::Unreadable;
+                                eprintln!("warning: {diagnostic}");
+                            }
                         }
                         captured = Some((
                             RawSelectionResult {
@@ -1365,7 +1436,23 @@ fn selection_table_for(
         SelectionTable {
             id: 0,
             version,
-            walk: snapshot.walk.clone(),
+            walk: match &snapshot.walk {
+                WalkOutcome::Unreadable { detail } => WalkOutcome::Unreadable {
+                    detail: if detail.starts_with("version header unreadable:") {
+                        format!(
+                            "version header unreadable: metadata unavailable; {} complete function words",
+                            snapshot.values.len()
+                        )
+                    } else {
+                        format!(
+                            "function word {} unreadable after {} complete function words",
+                            snapshot.values.len(),
+                            snapshot.values.len()
+                        )
+                    },
+                },
+                walk => walk.clone(),
+            },
             functions,
             semantic_authorized: false,
         },
@@ -1511,7 +1598,10 @@ fn selection_records(
         if let Some((mut table, origin)) = raw_result.table
             && matches.is_empty()
         {
-            selection_truncated |= selection_table_incomplete(&table);
+            selection_truncated |= selection_table_incomplete(
+                &table,
+                raw.helper_failure == Some(SelectionFailure::UnreadableVersion),
+            );
             let pair = (result.version, result.flags);
             let table_id = if let Some((_, known)) =
                 table_observations.iter().find(|(known_origin, known)| {
@@ -2676,7 +2766,78 @@ mod tests {
             functions: vec![],
             semantic_authorized: false,
         };
-        assert!(selection_table_incomplete(&table));
+        assert!(selection_table_incomplete(&table, false));
+    }
+
+    #[test]
+    fn selection_metadata_drift_preserves_real_words_but_changed_word_refuses() {
+        #[repr(C)]
+        struct Table {
+            version: cryptoki_sys::CK_VERSION,
+            functions: [usize; 104],
+        }
+        let mut table = Box::new(Table {
+            version: cryptoki_sys::CK_VERSION { major: 3, minor: 2 },
+            functions: [0; 104],
+        });
+        table.functions[0] = selection_metadata_drift_preserves_real_words_but_changed_word_refuses
+            as *const () as usize;
+        table.functions[103] = table.functions[0];
+        let pointer = (&*table) as *const Table as usize;
+        let memory = ProcessMemory::open().unwrap();
+        let source = Ok(Surface::StandardInterface {
+            version: table.version,
+        });
+        let snapshot = inventory_snapshot(&memory, pointer, source);
+        assert_eq!(snapshot.values.len(), 104);
+        table.version = cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        };
+        let diagnostic = confirm_selection_snapshot(&memory, pointer, &snapshot, Some((3, 2)))
+            .expect("metadata drift does not invalidate identical function words")
+            .unwrap();
+        assert!(diagnostic.starts_with("version metadata changed:"));
+        let mapping_entries = read_self_maps().unwrap();
+        let mappings = validated_map_index(&mapping_entries).unwrap();
+        let maps::Resolved::File { device, inode, .. } =
+            mappings.resolve(table.functions[0] as u64)
+        else {
+            panic!("test code must be file-backed");
+        };
+        let module_key = ObjectKey { device, inode };
+        let executable = std::env::current_exe().unwrap();
+        let identity = identity_and_key(&executable).unwrap().1;
+        let mut objects = ObjectTable::new(
+            executable,
+            module_key,
+            identity,
+            BTreeSet::from([module_key]),
+        );
+        let (observed, _) = selection_table_for(
+            pointer,
+            Version { major: 3, minor: 2 },
+            &snapshot,
+            &mappings,
+            &mut objects,
+        );
+        assert_eq!(observed.functions.len(), 104);
+        assert!(matches!(
+            observed.functions[103].resolution,
+            Resolution::Resolved { .. }
+        ));
+        table.functions[5] = 1;
+        assert_eq!(
+            confirm_selection_snapshot(&memory, pointer, &snapshot, Some((3, 2))),
+            Err(SelectionFailure::ProviderChanged)
+        );
+        let invalid_snapshot = inventory_snapshot(&memory, pointer, source);
+        table.functions[5] = 2;
+        assert_eq!(
+            confirm_selection_snapshot(&memory, pointer, &invalid_snapshot, Some((2, 40))),
+            Err(SelectionFailure::ProviderChanged),
+            "invalid observed words participate in coherence too"
+        );
     }
 
     #[test]

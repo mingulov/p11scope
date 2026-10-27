@@ -562,8 +562,15 @@ pub struct Engine {
     /// When the expected-target-exit wait armed (wall clock): bounds the
     /// `profile --pid` wait for draining retirement cleanup, so a cleanup
     /// that stays queued ends the capture with a named PARTIAL reason
-    /// instead of holding it open until Ctrl-C. `None` until armed.
+    /// instead of holding it open until Ctrl-C. `None` until armed;
+    /// restarted whenever the drain makes progress, so only a stall with
+    /// no progress at all trips the bound.
     expected_target_exit_since: Option<std::time::Instant>,
+    /// Blocking-set baseline the wait above compares against: snapshotted
+    /// at the arm, refreshed on every observation, cleared whenever the
+    /// wait disarms. A wait whose pending was set directly snapshots its
+    /// baseline on its first observation instead.
+    expected_target_exit_blocked: Option<ExpectedTargetExitBlocked>,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     // Kernel lifecycle timestamps only, bounded by pending retained views.
     // None means at least one pending EXIT has unknown ordering.
@@ -3623,7 +3630,7 @@ const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duratio
 /// cleanup drains — but a cleanup that stays queued (a conservative
 /// candidate that never applies, loader ids that never drain) must not
 /// hold a `profile --pid` capture open until Ctrl-C. When the armed wait
-/// observes no all-clear for this long, the latch trips with a named
+/// makes no drain progress for this long, the latch trips with a named
 /// PARTIAL reason and keeps the calls collected so far. Mirrors
 /// `JOINT_FINISH_NO_PROGRESS_TIMEOUT`: the same 6 s value, kept equal so
 /// every terminal no-progress wait in the stop path ends on the one
@@ -3632,6 +3639,46 @@ const GRAPH_NATIVE_POLL_WEDGE_DEADLINE: std::time::Duration = std::time::Duratio
 /// modules this file cannot name.
 const EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(6);
+
+/// Blocking-set fingerprint behind the expected-target-exit no-progress
+/// clock: one entry per all-clear conjunct in
+/// `finalize_expected_target_exit`. Any entry shrinking between two
+/// observations is drain progress and restarts the clock. The three
+/// progress signals are: a retirement settled (`views`,
+/// `retirement_intents` or `pending_retirements` shrank, or
+/// `ended_pid_retirement` cleared); a loader id cleared
+/// (`loader_registry.ids_for_view` shrank); a parked record finalized
+/// (`pending_rejected_keys` or `pending_discovery_records` shrank, or
+/// `terminal_journal`/`terminal_batch` cleared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedTargetExitBlocked {
+    views: usize,
+    intents: usize,
+    retirements: usize,
+    ended: bool,
+    rejected: usize,
+    loader_ids: usize,
+    journal: bool,
+    batch: bool,
+    records: usize,
+}
+
+impl ExpectedTargetExitBlocked {
+    /// True when any blocking entry shrank since `previous`: the drain
+    /// moved, even if another entry grew (newly queued work never erases
+    /// observed progress).
+    fn drained_since(&self, previous: &Self) -> bool {
+        self.views < previous.views
+            || self.intents < previous.intents
+            || self.retirements < previous.retirements
+            || (previous.ended && !self.ended)
+            || self.rejected < previous.rejected
+            || self.loader_ids < previous.loader_ids
+            || (previous.journal && !self.journal)
+            || (previous.batch && !self.batch)
+            || self.records < previous.records
+    }
+}
 
 /// Fixed accounting limit for the Engine's dedicated collected-graph pool.
 /// Measured system-scale peak is 211,743,432 bytes (~202 MiB), which sits
@@ -9568,6 +9615,7 @@ impl Engine {
             expected_target_exit_pending: None,
             expected_target_exit: false,
             expected_target_exit_since: None,
+            expected_target_exit_blocked: None,
             pending_leader_exit_views: BTreeSet::new(),
             pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
@@ -18407,8 +18455,30 @@ impl Engine {
     /// capture policy. One place decides that, so the two scopes cannot drift.
     fn arm_expected_target_exit(&mut self, view: ProcessViewId) {
         if matches!(self.scope, Scope::Pid(_)) {
+            let blocked = self.snapshot_expected_target_exit_blocked(view);
             self.expected_target_exit_pending = Some(view);
             self.expected_target_exit_since = Some(std::time::Instant::now());
+            self.expected_target_exit_blocked = Some(blocked);
+        }
+    }
+
+    /// Snapshots the blocking set behind the expected-target-exit wait:
+    /// the same conjuncts `finalize_expected_target_exit` needs empty
+    /// for its all-clear.
+    fn snapshot_expected_target_exit_blocked(
+        &self,
+        view: ProcessViewId,
+    ) -> ExpectedTargetExitBlocked {
+        ExpectedTargetExitBlocked {
+            views: self.views.len(),
+            intents: self.retirement_intents.len(),
+            retirements: self.pending_retirements.len(),
+            ended: self.ended_pid_retirement.is_some(),
+            rejected: self.pending_rejected_keys.len(),
+            loader_ids: self.loader_registry.ids_for_view(view).len(),
+            journal: self.terminal_journal.is_some(),
+            batch: self.terminal_batch.is_some(),
+            records: self.pending_discovery_records.len(),
         }
     }
 
@@ -18440,6 +18510,7 @@ impl Engine {
             && self.pending_discovery_records.is_empty()
         {
             self.expected_target_exit_pending = None;
+            self.expected_target_exit_blocked = None;
             self.expected_target_exit = true;
             return;
         }
@@ -18450,16 +18521,27 @@ impl Engine {
             // behaviour is unchanged.
             return;
         }
+        // Drain progress restarts the no-progress clock: a retirement
+        // settled, a loader id cleared, or a parked record finalized (see
+        // `ExpectedTargetExitBlocked`). Only a stall with none of those
+        // trips the bound below.
+        let blocked = self.snapshot_expected_target_exit_blocked(view);
+        let now = std::time::Instant::now();
+        if self
+            .expected_target_exit_blocked
+            .is_some_and(|previous| blocked.drained_since(&previous))
+        {
+            self.expected_target_exit_since = Some(now);
+        }
+        self.expected_target_exit_blocked = Some(blocked);
         // A retirement cleanup that stays queued must not hold a
         // `profile --pid` capture open past its target's exit forever:
-        // when the armed wait observes no all-clear for the whole
+        // when the armed wait makes no drain progress for the whole
         // no-progress bound, end the wait with a named PARTIAL reason and
         // keep the calls collected so far. The arm proves the target
         // exited, so the bound can only trip after the exit — never while
         // the target is alive.
-        let since = *self
-            .expected_target_exit_since
-            .get_or_insert_with(std::time::Instant::now);
+        let since = *self.expected_target_exit_since.get_or_insert(now);
         let stalled = since.elapsed();
         if stalled >= EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT {
             self.mark_partial(
@@ -18471,6 +18553,7 @@ impl Engine {
                 ),
             );
             self.expected_target_exit_pending = None;
+            self.expected_target_exit_blocked = None;
             self.expected_target_exit = true;
         }
     }

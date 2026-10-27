@@ -52613,6 +52613,60 @@ fn acquired_header_and_pointer_failure_keeps_completed_legacy_words() {
 }
 
 #[test]
+fn acquired_unreadable_header_keeps_the_complete_observed_body() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    let address = unsafe { fixture.base.cast::<u8>().add(fixture.page - 8) } as u64;
+    let target = self_export_fixture(ProcessViewId(4305)).2.pointers[0];
+    let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u64, 69) };
+    words[0] = 0xe707;
+    words[1..].fill(0);
+    words[68] = target;
+    assert_eq!(unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) }, 0);
+    let mut record = compatibility_publication_record(address, 0, 68);
+    record.status_flags = p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE;
+    let module = compatibility_lower_self(&record);
+    let table = &module.tables[0];
+    assert_eq!(table.entries.len(), 1);
+    assert_eq!(table.entries[0].name, "C_WaitForSlotEvent");
+    assert_eq!(table.null_entries.len(), 67);
+    assert_eq!(table.walk, "full", "metadata does not change the observed extent");
+    // The mandatory tuple is a placeholder; engine diagnostics disclose that
+    // neither capture nor validation observed these metadata bytes.
+    assert_eq!(table.version, (0, 0));
+}
+
+#[test]
+fn failed_acquisition_keeps_targets_and_discloses_uncertain_metadata() {
+    let (view, _maps, mut record) = self_export_fixture(ProcessViewId(0));
+    record.version_major = 0;
+    record.version_minor = 0;
+    record.status_flags = p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE;
+    record.completed_prefix = 1;
+    record.usable_n = 1;
+    record.pointers[1..].fill(0);
+    let mut engine = Engine::empty();
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    });
+    let outcome = engine.process_export_record(
+        &record, &mut ScriptedSession::default(), &mut true, &mut PendingViewRetirements::new(),
+    ).unwrap();
+    assert!(outcome.required_complete());
+    assert_eq!(engine.plan.slots.len(), 1, "the observed target survives");
+    assert_eq!(engine.modules[0].scanned.tables[0].version, (2, 40), "fresh metadata is factual");
+    assert_eq!(engine.discovery_truncated, 0);
+    assert!(engine.counters.object_skips.iter().any(|skip|
+        skip.reason.contains("read failure") && skip.reason.contains("1 completed")),
+        "unread words are diagnosed separately from NULL");
+    assert!(engine.counters.object_skips.iter().any(|skip|
+        skip.reason.contains("metadata") && skip.reason.contains("unavailable") && skip.reason.contains("placeholder")),
+        "zero capture metadata is not claimed as observed version 0.0");
+}
+
+#[test]
 fn opaque_publication_retains_observation_without_standard_names_or_list_position() {
     use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
 

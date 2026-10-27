@@ -93,7 +93,8 @@ impl std::fmt::Display for MultiHostRefusal {
         }
         write!(
             out,
-            "; run `p11scope doctor --pid <n>` to check host and target readiness; \
+            "; run `p11scope doctor` for host readiness or \
+             `p11scope doctor --pid <n>` for target readiness; \
              `p11scope inspect --pid <n>` lists readable mapped providers without live capture"
         )
     }
@@ -299,6 +300,10 @@ mod tests {
             assert!(text.contains("requires root"), "{text}");
             assert!(text.contains("appropriate capabilities"), "{text}");
             assert!(text.contains("policy") && text.contains("sudo"), "{text}");
+            assert!(
+                text.contains("`p11scope doctor` for host readiness"),
+                "{text}"
+            );
             assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
             assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
             assert!(text.contains("without live capture"), "{text}");
@@ -336,6 +341,10 @@ mod tests {
             assert_ne!(refusal.cause, MultiHostCause::Denied);
             let text = refusal.to_string();
             assert!(text.starts_with("uprobe-multi-required: "), "{text}");
+            assert!(
+                text.contains("`p11scope doctor` for host readiness"),
+                "{text}"
+            );
             assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
             assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
             assert!(text.contains("without live capture"), "{text}");

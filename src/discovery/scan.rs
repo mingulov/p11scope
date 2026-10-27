@@ -3936,9 +3936,7 @@ fn acquire_cold_survivor_maps(
     let original = Arc::new(view.retained_pin().try_clone().ok()?);
     let minted = cold_admit_member(&original, budget).ok()?;
     io.note_cold_member(view.pid(), minted.member, minted.minter);
-    if io.cold_member_for(view.pid()).is_none() {
-        return None;
-    }
+    io.cold_member_for(view.pid())?;
     let reader = view
         .run_while_same(|| io.open_maps(view, budget))
         .ok()?

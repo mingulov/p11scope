@@ -1976,12 +1976,13 @@ fn cold_member_handoff_routes_confirm_through_survivor() {
     io.hand_cold_member(group.tgid.wrapping_add(1), minted);
     drop(pin);
     let mut budget = CaptureWorkBudget::with_work_ceiling(handed_spend);
-    match prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None) {
-        Ok(prepared) => assert!(
+    if let Ok(prepared) =
+        prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+    {
+        assert!(
             prepared.member.is_none(),
             "a dropped handoff carries nothing under the handed ceiling"
-        ),
-        Err(_) => {}
+        );
     }
 }
 

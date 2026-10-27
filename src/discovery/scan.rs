@@ -6359,6 +6359,46 @@ mod tests {
     }
 
     #[test]
+    fn own_export_corroboration_does_not_depend_on_the_declared_table_label() {
+        let mut table = short_prefix_table();
+        table.entries.truncate(1);
+        table.null_entries = (1..68)
+            .map(|ordinal| function_name(ordinal).unwrap())
+            .collect();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: table.entries[0].object,
+            symbols: &symbols,
+        };
+        for version in [(2, 40), (3, 0), (3, 1), (3, 2)] {
+            table.version = version;
+            table.walk = if version == (2, 40) {
+                "full"
+            } else {
+                "known_prefix"
+            };
+            let score =
+                table_evidence_score(0, std::slice::from_ref(&table), &[], &[], &[], &exports);
+            assert!(
+                score.exports,
+                "{version:?}: identical observed positions and exports"
+            );
+            assert!(table_name_authorized(&score));
+            assert!(
+                !table_evidence_score(
+                    0,
+                    std::slice::from_ref(&table),
+                    &[],
+                    &[],
+                    &[],
+                    &ObjectExports::NONE
+                )
+                .exports
+            );
+        }
+    }
+
+    #[test]
     fn retain_tables_ignores_unmapped_tail_words_beyond_the_decoded_prefix() {
         let maps = mislabelled_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();

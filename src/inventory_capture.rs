@@ -3890,6 +3890,10 @@ mod stop_latch_tests {
         stop_calls: Option<Rc<Cell<u64>>>,
         stage_marks: Vec<(u64, usize)>,
         gaps: Vec<(String, String)>,
+        /// Gaps staged but not yet committed (the settle-owed probe).
+        staged: Vec<(String, String)>,
+        /// Staged gaps a commit published (the settle-owed probe).
+        committed: Vec<(String, String)>,
     }
     impl F9Host {
         fn new() -> Self {
@@ -3900,6 +3904,8 @@ mod stop_latch_tests {
                 stop_calls: None,
                 stage_marks: Vec::new(),
                 gaps: Vec::new(),
+                staged: Vec::new(),
+                committed: Vec::new(),
             }
         }
     }
@@ -3949,6 +3955,10 @@ mod stop_latch_tests {
         on_collect: Option<Arc<dyn Fn() + Send + Sync>>,
         /// Mirrors `collects` for stop closures that arm on a later pass.
         collect_count: Option<Rc<Cell<usize>>>,
+        /// A begun finish pends beside the lane (the settle-owed probe).
+        pending: bool,
+        /// The settle holds the pending finish and stages its gap.
+        settle_stages_held: bool,
     }
     impl F9Driver {
         fn new() -> Self {
@@ -3961,6 +3971,8 @@ mod stop_latch_tests {
                 arm_stop_on_collect: None,
                 on_collect: None,
                 collect_count: None,
+                pending: false,
+                settle_stages_held: false,
             }
         }
         fn report(&self) -> PassReport {
@@ -4010,7 +4022,24 @@ mod stop_latch_tests {
         }
         fn commit(&mut self, _engine_changed: bool) -> Result<()> {
             self.commits += 1;
+            // The settle-owed probe: a commit publishes staged gaps.
+            // Other probes stage nothing, so this drains nothing.
+            self.host.committed.append(&mut self.host.staged);
             Ok(())
+        }
+        fn publication_pending(&self) -> bool {
+            self.pending
+        }
+        fn settle_joint_finish(&mut self) {
+            // The settle-owed probe only: hold the pending finish and
+            // stage its gap. Other probes never arm this.
+            if self.settle_stages_held {
+                self.pending = false;
+                self.host.staged.push((
+                    "joint finish held for exit".to_string(),
+                    "settle-owed probe hold".to_string(),
+                ));
+            }
         }
     }
 
@@ -4411,6 +4440,55 @@ mod stop_latch_tests {
         );
         assert!(driver.host.stages > 0, "the terminal sweep still stages");
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn scan_terminal_commit_publishes_settled_hold_after_completed_passes() {
+        // The settle-owed trigger: one scan pass completes (so neither
+        // an error nor a zero-pass diagnostic forces the terminal
+        // commit) while a begun Joint finish pends. The settle holds
+        // the finish and stages its gap; the terminal commit must
+        // still run and publish the hold. Without `|| settle_owed`
+        // the gap strands unpublished.
+        let mut driver = F9Driver::new();
+        driver.pending = true;
+        driver.settle_stages_held = true;
+        let applied = Rc::clone(&driver.applied);
+        let stop = move || applied.get() >= 1;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none(), "no error forces the commit");
+        assert!(
+            outcome.zero_pass.is_none(),
+            "a completed pass forces no diagnostic"
+        );
+        assert_eq!(pass_publications, 1, "one pass completes");
+        assert!(
+            !driver.pending,
+            "the settle resolved the pending publication"
+        );
+        assert!(
+            driver
+                .host
+                .committed
+                .iter()
+                .any(|(subject, _)| subject == "joint finish held for exit"),
+            "the settled hold publishes with the stop: staged={:?} committed={:?}",
+            driver.host.staged,
+            driver.host.committed
+        );
     }
 
     #[test]

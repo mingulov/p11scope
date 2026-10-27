@@ -2899,6 +2899,55 @@ fn joint_machine_abandon_drops_a_stranded_collected_batch() {
         .expect("a later plain commit succeeds past the abandoned publication");
 }
 
+#[test]
+fn joint_finish_completion_certifies_the_final_drain() {
+    // A healthy joint finish proves its own drain (Q observed, discovery
+    // drained to Q, the retained original sealed and delivered at Q,
+    // producers frozen): completion records the stop certification
+    // instead of leaving the lane's drain unproven.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("drain prefix", None);
+    fixture.enable_finish_fixture(vec![]);
+    fixture.begin_finish().unwrap();
+    fixture.finish_published();
+    assert!(fixture.scene.real.lane.is_finished());
+    let summary = fixture.scene.real.lane.semantic_summary();
+    assert_eq!(
+        summary.stop_quiescence,
+        crate::inventory_semantics::SemanticStopQuiescence::Quiesced
+    );
+    assert_eq!(summary.final_drain, Some(true));
+}
+
+#[test]
+fn joint_finish_refusal_certifies_no_drain() {
+    // The certification fires only on proof: a finish that refuses
+    // before completing leaves the lane's drain unproven (no
+    // fabricated settlement).
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("drain prefix", None);
+    fixture.enable_finish_fixture(vec![]);
+    fixture.begin_finish().unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(crate::inventory_semantics::FinishSite::ValidateOwner);
+    assert!(fixture.poll_finish(1).is_err());
+    let summary = fixture.scene.real.lane.semantic_summary();
+    assert_eq!(
+        summary.stop_quiescence,
+        crate::inventory_semantics::SemanticStopQuiescence::NotRequested
+    );
+    assert_eq!(summary.final_drain, None);
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

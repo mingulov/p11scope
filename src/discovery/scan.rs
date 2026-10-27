@@ -9416,10 +9416,7 @@ mod tests {
             let top = stack.as_mut_ptr_range().end as *mut std::ffi::c_void;
             let mut go = [0; 2];
             // SAFETY: a valid two-element array for pipe2.
-            assert_eq!(
-                unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) },
-                0
-            );
+            assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
             // SAFETY: the child only closes one end, reads one go byte,
             // clones, and exits its leader thread; no allocator, no
             // pthread, no locks.
@@ -9439,8 +9436,7 @@ mod tests {
                         | libc::CLONE_SIGHAND
                         | libc::CLONE_THREAD
                         | libc::CLONE_SYSVSEM;
-                    let cloned =
-                        libc::clone(pause_survivor_main, top, FLAGS, std::ptr::null_mut());
+                    let cloned = libc::clone(pause_survivor_main, top, FLAGS, std::ptr::null_mut());
                     if cloned < 0 {
                         libc::_exit(1);
                     }
@@ -9455,8 +9451,8 @@ mod tests {
                 libc::close(go[0]);
             }
             let tgid = pid as u32;
-            let view =
-                ProcessView::open(ProcessViewId(7501), tgid).expect("a warm view opens while alive");
+            let view = ProcessView::open(ProcessViewId(7501), tgid)
+                .expect("a warm view opens while alive");
             // Release the child only after the view pins the live leader.
             let byte = [1u8; 1];
             // SAFETY: writing one byte to the owned pipe.

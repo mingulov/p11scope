@@ -1841,7 +1841,7 @@ fn cold_admission_two_survivors_refuses_ambiguity() {
 /// re-list still admits, proving the refused mint released its slot.
 #[test]
 fn cold_admission_relist_refuses_survivor_appearing_after_mint() {
-    use crate::discovery::caller_registry::{cold_admit_member_with_relist, ColdRefusal};
+    use crate::discovery::caller_registry::{ColdRefusal, cold_admit_member_with_relist};
     use crate::process::PidPin;
     use std::sync::Arc;
     let group = ZombieLeaderGroup::spawn();
@@ -1856,9 +1856,7 @@ fn cold_admission_relist_refuses_survivor_appearing_after_mint() {
     }
     assert_ne!(other, group.survivor);
     let mut work = CaptureWorkBudget::default();
-    match cold_admit_member_with_relist(&pin, &mut work, &mut |_| {
-        Ok(vec![group.survivor, other])
-    }) {
+    match cold_admit_member_with_relist(&pin, &mut work, &mut |_| Ok(vec![group.survivor, other])) {
         Err(ColdRefusal::Ambiguous(message)) => assert!(
             message.contains("more than one live survivor"),
             "grown sets refuse by the ambiguity name, got {message}"

@@ -3613,9 +3613,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // The successor's binding safety needs the staging clock (its
         // first_seen) to be later than the hook's timestamp: at or before
-        // it, binder Rule 4 would refuse every row the successor ever
-        // reads, so a mint here could never bind. Refuse fail-closed: the
-        // proved old incarnation retires without a successor, disclosed.
+        // it, the binder would refuse every row the successor ever reads,
+        // since a proved exec of its thread group sits at or after its
+        // admission, so a mint here could never bind. Refuse fail-closed:
+        // the proved old incarnation retires without a successor, disclosed.
         if now_ns <= hook_ts_ns {
             self.registry.record_gap(RegistryGap {
                 caller: Some(caller),
@@ -3623,9 +3624,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pid: Some(pid),
                 subject: "successor admission refused with a stale staging clock".into(),
                 reason: "the staging clock is not later than the exec hook's timestamp, so the \
-                     successor's first_seen would be at or before the proved exec and binder \
-                     Rule 4 would refuse every row it ever reads; the proved old incarnation \
-                     retires without a successor"
+                     successor's first_seen would be at or before the proved exec and the binder \
+                     would refuse every row it ever reads, since a proved exec sits at or after \
+                     its admission; the proved old incarnation retires without a successor"
                     .into(),
                 budget: None,
             });
@@ -13203,10 +13204,11 @@ exit 0
     fn an_exec_hook_with_a_stale_staging_clock_mints_no_successor() {
         // The successor's binding safety needs the staging clock (its
         // first_seen) to be later than the hook's timestamp: at or before
-        // it, binder Rule 4 would refuse every row the successor ever
-        // reads. When now_ns <= hook_ts_ns the hook refuses with a gap and
-        // the proved old incarnation retires without a successor. Both the
-        // boundary (equal) and a strictly stale clock refuse.
+        // it, the binder would refuse every row the successor ever reads,
+        // since a proved exec of its thread group sits at or after its
+        // admission. When now_ns <= hook_ts_ns the hook refuses with a gap
+        // and the proved old incarnation retires without a successor. Both
+        // the boundary (equal) and a strictly stale clock refuse.
         for (hook_ts_ns, now_ns) in [(1_500, 1_500), (1_500, 1_400)] {
             let (mut native, caller) = NativeScene::new();
             native.answer(7, 500, 41);

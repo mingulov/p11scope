@@ -4624,12 +4624,78 @@ struct QuietExemption<'a> {
     max: Option<u64>,
 }
 
+/// One edge whose semantic lane the cell stopped on purpose before the
+/// quiet check (promotion: A's lane winds down and retires before qb).
+/// The lane's terminal `Stopped` invalidation marks the edge lossy with
+/// exactly the stop's boundary and cause, `{SemanticLoss, CaptureStopped}`
+/// (the product contract pinned by
+/// `native_semantic_finalize_invalidation_covers_domain_reasons`): the
+/// caller lives on unobserved, so its count is a lower bound from the stop
+/// on. That is a disclosure, not a lost call. The edge is excused from the
+/// loss twins only while it carries exactly that disclosure (plus
+/// `NoCalls` when no call was attributed before the stop) and the
+/// attributed count the cell proved before the stop, with nothing
+/// historical-only and no saturation; any other reason, a changed count, a
+/// missing stop disclosure or a missing edge still fails.
+struct StoppedEdge {
+    caller: crate::discovery::caller_registry::CallerId,
+    module: crate::discovery::caller_registry::ModuleId,
+    /// The edge's attributed returns read before the stop.
+    api_returns: Option<u64>,
+}
+
+/// The stopped-edge verdict over one edge's published state (pure, so the
+/// unprivileged twins pin it).
+fn check_stopped_edge(
+    stopped: &StoppedEdge,
+    lossy: bool,
+    reasons: &BTreeSet<crate::discovery::caller_registry::instance_input::InstanceReason>,
+    api_returns: Option<u64>,
+    historical_only: u64,
+    saturated: bool,
+) -> Result<()> {
+    use crate::discovery::caller_registry::instance_input::InstanceReason;
+    let mut stop = BTreeSet::from([InstanceReason::SemanticLoss, InstanceReason::CaptureStopped]);
+    if stopped.api_returns.is_none() {
+        stop.insert(InstanceReason::NoCalls);
+    }
+    ensure!(
+        lossy && *reasons == stop,
+        "stopped edge {:?}/{:?} must carry exactly the stop disclosure {stop:?}: \
+         lossy={lossy} reasons={reasons:?}",
+        stopped.caller,
+        stopped.module
+    );
+    ensure!(
+        api_returns == stopped.api_returns && historical_only == 0 && !saturated,
+        "stopped edge {:?}/{:?} keeps its pre-stop count {:?}: api={api_returns:?} \
+         historical_only={historical_only} saturated={saturated}",
+        stopped.caller,
+        stopped.module,
+        stopped.api_returns
+    );
+    Ok(())
+}
+
 /// The quiet-path loss twins with disclosed exemptions. Anything else
 /// loss-ish still fails.
 fn assert_quiet_twins_except(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     tag: &str,
     exempt: &[QuietExemption<'_>],
+) -> Result<()> {
+    assert_quiet_twins_except_stopped(coordinator, tag, exempt, &[])
+}
+
+/// [`assert_quiet_twins_except`] plus edges whose lane the cell stopped on
+/// purpose ([`StoppedEdge`]): each must exist and pass the strict
+/// stopped-edge verdict instead of the loss twins; every other edge keeps
+/// the loss twins unchanged.
+fn assert_quiet_twins_except_stopped(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+    exempt: &[QuietExemption<'_>],
+    stopped: &[StoppedEdge],
 ) -> Result<()> {
     for exemption in exempt {
         let count = count_disclosed_gaps(
@@ -4674,12 +4740,42 @@ fn assert_quiet_twins_except(
             gap.reason
         );
     }
+    for edge in stopped {
+        ensure!(
+            coordinator
+                .registry()
+                .instance_semantic_edges()
+                .any(|record| record.caller == edge.caller && record.module == edge.module),
+            "{tag}: the stopped edge {:?}/{:?} is missing",
+            edge.caller,
+            edge.module
+        );
+    }
     for record in coordinator.registry().instance_semantic_edges() {
+        if let Some(edge) = stopped
+            .iter()
+            .find(|edge| edge.caller == record.caller && edge.module == record.module)
+        {
+            check_stopped_edge(
+                edge,
+                record.lossy,
+                &record.reasons,
+                record.api_returns,
+                record.historical_only_returns,
+                record.saturated,
+            )
+            .with_context(|| format!("{tag}: stopped edge"))?;
+            continue;
+        }
         ensure!(
             !record.lossy,
-            "{tag}: edge {:?}/{:?} is lossy",
+            "{tag}: edge {:?}/{:?} is lossy: reasons={:?} api={:?} historical_only={} saturated={}",
             record.caller,
-            record.module
+            record.module,
+            record.reasons,
+            record.api_returns,
+            record.historical_only_returns,
+            record.saturated
         );
         for reason in &record.reasons {
             let text = format!("{reason:?}");
@@ -6392,7 +6488,20 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
             max: None,
         });
     }
-    assert_quiet_twins_except(coordinator, "r16c-qb", &exemptions)?;
+    // A's lane was stopped on purpose above (wind-down, joined detach,
+    // retire), so its stop disclosure is expected on A's edge if qa saw
+    // one; the strict stopped-edge verdict replaces the loss twins for
+    // that edge only, pinned to A's qa count. B's edge keeps the twins.
+    let stopped_a: Vec<StoppedEdge> = edge_a_row
+        .as_ref()
+        .map(|edge| StoppedEdge {
+            caller: caller_a,
+            module: module_a,
+            api_returns: edge.api_returns,
+        })
+        .into_iter()
+        .collect();
+    assert_quiet_twins_except_stopped(coordinator, "r16c-qb", &exemptions, &stopped_a)?;
     eprintln!(
         "JOINT_R16 r16c-qb polls={qb_polls} revision={revision} b_api={api_b} \
          promotion_refusal={promotion_reason:?}"
@@ -6422,7 +6531,8 @@ mod joint_ledger_parse_tests {
     //! population assertions rest on these, so their parsing is pinned
     //! here rather than trusted implicitly.
     use super::{
-        JOINT_SOFT_FUNCTIONS, QuietExemption, assert_quiet_twins_except, count_disclosed_gaps,
+        JOINT_SOFT_FUNCTIONS, QuietExemption, StoppedEdge, assert_quiet_twins_except,
+        assert_quiet_twins_except_stopped, check_stopped_edge, count_disclosed_gaps,
         disclosed_scope_reason, exactness_diagnosis, joint_edges_fingerprint,
         joint_gaps_fingerprint, ledger_calls, ledger_semantic_split, ledger_stamp,
         system_joint_coordinator,
@@ -6719,6 +6829,66 @@ mod joint_ledger_parse_tests {
             max: Some(2),
         };
         assert!(assert_quiet_twins_except(&coordinator, "t", &[exemption]).is_err());
+        Ok(())
+    }
+
+    /// The stopped-edge verdict accepts exactly the lane stop's disclosure
+    /// over the pre-stop count, and nothing else: every failure twin
+    /// (not lossy, a non-stop loss, an extra reason, a changed count,
+    /// historical-only returns, saturation, a stray `NoCalls`) fails.
+    #[test]
+    fn stopped_edge_accepts_only_the_stop_disclosure() {
+        use crate::discovery::caller_registry::instance_input::InstanceReason::{
+            CaptureStopped, NoCalls, OutOfOrderReturn, SemanticLoss,
+        };
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        use std::collections::BTreeSet;
+        let edge = StoppedEdge {
+            caller: CallerId(7),
+            module: ModuleId(0),
+            api_returns: Some(12),
+        };
+        let stop = BTreeSet::from([SemanticLoss, CaptureStopped]);
+        assert!(check_stopped_edge(&edge, true, &stop, Some(12), 0, false).is_ok());
+        assert!(check_stopped_edge(&edge, false, &stop, Some(12), 0, false).is_err());
+        let loss_only = BTreeSet::from([SemanticLoss]);
+        assert!(check_stopped_edge(&edge, true, &loss_only, Some(12), 0, false).is_err());
+        let cause_only = BTreeSet::from([CaptureStopped]);
+        assert!(check_stopped_edge(&edge, true, &cause_only, Some(12), 0, false).is_err());
+        let extra = BTreeSet::from([SemanticLoss, CaptureStopped, OutOfOrderReturn]);
+        assert!(check_stopped_edge(&edge, true, &extra, Some(12), 0, false).is_err());
+        assert!(check_stopped_edge(&edge, true, &stop, Some(11), 0, false).is_err());
+        assert!(check_stopped_edge(&edge, true, &stop, Some(13), 0, false).is_err());
+        assert!(check_stopped_edge(&edge, true, &stop, None, 0, false).is_err());
+        assert!(check_stopped_edge(&edge, true, &stop, Some(12), 1, false).is_err());
+        assert!(check_stopped_edge(&edge, true, &stop, Some(12), 0, true).is_err());
+        let stray = BTreeSet::from([NoCalls, SemanticLoss, CaptureStopped]);
+        assert!(check_stopped_edge(&edge, true, &stray, Some(12), 0, false).is_err());
+        // An edge that attributed nothing before the stop keeps NoCalls.
+        let silent = StoppedEdge {
+            api_returns: None,
+            ..edge
+        };
+        assert!(check_stopped_edge(&silent, true, &stray, None, 0, false).is_ok());
+        assert!(check_stopped_edge(&silent, true, &stop, None, 0, false).is_err());
+        assert!(check_stopped_edge(&silent, true, &stray, Some(1), 0, false).is_err());
+    }
+
+    /// A named stopped edge must exist: the stopped variant fails on a
+    /// coordinator without it, while the plain check (no stopped edges)
+    /// passes on the same coordinator.
+    #[test]
+    fn stopped_edge_must_exist() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let coordinator = system_joint_coordinator(&[])?;
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[]).is_ok());
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[]).is_ok());
+        let edge = StoppedEdge {
+            caller: CallerId(7),
+            module: ModuleId(0),
+            api_returns: Some(12),
+        };
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[edge]).is_err());
         Ok(())
     }
 

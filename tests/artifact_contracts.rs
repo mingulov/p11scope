@@ -775,6 +775,11 @@ fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
         ),
     ] {
         let expected = format!("{PARTITION_RUN}{partition} -- {WORKSPACE_TEST_GATE}");
+        let expected = if job == "tests" {
+            format!("{expected} --no-fail-fast")
+        } else {
+            expected
+        };
         if !step_calls(job_block(ci, job)).any(|call| call == expected) {
             return Err(format!(
                 "the scope line claims the workspace test gate, which the {job} job does not \
@@ -10734,7 +10739,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         );
     }
     // Exactly the two shares of the gate, and the gate in no other form.
-    let rest = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE}");
+    let rest = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE} --no-fail-fast");
     let shard = format!(
         "{PARTITION_RUN}\"contracts:${{{{ matrix.shard }}}}/{shards}\" -- {WORKSPACE_TEST_GATE}"
     );
@@ -10771,7 +10776,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         (
             coverage,
             format!(
-                "{PARTITION_RUN}\"${{{{ matrix.partition }}}}\" -- cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --no-report"
+                "{PARTITION_RUN}\"${{{{ matrix.partition }}}}\" -- cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --no-report --no-fail-fast"
             ),
         ),
         (

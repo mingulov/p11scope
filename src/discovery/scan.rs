@@ -6806,6 +6806,44 @@ mod tests {
     }
 
     #[test]
+    fn same_base_extension_anchor_preserves_known_prefix_and_extra_targets() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [
+            ("C_Initialize".to_string(), 0x500),
+            (function_name(103).unwrap().to_string(), 0x700),
+        ];
+        let exports = ObjectExports {
+            object: ObjectKey { device: Device { major: 8, minor: 1 }, inode: 7 },
+            symbols: &symbols,
+        };
+        for word in [0x2802u64, 0x0003, 0x0103] {
+            let mut snapshot = vec![0u8; 105 * 8];
+            snapshot[..8].copy_from_slice(&word.to_le_bytes());
+            snapshot[8..16].copy_from_slice(&0x1500u64.to_le_bytes());
+            snapshot[93 * 8..94 * 8].copy_from_slice(&0x1600u64.to_le_bytes());
+            snapshot[104 * 8..105 * 8].copy_from_slice(&0x1700u64.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64, &snapshot, 0x7000, &index,
+                &mut CaptureWorkBudget::default(), Some(&exports), || Some(0),
+            );
+            assert!(skipped.is_empty());
+            let targets: BTreeSet<_> = tables.iter().filter(|table| table.address == 0x7000)
+                .flat_map(|table| table.entries.iter().map(|entry| entry.file_offset)).collect();
+            assert_eq!(targets, [0x500, 0x600, 0x700].into_iter().collect(),
+                "{word:#x}: a shorter strict shape must not erase independently anchored targets");
+            assert!(tables.iter().enumerate().any(|(at, table)|
+                table.address == 0x7000 && table.decoded_slot_count() <= 92
+                    && table_evidence_score(at, &tables, &[], &[], &[], &exports).exports),
+                "the known prefix retains its exact own-export name evidence");
+            assert!(tables.iter().enumerate().any(|(at, table)|
+                table.address == 0x7000 && table.decoded_slot_count() == 104
+                    && !table_name_authorized(&table_evidence_score(at, &tables, &[], &[], &[], &exports))),
+                "unproven extension callbacks remain unknown/count-only");
+        }
+    }
+
+    #[test]
     fn runtime_fingerprint_is_not_reused_for_a_different_decoded_shape() {
         let maps = parse_maps(
             b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n6000-7000 rw-p 00000000 00:00 0\n",

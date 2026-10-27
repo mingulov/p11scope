@@ -21137,8 +21137,7 @@ fn an_expired_batch_deadline_admits_no_live_export_record() {
 #[test]
 fn engine_lowers_export_table_owner_and_prefix() {
     use p11scope_ebpf_common::{
-        DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
-        DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord,
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_STATUS_READ_FAILURE,
     };
 
     let (view, maps, mut record) = self_export_fixture(ProcessViewId(41));
@@ -51670,48 +51669,7 @@ fn collected_graph_matches_conservative_reference() {
 /// T8 helper: the `engine_lowers_export_table_owner_and_prefix`
 /// lowered module for the test process itself.
 fn facts_lowered_self_export() -> (ProcessView, ScannedModule) {
-    use p11scope_ebpf_common::{DISCOVERY_KIND_FUNCTION_LIST_RETURN, DiscoveryRecord};
-
-    let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
-    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-    let executable = std::env::current_exe().unwrap();
-    let executable = executable.canonicalize().unwrap_or(executable);
-    let owner = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode != 0
-                && mapping.permissions[0] == b'r'
-                && mapping.permissions[2] != b'x'
-                && matches!(
-                    map_index.resolve(mapping.start),
-                    Resolved::File {
-                        path: MappedPath::Usable(ref path),
-                        ..
-                    } if path == &executable
-                )
-        })
-        .expect("the test executable has a file-backed data mapping");
-    let code = maps
-        .iter()
-        .find(|mapping| {
-            mapping.inode == owner.inode
-                && mapping.device == owner.device
-                && mapping.permissions[2] == b'x'
-        })
-        .expect("the test executable has a matching code mapping");
-
-    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
-    record.symbol_id = 1;
-    record.table_ptr = owner.start;
-    record.version_major = 2;
-    record.version_minor = 40;
-    record.pointers[0] = code.start;
-    record.pointers_attempted = 1;
-    record.completed_prefix = 1;
-    record.usable_n = 1;
-
+    let (view, maps, record) = self_export_fixture(ProcessViewId(41));
     let hooks = crate::discovery::hooks::HookRegistry::builtin();
     let limits = ScanLimits {
         per_object_bytes: u64::MAX,
@@ -52621,7 +52579,10 @@ fn acquired_unreadable_header_keeps_the_complete_observed_body() {
     words[0] = 0xe707;
     words[1..].fill(0);
     words[68] = target;
-    assert_eq!(unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) }, 0);
+    assert_eq!(
+        unsafe { libc::mprotect(fixture.base, fixture.page, libc::PROT_NONE) },
+        0
+    );
     let mut record = compatibility_publication_record(address, 0, 68);
     record.status_flags = p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE;
     let module = compatibility_lower_self(&record);
@@ -52629,7 +52590,10 @@ fn acquired_unreadable_header_keeps_the_complete_observed_body() {
     assert_eq!(table.entries.len(), 1);
     assert_eq!(table.entries[0].name, "C_WaitForSlotEvent");
     assert_eq!(table.null_entries.len(), 67);
-    assert_eq!(table.walk, "full", "metadata does not change the observed extent");
+    assert_eq!(
+        table.walk, "full",
+        "metadata does not change the observed extent"
+    );
     // The mandatory tuple is a placeholder; engine diagnostics disclose that
     // neither capture nor validation observed these metadata bytes.
     assert_eq!(table.version, (0, 0));
@@ -52651,19 +52615,66 @@ fn failed_acquisition_keeps_targets_and_discloses_uncertain_metadata() {
         per_object_bytes: u64::MAX,
         total_bytes: u64::MAX,
     });
-    let outcome = engine.process_export_record(
-        &record, &mut ScriptedSession::default(), &mut true, &mut PendingViewRetirements::new(),
-    ).unwrap();
+    let outcome = engine
+        .process_export_record(
+            &record,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
     assert!(outcome.required_complete());
     assert_eq!(engine.plan.slots.len(), 1, "the observed target survives");
-    assert_eq!(engine.modules[0].scanned.tables[0].version, (2, 40), "fresh metadata is factual");
+    assert_eq!(
+        engine.modules[0].scanned.tables[0].version,
+        (2, 40),
+        "fresh metadata is factual"
+    );
     assert_eq!(engine.discovery_truncated, 0);
     assert!(engine.counters.object_skips.iter().any(|skip|
         skip.reason.contains("read failure") && skip.reason.contains("1 completed")),
         "unread words are diagnosed separately from NULL");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("metadata")
+                && skip.reason.contains("unavailable")
+                && skip.reason.contains("placeholder")),
+        "zero capture metadata is not claimed as observed version 0.0"
+    );
+}
+
+#[test]
+fn version_only_change_keeps_matching_words_but_pointer_changes_refuse() {
+    let (view, maps, mut record) = self_export_fixture(ProcessViewId(0));
+    record.version_major = 3;
+    record.version_minor = 2;
+    let mut changed_pointer = record;
+    changed_pointer.pointers[0] += 1;
+    assert!(matches!(lower_heap_publication_record(
+        &view, &MapIndex::new(&maps).unwrap(), &HookRegistry::builtin(), &changed_pointer,
+        &[], &mut CaptureWorkBudget::default(), None,
+    ).unwrap(), HeapLowerOutcome::Refused(
+        "a published table changed between the probe capture and validation"
+    )));
+    let mut engine = Engine::empty();
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    });
+    let outcome = engine.process_export_record(
+        &record, &mut ScriptedSession::default(), &mut true, &mut PendingViewRetirements::new(),
+    ).unwrap();
+    assert!(outcome.required_complete());
+    assert_eq!(engine.plan.slots.len(), 1, "matching observed words survive metadata changes");
+    assert_eq!(engine.modules[0].scanned.tables[0].version, (2, 40));
     assert!(engine.counters.object_skips.iter().any(|skip|
-        skip.reason.contains("metadata") && skip.reason.contains("unavailable") && skip.reason.contains("placeholder")),
-        "zero capture metadata is not claimed as observed version 0.0");
+        skip.reason.contains("metadata changed") && skip.reason.contains("3.2") && skip.reason.contains("2.40")),
+        "the metadata change remains explicit");
 }
 
 #[test]

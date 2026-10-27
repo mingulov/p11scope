@@ -3313,20 +3313,32 @@ impl BankIo for NativeIo<'_> {
 const COUNTER_VERIFIER_BUDGET_REFUSAL: &str = "counter-mode-unavailable-on-kernel: the kernel verifier rejected a counter program as too complex (E2BIG)";
 
 /// Finite refusal for a counter-object preflight load failure: only a
-/// real E2BIG becomes the old-kernel token; any other failure names
-/// its errno class (or a static fallback when no errno is present) so
-/// callers treat it as unproven instead of refused. The loader error
-/// itself is never rendered: its Display can carry the verifier log.
+/// genuine program-load E2BIG becomes the old-kernel token; any other
+/// failure names its errno class (or a static fallback when no errno is
+/// present) so callers treat it as unproven instead of refused. The loader
+/// error itself is never rendered: its Display can carry the verifier log.
 fn counter_load_refusal(error: &anyhow::Error) -> String {
-    let mut io_error = None;
-    for cause in error.chain() {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            io_error = Some(io);
-            if super::is_verifier_budget_errno(io.raw_os_error()) {
-                return COUNTER_VERIFIER_BUDGET_REFUSAL.to_string();
-            }
-        }
+    // The token needs a genuine BPF_PROG_LOAD E2BIG, as
+    // `map_counter_verifier_budget_refusal` checks: a map-create E2BIG or a
+    // bare io E2BIG is unproven and keeps its own error.
+    let budget = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<aya::programs::ProgramError>()
+            .is_some_and(|program| {
+                matches!(
+                    program,
+                    aya::programs::ProgramError::LoadError { io_error, .. }
+                    if super::is_verifier_budget_errno(io_error.raw_os_error())
+                )
+            })
+    });
+    if budget {
+        return COUNTER_VERIFIER_BUDGET_REFUSAL.to_string();
     }
+    let io_error = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .last();
     match io_error {
         Some(io) => format!("counter object load failed ({io})"),
         None => "counter object load failed before the verifier ran".to_string(),

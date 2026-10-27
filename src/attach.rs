@@ -5277,14 +5277,16 @@ pub(crate) fn program_name_in_preparation_context(context: &str) -> Option<Strin
     }
     // Detailed and counter loads name the program in `loading ...` stages
     // (`loading {prog}`, `loading {prog} for multi attach`,
-    // `loading required raw|typed {prog}`); only those shapes qualify, so
-    // a BTF or object stage never yields a program name.
+    // `loading required raw|typed {prog}`,
+    // `loading private counter root {prog}`); only those shapes qualify,
+    // so a BTF or object stage never yields a program name.
     if let Some(rest) = context.split_once("loading ").map(|(_, rest)| rest) {
         let line = rest.lines().next().unwrap_or_default();
         let candidate = line.strip_suffix(" for multi attach").unwrap_or(line);
         let candidate = candidate
             .strip_prefix("required raw ")
             .or_else(|| candidate.strip_prefix("required typed "))
+            .or_else(|| candidate.strip_prefix("private counter root "))
             .unwrap_or(candidate);
         if !candidate.is_empty()
             && candidate.len() <= 64

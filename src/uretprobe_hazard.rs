@@ -289,10 +289,18 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
         })
     };
     let attaching = error.to_string() == SELF_PROBE_ATTACH_CONTEXT;
+    // A refused program load carries the kernel's whole verifier log, and
+    // the verdict reaches stderr and doctor as a plain string no later seam
+    // can bound — so a load refusal routes through the shared bounded
+    // formatter. Any other failure is small and keeps its text.
+    let why = match crate::attach::summarize_load_refusal_for_stderr(error) {
+        Some(summary) => summary,
+        None => format!("{error:#}"),
+    };
     if errno(libc::EPERM) || (attaching && errno(libc::EACCES)) {
-        KernelVerdict::NotPermitted(format!("{error:#}"))
+        KernelVerdict::NotPermitted(why)
     } else {
-        KernelVerdict::Unknown(format!("{error:#}"))
+        KernelVerdict::Unknown(why)
     }
 }
 

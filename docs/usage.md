@@ -25,8 +25,10 @@ implementation limits are code contracts, not measurements.
 capture for `profile` or `run` with `--mode metrics`, available on 6.6+
 (LP64). On 5.15 and 6.1 every mode refuses with the named
 `counter-mode-unavailable-on-kernel` reason before capture setup or
-owned-child launch. Omit `--counter-mode` to keep existing metrics
-behavior.
+owned-child launch. Latency banks grow with the host possible-CPU count
+and refuse with `counter-memory-limit` past the per-capture kernel-map
+memory cap on hosts with many CPUs. Omit `--counter-mode` to keep
+existing metrics behavior.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)

@@ -5256,6 +5256,88 @@ mod promotion_lifecycle_tests {
     }
 
     #[test]
+    fn manifest_pinning_without_a_split_keeps_the_fd_key_only() {
+        use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let fixture = SelectedProviderFixture::new();
+        let fd_key = fixture
+            .pins
+            .pinned()
+            .next()
+            .expect("fixture pins one object")
+            .key;
+        // An inconclusive probe on overlayfs: the kernel renders nothing
+        // usable, so the pin must stay fd-only instead of fabricating a
+        // maps rendering.
+        let absent = ObjectKey {
+            device: Device {
+                major: fd_key.device.major,
+                minor: fd_key.device.minor.wrapping_add(1),
+            },
+            inode: fd_key.inode,
+        };
+        assert_ne!(absent, fd_key, "the test needs a genuine non-key");
+        let mut budget = CaptureWorkBudget::default();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_probe(
+                &fixture.manifest,
+                &[],
+                &mut budget,
+                &probe,
+            )
+            .expect("pinning succeeds without a split");
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 1);
+        let pin = pinning.pins.pinned().next().expect("one object");
+        let id = pin.id;
+        assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
+        assert_eq!(
+            pin.probed_maps_key, None,
+            "no fabricated maps rendering rides the entry"
+        );
+        let path = pin.path.to_owned();
+        let sha256 = pin.sha256.to_owned();
+        assert_eq!(
+            pinning.pins.id_for_path(&path),
+            Some(id),
+            "the record path still resolves through one manifest raw"
+        );
+        let subset = AttestedSubset {
+            plan: plan::AttachPlan::from_slots(vec![]),
+            pins: pinning.pins,
+            required: BTreeMap::from([(id, BTreeSet::new())]),
+        };
+        let fd_module = ModuleKey::physical(
+            fd_key.device.major,
+            fd_key.device.minor,
+            fd_key.inode,
+            Some(sha256.clone()),
+            &path,
+        );
+        assert!(
+            subset.proves_provider_module(id, &fd_module),
+            "the fd key still proves the provider"
+        );
+        let absent_module = ModuleKey::physical(
+            absent.device.major,
+            absent.device.minor,
+            absent.inode,
+            Some(sha256),
+            &path,
+        );
+        assert!(
+            !subset.proves_provider_module(id, &absent_module),
+            "no maps key proves without a probed rendering"
+        );
+        assert_eq!(
+            provider_object_for_key(&subset.pins, &absent_module),
+            None,
+            "the mirror finds no unprobed maps key"
+        );
+    }
+
+    #[test]
     fn selected_subset_partitions_the_rival_aware_plan() {
         let first = SelectedProviderFixture::new();
         let second = SelectedProviderFixture::new();

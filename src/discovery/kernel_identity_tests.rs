@@ -5462,6 +5462,8 @@ fn unvisited_and_below_threshold_classified_separately() {
     assert_eq!(watched.target_reads, 0);
     assert_eq!(unvisited.target_reads, 1);
     assert_eq!(below.attempts, 0);
+}
+
 // Cached strict census for examined custody: one strict census per custody
 // phase plus a local ledger, instead of one census per offered object. The
 // safety rule is unchanged: an anchor is never taken below three

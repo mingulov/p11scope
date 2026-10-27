@@ -87,13 +87,13 @@ v0.4.0 on hosts with many processes mapping providers from btrfs:
 each file needs extra per-file checks for btrfs to identify it
 correctly. This affects `inventory --system --identity-backend
 userspace`, and the userspace path when kernel identity is
-unavailable. Measured on Fedora (Linux 7.2.9; 10 rounds, 400
+unavailable. Earlier v0.5.0 candidate runs on Fedora (Linux 7.2.9; 10 rounds, 400
 processes by 8 providers on btrfs), the confirm stage's slowest 5%
 ran about 7–14% slower and the whole scan about 5–10% slower, but
 host noise is large: it moved an unchanged comparison run by 17%.
 The default `--identity-backend auto` uses kernel identity where
-available. These numbers will be refreshed from the final release
-measurement, and a speed-up is planned for a later 0.5.x.
+available. The release notes carry the final candidate's measurement;
+a speed-up is planned for a later 0.5.x.
 
 On some overlayfs setups before Linux 6.8, p11scope may be unable to
 prove how a provider file appears in /proc maps: the opened file and

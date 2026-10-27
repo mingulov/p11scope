@@ -2140,6 +2140,112 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn refused_object_base_output_keeps_one_exact_ordinary_record() {
+        use p11scope_ebpf_common::object_flow::{
+            RefusedBaseOutcome, continuity_joins, preserve_refused_base,
+        };
+        use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp, instance};
+        use std::cell::Cell;
+        let rows = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+        let stamp = InstanceStamp {
+            epoch: 7,
+            global: 9,
+            fault: 11,
+            file_slot_plus1: 3,
+            flags: instance::STAMP_VALID,
+        };
+        let mut straddled = stamp;
+        straddled.epoch += 1;
+        let mut faulted = stamp;
+        faulted.flags |= instance::STAMP_LOCAL_FAULT;
+        for (entry_stamp, return_stamp) in [
+            (InstanceStamp::default(), stamp),
+            (stamp, straddled),
+            (faulted, faulted),
+        ] {
+            let base = EventRecord {
+                event: Event {
+                    event_type: event_type::CALL,
+                    slot: 12,
+                    ts_ns: 800,
+                    duration_ns: 91,
+                    rv: 7,
+                    ..Default::default()
+                },
+                continuity: InstanceContinuity {
+                    entry_ip: 0x1234,
+                    entry_stamp,
+                    return_stamp,
+                },
+            };
+            assert!(!continuity_joins(&base.continuity));
+            let original_prefix = record_bytes(&base);
+            for (retired, output_ok, expected) in [
+                (true, true, RefusedBaseOutcome::Emitted),
+                (true, false, RefusedBaseOutcome::OutputFailed),
+                (false, true, RefusedBaseOutcome::RetirementFailed),
+                (false, false, RefusedBaseOutcome::RetirementFailed),
+            ] {
+                let stage = Cell::new(0);
+                let mut delivered = Vec::new();
+                let outcome = preserve_refused_base(
+                    || {
+                        assert_eq!(stage.replace(1), 0);
+                        retired
+                    },
+                    || assert_eq!(stage.replace(2), 1),
+                    || {
+                        assert_eq!(stage.replace(3), 2);
+                        if output_ok {
+                            // Aya output copies the exact borrowed EventRecord,
+                            // never the uninitialized 240-byte object suffix.
+                            delivered.push(record_bytes(&base));
+                        }
+                        output_ok
+                    },
+                );
+                assert_eq!(outcome, expected);
+                assert_eq!(stage.get(), if retired { 3 } else { 2 });
+                assert_eq!(delivered.len(), usize::from(retired && output_ok));
+                for bytes in delivered {
+                    assert_eq!(bytes.len(), 368);
+                    assert_eq!(bytes, original_prefix);
+                    let decoded = decode_object_record(&bytes, &rows).unwrap();
+                    assert_eq!(record_bytes(&decoded.base), original_prefix);
+                    assert!(!continuity_joins(&decoded.base.continuity));
+                    assert!(decoded.object.is_none());
+                    assert!(decoded.joint_resource.is_none());
+                }
+            }
+            let mut unfilled_object = original_prefix;
+            unfilled_object.extend_from_slice(&[0u8; OBJECT_TAIL_BYTES]);
+            assert_eq!(unfilled_object.len(), 608);
+            assert!(decode_object_record(&unfilled_object, &rows).is_none());
+        }
+        // Healthy extended transport still carries a validated tail once;
+        // preserving refused bases never changes the atomic 608-byte decoder.
+        let mut healthy = ordinary_object_transport_record(12);
+        let healthy_base = EventRecord {
+            event: Event {
+                event_type: event_type::CALL,
+                slot: 12,
+                ..Default::default()
+            },
+            continuity: InstanceContinuity {
+                entry_ip: 0x1234,
+                entry_stamp: stamp,
+                return_stamp: stamp,
+            },
+        };
+        healthy[..368].copy_from_slice(&record_bytes(&healthy_base));
+        let decoded = decode_object_record(&healthy, &rows).unwrap();
+        assert!(continuity_joins(&decoded.base.continuity));
+        assert!(decoded.object.is_some());
+        assert!(decoded.joint_resource.is_none());
+        assert_eq!(healthy.len(), 608);
+    }
+
     // A drift back to the strict 368-byte decoder loses the first call;
     // accepting only a valid prefix of the 608-byte envelope admits slot 99.
     fn check_ordinary_object_transport_route(route: u8) {

@@ -1282,6 +1282,8 @@ struct EmissionOutcome {
     tailed: bool,
     emitted: bool,
     fault_required: bool,
+    base_emitted: bool,
+    base_output_attempts: usize,
     side: p11scope_ebpf_common::object_wire::ObjectStart,
     tail: p11scope_ebpf_common::object_wire::ObjectCallWire,
 }
@@ -1330,13 +1332,35 @@ fn run_production_return_arm(
     retire_ok: bool,
 ) -> EmissionOutcome {
     use p11scope_ebpf_common::object_flow::{
-        adapter_emit_find, adapter_emit_get_attributes, adapter_fill_return, adapter_tail_fill,
-        continuity_joins, emission_finalize,
+        RefusedBaseOutcome, adapter_emit_find, adapter_emit_get_attributes, adapter_fill_return,
+        adapter_tail_fill, continuity_joins, emission_finalize, preserve_refused_base,
     };
     use p11scope_ebpf_common::object_wire::ObjectCallWire;
     let descriptor = side.descriptor_index;
     // Gate: the production predicate on the reserved record's stamps.
     let joined = continuity_joins(continuity);
+    if !joined {
+        let outputs = std::cell::Cell::new(0);
+        let outcome = preserve_refused_base(
+            || retire_ok,
+            || {},
+            || {
+                outputs.set(outputs.get() + 1);
+                true
+            },
+        );
+        return EmissionOutcome {
+            joined,
+            filled: false,
+            tailed: false,
+            emitted: false,
+            fault_required: true,
+            base_emitted: outcome == RefusedBaseOutcome::Emitted,
+            base_output_attempts: outputs.get(),
+            side,
+            tail: ObjectCallWire::default(),
+        };
+    }
     // Fills in root order; each stage short-circuits like the root, so a
     // refused fill runs no later adapter and touches no tail.
     let (reader, _) = adapter::readers(target);
@@ -1396,6 +1420,8 @@ fn run_production_return_arm(
         tailed,
         emitted,
         fault_required: !joined || outcome.faulted,
+        base_emitted: false,
+        base_output_attempts: 0,
         side,
         tail,
     }
@@ -1437,8 +1463,8 @@ fn pin_continuity_gate_precedes_fills() {
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The continuity fill and its join gate precede every object result
-    // read; the gate arm discards the reservation, retires ownership and
-    // faults instead of emitting.
+    // read; the gate arm retires ownership and faults, preserves only the
+    // ordinary base, then discards the unfilled object reservation.
     let continuity = returned
         .find("p11_instance_return(&key,")
         .expect("return must fill continuity on the object arm");
@@ -1513,6 +1539,50 @@ fn pin_continuity_gate_precedes_fills() {
     );
 }
 
+/// Continuity refusal preserves the initialized ordinary return without
+/// granting permission to fill an object tail. The shared adapter's executed
+/// cleanup/output controls are covered by the common and raw decoder tests.
+#[test]
+fn object_return_refused_continuity_keeps_ordinary_base() {
+    pin_continuity_gate_precedes_fills();
+    let source = bpf_source();
+    let returned = source_between(
+        &source,
+        "fn object_return(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    let arm = source_between(returned, "if !joined {", "let tail =");
+    let preserve = arm
+        .find("preserve_refused_base(")
+        .expect("a refused object join must preserve one ordinary base after checked retirement");
+    let output = arm
+        .find("EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0)")
+        .expect("copy exactly the initialized 368-byte EventRecord, with its original stamps");
+    let discard = arm
+        .find("entry.discard(0)")
+        .expect("release the original reservation");
+    assert!(
+        preserve < output && output < discard,
+        "output must run while the original reservation is owned"
+    );
+    assert!(arm.contains("|| owned_start_remove(&key, true).is_ok()"));
+    assert!(arm.contains("RefusedBaseOutcome::OutputFailed"));
+    assert!(arm.contains("bump_evidence(EVIDENCE_RING_LOSS)"));
+    assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
+    assert!(
+        !arm[discard..].contains("raw"),
+        "never read a discarded reservation"
+    );
+    assert!(!arm.contains("object_fill_return("));
+    assert!(!arm.contains("object_tail_fill("));
+    assert!(!arm.contains("object_emit_"));
+    let healthy = source_between(returned, "let tail =", "entry.submit(0)");
+    assert!(
+        !healthy.contains("EVENTS.output"),
+        "healthy 608-byte returns do not copy a second record"
+    );
+}
+
 /// G02/E1: refused continuity performs zero result-handle reads. Healthy
 /// twin reads the exact expected result once and retains the joined
 /// stamps; every refusal (absent entry, straddled epoch/global/fault/
@@ -1557,6 +1627,11 @@ fn object_return_continuity_refuses_before_reads() {
             "{layout:?} healthy twin must read the exact result once"
         );
         assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
+        assert!(!outcome.base_emitted);
+        assert_eq!(
+            outcome.base_output_attempts, 0,
+            "healthy 608 path copies no base"
+        );
         assert_eq!(
             outcome.side.result_statuses,
             [handle_status::VALUE, handle_status::ABSENT]
@@ -1687,6 +1762,26 @@ fn object_return_continuity_refuses_before_reads() {
                 outcome.fault_required,
                 "{layout:?} {name}: refused continuity faults visibly"
             );
+            assert!(
+                outcome.base_emitted,
+                "{layout:?} {name}: retain one ordinary return"
+            );
+            assert_eq!(outcome.base_output_attempts, 1);
+
+            let failed_retirement = run_production_return_arm(
+                &target,
+                layout,
+                healthy_side(),
+                &row,
+                adapter::rv_ok(),
+                &continuity_of(entry, ret),
+                capture::MECHANISM_VALUE,
+                0,
+                false,
+            );
+            assert!(!failed_retirement.base_emitted);
+            assert_eq!(failed_retirement.base_output_attempts, 0);
+            adapter::assert_no_target_reads(&target, "failed retirement grants no object reads");
         }
     }
     pin_continuity_gate_precedes_fills();

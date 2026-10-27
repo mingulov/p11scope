@@ -1184,6 +1184,36 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
     }
 }
 
+/// Outcome of retaining an ordinary return after its object join refused.
+/// This is a private producer decision, not a wire value or a join grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBaseOutcome {
+    RetirementFailed,
+    OutputFailed,
+    Emitted,
+}
+
+/// Retire the START exactly once and fault object continuity before copying
+/// the already initialized ordinary base. A failed retirement cannot emit a
+/// duplicate-capable return. The caller still owns its object reservation
+/// through this call and must discard it afterwards on every outcome.
+#[inline(always)]
+pub fn preserve_refused_base(
+    remove: impl FnOnce() -> bool,
+    fault: impl FnOnce(),
+    output_base: impl FnOnce() -> bool,
+) -> RefusedBaseOutcome {
+    let retired = remove();
+    fault();
+    if !retired {
+        RefusedBaseOutcome::RetirementFailed
+    } else if output_base() {
+        RefusedBaseOutcome::Emitted
+    } else {
+        RefusedBaseOutcome::OutputFailed
+    }
+}
+
 /// Production entry attribute-inspection path (H7-E4 seam).
 ///
 /// Inspects one authorized creation-template pair and populates `out`
@@ -1271,6 +1301,32 @@ pub fn production_capture_get_return(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_base_requires_retirement_and_fault_before_output() {
+        use core::cell::Cell;
+        for (retired, output_ok, expected) in [
+            (true, true, RefusedBaseOutcome::Emitted),
+            (true, false, RefusedBaseOutcome::OutputFailed),
+            (false, true, RefusedBaseOutcome::RetirementFailed),
+            (false, false, RefusedBaseOutcome::RetirementFailed),
+        ] {
+            let stage = Cell::new(0);
+            let outcome = preserve_refused_base(
+                || {
+                    assert_eq!(stage.replace(1), 0);
+                    retired
+                },
+                || assert_eq!(stage.replace(2), 1),
+                || {
+                    assert_eq!(stage.replace(3), 2);
+                    output_ok
+                },
+            );
+            assert_eq!(outcome, expected);
+            assert_eq!(stage.get(), if retired { 3 } else { 2 });
+        }
+    }
 
     /// P0-only ship vehicle: the default build wires FULL object
     /// attribute capture. Only the `stub-object-attributes` BPF build

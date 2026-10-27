@@ -79,9 +79,10 @@ use p11scope_ebpf_common::object_capture::{
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
-    ReturnEventFacts, adapter_attributes_entry, adapter_derive_entry, adapter_emit_find_control,
-    adapter_emit_get_control, adapter_fill_return_control, adapter_tail_fill, continuity_joins,
-    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
+    RefusedBaseOutcome, ReturnEventFacts, adapter_attributes_entry, adapter_derive_entry,
+    adapter_emit_find_control, adapter_emit_get_control, adapter_fill_return_control,
+    adapter_tail_fill, continuity_joins, decode_return_gate, emission_finalize, encode_return_gate,
+    fill_call_event, preserve_refused_base,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -4186,8 +4187,8 @@ fn object_return(
     // and its continuity landing in the reserved record FIRST, then
     // the join gate before any object result read, then (with the S1
     // return-time mechanism evidence the return body just captured)
-    // the result fills and tail sections. Any refusal discards: no
-    // facts. A found continuity entry is not a join: only the full
+    // the result fills and tail sections. A refused join preserves only
+    // the ordinary base. A found continuity entry is not a join: only the full
     // stamp predicate authorizes result/Find/attribute reads.
     let raw = entry.as_mut_ptr();
     unsafe {
@@ -4201,9 +4202,19 @@ fn object_return(
     }
     let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
     if !joined {
-        let _ = owned_start_remove(&key, true);
-        unsafe { p11_object_fault() };
+        let outcome = preserve_refused_base(
+            || owned_start_remove(&key, true).is_ok(),
+            || unsafe { p11_object_fault() },
+            // SAFETY: fill_call_event and p11_instance_return initialized
+            // every byte of this 368-byte base while the reservation was
+            // owned. Copy it before discard; the unfilled object tail is
+            // never read, and the original failing stamps remain unchanged.
+            || EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok(),
+        );
         entry.discard(0);
+        if outcome == RefusedBaseOutcome::OutputFailed {
+            bump_evidence(EVIDENCE_RING_LOSS);
+        }
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }

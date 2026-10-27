@@ -5234,7 +5234,7 @@ mod promotion_lifecycle_tests {
             fd_key.device.major,
             fd_key.device.minor,
             fd_key.inode,
-            Some(sha256),
+            Some(sha256.clone()),
             &path,
         );
         assert!(
@@ -5252,6 +5252,54 @@ mod promotion_lifecycle_tests {
             provider_object_for_key(&subset.pins, &fd_module),
             Some(id),
             "the mirror keeps finding the fd-keyed provider"
+        );
+        // A module on the split device but with a DIFFERENT inode must NOT
+        // prove: the rendering only names this exact fd's inode, and a
+        // recycled inode naming another file is the recorded identity trap.
+        let reused_inode = split.inode.wrapping_add(1);
+        assert_ne!(
+            reused_inode, fd_key.inode,
+            "the test needs a genuinely different inode"
+        );
+        let reused = ModuleKey::physical(
+            split.device.major,
+            split.device.minor,
+            reused_inode,
+            Some(sha256.clone()),
+            &path,
+        );
+        assert!(
+            !subset.proves_provider_module(id, &reused),
+            "a split-device module with a different inode must not prove the provider"
+        );
+        assert_eq!(
+            provider_object_for_key(&subset.pins, &reused),
+            None,
+            "the mirror refuses the reused inode too"
+        );
+        // A module on the split key with a DIFFERENT digest must NOT prove:
+        // the sha256 conjunct is what keeps a same-key impostor out. The
+        // digest stays non-empty so only the equality conjunct refuses.
+        let wrong_digest = format!("{sha256}x");
+        assert_ne!(
+            wrong_digest, sha256,
+            "the test needs a genuinely different digest"
+        );
+        let impostor = ModuleKey::physical(
+            split.device.major,
+            split.device.minor,
+            split.inode,
+            Some(wrong_digest),
+            &path,
+        );
+        assert!(
+            !subset.proves_provider_module(id, &impostor),
+            "a split-keyed module with a different digest must not prove the provider"
+        );
+        assert_eq!(
+            provider_object_for_key(&subset.pins, &impostor),
+            None,
+            "the mirror refuses the wrong digest too"
         );
     }
 

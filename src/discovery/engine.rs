@@ -894,7 +894,6 @@ struct CaptureHistory {
     selections: Vec<LiveSelectionTuple>,
     selection_truncated: bool,
     standard_exports: BTreeMap<plan::ModuleId, BTreeSet<StandardExportFact>>,
-    standard_requirements: BTreeMap<plan::ModuleId, BTreeSet<StandardRequirementFact>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -904,44 +903,17 @@ enum StandardExportFact {
     Outside,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum StandardRequirementFact {
-    Legacy,
-    V3,
-}
-
-fn standard_export_status(
-    exports: Option<&BTreeSet<StandardExportFact>>,
-    requirements: Option<&BTreeSet<StandardRequirementFact>>,
-) -> &'static str {
-    match (exports, requirements) {
-        (Some(exports), _)
-            if exports.len() == 1 && exports.contains(&StandardExportFact::Present) =>
-        {
-            "present"
-        }
-        (Some(exports), _)
-            if exports.len() == 1 && exports.contains(&StandardExportFact::Outside) =>
-        {
-            "outside_module"
-        }
-        (Some(exports), Some(requirements))
-            if exports.len() == 1
-                && exports.contains(&StandardExportFact::Absent)
-                && requirements.len() == 1
-                && requirements.contains(&StandardRequirementFact::Legacy) =>
-        {
-            "legacy_absent"
-        }
-        (Some(exports), Some(requirements))
-            if exports.len() == 1
-                && exports.contains(&StandardExportFact::Absent)
-                && requirements.len() == 1
-                && requirements.contains(&StandardRequirementFact::V3) =>
-        {
-            "required_absent"
-        }
-        _ => "unresolved",
+/// Historical schema spelling for a proven absent optional export. Version
+/// metadata never makes an observed absence a discovery failure.
+fn standard_export_status(exports: Option<&BTreeSet<StandardExportFact>>) -> &'static str {
+    let Some(exports) = exports.filter(|facts| facts.len() == 1) else {
+        return "unresolved";
+    };
+    match exports.first() {
+        Some(StandardExportFact::Present) => "present",
+        Some(StandardExportFact::Absent) => "legacy_absent",
+        Some(StandardExportFact::Outside) => "outside_module",
+        None => "unresolved",
     }
 }
 
@@ -1324,14 +1296,9 @@ fn canonical_selection_targets(
     }
     targets
         .into_iter()
-        .map(
-            |((object, file_offset, name), object_path)| plan::SelectionTableTarget {
-                object,
-                object_path,
-                file_offset,
-                name,
-            },
-        )
+        .map(|((object, file_offset, name), object_path)| {
+            plan::SelectionTableTarget::provider_local(object, object_path, file_offset, name)
+        })
         .collect()
 }
 
@@ -1339,8 +1306,14 @@ fn same_selection_target_set(
     left: &[plan::SelectionTableTarget],
     right: &[plan::SelectionTableTarget],
 ) -> bool {
-    let identity =
-        |target: &plan::SelectionTableTarget| (target.object, target.file_offset, target.name);
+    let identity = |target: &plan::SelectionTableTarget| {
+        (
+            target.object,
+            target.file_offset,
+            target.name,
+            target.ordinal,
+        )
+    };
     let mut left = left.iter().map(identity).collect::<Vec<_>>();
     let mut right = right.iter().map(identity).collect::<Vec<_>>();
     left.sort();
@@ -1463,6 +1436,7 @@ pub(crate) fn manifest_selection_targets<'a>(
     manifest: &'a Manifest,
     pinned: &'a PinnedObjects,
 ) -> impl Iterator<Item = (u8, Vec<plan::SelectionTableTarget>)> + 'a {
+    let provider = manifest_module_object(manifest, pinned);
     let reachable: BTreeSet<_> = manifest
         .selection_evidence
         .queries
@@ -1475,9 +1449,14 @@ pub(crate) fn manifest_selection_targets<'a>(
         .tables
         .iter()
         .filter(move |table| reachable.contains(&table.id))
-        .map(|table| {
+        .map(move |table| {
+            let Some(provider) = provider else {
+                return (table.id, Vec::new());
+            };
+            let name_authorized =
+                crate::manifest_input::selection_table_name_authorized(manifest, table.id);
             let mut targets = Vec::new();
-            for function in &table.functions {
+            for (ordinal, function) in table.functions.iter().enumerate() {
                 let Resolution::Resolved {
                     object,
                     file_offset,
@@ -1491,7 +1470,7 @@ pub(crate) fn manifest_selection_targets<'a>(
                 let Some(object) = pinned.id_for_manifest(key, path) else {
                     continue;
                 };
-                let Some(name) = pkcs11_module::FUNCTION_LIST_FIELDS
+                let Some(canonical_name) = pkcs11_module::FUNCTION_LIST_FIELDS
                     .iter()
                     .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
                     .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
@@ -1500,12 +1479,25 @@ pub(crate) fn manifest_selection_targets<'a>(
                 else {
                     continue;
                 };
-                targets.push(plan::SelectionTableTarget {
+                let Ok(ordinal) = u16::try_from(ordinal) else {
+                    continue;
+                };
+                let name = if name_authorized {
+                    canonical_name
+                } else {
+                    plan::UNKNOWN_FUNCTION_NAME
+                };
+                if let Some(target) = plan::SelectionTableTarget::from_pinned(
+                    provider,
                     object,
-                    object_path: path.into(),
+                    path.into(),
                     file_offset,
                     name,
-                });
+                    ordinal,
+                    pinned,
+                ) {
+                    targets.push(target);
+                }
             }
             (table.id, targets)
         })
@@ -1543,16 +1535,6 @@ fn lower_manifest_selection_tables(
         }
     }
     (admissions, refused)
-}
-
-fn manifest_walk_label(walk: &WalkOutcome) -> String {
-    match walk {
-        WalkOutcome::Full => "full".into(),
-        WalkOutcome::KnownPrefix => "known_prefix".into(),
-        WalkOutcome::Refused => "refused".into(),
-        WalkOutcome::NotWalked => "not_walked".into(),
-        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
-    }
 }
 
 fn manifest_acquisition_label(acquisition: &Acquisition) -> String {
@@ -2009,20 +1991,6 @@ impl CaptureFacts {
                     StandardExportFact::Absent
                 },
             );
-            for table in &module.scanned.tables {
-                let requirement = match table.version.0 {
-                    2 => Some(StandardRequirementFact::Legacy),
-                    3.. => Some(StandardRequirementFact::V3),
-                    _ => None,
-                };
-                if let Some(requirement) = requirement {
-                    history
-                        .standard_requirements
-                        .entry(owner)
-                        .or_default()
-                        .insert(requirement);
-                }
-            }
             let mut targets = BTreeMap::new();
             let mut skips = BTreeMap::new();
             let mut surfaces = BTreeMap::new();
@@ -2233,19 +2201,6 @@ impl CaptureFacts {
                 .entry(owner)
                 .or_default()
                 .insert(export);
-            for surface in &manifest.surfaces {
-                if let Some(requirement) = surface.version.and_then(|version| match version.major {
-                    2 => Some(StandardRequirementFact::Legacy),
-                    3.. => Some(StandardRequirementFact::V3),
-                    _ => None,
-                }) {
-                    history
-                        .standard_requirements
-                        .entry(owner)
-                        .or_default()
-                        .insert(requirement);
-                }
-            }
             let mut manifest_surface_keys = BTreeMap::new();
             let manifest_surface_candidates: Vec<_> = manifest
                 .surfaces
@@ -2279,7 +2234,7 @@ impl CaptureFacts {
                     .entry(surface_key)
                     .or_insert_with(|| plan::SurfaceSummary {
                         source: plan::source_label(&surface.source),
-                        walk: manifest_walk_label(&surface.walk),
+                        walk: crate::manifest_input::effective_surface_walk(surface),
                         acquisition: manifest_acquisition_label(&surface.acquisition),
                         functions: surface.functions.len(),
                     });
@@ -10790,10 +10745,7 @@ impl Engine {
             .keys()
             .map(|stable| render::StandardExport {
                 module: public_modules[stable],
-                status: standard_export_status(
-                    history.standard_exports.get(stable),
-                    history.standard_requirements.get(stable),
-                ),
+                status: standard_export_status(history.standard_exports.get(stable)),
             })
             .collect();
         if standard_exports.len() > MAX_LIVE_SELECTION_SURFACES {
@@ -15636,11 +15588,13 @@ impl Engine {
         let targets: Vec<_> = table
             .entries
             .iter()
-            .map(|entry| plan::SelectionTableTarget {
-                object: binding.object,
-                object_path: entry.object_path.clone(),
-                file_offset: entry.file_offset,
-                name: entry.name,
+            .map(|entry| {
+                plan::SelectionTableTarget::provider_local(
+                    binding.object,
+                    entry.object_path.clone(),
+                    entry.file_offset,
+                    entry.name,
+                )
             })
             .collect();
         let previous_claims = self
@@ -15710,11 +15664,13 @@ impl Engine {
                 targets: table
                     .entries
                     .iter()
-                    .map(|entry| plan::SelectionTableTarget {
-                        object: binding.object,
-                        object_path: entry.object_path.clone(),
-                        file_offset: entry.file_offset,
-                        name: entry.name,
+                    .map(|entry| {
+                        plan::SelectionTableTarget::provider_local(
+                            binding.object,
+                            entry.object_path.clone(),
+                            entry.file_offset,
+                            entry.name,
+                        )
                     })
                     .collect(),
             },

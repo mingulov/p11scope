@@ -12838,12 +12838,12 @@ fn selection_bindings_isolate_provider_attribution_and_refusal() {
     let table = SelectionTableFact {
         object: first,
         file_offset: 0x20,
-        targets: vec![plan::SelectionTableTarget {
-            object: first,
-            object_path: String::new(),
-            file_offset: 0x100,
-            name: "C_Initialize",
-        }],
+        targets: vec![plan::SelectionTableTarget::provider_local(
+            first,
+            String::new(),
+            0x100,
+            "C_Initialize",
+        )],
     };
     let pending = PendingSelectionAdmission {
         key: table_key.clone(),
@@ -13661,10 +13661,105 @@ fn invalid_selection_cross_reference_is_dropped_and_truncated() {
 }
 
 #[test]
+fn optional_export_absence_is_complete_independently_of_table_version() {
+    let (_fixture, mut engine, _session, _binding) = attached_selection_route();
+    let original_modules = engine.modules.clone();
+    for version in [(2, 40), (3, 0), (3, 1), (3, 2), (0, 0), (255, 255)] {
+        let mut modules = original_modules.clone();
+        for module in &mut modules {
+            module
+                .scanned
+                .exports
+                .retain(|name| name != "C_GetInterface");
+            module.scanned.tables = vec![ScannedTable {
+                version,
+                walk: "full",
+                entries: Vec::new(),
+                null_entries: pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .map(|field| field.name)
+                    .collect(),
+                unpinned: Vec::new(),
+                address: 0,
+                file_offset: None,
+                live_return: true,
+                manifest_supported: false,
+            }];
+            module.entry_objects = vec![Vec::new()];
+        }
+        engine.capture_facts.history = CaptureHistory::default();
+        engine
+            .capture_facts
+            .merge_current(
+                &engine.plan,
+                &engine.pinned,
+                &modules,
+                &[],
+                &[],
+                &engine.counters,
+            )
+            .unwrap();
+        let exports = engine.interface_selection().standard_exports;
+        assert!(
+            !exports.is_empty(),
+            "version {version:?} lost the absence fact"
+        );
+        assert!(
+            exports
+                .iter()
+                .all(|export| export.status == "legacy_absent"),
+            "version {version:?}: {exports:?}"
+        );
+        let mut evidence = evidence_verdict(engine.plan(), engine.pinned(), &engine.counters);
+        evidence.slots = 1;
+        evidence.interface_selection = render::InterfaceSelection {
+            standard_exports: exports,
+            ..Default::default()
+        };
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE", "version {version:?}");
+    }
+}
+
+#[test]
+fn capture_history_preserves_the_effective_short_manifest_walk() {
+    let (_fixture, engine, _session, _binding) = attached_selection_route();
+    let summary = engine.pinned.pinned().next().unwrap();
+    let path = summary.path.to_string();
+    let pins = pin_as_manifest_object(&path);
+    let mut manifest = manifest_naming(&path, Some(summary.sha256.to_string()));
+    manifest.surfaces[0].version = Some(p11scope_manifest::manifest::Version {
+        major: 2,
+        minor: 40,
+    });
+    manifest.surfaces[0].functions = pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+        .iter()
+        .map(|field| p11scope_manifest::manifest::FunctionRecord {
+            name: field.name.into(),
+            resolution: Resolution::NullPointer,
+        })
+        .collect();
+    retarget_to_pins(&mut manifest, &[], &PinnedObjects::empty(), &pins);
+    let manifests = [manifest];
+    let mut facts = CaptureFacts::default();
+    let counters = DiscoveryCounters::default();
+    let mut plan = plan::build_from_reconciled_modules(&[]);
+    facts
+        .bind_plan_module_ids(&mut plan, &[], &manifests, &pins)
+        .unwrap();
+    facts
+        .merge_current(&plan, &pins, &[], &manifests, &[0], &counters)
+        .unwrap();
+    let surfaces = facts.history.surfaces.values().collect::<Vec<_>>();
+    assert_eq!(surfaces.len(), 1);
+    assert_eq!(surfaces[0].functions, 67);
+    assert_eq!(surfaces[0].walk, "known_prefix");
+}
+
+#[test]
 fn retained_standard_export_facts_project_through_public_selection() {
     let (_fixture, mut engine, _session, _binding) = attached_selection_route();
     engine.capture_facts.history.standard_exports.clear();
-    engine.capture_facts.history.standard_requirements.clear();
     for id in 1..5 {
         let id = plan::ModuleId(id);
         let mut module = merged_module(vec!["manifest", "scan"]);
@@ -13676,10 +13771,6 @@ fn retained_standard_export_facts_project_through_public_selection() {
         plan::ModuleId(0),
         BTreeSet::from([StandardExportFact::Present]),
     );
-    history.standard_requirements.insert(
-        plan::ModuleId(1),
-        BTreeSet::from([StandardRequirementFact::Legacy]),
-    );
     history.standard_exports.insert(
         plan::ModuleId(1),
         BTreeSet::from([StandardExportFact::Absent]),
@@ -13687,10 +13778,6 @@ fn retained_standard_export_facts_project_through_public_selection() {
     history.standard_exports.insert(
         plan::ModuleId(2),
         BTreeSet::from([StandardExportFact::Absent]),
-    );
-    history.standard_requirements.insert(
-        plan::ModuleId(2),
-        BTreeSet::from([StandardRequirementFact::V3]),
     );
     history.standard_exports.insert(
         plan::ModuleId(3),
@@ -13711,7 +13798,7 @@ fn retained_standard_export_facts_project_through_public_selection() {
         [
             (0, "present"),
             (1, "legacy_absent"),
-            (2, "required_absent"),
+            (2, "legacy_absent"),
             (3, "outside_module"),
             (4, "unresolved"),
         ]
@@ -13731,32 +13818,12 @@ fn standard_export_reducer_is_order_independent_and_fail_closed() {
     let absent = BTreeSet::from([StandardExportFact::Absent]);
     let outside = BTreeSet::from([StandardExportFact::Outside]);
     let conflicting = BTreeSet::from([StandardExportFact::Present, StandardExportFact::Absent]);
-    let legacy = BTreeSet::from([StandardRequirementFact::Legacy]);
-    let v3 = BTreeSet::from([StandardRequirementFact::V3]);
-    let mixed = BTreeSet::from([StandardRequirementFact::Legacy, StandardRequirementFact::V3]);
-
-    assert_eq!(standard_export_status(Some(&present), None), "present");
-    assert_eq!(
-        standard_export_status(Some(&outside), None),
-        "outside_module"
-    );
-    assert_eq!(
-        standard_export_status(Some(&absent), Some(&legacy)),
-        "legacy_absent"
-    );
-    assert_eq!(
-        standard_export_status(Some(&absent), Some(&v3)),
-        "required_absent"
-    );
-    assert_eq!(standard_export_status(Some(&absent), None), "unresolved");
-    assert_eq!(
-        standard_export_status(Some(&absent), Some(&mixed)),
-        "unresolved"
-    );
-    assert_eq!(
-        standard_export_status(Some(&conflicting), Some(&v3)),
-        "unresolved"
-    );
+    assert_eq!(standard_export_status(Some(&present)), "present");
+    assert_eq!(standard_export_status(Some(&outside)), "outside_module");
+    assert_eq!(standard_export_status(Some(&absent)), "legacy_absent");
+    assert_eq!(standard_export_status(None), "unresolved");
+    assert_eq!(standard_export_status(Some(&BTreeSet::new())), "unresolved");
+    assert_eq!(standard_export_status(Some(&conflicting)), "unresolved");
 }
 
 #[test]
@@ -19422,11 +19489,13 @@ fn add_published_loader_planning_state(engine: &mut Engine) {
             targets: module.scanned.tables[0]
                 .entries
                 .iter()
-                .map(|entry| plan::SelectionTableTarget {
-                    object,
-                    object_path: entry.object_path.clone(),
-                    file_offset: entry.file_offset,
-                    name: entry.name,
+                .map(|entry| {
+                    plan::SelectionTableTarget::provider_local(
+                        object,
+                        entry.object_path.clone(),
+                        entry.file_offset,
+                        entry.name,
+                    )
                 })
                 .collect(),
         },

@@ -9020,6 +9020,18 @@ fn loaded_seed_provider_with_owned_loader(
     ScannedModule,
     PinnedObjects,
 ) {
+    loaded_seed_provider_with_seed_table(owned_loader, false)
+}
+
+fn loaded_seed_provider_with_seed_table(
+    owned_loader: bool,
+    readable_table: bool,
+) -> (
+    LoadedSeedProvider,
+    ProcessView,
+    ScannedModule,
+    PinnedObjects,
+) {
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("seed-provider.so");
     let source = dir.path().join("seed-provider.c");
@@ -9029,9 +9041,28 @@ fn loaded_seed_provider_with_owned_loader(
         &source,
         r#"
 #include <stddef.h>
+int C_GetFunctionList(void **out);
+#ifdef P11SCOPE_SEED_READABLE_TABLE
+static struct {
+    unsigned char version[2];
+    void *functions[68];
+} seed_selection_table __attribute__((used)) = {
+    {7,231}, {[67] = (void *)C_GetFunctionList}
+};
+static struct {
+    const char *name;
+    void *table;
+    unsigned long flags;
+} seed_selection_interface = {"Opaque Fixture", &seed_selection_table, 0};
+#define SEED_TABLE (&seed_selection_table)
+#define SEED_INTERFACE (&seed_selection_interface)
+#else
+#define SEED_TABLE NULL
+#define SEED_INTERFACE NULL
+#endif
 __attribute__((visibility("default"), noinline))
 int C_GetFunctionList(void **out) {
-    if (out != NULL) *out = NULL;
+    if (out != NULL) *out = SEED_TABLE;
     return 0;
 }
 __attribute__((visibility("default"), noinline))
@@ -9045,7 +9076,7 @@ int C_GetInterface(const char *name, void *version, void **out, unsigned long fl
     (void)name;
     (void)version;
     (void)flags;
-    if (out != NULL) *out = NULL;
+    if (out != NULL) *out = SEED_INTERFACE;
     return 0;
 }
 "#,
@@ -9053,6 +9084,7 @@ int C_GetInterface(const char *name, void *version, void **out, unsigned long fl
     .unwrap();
     assert!(
         std::process::Command::new("gcc")
+            .args(readable_table.then_some("-DP11SCOPE_SEED_READABLE_TABLE"))
             .args(["-shared", "-fPIC", "-o"])
             .arg(&library)
             .arg(&source)
@@ -9129,7 +9161,18 @@ int main(int argc, char **argv) {
 }
 
 fn initial_export_route() -> (LoadedSeedProvider, Engine, ScriptedSession) {
-    let (fixture, view, mut module, pins) = loaded_seed_provider();
+    initial_export_route_from_seed(loaded_seed_provider())
+}
+
+fn initial_export_route_from_seed(
+    seed: (
+        LoadedSeedProvider,
+        ProcessView,
+        ScannedModule,
+        PinnedObjects,
+    ),
+) -> (LoadedSeedProvider, Engine, ScriptedSession) {
+    let (fixture, view, mut module, pins) = seed;
     let pid = view.pid();
     module.exports = vec![
         "C_GetFunctionList".into(),
@@ -13252,6 +13295,8 @@ fn selection_claim_cap_is_checked_before_production_candidate_application() {
             });
     }
     let before_calls = session.attached_slots.len();
+    let before_batches = session.attached_slots.clone();
+    let before_functions = engine.plan.slots.len();
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
     record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
     record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
@@ -13276,8 +13321,46 @@ fn selection_claim_cap_is_checked_before_production_candidate_application() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DiscoveryRecordOutcome::applied(false, true));
-    assert_eq!(session.attached_slots.len(), before_calls);
+    assert_eq!(
+        outcome,
+        DiscoveryRecordOutcome::applied(true, true),
+        "unavailable observation metadata can change without admitting a selection claim"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        before_functions,
+        "no function is admitted"
+    );
+    let unavailable = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .find(|table| table.address == 1 && table.live_return)
+        .expect("the attributed unavailable observation is retained explicitly");
+    assert_eq!(unavailable.decoded_slot_count(), 0);
+    assert!(unavailable.entries.is_empty() && unavailable.null_entries.is_empty());
+    assert_eq!(unavailable.walk, "known_prefix");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("metadata") && skip.reason.contains("unreadable"))
+    );
+    assert_eq!(
+        &session.attached_slots[..before_calls],
+        before_batches.as_slice()
+    );
+    assert_eq!(
+        &session.attached_slots[before_calls..],
+        &[0],
+        "metadata-only application invokes one empty batch; Session returns before native target preparation"
+    );
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        before_batches.iter().sum::<usize>(),
+        "no physical target work was added"
+    );
     assert!(engine.selection_claims.is_empty());
     assert!(engine.selection_tables.is_empty());
     assert_eq!(engine.capture_facts.history.selections.len(), 16);
@@ -13287,6 +13370,134 @@ fn selection_claim_cap_is_checked_before_production_candidate_application() {
             known.authority == SelectionAuthority::SelectionCountOnly
                 && known.request == tuple.request
         })
+    );
+}
+
+#[test]
+fn exhausted_selection_authority_keeps_a_readable_opaque_table_count_only() {
+    let (_fixture, mut engine, mut session) =
+        initial_export_route_from_seed(loaded_seed_provider_with_seed_table(false, true));
+    session.dynamic_attach_reports_added = true;
+    engine.attach_initial_exports(
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+        &mut PauseClosure::new(true),
+    );
+    let binding = *engine.selection_bindings.values().next().unwrap();
+    let provider = engine.pinned.summary(binding.object).unwrap();
+    let file = engine.pinned.file_for(binding.object).unwrap();
+    let offset = ElfSnapshot::read(file)
+        .unwrap()
+        .defined_symbol("seed_selection_table")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let maps = parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
+        .unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| {
+            ObjectKey::of(mapping) == provider.key
+                && offset
+                    .checked_sub(mapping.file_offset)
+                    .is_some_and(|delta| delta < mapping.end - mapping.start)
+        })
+        .unwrap();
+    let address = mapping.start + offset - mapping.file_offset;
+    let tuple = LiveSelectionTuple {
+        module: binding.provider,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Null,
+            flags: 0,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::Other,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        }),
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for flags in 0..MAX_LIVE_SELECTION_TUPLES {
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                request: SelectionRequest {
+                    flags: flags as u64,
+                    ..tuple.request
+                },
+                ..tuple.clone()
+            });
+    }
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_NULL;
+    record.name_class = DISCOVERY_NAME_OTHER;
+    record.selection_version_class = DISCOVERY_VERSION_OTHER;
+    record.table_ptr = address;
+    record.binding_id = binding.id;
+    assert!(
+        valid_discovery_record(&record),
+        "real opaque transport carries an address, not fabricated prefix words"
+    );
+    let before_calls = session.attached_slots.len();
+    let outcome = engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(outcome, DiscoveryRecordOutcome::applied(true, true));
+    assert_eq!(
+        engine.plan.slots.len(),
+        1,
+        "one fresh readable non-NULL word becomes a count target"
+    );
+    assert_eq!(engine.plan.slots[0].names, ["unknown"]);
+    assert_eq!(
+        session.attached_slots[before_calls..].iter().sum::<usize>(),
+        1
+    );
+    let table = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .find(|table| table.address == address && table.live_return)
+        .unwrap();
+    assert_eq!(table.version, (7, 231));
+    assert_eq!(table.decoded_slot_count(), 68);
+    assert_eq!(table.entries[0].name, "C_WaitForSlotEvent");
+    assert_eq!(table.null_entries.len(), 67);
+    assert_eq!(table.walk, "full");
+    assert!(engine.selection_claims.is_empty() && engine.selection_tables.is_empty());
+    assert_eq!(
+        engine.capture_facts.history.selections.len(),
+        MAX_LIVE_SELECTION_TUPLES
+    );
+    assert_eq!(engine.capture_facts.history.selections[0].count, 2);
+    assert!(
+        engine
+            .capture_facts
+            .history
+            .selections
+            .iter()
+            .all(|known| known.authority == SelectionAuthority::None)
     );
 }
 

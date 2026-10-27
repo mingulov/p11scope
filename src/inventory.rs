@@ -3779,7 +3779,7 @@ impl ClassicDriver<'_> {
         match self.commit(engine_changed) {
             Ok(()) => Ok(PassCommitProgress::Published),
             Err(error)
-                if Self::commit_hit_unfinished_joint_publication(&error, &self.coordinator) =>
+                if Self::commit_hit_unfinished_joint_publication(&error, &*self.coordinator) =>
             {
                 // The machine latched after physically preparing the
                 // commit: the coordinator still holds the unfinished

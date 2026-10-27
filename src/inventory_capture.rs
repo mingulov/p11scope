@@ -1946,6 +1946,7 @@ pub(crate) mod collection_deadline_test {
 /// result crosses back over a channel; the worker owns everything it reads.
 /// A worker that cannot be spawned runs `job` here instead (the ring then
 /// waits for the pass, as before); a worker panic resumes here.
+#[cfg_attr(not(test), allow(dead_code))] // Production waits check the deadline; tests use the plain wait.
 pub(crate) fn collect_off_thread<T: Send>(
     job: impl FnOnce() -> T + Send,
     tick: Duration,

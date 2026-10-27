@@ -10,6 +10,7 @@
  *       c  call C_GetSlotInfo(0x70000000 + gen) through the current handle
  *       C  call it through the dlmopen sibling, tag 0x71000000 + gen
  *       b  hold one C_GetSlotInfo inside the provider        -> HELD
+ *       o  hold one C_SignInit inside the provider           -> OHELD tid
  *       u  release the held call                             -> UNHELD gen rv
  *       K  cancel the held call's thread (no return)         -> CANCELLED gen
  *       r  reload: dlclose then dlopen (gen += 1)        -> RELOAD gen old new
@@ -112,9 +113,8 @@ void instance_block_disarm(void)
     gate_close_pair(gate_entry);
     gate_close_pair(gate_release);
 }
-CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
+static void instance_block_wait(void)
 {
-    (void)info;
     if (gate_armed) {
         /* EINTR-only retries: a persistently broken gate must fail the
          * driver's entry-proof read loudly, never spin here. */
@@ -127,7 +127,20 @@ CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
             done = read(gate_release[0], &released, 1);
         } while (done < 0 && errno == EINTR);
     }
+}
+CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
+{
+    (void)info;
+    instance_block_wait();
     return instance_continuity_pad(slot) == 1 ? 0 : 3;
+}
+CK_ULONG C_SignInit(CK_ULONG session, void *mechanism, CK_ULONG key)
+{
+    (void)session;
+    (void)mechanism;
+    (void)key;
+    instance_block_wait();
+    return 0;
 }
 #else
 #include <dlfcn.h>
@@ -151,6 +164,7 @@ CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
 
 typedef unsigned long CK_ULONG;
 typedef CK_ULONG (*slot_info_fn)(CK_ULONG, void *);
+typedef CK_ULONG (*sign_init_fn)(CK_ULONG, void *, CK_ULONG);
 
 static uint64_t now_ns(void)
 {
@@ -209,19 +223,20 @@ static int held_sharer_child(void *unused)
     return 0;
 }
 
-/* A held provider call for the birth-marker return-side cell: 'b' arms the
- * provider gate, runs one C_GetSlotInfo on a worker thread, and reports
+/* A held provider call: 'b' arms the provider gate for C_GetSlotInfo,
+ * 'o' for C_SignInit. Each runs on one worker thread and reports
  * HELD once the provider's entry byte proves the call is inside the
  * provider frame. 'u' releases it and joins the thread. At most one call
  * is held at a time. */
 static pthread_t held_call_thread;
-static pid_t held_call_tid = -1;
+static atomic_int held_call_tid = -1;
 static int held_call_active = 0;
 static int held_call_entry = -1;
 static int held_call_release = -1;
 static void (*held_call_disarm)(void) = NULL;
 static struct {
     slot_info_fn call;
+    sign_init_fn sign_init;
     CK_ULONG tag;
     char info[256];
     CK_ULONG rv;
@@ -231,7 +246,9 @@ static void *held_call_worker(void *unused)
 {
     (void)unused;
     held_call_tid = (pid_t)syscall(SYS_gettid);
-    held_call.rv = held_call.call(held_call.tag, held_call.info);
+    held_call.rv = held_call.sign_init
+        ? held_call.sign_init(held_call.tag, NULL, 0x42UL)
+        : held_call.call(held_call.tag, held_call.info);
     return NULL;
 }
 
@@ -602,8 +619,9 @@ static int cmd_mode(const char *provider)
             printf("SCALL %u %lu\n", gen, call(0x71000000UL + gen, info));
             break;
         }
+        case 'o':
         case 'b': {
-            /* Hold one provider call inside C_GetSlotInfo. HELD is printed
+            /* Hold one call inside C_GetSlotInfo or C_SignInit. The ledger is printed
              * only after the entry byte arrives, so the observer's entry
              * probe has certainly fired before the test moves on. */
             int (*arm)(void);
@@ -624,8 +642,10 @@ static int cmd_mode(const char *provider)
             held_call_release = release_fd();
             if (held_call_release < 0)
                 die("held-call release fd");
-            held_call.call = main_call(handle);
-            if (!held_call.call)
+            held_call.call = command == 'b' ? main_call(handle) : NULL;
+            held_call.sign_init = command == 'o'
+                ? (sign_init_fn)dlsym(handle, "C_SignInit") : NULL;
+            if (!held_call.call && !held_call.sign_init)
                 die("dlsym");
             held_call.tag = 0x70000000UL + gen;
             held_call_disarm = disarm;
@@ -637,7 +657,10 @@ static int cmd_mode(const char *provider)
             } while (done < 0 && errno == EINTR);
             if (done != 1 || entered != 'E')
                 die("held-call entry");
-            printf("HELD\n");
+            if (command == 'o')
+                printf("OHELD %d\n", atomic_load(&held_call_tid));
+            else
+                printf("HELD\n");
             break;
         }
         case 'u': {

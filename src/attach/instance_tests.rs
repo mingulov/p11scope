@@ -581,6 +581,222 @@ fn spawn_cmd_target() -> Result<CmdSetup> {
     })
 }
 
+fn held_object_tid(target: &mut Target) -> Result<u32> {
+    let held = target.command(b'o')?;
+    let mut fields = held.split_whitespace();
+    ensure!(
+        fields.next() == Some("OHELD"),
+        "object entry ledger: {held}"
+    );
+    let tid: u32 = fields.next().context("object call worker tid")?.parse()?;
+    ensure!(tid != 0 && tid != target.pid() && fields.next().is_none());
+    Ok(tid)
+}
+
+#[test]
+fn instance_object_call_gate_reports_owned_tid_and_returns() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider: _,
+        mut target,
+    } = spawn_cmd_target()?;
+    held_object_tid(&mut target)?;
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    // Existing ordinary held-call commands keep their original protocol.
+    ensure!(target.command(b'b')? == "HELD");
+    ensure!(target.command(b'u')? == "UNHELD 0 3");
+    Ok(())
+}
+
+fn object_call_evidence(session: &Session) -> Result<(u64, u64)> {
+    use p11scope_ebpf_common::{EVIDENCE_RING_LOSS, EVIDENCE_UNMATCHED_RETURNS};
+    let map: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+    let total = |index| -> Result<u64> { Ok(map.get(&index, 0)?.iter().copied().sum()) };
+    Ok((
+        total(EVIDENCE_RING_LOSS)?,
+        total(EVIDENCE_UNMATCHED_RETURNS)?,
+    ))
+}
+
+/// Default FULL, real Multi/native hooks, with one exact owned continuity
+/// entry removed while its object-arm call is held inside the provider.
+/// Separate sessions keep the refused call's fault out of the healthy twin.
+#[test]
+#[ignore = "privileged: default FULL LP64, Multi and native instance hooks; exact held-call map injection"]
+fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
+    use p11scope_ebpf_common::object_flow::continuity_joins;
+    use p11scope_ebpf_common::{CallStart, InstanceEntry, InstanceStamp, StartKey};
+
+    for missing_entry in [false, true] {
+        let CmdSetup {
+            _directory,
+            provider,
+            mut target,
+        } = spawn_cmd_target()?;
+        let pid = target.pid();
+        let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_SignInit"])?;
+        let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+        ensure!(harness.session.static_multi_attached());
+        ensure!(harness.session.backend_fallback().is_none());
+        ensure!(!embedded_object_is_stubbed());
+        let Some(Map::LruHashMap(starts)) = harness.session.ebpf.map("INSTANCE_START") else {
+            bail!("expected native INSTANCE_START LRU map");
+        };
+        let info = starts.info()?;
+        ensure!(info.key_size() == 16 && info.value_size() == 24 && info.max_entries() == 16_384);
+        harness.pump(&target)?;
+        ensure!(harness.events == 0 && harness.routed.is_empty());
+        {
+            let (drain, rows) = harness.session.event_drain_with_object_table()?;
+            ensure!(rows.is_some(), "requires the actual atomic 368/608 decoder");
+            ensure!(drain.malformed() == 0);
+        }
+        let before = crate::events::event_drain_positions(harness.session.event_drain()?);
+        ensure!(
+            before.capacity == 4 * 1024 * 1024,
+            "requires the default FULL ring"
+        );
+        ensure!(
+            before.consumer == before.producer,
+            "startup ring must be empty"
+        );
+        let evidence_before = object_call_evidence(&harness.session)?;
+        let fault_before = harness.session.instance_maps().fault()?;
+
+        let tid = held_object_tid(&mut target)?;
+        let key = StartKey {
+            pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+            slot: 0,
+            _pad: 0,
+        };
+        {
+            let starts: HashMap<_, StartKey, CallStart> =
+                HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+            ensure!(
+                starts.get(&key, 0)?.object_required
+                    == u64::from(plan.slots[0].descriptor_index) + 1
+            );
+        }
+        let entry = {
+            let mut starts: HashMap<_, StartKey, InstanceEntry> = HashMap::try_from(
+                harness
+                    .session
+                    .ebpf
+                    .map_mut("INSTANCE_START")
+                    .context("INSTANCE_START")?,
+            )?;
+            let entry = starts.get(&key, 0)?;
+            ensure!(entry.entry_ip != 0);
+            ensure!(entry.entry_stamp.flags == instance::STAMP_VALID);
+            ensure!(u32::from(entry.entry_stamp.file_slot_plus1) == harness.file_slot + 1);
+            if missing_entry {
+                starts.remove(&key)?;
+                ensure!(matches!(starts.get(&key, 0), Err(MapError::KeyNotFound)));
+            }
+            entry
+        }; // Release the map borrow before the call/session runs again.
+        ensure!(target.command(b'u')? == "UNHELD 0 0");
+        let after = crate::events::event_drain_positions(harness.session.event_drain()?);
+        ensure!(
+            after.consumer == before.consumer,
+            "only H0 may advance this cursor"
+        );
+        // Actual producer positions include each eight-byte ring header.
+        // Healthy:608. Refused: discarded608 plus one ordinary368. Combined
+        // with the atomic decoder/outcome checks below this pins wire sizes
+        // without adding a second ring consumer or a test emission flag.
+        let expected_bytes = if missing_entry {
+            608 + 8 + 368 + 8
+        } else {
+            608 + 8
+        };
+        ensure!(after.producer.checked_sub(before.producer) == Some(expected_bytes));
+        let evidence_after = object_call_evidence(&harness.session)?;
+        ensure!(
+            evidence_after.0 == evidence_before.0,
+            "no ring loss in either twin"
+        );
+        ensure!(evidence_after.1 - evidence_before.1 == u64::from(missing_entry));
+        ensure!(
+            harness.session.instance_maps().fault()? - fault_before == u64::from(missing_entry)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut collected = 0;
+        let mut shed = 0u64;
+        let mut calls = Vec::new();
+        loop {
+            let report = harness
+                .capture
+                .tick(&mut harness.session, std::slice::from_ref(&target.pin))?;
+            collected += report.collected_calls;
+            let outcomes = report.into_outcomes();
+            shed += crate::semantic_capture::unjoined_shed_counts(&outcomes)
+                .values()
+                .sum::<u64>();
+            for outcome in outcomes {
+                if let TickOutcome::Call(call) = outcome {
+                    ensure!(call.joint_resource().is_none());
+                    calls.push((*call.record(), call.route(), call.into_object_tail()));
+                }
+            }
+            let positions = crate::events::event_drain_positions(harness.session.event_drain()?);
+            if !calls.is_empty()
+                && positions.consumer == positions.producer
+                && harness.capture.router().pending_len() == 0
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "missing_entry={missing_entry}: collected={collected}, routed={}",
+                calls.len()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ensure!(
+            collected == 1 && calls.len() == 1,
+            "one actual call must conserve one collected/routed outcome"
+        );
+        let (record, route, object) = calls.pop().unwrap();
+        ensure!(record.event.event_type == event_type::CALL && record.event.slot == 0);
+        ensure!(record.event.pid_tgid == key.pid_tgid && record.event.rv == 0);
+        ensure!(record.continuity.return_stamp == entry.entry_stamp);
+        if missing_entry {
+            ensure!(record.continuity.entry_ip == 0);
+            ensure!(record.continuity.entry_stamp == InstanceStamp::default());
+            ensure!(!continuity_joins(&record.continuity));
+            ensure!(object.is_none());
+            ensure!(
+                matches!(route, Route::Unknown(_)),
+                "actual negative route: {route:?}"
+            );
+            ensure!(
+                shed == 1,
+                "count the routed call once, never a receipt repeat"
+            );
+        } else {
+            ensure!(record.continuity.entry_ip == entry.entry_ip);
+            ensure!(record.continuity.entry_stamp == entry.entry_stamp);
+            ensure!(continuity_joins(&record.continuity));
+            ensure!(
+                object.context("healthy608 object tail")?.descriptor_index()
+                    == plan.slots[0].descriptor_index
+            );
+            ensure!(
+                matches!(route, Route::Joined(_)),
+                "healthy route: {route:?}"
+            );
+            ensure!(shed == 0);
+        }
+        eprintln!(
+            "S1 object twin missing_entry={missing_entry}: collected=1 route={route:?} shed={shed} wire_bytes={expected_bytes}"
+        );
+    }
+    Ok(())
+}
+
 /// Two cmd targets sharing one provider file: the in-scope target and an
 /// out-of-scope sibling whose calls hit the same probed offsets.
 struct PairSetup {

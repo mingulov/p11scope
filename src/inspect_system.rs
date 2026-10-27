@@ -1432,6 +1432,61 @@ fn attribute_sweep(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFUSED_SCAN_ENTRIES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn count_refused_scans_for_test<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSED_SCAN_ENTRIES.set(self.0);
+        }
+    }
+    let restore = Restore(REFUSED_SCAN_ENTRIES.replace(Some(0)));
+    let result = body();
+    let count = REFUSED_SCAN_ENTRIES
+        .get()
+        .expect("refused-scan counter is scoped");
+    drop(restore);
+    (result, count)
+}
+
+#[cfg(test)]
+fn record_refused_scan_for_test() {
+    REFUSED_SCAN_ENTRIES.set(REFUSED_SCAN_ENTRIES.get().map(|count| count + 1));
+}
+
+fn is_caller_range_counted(entry: &MapEntry) -> bool {
+    #[cfg(test)]
+    record_refused_scan_for_test();
+    is_caller_range(entry)
+}
+
+/// Keep only refused objects an unselected process maps as a caller
+/// would: executably (A6, the same rule as attribution). A refused
+/// object is a loss only there; elsewhere it is not this pass's gap.
+fn retain_refused_to_unselected(
+    refused: &mut Vec<RefusedObject>,
+    sweep: &[(u32, Vec<MapEntry>)],
+    selected: &BTreeSet<u32>,
+) {
+    let unselected_keys: BTreeSet<ObjectKey> = sweep
+        .iter()
+        .filter(|(pid, _)| !selected.contains(pid))
+        .flat_map(|(_, entries)| {
+            entries
+                .iter()
+                .filter(|entry| is_caller_range_counted(entry))
+        })
+        .map(ObjectKey::of)
+        .collect();
+    refused.retain(|object| unselected_keys.contains(&object.key));
+}
+
 /// The shared sweep-attribution prefix: this pass's key index, the
 /// selected set, and the refused objects filtered to unselected caller
 /// keys. Both attribution paths and the auto/kernel proof gate build
@@ -1476,16 +1531,7 @@ fn sweep_proof_prefix(
         .flat_map(|member| member.examined.iter().copied());
     let (index, mut refused) = KnownKeyIndex::build(modules, &match_keys, examined, checks);
     let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
-    // A refused object is a loss only where an unselected process maps it
-    // as a caller would: executably (A6, the same rule as attribution).
-    let unselected_keys: BTreeSet<ObjectKey> = collection
-        .sweep
-        .iter()
-        .filter(|(pid, _)| !selected.contains(pid))
-        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_caller_range(entry)))
-        .map(ObjectKey::of)
-        .collect();
-    refused.retain(|object| unselected_keys.contains(&object.key));
+    retain_refused_to_unselected(&mut refused, &collection.sweep, &selected);
     (index, selected, refused)
 }
 
@@ -7274,5 +7320,91 @@ mod privileged_tests {
             1,
             "the seam must observe exactly one attempted syscall"
         );
+    }
+}
+
+#[cfg(test)]
+mod refused_filter_tests {
+    use super::{count_refused_scans_for_test, retain_refused_to_unselected};
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::discovery::sweep_attribution::RefusedObject;
+    use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
+    use std::collections::BTreeSet;
+
+    fn caller_entry(device: Device, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device,
+            inode,
+            raw_path: Some(b"/lib/libfake.so".to_vec()),
+        }
+    }
+
+    fn noncaller_entry(device: Device, inode: u64) -> MapEntry {
+        MapEntry {
+            permissions: *b"r--p",
+            ..caller_entry(device, inode)
+        }
+    }
+
+    fn refused_object(object: u32, key: ObjectKey) -> RefusedObject {
+        RefusedObject {
+            object: PinnedObjectId(object),
+            key,
+            filesystem: "fuse",
+        }
+    }
+
+    #[test]
+    fn empty_refused_scans_no_sweep_entries() {
+        let dev = Device { major: 7, minor: 7 };
+        let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+            (1001, vec![caller_entry(dev, 42), caller_entry(dev, 43)]),
+            (1002, vec![caller_entry(dev, 42), noncaller_entry(dev, 44)]),
+        ];
+        let selected = BTreeSet::new();
+        let mut refused = Vec::new();
+        let ((), scans) = count_refused_scans_for_test(|| {
+            retain_refused_to_unselected(&mut refused, &sweep, &selected);
+        });
+        assert_eq!(scans, 0, "empty refused must skip the sweep scan");
+        assert!(refused.is_empty());
+    }
+
+    #[test]
+    fn nonempty_refused_scans_and_filters_to_unselected_caller_keys() {
+        let dev = Device { major: 7, minor: 7 };
+        let key = |inode| ObjectKey { device: dev, inode };
+        let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+            (1001, vec![caller_entry(dev, 42), caller_entry(dev, 43)]),
+            (1002, vec![caller_entry(dev, 42)]),
+        ];
+        let selected = BTreeSet::new();
+        let mut refused = vec![refused_object(1, key(42)), refused_object(2, key(99))];
+        let ((), scans) = count_refused_scans_for_test(|| {
+            retain_refused_to_unselected(&mut refused, &sweep, &selected);
+        });
+        assert_eq!(scans, 3, "nonempty refused must scan every entry");
+        assert_eq!(refused, vec![refused_object(1, key(42))]);
+    }
+
+    #[test]
+    fn refused_scan_skips_selected_pids() {
+        let dev = Device { major: 7, minor: 7 };
+        let key = |inode| ObjectKey { device: dev, inode };
+        let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+            (1001, vec![caller_entry(dev, 42), caller_entry(dev, 43)]),
+            (1002, vec![caller_entry(dev, 42), noncaller_entry(dev, 44)]),
+        ];
+        let selected: BTreeSet<u32> = BTreeSet::from([1001]);
+        let mut refused = vec![refused_object(1, key(42))];
+        let ((), scans) = count_refused_scans_for_test(|| {
+            retain_refused_to_unselected(&mut refused, &sweep, &selected);
+        });
+        assert_eq!(scans, 2, "only unselected entries are scanned");
+        assert_eq!(refused, vec![refused_object(1, key(42))]);
     }
 }

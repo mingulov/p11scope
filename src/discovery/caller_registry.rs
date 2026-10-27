@@ -326,6 +326,25 @@ fn cold_mint_deadline(work: &CaptureWorkBudget) -> Instant {
     capped.map(|deadline| deadline.min(grace)).unwrap_or(grace)
 }
 
+/// Live non-leader task IDs of `tgid`, sorted. `ColdRefusal::Dead`
+/// when the listing itself fails (the group is gone or unreadable).
+fn live_survivor_tids(tgid: u32) -> Result<Vec<u32>, ColdRefusal> {
+    let mut tids: Vec<u32> = std::fs::read_dir(format!("/proc/{tgid}/task"))
+        .map_err(|_| ColdRefusal::Dead)?
+        .map(|entry| {
+            entry
+                .map_err(|_| ColdRefusal::Dead)?
+                .file_name()
+                .to_string_lossy()
+                .parse::<u32>()
+                .map_err(|_| ColdRefusal::Dead)
+        })
+        .collect::<Result<_, _>>()?;
+    tids.retain(|tid| *tid != tgid);
+    tids.sort();
+    Ok(tids)
+}
+
 /// Mint the lone survivor of an already-zombie leader from the held
 /// original: the TGID's own task listing selects exactly one non-leader
 /// candidate, then the retained-member proof (tgkill liveness, group
@@ -337,6 +356,18 @@ fn cold_mint_deadline(work: &CaptureWorkBudget) -> Instant {
 pub(crate) fn cold_admit_member(
     original: &Arc<PidPin>,
     work: &mut CaptureWorkBudget,
+) -> Result<ColdMint, ColdRefusal> {
+    cold_admit_member_with_relist(original, work, &mut |tgid| live_survivor_tids(tgid))
+}
+
+/// `cold_admit_member` with the post-mint task re-list injected:
+/// production passes the live listing; tests script the second
+/// listing so a survivor appearing between the two lists is
+/// deterministic, never timing.
+pub(crate) fn cold_admit_member_with_relist(
+    original: &Arc<PidPin>,
+    work: &mut CaptureWorkBudget,
+    _relist: &mut impl FnMut(u32) -> Result<Vec<u32>, ColdRefusal>,
 ) -> Result<ColdMint, ColdRefusal> {
     let tgid = original.pid();
     work.spend(1).map_err(|_| ColdRefusal::Raced)?;

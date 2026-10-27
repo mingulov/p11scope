@@ -595,7 +595,7 @@ class IgnoredTestsTests(unittest.TestCase):
         for pin in (
             "DEFAULT_TESTS=118",
             "ALTERNATIVE_TESTS=2",
-            "LONG_TESTS=14",
+            "LONG_TESTS=16",
             "SKIP_TESTS=65",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",

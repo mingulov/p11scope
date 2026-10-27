@@ -78,6 +78,25 @@ impl KernelAnchorExclusions {
 pub(crate) const EXAMINED_ANCHOR_CAP: usize = 512;
 pub(crate) const TOTAL_ANCHOR_CAP: usize = 1024;
 
+/// An anchor is never taken below this many descriptors of headroom.
+const CUSTODY_TAKE_FLOOR: usize = 3;
+
+/// Descriptors one deep-scan offer can hold beyond the retained custody
+/// anchors and the offered file itself: the member view pin (one pidfd at
+/// most), the /proc mem handle (one at most) and the mount-table cache
+/// file (one at most). Deep scans run serially on one thread while shard
+/// and confirmation workers only exist past the reconcile census, so no
+/// other thread grows the observer's descriptor table between two offers;
+/// the remaining slack absorbs platform and test-double variance.
+const CUSTODY_TRANSIENT_MARGIN: usize = 16;
+
+/// Ledger takes need this much estimated headroom: the unchanged take
+/// floor plus the full transient margin, so a cached census still refuses
+/// before the true headroom can reach the floor even if live transients
+/// exceeded the margin by its whole width. Below this line the offer
+/// re-takes the strict census and obeys it exactly, as before.
+const CUSTODY_LEDGER_TAKE_LINE: usize = CUSTODY_TAKE_FLOOR + CUSTODY_TRANSIENT_MARGIN;
+
 /// One shared per-pass count of actual proof target runs: whole-system
 /// segment batches and per-PID promotion packets, including failed runs.
 /// Anchor setup and the one-time eligibility probe are not target attempts.
@@ -106,6 +125,8 @@ pub(crate) struct ExaminedCustody {
     ordinal: u64,
     cap: usize,
     failed: bool,
+    census_headroom: Option<usize>,
+    census_held: usize,
 }
 
 impl ExaminedCustody {
@@ -120,6 +141,8 @@ impl ExaminedCustody {
             ordinal: 0,
             cap,
             failed: false,
+            census_headroom: None,
+            census_held: 0,
         }
     }
 
@@ -187,19 +210,37 @@ impl ExaminedCustody {
                 .insert((scan, examined.key), AnchorDeny::AnchorCap);
             return false;
         }
-        match census() {
-            Err(_) => {
-                self.fail();
-                self.missing
-                    .insert((scan, examined.key), AnchorDeny::FdHeadroom);
-                return false;
+        // One strict census per custody phase plus a local ledger: held
+        // anchors are the only descriptors custody retains between offers,
+        // so the cached headroom minus their growth (and the still-open
+        // offered file) can only overstate consumption once scan
+        // transients are covered by the take line. A ledger below the
+        // line, or no cached census yet, re-takes the strict census and
+        // obeys it exactly. Replacements keep the count, discards shrink
+        // it (saturating: freed anchors only make the ledger pessimistic).
+        let ledger_covers = self.census_headroom.is_some_and(|cached| {
+            let grown = self.candidates.len().saturating_sub(self.census_held);
+            let estimate = cached.saturating_sub(grown).saturating_sub(1);
+            estimate >= CUSTODY_LEDGER_TAKE_LINE
+        });
+        if !ledger_covers {
+            match census() {
+                Err(_) => {
+                    self.fail();
+                    self.missing
+                        .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+                    return false;
+                }
+                Ok(policy) => {
+                    self.census_headroom = Some(policy.headroom);
+                    self.census_held = self.candidates.len();
+                    if policy.headroom < CUSTODY_TAKE_FLOOR {
+                        self.missing
+                            .insert((scan, examined.key), AnchorDeny::FdHeadroom);
+                        return false;
+                    }
+                }
             }
-            Ok(policy) if policy.headroom < 3 => {
-                self.missing
-                    .insert((scan, examined.key), AnchorDeny::FdHeadroom);
-                return false;
-            }
-            Ok(_) => {}
         }
         if let Some(index) = replace {
             let removed = self.candidates.remove(index);

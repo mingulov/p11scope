@@ -5579,10 +5579,12 @@ fn custody_recensus_failure_still_closes_custody() {
     let (first_file, first_examined) = opened(dir.path(), "first.so");
     let first_fd = FdToken::of(&first_file);
     let calls = Cell::new(0usize);
-    assert!(custody.offer_with_census(scan, first_examined, first_file, || {
-        calls.set(calls.get() + 1);
-        Ok(SegmentPolicy::from_headroom(64, 0, 0))
-    }));
+    assert!(
+        custody.offer_with_census(scan, first_examined, first_file, || {
+            calls.set(calls.get() + 1);
+            Ok(SegmentPolicy::from_headroom(64, 0, 0))
+        })
+    );
     // Grow the ledger until the cached census no longer covers the next
     // offer; that offer's fresh census then fails.
     let mut failed_key = None;
@@ -5602,7 +5604,10 @@ fn custody_recensus_failure_still_closes_custody() {
     assert!(custody.failed());
     assert!(custody.candidates.is_empty());
     assert_eq!(owner.examined_for_test().0, 0);
-    assert!(!fd_open(first_fd), "failed custody leaked its examined file");
+    assert!(
+        !fd_open(first_fd),
+        "failed custody leaked its examined file"
+    );
     assert_eq!(
         custody.missing.get(&(scan, failed_key)),
         Some(&AnchorDeny::FdHeadroom)
@@ -5646,7 +5651,10 @@ fn custody_cached_census_keeps_rank_replacement_order() {
     actual.sort_unstable();
     let mut wanted = expected[..2].to_vec();
     wanted.sort_unstable();
-    assert_eq!(actual, wanted, "cached census changed the replacement order");
+    assert_eq!(
+        actual, wanted,
+        "cached census changed the replacement order"
+    );
     assert_eq!(owner.examined_for_test(), (2, 2));
 }
 

@@ -103,6 +103,12 @@ struct E2eWorkload {
     conf: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum E2eLifetime {
+    ExitAfterWork,
+    HoldAfterWork,
+}
+
 impl E2eWorkload {
     fn build(module: &str) -> Result<Self> {
         ensure!(
@@ -153,32 +159,48 @@ impl E2eWorkload {
         gate: &Path,
         iters: u32,
         delay_ms: u64,
+        lifetime: E2eLifetime,
     ) -> Result<E2eProcess> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
-        let child = Command::new(&self.ledger)
-            .args([
-                "mech",
-                "--cell",
-                "E",
-                "--module",
-                module,
-                "--iters",
-                &iters.to_string(),
-                "--gate",
-                gate.to_str().context("gate path")?,
-                "--late",
-                "--delay-ms",
-                &delay_ms.to_string(),
-            ])
+        let private_log = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+        };
+        let stderr = out.with_extension("stderr");
+        let mut command = Command::new(&self.ledger);
+        command.args([
+            "mech",
+            "--cell",
+            "E",
+            "--module",
+            module,
+            "--iters",
+            &iters.to_string(),
+            "--gate",
+            gate.to_str().context("gate path")?,
+            "--late",
+            "--delay-ms",
+            &delay_ms.to_string(),
+        ]);
+        if matches!(lifetime, E2eLifetime::HoldAfterWork) {
+            command.arg("--hold");
+        }
+        let child = command
             .env("SOFTHSM2_CONF", &self.conf)
             .stdin(Stdio::null())
-            .stdout(std::fs::File::create(out)?)
-            .stderr(Stdio::null())
+            .stdout(private_log(out)?)
+            .stderr(private_log(&stderr)?)
             .spawn()
             .context("spawning ledger")?;
         Ok(E2eProcess {
             child,
             out: out.to_path_buf(),
+            stderr,
         })
     }
 }
@@ -186,6 +208,7 @@ impl E2eWorkload {
 struct E2eProcess {
     child: Child,
     out: PathBuf,
+    stderr: PathBuf,
 }
 
 impl E2eProcess {
@@ -194,20 +217,53 @@ impl E2eProcess {
             .is_ok_and(|text| text.lines().any(|line| line.starts_with(prefix)))
     }
 
-    fn tail(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.out)
-            .map(|text| text.lines().take(12).map(String::from).collect())
-            .unwrap_or_default()
+    fn diagnostics(&self) -> String {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        fn tail(path: &Path) -> std::io::Result<Vec<String>> {
+            let mut file = std::fs::File::open(path)?;
+            let start = file.metadata()?.len().saturating_sub(4096);
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            file.take(4096).read_to_end(&mut bytes)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut lines: Vec<_> = text.lines().rev().take(12).map(String::from).collect();
+            lines.reverse();
+            Ok(lines)
+        }
+        format!(
+            "ledger tail={:?}; stderr tail={:?}",
+            tail(&self.out),
+            tail(&self.stderr)
+        )
     }
 
-    fn wait_for(&self, prefix: &str, budget: Duration) -> Result<()> {
+    fn ensure_alive(&mut self, point: &str) -> Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            anyhow::bail!(
+                "ledger exited {point} with {status}: {}",
+                self.diagnostics()
+            );
+        }
+        Ok(())
+    }
+
+    fn wait_for(&mut self, prefix: &str, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         while !self.has(prefix) {
+            if let Err(error) = self.ensure_alive(&format!("before {prefix:?}")) {
+                // A finite control can publish its last line between the
+                // first read and exit observation. Re-read after reaping.
+                if self.has(prefix) {
+                    break;
+                }
+                return Err(error);
+            }
             ensure!(
                 Instant::now() < deadline,
-                "ledger {} never printed {prefix:?}: {:?}",
+                "ledger {} never printed {prefix:?}: {}",
                 self.out.display(),
-                self.tail()
+                self.diagnostics()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -215,9 +271,141 @@ impl E2eProcess {
     }
 
     fn kill(&mut self) {
-        let _ = self.child.kill();
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
+}
+
+impl Drop for E2eProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[test]
+fn headline_workload_holds_after_done_without_adding_calls() -> Result<()> {
+    let module = softhsm_path()?;
+    let workload = E2eWorkload::build(&module)?;
+    let held_out = workload.path("held.out");
+    let held_gate = workload.path("held.gate");
+    let mut held = workload.spawn(
+        &held_out,
+        &module,
+        &held_gate,
+        2,
+        0,
+        E2eLifetime::HoldAfterWork,
+    )?;
+    held.wait_for("READY ", Duration::from_secs(30))?;
+    std::fs::write(&held_gate, b"open\n")?;
+    held.wait_for("DONE ", Duration::from_secs(30))?;
+    let held_ledger = std::fs::read_to_string(&held_out)?;
+
+    // A second finite workload must finish while the headline workload
+    // remains mapped, with no additional PKCS#11 calls after DONE.
+    let control_out = workload.path("control.out");
+    let control_gate = workload.path("control.gate");
+    let mut control = workload.spawn(
+        &control_out,
+        &module,
+        &control_gate,
+        2,
+        0,
+        E2eLifetime::ExitAfterWork,
+    )?;
+    control.wait_for("READY ", Duration::from_secs(30))?;
+    std::fs::write(&control_gate, b"open\n")?;
+    control.wait_for("DONE ", Duration::from_secs(30))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = control.child.try_wait()? {
+            break status;
+        }
+        ensure!(Instant::now() < deadline, "finite ledger did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    ensure!(status.success(), "finite ledger exited with {status}");
+    held.ensure_alive("after DONE before the observer could stop")?;
+    ensure!(
+        std::fs::read_to_string(format!("/proc/{}/maps", held.child.id()))?.contains(&module),
+        "held workload lost its provider mapping"
+    );
+    ensure!(
+        std::fs::read_to_string(&held_out)? == held_ledger,
+        "held ledger added calls after DONE"
+    );
+
+    let counts = |text: &str| {
+        let mut counts = std::collections::BTreeMap::new();
+        for line in text.lines().filter(|line| line.starts_with("LEDGER ")) {
+            let fields: std::collections::BTreeMap<_, _> = line
+                .split_whitespace()
+                .filter_map(|field| field.split_once('='))
+                .collect();
+            assert_eq!(fields["bad"], "0", "ledger API call failed: {line}");
+            let key = format!("{} {} {}", fields["fn"], fields["mech"], fields["phase"]);
+            *counts.entry(key).or_insert(0u64) += fields["n"].parse::<u64>().unwrap();
+        }
+        counts
+    };
+    let held_counts = counts(&held_ledger);
+    assert_eq!(
+        held_counts
+            .iter()
+            .filter(|(key, _)| key.ends_with(" main"))
+            .map(|(_, count)| count)
+            .sum::<u64>(),
+        20,
+        "two iterations must retain ten calls each"
+    );
+    assert_eq!(held_counts, counts(&std::fs::read_to_string(&control_out)?));
+    let held_pid = held.child.id();
+    drop(held);
+    // SAFETY: the workload was our child; Drop must have terminated and
+    // reaped it, leaving no waitable child at its former PID.
+    assert_eq!(
+        unsafe { libc::waitpid(held_pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    Ok(())
+}
+
+#[test]
+fn headline_workload_reports_early_exit_status_and_private_diagnostics() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let module = softhsm_path()?;
+    let workload = E2eWorkload::build(&module)?;
+    let missing = workload.path("missing-provider.so");
+    let gate = workload.path("failure.gate");
+    let mut target = workload.spawn(
+        &workload.path("failure.out"),
+        missing.to_str().context("missing provider path")?,
+        &gate,
+        2,
+        0,
+        E2eLifetime::HoldAfterWork,
+    )?;
+    target.wait_for("READY ", Duration::from_secs(30))?;
+    std::fs::write(&gate, b"open\n")?;
+    let error = target
+        .wait_for("LEDGER ", Duration::from_secs(30))
+        .expect_err("a missing provider must exit before any calls")
+        .to_string();
+    assert!(error.contains("exit status: 1"), "{error}");
+    assert!(error.contains("status=fail"), "{error}");
+    assert!(error.contains("stderr tail=Ok(["), "{error}");
+    assert!(error.contains("realpath of a module failed"), "{error}");
+    for path in [&target.out, &target.stderr] {
+        assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+    }
+    Ok(())
 }
 
 /// A manifest resolving exactly the ledger `mech` functions against
@@ -326,7 +514,14 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
     let gate = workload.path("gate");
     let ledger_out = workload.path("ledger.out");
     let observer_out = workload.path("observer.out");
-    let mut target = workload.spawn(&ledger_out, &module, &gate, 100_000, 2_000)?;
+    let mut target = workload.spawn(
+        &ledger_out,
+        &module,
+        &gate,
+        100_000,
+        2_000,
+        E2eLifetime::HoldAfterWork,
+    )?;
     // READY prints before the gate wait: the workload is up and its
     // dlopen is held until the cell opens the gate post-attach.
     target.wait_for("READY ", Duration::from_secs(30))?;
@@ -389,10 +584,7 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    ensure!(
-        target.child.try_wait()?.is_none(),
-        "the workload is still alive at the observer stop"
-    );
+    target.ensure_alive("at observer stop")?;
     target.kill();
     let rc = status.code().unwrap_or(-1);
     println!("MAN1_E2E observer rc={rc}");
@@ -953,7 +1145,14 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     let gate = workload.path("gate");
     let ledger_out = workload.path("ledger.out");
     let observer_out = workload.path("observer.out");
-    let mut target = workload.spawn(&ledger_out, &module, &gate, 100_000, 2_000)?;
+    let mut target = workload.spawn(
+        &ledger_out,
+        &module,
+        &gate,
+        100_000,
+        2_000,
+        E2eLifetime::ExitAfterWork,
+    )?;
     target.wait_for("READY ", Duration::from_secs(30))?;
     let ledger_pid = target.child.id();
     println!(

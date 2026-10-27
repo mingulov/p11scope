@@ -817,7 +817,10 @@ link.
   already-zombie thread-group leader with exactly one live survivor
   admits as a caller with the survivor-served image and the leader
   birth, and both identity backends then attribute its held mappings
-  exactly like the warm path. Two or more live survivors refuse by
+  exactly like the warm path. In a live capture today this reaches
+  only groups the observer already held a view of (their scans now
+  read the survivor's maps); a group first met after its leader died
+  is still not admitted. Two or more live survivors refuse by
   name (never a pick); a fully dead group keeps the generic gone
   refusal. Cold callers make no native-use claim (they stay unproven
   for native binding). Live-capture enumeration of a group first met
@@ -830,9 +833,10 @@ link.
 - What the user sees: a process whose thread-group leader has exited while
   other threads keep running (a zombie leader), and that the capture never
   observed before the exit, is still not admitted as a caller: it has no
-  `callers[]` record and no edge, and its provider use appears only as
-  module-level `modules[].unbound_use` with the
-  `used by an unidentified caller image` gap. An exec chain whose images
+  `callers[]` record and no edge, and its provider use appears at most as
+  module-level `modules[].unbound_use` (only when another process got the
+  provider attached, with the `used by an unidentified caller image` gap);
+  otherwise only the `process view` gap marks the omission. An exec chain whose images
   exec within one pass likewise binds no image: its rows are unbound as
   `exec_after_admission`, `no_live_caller` or `before_admission`, and the
   retired callers' edges read `unknown`/`use_before_admission`.

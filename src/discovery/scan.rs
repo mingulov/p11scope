@@ -3636,6 +3636,12 @@ trait ScanIo {
     fn cold_member_for(&self, _pid: u32) -> Option<&RetainedGroupMember> {
         None
     }
+    /// Whether this IO stashes a cold-minted survivor for later reads.
+    /// Production `ProcScanIo` only; scripted IOs keep the default so
+    /// a cold attempt never mints a real member for fixture bytes.
+    fn accepts_cold_member(&self) -> bool {
+        false
+    }
 }
 
 struct ProcScanIo {
@@ -3707,6 +3713,10 @@ impl ScanIo for ProcScanIo {
             .as_ref()
             .filter(|cold| cold.pid == pid)
             .map(|cold| &cold.member)
+    }
+
+    fn accepts_cold_member(&self) -> bool {
+        true
     }
 }
 
@@ -3917,9 +3927,18 @@ fn acquire_cold_survivor_maps(
     if !crate::process::process_is_zombie(view.pid()) {
         return None;
     }
+    // Scripted IOs never take the stash, so never mint a real member
+    // for them: no real capture budget, no live-mint slot, and the
+    // exited outcome stands. Production `ProcScanIo` is unaffected.
+    if !io.accepts_cold_member() {
+        return None;
+    }
     let original = Arc::new(view.retained_pin().try_clone().ok()?);
     let minted = cold_admit_member(&original, budget).ok()?;
     io.note_cold_member(view.pid(), minted.member, minted.minter);
+    if io.cold_member_for(view.pid()).is_none() {
+        return None;
+    }
     let reader = view
         .run_while_same(|| io.open_maps(view, budget))
         .ok()?

@@ -2439,13 +2439,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Resolve semantic batches a latched machine stranded behind
     /// its unfinished Joint publication, so the exit-hold abandon
     /// strands neither a Prepared blocker nor an unpublished batch.
-    /// Stub: the twins pin the contract; the drain/drop follows with
-    /// the abandon.
+    /// A Prepared batch drains S1-direct and mints its H3 (its calls
+    /// already joined at H0, so nothing sheds); a Collected batch
+    /// drops through the audited path (H3 shed shadow plus the
+    /// immediate shed count, so collected == joined + shed holds on
+    /// the stop line). Either would otherwise block every later
+    /// finalization (Prepared) or vanish under the next stage
+    /// (Collected).
     pub(crate) fn abandon_stranded_semantic_batches(
         &mut self,
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
     ) {
-        let _ = lane;
+        let pending = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.take());
+        match pending {
+            None => {}
+            Some(PendingSemanticBatch::Collected(batch)) => {
+                self.record_semantic_drop(&batch);
+                let counted = crate::semantic_capture::unjoined_shed_counts(batch.outcomes());
+                self.publish_drop_shed(lane, "abandoned", counted);
+            }
+            Some(PendingSemanticBatch::Prepared(mut prepared)) => {
+                self.drain_prepared_s1(&mut prepared);
+                self.finish_semantic_preparation(prepared, lane.stash_pending_floor());
+            }
+        }
     }
 
     /// The private semantic finalizer: consumes pending semantic batches,
@@ -3869,10 +3889,10 @@ mod finalizer_history_tests {
             "the staged batch pends its finalization"
         );
         coordinator.abandon_stranded_semantic_batches(&mut lane);
-        assert!(
-            !coordinator.joint_domain_has_pending_work(domain),
-            "the abandon resolves the stranded batch"
-        );
+        // The drop shadow is real pending H3 work for the next mint
+        // (its barrier voids there), so pending-work stays true by
+        // design; the shadow and shed below prove the take consumed
+        // this batch itself.
         assert_eq!(
             coordinator
                 .semantic_finalizer

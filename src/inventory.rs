@@ -3153,6 +3153,16 @@ impl ClassicDriver<'_> {
                 trip.polls,
             ));
         }
+        // Abandon the unfinished Joint publication first: its prepared
+        // frame can never resume past the latched machine, and every
+        // later plain commit (including the abandon commit below)
+        // refuses while it stands. The abandon publishes the prepared
+        // physical work, resolves stranded semantic batches (their
+        // shed counts land before the disclosure below), and stages
+        // its named loss gap, so the abandon commit succeeds and the
+        // staged gaps publish. Nothing pending is a quiet no-op.
+        let frame = lane.take_joint_frame_for_abandon();
+        coordinator.abandon_unfinished_joint_publication(&mut lane, frame, reason.to_string());
         let counts = SemanticStopCounts::read(&lane, coordinator);
         match winding_disclosed {
             // A stop path already disclosed this winding: stay silent.
@@ -14396,11 +14406,7 @@ mod tests {
             !coordinator.publication_pending(),
             "the bare coordinator pends nothing"
         );
-        coordinator.abandon_unfinished_joint_publication(
-            &mut lane,
-            None,
-            "test noop".to_string(),
-        );
+        coordinator.abandon_unfinished_joint_publication(&mut lane, None, "test noop".to_string());
         assert!(
             !coordinator.publication_pending(),
             "the no-op clears nothing"
@@ -14432,7 +14438,9 @@ mod tests {
         );
         let lane = joint_lane(WindDownIo::completing(), false);
         let mut display = None;
-        let mut warn = WarnSink { display: &mut display };
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
         let _ = ClassicDriver::hold_joint_lane_for_exit(
             lane,
             &mut coordinator,

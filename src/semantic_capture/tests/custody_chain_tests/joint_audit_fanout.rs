@@ -2567,9 +2567,7 @@ fn joint_machine_abandon_cancels_an_unapplied_publication() {
     // succeeds instead of refusing past the wedge.
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture
-        .scene
-        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     fixture.reach_phase("Audited");
     assert!(
         fixture.scene.real.scene.coordinator.publication_pending(),
@@ -2596,18 +2594,26 @@ fn joint_machine_abandon_cancels_an_unapplied_publication() {
         "the Staging finish consumed the prepared batch"
     );
     assert!(
-        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        fixture
+            .scene
+            .real
+            .lane
+            .take_joint_frame_for_abandon()
+            .is_none(),
         "the fixture drives its machine beside the lane, not inside it"
     );
     let frame = fixture.machine.take_abandoned_frame();
     assert!(frame.is_some(), "the Audited phase retains its frame");
     {
         let scene = &mut fixture.scene.real;
-        scene.scene.coordinator.abandon_unfinished_joint_publication(
-            &mut scene.lane,
-            frame,
-            "test abandon".to_string(),
-        );
+        scene
+            .scene
+            .coordinator
+            .abandon_unfinished_joint_publication(
+                &mut scene.lane,
+                frame,
+                "test abandon".to_string(),
+            );
     }
     assert!(
         !fixture.scene.real.scene.coordinator.publication_pending(),
@@ -2676,18 +2682,26 @@ fn joint_machine_abandon_finishes_an_applied_publication() {
         "the unfinished publication still pends"
     );
     assert!(
-        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        fixture
+            .scene
+            .real
+            .lane
+            .take_joint_frame_for_abandon()
+            .is_none(),
         "the fixture drives its machine beside the lane, not inside it"
     );
     let frame = fixture.machine.take_abandoned_frame();
     assert!(frame.is_some(), "the Audited phase retains its frame");
     {
         let scene = &mut fixture.scene.real;
-        scene.scene.coordinator.abandon_unfinished_joint_publication(
-            &mut scene.lane,
-            frame,
-            "test abandon".to_string(),
-        );
+        scene
+            .scene
+            .coordinator
+            .abandon_unfinished_joint_publication(
+                &mut scene.lane,
+                frame,
+                "test abandon".to_string(),
+            );
     }
     assert!(
         !fixture.scene.real.scene.coordinator.publication_pending(),
@@ -2723,9 +2737,7 @@ fn joint_machine_abandon_drains_a_stranded_prepared_batch() {
     // later finalizations, and the later plain commit succeeds.
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture
-        .scene
-        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     let mut stranded = false;
     for _ in 0..512 {
         match fixture.service(1) {
@@ -2764,7 +2776,12 @@ fn joint_machine_abandon_drains_a_stranded_prepared_batch() {
         "the stranded batch never reached the seal"
     );
     assert!(
-        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        fixture
+            .scene
+            .real
+            .lane
+            .take_joint_frame_for_abandon()
+            .is_none(),
         "the fixture drives its machine beside the lane, not inside it"
     );
     assert!(
@@ -2773,11 +2790,14 @@ fn joint_machine_abandon_drains_a_stranded_prepared_batch() {
     );
     {
         let scene = &mut fixture.scene.real;
-        scene.scene.coordinator.abandon_unfinished_joint_publication(
-            &mut scene.lane,
-            None,
-            "test abandon".to_string(),
-        );
+        scene
+            .scene
+            .coordinator
+            .abandon_unfinished_joint_publication(
+                &mut scene.lane,
+                None,
+                "test abandon".to_string(),
+            );
     }
     assert!(
         fixture
@@ -2822,9 +2842,7 @@ fn joint_machine_abandon_drops_a_stranded_collected_batch() {
     // succeeds. The drop's H3 shed shadow is pinned at the helper.
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture
-        .scene
-        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     let mut stranded = false;
     for _ in 0..512 {
         match fixture.service(1) {
@@ -2847,11 +2865,14 @@ fn joint_machine_abandon_drops_a_stranded_collected_batch() {
     );
     {
         let scene = &mut fixture.scene.real;
-        scene.scene.coordinator.abandon_unfinished_joint_publication(
-            &mut scene.lane,
-            None,
-            "test abandon".to_string(),
-        );
+        scene
+            .scene
+            .coordinator
+            .abandon_unfinished_joint_publication(
+                &mut scene.lane,
+                None,
+                "test abandon".to_string(),
+            );
     }
     assert!(
         !fixture.scene.real.scene.coordinator.publication_pending(),

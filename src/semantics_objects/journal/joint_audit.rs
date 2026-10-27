@@ -1677,4 +1677,19 @@ impl IngestedJointQuantum {
             frontier: self.frontier,
         })
     }
+
+    /// Abandon disposal for the exit hold: mint the frame's completion
+    /// metadata without seal proof. The caller holds the semantic lane
+    /// for exit, so the frame can never resume; its unfinished audit
+    /// state drops with its buffers (physical originals retain their
+    /// owners) and the abandon gap discloses the loss. No H3 void is
+    /// acknowledged: the seal never consumed this frame's evidence.
+    pub(crate) fn abandon_unfinished(self) -> DisposedJointQuantum {
+        let disposed = DisposedJointQuantum {
+            identity: self.identity(),
+            frontier: self.frontier,
+        };
+        drop(self); // Only frame buffers drop; physical originals retain their owners.
+        disposed
+    }
 }

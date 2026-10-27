@@ -5956,16 +5956,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Abandon an unfinished Joint publication the driver can no
-    /// longer resume, so the exit-hold abandon commit and every later
-    /// plain commit proceed past it. Stub: the twins pin the
-    /// contract; the cancel/finish follows with the abandon.
+    /// longer resume (its machine latched after preparing), so the
+    /// exit-hold abandon commit and every later plain commit proceed
+    /// past it. Stranded semantic batches resolve first (a Prepared
+    /// batch drains S1-direct and mints its H3; a Collected batch
+    /// drops through the audited path). An applied registry phase
+    /// finishes through the retained frame's abandon disposal; an
+    /// unapplied phase cancels. The prepared physical work publishes,
+    /// the abandon stages its named loss gap, and nothing pending is
+    /// a quiet no-op. An applied phase without its frame, without
+    /// bound seal targets, or refusing the finish is left standing:
+    /// the later refusal discloses it exactly as today.
     pub(crate) fn abandon_unfinished_joint_publication(
         &mut self,
         lane: &mut AttestedSemanticLane,
         frame: Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum>,
         reason: String,
     ) {
-        let _ = (lane, frame, reason);
+        if !self.publication_pending() {
+            drop(frame);
+            return;
+        }
+        self.abandon_stranded_semantic_batches(lane);
+        let mut applied = 0;
+        if self.registry.publication_pending() {
+            if self.registry.joint_publication_applied() {
+                let Some(frame) = frame else {
+                    return;
+                };
+                if !self.registry.joint_publication_targets_bound() {
+                    drop(frame);
+                    return;
+                }
+                let disposed = frame.abandon_unfinished();
+                let finished = self
+                    .registry
+                    .finish_joint_publication(&mut self.joint_capture, &disposed);
+                let Ok(finished) = finished else {
+                    return;
+                };
+                applied = finished;
+            } else {
+                drop(frame);
+                self.registry.cancel_unapplied_joint_publication();
+            }
+        } else {
+            drop(frame);
+        }
+        if let Some(pending) = self.joint_publication.take() {
+            let _ = self.finish_publication_context(pending.completion, applied);
+            drop(pending._storage);
+        }
+        self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
     }
 
     /// Pose a coordinator-half pending Joint publication (no registry

@@ -6439,12 +6439,23 @@ fn dashboard_stream_pass<S: ProcessSource>(
     (display_view, error)
 }
 
+/// Whether a live read must wait: the Joint driver still owes a
+/// publication, or the coordinator still holds an unfinished one
+/// the driver already abandoned (a held lane owes nothing, but its
+/// wedge still refuses a fresh capture). The stream and the
+/// dashboard keep their prior bytes; the final reuses its prior
+/// view — so a stuck publication degrades the report instead of
+/// panicking past the stop.
+fn publication_pending_for_view(driver: &ClassicDriver<'_>) -> bool {
+    driver.publication_pending() || driver.coordinator.publication_pending()
+}
+
 /// The stream view for one pass or stop publication: `None` while
-/// the Joint driver has a publication pending, so the caller emits
-/// nothing and the stream keeps its prior bytes and baselines (no
-/// commit, no key-operation, caller-event or baseline mutation, no
-/// live registry read). Otherwise the fresh view, retained as the
-/// prior for later pending views and the finals.
+/// a publication pends ([`publication_pending_for_view`]), so the
+/// caller emits nothing and the stream keeps its prior bytes and
+/// baselines (no commit, no key-operation, caller-event or baseline
+/// mutation, no live registry read). Otherwise the fresh view,
+/// retained as the prior for later pending views and the finals.
 fn stream_view_guarded(
     driver: &ClassicDriver<'_>,
     state: &mut StreamState,
@@ -6452,7 +6463,7 @@ fn stream_view_guarded(
     started_ns: u64,
     now_ns: u64,
 ) -> Option<Presentation> {
-    if driver.publication_pending() {
+    if publication_pending_for_view(driver) {
         return None;
     }
     let mut presentation = stream_presentation(driver.coordinator, scope_label, started_ns, now_ns);
@@ -6461,10 +6472,10 @@ fn stream_view_guarded(
     Some(presentation)
 }
 
-/// The dashboard pass views: `None` while the Joint driver has a
-/// publication pending, so the caller skips both the stream emit
-/// and the display offer and both keep their prior view. Otherwise
-/// the display view with its stream error, as
+/// The dashboard pass views: `None` while a publication pends
+/// ([`publication_pending_for_view`]), so the caller skips both the
+/// stream emit and the display offer and both keep their prior view.
+/// Otherwise the display view with its stream error, as
 /// [`dashboard_stream_pass`].
 fn dashboard_pass_guarded(
     driver: &ClassicDriver<'_>,
@@ -6475,7 +6486,7 @@ fn dashboard_pass_guarded(
     started_ns: u64,
     now_ns: u64,
 ) -> Option<(Presentation, Option<String>)> {
-    if driver.publication_pending() {
+    if publication_pending_for_view(driver) {
         return None;
     }
     Some(dashboard_stream_pass(
@@ -6491,12 +6502,12 @@ fn dashboard_pass_guarded(
 }
 
 /// The final report view shared by the classic and dashboard
-/// finals: the prior stream view while the Joint driver has a
-/// publication pending (with the current lane-side summary, which
-/// is not a registry read), so the report reuses the last
-/// completed observation instead of a partial live read. Pending
-/// without a prior (only before the opening seed, which the run
-/// functions always install) falls back to a fresh capture: the
+/// finals: the prior stream view while a publication pends
+/// ([`publication_pending_for_view`], with the current lane-side
+/// summary, which is not a registry read), so the report reuses the
+/// last completed observation instead of a partial live read.
+/// Pending without a prior (only before the opening seed, which the
+/// run functions always install) falls back to a fresh capture: the
 /// stop must still write its report.
 fn final_view_guarded(
     driver: &ClassicDriver<'_>,
@@ -6505,7 +6516,7 @@ fn final_view_guarded(
     started_ns: u64,
     ended_ns: u64,
 ) -> Presentation {
-    if driver.publication_pending()
+    if publication_pending_for_view(driver)
         && let Some(prior) = state.last_stream_view.as_ref()
     {
         let mut view = prior.clone();

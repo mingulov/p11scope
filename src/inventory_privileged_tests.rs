@@ -5579,8 +5579,24 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         lane.shed_calls_disclosed(),
         "r16-q2",
         &[
-            ("A", a_semantic, a_count_only, a_total, api_a, slot_a, inst_a),
-            ("B", b_semantic, b_count_only, b_total, api_b, slot_b, inst_b),
+            (
+                "A",
+                a_semantic,
+                a_count_only,
+                a_total,
+                api_a,
+                slot_a,
+                inst_a,
+            ),
+            (
+                "B",
+                b_semantic,
+                b_count_only,
+                b_total,
+                api_b,
+                slot_b,
+                inst_b,
+            ),
         ],
     )?;
     // Op-level asserts hold per fully attributed owner; a shed owner
@@ -5989,7 +6005,15 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         &coordinator,
         lane_a.shed_calls_disclosed(),
         "r16c-qa",
-        &[("A", a_semantic, a_count_only, a_total, api_a, slot_a, inst_a)],
+        &[(
+            "A",
+            a_semantic,
+            a_count_only,
+            a_total,
+            api_a,
+            slot_a,
+            inst_a,
+        )],
     )?;
     if a_complete {
         let edge = edge_a_row.as_ref().expect("complete implies a row");
@@ -6301,7 +6325,15 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         coordinator,
         lane_b.shed_calls_disclosed(),
         "r16c-qb",
-        &[("B", b_semantic, b_count_only, b_total, api_b, slot_b, inst_b)],
+        &[(
+            "B",
+            b_semantic,
+            b_count_only,
+            b_total,
+            api_b,
+            slot_b,
+            inst_b,
+        )],
     )?;
     if b_complete {
         let edge = edge_b_row.as_ref().expect("complete implies a row");
@@ -7567,8 +7599,24 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
                 slot_e,
                 inst_e,
             ),
-            ("C", c_semantic, c_count_only, c_total, api_c, slot_c, inst_c),
-            ("H", h_semantic, h_count_only, h_total, api_h, slot_h, inst_h),
+            (
+                "C",
+                c_semantic,
+                c_count_only,
+                c_total,
+                api_c,
+                slot_c,
+                inst_c,
+            ),
+            (
+                "H",
+                h_semantic,
+                h_count_only,
+                h_total,
+                api_h,
+                slot_h,
+                inst_h,
+            ),
         ],
     )?;
     if joint_world {

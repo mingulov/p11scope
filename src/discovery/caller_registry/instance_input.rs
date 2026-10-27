@@ -4289,10 +4289,17 @@ mod journal_unavailable_tests {
         let mut scene = UnlinkedScene::new();
         let (key, _) = scene.register(1);
         let other = CallerId(11);
-        scene.registry.scripted_module_edge(scene.module.clone(), other);
-        scene.registry.observe_instance_semantic(
-            AdmittedInstanceCall::scripted(key, other, 1, s1_call("C_Sign", RV_OK, MECHANISM)),
-        );
+        scene
+            .registry
+            .scripted_module_edge(scene.module.clone(), other);
+        scene
+            .registry
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key,
+                other,
+                1,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            ));
         scene.registry.publish();
         assert!(
             scene.registry.gaps().iter().any(|gap| {

@@ -11185,7 +11185,7 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
     )?;
     require_contract_marker(
         terminal,
-        "self.fresh_with(plan, pins, profile, binding, acquire, legacy)?\n            .require_terminal()",
+        "self.fresh_with(\n            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )?\n        .require_terminal()",
         "fresh terminal observation",
     )?;
     let terminal_acceptance = contract_section(

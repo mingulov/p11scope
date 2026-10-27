@@ -132,12 +132,13 @@ impl AttestedSubset {
         let Some(pin) = self.pins.pinned().find(|pin| pin.id == object) else {
             return false;
         };
-        pin.sha256 == sha256
-            && self.pins.raw_keys_for(object).iter().any(|key| {
-                key.device.major == *dev_major
-                    && key.device.minor == *dev_minor
-                    && key.inode == *ino
-            })
+        if pin.sha256 != sha256 {
+            return false;
+        }
+        // A pre-6.8 overlay split also proves through the entry-carried
+        // maps rendering; see `PinnedObjects::object_matches_key`.
+        self.pins
+            .object_matches_key(object, *dev_major, *dev_minor, *ino)
     }
 
     /// Tests-only envelope: conversion tests script descriptor shapes
@@ -179,12 +180,7 @@ fn provider_object_for_key(pins: &PinnedObjects, module: &ModuleKey) -> Option<P
     }
     pins.pinned()
         .find(|pin| {
-            pin.sha256 == sha256
-                && pins.raw_keys_for(pin.id).iter().any(|key| {
-                    key.device.major == *dev_major
-                        && key.device.minor == *dev_minor
-                        && key.inode == *ino
-                })
+            pin.sha256 == sha256 && pins.object_matches_key(pin.id, *dev_major, *dev_minor, *ino)
         })
         .map(|pin| pin.id)
 }
@@ -5075,6 +5071,100 @@ mod promotion_lifecycle_tests {
                 pin.path,
             )
         }
+    }
+
+    #[test]
+    fn manifest_pinning_records_probe_rendered_split_key() {
+        use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let fixture = SelectedProviderFixture::new();
+        let fd_key = fixture
+            .pins
+            .pinned()
+            .next()
+            .expect("fixture pins one object")
+            .key;
+        // A pre-6.8 overlay split: the kernel renders this exact fd at a
+        // different device than the mount table resolves.
+        let split = ObjectKey {
+            device: Device {
+                major: fd_key.device.major,
+                minor: fd_key.device.minor.wrapping_add(1),
+            },
+            inode: fd_key.inode,
+        };
+        assert_ne!(split, fd_key, "the test needs a genuine split");
+        let mut budget = CaptureWorkBudget::default();
+        let probe = FakeSelfMappingProbe::new(true, Some(split));
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_probe(
+                &fixture.manifest,
+                &[],
+                &mut budget,
+                &probe,
+            )
+            .expect("split pinning succeeds");
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 1);
+        let pin = pinning.pins.pinned().next().expect("one object");
+        let id = pin.id;
+        assert_eq!(pin.key, fd_key, "the mount-table key stays primary");
+        assert_eq!(
+            pin.probed_maps_key,
+            Some(split),
+            "the probe rendering rides on the entry"
+        );
+        // The split must not add a second manifest raw: `id_for_path`
+        // resolves exactly one raw per path, and a second raw refuses
+        // the whole semantic subset ("manifest targets unavailable").
+        let path = pin.path.to_owned();
+        let sha256 = pin.sha256.to_owned();
+        assert_eq!(
+            pinning.pins.id_for_path(&path),
+            Some(id),
+            "the record path still resolves through one manifest raw"
+        );
+        // End to end: a module keyed by the split maps key proves against
+        // the manifest pin, exactly as on a consistent filesystem.
+        let subset = AttestedSubset {
+            plan: plan::AttachPlan::from_slots(vec![]),
+            pins: pinning.pins,
+            required: BTreeMap::from([(id, BTreeSet::new())]),
+        };
+        let module = ModuleKey::physical(
+            split.device.major,
+            split.device.minor,
+            split.inode,
+            Some(sha256.clone()),
+            &path,
+        );
+        assert!(
+            subset.proves_provider_module(id, &module),
+            "the split maps key proves the provider"
+        );
+        let fd_module = ModuleKey::physical(
+            fd_key.device.major,
+            fd_key.device.minor,
+            fd_key.inode,
+            Some(sha256),
+            &path,
+        );
+        assert!(
+            subset.proves_provider_module(id, &fd_module),
+            "the fd key still proves the provider"
+        );
+        // The documented mirror resolves the split key to the same
+        // object: admission, labeling, and selection must agree.
+        assert_eq!(
+            provider_object_for_key(&subset.pins, &module),
+            Some(id),
+            "the mirror finds the split-keyed provider"
+        );
+        assert_eq!(
+            provider_object_for_key(&subset.pins, &fd_module),
+            Some(id),
+            "the mirror keeps finding the fd-keyed provider"
+        );
     }
 
     #[test]

@@ -67,11 +67,9 @@ impl CallerRegistry {
             else {
                 return false;
             };
-            subset.pins().raw_keys_for(object).iter().any(|raw| {
-                raw.device.major == *dev_major
-                    && raw.device.minor == *dev_minor
-                    && raw.inode == *ino
-            })
+            subset
+                .pins()
+                .object_matches_key(object, *dev_major, *dev_minor, *ino)
         };
         let mut selected: Option<&ModuleKey> = None;
         // Positive catalog rows remain subject to ALL original prefix

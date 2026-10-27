@@ -18295,9 +18295,13 @@ fn joint_machine_promotion_finish_ignores_shared_engine_backlog() {
 fn joint_machine_receipt_model_sizes_and_collect_growth() {
     use std::mem::size_of;
     assert_eq!(size_of::<crate::discovery::instances::InstanceId>(), 8);
+    // 488 + 32: the retained target carries the entry's probed maps key
+    // (pre-6.8 overlay split rendering). Re-audited: the worst-case
+    // 1,024-partition transaction below still binds within the 64 MiB
+    // pool, so the reservation holds.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        488
+        520
     );
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);

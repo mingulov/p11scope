@@ -144,6 +144,13 @@ struct Entry {
     /// entry stands for more than one proven kernel file, so its raw key is
     /// never a sweep-matching key (`sweep_match_keys`).
     collapsed: bool,
+    /// How the kernel renders this exact held fd in `/proc` maps when that
+    /// differs from the fd's own key (pre-6.8 overlayfs split), proved by
+    /// the shared self-mapping probe at pin time. `None` whenever the
+    /// rendering agrees or is inconclusive. Carried on the entry — never
+    /// as a second manifest raw — so the one-manifest-raw-per-path
+    /// invariant behind `id_for_path` is preserved.
+    probed_maps_key: Option<ObjectKey>,
 }
 
 /// The exact, bounded pin subset retained by private Inventory activation.
@@ -815,6 +822,7 @@ impl Entry {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
             collapsed: false,
+            probed_maps_key: None,
             raw,
             mapping,
             file: Arc::new(file),
@@ -847,6 +855,10 @@ pub struct PinnedSummary<'a> {
     pub identity_source: &'static str,
     /// Reserved for bounded diagnostic context; ordinary comparable pins have none.
     pub note: Option<&'a str>,
+    /// The kernel's maps rendering of this entry's held fd when it splits
+    /// from the fd key (pre-6.8 overlayfs); `None` otherwise. Mirrors
+    /// `Entry::probed_maps_key` for the provider-proof join.
+    pub probed_maps_key: Option<ObjectKey>,
 }
 
 /// Claims retained per accepted process view. Vectors deliberately preserve duplicate
@@ -1227,6 +1239,28 @@ impl PinnedObjects {
         keys
     }
 
+    /// Whether a physical `(dev_major, dev_minor, ino)` names this pinned
+    /// object: one of its raw keys, or — on a pre-6.8 overlay split — the
+    /// kernel maps rendering the pin-time probe proved for its exact held
+    /// fd. The single join predicate behind the provider proof and its
+    /// mirrors, so a split-proved binding resolves identically at
+    /// admission, labeling, and selection.
+    pub(crate) fn object_matches_key(
+        &self,
+        object: PinnedObjectId,
+        dev_major: u64,
+        dev_minor: u64,
+        ino: u64,
+    ) -> bool {
+        self.raw_keys_for(object).iter().any(|key| {
+            key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
+        }) || self.by_id.get(&object).is_some_and(|entry| {
+            entry.probed_maps_key.is_some_and(|key| {
+                key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
+            })
+        })
+    }
+
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
         self.by_id.get(&id).map(|entry| entry.abi)
     }
@@ -1484,6 +1518,7 @@ impl PinnedObjects {
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
             note: None,
+            probed_maps_key: entry.probed_maps_key,
         })
     }
 
@@ -1757,6 +1792,7 @@ impl PinnedObjects {
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
             note: None,
+            probed_maps_key: entry.probed_maps_key,
         })
     }
 
@@ -2197,6 +2233,7 @@ mod conservative_copy {
                     exports: old.exports.clone(),
                     overlay: old.overlay,
                     collapsed: old.collapsed,
+                    probed_maps_key: old.probed_maps_key,
                 },
                 field: 0,
             }
@@ -6253,6 +6290,18 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
     views: &[ProcessView],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe(m, views, budget, &KernelSelfMappingProbe)
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_budget`] with an injected
+/// self-mapping probe, so unit tests can script the kernel side of a
+/// pre-6.8 overlay split. Production always passes the kernel probe.
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
         return Err(ManifestPinError::Invalid(structural));
@@ -6425,7 +6474,7 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
         };
-        let entry = match Entry::new(
+        let mut entry = match Entry::new(
             file,
             pin,
             object.path.clone(),
@@ -6462,6 +6511,13 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
             drop(entry);
             continue;
         }
+        // A pre-6.8 overlay fd renders in maps at a different key than
+        // the mount table resolves; record the kernel rendering of this
+        // exact held fd on the entry so the provider proof matches it.
+        // The probe returns None (no split) whenever the rendering agrees
+        // or is inconclusive. Never a second manifest raw: the
+        // one-manifest-raw-per-path invariant behind `id_for_path` holds.
+        entry.probed_maps_key = self_mapped_fallback_key(&entry.file, key, budget, probe);
         opened.insert(object.id, (entry, inspected));
     }
 
@@ -7007,6 +7063,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: false,
             collapsed: false,
+            probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7048,6 +7105,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay,
             collapsed: false,
+            probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7236,6 +7294,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: true,
             collapsed: false,
+            probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7268,6 +7327,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: true,
             collapsed: false,
+            probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());

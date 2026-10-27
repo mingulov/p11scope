@@ -4835,6 +4835,31 @@ impl ClassicDriver<'_> {
         Option<anyhow::Error>,
         Option<ZeroPassStop>,
     ) {
+        self.consume_retained_run_with_bound(
+            run,
+            error,
+            clock,
+            publish,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// The drain above with an explicit wall bound on a continuously
+    /// pending Joint commit (tests pose a short one; production
+    /// passes the retained publication timeout). The bound is not
+    /// yet enforced here.
+    fn consume_retained_run_with_bound(
+        &mut self,
+        run: RetainedClassicRun<FacadeLane>,
+        error: Option<anyhow::Error>,
+        clock: &LoopClock,
+        publish: &mut dyn FnMut(&mut Self, Publish<'_>) -> Result<()>,
+        _bound: Duration,
+    ) -> (
+        Option<Stopped<FacadeLane>>,
+        Option<anyhow::Error>,
+        Option<ZeroPassStop>,
+    ) {
         self.suspended = true;
         let mut outcome = ClassicOutcome {
             stopped: None,
@@ -13956,6 +13981,107 @@ mod tests {
         assert!(
             driver.fold_retained_joint_error(None).is_none(),
             "the retained run folds no error from the conversion"
+        );
+    }
+
+    #[test]
+    fn retained_deadline_with_pending_publication_names_the_retained_run() {
+        // When the deadline retains the run while a Joint publication
+        // pends, the consumer names the retained drain on stderr, so a
+        // slow drain is visible instead of a silent hang. The
+        // conversion still finalizes the run without an error.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_commit_pending = true;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::Deadline, None);
+        assert!(outcome.retained.is_some(), "the deadline retains the run");
+        assert!(driver.suspended, "the run suspends beside the driver");
+        super::take_warned_for_test();
+        let stop_now = || false;
+        let clock = consume_clock(&stop_now);
+        let (stopped, error, _zero_pass) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(
+            stopped.is_some() || error.is_none(),
+            "the retained run finalizes"
+        );
+        assert!(error.is_none(), "the conversion folds no run error");
+        let warned = super::take_warned_for_test();
+        assert!(
+            warned.iter().any(|line| line.contains("deadline")
+                && line.contains("joint publication")
+                && line.contains("retained run")),
+            "the retained drain is named on stderr: {warned:?}"
+        );
+    }
+
+    #[test]
+    fn retained_stuck_joint_publication_holds_for_report_within_bound() {
+        // A Joint commit stuck Pending past the retained wall bound is
+        // held so the report still writes: the hold names its own gap,
+        // marks the summary Partial, drops the hold error (exit 0),
+        // and the pump finalizes past the held lane. The sticky
+        // Pending stands in for the unbounded production wedge;
+        // without the bound this test never ends.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_commit_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        driver.semantic = Some(lane);
+        driver.joint_commit_pending = true;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::Deadline, None);
+        assert!(outcome.retained.is_some(), "the deadline retains the run");
+        let (run, error) = retained_run_of(outcome);
+        let stop_now = || false;
+        let clock = consume_clock(&stop_now);
+        let started = std::time::Instant::now();
+        let (stopped, error, _zero_pass) = driver.consume_retained_run_with_bound(
+            run,
+            error,
+            &clock,
+            &mut |_, _| Ok(()),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the bound ends a stuck publication finitely"
+        );
+        assert!(
+            stopped.is_some() || error.is_none(),
+            "the retained run finalizes"
+        );
+        assert!(error.is_none(), "the bound hold folds no run error");
+        assert!(
+            driver.semantic.is_none(),
+            "the stuck lane is held for exit"
+        );
+        assert!(
+            !driver.joint_commit_pending,
+            "the held commit pends nothing"
+        );
+        assert!(
+            driver.joint_first_error.is_none(),
+            "the bound hold keeps no run error"
+        );
+        assert_eq!(
+            driver.semantic_summary().status,
+            crate::inventory_semantics::SemanticCaptureStatus::Partial,
+            "a bound-held lane reads partial"
+        );
+        let timeouts: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "retained joint publication timed out")
+            .collect();
+        assert_eq!(timeouts.len(), 1, "the bound hold is disclosed once");
+        assert!(
+            timeouts[0].1.contains("still pending")
+                && timeouts[0].1.contains("report written"),
+            "the gap words the hold in plain words: {:?}",
+            timeouts[0].1
         );
     }
 

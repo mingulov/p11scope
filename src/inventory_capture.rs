@@ -1904,6 +1904,27 @@ pub(crate) trait PassDriver<Pin> {
     fn on_lane_stopped(&mut self) {}
 }
 
+/// The collection wait below with a run-deadline check: when the
+/// deadline passes while the worker still runs, the wait names the
+/// overrun once (stderr in production, recorded for tests) and keeps
+/// servicing until the worker's value crosses back. A worker thread
+/// cannot be cancelled, so the check discloses the wedge; it never
+/// drops the pass. The check is not yet enforced here.
+pub(crate) fn collect_off_thread_with_deadline<T: Send>(
+    job: impl FnOnce() -> T + Send,
+    tick: Duration,
+    service: &mut dyn FnMut(),
+    _deadline: Option<Instant>,
+) -> T {
+    collect_off_thread(job, tick, service)
+}
+
+/// Whether the last wait named a passed deadline (tests drain it).
+#[cfg(test)]
+pub(crate) fn take_collection_deadline_noted_for_test() -> bool {
+    false
+}
+
 /// Runs `job` on a scoped worker thread and calls `service` every `tick`
 /// until its result arrives (C5.7, ruling D8): the lifecycle ring is
 /// serviced while the scope is collected, not only between passes. The
@@ -4488,6 +4509,45 @@ mod stop_latch_tests {
             "the settled hold publishes with the stop: staged={:?} committed={:?}",
             driver.host.staged,
             driver.host.committed
+        );
+    }
+
+    #[test]
+    fn collect_off_thread_notes_a_passed_deadline_and_stays_silent_without_one() {
+        // The main-thread collection wait checks the run deadline: a
+        // passed deadline is named once (stderr in production,
+        // recorded here) while the worker's value still crosses back;
+        // without a deadline the wait stays silent. The jobs outlast
+        // one tick so the wait actually waits (an instant job never
+        // ticks, so there is no overrun to name).
+        take_collection_deadline_noted_for_test();
+        let value = collect_off_thread_with_deadline(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                7
+            },
+            std::time::Duration::from_millis(1),
+            &mut || {},
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        assert_eq!(value, 7, "the worker's value still crosses back");
+        assert!(
+            take_collection_deadline_noted_for_test(),
+            "a passed deadline is named once"
+        );
+        let silent = collect_off_thread_with_deadline(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                7
+            },
+            std::time::Duration::from_millis(1),
+            &mut || {},
+            None,
+        );
+        assert_eq!(silent, 7);
+        assert!(
+            !take_collection_deadline_noted_for_test(),
+            "no deadline means no note"
         );
     }
 

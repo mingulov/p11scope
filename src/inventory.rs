@@ -7228,11 +7228,6 @@ pub(crate) fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json
         "semantics": edge.semantics.label,
         "mechanisms": mechanisms_json(&edge.semantics.mechanisms),
         "operations": operations_json(edge.semantics.operations.as_ref()),
-        // Additive (v1): the edge-level coverage repeats the entries
-        // coverage object, so consumers judging the edge as a whole
-        // (e.g., the workload ledger join) read the same state both
-        // paths carry.
-        "coverage": coverage_json(&edge.coverage),
     })
 }
 

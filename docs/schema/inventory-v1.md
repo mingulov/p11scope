@@ -324,10 +324,7 @@ non-null values needs a new allowlist row.
   (`null` where a key does not apply: `lossy` is a boolean only for
   `counted`). In v0.2.0 the producer emits `witnessed`, `watched_no_use`
   and `unknown` only; since v0.3.0 the native lane also emits `counted`
-  (C7). `edges[].coverage` repeats the same object at the edge level,
-  so consumers judging the edge as a whole (e.g., the workload ledger
-  join) read the same state; both paths always carry identical values.
-  `state` is:
+  (C7). `state` is:
   - `counted`: a counting feed (actual call observations) covers the
     edge since `since_ns`; `count` and `last_seen_ns` are meaningful.
     `count` is a saturating lower bound of entries on the module's

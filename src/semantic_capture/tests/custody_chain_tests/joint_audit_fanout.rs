@@ -227,6 +227,7 @@ struct FinishMachineFixture {
     staged: crate::attach::DiscoveryStage,
     stop_requests: usize,
     q_observations: usize,
+    at_q_coverage_failures: usize,
     stops: usize,
     at_stop: Option<FinishStopObservation>,
 }
@@ -554,7 +555,16 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         q: &crate::attach::CollectedFinishQ,
     ) -> Result<SemanticBatch, SemanticRefusal> {
         self.validate_finish_q(q)?;
-        self.tick_collected(lane, bindings, raw)
+        let batch = self.tick_collected(lane, bindings, raw)?;
+        self.finish.as_deref_mut().unwrap().at_q_coverage_failures += batch
+            .outcomes()
+            .iter()
+            .filter(|outcome| {
+                matches!(outcome, TickOutcome::Invalidation(loss)
+                    if matches!(loss.scope(), InvalidationScope::CoverageFailed))
+            })
+            .count();
+        Ok(batch)
     }
 
     fn prepare_publication_at_q(
@@ -1233,6 +1243,7 @@ impl MachineScene {
             staged: crate::attach::DiscoveryStage::default(),
             stop_requests: 0,
             q_observations: 0,
+            at_q_coverage_failures: 0,
             stops: 0,
             at_stop: None,
         });
@@ -2919,6 +2930,49 @@ fn joint_finish_completion_certifies_the_final_drain() {
         crate::inventory_semantics::SemanticStopQuiescence::Quiesced
     );
     assert_eq!(summary.final_drain, Some(true));
+}
+
+#[test]
+fn joint_finish_at_q_coverage_loss_quiesces_without_certifying_final_drain() {
+    // With no key-operation consumers (the v0.5.0 live shape), a discarded
+    // reservation still permits quiescence. Its CoverageFailed report must
+    // survive later healthy at-Q ticks and forbid a lossless-drain claim.
+    for (discard, expected_drain) in [(false, true), (true, false)] {
+        let mut fixture = MachineScene::new(1);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_feeds(),
+            0
+        );
+        fixture.enable_finish_fixture(vec![]);
+        if discard {
+            fixture.scene.drain.source_mut().push_discard();
+        }
+        fixture.begin_finish().unwrap();
+        fixture.finish_published();
+        assert_eq!(fixture.scene.drain.source().remaining(), 0);
+        assert_eq!(fixture.scene.drain.discarded(), u64::from(discard));
+        assert_eq!(
+            fixture.finish.as_ref().unwrap().at_q_coverage_failures,
+            usize::from(discard),
+            "the actual at-Q report must declare the injected loss"
+        );
+        let summary = fixture.scene.real.lane.semantic_summary();
+        assert_eq!(
+            summary.stop_quiescence,
+            crate::inventory_semantics::SemanticStopQuiescence::Quiesced
+        );
+        assert_eq!(
+            summary.final_drain,
+            Some(expected_drain),
+            "discard={discard}"
+        );
+    }
 }
 
 #[test]

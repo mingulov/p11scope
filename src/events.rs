@@ -1513,10 +1513,11 @@ pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
 /// missing quantum is a panic on a finite script, never a hang.
 #[cfg(test)]
 pub(crate) struct ScriptedRecords {
-    queue: std::collections::VecDeque<Vec<u8>>,
+    queue: std::collections::VecDeque<Option<Vec<u8>>>,
     pub(crate) bound: usize,
     taken: usize,
     front_busy: bool,
+    discarded: u64,
 }
 
 #[cfg(test)]
@@ -1527,10 +1528,11 @@ impl ScriptedRecords {
 
     pub(crate) fn records(records: impl IntoIterator<Item = Vec<u8>>, bound: usize) -> Self {
         Self {
-            queue: records.into_iter().collect(),
+            queue: records.into_iter().map(Some).collect(),
             bound,
             taken: 0,
             front_busy: false,
+            discarded: 0,
         }
     }
 
@@ -1558,15 +1560,23 @@ impl RecordSource for ScriptedRecords {
         if self.front_busy {
             return None;
         }
-        let item = self.queue.pop_front()?;
-        self.taken += 1;
-        assert!(
-            self.taken <= self.bound,
-            "the poll took record {} past its bound of {}",
-            self.taken,
-            self.bound
-        );
-        Some(item)
+        loop {
+            let item = self.queue.pop_front()?;
+            self.taken += 1;
+            assert!(
+                self.taken <= self.bound,
+                "the poll took record {} past its bound of {}",
+                self.taken,
+                self.bound
+            );
+            if let Some(item) = item {
+                return Some(item);
+            }
+            self.discarded += 1;
+        }
+    }
+    fn discarded(&self) -> u64 {
+        self.discarded
     }
 }
 
@@ -1575,10 +1585,15 @@ impl ScriptedRecords {
     /// A record committed after the script was fixed: advances the producer
     /// past any position observed before the push, like a post-Q write.
     pub(crate) fn push_event(&mut self, event: &Event) {
-        self.queue.push_back(event_bytes(event));
+        self.queue.push_back(Some(event_bytes(event)));
     }
     pub(crate) fn push_record(&mut self, record: Vec<u8>) {
-        self.queue.push_back(record);
+        self.queue.push_back(Some(record));
+    }
+    /// One kernel-discarded reservation: advances the owned cursor without
+    /// delivering a record, while retaining the reader's loss accounting.
+    pub(crate) fn push_discard(&mut self) {
+        self.queue.push_back(None);
     }
 }
 
@@ -1598,24 +1613,29 @@ impl BoundedRecordSource for ScriptedRecords {
         &mut self,
         stop: usize,
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
-        if self.taken * 8 == stop {
-            return Ok(BoundedRecord::Reached);
-        }
-        if self.front_busy {
-            return Ok(BoundedRecord::Pending);
-        }
-        match self.queue.pop_front() {
-            Some(item) => {
-                self.taken += 1;
-                assert!(
-                    self.taken <= self.bound,
-                    "the poll took record {} past its bound of {}",
-                    self.taken,
-                    self.bound
-                );
-                Ok(BoundedRecord::Item(item))
+        loop {
+            if self.taken * 8 == stop {
+                return Ok(BoundedRecord::Reached);
             }
-            None => Ok(BoundedRecord::Pending),
+            if self.front_busy {
+                return Ok(BoundedRecord::Pending);
+            }
+            match self.queue.pop_front() {
+                Some(item) => {
+                    self.taken += 1;
+                    assert!(
+                        self.taken <= self.bound,
+                        "the poll took record {} past its bound of {}",
+                        self.taken,
+                        self.bound
+                    );
+                    if let Some(item) = item {
+                        return Ok(BoundedRecord::Item(item));
+                    }
+                    self.discarded += 1;
+                }
+                None => return Ok(BoundedRecord::Pending),
+            }
         }
     }
 }

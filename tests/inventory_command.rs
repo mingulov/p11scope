@@ -1164,6 +1164,7 @@ fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
             keys,
             vec![
                 "caller",
+                "coverage",
                 "entries",
                 "mapping",
                 "mechanisms",

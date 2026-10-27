@@ -18,6 +18,8 @@ enum FixtureMode {
     UnknownFlags,
     ShortTable,
     Outside,
+    InterfaceOnly,
+    InterfaceOnlyOutside,
 }
 
 fn build_fixture(mode: FixtureMode) -> PathBuf {
@@ -30,7 +32,10 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
     let helper = dir.join("helper.so");
     let provider = dir.join("provider.so");
     let outside = dir.join("outside.c");
-    if matches!(mode, FixtureMode::Outside) {
+    if matches!(
+        mode,
+        FixtureMode::Outside | FixtureMode::InterfaceOnlyOutside
+    ) {
         std::fs::write(
             &outside,
             "typedef unsigned long CK_RV; typedef unsigned long CK_FLAGS; typedef struct { unsigned char major; unsigned char minor; } CK_VERSION; CK_RV C_GetInterface(void *n, void *v, void **o, CK_FLAGS f) { (void)n; (void)v; (void)o; (void)f; __builtin_trap(); }\n",
@@ -43,7 +48,10 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
         .args(["-shared", "-fPIC", "-Wl,-soname,helper.so", "-o"])
         .arg(&helper)
         .arg(src.join("helper.c"));
-    if matches!(mode, FixtureMode::Outside) {
+    if matches!(
+        mode,
+        FixtureMode::Outside | FixtureMode::InterfaceOnlyOutside
+    ) {
         helper_cmd.arg(&outside);
     }
     let ok = helper_cmd.status().unwrap().success();
@@ -61,8 +69,17 @@ fn build_fixture(mode: FixtureMode) -> PathBuf {
     if matches!(mode, FixtureMode::PostFailure) {
         provider_cmd.arg("-DPOST_FAILURE_FIXTURE=1");
     }
-    if matches!(mode, FixtureMode::Absent | FixtureMode::Outside) {
+    if matches!(
+        mode,
+        FixtureMode::Absent | FixtureMode::Outside | FixtureMode::InterfaceOnlyOutside
+    ) {
         provider_cmd.arg("-DNO_GET_INTERFACE=1");
+    }
+    if matches!(
+        mode,
+        FixtureMode::InterfaceOnly | FixtureMode::InterfaceOnlyOutside
+    ) {
+        provider_cmd.arg("-DINTERFACE_ONLY_FIXTURE=1");
     }
     if matches!(mode, FixtureMode::UnknownFlags) {
         provider_cmd.arg("-DUNKNOWN_FLAGS_FIXTURE=1");
@@ -259,6 +276,43 @@ fn selection_helper_export_outside_module_makes_zero_queries() {
     );
     assert!(m.selection_evidence.queries.is_empty());
     assert!(m.selection_evidence.tables.is_empty());
+}
+
+#[test]
+fn interface_only_export_supplies_selection_inventory() {
+    let _guard = DISCOVER_LOCK.lock().unwrap();
+    let provider = build_fixture(FixtureMode::InterfaceOnly);
+    let manifest = discover(&provider).unwrap();
+    assert_eq!(manifest.surfaces[0].acquisition, Acquisition::Absent);
+    assert_eq!(manifest.interface_list, Acquisition::Absent);
+    assert_eq!(
+        manifest.selection_evidence.acquisition,
+        SelectionAcquisition::Queried
+    );
+    assert_eq!(manifest.selection_evidence.queries.len(), 10);
+    assert_eq!(manifest.selection_evidence.tables.len(), 1);
+    let table = &manifest.selection_evidence.tables[0];
+    assert_eq!(table.functions.len(), 92);
+    assert!(matches!(table.walk, WalkOutcome::Full));
+    assert!(!table.semantic_authorized);
+    assert!(
+        manifest
+            .selection_evidence
+            .queries
+            .iter()
+            .any(|query| query.authority == SelectionAuthority::SelectionCountOnly)
+    );
+}
+
+#[test]
+fn interface_only_export_outside_module_cannot_establish_module_identity() {
+    let _guard = DISCOVER_LOCK.lock().unwrap();
+    let provider = build_fixture(FixtureMode::InterfaceOnlyOutside);
+    let error = discover(&provider).unwrap_err();
+    assert!(
+        error.contains("no module acquisition export maps to the requested file identity"),
+        "{error}"
+    );
 }
 
 #[test]

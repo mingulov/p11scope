@@ -10,9 +10,7 @@ use p11scope_manifest::identity::{
     UnboundedProbeBudget, opened_file_matches_maps, self_mapped_fallback_key,
 };
 use p11scope_manifest::manifest::*;
-use pkcs11_module::{
-    RawInterface, Surface, TableSet, function_list, interface_list, read_fn_pointers, tables_for,
-};
+use pkcs11_module::{RawInterface, Surface, TableSet, function_list, interface_list, tables_for};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::raw::c_void;
@@ -353,9 +351,13 @@ fn loaded_module_key_with_probe(
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
 ) -> Result<ObjectKey, String> {
-    for address in [exports.get_function_list, exports.get_interface_list]
-        .into_iter()
-        .flatten()
+    for address in [
+        exports.get_function_list,
+        exports.get_interface_list,
+        exports.get_interface,
+    ]
+    .into_iter()
+    .flatten()
     {
         if let maps::Resolved::File {
             path,
@@ -592,41 +594,61 @@ fn snapshot_table(memory: &ProcessMemory, base: usize, set: TableSet) -> TableSn
         }
     };
     let width = std::mem::size_of::<usize>();
-    let Some(len) = spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .filter_map(|field| field.offset.checked_add(width))
-        .max()
-    else {
-        return TableSnapshot {
-            walk: WalkOutcome::Unreadable {
-                detail: "selected table has no fields".into(),
-            },
-            values: vec![],
-        };
-    };
-    let bytes = match memory.read_exact(base, len) {
-        Ok(bytes) => bytes,
-        Err(detail) => {
-            return TableSnapshot {
-                walk: WalkOutcome::Unreadable { detail },
-                values: vec![],
-            };
-        }
-    };
     let mut values = Vec::new();
-    for span in spans {
-        match read_fn_pointers(&bytes, span.fields()) {
-            Ok(mut span_values) => values.append(&mut span_values),
+    for field in spans.iter().flat_map(|span| span.fields()) {
+        // A failed word ends the contiguous inventory. Earlier complete words,
+        // including observed NULLs and unusable targets, retain their ordinals.
+        let bytes = base
+            .checked_add(field.offset)
+            .ok_or_else(|| "provider pointer arithmetic overflow".to_string())
+            .and_then(|address| memory.read_exact(address, width));
+        match bytes {
+            Ok(bytes) => {
+                let mut raw = [0u8; std::mem::size_of::<usize>()];
+                raw.copy_from_slice(&bytes);
+                values.push((field.name, usize::from_ne_bytes(raw)));
+            }
             Err(detail) => {
                 return TableSnapshot {
-                    walk: WalkOutcome::Unreadable { detail },
-                    values: vec![],
+                    walk: WalkOutcome::Unreadable {
+                        detail: format!(
+                            "{} after {} complete function words: {detail}",
+                            field.name,
+                            values.len()
+                        ),
+                    },
+                    values,
                 };
             }
         }
     }
     TableSnapshot { walk, values }
+}
+
+fn inventory_tables(source: Surface) -> TableSet {
+    // The typed getter supplies all 68 bounded legacy positions independently
+    // of its label. An unrecognized interface label retains this common ABI.
+    let TableSet::Walk(spans) = tables_for(Surface::LegacyFunctionList {
+        version: cryptoki_sys::CK_VERSION {
+            major: 2,
+            minor: 40,
+        },
+    }) else {
+        unreachable!("the legacy ABI has a bounded field catalogue");
+    };
+    match (source, tables_for(source)) {
+        (Surface::LegacyFunctionList { .. }, TableSet::Walk(_)) => TableSet::Walk(spans),
+        (Surface::LegacyFunctionList { .. }, _) | (_, TableSet::Refuse) => {
+            TableSet::WalkKnownPrefix(spans)
+        }
+        (_, selected) => selected,
+    }
+}
+
+fn selection_inventory_usable(source: Surface, walk: &WalkOutcome) -> bool {
+    // Common-prefix recovery does not widen the fixed selection contract.
+    !matches!(tables_for(source), TableSet::Refuse)
+        && matches!(walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
 }
 
 fn legacy_surface(
@@ -698,18 +720,14 @@ fn legacy_surface(
             );
         }
     };
-    let snapshot = snapshot_table(
-        memory,
-        base,
-        tables_for(Surface::LegacyFunctionList { version }),
-    );
+    let source_abi = Surface::LegacyFunctionList { version };
+    let snapshot = snapshot_table(memory, base, inventory_tables(source_abi));
     let legacy_240 = (version.major == 2
         && version.minor == 40
         && matches!(&snapshot.walk, WalkOutcome::Full)
         && snapshot.values.len() == 68)
         .then(|| snapshot.values.iter().map(|(_, value)| *value).collect());
-    let inventory_pointer =
-        matches!(snapshot.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix).then_some(base);
+    let inventory_pointer = selection_inventory_usable(source_abi, &snapshot.walk).then_some(base);
     let functions = resolve_values(snapshot.values, maps, objects);
     (
         SurfaceRecord {
@@ -778,7 +796,19 @@ fn interface_records(
                 objects,
             );
             table_ptrs.push(
-                matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+                surface
+                    .version
+                    .is_some_and(|version| {
+                        selection_inventory_usable(
+                            Surface::StandardInterface {
+                                version: cryptoki_sys::CK_VERSION {
+                                    major: version.major,
+                                    minor: version.minor,
+                                },
+                            },
+                            &surface.walk,
+                        )
+                    })
                     .then_some(entry.func_list as usize),
             );
             surfaces.push(surface);
@@ -789,7 +819,7 @@ fn interface_records(
             let snapshot = snapshot_table(
                 memory,
                 entry.func_list as usize,
-                tables_for(Surface::StandardInterface {
+                inventory_tables(Surface::StandardInterface {
                     version: version_value,
                 }),
             );
@@ -806,8 +836,13 @@ fn interface_records(
                     objects,
                 );
                 table_ptrs.push(
-                    matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
-                        .then_some(entry.func_list as usize),
+                    selection_inventory_usable(
+                        Surface::StandardInterface {
+                            version: version_value,
+                        },
+                        &surface.walk,
+                    )
+                    .then_some(entry.func_list as usize),
                 );
                 surfaces.push(surface);
                 continue;
@@ -1526,7 +1561,7 @@ fn interface_surface(
     let snapshot = snapshot_table(
         memory,
         entry.func_list as usize,
-        tables_for(Surface::StandardInterface { version }),
+        inventory_tables(Surface::StandardInterface { version }),
     );
     interface_surface_from_snapshot(
         index,

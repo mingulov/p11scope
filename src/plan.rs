@@ -3247,11 +3247,9 @@ pub(crate) fn semantic_source_claims(
     let mut incomplete: BTreeSet<_> = scanned
         .iter()
         .filter(|module| {
-            module
-                .scanned
-                .tables
-                .iter()
-                .any(|table| table.unpinned.iter().any(|entry| affecting(&entry.subject)))
+            module.scanned.tables.iter().any(|table| {
+                table.walk != "full" || table.unpinned.iter().any(|entry| affecting(&entry.subject))
+            })
         })
         .map(|module| module.object)
         .collect();
@@ -5932,6 +5930,139 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_short_prefix_without_bad_targets_remains_semantically_incomplete() {
+        for words in [0, 1, 3, 67] {
+            let mut module = scanned_with(
+                TEST_OBJECT,
+                "/opt/p11.so",
+                if words == 0 { vec![] } else { vec![0x10] },
+            );
+            let table = &mut module.scanned.tables[0];
+            for entry in &mut table.entries {
+                entry.name = "C_Initialize";
+            }
+            table.walk = "known_prefix";
+            table.live_return = true;
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .take(words)
+                .skip(1)
+                .map(|field| field.name)
+                .collect();
+            assert!(table.unpinned.is_empty());
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert_eq!(plan.slots.len(), usize::from(words > 0));
+            assert_eq!(plan.entries_seen, words);
+            assert!(plan.slots.iter().all(|slot| !slot.semantic_authorized));
+            let claims =
+                semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+            assert!(
+                claims.incomplete.contains(&module.object),
+                "{words} observed words cannot prove the missing tail"
+            );
+            if words > 0 {
+                assert_eq!(plan.slots[0].names, ["C_Initialize"]);
+                assert!(claims.providers[&module.object].contains(&AttachKey {
+                    object: module.object,
+                    file_offset: 0x10,
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn native_complete_all_null_inventory_remains_a_complete_empty_observation() {
+        for version in [(2, 40), (3, 0), (3, 1), (3, 2), (4, 19)] {
+            let mut module = scanned_with(TEST_OBJECT, "/opt/p11.so", []);
+            let table = &mut module.scanned.tables[0];
+            table.live_return = true;
+            table.version = version;
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .collect();
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert!(plan.slots.is_empty());
+            assert_eq!(plan.entries_seen, 68);
+            let claims = semantic_source_claims(&[module], &[], &PinnedObjects::empty());
+            assert!(claims.incomplete.is_empty());
+        }
+    }
+
+    #[test]
+    fn manifest_missing_tail_prevents_provider_completeness_but_metadata_does_not() {
+        let path = "/bin/true";
+        let file = p11scope_manifest::identity::open_object(std::path::Path::new(path)).unwrap();
+        let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let identity = p11scope_manifest::identity::inspect_file(&file)
+            .unwrap()
+            .identity;
+        let mut manifest = manifest_with(
+            pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| rec(field.name, Resolution::NullPointer))
+                .collect(),
+        );
+        manifest.module_path = path.into();
+        manifest.objects[0].path = path.into();
+        manifest.objects[0].identity = identity.clone();
+        manifest.provenance_objects[0] = ProvenanceObject {
+            path: path.into(),
+            device_major: key.device_major,
+            device_minor: key.device_minor,
+            inode: key.inode,
+            identity,
+        };
+        manifest.surfaces[0].version = Some(Version {
+            major: 0,
+            minor: 255,
+        });
+        manifest.surfaces[0].walk = WalkOutcome::KnownPrefix;
+        for interface in [false, true] {
+            let mut manifest = manifest.clone();
+            let surface_index = usize::from(interface);
+            if interface {
+                manifest.surfaces[0].source = SurfaceSource::Interface {
+                    index: 0,
+                    raw_name_hex: Some("504b4353203131".into()),
+                    name_lossy: Some("PKCS 11".into()),
+                    name_error: None,
+                    flags: 0,
+                    classification: InterfaceClassification::ExactStandard,
+                };
+                manifest.surfaces.insert(
+                    0,
+                    SurfaceRecord {
+                        source: SurfaceSource::LegacyFunctionList,
+                        acquisition: Acquisition::Absent,
+                        version: None,
+                        walk: WalkOutcome::NotWalked,
+                        functions: vec![],
+                    },
+                );
+                manifest.interface_list = Acquisition::Ok;
+            }
+            let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+            let claims = semantic_source_claims(&[], std::slice::from_ref(&manifest), &pins);
+            assert!(
+                claims.incomplete.is_empty(),
+                "complete common inventory is independent of version metadata"
+            );
+            manifest.surfaces[surface_index].walk = WalkOutcome::Unreadable {
+                detail: "slot 3 unavailable".into(),
+            };
+            manifest.surfaces[surface_index].functions.truncate(3);
+            let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+            let claims = semantic_source_claims(&[], &[manifest], &pins);
+            assert_eq!(
+                claims.incomplete.len(),
+                1,
+                "observed NULLs cannot certify the unavailable tail"
+            );
+        }
+    }
+
     fn scanned_with_heuristic_tables(count: usize) -> ReconciledModule {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
 
@@ -6879,6 +7010,57 @@ mod tests {
 
     fn provisional_plan(object: PinnedObjectId) -> AttachPlan {
         exact_plan(vec![], vec![exact_module(0, object)])
+    }
+
+    #[test]
+    fn interface_only_helper_inventory_reaches_count_only_selection_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture");
+        let helper = dir.path().join("helper.so");
+        let provider = dir.path().join("provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-Wl,-soname,helper.so", "-o"])
+                .arg(&helper)
+                .arg(fixtures.join("helper.c"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-DINTERFACE_ONLY_FIXTURE=1", "-o"])
+                .arg(&provider)
+                .arg(fixtures.join("provider.c"))
+                .arg(&helper)
+                .arg(format!("-Wl,-rpath,{}", dir.path().display()))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let manifest = p11scope_discover::discover::discover(&provider).unwrap();
+        assert_eq!(manifest.interface_list, Acquisition::Absent);
+        assert_eq!(manifest.surfaces[0].acquisition, Acquisition::Absent);
+        assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+        let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let mut plan = build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert!(plan.slots.is_empty());
+        assert_eq!(plan.modules.len(), 1);
+        let allocated = plan.clone();
+        for (_, targets) in crate::discovery::engine::manifest_selection_targets(&manifest, &pins) {
+            plan.add_selection_table(&allocated, ModuleId(0), targets)
+                .unwrap();
+        }
+        assert_eq!(plan.slots.len(), 92);
+        assert!(plan.slots.iter().all(|slot| slot.descriptor_index == 0
+            && !slot.semantic_authorized
+            && slot.semantics == SlotSemantics::COUNT_ONLY));
+        assert!(
+            plan.slots
+                .iter()
+                .any(|slot| slot.names == ["C_MessageVerifyFinal"])
+        );
     }
 
     fn selection_target(

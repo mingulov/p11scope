@@ -102,6 +102,9 @@ fn discover_fixture(mode: &str) -> PathBuf {
         "short-table" => {
             provider_command.arg("-DSHORT_TABLE_FIXTURE=1");
         }
+        "interface-only" => {
+            provider_command.arg("-DINTERFACE_ONLY_FIXTURE=1");
+        }
         "normal" => {}
         other => panic!("unknown fixture mode {other}"),
     }
@@ -113,6 +116,303 @@ fn discover_fixture(mode: &str) -> PathBuf {
             .success()
     );
     provider
+}
+
+fn compatibility_fixture(name: &str, defines: &[String]) -> PathBuf {
+    let _guard = CC_LOCK.lock().unwrap();
+    let dir = tmpdir("manifest-compatibility");
+    let provider = dir.join(format!("{name}.so"));
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("crates/discover/tests/fixture/version_matrix.c")
+            )
+            .args(defines)
+            .status()
+            .unwrap()
+            .success()
+    );
+    provider
+}
+
+#[test]
+fn provider_compatibility_prefixes_validate_and_plan_without_invented_nulls() {
+    for (major, minor, words, populated) in [
+        (2, 0, 68, 67),
+        (3, 0, 68, 67),
+        (3, 1, 68, 67),
+        (3, 2, 68, 67),
+        (4, 19, 68, 27),
+        (0, 255, 68, -1),
+        (2, 0, 67, 0),
+        (3, 2, 3, 0),
+        (3, 2, 0, -1),
+    ] {
+        let name = format!("legacy-{major}-{minor}-{words}-{populated}");
+        let provider = compatibility_fixture(
+            &name,
+            &[
+                format!("-DLEGACY_MAJOR={major}"),
+                format!("-DLEGACY_MINOR={minor}"),
+                format!("-DMAPPED_LEGACY_WORDS={words}"),
+                format!("-DSPARSE_LEGACY={populated}"),
+                "-DMATRIX_INTERFACES=0".into(),
+                "-DLEGACY_PADDING=1".into(),
+            ],
+        );
+        let manifest = discover_provider(&provider).unwrap();
+        let surface = &manifest.surfaces[0];
+        assert_eq!(surface.functions.len(), words, "{name}");
+        assert_eq!(surface.version, Some(Version { major, minor }));
+        let partial = words < 68;
+        assert_eq!(
+            matches!(surface.walk, WalkOutcome::Unreadable { .. }),
+            partial,
+            "{name}"
+        );
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{name}: {problems:?}");
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+        assert_eq!(plan.entries_seen, words, "{name}");
+        assert_eq!(plan.slots.len(), usize::from(populated >= 0), "{name}");
+        assert_eq!(plan.skipped.len(), words - plan.slots.len(), "{name}");
+        if let Some(slot) = plan.slots.first() {
+            assert!(
+                slot.semantic_authorized,
+                "{name}: a validated manifest keeps per-function authority"
+            );
+            assert_eq!(
+                slot.names,
+                [if populated == 67 {
+                    "C_WaitForSlotEvent"
+                } else if populated == 27 {
+                    "C_FindObjects"
+                } else {
+                    "C_Initialize"
+                }],
+                "{name}"
+            );
+        }
+        if partial {
+            assert!(plan.surfaces[0].walk.starts_with("unreadable:"), "{name}");
+            assert!(
+                manifest.selection_evidence.queries.iter().all(|query| query
+                    .inventory_matches
+                    .iter()
+                    .all(|found| found.surface != 0)),
+                "{name}: incomplete table cannot grant inventory selection"
+            );
+        }
+    }
+
+    for ((major, minor, bound), words) in [
+        (2, 40, 68),
+        (3, 0, 92),
+        (3, 1, 92),
+        (3, 2, 104),
+        (4, 19, 68),
+    ]
+    .into_iter()
+    .flat_map(|case| [68, 92, 104].map(|words| (case, words)))
+    {
+        let name = format!("interface-{major}-{minor}-with-{words}");
+        let provider = compatibility_fixture(
+            &name,
+            &[
+                format!("-DINTERFACE_MAJOR={major}"),
+                format!("-DINTERFACE_MINOR={minor}"),
+                format!("-DMAPPED_V32_WORDS={words}"),
+                "-DSINGLE_INTERFACE=1".into(),
+                "-DSPARSE_LEGACY=-1".into(),
+            ],
+        );
+        let manifest = discover_provider(&provider).unwrap();
+        let problems = p11scope::manifest_input::validate_structure(&manifest);
+        assert!(problems.is_empty(), "{name}: {problems:?}");
+        // Only this interface has targets; the complete all-NULL legacy table
+        // cannot hide loss of the interface's observed entries.
+        let pins = p11scope::discovery::identity::pin_manifest_objects(&manifest).unwrap();
+        let plan = p11scope::plan::build_from_sources(&[], &[manifest], &pins);
+        assert_eq!(plan.entries_seen, 68 + words.min(bound), "{name}");
+        assert_eq!(plan.slots.len(), words.min(bound), "{name}");
+        assert_eq!(
+            plan.surfaces[1].walk.starts_with("unreadable:"),
+            words < bound,
+            "{name}"
+        );
+        if words.min(bound) >= 92 {
+            assert!(
+                plan.slots
+                    .iter()
+                    .any(|slot| slot.names == ["C_MessageVerifyFinal"]),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unfamiliar_versions_preserve_legacy_and_interface_inventory_without_selection_claims() {
+    let provider = compatibility_fixture(
+        "unfamiliar-version",
+        &[
+            "-DLEGACY_MAJOR=4".into(),
+            "-DLEGACY_MINOR=19".into(),
+            "-DINTERFACE_MAJOR=4".into(),
+            "-DINTERFACE_MINOR=19".into(),
+            "-DMAPPED_LEGACY_WORDS=68".into(),
+            "-DMAPPED_V32_WORDS=68".into(),
+        ],
+    );
+    let manifest = discover_provider(&provider).unwrap();
+    let problems = p11scope::manifest_input::validate_structure(&manifest);
+    assert!(problems.is_empty(), "{problems:?}");
+    for surface_index in [0, 4] {
+        let surface = &manifest.surfaces[surface_index];
+        assert_eq!(
+            surface.version,
+            Some(Version {
+                major: 4,
+                minor: 19
+            })
+        );
+        assert_eq!(surface.functions.len(), 68);
+        assert!(matches!(surface.walk, WalkOutcome::KnownPrefix));
+        assert!(manifest.selection_evidence.queries.iter().all(|query| {
+            query
+                .inventory_matches
+                .iter()
+                .all(|found| found.surface != surface_index)
+        }));
+        let mut forged = manifest.clone();
+        let query = &mut forged.selection_evidence.queries[0];
+        query.rv = 0;
+        query.result = Some(SelectionResult {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        });
+        query.inventory_matches = vec![SelectionInventoryMatch {
+            surface: surface_index,
+            name_agrees: surface_index == 4,
+            version_agrees: true,
+        }];
+        query.selection_table = None;
+        query.authority = SelectionAuthority::Inventory;
+        query.helper_failure = None;
+        assert!(
+            p11scope::manifest_input::validate_structure(&forged)
+                .iter()
+                .any(|problem| problem.contains("unavailable inventory surface")),
+            "unknown metadata cannot create stronger selection authority"
+        );
+    }
+}
+
+#[test]
+fn unreadable_manifest_prefix_requires_canonical_order_without_selection_authority() {
+    let path = Path::new("/bin/true");
+    let mut manifest = manifest_for(path);
+    manifest.surfaces[0] = SurfaceRecord {
+        source: SurfaceSource::LegacyFunctionList,
+        acquisition: Acquisition::Ok,
+        version: Some(Version { major: 3, minor: 2 }),
+        walk: WalkOutcome::Unreadable {
+            detail: "slot 3 is unavailable".into(),
+        },
+        functions: vec![
+            FunctionRecord {
+                name: "C_Initialize".into(),
+                resolution: Resolution::NullPointer,
+            },
+            FunctionRecord {
+                name: "C_Finalize".into(),
+                resolution: Resolution::NullPointer,
+            },
+            FunctionRecord {
+                name: "C_GetInfo".into(),
+                resolution: Resolution::Resolved {
+                    object: 0,
+                    file_offset: first_executable_offset(path),
+                },
+            },
+        ],
+    };
+    let problems = p11scope::manifest_input::validate_structure(&manifest);
+    assert!(
+        problems.is_empty(),
+        "canonical unreadable prefix: {problems:?}"
+    );
+    assert!(p11scope::discovery::identity::pin_manifest_objects(&manifest).is_ok());
+    for mutation in [
+        "reorder",
+        "unknown",
+        "missing-version",
+        "complete-walk",
+        "full-prefix",
+        "empty-detail",
+        "missing-object",
+        "non-ok",
+        "selection",
+    ] {
+        let mut changed = manifest.clone();
+        match mutation {
+            "reorder" => changed.surfaces[0].functions.swap(0, 1),
+            "unknown" => changed.surfaces[0].functions[1].name = "C_Unknown".into(),
+            "missing-version" => changed.surfaces[0].version = None,
+            "complete-walk" => changed.surfaces[0].walk = WalkOutcome::KnownPrefix,
+            "full-prefix" => {
+                changed.surfaces[0].functions = pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::NullPointer,
+                    })
+                    .collect()
+            }
+            "empty-detail" => {
+                changed.surfaces[0].walk = WalkOutcome::Unreadable {
+                    detail: String::new(),
+                }
+            }
+            "missing-object" => {
+                changed.surfaces[0].functions[2].resolution = Resolution::Resolved {
+                    object: 99,
+                    file_offset: 0,
+                }
+            }
+            "non-ok" => changed.surfaces[0].acquisition = Acquisition::Absent,
+            "selection" => {
+                changed.selection_evidence = queried_selection_matrix();
+                let query = &mut changed.selection_evidence.queries[8];
+                query.rv = 0;
+                query.result = Some(SelectionResult {
+                    name: SelectionNameClass::ExactStandard,
+                    version: SelectionVersionClass::V3_2,
+                    flags: 0,
+                });
+                query.inventory_matches = vec![SelectionInventoryMatch {
+                    surface: 0,
+                    name_agrees: false,
+                    version_agrees: true,
+                }];
+                query.authority = SelectionAuthority::Inventory;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !p11scope::manifest_input::validate_structure(&changed).is_empty(),
+            "{mutation} unexpectedly accepted"
+        );
+    }
+    let mut changed_hash = manifest.clone();
+    changed_hash.objects[0].identity.sha256 = Some("00".repeat(32));
+    changed_hash.provenance_objects[0].identity.sha256 = Some("00".repeat(32));
+    assert!(p11scope::discovery::identity::pin_manifest_objects(&changed_hash).is_err());
 }
 
 fn manifest_for(path: &Path) -> Manifest {
@@ -229,6 +529,7 @@ fn emitted_selection_fixtures_validate_as_v5_manifests() {
         "unknown-flags",
         "outside",
         "short-table",
+        "interface-only",
     ] {
         let provider = discover_fixture(mode);
         let manifest = discover_provider(&provider).unwrap();
@@ -1416,7 +1717,7 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()
             .map(|field| FunctionRecord {
                 name: field.name.into(),
@@ -1489,7 +1790,7 @@ fn reordered_or_unknown_standard_function_names_are_refused() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+        functions: pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()
             .enumerate()
             .map(|(index, field)| FunctionRecord {
@@ -1539,6 +1840,7 @@ fn every_supported_table_boundary_passes_structural_reuse_validation() {
         (3, 2, 104, false, false),
         (3, 9, 104, true, false),
         (3, 2, 104, true, true),
+        (4, 19, 68, true, false),
     ]
     .into_iter()
     .enumerate()
@@ -1587,7 +1889,7 @@ fn every_supported_table_boundary_passes_structural_reuse_validation() {
         acquisition: Acquisition::Ok,
         version: Some(Version { major: 2, minor: 0 }),
         walk: WalkOutcome::Full,
-        functions: all[..67]
+        functions: all[..68]
             .iter()
             .map(|name| FunctionRecord {
                 name: (*name).into(),

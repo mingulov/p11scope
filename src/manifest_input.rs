@@ -118,10 +118,33 @@ fn expected_surface(surface: &SurfaceRecord) -> Result<(Vec<&'static str>, &'sta
         SurfaceSource::LegacyFunctionList => Surface::LegacyFunctionList { version },
         SurfaceSource::Interface { .. } => Surface::StandardInterface { version },
     };
+    if matches!(surface.source, SurfaceSource::LegacyFunctionList) {
+        // The typed getter identifies the bounded 68-position ABI. Its label
+        // controls the recorded walk metadata, never the acquired positions.
+        return Ok((
+            pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .collect(),
+            if matches!(tables_for(source), TableSet::Walk(_)) {
+                "full"
+            } else {
+                "known_prefix"
+            },
+        ));
+    }
     let (spans, normal_walk) = match tables_for(source) {
         TableSet::Walk(spans) => (spans, "full"),
         TableSet::WalkKnownPrefix(spans) => (spans, "known_prefix"),
-        TableSet::Refuse => return Ok((Vec::new(), "refused")),
+        TableSet::Refuse => {
+            return Ok((
+                pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .map(|field| field.name)
+                    .collect(),
+                "known_prefix",
+            ));
+        }
     };
     let forced_prefix = matches!(
         surface.source,
@@ -256,6 +279,20 @@ fn selection_version_agrees(result: &SelectionResult, surface: &SurfaceRecord) -
 
 pub(crate) fn selection_surface_usable(surface: &SurfaceRecord) -> bool {
     if !matches!(surface.acquisition, Acquisition::Ok) {
+        return false;
+    }
+    let Some(version) = surface.version else {
+        return false;
+    };
+    let version = cryptoki_sys::CK_VERSION {
+        major: version.major,
+        minor: version.minor,
+    };
+    let source = match surface.source {
+        SurfaceSource::LegacyFunctionList => Surface::LegacyFunctionList { version },
+        SurfaceSource::Interface { .. } => Surface::StandardInterface { version },
+    };
+    if matches!(tables_for(source), TableSet::Refuse) {
         return false;
     }
     let Ok((_, expected_walk)) = expected_surface(surface) else {
@@ -801,6 +838,11 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             );
         }
         if let WalkOutcome::Unreadable { detail } = &surface.walk {
+            if detail.trim().is_empty() {
+                problems.push(format!(
+                    "surface {surface_index} unreadable walk has no detail"
+                ));
+            }
             bounded(
                 "surface walk error",
                 detail,
@@ -919,7 +961,21 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
         }
         if matches!(surface.walk, WalkOutcome::Unreadable { .. }) {
             if !surface.functions.is_empty() {
-                problems.push(format!("unreadable surface {surface_index} must be empty"));
+                match expected_surface(surface) {
+                    Ok((expected, _)) => {
+                        let actual: Vec<_> = surface
+                            .functions
+                            .iter()
+                            .map(|function| function.name.as_str())
+                            .collect();
+                        if actual.len() >= expected.len()
+                            || expected.get(..actual.len()) != Some(actual.as_slice())
+                        {
+                            problems.push(format!("unreadable surface {surface_index} does not match canonical partial function order"));
+                        }
+                    }
+                    Err(error) => problems.push(format!("surface {surface_index}: {error}")),
+                }
             }
             continue;
         }

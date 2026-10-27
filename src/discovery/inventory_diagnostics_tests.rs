@@ -186,6 +186,92 @@ fn genuine_ordinary_diagnostics_feed_g21_a_oracle() {
 }
 
 #[test]
+fn dropped_pair_raw_reads_remain_diagnostic_without_becoming_published_counts() {
+    for initial in [false, true] {
+        let mut disabled = Scene::placed();
+        let mut enabled = Scene::placed_with_diagnostics(Some(DiagnosticConfig::default()));
+        for scene in [&mut disabled, &mut enabled] {
+            scene.count(161950);
+            let mut row = scene.native.row(41, 1, 7, 100, 0);
+            let key = PairKey::of(&row);
+            let coordinator = &mut scene.native.scene.coordinator;
+            // Retain an already rejected range and drop its count target
+            // through production bookkeeping. The diagnostic read must not
+            // replace the retained history or revive this placement.
+            coordinator
+                .registry
+                .note_retirement_count_gap(scene.caller, 161950, 162003);
+            coordinator.drop_pair_count(&row, DiagnosticReason::IdentityChanged);
+            coordinator.commit_batch(false).unwrap();
+            let NativeBatch::Witness(mut read) =
+                scene.native.stamps.read(scene.native.domain, Vec::new())
+            else {
+                unreachable!("a witness read supplies the already acquired rows")
+            };
+            if initial {
+                row.entry_count = 162003;
+                read.rows.push(row);
+            } else {
+                read.counts.push(CallerCountUpdate {
+                    image: p11scope_ebpf_common::ImageIdentity {
+                        task_cookie: 41,
+                        exec_id: 1,
+                    },
+                    object: scene.native.scene.delta.endpoints[0].object,
+                    count: 162003,
+                });
+            }
+            // Drive the real read-consumption seam without replaying an
+            // initial row through the independent witness binder again.
+            scene.native.scene.coordinator.absorb_pair_counts(&read);
+            scene.native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(g21_committed_edge(scene, "a.so").unwrap().1, 161950);
+            assert!(matches!(
+                scene.native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped { .. })
+            ));
+            assert!(
+                !scene
+                    .native
+                    .scene
+                    .coordinator
+                    .pair_counts
+                    .contains_key(&key)
+            );
+            assert!(
+                scene
+                    .native
+                    .scene
+                    .coordinator
+                    .registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.reason.contains("(161950, 162003]")
+                        && gap.reason.contains("53 unattributed calls"))
+            );
+        }
+        assert_eq!(snapshot(&enabled), snapshot(&disabled));
+        let lines = export(&mut enabled);
+        let observation = lines
+            .iter()
+            .find(|line| line["kind"] == "count_observation" && line["absolute"] == 162003)
+            .expect("an already read absolute survives the dropped-placement branch");
+        assert_eq!(
+            observation["origin"],
+            if initial { "initial" } else { "refresh" }
+        );
+        assert!(observation["pair"].is_string());
+        assert!(observation["pre"].is_number() && observation["post"].is_number());
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line["kind"] == "publication" && line["edge_total"] == 162003)
+        );
+        assert_eq!(lines.last().unwrap()["kind"], "footer");
+    }
+}
+
+#[test]
 fn genuine_recovered_diagnostics_feed_g21_a_oracle() {
     let actual = genuine_g21_count_diagnostics(true);
     let mut disabled = Scene::placed();

@@ -12,6 +12,8 @@
 # bench-inventory-native.sh resource loop (1 Hz RSS, HWM, FD into
 # resources.tsv). A PASS verdict in live mode qualifies; a dry-run
 # PASS proves wiring only and never qualifies.
+# Optional --diagnostics retains bounded native count decisions in
+# WORK/count-diagnostics.jsonl; it is off by default.
 #
 # Usage (live 30-minute qualification; run under the privileged lock,
 # or as root on a dedicated guest/host):
@@ -53,6 +55,7 @@ SEED=1
 WORK=/var/tmp/p11scope-manifest-soak
 INSTALLED=
 DRY_RUN=0
+DIAGNOSTICS=0
 OBSERVER_STUB=
 KERNEL_PROFILE=current/default
 TEST_ID=
@@ -76,6 +79,7 @@ while [ "$#" -gt 0 ]; do
         --work) WORK=$2; shift 2 ;;
         --installed) INSTALLED=$2; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --diagnostics) DIAGNOSTICS=1; shift ;;
         --observer-stub) OBSERVER_STUB=$2; shift 2 ;;
         --kernel-profile) KERNEL_PROFILE=$2; shift 2 ;;
         --test-id) TEST_ID=$2; shift 2 ;;
@@ -415,6 +419,9 @@ else
         loop_index=$(( loop_index + 1 ))
     done
     SAMPLER_EXE_EXPECT=
+fi
+if [ "$DIAGNOSTICS" -eq 1 ]; then
+    set -- "$@" --diagnostics "$WORK/count-diagnostics.jsonl"
 fi
 OBS_ARGV_JSON=$(python3 -I -c "import json,sys; print(json.dumps(sys.argv[1:]))" "$@")
 T_SPAWN=$(mono_ns)

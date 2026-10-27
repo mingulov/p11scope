@@ -3850,23 +3850,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn absorb_pair_counts(&mut self, batch: &WitnessBatch) {
         for row in &batch.rows {
             let key = PairKey::of(row);
-            if matches!(
+            let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) {
-                continue;
+            );
+            if !dropped {
+                self.pair_counts
+                    .entry(key)
+                    .or_insert(HeldPairCount::new(PairCount {
+                        count: 0,
+                        first_ns: row.recorded_at_ns,
+                        anchor_ns: batch.rows_anchor_ns,
+                        last_ns: batch.rows_read_ns,
+                        retirement_usable: false,
+                        diagnostic_observation: 0,
+                        diagnostic_transition: 0,
+                    }));
             }
-            self.pair_counts
-                .entry(key)
-                .or_insert(HeldPairCount::new(PairCount {
-                    count: 0,
-                    first_ns: row.recorded_at_ns,
-                    anchor_ns: batch.rows_anchor_ns,
-                    last_ns: batch.rows_read_ns,
-                    retirement_usable: false,
-                    diagnostic_observation: 0,
-                    diagnostic_transition: 0,
-                }));
             if self.diagnostics.is_some() {
                 self.diagnostic_raw_count(
                     key,
@@ -3876,6 +3876,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     (batch.rows_anchor_ns, batch.rows_read_ns),
                     row.entry_count > 0,
                 );
+            }
+            // Copy the already acquired read before declining attribution.
+            // A dropped pair gains no retained count state or placement.
+            if dropped {
+                continue;
             }
             let held = self.pair_counts.get_mut(&key).expect("inserted row count");
             // The row sets its first record whatever arrived before: a
@@ -3892,26 +3897,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut retry = Vec::new();
         for update in &batch.counts {
             let key = PairKey::of_update(batch.domain, update);
-            if matches!(
+            let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            ) {
-                continue;
-            }
+            );
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
-            self.pair_counts
-                .entry(key)
-                .or_insert(HeldPairCount::new(PairCount {
-                    count: 0,
-                    first_ns: batch.rows_read_ns,
-                    anchor_ns: batch.counts_read_ns,
-                    last_ns: batch.rows_read_ns,
-                    retirement_usable: false,
-                    diagnostic_observation: 0,
-                    diagnostic_transition: 0,
-                }));
+            if !dropped {
+                self.pair_counts
+                    .entry(key)
+                    .or_insert(HeldPairCount::new(PairCount {
+                        count: 0,
+                        first_ns: batch.rows_read_ns,
+                        anchor_ns: batch.counts_read_ns,
+                        last_ns: batch.rows_read_ns,
+                        retirement_usable: false,
+                        diagnostic_observation: 0,
+                        diagnostic_transition: 0,
+                    }));
+            }
             if self.diagnostics.is_some() {
                 self.diagnostic_raw_count(
                     key,
@@ -3921,6 +3926,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     (batch.counts_read_ns, batch.rows_read_ns),
                     valid_retirement_refresh(batch, update.count),
                 );
+            }
+            if dropped {
+                continue;
             }
             let (held, advanced) = {
                 let held = self

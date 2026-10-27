@@ -30,6 +30,7 @@ gate so a passing suite proves every gate measures.
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -260,6 +261,55 @@ class SoakOracleTest(unittest.TestCase):
         for edge in report["edges"]:
             self.assertNotIn("coverage", edge)
             self.assertEqual(edge["entries"]["coverage"]["state"], "counted")
+        passed, detail = self.oracle.gate_workload_ledger(self.oracle.Evidence(dry))
+        self.assertTrue(passed, detail)
+
+    def test_vehicle_diagnostics_are_opt_in_in_both_observer_branches(self):
+        vehicle = ROOT / "scripts" / "system-manifest-soak.sh"
+        parsed = subprocess.run(["sh", str(vehicle), "--diagnostics", "--help"],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        text = vehicle.read_text(encoding="utf-8")
+        start = text.index('if [ "$MODE" = live ]; then\n    set -- "$INSTALLED_COPY" inventory')
+        end = text.index('T_SPAWN=$(mono_ns)', start)
+        command = text[start:end] + '\nprintf \'%s\\n\' "$OBS_ARGV_JSON"\n'
+        work = self.base / "observer-argv"
+        for mode in ("live", "dry-run"):
+            for requested in (False, True):
+                with self.subTest(mode=mode, requested=requested):
+                    env = dict(os.environ, MODE=mode, WORK=str(work),
+                               INSTALLED_COPY="/installed/p11scope", STUB_COPY="/stub.py",
+                               OBSERVER_DURATION="30", CALLERS="2",
+                               DIAGNOSTICS="1" if requested else "0")
+                    result = subprocess.run(["sh", "-c", command], env=env,
+                                            capture_output=True, text=True, check=False, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    argv = json.loads(result.stdout)
+                    self.assertEqual(argv.count("--diagnostics"), int(requested))
+                    if requested:
+                        self.assertEqual(argv[argv.index("--diagnostics") + 1],
+                                         str(work / "count-diagnostics.jsonl"))
+                    self.assertEqual(argv[argv.index("--duration") + 1], "30")
+                    self.assertEqual(argv[argv.index("-o") + 1], str(work / "report.json"))
+
+    def test_stub_accepts_opt_in_diagnostics_without_native_evidence(self):
+        dry = make_green(self.base / "stub-diagnostics", horizon=8, mode="dry-run")
+        manifest = dry / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts" / "fixtures" /
+                                       "system-manifest-soak-stub.py"),
+             "inventory", "--system", "--manifest", str(manifest),
+             "--duration", "1", "--attach-delay", "0", "--json",
+             "-o", str(dry / "report.json"),
+             "--diagnostics", str(dry / "count-diagnostics.jsonl"),
+             "--loopback-log", str(dry / "workload-0.log"),
+             "--loopback-log", str(dry / "workload-1.log")],
+            capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads((dry / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["soak_stub"]["mode"], "dry-run-loopback")
+        self.assertEqual(report["semantic_edges"], [])
         passed, detail = self.oracle.gate_workload_ledger(self.oracle.Evidence(dry))
         self.assertTrue(passed, detail)
 

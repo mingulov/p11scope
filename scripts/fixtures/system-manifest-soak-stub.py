@@ -12,6 +12,8 @@ ledger join, verdict plumbing and sampler wiring run end to end on
 real timestamps. The semantic stop line conserves with zero shed.
 
 Live mode never invokes this stub. Stdlib only. Unprivileged.
+The optional --diagnostics path is accepted for argv wiring only; this
+stand-in produces no native diagnostic observations or diagnostic file.
 """
 import argparse
 import json
@@ -63,6 +65,7 @@ def main(argv):
     parser.add_argument("--json", action="store_true", required=True)
     parser.add_argument("-o", "--output", required=True)
     parser.add_argument("--loopback-log", action="append", default=[])
+    parser.add_argument("--diagnostics", help="argv wiring only; no native diagnostics")
     parser.add_argument("--attach-delay", type=float, default=0.5)
     args = parser.parse_args(argv)
     if args.duration <= 0 or args.attach_delay < 0:
@@ -71,6 +74,9 @@ def main(argv):
     if not Path(args.manifest).is_file():
         print(f"stub: manifest {args.manifest} is missing", file=sys.stderr)
         return 2
+    if args.diagnostics:
+        print("stub: diagnostics requested for argv wiring only; no native diagnostic file",
+              file=sys.stderr)
     print("p11scope: pass 0: 2 scanned (2 maps-matched; 2 native, 0 scan-pinned)",
           file=sys.stderr, flush=True)
     time.sleep(args.attach_delay)

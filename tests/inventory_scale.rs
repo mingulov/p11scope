@@ -15,6 +15,31 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+#[path = "support/multi_host.rs"]
+mod multi_host;
+
+/// Breadth/churn always check their mapping ledgers. Eligible hosts retain
+/// the live Auto path; other hosts first prove the exact early refusal, then
+/// run the explicit offline path rather than treating refusal as a snapshot.
+fn system_capture_args() -> Vec<&'static str> {
+    if let Some(reason) = multi_host::refusal() {
+        let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+            .args(["inventory", "--system", "--capture", "native", "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("p11scope: inventory --system: {reason}\n")
+        );
+        vec!["--capture", "scan", "--identity-backend", "userspace"]
+    } else {
+        vec!["--capture", "auto"]
+    }
+}
+
 /// Stated peak-RSS bound for every observer run below. Real runs peak
 /// near ~40 MiB; the bound leaves headroom for machine variance while
 /// still catching runaway growth.
@@ -54,6 +79,38 @@ fn fixture_source(rel: &str) -> PathBuf {
 
 fn matrix_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture/version_matrix.c")
+}
+
+/// One real legacy68 table with exact own-export evidence for every retained
+/// target. Sparse tails contain observedNULLs, not aliases or guessed fields.
+fn capacity_provider(dir: &Path, name: &str, unique: usize) -> PathBuf {
+    assert!((1..=68).contains(&unique));
+    let mut source = String::from(
+        "typedef unsigned long CK_RV;\n\
+         typedef struct { unsigned char version[2]; void *functions[68]; } Table;\n\
+         CK_RV C_GetFunctionList(void **out);\n",
+    );
+    let mut slots = vec!["0".to_string(); 68];
+    slots[3] = "(void *)C_GetFunctionList".into();
+    for ordinal in (0..68).filter(|ordinal| *ordinal != 3).take(unique - 1) {
+        let function = pkcs11_module::function_name(ordinal).unwrap();
+        source.push_str(&format!("CK_RV {function}(void) {{ return 0; }}\n"));
+        slots[ordinal] = format!("(void *){function}");
+    }
+    source.push_str(&format!(
+        "static Table table = {{{{2,40}}, {{{}}}}};\n\
+         CK_RV C_GetFunctionList(void **out) {{ if (!out) return 7; *out = &table; return 0; }}\n",
+        slots.join(","),
+    ));
+    let path = dir.join(format!("{name}.c"));
+    std::fs::write(&path, source).unwrap();
+    gcc(
+        dir,
+        &format!("{name}.so"),
+        &path,
+        &["-shared", "-fPIC"],
+        &[],
+    )
 }
 
 /// Kills owned fixture pids on drop, so a failed assert cannot leak
@@ -200,7 +257,7 @@ fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
     #[repr(C)]
     struct Table {
         version: [u8; 2],
-        functions: [*mut libc::c_void; 104],
+        functions: [*mut libc::c_void; 68],
     }
     struct Library(*mut libc::c_void);
     impl Drop for Library {
@@ -224,16 +281,12 @@ fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
     let mut table = std::ptr::null_mut();
     assert_eq!(unsafe { get_list(&mut table) }, 0);
     let table = unsafe { table.as_ref() }.unwrap();
-    let slots = match table.version {
-        [2, 40] => 68,
-        [3, 0] => 92,
-        version => panic!("unsupported owned fixture surface {version:?}"),
-    };
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-    table.functions[..slots]
+    table
+        .functions
         .iter()
+        .filter(|function| !function.is_null())
         .map(|function| {
-            assert!(!function.is_null());
             let address = *function as u64;
             maps.lines()
                 .find_map(|line| {
@@ -281,13 +334,7 @@ fn inventory_capacity_public_exact_discoverable_boundaries() {
         &["-O2", "-Wall", "-Wextra", "-Werror"],
         &["-ldl"],
     );
-    let full = gcc(
-        &dir,
-        "full.so",
-        &matrix_source(),
-        &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=68"],
-        &[],
-    );
+    let full = capacity_provider(&dir, "full", 68);
     let full_offsets = fixture_endpoint_offsets(&full);
     assert_eq!(
         full_offsets.len(),
@@ -299,14 +346,7 @@ fn inventory_capacity_public_exact_discoverable_boundaries() {
         std::fs::create_dir(&population).unwrap();
         let count = demand / full_offsets.len();
         let remainder = demand % full_offsets.len();
-        let unique_flag = format!("-DCAPACITY_UNIQUE={remainder}");
-        let tail = gcc(
-            &population,
-            "tail.so",
-            &matrix_source(),
-            &["-shared", "-fPIC", &unique_flag],
-            &[],
-        );
+        let tail = capacity_provider(&population, "tail", remainder);
         let tail_offsets = fixture_endpoint_offsets(&tail);
         assert_eq!(tail_offsets.len(), remainder, "independent physical tail");
         let mut providers = Vec::new();
@@ -354,6 +394,8 @@ fn inventory_capacity_public_exact_discoverable_boundaries() {
                 "--json",
                 "--capture",
                 "scan",
+                "--identity-backend",
+                "userspace",
                 "--max-scan-pids",
                 "64",
                 "--max-endpoints",
@@ -447,39 +489,30 @@ fn inventory_capacity_default_refuses_and_override_admits() {
         &["-O2", "-Wall", "-Wextra", "-Werror"],
         &["-ldl"],
     );
-    // A synthetic, test-local copy selects the matrix's anchored3.0 table
-    // as the actual surface returned to the unchanged driver. The shared
-    // fixture returns2.40; counting its separately exposed3.2 table would
-    // overstate this target. Keep one getter address, with no wrapper alias.
-    let provider_source = dir.join("provider.c");
-    let matrix = std::fs::read_to_string(matrix_source()).unwrap();
-    let original = "*out = SHORT_LEGACY ? short_legacy : (void *)&legacy;";
-    assert_eq!(matrix.matches(original).count(), 1);
-    std::fs::write(
-        &provider_source,
-        matrix.replace(original, "*out = (void *)&t30;"),
-    )
-    .unwrap();
-    let template = gcc(
-        &dir,
-        "template.so",
-        &provider_source,
-        &["-shared", "-fPIC"],
-        &[],
-    );
+    // Keep the exact4140 demand using getter-proven legacy storage, with
+    // independently corroborated targets instead of a label-sized legacy read.
+    let template = capacity_provider(&dir, "template", 68);
+    let tail = capacity_provider(&dir, "tail", 60);
     let offsets = fixture_endpoint_offsets(&template);
+    let tail_offsets = fixture_endpoint_offsets(&tail);
     assert_eq!(
         offsets.len(),
-        92,
+        68,
         "distinct published physical function offsets"
     );
+    assert_eq!(tail_offsets.len(), 60);
     let mut providers = Vec::new();
     let mut physical_union = BTreeSet::new();
-    for index in 0..45 {
+    for index in 0..=60 {
         let provider = dir.join(format!("capacity-{index:02}.so"));
-        std::fs::copy(&template, &provider).unwrap();
+        let (source, own_offsets) = if index == 60 {
+            (&tail, &tail_offsets)
+        } else {
+            (&template, &offsets)
+        };
+        std::fs::copy(source, &provider).unwrap();
         let metadata = std::fs::metadata(&provider).unwrap();
-        for offset in &offsets {
+        for offset in own_offsets {
             physical_union.insert((metadata.dev(), metadata.ino(), *offset));
         }
         providers.push(provider);
@@ -511,6 +544,8 @@ fn inventory_capacity_default_refuses_and_override_admits() {
                 "--json",
                 "--capture",
                 "scan",
+                "--identity-backend",
+                "userspace",
                 "--max-scan-pids",
                 "64",
             ]);
@@ -582,7 +617,14 @@ fn inventory_capacity_default_refuses_and_override_admits() {
                     std::fs::metadata(provider).unwrap().ino()
                 );
                 assert_eq!(module["admission"]["state"], "admitted");
-                assert_eq!(module["admission"]["endpoints"], offsets.len());
+                assert_eq!(
+                    module["admission"]["endpoints"],
+                    if provider == providers.last().unwrap() {
+                        60
+                    } else {
+                        68
+                    }
+                );
             }
         } else {
             assert!(budget["occupied"].as_u64().unwrap() <= 4096);
@@ -690,6 +732,7 @@ fn scale_48_drivers_4_providers_through_real_binary() {
     cmd.arg(fixture_source("inventory-scale-observe.sh"))
         .arg("--system")
         .args(["--json", "--max-scan-pids", "4096"])
+        .args(system_capture_args())
         .env("INV_DRIVER", &driver)
         .env("INV_COUNT", "48")
         .env("INV_PROVIDERS", &prov_list)
@@ -765,6 +808,7 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     cmd.arg(fixture_source("inventory-churn-observe.sh"))
         .arg("--system")
         .args(["--json", "--duration", "14s", "--max-scan-pids", "4096"])
+        .args(system_capture_args())
         .env("INV_DRIVER", &driver)
         .env("INV_PROV", &prov)
         .env("INV_CHURNERS", "8")
@@ -899,7 +943,15 @@ fn slow_stdout_reader_gets_exact_bytes() {
         let mut cmd = Command::new("sh");
         cmd.arg(fixture_source("inventory-scale-observe.sh"))
             .arg("--system")
-            .args(["--json", "--max-scan-pids", "4096"])
+            .args([
+                "--json",
+                "--capture",
+                "scan",
+                "--identity-backend",
+                "userspace",
+                "--max-scan-pids",
+                "4096",
+            ])
             .env("INV_DRIVER", &driver)
             .env("INV_COUNT", "48")
             .env("INV_PROVIDERS", &prov_list)
@@ -1035,7 +1087,7 @@ fn unwritable_out_is_a_hard_error_not_success() {
     let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .args(["inventory", "--pid"])
         .arg(me.to_string())
-        .args(["--json", "-o", "/dev/full"])
+        .args(["--json", "--capture", "scan", "-o", "/dev/full"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1097,7 +1149,7 @@ fn sigkill_mid_run_leaves_no_partial_report() {
     let stderr_log = dir.join("stderr.log");
     let mut child = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
-        .args(["--json", "--duration", "25s", "-o"])
+        .args(["--json", "--capture", "scan", "--duration", "25s", "-o"])
         .arg(&file)
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "plain")
@@ -1169,6 +1221,10 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
             "inventory",
             "--system",
             "--json",
+            "--capture",
+            "scan",
+            "--identity-backend",
+            "userspace",
             "--max-scan-pids",
             "1",
             "-o",

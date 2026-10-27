@@ -1,9 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Hostile provider-table regression tests: modules whose `C_GetFunctionList`
-//! or `C_GetInterfaceList` return null pointers, hostile versions, garbage
-//! addresses or lying counts must be recorded as evidence, never walked as
-//! valid tables. No hostile provider yields attributed (resolved) functions,
-//! and no provider pointer is ever dereferenced unsafely.
+//! or `C_GetInterfaceList` return null pointers, garbage addresses or lying
+//! counts must be recorded as evidence. Version labels remain metadata;
+//! unusable pointers must never become resolved targets or invented NULLs.
 
 use p11scope_discover::discover::discover;
 use p11scope_manifest::manifest::{Acquisition, Resolution, SurfaceSource, WalkOutcome};
@@ -48,7 +47,7 @@ const HOSTILE_PROVIDERS: &[&str] = &[
     "bad_rv",
     // module_without_pkcs11_exports_is_refused_not_attributed
     "plain",
-    // hostile_versions_are_never_walked
+    // arbitrary_version_labels_keep_bounded_unusable_entries
     "version_9_9",
     "version_0_0",
     "version_4_0",
@@ -166,7 +165,7 @@ fn module_without_pkcs11_exports_is_refused_not_attributed() {
 }
 
 #[test]
-fn hostile_versions_are_never_walked() {
+fn arbitrary_version_labels_keep_bounded_unusable_entries() {
     let dir = workdir("versions");
     let mut built = Vec::new();
     let cases = [(9u8, 9u8), (0, 0), (4, 0), (2, 255)];
@@ -199,21 +198,17 @@ CK_RV C_GetFunctionList(void **out){{ *out = &table; return 0; }}
             .as_ref()
             .expect("reported version is recorded");
         assert_eq!((version.major, version.minor), (major, minor));
-        // 2.255 walks its known 2.40 prefix; every other hostile version
-        // refuses the walk. Either way nothing resolves.
-        assert!(
-            matches!(
-                surface.walk,
-                WalkOutcome::Refused | WalkOutcome::KnownPrefix | WalkOutcome::Full
-            ),
-            "version {major}.{minor}: {:?}",
-            surface.walk
-        );
+        // The proven legacy getter supplies68 words independently of its
+        // label. Every observed word here is invalid, so coverage is partial.
+        assert_eq!(surface.walk, WalkOutcome::KnownPrefix);
+        assert_eq!(surface.functions.len(), 68);
         assert_nothing_resolved(&manifest, &format!("version {major}.{minor}"));
-        if (major, minor) != (2, 255) {
-            assert_eq!(surface.walk, WalkOutcome::Refused);
-            assert!(surface.functions.is_empty());
-        }
+        assert!(
+            surface
+                .functions
+                .iter()
+                .all(|function| !matches!(function.resolution, Resolution::NullPointer))
+        );
     }
     assert_eq!(built, HOSTILE_PROVIDERS[3..7]);
 }

@@ -261,9 +261,9 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
 /// fixture built as verify-canaries.sh builds matrix-provider.so (legacy
 /// 2.40 plus the 13 interface tables), every table the scan decodes is a
 /// (version, slots, walk) triple the helper manifest also walks, no
-/// version skip is emitted, and the refused [4,0] table is decoded by
-/// neither source. This guards the widened gate: accepting more version
-/// words must not invent tables the helper does not walk.
+/// version skip is emitted. OD35 treats [4,0] as metadata too: an acquired
+/// interface retains its bounded common68 catalogue. Every raw-scan table
+/// must still agree with an actually acquired helper extent.
 ///
 /// Reachability note: the scan covers only file-backed mappings
 /// (`candidate_groups` keeps inode-bearing mappings; snapshots are
@@ -307,8 +307,8 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         "the helper must walk [3,9] as a 104-slot known prefix: {helper:?}"
     );
     assert!(
-        !helper.iter().any(|((major, _), _, _)| *major == 4),
-        "the helper refuses the new major: {helper:?}"
+        helper.contains(&((4, 0), 68, "known_prefix")),
+        "the acquired [4,0] interface keeps its common prefix: {helper:?}"
     );
 
     let ScanOutcome::Scanned {
@@ -339,7 +339,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         "the scan must decode the legacy table"
     );
     for table in &module.tables {
-        let slots = table.entries.len() + table.null_entries.len();
+        let slots = table.entries.len() + table.null_entries.len() + table.unpinned.len();
         assert!(
             helper.contains(&(table.version, slots, table.walk)),
             "{:?}: the scan decoded ({slots}, {}), which the helper does not walk: {helper:?}",
@@ -347,10 +347,6 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
             table.walk,
         );
     }
-    assert!(
-        !module.tables.iter().any(|t| t.version == (4, 0)),
-        "the refused [4,0] table is decoded by neither source"
-    );
 }
 
 /// A provider-owned, statically initialised `CK_FUNCTION_LIST` plus the
@@ -755,15 +751,19 @@ fn maps_snapshot_bytes() -> u64 {
         .expect("/proc/self/maps length fits in u64")
 }
 
-/// The ELF-table bytes one export check charges for `so`, as the scan itself
-/// counts them — used to size a budget that admits exactly one object.
+/// The ELF structural bytes the raw scan charges, including section-name
+/// classification — used to size a budget that admits exactly one object.
 fn elf_table_bytes(so: &Path) -> u64 {
     let file = std::fs::File::open(so).unwrap();
     let hooks = HookRegistry::builtin();
     let wanted = hooks.names();
-    p11scope_manifest::elf::read_export_facts(&file, &wanted)
-        .unwrap()
-        .2
+    p11scope_manifest::elf::read_raw_scan_facts_bounded(
+        &file,
+        &wanted,
+        file.metadata().unwrap().len(),
+    )
+    .unwrap()
+    .structural_bytes
 }
 
 #[test]

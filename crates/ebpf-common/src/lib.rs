@@ -578,12 +578,10 @@ pub const fn discovery_version_class(major: u8, minor: u8) -> u8 {
     }
 }
 
-pub const fn discovery_usable_prefix(read_failed: bool, completed: u8) -> u8 {
-    if read_failed {
-        0
-    } else {
-        completed
-    }
+/// Complete pointer words remain observations after a later read fails. The
+/// producer carries that failure separately in its status and loss counter.
+pub const fn discovery_usable_prefix(_read_failed: bool, completed: u8) -> u8 {
+    completed
 }
 
 pub const fn valid_loader_cookie(cookie: u64) -> bool {
@@ -753,10 +751,7 @@ fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
 fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
     if record.pointers_attempted as usize > DISCOVERY_POINTERS
         || record.completed_prefix > record.pointers_attempted
-        || record.usable_n > record.completed_prefix
-        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0 && record.usable_n != 0)
-        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE == 0
-            && record.usable_n != record.completed_prefix)
+        || record.usable_n != record.completed_prefix
     {
         return false;
     }
@@ -2473,7 +2468,7 @@ mod tests {
         assert_eq!(discovery_table_slots(3, 2), 104);
         assert_eq!(discovery_table_slots(4, 0), 0);
         assert_eq!(discovery_usable_prefix(false, 104), 104);
-        assert_eq!(discovery_usable_prefix(true, 67), 0);
+        assert_eq!(discovery_usable_prefix(true, 67), 67);
 
         assert!(!valid_loader_cookie(0));
         assert!(!valid_loader_cookie(1));
@@ -2624,6 +2619,74 @@ mod tests {
         record
     }
 
+    /// A failed next-word read must not erase words the probe already read,
+    /// including an observed NULL between two non-NULL target words.
+    #[test]
+    fn discovery_failed_read_preserves_completed_pointer_words() {
+        for completed in [1, 3, 67, 68, 91, 92, 103] {
+            assert_eq!(discovery_usable_prefix(true, completed), completed);
+        }
+        let mut record = function_list_record();
+        record.version_major = 3;
+        record.version_minor = 2;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers_attempted = 4;
+        record.completed_prefix = 3;
+        record.usable_n = 3;
+        record.pointers[0] = 0x2000;
+        record.pointers[2] = 0x3000;
+        assert!(valid_discovery_record(&record));
+        assert_eq!(record.pointers[1], 0, "the middle NULL was read");
+
+        for usable in [0, 1, 2, 4] {
+            record.usable_n = usable;
+            assert!(!valid_discovery_record(&record), "usable={usable}");
+        }
+        record.usable_n = 3;
+        record.pointers[3] = 0x4000;
+        assert!(
+            !valid_discovery_record(&record),
+            "an unread trailing word cannot be transported as observed"
+        );
+    }
+
+    /// Interface classification still bounds the carried data: partial standard
+    /// tables survive, while a nonstandard name cannot acquire a raw prefix.
+    #[test]
+    fn discovery_failed_interface_read_keeps_prefix_and_name_guards() {
+        let mut listed = discovery_record(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN);
+        listed.symbol_id = 2;
+        listed.announced_count = 1;
+        listed.table_ptr = 0x1000;
+        listed.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        listed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        listed.version_major = 3;
+        listed.version_minor = 2;
+        listed.pointers_attempted = 69;
+        listed.completed_prefix = 68;
+        listed.usable_n = 68;
+        listed.pointers[67] = 0x2000;
+        assert!(valid_discovery_record(&listed));
+        listed.name_class = DISCOVERY_NAME_OTHER;
+        assert!(!valid_discovery_record(&listed));
+
+        let mut selected = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        selected.binding_id = 9;
+        selected.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        selected.interface_index = DISCOVERY_VERSION_NULL;
+        selected.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        selected.selection_version_class = DISCOVERY_VERSION_OTHER;
+        selected.table_ptr = 0x1000;
+        selected.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        selected.pointers_attempted = 4;
+        selected.completed_prefix = 3;
+        selected.usable_n = 3;
+        selected.pointers[2] = 0x2000;
+        assert!(valid_discovery_record(&selected));
+        selected.name_class = DISCOVERY_NAME_OTHER;
+        assert!(!valid_discovery_record(&selected));
+    }
+
     /// A finite native candidacy value must survive decoding without making
     /// any other lifecycle payload admissible.
     #[test]
@@ -2747,7 +2810,6 @@ mod tests {
 
         export.status_flags = DISCOVERY_STATUS_READ_FAILURE | DISCOVERY_STATUS_COALESCED_NO_HELPER;
         export.send_signal_rc = COALESCED_NO_HELPER_RC;
-        export.usable_n = 0;
         assert!(valid_discovery_record(&export));
         export.send_signal_rc = 0;
         assert!(!valid_discovery_record(&export));
@@ -3080,7 +3142,7 @@ mod tests {
         assert!(!valid_discovery_record(&malformed));
         malformed = function_list_record();
         malformed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
-        malformed.usable_n = 1;
+        malformed.usable_n = 0;
         malformed.pointers_attempted = 1;
         malformed.completed_prefix = 1;
         malformed.pointers[0] = 7;

@@ -3900,6 +3900,179 @@ mod tests {
         assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
     }
 
+    /// Version metadata must not filter an acquired legacy prefix or compact
+    /// sparse entries into different ordinals.
+    #[test]
+    fn discovery_decode_keeps_legacy_labels_and_sparse_ordinals() {
+        use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+
+        for (major, minor) in [(3, 0), (3, 1), (3, 2), (0, 0), (4, 0), (255, 255)] {
+            for populated in [0, 27, 67] {
+                let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+                record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+                record.pid_tgid = (7u64 << 32) | 7;
+                record.symbol_id = 1;
+                record.table_ptr = 0x1000;
+                record.version_major = major;
+                record.version_minor = minor;
+                record.usable_n = 68;
+                record.completed_prefix = 68;
+                record.pointers_attempted = 68;
+                record.pointers[populated] = 0x2000;
+                let bytes = discovery_bytes(&record);
+                assert_eq!(bytes.len(), 920);
+                let decoded = decode_discovery(&bytes).expect("an acquired legacy prefix");
+                assert_eq!(
+                    (decoded.version_major, decoded.version_minor),
+                    (major, minor)
+                );
+                assert_eq!(decoded.pointers[populated], 0x2000);
+                assert_eq!(
+                    decoded.pointers.iter().filter(|word| **word != 0).count(),
+                    1
+                );
+                assert_eq!(decoded.usable_n, 68);
+            }
+        }
+    }
+
+    /// Raw ring decoding must keep a nonempty read-failed prefix and its loss
+    /// flag together instead of rejecting all the successfully acquired words.
+    #[test]
+    fn discovery_decode_keeps_nonempty_failed_read_prefix() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_STATUS_READ_FAILURE,
+        };
+
+        for completed in [1, 3, 67] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+            record.pid_tgid = (7u64 << 32) | 7;
+            record.symbol_id = 1;
+            record.table_ptr = 0x1000;
+            record.version_major = 3;
+            record.version_minor = 2;
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.usable_n = completed;
+            record.completed_prefix = completed;
+            record.pointers_attempted = completed + 1;
+            record.pointers[usize::from(completed) - 1] = 0x2000;
+            let decoded = decode_discovery(&discovery_bytes(&record))
+                .expect("successfully read words survive a failed next-word read");
+            assert_eq!(decoded.status_flags, DISCOVERY_STATUS_READ_FAILURE);
+            assert_eq!(decoded.usable_n, completed);
+            assert_eq!(decoded.completed_prefix, completed);
+            assert_eq!(decoded.pointers_attempted, completed + 1);
+            assert_eq!(decoded.pointers[usize::from(completed) - 1], 0x2000);
+            assert!(
+                decoded.pointers[usize::from(completed)..]
+                    .iter()
+                    .all(|word| *word == 0)
+            );
+
+            record.status_flags = 0;
+            record.pointers_attempted = completed;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_some());
+
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.pointers_attempted = completed + 1;
+            record.usable_n = 0;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+            record.usable_n = completed;
+            record.pointers[usize::from(completed)] = 0x3000;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+    }
+
+    /// A reported 3.2 interface may end after the common 68 words or the
+    /// 3.0-sized 92 words; neither failed extension erases that prefix.
+    #[test]
+    fn discovery_decode_keeps_failed_interface_extensions() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+            DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_V3_2,
+        };
+
+        for kind in [
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_KIND_INTERFACE_RETURN,
+        ] {
+            for completed in [68, 92] {
+                let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+                record.kind = kind;
+                record.pid_tgid = (7u64 << 32) | 7;
+                record.table_ptr = 0x1000;
+                record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+                record.usable_n = completed;
+                record.completed_prefix = completed;
+                record.pointers_attempted = completed + 1;
+                record.pointers[usize::from(completed) - 1] = 0x2000;
+                if kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                    record.binding_id = 9;
+                    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+                    record.selection_version_class = DISCOVERY_VERSION_V3_2;
+                } else {
+                    record.symbol_id = 2;
+                    record.announced_count = 1;
+                    record.version_major = 3;
+                    record.version_minor = 2;
+                }
+                let decoded = decode_discovery(&discovery_bytes(&record))
+                    .expect("a readable prefix survives an unreadable interface extension");
+                assert_eq!(decoded.usable_n, completed);
+                assert_eq!(decoded.pointers[usize::from(completed) - 1], 0x2000);
+                assert_eq!(decoded.status_flags, DISCOVERY_STATUS_READ_FAILURE);
+            }
+        }
+    }
+
+    /// Partial prefixes do not relax private-hook, field ownership, or raw
+    /// buffer bounds when records cross the actual events decoder.
+    #[test]
+    fn discovery_decode_rejects_malformed_partial_prefix_twins() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_NAME_OTHER, DISCOVERY_STATUS_READ_FAILURE,
+        };
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = 1;
+        record.table_ptr = 0x1000;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers_attempted = 4;
+        record.completed_prefix = 3;
+        record.usable_n = 3;
+        record.pointers[2] = 0x2000;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_some());
+
+        for mutate in [
+            |value: &mut DiscoveryRecord| value.symbol_id = 0,
+            |value: &mut DiscoveryRecord| value.usable_n = 2,
+            |value: &mut DiscoveryRecord| value.usable_n = 4,
+            |value: &mut DiscoveryRecord| value.pointers_attempted = 2,
+            |value: &mut DiscoveryRecord| value.pointers_attempted = 105,
+            |value: &mut DiscoveryRecord| value.pointers[3] = 0x3000,
+            |value: &mut DiscoveryRecord| value.reserved_zero[0] = 1,
+        ] {
+            let mut malformed = record;
+            mutate(&mut malformed);
+            assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+        }
+        let bytes = discovery_bytes(&record);
+        assert!(decode_discovery(&bytes[..919]).is_none());
+        let mut oversized = bytes;
+        oversized.push(0);
+        assert!(decode_discovery(&oversized).is_none());
+
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.symbol_id = 2;
+        record.name_class = DISCOVERY_NAME_OTHER;
+        record.announced_count = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+    }
+
     #[test]
     fn exec_task_decode_keeps_920_byte_transport_and_private_finite_class() {
         let mut record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);

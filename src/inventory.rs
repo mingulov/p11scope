@@ -7598,6 +7598,48 @@ mod tests {
     }
 
     #[test]
+    fn edge_json_repeats_the_entries_coverage_at_the_edge_level() {
+        // Ledger consumers judge the edge as a whole: the top-level
+        // coverage repeats the entries coverage object, so both paths
+        // carry the same state.
+        let edge = crate::inventory_present::EdgeView {
+            caller: crate::discovery::caller_registry::CallerId(0),
+            module: crate::discovery::caller_registry::ModuleId(1),
+            mapping: crate::discovery::caller_registry::MappingState::Mapped,
+            mapping_reason: None,
+            mapping_evidence: crate::discovery::caller_registry::MappingEvidence::DeepScan,
+            mapping_first_seen_ns: 100,
+            mapping_last_seen_ns: 200,
+            mapping_interruptions: 0,
+            entry_count: 1,
+            entry_saturated: false,
+            entry_first_seen_ns: Some(120),
+            entry_last_seen_ns: Some(180),
+            entry_in_flight: false,
+            entry_observation: "observed",
+            coverage: crate::discovery::caller_registry::UseCoverage::Counted {
+                since_ns: 110,
+                lossy: false,
+            },
+            presence: crate::inventory_present::Presence::Mapped,
+            capture: crate::inventory_present::Capture::Armed,
+            activity: crate::inventory_present::Activity::RecentlyObserved,
+            semantics: crate::inventory_present::EdgeSemanticsView {
+                label: crate::discovery::caller_registry::SEMANTIC_UNKNOWN,
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+        };
+        let payload = super::edge_json(&edge);
+        assert_eq!(
+            payload["coverage"], payload["entries"]["coverage"],
+            "the edge level repeats the entries coverage object"
+        );
+        assert_eq!(payload["coverage"]["state"], "counted");
+        assert_eq!(payload["coverage"]["lossy"], false);
+    }
+
+    #[test]
     fn cgroup_stop_acceptance_inherited_fd_child() {
         if std::env::var_os("P11SCOPE_CGROUP_STOP_TEST_CHILD").is_none() {
             return;

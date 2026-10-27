@@ -81,9 +81,14 @@ struct FixtureSet {
     marker: PathBuf,
 }
 
-fn build_fixtures(dir: &Path) -> FixtureSet {
+fn build_fixtures(dir: &Path, corroborated: bool) -> FixtureSet {
     let matrix = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates/discover/tests/fixture/version_matrix.c");
+    let called_matrix = if corroborated {
+        fixture_source("catalog-version-matrix.c")
+    } else {
+        matrix.clone()
+    };
     let driver = gcc(
         dir,
         "driver",
@@ -94,14 +99,14 @@ fn build_fixtures(dir: &Path) -> FixtureSet {
     let v1 = gcc(
         dir,
         "v1.so",
-        &matrix,
+        &called_matrix,
         &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
         &[],
     );
     let v2 = gcc(
         dir,
         "v2.so",
-        &matrix,
+        &called_matrix,
         &["-shared", "-fPIC", "-DLEGACY_MINOR=41"],
         &[],
     );
@@ -715,10 +720,47 @@ fn catalog_admission_oracle_rejects_admitted_prefixes() {
 }
 
 #[test]
+fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
+    let _guard = serial_guard();
+    let dir = tmp("catalog-reader-partial-exports");
+    let fixtures = build_fixtures(&dir, false);
+    let run = dance(&fixtures, true);
+    let b = object_for(run.json.as_ref().unwrap(), &run.pids, "prov.so");
+    assert_eq!(
+        tables_of(b),
+        vec![
+            ("2.41".to_owned(), 68, "known_prefix".to_owned(), 0),
+            ("2.40".to_owned(), 68, "full".to_owned(), 0),
+            ("3.0".to_owned(), 92, "full".to_owned(), 0),
+        ]
+    );
+    assert_eq!(b["observations"][0]["pid"], pid_of(&run.pids, "B"));
+    assert_eq!(b["inode"], std::fs::metadata(&fixtures.prov).unwrap().ino());
+    assert_eq!(b["identity"]["sha256"], sha256_file(&fixtures.prov));
+    assert_eq!(sha256_file(&fixtures.prov), sha256_file(&fixtures.v2));
+    assert_ne!(sha256_file(&fixtures.prov), sha256_file(&fixtures.v1));
+    assert_eq!(b["admission"]["class"], "heuristic");
+    assert_eq!(b["admission"]["scan_only"], true);
+    match b["admission"]["state"].as_str() {
+        Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
+        Some("refused") if !strict_admission() => {
+            assert!(b["admission"]["endpoints"].is_null());
+            assert!(
+                b["admission"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("attach slots")
+            );
+        }
+        state => panic!("unexpected partial-export admission: {state:?}"),
+    }
+}
+
+#[test]
 fn catalog_reader_finds_every_fixture_object() {
     let _guard = serial_guard();
     let dir = tmp("catalog-reader");
-    let fixtures = build_fixtures(&dir);
+    let fixtures = build_fixtures(&dir, true);
     let strict = strict_admission();
     let wide = cfg!(feature = "wide-detailed-2112");
 
@@ -742,7 +784,7 @@ fn catalog_reader_finds_every_fixture_object() {
     }
 
     // B: same-path dance, V2 bytes pinned. Three file-backed tables; the
-    // 3.0 table's exported anchors corroborate the object.
+    // 3.0 table's 92 matching standard exports corroborate the object.
     let b = object_for(doc, &run.pids, "prov.so");
     assert_eq!(
         tables_of(b),

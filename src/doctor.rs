@@ -2613,7 +2613,13 @@ mod tests {
         };
         let wrapped = anyhow::Error::new(error).context("loading p11_entry");
         let rendered = format_preflight_error(wrapped.as_ref());
-        assert!(rendered.contains("verifier budget refused"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "verifier log filled during a very long check (ENOSPC); usually the complexity limit"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("verifier budget refused"), "{rendered}");
         assert!(rendered.contains("ENOSPC"), "{rendered}");
         assert!(!rendered.contains("(E2BIG)"), "{rendered}");
         assert!(rendered.contains("truncated verifier dump"), "{rendered}");
@@ -2629,7 +2635,7 @@ mod tests {
         let rendered = format_preflight_error(wrapped.as_ref());
         assert_eq!(
             rendered,
-            r"loading required typed task_newtask: verifier: denied\u{1b}[2J"
+            r"loading required typed task_newtask: BPF_PROG_LOAD failed with EPERM (os error 1); verifier: denied\u{1b}[2J"
         );
         assert!(!rendered.contains("Operation not permitted"));
 
@@ -2642,6 +2648,38 @@ mod tests {
         assert!(rendered.contains(" [middle omitted] "));
         assert!(rendered.ends_with('é'));
         assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn preflight_names_errno_for_non_budget_load_refusals() {
+        // The budget arm names its errno; any other load refusal must name
+        // its errno too, not just the verifier excerpt.
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EACCES),
+            verifier_log: aya_obj::VerifierLog::new("R1 invalid mem access".to_string()),
+        };
+        let wrapped = anyhow::Error::new(error).context("loading p11_entry");
+        let rendered = format_preflight_error(wrapped.as_ref());
+        assert!(
+            rendered.contains("BPF_PROG_LOAD failed with EACCES (os error 13); "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("R1 invalid mem access"), "{rendered}");
+    }
+
+    #[test]
+    fn preflight_names_numeric_errno_when_name_unknown() {
+        // Errnos outside the short-name table stay numeric rather than
+        // losing the failure's identity.
+        let error = ProgramError::LoadError {
+            io_error: std::io::Error::from_raw_os_error(libc::EIO),
+            verifier_log: aya_obj::VerifierLog::new("i/o hiccup".to_string()),
+        };
+        let rendered = format_preflight_error(anyhow::Error::new(error).as_ref());
+        assert!(
+            rendered.contains("BPF_PROG_LOAD failed with os error 5; "),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2731,10 +2769,10 @@ mod tests {
             ),
         ];
         assert_eq!(verdict(&checks), 1);
-        assert!(
-            verdict_line(&checks).starts_with("verdict: capture unavailable"),
-            "{}",
-            verdict_line(&checks)
+        assert_eq!(
+            verdict_line(&checks),
+            "verdict: capture available; inventory capture unavailable \
+             (verifier budget refused the program (E2BIG); verifier: denied)"
         );
         assert_eq!(
             render(&checks).lines().next(),
@@ -2742,6 +2780,43 @@ mod tests {
         );
         checks[2].status = Status::Ok("available".into());
         assert_eq!(verdict(&checks), 0);
+        assert!(
+            !verdict_line(&checks).contains("inventory capture"),
+            "{}",
+            verdict_line(&checks)
+        );
+    }
+
+    #[test]
+    fn verdict_names_inventory_failure_beside_host_failure() {
+        // Twin: when the host lanes fail too, the verdict names both the
+        // capture failure and the inventory lane's own reason. The exit
+        // gating is unchanged: any failed requested lane exits 1.
+        let row = |name: &str, status: Status| Check {
+            name: name.into(),
+            status,
+        };
+        let checks = vec![
+            row("BPF map create", Status::Ok("available".into())),
+            row(
+                "host program preflight",
+                Status::Fail(
+                    "BPF_PROG_LOAD failed with EPERM (os error 1); verifier: denied".into(),
+                ),
+            ),
+            row(
+                "inventory program preflight",
+                Status::Fail(
+                    "verifier budget refused the program (E2BIG); verifier: denied".into(),
+                ),
+            ),
+        ];
+        assert_eq!(verdict(&checks), 1);
+        assert_eq!(
+            verdict_line(&checks),
+            "verdict: capture unavailable; inventory capture unavailable \
+             (verifier budget refused the program (E2BIG); verifier: denied)"
+        );
     }
 
     // ---- Slice 1b-2 doctor contract (design §10.1) ------------------------

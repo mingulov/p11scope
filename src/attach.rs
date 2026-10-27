@@ -11998,7 +11998,11 @@ mod tests {
         );
         let rendered = format!("{error:#}");
         assert!(rendered.contains("loading p11_return"), "{rendered}");
-        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(
+            rendered.contains("verifier log filled during a very long check"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("too complex"), "{rendered}");
         assert!(rendered.contains("p11scope doctor"), "{rendered}");
         assert!(!rendered.contains("CAP_BPF"), "{rendered}");
         assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
@@ -12028,7 +12032,15 @@ mod tests {
             .context("loading p11_return"),
         );
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("too complex"), "{rendered}");
+        assert!(
+            rendered.contains("verifier log filled during a very long check"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("usually the complexity limit"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("too complex"), "{rendered}");
         assert!(rendered.contains("ENOSPC"), "{rendered}");
         assert!(!rendered.contains("(E2BIG)"), "{rendered}");
         assert!(!rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
@@ -12047,6 +12059,85 @@ mod tests {
         assert!(rendered.contains("loading p11_return"), "{rendered}");
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT), "{rendered}");
         assert!(!rendered.contains("too complex"), "{rendered}");
+    }
+
+    #[test]
+    fn refused_program_load_prints_bounded_summary_not_raw_log() {
+        // A refused Detailed program used to dump aya's whole verifier log
+        // on stderr (up to about 16 MiB after a log-exhausting refusal).
+        // The seam keeps the program name, the errno name and number, and
+        // a short tail of the log, naming the truncation with the original
+        // byte count — the same bounded shape as the inventory gap reason.
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        assert_eq!(log.len(), 300 * 1024);
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new(log),
+            })
+            .context("loading p11_return"),
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.len() <= 1024,
+            "seam output must stay bounded: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains(r#"program "p11_return" refused"#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("E2BIG (os error 7)"), "{rendered}");
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(rendered.contains("307200 verifier-log bytes"), "{rendered}");
+        assert!(
+            !rendered.contains(&"f".repeat(1024)),
+            "the raw log must not survive the seam"
+        );
+    }
+
+    #[test]
+    fn refused_program_start_stays_within_the_stderr_bound() {
+        // CLI level: the same wrappers `run`/`capture` (run.rs "starting
+        // attach session") and `main` ("p11scope: {e:#}") apply, mirrored
+        // here because the binary entry point is not callable from a unit
+        // test. If those wrappers change, this mirror must change with
+        // them. The exit code stays 1.
+        let log = format!("{}TAIL-MARKER", "f".repeat(300 * 1024 - 11));
+        let error = unsupported_environment_context(
+            anyhow::Error::new(aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+                verifier_log: aya_obj::VerifierLog::new(log),
+            })
+            .context("loading p11_return"),
+        );
+        let error = error.context("starting attach session");
+        let stderr = format!("p11scope: {error:#}");
+        assert!(
+            stderr.len() <= 1024,
+            "stderr must stay bounded: {} bytes",
+            stderr.len()
+        );
+        assert!(
+            stderr.contains(r#"program "p11_return" refused"#),
+            "{stderr}"
+        );
+        assert!(stderr.contains("E2BIG (os error 7)"), "{stderr}");
+        assert!(stderr.contains("TAIL-MARKER"), "{stderr}");
+        assert!(stderr.contains("307200 verifier-log bytes"), "{stderr}");
+        assert_eq!(crate::failure_exit_code(&error), 1);
+    }
+
+    #[test]
+    fn unsupported_environment_context_keeps_non_load_errors_verbatim() {
+        // Only a genuine program-load refusal is summarized; any other
+        // failure keeps its chain, with the hint added in front.
+        let before = anyhow::anyhow!("some other failure").context("starting workers");
+        let expected = format!("{before:#}");
+        let after = unsupported_environment_context(before);
+        let rendered = format!("{after:#}");
+        assert!(rendered.starts_with(UNSUPPORTED_ENV_HINT), "{rendered}");
+        assert!(rendered.ends_with(&expected), "{rendered}");
     }
 
     fn expected_preparation(unsafe_object: bool) -> Vec<SessionPreparation> {

@@ -10234,6 +10234,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn counter_verifier_budget_refusal_keeps_map_create_e2big() {
+        // A map-create E2BIG is not a program-load refusal: only a genuine
+        // BPF_PROG_LOAD E2BIG takes the old-kernel token. The map error
+        // keeps its own text and errno.
+        let map_create =
+            anyhow::Error::new(aya::EbpfError::MapError(aya::maps::MapError::CreateError {
+                name: "COUNTS".to_string(),
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            }))
+            .context("creating counter map");
+        let before = format!("{map_create:#}");
+        assert!(before.contains("os error 7"), "{before}");
+        let after = map_counter_verifier_budget_refusal(map_create);
+        assert_eq!(format!("{after:#}"), before);
+        assert!(
+            !format!("{after:#}").contains("counter-mode-unavailable-on-kernel"),
+            "a map-create E2BIG must keep its own error: {after:#}"
+        );
+    }
+
+    #[test]
     fn counter_start_error_maps_e2big_load_chain_to_the_named_refusal() {
         // The 6.1 production shape: aya's load error (E2BIG source, long
         // verifier log) under a loader context, as start_on_backend sees

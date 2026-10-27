@@ -835,8 +835,8 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     // 4163, occupied 4216 = 62*68), so the admitted demand is one full
     // surface per copy plus one for the original. When that loop total
     // would exceed the cap, size exactly with a tail instead.
-    let loop_copies = ((endpoint_target - MECH_FUNCTIONS.len() as u64 + per_copy as u64 - 1)
-        / per_copy as u64) as usize;
+    let loop_copies =
+        (endpoint_target - MECH_FUNCTIONS.len() as u64).div_ceil(per_copy as u64) as usize;
     let loop_admitted = (loop_copies + 1) * per_copy;
     let tail_path: Option<PathBuf>;
     let tail_endpoints: usize;

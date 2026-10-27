@@ -1753,11 +1753,22 @@ mod tests {
         target: libc::pthread_t,
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
+        // musl's `pthread_t` is a raw pointer, which is not `Send`.
+        struct Target(libc::pthread_t);
+        // SAFETY: the handle is only passed back to `pthread_kill`, which
+        // accepts it from any thread of the process.
+        unsafe impl Send for Target {}
+        impl Target {
+            fn get(&self) -> libc::pthread_t {
+                self.0
+            }
+        }
+        let target = Target(target);
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 // SAFETY: pthread_kill to a live test thread with a valid signal.
                 unsafe {
-                    libc::pthread_kill(target, libc::SIGURG);
+                    libc::pthread_kill(target.get(), libc::SIGURG);
                 }
             }
         })

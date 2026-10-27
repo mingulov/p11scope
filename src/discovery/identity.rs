@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
-    IdentityKind, InspectedObject, MappingFileKey, inspect_file_with_reader_exporting,
-    is_missing_mount_id_error, mapping_file_key, mapping_file_key_in_mountinfo, open_object,
-    open_regular,
+    IdentityKind, InspectedObject, MappingFileKey, SelfMappedFallback,
+    inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
+    mapping_file_key_in_mountinfo, open_object, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -144,6 +144,12 @@ struct Entry {
     /// entry stands for more than one proven kernel file, so its raw key is
     /// never a sweep-matching key (`sweep_match_keys`).
     collapsed: bool,
+    /// Sticky: the pin-time self-mapping probe could not decide how the
+    /// kernel renders this overlay fd in maps (budget spent, mmap or maps
+    /// read failed). The fd key stays primary and the summary carries
+    /// [`PROBED_MAPS_UNPROVEN_NOTE`], so a caller the rendering would have
+    /// bound never stays unbound silently.
+    probed_maps_unproven: bool,
     /// How the kernel renders this exact held fd in `/proc` maps when that
     /// differs from the fd's own key (pre-6.8 overlayfs split), proved by
     /// the shared self-mapping probe at pin time. `None` whenever the
@@ -822,6 +828,7 @@ impl Entry {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
             collapsed: false,
+            probed_maps_unproven: false,
             probed_maps_key: None,
             raw,
             mapping,
@@ -840,6 +847,13 @@ impl Entry {
         })
     }
 }
+
+/// The pin-time note an overlay provider pin carries when the self-mapping
+/// probe could not decide how the kernel renders its held fd in maps: the
+/// fd key stays primary, and callers the rendering would have bound may
+/// stay unbound. One value, so every such pin discloses identically.
+pub(crate) const PROBED_MAPS_UNPROVEN_NOTE: &str =
+    "provider's maps rendering unproven; callers mapping it may stay unbound";
 
 /// What a pinned object is, for the `discovery[]` report.
 #[derive(Debug, Clone, Copy)]
@@ -1513,7 +1527,9 @@ impl PinnedObjects {
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
-            note: None,
+            note: entry
+                .probed_maps_unproven
+                .then_some(PROBED_MAPS_UNPROVEN_NOTE),
         })
     }
 
@@ -1860,7 +1876,9 @@ impl PinnedObjects {
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
             identity_source: "mountinfo",
-            note: None,
+            note: entry
+                .probed_maps_unproven
+                .then_some(PROBED_MAPS_UNPROVEN_NOTE),
         })
     }
 
@@ -2301,6 +2319,7 @@ mod conservative_copy {
                     exports: old.exports.clone(),
                     overlay: old.overlay,
                     collapsed: old.collapsed,
+                    probed_maps_unproven: old.probed_maps_unproven,
                     probed_maps_key: old.probed_maps_key,
                 },
                 field: 0,
@@ -6156,6 +6175,23 @@ pub(crate) fn self_mapped_fallback_key(
     )
 }
 
+/// [`self_mapped_fallback_key`] with the full probe answer: the pin-time
+/// drain latches [`PROBED_MAPS_UNPROVEN_NOTE`] on `Inconclusive`, where the
+/// snapshot retry only needs the `Split` key.
+pub(crate) fn self_mapped_fallback_detailed(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> SelfMappedFallback {
+    p11scope_manifest::identity::self_mapped_fallback_detailed(
+        file,
+        fd_key,
+        &mut BudgetAdapter(budget),
+        probe,
+    )
+}
+
 /// Structural validation + open + size cap + identity match + executable-offset check.
 /// Opens, identifies, and pins every object. Errors are aggregated so an
 /// operator sees every stale or malformed target in one run.
@@ -6582,10 +6618,19 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         // A pre-6.8 overlay fd renders in maps at a different key than
         // the mount table resolves; record the kernel rendering of this
         // exact held fd on the entry so the provider proof matches it.
-        // The probe returns None (no split) whenever the rendering agrees
-        // or is inconclusive. Never a second manifest raw: the
-        // one-manifest-raw-per-path invariant behind `id_for_path` holds.
-        entry.probed_maps_key = self_mapped_fallback_key(&entry.file, key, budget, probe);
+        // An inconclusive probe latches the named unproven note instead:
+        // the fd key stays primary, and no caller stays unbound silently.
+        // Never a second manifest raw: the one-manifest-raw-per-path
+        // invariant behind `id_for_path` holds.
+        match self_mapped_fallback_detailed(&entry.file, key, budget, probe) {
+            SelfMappedFallback::Split(probed) => {
+                entry.probed_maps_key = Some(probed);
+            }
+            SelfMappedFallback::Agrees => {}
+            SelfMappedFallback::Inconclusive => {
+                entry.probed_maps_unproven = true;
+            }
+        }
         opened.insert(object.id, (entry, inspected));
     }
 
@@ -7131,6 +7176,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: false,
             collapsed: false,
+            probed_maps_unproven: false,
             probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
@@ -7173,6 +7219,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay,
             collapsed: false,
+            probed_maps_unproven: false,
             probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
@@ -7362,6 +7409,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: true,
             collapsed: false,
+            probed_maps_unproven: false,
             probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();
@@ -7395,6 +7443,7 @@ pub(crate) mod test_fixture {
             exports: Arc::from(Vec::new()),
             overlay: true,
             collapsed: false,
+            probed_maps_unproven: false,
             probed_maps_key: None,
         };
         let mut pins = PinnedObjects::empty();

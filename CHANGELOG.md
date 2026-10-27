@@ -82,6 +82,12 @@ User-facing limits live in
 
 ### Fixed
 
+- Provider discovery retains usable function entries independently of version
+  labels, including 68-entry legacy tables labelled 3.2, sparse tables and
+  acquired all-NULL tables. Unavailable words and unusable targets remain
+  explicit; they no longer erase other usable entries. Partial manifests
+  preserve their observed ordinals and useful targets without claiming a
+  complete table or stronger semantic authority.
 - `inspect` and discovery refuse corrupt ELF segments and validate mmap
   segment ranges instead of misreading them.
 
@@ -155,9 +161,6 @@ Known issues in this release:
   note, and callers mapping it may stay unbound.
 - Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
   are not qualified yet.
-- Fedora 44's SoftHSM 2.7.0 legacy-width table labelled 3.2 is not
-  decoded by ordinary inventory scanning. A manifest enables its
-  Detailed/S1 path, while ordinary scanned endpoints remain unavailable.
 
 ### Qualification of this release
 

@@ -771,7 +771,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     loss = (
         selection["selection_truncated"]
         or any(item["coverage"] not in {"observed", "absent_covered"} for item in providers)
-        or any(item["status"] not in {"present", "legacy_absent"} for item in exports)
+        or any(item["status"] not in {"present", "legacy_absent", "required_absent"} for item in exports)
         or any(item["authority"] == "selection_count_only" for item in tuples)
         or any(item["rv"] == 0 and item["authority"] == "none" for item in tuples)
         or evidence["pid_descendant_gaps"] != 0
@@ -1259,7 +1259,7 @@ def selection_observation_complete(selection):
     return (
         not selection["selection_truncated"]
         and all(p["coverage"] in ("observed", "absent_covered") for p in selection["providers"])
-        and all(e["status"] in ("present", "legacy_absent") for e in selection["standard_exports"])
+        and all(e["status"] in ("present", "legacy_absent", "required_absent") for e in selection["standard_exports"])
         and all(
             not (
                 t["rv"] == 0

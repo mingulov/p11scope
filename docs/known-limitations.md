@@ -103,15 +103,12 @@ pin then carries the note `provider's maps rendering unproven;
 callers mapping it may stay unbound`, and callers mapping that provider
 may stay unbound. This key split does not happen on Linux 6.8 and later.
 
-Fedora 44's SoftHSM 2.7.0 exposes a file-backed 68-entry legacy
-function table labelled version 3.2. The automatic scanner expects
-the wider 3.2 layout and declines this table, so ordinary inventory
-reports zero endpoints for it with a named discovery gap. Calling
-`C_GetFunctionList` first does not change that result. An explicit
-manifest supplies addresses to `profile`, `trace` and inventory's S1
-semantic lane; it does not change inventory's scan-only ordinary
-admission. The 2.6.1 table layout is a separate qualification input.
-Support for this 2.7.0 scan layout remains planned for a later release.
+Provider function tables can contain NULLs, unusable entries or fewer readable
+words than their version label suggests. Discovery retains usable targets
+around those gaps; an unread word is never treated as an observed NULL.
+Version metadata alone does not require a wider table. If the evidence cannot
+justify an API name, its target remains observable as `unknown`, count-only.
+Actual unavailable entries and incomplete observations remain disclosed.
 
 A `profile` or `trace` output has no per-run marker for calls made
 before a provider's probes landed, so a missed early burst reads the
@@ -1060,16 +1057,15 @@ the report then reads PARTIAL. The `-o` file is always complete: every
 line is written to it, and a file write failure is an error rather than
 a silent drop.
 
-### Providers that build their function table at run time need a manifest
+### Runtime-built function tables need publication evidence or a manifest
 
 - What the user sees: automatic discovery finds no table in the
   provider's file-backed data, attaches 0 probes, and reports
   `discovery skipped <path> — no function table was found in its
-  file-backed data; ...`. A table built at run time (in `.bss` or on
-  the heap) is outside the memory scan's reach. SoftHSM 2.6.1 on
-  Ubuntu keeps its table in the file and needs no manifest. Fedora's
-  SoftHSM 2.7.0 has a different, file-backed layout limitation described
-  in the current release section above.
+  file-backed data; ...`. A table stored only in runtime allocation is
+  outside the file-data scan's reach. A getter return observed after its
+  watch attaches can supply the table; earlier returns are not replayed.
+  SoftHSM 2.6.1 on Ubuntu keeps its table in the file and needs no manifest.
 - Kernels/conditions: all kernels; any provider that builds its
   function table at run time instead of keeping it in the file.
 - Disclosure: the `discovery skipped` line above, which ends with the

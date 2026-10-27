@@ -101,7 +101,9 @@ discriminator value.
   array truncates with `selection_truncated` set.
 - `standard_exports`: sorted, unique `{module, status}` objects. `status` is
   exactly `present`, `outside_module`, `legacy_absent`, `required_absent`, or
-  `unresolved`.
+  `unresolved`. The historical absence labels both describe a known absent
+  optional export; neither asserts a provider-version requirement. Current
+  captures emit `legacy_absent` for known absence regardless of table metadata.
 - `inventory_surfaces`: at most 512 sorted `{module, ordinal, kind}` objects.
   `kind` is `legacy` or `interface`; `ordinal` starts at zero and is contiguous
   within each module.
@@ -392,8 +394,8 @@ this addition touches the `capture` section only.
 
 ## Completeness and terminal trace
 
-Any truncation, uncovered provider, export status other than `present` or
-`legacy_absent`, count-only tuple, successful tuple with `none` authority,
+Any truncation, uncovered provider, export status other than `present`,
+`legacy_absent` or historical `required_absent`, count-only tuple, successful tuple with `none` authority,
 nonzero descendant gap, nonzero rebuild gap, or nonzero
 `task_uprobe_link_losses` or `abi_refusals` forces
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace

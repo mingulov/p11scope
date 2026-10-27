@@ -267,10 +267,10 @@ If you installed the optional helper, also run
 
   Start with a passive diagnostic capture. This manifest-free path retains
   aggregate function counts, return values and latency; scanned slots are
-  semantics-unverified and count-only. Providers that build their function
-  table at run time instead of keeping it in the file stay invisible to
-  this path and need a manifest built with `p11scope-discover` (see
-  [known limitations](docs/known-limitations.md#providers-that-build-their-function-table-at-run-time-need-a-manifest)).
+  semantics-unverified and count-only. File-data scans can miss tables held
+  only in runtime allocation. A manifest built with `p11scope-discover`
+  supplies explicit targets when discovery has no observed publication (see
+  [known limitations](docs/known-limitations.md#runtime-built-function-tables-need-publication-evidence-or-a-manifest)).
   Rows carry standard function names
   when the provider's own `.dynsym` exports every standard name exactly where
   its function table points (`linkage: "exports"`, as SoftHSM2 does);

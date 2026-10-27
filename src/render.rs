@@ -475,10 +475,12 @@ impl InterfaceSelection {
                 .providers
                 .iter()
                 .all(|provider| matches!(provider.coverage, "observed" | "absent_covered"))
-            && self
-                .standard_exports
-                .iter()
-                .all(|export| matches!(export.status, "present" | "legacy_absent"))
+            && self.standard_exports.iter().all(|export| {
+                matches!(
+                    export.status,
+                    "present" | "legacy_absent" | "required_absent"
+                )
+            })
             && self.tuples.iter().all(|tuple| {
                 !(tuple.rv == 0
                     && tuple.result.is_some()
@@ -7023,14 +7025,6 @@ pub(crate) mod tests {
                     coverage: "absent_uncovered",
                 })
             }),
-            ("required standard export absent", |ev| {
-                ev.interface_selection
-                    .standard_exports
-                    .push(StandardExport {
-                        module: 0,
-                        status: "required_absent",
-                    })
-            }),
             ("standard export outside module", |ev| {
                 ev.interface_selection
                     .standard_exports
@@ -7142,6 +7136,14 @@ pub(crate) mod tests {
                     .push(StandardExport {
                         module: 0,
                         status: "legacy_absent",
+                    })
+            }),
+            ("historical required absent", |ev| {
+                ev.interface_selection
+                    .standard_exports
+                    .push(StandardExport {
+                        module: 0,
+                        status: "required_absent",
                     })
             }),
             ("nonzero rv", |ev| {

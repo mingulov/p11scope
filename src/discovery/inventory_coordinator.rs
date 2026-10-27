@@ -3489,6 +3489,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !crate::pidns::numbering().agrees() {
             return;
         }
+        // All records drained after stop share one finite allowance.
+        // Unproved final records are disposed, never queued for retry.
+        let mut final_work = crate::process::leader_exit::LeaderExitReadBudget::for_commit();
         for record in &batch.records {
             if record.kind != DISCOVERY_KIND_LEADER_EXIT {
                 continue;
@@ -3526,7 +3529,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 continue;
             }
-            self.defer_leader_exit(caller, pid, record.hook_ts_ns, batch.domain);
+            if self.stopped {
+                self.adjudicate_stopped_leader_exit(
+                    caller,
+                    pid,
+                    record.hook_ts_ns,
+                    batch.domain,
+                    &mut final_work,
+                );
+            } else {
+                self.defer_leader_exit(caller, pid, record.hook_ts_ns, batch.domain);
+            }
         }
     }
 

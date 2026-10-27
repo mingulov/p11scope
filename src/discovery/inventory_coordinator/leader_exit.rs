@@ -221,6 +221,106 @@ mod tests {
                 .any(|gap| gap.subject == "leader task link loss")
         );
     }
+
+    #[test]
+    fn stopped_exit_dispositions_share_one_budget_and_retain_no_retry_rows() {
+        let (mut native, first) = NativeScene::boxed();
+        native.scene.source.spawn(8, 600);
+        native
+            .scene
+            .source
+            .set_leader_exit_observation(8, LeaderExitObservation::LiveNonleader);
+        let second = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.stop();
+        let mut shared_final_work = LeaderExitReadBudget::for_test(1);
+        native.scene.coordinator.adjudicate_stopped_leader_exit(
+            first,
+            7,
+            1_500,
+            native.domain,
+            &mut shared_final_work,
+        );
+        native.scene.coordinator.adjudicate_stopped_leader_exit(
+            second,
+            8,
+            1_500,
+            native.domain,
+            &mut shared_final_work,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.source.leader_exit_queries(),
+            1,
+            "the second record gets no fresh allowance"
+        );
+        assert!(native.scene.coordinator.pending_leader_exits.is_empty());
+        assert!(!native.scene.coordinator.adapter.leader_exit_pending(first));
+        assert!(native.scene.coordinator.adapter.leader_exit_pending(second));
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.caller == Some(first) && gap.subject == "leader task link loss")
+                .count(),
+            1
+        );
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.caller == Some(second)
+                    && gap.subject == "leader exit status unresolved at stop")
+                .count(),
+            1
+        );
+        assert_eq!(
+            native.scene.coordinator.adapter.live_pin(8).unwrap().1,
+            &(8, 600)
+        );
+    }
+
+    #[test]
+    fn stopped_unknown_exit_is_disposed_once_without_later_retry() {
+        let (mut native, caller) = NativeScene::boxed();
+        native
+            .scene
+            .source
+            .set_leader_exit_observation(7, LeaderExitObservation::Unresolved);
+        native.scene.coordinator.stop();
+        native.scene.coordinator.adjudicate_stopped_leader_exit(
+            caller,
+            7,
+            1_500,
+            native.domain,
+            &mut LeaderExitReadBudget::for_test(128),
+        );
+        native
+            .scene
+            .source
+            .set_leader_exit_observation(7, LeaderExitObservation::LiveNonleader);
+        native.scene.coordinator.adjudicate_stopped_leader_exit(
+            caller,
+            7,
+            1_500,
+            native.domain,
+            &mut LeaderExitReadBudget::for_test(128),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(native.scene.source.leader_exit_queries(), 1);
+        assert!(native.scene.coordinator.pending_leader_exits.is_empty());
+        assert!(native.scene.coordinator.adapter.leader_exit_pending(caller));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "leader task link loss")
+        );
+    }
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
@@ -316,24 +416,64 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.adapter.mark_leader_exit_pending(caller, false);
                 }
                 LeaderExitObservation::LiveNonleader => {
-                    self.adapter.mark_leader_exit_pending(caller, false);
-                    if self.leader_link_loss_noted.insert(caller) {
-                        self.registry.record_gap(RegistryGap {
-                            caller: Some(caller), module: None, pid: Some(pending.pid),
-                            subject: "leader task link loss".into(),
-                            reason: "the leader task exited while a same-generation nonleader was proven live and not exiting; original custody is retained with no tombstone, and a later EXEC may renew recovery".into(),
-                            budget: None,
-                        });
-                        if self.semantic_bindings.get(caller).is_some() {
-                            self.tail_uncertain.insert(caller);
-                        }
-                    }
+                    self.record_live_nonleader_loss(caller, pending.pid);
                 }
                 LeaderExitObservation::Unresolved => {
                     self.pending_leader_exits.insert(caller, pending);
                 }
             }
         }
+    }
+
+    fn record_live_nonleader_loss(&mut self, caller: CallerId, pid: u32) {
+        self.adapter.mark_leader_exit_pending(caller, false);
+        if self.leader_link_loss_noted.insert(caller) {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller), module: None, pid: Some(pid),
+                subject: "leader task link loss".into(),
+                reason: "the leader task exited while a same-generation nonleader was proven live and not exiting; original custody is retained with no tombstone, and a later EXEC may renew recovery".into(),
+                budget: None,
+            });
+            if self.semantic_bindings.get(caller).is_some() {
+                self.tail_uncertain.insert(caller);
+            }
+        }
+    }
+
+    pub(super) fn adjudicate_stopped_leader_exit(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        hook_ns: u64,
+        domain: NativeDomainId,
+        work: &mut LeaderExitReadBudget,
+    ) {
+        if self.leader_link_loss_noted.contains(&caller) || self.adapter.leader_exit_pending(caller)
+        {
+            return;
+        }
+        self.adapter.mark_leader_exit_pending(caller, true);
+        let observation = if work.spend(1) {
+            self.adapter
+                .share_caller_pin(caller)
+                .map_or(LeaderExitObservation::Unresolved, |pin| {
+                    self.adapter.source().leader_exit_observation(&pin, work)
+                })
+        } else {
+            LeaderExitObservation::Unresolved
+        };
+        match observation {
+            LeaderExitObservation::GroupExited => self.adapter.mark_leader_exit_pending(caller, false),
+            LeaderExitObservation::LiveNonleader => self.record_live_nonleader_loss(caller, pid),
+            LeaderExitObservation::Unresolved => self.registry.record_gap(RegistryGap {
+                caller: Some(caller), module: None, pid: Some(pid),
+                subject: "leader exit status unresolved at stop".into(),
+                reason: format!("final hook={hook_ns} domain={domain:?} had no live-worker or group-exit proof within the shared final-batch allowance; semantic inputs retain custody refusal"),
+                budget: None,
+            }),
+        }
+        // No reservation, retry row or new retained pin survives this
+        // final disposition. The caller bit keeps unproved inputs fenced.
     }
 
     pub(super) fn resolve_leader_exit_for_exec(&mut self, caller: CallerId) {

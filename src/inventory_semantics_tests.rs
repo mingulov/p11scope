@@ -7855,6 +7855,12 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
             exec_id: 1,
         };
         assert_eq!(conv.scene.bind(sibling, &module, detailed, image9), Ok(()));
+        let sibling_custody = conv
+            .scene
+            .coordinator
+            .adapter()
+            .shared_semantic_custody(sibling)
+            .unwrap();
 
         let gaps_before = conv.gap_pairs().len();
         let passes_before = conv.scene.coordinator.passes();
@@ -7900,8 +7906,9 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
             "one finite scan refusal: {:?}",
             conv.gap_pairs()
         );
-        // Staged lifecycle facts still drain: the live sibling's leader
-        // exit records honest link loss after stop (drain, not gate).
+        // Staged lifecycle facts still drain. This independent /bin/sleep
+        // is not a zombie leader with a live worker: its held pidfd alone
+        // cannot turn an injected exit into a survivor-loss claim.
         // SAFETY: DiscoveryRecord contains only integer fields.
         let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
         exit_record.hook_ts_ns = 5_500;
@@ -7923,7 +7930,35 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
             .iter()
             .filter(|(subject, _)| subject == "leader task link loss")
             .count();
-        assert_eq!(link_loss, 1, "link-loss evidence drains after stop");
+        assert_eq!(
+            link_loss, 0,
+            "an ordinary live child is not a proven survivor group"
+        );
+        assert_eq!(
+            conv.gap_pairs()
+                .iter()
+                .filter(|(subject, _)| subject == "leader exit status unresolved at stop")
+                .count(),
+            1,
+            "the drained unproved hook has one explicit final uncertainty"
+        );
+        let adapter = conv.scene.coordinator.adapter();
+        assert!(
+            adapter.leader_exit_pending(sibling),
+            "unproved semantic authority stays fenced"
+        );
+        assert_eq!(adapter.live_id(child.pid()), Some(sibling));
+        assert!(
+            !adapter.record(sibling).unwrap().retired,
+            "no invented tombstone"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &sibling_custody,
+                &adapter.shared_semantic_custody(sibling).unwrap()
+            ),
+            "the exact original custody is retained"
+        );
         // Exec admissions refuse after stop: the old retires, no
         // successor is minted, no retry is scheduled.
         let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 5_700)], 5_800);

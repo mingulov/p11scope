@@ -183,8 +183,9 @@ pub(crate) trait ProcessSource {
     /// from this same pin and return its exe identity for the record.
     /// `Ok(None)` means "not a cold-admittable zombie" (the ordinary
     /// gone refusal applies); `Err` is a NAMED refusal (ambiguity —
-    /// never a pick). The default never cold-admits: scripted sources
-    /// gain no process authority from this hook.
+    /// never a pick — or a raced proof, which stays silent about
+    /// whether the group is dead). The default never cold-admits:
+    /// scripted sources gain no process authority from this hook.
     fn cold_zombie_exe(&self, _pin: &Arc<Self::Pin>) -> Result<Option<ExeIdentity>, String> {
         Ok(None)
     }
@@ -261,7 +262,13 @@ impl ProcessSource for OsProcessSource {
                 Ok(exe)
             }
             Err(ColdRefusal::Ambiguous(reason)) => Err(reason),
-            Err(ColdRefusal::Dead) | Err(ColdRefusal::Raced) => Ok(None),
+            Err(ColdRefusal::Dead) => Ok(None),
+            // A raced proof stays silent about whether the group is
+            // dead, so it keeps its own reason instead of the generic
+            // gone refusal (which would falsely claim an exit).
+            Err(ColdRefusal::Raced) => {
+                Err("admission raced a thread change; retries on the next observation".to_string())
+            }
         }
     }
 
@@ -349,7 +356,9 @@ fn live_survivor_tids(tgid: u32) -> Result<Vec<u32>, ColdRefusal> {
 /// original: the TGID's own task listing selects exactly one non-leader
 /// candidate, then the retained-member proof (tgkill liveness, group
 /// anchor, birth brackets) admits it, then a post-mint task re-list
-/// refuses by the ambiguity name when the live set grew or changed.
+/// refuses by the ambiguity name when the live set grew or changed,
+/// and the original pidfd re-proves the group alive before the mint
+/// lands (a group dead under a passing re-list refuses raced).
 /// No numeric-PID reopen anywhere: the listings and the mint all
 /// derive from `original`, whose pidfd stays non-ready while threads
 /// live. A bare TID never selects here — its own task listing holds no
@@ -425,6 +434,14 @@ pub(crate) fn cold_admit_member_with_relist(
         return Err(ColdRefusal::Ambiguous(format!(
             "thread group {tgid} has more than one live survivor (ambiguous; refusing to pick one)"
         )));
+    }
+    // The re-list passed, but the listing may be stale: an original
+    // whose pidfd no longer reports the group alive means the group
+    // died under the listing, so refuse raced instead of admitting a
+    // dead group. pidfd readiness never flips back, so this closes the
+    // gap; the refused member drops here with its mint slot.
+    if !original.still_the_same() {
+        return Err(ColdRefusal::Raced);
     }
     Ok(ColdMint {
         member,

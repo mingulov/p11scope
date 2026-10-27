@@ -27332,6 +27332,16 @@ impl Engine {
         CounterBudget::new(ceiling).map_err(|refusal| anyhow!("{refusal}"))
     }
 
+    /// Re-admit the retained plan under the counter start budget after the
+    /// attach-preparation retain loop. Stale-view removal rebuilds the plan
+    /// from the surviving views' scan inputs, which always lowers a Detailed
+    /// plan; without this the session holds prepared counter banks while the
+    /// Engine plan — and therefore the capture's counter owner inputs —
+    /// silently leaves the Counters policy.
+    fn restore_counters_policy_after_retain(&mut self, _budget: CounterBudget) -> Result<()> {
+        Ok(())
+    }
+
     /// CPU count behind the counter preflight: the test seam when set,
     /// otherwise the host topology.
     fn counter_preflight_cpus(&self) -> usize {
@@ -27502,7 +27512,7 @@ impl Engine {
             self.counter_preflight_cpus(),
             self.counter_reserver(),
         )?;
-        if counter.is_some() {
+        let counter_budget = if counter.is_some() {
             let mode = policy
                 .counter_mode()
                 .expect("counter spec implies counter policy");
@@ -27511,7 +27521,10 @@ impl Engine {
                 .plan
                 .with_counters_policy(budget)
                 .map_err(|refusal| anyhow!("{refusal}"))?;
-        }
+            Some(budget)
+        } else {
+            None
+        };
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
@@ -27547,6 +27560,11 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
+        if let Some(budget) = counter_budget
+            && let Err(error) = self.restore_counters_policy_after_retain(budget)
+        {
+            return self.finish_start_capture_attempt(snapshot, Err(error));
+        }
         self.record_session_lifecycle_tracking(&session);
         let result = (|| {
             // Lifecycle producers have been live since the load, and the

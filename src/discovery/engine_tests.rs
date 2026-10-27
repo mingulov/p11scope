@@ -24514,6 +24514,67 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
     drop(session);
 }
 
+/// A counter start that meets stale views during attach preparation keeps
+/// its Counters policy. The retain loop rebuilds the plan from the surviving
+/// views' scan inputs, which always lowers a Detailed plan; without a
+/// re-admission under the start budget the session holds prepared counter
+/// banks while the Engine plan — and therefore the capture's counter owner
+/// inputs — silently leaves the Counters policy, and the first collection
+/// read bails with "prepared counter collection unavailable (owner limits
+/// and reserver required)". Zero modules, one stale view before the start.
+#[test]
+fn counter_start_readmits_retained_plan_under_its_budget_after_stale_removal() {
+    let views: Vec<_> = (0..2)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let stale = views[0].id();
+    let mut discovered = lifecycle_discovered(views);
+    // Mirrors `start_session_with` just before the retain loop: the empty
+    // discovery plan re-admitted under the counter endpoint budget.
+    let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+    discovered.plan = discovered.plan.with_counters_policy(budget).unwrap();
+    let checks = Cell::new(0usize);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let session = start_retained_with(
+        &mut discovered,
+        false,
+        |_| {
+            checks.set(checks.get() + 1);
+            (checks.get() == 1)
+                .then_some(stale)
+                .into_iter()
+                .collect()
+        },
+        |_, _| {
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            discovered.plan.admission_policy(),
+            crate::plan::AdmissionPolicy::Detailed
+        ),
+        "stale-view removal rebuilds the retained plan Detailed"
+    );
+    discovered
+        .restore_counters_policy_after_retain(budget)
+        .unwrap();
+    assert!(
+        matches!(
+            discovered.plan.admission_policy(),
+            crate::plan::AdmissionPolicy::Counters(kept) if kept == budget
+        ),
+        "the retained plan is re-admitted under the unchanged start budget"
+    );
+    assert!(
+        discovered.plan.slots.is_empty(),
+        "re-admission keeps the retained slots"
+    );
+    drop(session);
+}
+
 /// H-2. A multi-process capture started a whole new session — every link
 /// detached, the plan rebuilt, BPF reloaded and reattached — whenever any
 /// retained view went stale during the seconds-long load and attach, once per

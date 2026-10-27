@@ -675,21 +675,8 @@ fn interface_identity(
     runtime_view: Option<ProcessViewId>,
 ) -> Option<InterfaceIdentity> {
     let version_word = u64::from(table.version.0) | (u64::from(table.version.1) << 8);
-    // `usable` is the slot count the table charged under: the decoded
-    // record count, bounded by the layout's field count. A mislabelled
-    // table charges its short validated prefix, not its declared layout;
-    // versions the layout decoder refuses (hand-built records only)
-    // keep the stored record counts as fallback.
-    let stored = table.decoded_slot_count();
-    let usable = spans_for(version_word)
-        .map(|(_, spans, _)| {
-            spans
-                .iter()
-                .map(|span| span.fields().len())
-                .sum::<usize>()
-                .min(stored)
-        })
-        .unwrap_or(stored);
+    // Identity follows actual observed positions, independently of metadata.
+    let usable = table.decoded_slot_count();
     let key = match maps.resolve(table.address) {
         Resolved::File {
             device,
@@ -778,6 +765,30 @@ fn stored_table_content_hash(table: &ScannedTable, version_word: u64, usable: us
         }
     }
     hash
+}
+
+fn observed_interface_identity(
+    table: &ScannedTable,
+    name_class: &'static str,
+    name_private: &Option<Vec<u8>>,
+    flags: u64,
+    maps: &MapIndex<'_>,
+    runtime_view: Option<ProcessViewId>,
+    budget: &CaptureWorkBudget,
+) -> Option<InterfaceIdentity> {
+    let mut identity =
+        interface_identity(table, name_class, name_private, flags, maps, runtime_view)?;
+    if let InterfaceTableKey::Runtime(key) = &mut identity.table
+        && let Some(content) = budget.runtime_table_contents.get(&(
+            key.view,
+            key.address,
+            key.version_word,
+            key.usable,
+        ))
+    {
+        key.content = *content;
+    }
+    Some(identity)
 }
 
 /// The cached inspection of one file: exactly what `inspect_file_with_reader`
@@ -893,6 +904,10 @@ pub struct CaptureWorkBudget {
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
     admitted_runtime_tables: BTreeSet<RuntimeTableIdentity>,
+    // One current fingerprint per admitted runtime table position. This
+    // map is bounded by admitted_runtime_tables, including invalid words
+    // without placing their values in diagnostic/output records.
+    runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), u64>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
     interface_records: usize,
@@ -944,6 +959,7 @@ impl CaptureWorkBudget {
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
             admitted_runtime_tables: BTreeSet::new(),
+            runtime_table_contents: BTreeMap::new(),
             inspected_files: BTreeMap::new(),
             elf_export_facts: BTreeMap::new(),
             interface_records: 0,
@@ -2095,9 +2111,9 @@ pub(crate) fn table_evidence_score(
             || table
                 .file_offset
                 .is_some_and(|offset| manifest_offsets.contains(&offset)),
-        // Only a complete walk is compared: a known prefix leaves ordinals
-        // unexamined that could contradict.
-        exports: table.walk == "full" && export_agreement(table, exports).corroborates(),
+        // Corroboration concerns the positions actually observed. A label
+        // suggesting an unavailable extension cannot erase their evidence.
+        exports: table.file_offset.is_some() && export_agreement(table, exports).corroborates(),
         full_walk: table.walk == "full",
     }
 }
@@ -2558,6 +2574,162 @@ pub(crate) fn decode_exact_table(
         .map(|decoded| decoded.map(|(table, _)| table))
 }
 
+/// Decode words acquired through a typed getter or independently corroborated
+/// ordinal source. Header metadata does not determine which words exist. NULL,
+/// unusable and unavailable positions remain distinct; only complete words
+/// supplied by the acquisition are represented here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_observed_words(
+    version: (u8, u8),
+    words: &[u64],
+    limit: usize,
+    address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    runtime_view: Option<ProcessViewId>,
+) -> Result<Option<ScannedTable>, ()> {
+    if limit > 104 || words.len() > limit {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    let mut null_entries = Vec::new();
+    let mut unpinned = Vec::new();
+    for (ordinal, &value) in words.iter().enumerate() {
+        if !budget.charge(1) {
+            return Err(());
+        }
+        let Some(name) = function_name(ordinal) else {
+            return Ok(None);
+        };
+        if value == 0 {
+            null_entries.push(name);
+            continue;
+        }
+        let target = match maps.resolve(value) {
+            Resolved::File {
+                permissions,
+                path: MappedPath::Usable(path),
+                device,
+                inode,
+                file_offset,
+                ..
+            } if inode != 0 && permissions[2] == b'x' => Some((path, device, inode, file_offset)),
+            _ => None,
+        };
+        if let Some((path, device, inode, file_offset)) = target {
+            entries.push(ScannedEntry {
+                name,
+                object: ObjectKey { device, inode },
+                object_path: path.display().to_string(),
+                file_offset,
+            });
+        } else {
+            unpinned.push(Skipped {
+                subject: name.to_string(),
+                reason: "observed function target is not a usable file-backed executable address"
+                    .to_string(),
+            });
+        }
+    }
+    let version_word = u64::from(version.0) | (u64::from(version.1) << 8);
+    let usable = words.len();
+    let file_owner = match maps.resolve(address) {
+        Resolved::File {
+            device,
+            inode,
+            file_offset,
+            ..
+        } if inode != 0 => Some((device, inode, file_offset)),
+        _ => None,
+    };
+    let mut content = 0xcbf2_9ce4_8422_2325u64;
+    for word in [version_word, usable as u64]
+        .into_iter()
+        .chain(words.iter().copied())
+    {
+        for byte in word.to_le_bytes() {
+            content = (content ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let file_identity = file_owner.map(|(device, inode, file_offset)| TableIdentity {
+        device,
+        inode,
+        file_offset,
+        version_word,
+        usable,
+    });
+    let runtime_identity = if file_identity.is_none() {
+        runtime_view.map(|view| RuntimeTableIdentity {
+            view,
+            address,
+            version_word,
+            usable,
+            content,
+        })
+    } else {
+        None
+    };
+    let repeat = file_identity
+        .as_ref()
+        .is_some_and(|id| budget.table_already_admitted(id))
+        || runtime_identity
+            .as_ref()
+            .is_some_and(|id| budget.runtime_table_already_admitted(id));
+    if !budget.admit_decoded_table(usable) || (!repeat && !budget.admit_table(usable)) {
+        return Err(());
+    }
+    if !repeat {
+        if let Some(id) = file_identity
+            && !budget.note_table_admitted(id)
+        {
+            return Err(());
+        }
+        if let Some(id) = runtime_identity
+            && !budget.note_runtime_table_admitted(id)
+        {
+            return Err(());
+        }
+    }
+    if let Some(id) = runtime_identity {
+        budget.runtime_table_contents.insert(
+            (id.view, id.address, id.version_word, id.usable),
+            id.content,
+        );
+    }
+    Ok(Some(ScannedTable {
+        version,
+        walk: if usable == limit && unpinned.is_empty() {
+            "full"
+        } else {
+            "known_prefix"
+        },
+        entries,
+        null_entries,
+        unpinned,
+        address,
+        file_offset: file_owner.map(|(_, _, offset)| offset),
+        live_return: false,
+        manifest_supported: false,
+    }))
+}
+
+/// Only validated targets become dependencies. Invalid observed words remain
+/// in the table's partial diagnostics and private content fingerprint.
+pub(crate) fn decoded_table_addresses(
+    snapshot: &[u8],
+    layout: LinuxLayout,
+    table: &ScannedTable,
+) -> Option<Vec<u64>> {
+    table
+        .entries
+        .iter()
+        .map(|entry| {
+            let ordinal = usize::from(standard_ordinal(entry.name)?);
+            read_function_pointer(snapshot, layout, ordinal).ok()
+        })
+        .collect()
+}
+
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
 /// The second return carries the one bounded exhaustion reason, if decoding stopped.
 #[cfg(test)]
@@ -2583,23 +2755,58 @@ fn detect_tables_for_layout(
         base_address,
         maps,
         budget,
+        None,
         crate::attach::monotonic_ns,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
     snapshot: &[u8],
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
+    export_evidence: Option<&ObjectExports<'_>>,
     mut now: F,
 ) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    let mut anchors: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    if let Some(exports) = export_evidence {
+        if let Err(reason) = budget.spend(maps.entries().len() as u64) {
+            return (Vec::new(), vec![reason.to_string()]);
+        }
+        let executable: Vec<_> = maps
+            .entries()
+            .iter()
+            .filter(|mapping| {
+                mapping.device == exports.object.device
+                    && mapping.inode == exports.object.inode
+                    && mapping.permissions[2] == b'x'
+            })
+            .collect();
+        for (name, file_offset) in exports.symbols {
+            let Some(ordinal) = standard_ordinal(name).map(usize::from) else {
+                continue;
+            };
+            for mapping in &executable {
+                if let Some(address) = file_offset
+                    .checked_sub(mapping.file_offset)
+                    .and_then(|delta| mapping.start.checked_add(delta))
+                    .filter(|address| *address < mapping.end)
+                {
+                    anchors.entry(address).or_default().push(ordinal);
+                }
+            }
+        }
+    }
+    // At most one current width for each accepted offset; decoded-table
+    // budgets bound both this map and the existing result collection.
+    let mut seen = BTreeMap::<usize, usize>::new();
     let mut offset = 0usize;
     let width = layout.word_bytes();
-    while offset + width <= snapshot.len() {
+    'scan: while offset + width <= snapshot.len() {
         if (offset / width).is_multiple_of(4096)
             && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
@@ -2620,7 +2827,10 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             break;
         }
         match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
-            Ok(Some((table, len))) => found.push((offset, len, table)),
+            Ok(Some((table, len))) => {
+                seen.insert(offset, table.decoded_slot_count());
+                found.push((offset, len, table));
+            }
             // Owner-approved 2026-09-27: F-14's version skip is retired —
             // future minors walk as known prefixes, and anything else the
             // gate rejects (unknown major, upper bits set) is data.
@@ -2632,6 +2842,74 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                     skipped.push(reason);
                 }
                 break;
+            }
+        }
+        // An own exported function at its actual catalog position anchors
+        // partial recovery. Merely being in a provider mapping (or being
+        // all-zero data) is not such a witness. This is a single pass over
+        // pointer words, rather than rewalking 104 words at every offset.
+        let value = read_word_le(snapshot, layout, offset).expect("one complete word");
+        if let Some(ordinals) = anchors.get(&value) {
+            for &ordinal in ordinals {
+                if !budget.charge(1) {
+                    if let Some(reason) = budget.take_scan_stop_reason() {
+                        skipped.push(reason.into());
+                    }
+                    break 'scan;
+                }
+                let Some(candidate) = offset.checked_sub(width * (ordinal + 1)) else {
+                    continue;
+                };
+                if seen.get(&candidate).is_some_and(|count| *count > ordinal) {
+                    continue;
+                }
+                let header =
+                    read_word_le(snapshot, layout, candidate).expect("the earlier complete header");
+                let version = (header as u8, (header >> 8) as u8);
+                // Extended positions need their own export witness. A legacy
+                // label/common extent never turns following data into 3.x APIs.
+                if ordinal >= 68 && version.0 != 3 {
+                    continue;
+                }
+                let limit = if ordinal < 68 {
+                    68
+                } else if ordinal < 92 {
+                    92
+                } else {
+                    104
+                };
+                let count = ((snapshot.len() - candidate - width) / width).min(limit);
+                let words: Vec<_> = (0..count)
+                    .map(|slot| {
+                        read_function_pointer(&snapshot[candidate..], layout, slot)
+                            .expect("complete observed word")
+                    })
+                    .collect();
+                let Some(address) = base_address.checked_add(candidate as u64) else {
+                    continue;
+                };
+                match decode_observed_words(version, &words, limit, address, maps, budget, None) {
+                    Ok(Some(mut table)) => {
+                        // Independent exports authorize names, not unobserved
+                        // extension completeness or interface-selection claims.
+                        table.walk = "known_prefix";
+                        seen.insert(candidate, count);
+                        found.push((
+                            candidate,
+                            table_bytes(layout, count).expect("bounded catalog"),
+                            table,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        if let Some(reason) = budget.take_scan_stop_reason() {
+                            skipped.push(reason.into());
+                        } else if let Some(reason) = budget.table_exhaustion_reason() {
+                            skipped.push(reason);
+                        }
+                        break 'scan;
+                    }
+                }
             }
         }
         offset += width;
@@ -2807,13 +3085,14 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             // only a new distinct interface consumes a lifetime record. A
             // refused triple is skipped — not fatal — so later repeats still
             // decode; the refusal counter keeps the scan incomplete.
-            let identity = interface_identity(
+            let identity = observed_interface_identity(
                 &tables[table],
                 name_class,
                 &name_private,
                 flags,
                 maps,
                 runtime_view,
+                budget,
             );
             let repeat = identity
                 .as_ref()
@@ -3902,7 +4181,7 @@ impl<'a> ScanDependencies<'a> {
                 if mapping.permissions[0] != b'r' || end > mapping.end {
                     return None;
                 }
-                let addresses = exact_table_addresses_n(bytes, layout, slots)?;
+                let addresses = decoded_table_addresses(bytes, layout, table)?;
                 for address in addresses {
                     budget.spend(1).ok()?;
                     let target = maps.containing(address)?;
@@ -4395,7 +4674,10 @@ fn scan_view_examined_mode(
         (None, None)
     };
 
-    let wanted = request.hooks.names();
+    let mut wanted = request.hooks.names();
+    wanted.extend(standard_function_names());
+    wanted.sort_unstable();
+    wanted.dedup();
     let hint_ids: Vec<Option<(u64, u64)>> =
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
@@ -4554,7 +4836,12 @@ fn scan_view_examined_mode(
             }
         };
         let layout = target_layout(abi);
-        if request.hints.is_empty() && exports.is_empty() {
+        let hook_exports: Vec<_> = exports
+            .iter()
+            .filter(|(name, _)| request.hooks.abi(name).is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if request.hints.is_empty() && hook_exports.is_empty() {
             // Opened, identified, and read: examined, and not a provider.
             if let Some(held) = held {
                 examined.push(ExaminedObject {
@@ -4587,7 +4874,7 @@ fn scan_view_examined_mode(
             double_loaded: duplicate_exec_coverage(&group),
             path,
             decoder_abi: Some(abi),
-            exports: exports.into_iter().map(|(name, _)| name).collect(),
+            exports: hook_exports,
             tables: Vec::new(),
             interfaces: Vec::new(),
         };
@@ -4641,8 +4928,19 @@ fn scan_view_examined_mode(
             }
         }
         for (base, snapshot) in &snapshots {
-            let (tables, exhausted) =
-                detect_tables_for_layout(layout, snapshot, *base, &map_index, budget);
+            let evidence = ObjectExports {
+                object: key,
+                symbols: &exports,
+            };
+            let (tables, exhausted) = detect_tables_with_clock(
+                layout,
+                snapshot,
+                *base,
+                &map_index,
+                budget,
+                Some(&evidence),
+                crate::attach::monotonic_ns,
+            );
             dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
             module.tables.extend(tables);
             skipped.extend(
@@ -6399,6 +6697,44 @@ mod tests {
     }
 
     #[test]
+    fn observed_runtime_identity_distinguishes_invalid_words_from_null_and_each_other() {
+        let maps = parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n6000-7000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessViewId(77);
+        let mut words = vec![0x1500u64; 68];
+        for invalid in [1u64, 2, 0] {
+            words[5] = invalid;
+            let table = decode_observed_words(
+                (7, 231),
+                &words,
+                68,
+                0x6000,
+                &index,
+                &mut budget,
+                Some(view),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(table.unpinned.len(), usize::from(invalid != 0));
+            assert_eq!(table.null_entries.len(), usize::from(invalid == 0));
+            let identity =
+                observed_interface_identity(&table, "null", &None, 0, &index, Some(view), &budget)
+                    .unwrap();
+            let InterfaceTableKey::Runtime(key) = identity.table else {
+                panic!("anonymous table");
+            };
+            assert!(budget.runtime_table_already_admitted(&key));
+        }
+        assert_eq!(budget.admitted_runtime_tables.len(), 3);
+        assert_eq!(budget.runtime_table_contents.len(), 1);
+        assert_eq!(budget.table_candidates_count(), 3);
+    }
+
+    #[test]
     fn retain_tables_ignores_unmapped_tail_words_beyond_the_decoded_prefix() {
         let maps = mislabelled_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();
@@ -7837,6 +8173,7 @@ mod tests {
             0x7000,
             &map_index,
             &mut budget,
+            None,
             || {
                 polls += 1;
                 Some(if polls == 1 { 0 } else { 10 })

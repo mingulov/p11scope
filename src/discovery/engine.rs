@@ -33,10 +33,11 @@ use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
     ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
-    decode_exact_table, exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes,
-    export_agreement, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
-    scan_skip_truncates, spans_for, table_evidence_score, table_linkage, target_layout,
+    decode_exact_table, decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
+    exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
+    read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
+    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score, table_linkage,
+    target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -7970,6 +7971,7 @@ fn name_class(class: u8) -> &'static str {
 enum HeapLowerOutcome {
     Admitted(ScannedModule),
     Refused(&'static str),
+    Unowned(ScannedTable),
 }
 
 /// Why one bounded exact-address validation failed. The selection path
@@ -8082,7 +8084,7 @@ fn lower_publication_record(
     let Some(expected_abi) = export_abi(record.kind) else {
         return Err("non-export discovery record reached export lowering".into());
     };
-    let (hook_name, abi) = match record.kind {
+    let (_hook_name, abi) = match record.kind {
         DISCOVERY_KIND_INTERFACE_RETURN => {
             gi_hook.ok_or("selection record reached export lowering without its bound hook")?
         }
@@ -8099,163 +8101,19 @@ fn lower_publication_record(
     if abi != expected_abi {
         return Err("export record kind disagrees with its private hook ABI".into());
     }
-    if record.usable_n == 0 {
-        return Ok(None);
-    }
-    if !view.still_the_same() {
-        return Err("process generation changed before export lowering".into());
-    }
-    // The live path's one clock poll per record: nothing between the bounded
-    // snapshot read and this decode polls the batch deadline, and a sticky stop
-    // another consumer of the one budget left must refuse the record here — the
-    // caller publishes either as live loss. Admission below refuses on the
-    // sticky stop too; a decode ceiling stays the count-only outcome it was.
-    if let Some(reason) = budget.stopped_now() {
-        return Err(reason.into());
-    }
-
-    budget.spend(1)?;
-    let Resolved::File {
-        path: MappedPath::Usable(owner_path),
-        device: owner_device,
-        inode: owner_inode,
-        file_offset: table_file_offset,
-        permissions: owner_permissions,
-        ..
-    } = maps.resolve(record.table_ptr)
-    else {
-        return Ok(None);
-    };
-    if owner_inode == 0 || owner_permissions[0] != b'r' {
-        return Ok(None);
-    }
-
-    let Some((prefix_major, prefix_minor)) = record_prefix_version(record) else {
-        return Ok(None);
-    };
-    let word = u64::from(prefix_major) | (u64::from(prefix_minor) << 8);
-    let Some((version, spans, walk)) = spans_for(word) else {
-        return Ok(None);
-    };
-    let usable = usize::from(record.usable_n);
-    if usable > spans.iter().map(|span| span.fields().len()).sum() {
-        return Ok(None);
-    }
-    // Byte-identical repeats skip the table charge but still decode below;
-    // the interface-record charge is per record, not per table, and stays.
-    let identity = TableIdentity {
-        device: owner_device,
-        inode: owner_inode,
-        file_offset: table_file_offset,
-        version_word: word,
-        usable,
-    };
-    if !budget.table_already_admitted(&identity) {
-        if !budget.admit_table(usable) {
-            return Ok(None);
-        }
-        budget.note_table_admitted(identity);
-    }
-    if matches!(
-        record.kind,
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
-    ) && !budget.admit_interface()
+    if !matches!(maps.resolve(record.table_ptr), Resolved::File { permissions, inode, path: MappedPath::Usable(_), .. } if inode != 0 && permissions[0] == b'r')
     {
         return Ok(None);
     }
-
-    let mut entries = Vec::new();
-    let mut null_entries = Vec::new();
-    for (field, pointer) in spans
-        .iter()
-        .flat_map(|span| span.fields())
-        .take(usable)
-        .zip(record.pointers)
-    {
-        if pointer == 0 {
-            null_entries.push(field.name);
-            continue;
+    match lower_heap_publication_record(view, maps, hooks, record, &[], budget, gi_hook)? {
+        HeapLowerOutcome::Admitted(mut module) => {
+            if record.kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN && record.usable_n > 0 {
+                module.interfaces[0].table = Some(0);
+            }
+            Ok(Some(module))
         }
-        budget.spend(1)?;
-        let Resolved::File {
-            path: MappedPath::Usable(path),
-            file_offset,
-            device,
-            inode,
-            permissions,
-            ..
-        } = maps.resolve(pointer)
-        else {
-            return Ok(None);
-        };
-        if inode == 0 || permissions[2] != b'x' {
-            return Ok(None);
-        }
-        entries.push(ScannedEntry {
-            name: field.name,
-            object: ObjectKey { device, inode },
-            object_path: path.display().to_string(),
-            file_offset,
-        });
+        HeapLowerOutcome::Refused(_) | HeapLowerOutcome::Unowned(_) => Ok(None),
     }
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    let interfaces = match record.kind {
-        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => vec![ScannedInterface {
-            index: usize::from(record.interface_index),
-            name_class: name_class(record.name_class),
-            name_lossy: None,
-            name_private: None,
-            flags: record.interface_flags,
-            table: Some(0),
-        }],
-        DISCOVERY_KIND_INTERFACE_RETURN => vec![ScannedInterface {
-            index: usize::from(record.interface_index),
-            name_class: name_class(record.name_class),
-            name_lossy: None,
-            name_private: None,
-            flags: record.interface_flags,
-            // Unlinked (see the heap arm below): the echoed index is the
-            // request version class, not a list position.
-            table: None,
-        }],
-        _ => Vec::new(),
-    };
-    let module = ScannedModule {
-        mapped_identity: None,
-        double_loaded: false,
-        view: view.id(),
-        mount_namespace: view.mount_namespace(),
-        key: ObjectKey {
-            device: owner_device,
-            inode: owner_inode,
-        },
-        path: owner_path.display().to_string(),
-        decoder_abi: None,
-        exports: vec![hook_name.to_string()],
-        tables: vec![ScannedTable {
-            version,
-            walk,
-            entries,
-            null_entries,
-            unpinned: Vec::new(),
-            address: record.table_ptr,
-            file_offset: Some(table_file_offset),
-            // The provider returned this table through a live export: its
-            // ordinal names carry publication evidence, unlike heuristic decode.
-            live_return: true,
-            // Manifest agreement is derived per rebuild by fallback binding,
-            // never at lowering time.
-            manifest_supported: false,
-        }],
-        interfaces,
-    };
-    if !view.still_the_same() {
-        return Err("process generation changed during export lowering".into());
-    }
-    Ok(Some(module))
 }
 
 /// Lowers a published table the file-backed prefix path could not own:
@@ -8323,14 +8181,7 @@ fn lower_heap_publication_record(
     let mut refusals = Vec::new();
     let mut validated = None;
     for layout in heap_table_layouts(hook_name, view.id(), modules) {
-        match Engine::read_exact_table_bracketed(
-            view,
-            record.table_ptr,
-            layout,
-            index_a,
-            budget,
-            false,
-        ) {
+        match Engine::read_acquired_table_bracketed(view, layout, index_a, budget, record) {
             Ok(valid) => {
                 validated = Some((layout, valid));
                 break;
@@ -8338,7 +8189,7 @@ fn lower_heap_publication_record(
             Err(refusal) => refusals.push(refusal),
         }
     }
-    let Some((layout, (_, mut table, bytes))) = validated else {
+    let Some((layout, (mut table, bytes))) = validated else {
         // The most actionable refusal first: a capture stop, then
         // instability (the world moved mid-read), then undecodability.
         let refusal = refusals
@@ -8369,12 +8220,12 @@ fn lower_heap_publication_record(
     // under us — refuse, never blend.
     let usable = usize::from(record.usable_n);
     if usable > 0 {
-        let Some(prefix_version) = record_prefix_version(record) else {
-            return Ok(HeapLowerOutcome::Refused(
-                "a published selection result carried a table prefix with an unknown version class",
-            ));
-        };
-        if prefix_version != table.version {
+        let header_unavailable =
+            record.status_flags & p11scope_ebpf_common::DISCOVERY_STATUS_READ_FAILURE != 0
+                && record.completed_prefix == record.pointers_attempted;
+        if !header_unavailable
+            && record_prefix_version(record).is_some_and(|version| version != table.version)
+        {
             return Ok(HeapLowerOutcome::Refused(
                 "a published table changed between the probe capture and validation",
             ));
@@ -8422,19 +8273,12 @@ fn lower_heap_publication_record(
             match resolve_heap_table_owner(hook_name, view.id(), &table.entries, modules) {
                 Some(owner) => owner,
                 None => {
-                    return Ok(HeapLowerOutcome::Refused(
-                        "a published heap table could not be attributed to exactly one provider",
-                    ));
+                    return Ok(HeapLowerOutcome::Unowned(table));
                 }
             }
         }
     };
 
-    // The provider returned this table through a live export: its ordinal
-    // names carry publication evidence, unlike heuristic decode. Manifest
-    // agreement is derived per rebuild by fallback binding, never here.
-    table.live_return = true;
-    table.manifest_supported = false;
     if matches!(
         record.kind,
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
@@ -8445,6 +8289,27 @@ fn lower_heap_publication_record(
         ));
     }
 
+    let module = publication_module(view, record, hook_name, key, path, table);
+    if !view.still_the_same() {
+        return Err("process generation changed during export lowering".into());
+    }
+    Ok(HeapLowerOutcome::Admitted(module))
+}
+
+fn publication_module(
+    view: &ProcessView,
+    record: &DiscoveryRecord,
+    hook_name: &str,
+    key: ObjectKey,
+    path: String,
+    mut table: ScannedTable,
+) -> ScannedModule {
+    // The provider returned this table through a live export: its ordinal
+    // names carry publication evidence, unlike heuristic decode. Manifest
+    // agreement is derived per rebuild by fallback binding, never here.
+    table.live_return = record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN
+        || record.name_class == DISCOVERY_NAME_EXACT_STANDARD;
+    table.manifest_supported = false;
     let interfaces = match record.kind {
         DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
             vec![ScannedInterface {
@@ -8459,7 +8324,7 @@ fn lower_heap_publication_record(
         }
         _ => Vec::new(),
     };
-    let module = ScannedModule {
+    ScannedModule {
         mapped_identity: None,
         double_loaded: false,
         view: view.id(),
@@ -8470,11 +8335,7 @@ fn lower_heap_publication_record(
         exports: vec![hook_name.to_string()],
         tables: vec![table],
         interfaces,
-    };
-    if !view.still_the_same() {
-        return Err("process generation changed during export lowering".into());
     }
-    Ok(HeapLowerOutcome::Admitted(module))
 }
 
 /// Whether `module` has no counterpart among already-retained modules:
@@ -14571,6 +14432,71 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_unowned_publication(
+        &mut self,
+        table: ScannedTable,
+        position: usize,
+        record: &DiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        subject: &str,
+    ) -> Result<DiscoveryRecordOutcome> {
+        self.note_unowned_publication(subject, &table);
+        let mut targets = BTreeMap::<ObjectKey, String>::new();
+        for entry in &table.entries {
+            targets
+                .entry(entry.object)
+                .or_insert_with(|| entry.object_path.clone());
+        }
+        let mut changed = false;
+        let mut complete = true;
+        for (key, path) in targets {
+            let mut observed = table.clone();
+            observed.entries.retain(|entry| entry.object == key);
+            observed.unpinned.extend(table.entries.iter().filter(|entry| entry.object != key).map(|entry| Skipped {
+                subject: entry.name.to_string(),
+                reason: "target belongs to another observed code object; provider ownership is uncertain".to_string(),
+            }));
+            observed.file_offset = None;
+            observed.live_return = false;
+            observed.manifest_supported = false;
+            observed.walk = "known_prefix";
+            let view = &self.views[position];
+            let module = ScannedModule {
+                mapped_identity: None,
+                double_loaded: false,
+                view: view.id(),
+                mount_namespace: view.mount_namespace(),
+                key,
+                path,
+                decoder_abi: None,
+                exports: Vec::new(),
+                tables: vec![observed],
+                interfaces: Vec::new(),
+            };
+            let outcome = self.apply_lowered_module(
+                module,
+                position,
+                record.hook_ts_ns,
+                session,
+                additions_allowed,
+                pending_views,
+            )?;
+            changed |= outcome.changed();
+            complete &= outcome.required_complete();
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, complete))
+    }
+
+    fn note_unowned_publication(&mut self, subject: &str, table: &ScannedTable) {
+        self.mark_partial(subject, &format!(
+            "acquired table observation retained with uncertain provider ownership: version {}.{}, {} observed positions, {} NULL, {} usable targets, {} unusable targets",
+            table.version.0, table.version.1, table.decoded_slot_count(), table.null_entries.len(), table.entries.len(), table.unpinned.len(),
+        ));
+    }
+
     fn process_export_record(
         &mut self,
         record: &DiscoveryRecord,
@@ -14619,6 +14545,17 @@ impl Engine {
                 ) {
                     Err(error) => return Err(anyhow!(error)),
                     Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Unowned(table)) => {
+                        return self.apply_unowned_publication(
+                            table,
+                            position,
+                            record,
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            "live export discovery",
+                        );
+                    }
                     Ok(HeapLowerOutcome::Refused(reason)) => {
                         self.mark_live_loss("live export discovery", reason);
                         return Ok(DiscoveryRecordOutcome::Rejected(
@@ -14716,14 +14653,22 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
-        let (binding_view, hook_name) = self
+        let (binding_view, hook_name, binding_owner) = self
             .selection_bindings
             .get(&record.binding_id)
             .and_then(|binding| {
                 self.hooks
                     .by_id(binding.hook_id)
                     .filter(|(_, abi)| *abi == HookAbi::Interface)
-                    .map(|(name, _)| (binding.view, name.to_string()))
+                    .map(|(name, _)| {
+                        (
+                            binding.view,
+                            name.to_string(),
+                            self.pinned
+                                .summary(binding.object)
+                                .map(|owner| (owner.key, owner.path.to_string())),
+                        )
+                    })
             })
             .ok_or_else(|| anyhow!("selection lowering lost its attributed binding"))?;
         let pid = (record.pid_tgid >> 32) as u32;
@@ -14766,6 +14711,24 @@ impl Engine {
                 ) {
                     Err(error) => return Err(anyhow!(error)),
                     Ok(HeapLowerOutcome::Admitted(module)) => module,
+                    Ok(HeapLowerOutcome::Unowned(table)) => {
+                        if let Some((key, path)) = binding_owner
+                            .clone()
+                            .filter(|_| self.pinned.check_unchanged().unwrap_or(false))
+                        {
+                            publication_module(view, record, &hook_name, key, path, table)
+                        } else {
+                            return self.apply_unowned_publication(
+                                table,
+                                position,
+                                record,
+                                session,
+                                additions_allowed,
+                                pending_views,
+                                "live interface selection",
+                            );
+                        }
+                    }
                     Ok(HeapLowerOutcome::Refused(reason)) => {
                         self.mark_live_loss("live interface selection", reason);
                         return Ok(DiscoveryRecordOutcome::applied(false, true));
@@ -16188,6 +16151,120 @@ impl Engine {
     /// is contiguity-checked mapping by mapping, fully decoded (the
     /// validated entries stay the content anchor), and every touched
     /// mapping is stability-bracketed — same contract, wider extent.
+    fn read_acquired_table_bracketed(
+        view: &ProcessView,
+        layout: LinuxLayout,
+        index_a: &MapIndex,
+        budget: &mut CaptureWorkBudget,
+        record: &DiscoveryRecord,
+    ) -> std::result::Result<(ScannedTable, Vec<u8>), ExactReadRefusal> {
+        let address = record.table_ptr;
+        let mem = view
+            .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
+            .map_err(|_| ExactReadRefusal::Unstable)?
+            .map_err(|_| ExactReadRefusal::Unreadable)?;
+        let width = layout.word_bytes();
+        let mut span = BTreeMap::<u64, MapEntry>::new();
+        if let Some(mapping) = index_a.containing(address) {
+            span.insert(mapping.start, mapping.clone());
+        }
+        let mut operation_bytes = 0u64;
+        let mut read_word =
+            |at: u64, len: usize| -> std::result::Result<Option<[u8; 8]>, ExactReadRefusal> {
+                if budget.check_deadline_now().is_some() {
+                    return Err(ExactReadRefusal::Budget);
+                }
+                let Some(end) = at.checked_add(len as u64) else {
+                    return Ok(None);
+                };
+                let mut cursor = at;
+                while cursor < end {
+                    let Some(mapping) = index_a.containing(cursor) else {
+                        return Ok(None);
+                    };
+                    if mapping.permissions[0] != b'r' {
+                        return Ok(None);
+                    }
+                    span.insert(mapping.start, mapping.clone());
+                    cursor = end.min(mapping.end);
+                }
+                if budget.allowed_io(operation_bytes, len) < len {
+                    return Err(ExactReadRefusal::Budget);
+                }
+                let mut bytes = [0u8; 8];
+                match mem.read_at(&mut bytes[..len], at) {
+                    Ok(read) => {
+                        budget.record_io(read);
+                        operation_bytes = operation_bytes.saturating_add(read as u64);
+                        Ok((read == len).then_some(bytes))
+                    }
+                    Err(_) => Ok(None),
+                }
+            };
+        // Only CK_VERSION's two bytes are metadata. Padding is never an
+        // acceptance condition or an excuse to read more function positions.
+        let header = read_word(address, 2)?;
+        let version = header
+            .map(|bytes| (bytes[0], bytes[1]))
+            .or_else(|| record_prefix_version(record))
+            .unwrap_or((0, 0));
+        let hinted =
+            p11scope_ebpf_common::discovery_table_slots(record.kind, version.0, version.1) as usize;
+        let limit = if record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+            68
+        } else {
+            hinted.max(usize::from(record.completed_prefix)).min(104)
+        };
+        let mut words = Vec::with_capacity(limit);
+        for ordinal in 0..limit {
+            let at = address
+                .checked_add(((ordinal + 1) * width) as u64)
+                .ok_or(ExactReadRefusal::Undecodable)?;
+            let Some(bytes) = read_word(at, width)? else {
+                break;
+            };
+            words.push(u64::from_le_bytes(bytes));
+        }
+        // The normalized header is metadata storage, not fabricated pointer
+        // input: every appended function word was actually read above.
+        let mut bytes = vec![0u8; width];
+        bytes[0] = version.0;
+        bytes[1] = version.1;
+        for word in &words {
+            bytes.extend_from_slice(&word.to_le_bytes()[..width]);
+        }
+        let table = decode_observed_words(
+            version,
+            &words,
+            limit,
+            address,
+            index_a,
+            budget,
+            Some(view.id()),
+        )
+        .map_err(|_| ExactReadRefusal::Budget)?
+        .ok_or(ExactReadRefusal::Undecodable)?;
+        for target in
+            decoded_table_addresses(&bytes, layout, &table).ok_or(ExactReadRefusal::Undecodable)?
+        {
+            let mapping = index_a
+                .containing(target)
+                .ok_or(ExactReadRefusal::Unstable)?;
+            span.insert(mapping.start, mapping.clone());
+        }
+        let maps_b = Self::read_maps(view, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        let index_b =
+            index_maps_or_refuse(&maps_b, budget).map_err(|_| ExactReadRefusal::Unstable)?;
+        if !view.still_the_same()
+            || !span
+                .values()
+                .all(|mapping| index_b.containing(mapping.start) == Some(mapping))
+        {
+            return Err(ExactReadRefusal::Unstable);
+        }
+        Ok((table, bytes))
+    }
+
     fn read_exact_table_bracketed(
         view: &ProcessView,
         address: u64,

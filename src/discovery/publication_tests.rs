@@ -676,10 +676,15 @@ fn gfl_record(pid: u32, table: &TablePrint, hooks: &HookRegistry) -> DiscoveryRe
     record.version_minor = table.minor;
     record.symbol_id = hooks.id("C_GetFunctionList").expect("builtin hook id");
     record.name_class = DISCOVERY_NAME_NA;
-    for (slot, (addr, _)) in record.pointers.iter_mut().zip(table.entries.iter()) {
+    for (slot, (addr, _)) in record
+        .pointers
+        .iter_mut()
+        .take(68)
+        .zip(table.entries.iter())
+    {
         *slot = *addr;
     }
-    record.pointers_attempted = u8::try_from(table.nentry).expect("nentry fits");
+    record.pointers_attempted = u8::try_from(table.nentry.min(68)).expect("legacy bound fits");
     record.completed_prefix = record.pointers_attempted;
     record.usable_n = record.pointers_attempted;
     assert!(
@@ -4482,4 +4487,148 @@ fn f_e21_gi_public_output_carries_no_raw_pointers() {
             "entry {addr:x} stays out of the slot inventory"
         );
     }
+}
+
+#[test]
+fn ambiguous_factory_ownership_keeps_verified_code_targets_count_only() {
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-compatibility.c");
+    let libraries: Vec<_> = ["first.so", "second.so"]
+        .iter()
+        .map(|name| {
+            let library = dir.path().join(name);
+            assert!(
+                Command::new("cc")
+                    .args([
+                        "-shared",
+                        "-fPIC",
+                        "-std=c11",
+                        "-O0",
+                        "-DCOMPAT_EMPTY_FACTORY"
+                    ])
+                    .arg(&fixture)
+                    .arg("-o")
+                    .arg(&library)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            library
+        })
+        .collect();
+    let source = dir.path().join("loader.c");
+    std::fs::write(
+        &source,
+        r#"
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *a = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    void *b = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    if (!a || !b) return 1;
+    uint64_t *words = calloc(69, sizeof(uint64_t));
+    if (!words) return 2;
+    words[0] = 0x2802;
+    words[1] = (uintptr_t)dlsym(a, "C_Initialize");
+    words[68] = (uintptr_t)dlsym(b, "C_WaitForSlotEvent");
+    void (*set)(void *) = dlsym(a, "compatibility_set_table");
+    unsigned long (*get)(void **) = dlsym(a, "C_GetFunctionList");
+    if (!set || !get || !words[1] || !words[68]) return 3;
+    set(words);
+    void *table = 0;
+    if (get(&table) || table != words) return 4;
+    printf("%p %p %p\n", table, (void *)words[1], (void *)words[68]);
+    fflush(stdout);
+    char byte;
+    (void)read(STDIN_FILENO, &byte, 1);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .args(&libraries)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let values: Vec<_> = line.split_whitespace().map(parse_hex_addr).collect();
+    assert_eq!(values.len(), 3);
+    let pid = child.0.id();
+    let maps = MapLite::snapshot(pid);
+    let mut table = TablePrint {
+        index: 0,
+        addr: values[0],
+        major: 2,
+        minor: 40,
+        nentry: 68,
+        entries: vec![(0, String::new()); 68],
+    };
+    table.entries[0].0 = values[1];
+    table.entries[67].0 = values[2];
+    let mut engine = engine_over_pids(&[pid]);
+    let expected: std::collections::BTreeSet<_> = values[1..]
+        .iter()
+        .map(|address| {
+            let (path, offset, _) = MapLite::file_target(&maps, *address);
+            (path, offset)
+        })
+        .collect();
+    assert_eq!(expected.len(), 2, "two real target-code objects");
+    drain_records(
+        &mut engine,
+        vec![gfl_record(pid, &table, &HookRegistry::builtin())],
+    );
+    assert!(expected.is_subset(&slot_targets(&engine)));
+    assert_count_only(&engine);
+    for slot in &engine.plan().slots {
+        assert!(
+            slot.names.iter().all(|name| name == "unknown"),
+            "uncertain provider/API names stay unknown"
+        );
+    }
+    let observations: Vec<_> = engine
+        .modules
+        .iter()
+        .flat_map(|module| &module.scanned.tables)
+        .filter(|observed| observed.address == values[0])
+        .collect();
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|observed| !observed.live_return
+        && !observed.manifest_supported
+        && observed.file_offset.is_none()));
+    assert!(
+        skip_reasons(&engine)
+            .iter()
+            .any(|(_, reason)| reason.contains("uncertain provider ownership"))
+    );
 }

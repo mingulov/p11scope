@@ -52241,6 +52241,10 @@ fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
     ));
 
     let mut overlong = record;
+    overlong.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+    overlong.symbol_id = hooks.id("C_GetInterfaceList").unwrap();
+    overlong.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+    overlong.announced_count = 1;
     overlong.pointers_attempted = 104;
     overlong.completed_prefix = 104;
     overlong.usable_n = 104;
@@ -52291,6 +52295,7 @@ fn compatibility_lower_self(record: &DiscoveryRecord) -> ScannedModule {
     {
         HeapLowerOutcome::Admitted(module) => module,
         HeapLowerOutcome::Refused(reason) => panic!("acquired table was discarded: {reason}"),
+        HeapLowerOutcome::Unowned(_) => panic!("the actual file owner is available"),
     }
 }
 
@@ -52519,4 +52524,126 @@ int main(int argc, char **argv) {
     assert_eq!(table.null_entries.len(), 65);
     assert_eq!(table.walk, "known_prefix");
     assert!(!table.live_return && !table.manifest_supported);
+}
+
+#[test]
+fn acquired_interfaces_keep_the_observed_extent_across_version_labels() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    for word in [0x0003u64, 0x0103, 0x0203] {
+        for physical in [68usize, 92, 104] {
+            let address = fixture.write_table(word, physical);
+            let mut record = compatibility_publication_record(address, word, 68);
+            record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+            record.symbol_id = HookRegistry::builtin().id("C_GetInterfaceList").unwrap();
+            record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+            record.announced_count = 1;
+            record.pointers_attempted = physical as u8;
+            record.completed_prefix = physical as u8;
+            record.usable_n = physical as u8;
+            record.pointers[..physical].copy_from_slice(unsafe {
+                std::slice::from_raw_parts((address as *const u64).add(1), physical)
+            });
+            assert!(valid_discovery_record(&record));
+            let module = compatibility_lower_self(&record);
+            assert_eq!(
+                module.tables[0].entries.len(),
+                physical,
+                "{word:#x}/{physical}"
+            );
+            assert_eq!(module.tables[0].decoded_slot_count(), physical);
+            assert_eq!(module.tables[0].version, (word as u8, (word >> 8) as u8));
+            if word == 0x0203 && physical == 92 {
+                assert_eq!(module.tables[0].walk, "known_prefix");
+            }
+        }
+    }
+}
+
+#[test]
+fn acquired_invalid_word_changes_still_fail_carried_content_coherence() {
+    let fixture = LegacyPrefixBoundaryFixture::new();
+    fixture.protect_tail();
+    let address = fixture.write_table(0x2802, 68);
+    unsafe { *(address as *mut u64).add(6) = 1 };
+    let record = compatibility_publication_record(address, 0x2802, 68);
+    unsafe { *(address as *mut u64).add(6) = 2 };
+    let view = ProcessView::open(ProcessViewId(4302), std::process::id()).unwrap();
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let outcome = lower_heap_publication_record(
+        &view,
+        &MapIndex::new(&maps).unwrap(),
+        &HookRegistry::builtin(),
+        &record,
+        &[],
+        &mut CaptureWorkBudget::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        HeapLowerOutcome::Refused(
+            "a published table changed between the probe capture and validation"
+        )
+    ));
+}
+
+#[test]
+fn empty_anonymous_publication_with_ambiguous_owner_is_handled_as_an_observation() {
+    struct Mapping(*mut libc::c_void);
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.0, 4096) }, 0);
+        }
+    }
+    let mapping = Mapping(unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    });
+    assert_ne!(mapping.0, libc::MAP_FAILED);
+    let address = mapping.0 as u64;
+    unsafe { *(address as *mut u64) = 0x2802 };
+    let record = compatibility_publication_record(address, 0x2802, 68);
+    let view = ProcessView::open(ProcessViewId(4303), std::process::id()).unwrap();
+    let id = view.id();
+    let mut first = midfinal_res3_provider_module(id, &[]);
+    first.scanned.tables.clear();
+    let mut second = first.clone();
+    second.object = PinnedObjectId(101);
+    second.scanned.key.inode += 1;
+    second.scanned.path = "/another-provider.so".to_string();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.modules = vec![first, second];
+    let outcome = engine
+        .process_export_record(
+            &record,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert_eq!(outcome, DiscoveryRecordOutcome::applied(false, true));
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "owner uncertainty is handled, not capture failure"
+    );
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.tables.is_empty())
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.reason.contains("uncertain provider ownership")
+            && skip
+                .reason
+                .contains("68 observed positions, 68 NULL, 0 usable targets")
+    }));
 }

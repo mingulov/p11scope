@@ -1168,9 +1168,10 @@ impl AttachPlan {
     }
 
     /// Re-admit this plan's exact slots under a counter budget, preserving
-    /// slots, activity, modules and evidence. The Engine converts its
-    /// discovery plan once when a counter capture starts; later rebuilds
-    /// preserve the policy.
+    /// slots, activity, modules and evidence. Rebuilds do not preserve the
+    /// policy: `rebuild_discovered` always lowers a Detailed plan, so Engine
+    /// callers that need Counters must re-admit the retained plan afterwards
+    /// (counter starts do this via `restore_counters_policy_after_retain`).
     pub(crate) fn with_counters_policy(
         &self,
         budget: crate::capacity::CounterBudget,

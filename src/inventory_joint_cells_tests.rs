@@ -1513,16 +1513,24 @@ fn stopdead_pub_body(scene: Scene, event: JointEvent) {
             driver.commit_calls, 1,
             "P: the abandon commits once; the error run stays markerless"
         );
+        // A running-commit refusal converts without abandoning: no
+        // finish was begun, so nothing abandons, and the conversion
+        // discloses the stop once.
         let abandons: Vec<(String, String)> = gaps(&mut driver)
             .into_iter()
             .filter(|(subject, _)| subject == "joint finish abandoned for exit")
             .collect();
         assert_eq!(
             abandons.len(),
-            1,
-            "U: exactly one abandon gap: {:?}",
+            0,
+            "U: no finish was begun, so nothing abandons: {:?}",
             gaps(&mut driver)
         );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "U: the conversion discloses the stop once");
         return;
     }
     assert!(error.is_none(), "J12 retains no error");

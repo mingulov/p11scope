@@ -1901,6 +1901,13 @@ impl LiveJointMachine {
         self.finish_disposed.as_ref()
     }
 
+    /// Borrow the retained genuine completion, if the Finish published
+    /// one (a CompleteFinish-injection test presents it to another lane).
+    #[cfg(test)]
+    pub(crate) fn retained_finish_completed_for_test(&self) -> Option<&CompletedJointFinish> {
+        self.finish_completed.as_ref()
+    }
+
     /// Refusal-only hook has no receiver to affect until real output exists.
     #[cfg(test)]
     pub(crate) fn reference_refuse_finish_q_merge_once(&mut self) {

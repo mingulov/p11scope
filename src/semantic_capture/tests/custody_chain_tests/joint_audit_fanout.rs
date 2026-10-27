@@ -2944,6 +2944,74 @@ fn joint_finish_refusal_certifies_no_drain() {
     assert_eq!(summary.final_drain, None);
 }
 
+#[test]
+fn joint_finish_live_branch_mismatch_certifies_no_drain() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    // A genuine completion presented where no live capture can match it
+    // refuses on the live branch of `complete_collected_finish` (a shell
+    // lane installs no substituted I/O, so the test branch cannot take
+    // it) before any certification: a mismatched finish never records
+    // final_drain. The doorstep injection also leaves the fixture lane
+    // itself unproven.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("drain prefix", None);
+    fixture.enable_finish_fixture(vec![]);
+    fixture.begin_finish().unwrap();
+    fixture
+        .machine
+        .inject_finish_site_for_test(crate::inventory_semantics::FinishSite::CompleteFinish);
+    let mut refused = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1) {
+            Err(reason) => {
+                assert_eq!(reason, SemanticRefusal::Unavailable);
+                refused = true;
+                break;
+            }
+            Ok(JointCommitProgress::Published(_)) => {
+                panic!("an injected completion refusal must not publish")
+            }
+            Ok(JointCommitProgress::Pending) => {}
+        }
+    }
+    assert!(refused, "the doorstep injection must surface its refusal");
+    let completed = fixture
+        .machine
+        .retained_finish_completed_for_test()
+        .expect("the refused completion stays retained");
+    let q = fixture
+        .machine
+        .retained_finish_q_for_test()
+        .expect("the refused finish retains its Q");
+    let held = HeldProviders::new(1);
+    let mut other =
+        AttestedSemanticLane::start(held.subset, &Scope::System, BackendSelection::Auto).unwrap();
+    assert!(
+        !other.is_live(),
+        "the shell lane owns no live capture to match"
+    );
+    other.mark_collected_finish_requested();
+    assert_eq!(
+        other.complete_collected_finish(completed, q),
+        Err(SemanticRefusal::Unavailable),
+        "a completion no live capture owns refuses"
+    );
+    let summary = other.semantic_summary();
+    assert_eq!(
+        summary.stop_quiescence,
+        crate::inventory_semantics::SemanticStopQuiescence::NotRequested
+    );
+    assert_eq!(summary.final_drain, None);
+    let fixture_summary = fixture.scene.real.lane.semantic_summary();
+    assert_eq!(
+        fixture_summary.stop_quiescence,
+        crate::inventory_semantics::SemanticStopQuiescence::NotRequested
+    );
+    assert_eq!(fixture_summary.final_drain, None);
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

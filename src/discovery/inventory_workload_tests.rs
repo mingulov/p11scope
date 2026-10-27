@@ -161,6 +161,7 @@ fn workload_fd_worker() {
     match mode.as_str() {
         "admission" => inject_admission_failures(),
         "mutation" => inject_provider_mutation(),
+        "mutation-uninitialized" => inject_provider_mutation_case(false),
         "discovery-loss" => inject_discovery_loss(),
         "churn" => run_churn_storm(),
         "shutdown" => interrupt_shutdown(),
@@ -1906,9 +1907,18 @@ fn provider_mutation_mid_run_splits_module_instances() {
     isolated_workload("mutation");
 }
 
+#[test]
+fn provider_mutation_without_getter_retains_no_uninitialized_table_pins() {
+    isolated_workload("mutation-uninitialized");
+}
+
 /// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
 /// callable from the test above and from the RSS worker.
 fn inject_provider_mutation() {
+    inject_provider_mutation_case(true);
+}
+
+fn inject_provider_mutation_case(invoke_getter: bool) {
     let base = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1946,7 +1956,11 @@ fn inject_provider_mutation() {
     let ready = dir.join("mut.ready");
     let go = dir.join("mut.go");
     let done = dir.join("mut.done");
-    let child = std::process::Command::new(&driver)
+    let mut command = std::process::Command::new(&driver);
+    if !invoke_getter {
+        command.arg("--map-only");
+    }
+    let child = command
         .arg("--ready")
         .arg(&ready)
         .arg("--go")
@@ -1962,6 +1976,15 @@ fn inject_provider_mutation() {
     let driver_pid = child.id();
     let reaper = ChildReaper(child);
     wait_for(&ready, "mutate ready");
+    assert!(
+        std::fs::read_to_string(&ready)
+            .unwrap()
+            .contains(if invoke_getter {
+                "getter_calls=1"
+            } else {
+                "getter_calls=0"
+            })
+    );
     let coordinator_scope = FdScope::open("provider mutation coordinator lifetime");
     let mut coordinator = InventoryCoordinator::new(
         Scope::Pid(driver_pid),
@@ -1991,6 +2014,15 @@ fn inject_provider_mutation() {
     std::fs::rename(dir.join("mut-prov.staging"), &prov).unwrap();
     std::fs::write(&go, "go\n").unwrap();
     wait_for(&done, "mutate done");
+    assert!(
+        std::fs::read_to_string(&done)
+            .unwrap()
+            .contains(if invoke_getter {
+                "getter_calls=2"
+            } else {
+                "getter_calls=0"
+            })
+    );
     let scope = FdScope::open("provider mutation second pass");
     let t1 = crate::discovery::caller_registry::now_ns();
     coordinator
@@ -2013,6 +2045,19 @@ fn inject_provider_mutation() {
         .iter()
         .filter(|(fd, _)| !scope.before.contains_key(fd))
         .collect();
+    if !invoke_getter {
+        assert!(
+            added.is_empty(),
+            "uninitialized tables add no retained pins"
+        );
+        scope.assert_delta(0);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        drop(coordinator);
+        coordinator_scope.assert_delta(0);
+        drop(reaper);
+        assert_workload_worker_reaped(driver_pid);
+        return;
+    }
     assert_eq!(added.len(), 1, "only the new provider pin is retained");
     let new_pin = added[0].1;
     use std::os::unix::fs::MetadataExt as _;

@@ -1833,6 +1833,52 @@ fn cold_admission_two_survivors_refuses_ambiguity() {
     );
 }
 
+/// A survivor appearing between the first task listing and the
+/// post-mint re-list refuses by the ambiguity name — never a pick of
+/// the earlier set. The re-list is scripted (a seam, not timing): the
+/// first listing reads the real lone survivor, the mint succeeds on
+/// it, and only the second listing shows two. Control: a stable
+/// re-list still admits, proving the refused mint released its slot.
+#[test]
+fn cold_admission_relist_refuses_survivor_appearing_after_mint() {
+    use crate::discovery::caller_registry::{cold_admit_member_with_relist, ColdRefusal};
+    use crate::process::PidPin;
+    use std::sync::Arc;
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let pin = Arc::new(PidPin::open(group.tgid).expect("cold pin opens"));
+    // A second TID that is neither the survivor nor the leader: the
+    // re-list never mints it, it only compares sets.
+    let mut other = group.survivor.wrapping_add(1);
+    if other == group.tgid {
+        other = other.wrapping_add(1);
+    }
+    assert_ne!(other, group.survivor);
+    let mut work = CaptureWorkBudget::default();
+    match cold_admit_member_with_relist(&pin, &mut work, &mut |_| {
+        Ok(vec![group.survivor, other])
+    }) {
+        Err(ColdRefusal::Ambiguous(message)) => assert!(
+            message.contains("more than one live survivor"),
+            "grown sets refuse by the ambiguity name, got {message}"
+        ),
+        Err(other) => panic!("a grown task set refuses ambiguous, got {other:?}"),
+        Ok(_) => panic!("a grown task set never admits"),
+    }
+    // Control: a stable re-list still admits (and the refused mint
+    // above released its slot, or this mint would refuse).
+    let mut work = CaptureWorkBudget::default();
+    let minted = cold_admit_member_with_relist(&pin, &mut work, &mut |_| Ok(vec![group.survivor]))
+        .expect("a stable re-list still admits");
+    let selector = minted
+        .member
+        .selector()
+        .expect("the admitted member selects");
+    assert_eq!(selector.tgid(), group.tgid);
+    assert_eq!(selector.tid(), group.survivor);
+}
+
 /// A cold-minted member handed into the confirm routes the confirm
 /// through the survivor. Routing — not just carriage — is pinned with
 /// the work budget: the handed path spends 0 mint units while an

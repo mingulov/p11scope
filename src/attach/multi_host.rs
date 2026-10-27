@@ -79,7 +79,23 @@ impl std::fmt::Display for MultiHostRefusal {
                 io::Error::from_raw_os_error(errno)
             )?;
         }
-        Ok(())
+        if self.cause == MultiHostCause::Denied {
+            let operation = match self.stage {
+                MultiHostStage::Anchor => "prepare p11scope's self-probe anchor",
+                MultiHostStage::ProgramLoad => "load p11scope's BPF programs",
+                MultiHostStage::SelfLink => "attach p11scope's required Multi probe",
+            };
+            write!(
+                out,
+                "; cannot {operation}; live capture requires root or appropriate capabilities \
+                 and a permitting host policy (for example, sudo)"
+            )?;
+        }
+        write!(
+            out,
+            "; run `p11scope doctor --pid <n>` to check host and target readiness; \
+             `p11scope inspect --pid <n>` lists readable mapped providers without live capture"
+        )
     }
 }
 

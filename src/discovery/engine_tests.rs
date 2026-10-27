@@ -4084,7 +4084,16 @@ fn stuck_cleanup_after_target_exit_ends_with_named_partial() {
     engine.release_view_id(view);
     engine.retirement_intents.clear();
     engine.scan_inputs.remove(&view);
-    engine.expected_target_exit_pending = Some(view);
+    engine.arm_expected_target_exit(view);
+    assert_eq!(
+        engine.expected_target_exit_pending,
+        Some(view),
+        "the arm records the proven exit behind the Pid-scope gate"
+    );
+    assert!(
+        engine.expected_target_exit_since.is_some(),
+        "the arm stamps the no-progress clock"
+    );
     engine.expected_target_exit_since = Some(
         std::time::Instant::now()
             - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
@@ -4135,10 +4144,134 @@ fn stuck_cleanup_after_target_exit_ends_with_named_partial() {
         "the reason keeps the collected calls: {:?}",
         trip.reason
     );
+    // The trip disarms the wait it ends.
+    assert!(
+        engine.expected_target_exit_pending.is_none(),
+        "the trip disarms the wait"
+    );
+    // The trip projects through the generic skip pipeline to text/JSON.
+    let public = render::capture_skipped_out(trip);
+    assert_eq!(
+        (public.name.as_str(), public.reason.as_str()),
+        ("discovery subject", "discovery unavailable"),
+        "the trip projects through the generic skip pipeline"
+    );
     // Ending the wait neither drains nor forgets the queued cleanup.
     assert!(
         !engine.loader_registry.ids_for_view(view).is_empty(),
         "the queued cleanup is untouched by the trip"
+    );
+}
+
+/// Twin: a cleanup that keeps draining past the 6 s horizon finishes
+/// COMPLETE. Every draining tick resets the no-progress clock, so the
+/// bound only trips on a stall with no progress at all — never on a
+/// slow drain that is still moving.
+#[test]
+fn cleanup_that_keeps_progress_past_the_bound_finishes_complete() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut engine, first) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    // A second attached loader context on the same view: two drain steps,
+    // so one tick can make progress while the wait stays blocked.
+    let prepared = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(10),
+            mapping: None,
+            hook: SymbolFact {
+                virtual_address: 0x2200,
+                file_offset: 0x2200,
+            },
+            state_address: None,
+        })
+        .expect("a preflighted second loader context");
+    let second = engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("a prepared second loader context");
+    engine
+        .loader_registry
+        .mark_attached(second)
+        .expect("an attached second loader context");
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view).len(),
+        2,
+        "two queued loader ids block the latch"
+    );
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.arm_expected_target_exit(view);
+    assert_eq!(engine.expected_target_exit_pending, Some(view));
+    let mut session = ScriptedSession::default();
+    // A full bound window passes, then one loader id clears: progress
+    // resets the clock instead of tripping, and the wait stays armed.
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine
+        .loader_registry
+        .tombstone(first)
+        .expect("tombstoning the first drained loader context");
+    engine
+        .loader_registry
+        .remove(first)
+        .expect("draining the first loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a progressing drain keeps the pass open");
+    assert!(
+        !engine.expected_target_exit(),
+        "a draining tick past the horizon does not trip the bound"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_some(),
+        "the wait stays armed while the drain is still blocked"
+    );
+    assert!(
+        engine
+            .expected_target_exit_since
+            .expect("the clock stays armed while the wait is pending")
+            .elapsed()
+            < EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT,
+        "the draining tick reset the no-progress clock"
+    );
+    // A second full window passes and the last id clears: the ordinary
+    // all-clear latches with no trip reason.
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine
+        .loader_registry
+        .tombstone(second)
+        .expect("tombstoning the last drained loader context");
+    engine
+        .loader_registry
+        .remove(second)
+        .expect("draining the last loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the draining batch succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the latch completes once drainage finishes"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "no trip reason on a drain that kept progressing: {:?}",
+        engine.counters.object_skips
     );
 }
 

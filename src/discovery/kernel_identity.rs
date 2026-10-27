@@ -127,6 +127,8 @@ pub(crate) struct ExaminedCustody {
     failed: bool,
     census_headroom: Option<usize>,
     census_held: usize,
+    #[cfg(test)]
+    rank_evals: std::cell::Cell<usize>,
 }
 
 impl ExaminedCustody {
@@ -143,6 +145,8 @@ impl ExaminedCustody {
             failed: false,
             census_headroom: None,
             census_held: 0,
+            #[cfg(test)]
+            rank_evals: std::cell::Cell::new(0),
         }
     }
 
@@ -172,6 +176,8 @@ impl ExaminedCustody {
     }
 
     fn rank(&self, key: ObjectKey, ordinal: u64) -> (Reverse<usize>, ObjectKey, u64) {
+        #[cfg(test)]
+        self.rank_evals.set(self.rank_evals.get() + 1);
         (
             Reverse(self.callers.get(&key).copied().unwrap_or(0)),
             key,
@@ -270,6 +276,11 @@ impl ExaminedCustody {
         self.candidates.retain(|candidate| candidate.scan != scan);
         self.missing
             .retain(|(missing_scan, _), _| *missing_scan != scan);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rank_evals_for_test(&self) -> usize {
+        self.rank_evals.get()
     }
 
     #[cfg(test)]

@@ -362,6 +362,38 @@ fn collect_members(
     collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget).0
 }
 
+/// Explicit userspace never attempts the kernel pass (`decide_pass_attempt`
+/// returns `Userspace` without consulting proof), so its identity scan takes
+/// no anchor custody: held anchors would only cost censuses, CPU and
+/// descriptors while shrinking the confirm allowance, and nothing under
+/// explicit userspace consumes them. Auto and kernel keep full custody.
+pub(crate) fn identity_takes_anchors(selection: crate::cli::IdentityBackendSelection) -> bool {
+    !matches!(selection, crate::cli::IdentityBackendSelection::Userspace)
+}
+
+/// Build the identity scan's custody: full anchor capacity when the pass may
+/// attempt the kernel, zero capacity (offers refuse before any census and
+/// their files close on refusal) under explicit userspace. A failed strict
+/// census still starts a closed custody phase in both cases: the normal
+/// userspace scan still runs, but no partial anchor population forms.
+pub(crate) fn build_identity_custody(
+    callers: BTreeMap<ObjectKey, usize>,
+    take_anchors: bool,
+) -> ExaminedCustody {
+    let cap = if take_anchors { EXAMINED_ANCHOR_CAP } else { 0 };
+    match SegmentPolicy::try_snapshot(0, 0) {
+        Ok(policy) => ExaminedCustody::new(ReservationOwner::for_examined(policy, cap), callers),
+        Err(reason) => {
+            let mut failed = ExaminedCustody::new(
+                ReservationOwner::for_examined(SegmentPolicy::from_headroom(0, 0, 0), 0),
+                callers,
+            );
+            let _ = failed.reconcile_census(Err(reason));
+            failed
+        }
+    }
+}
+
 fn collect_members_identity(
     hints: &[PathBuf],
     hooks: &HookRegistry,

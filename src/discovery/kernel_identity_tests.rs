@@ -5489,6 +5489,11 @@ fn custody_many_offers_in_one_scan_take_constant_censuses() {
 
 #[test]
 fn custody_census_cache_survives_scan_boundaries() {
+    // Per-scan rule: completed members keep their provider pins open until
+    // bind_collection, so a cached census must not cross a scan boundary —
+    // each member's first offer re-takes the strict census and counts all
+    // previously completed members' pins. Within one member the ledger
+    // still covers every later offer.
     let dir = tempfile::tempdir().unwrap();
     let mut custody = custody(64, BTreeMap::new());
     let mut accepted = 0usize;
@@ -5504,9 +5509,9 @@ fn custody_census_cache_survives_scan_boundaries() {
         }
     });
     assert_eq!(accepted, 25, "test hosts hold ample FD headroom");
-    assert!(
-        calls <= 2,
-        "25 offers across 5 scans took {calls} strict censuses"
+    assert_eq!(
+        calls, 5,
+        "25 offers across 5 scans took {calls} strict censuses instead of one per scan"
     );
 }
 
@@ -5635,8 +5640,11 @@ fn custody_cached_census_keeps_rank_replacement_order() {
     let mut custody = custody(2, ranks);
     let owner = custody.owner.clone();
     let calls = Cell::new(0usize);
+    // One shared scan: the per-scan census rule re-takes at every scan
+    // boundary, so per-offer scans would never exercise the cached ledger
+    // this twin is about. The order assertions below are unchanged.
+    let scan = custody.begin_scan();
     for (file, object) in opened {
-        let scan = custody.begin_scan();
         custody.offer_with_census(scan, object, file, || {
             calls.set(calls.get() + 1);
             Ok(SegmentPolicy::from_headroom(10_000, 0, 0))
@@ -5676,17 +5684,414 @@ fn custody_discarded_scan_returns_ledger_headroom() {
         );
     }
     assert_eq!(calls.get(), 1);
+    // The 45-offer count pins the take line from above (at line 20 the
+    // 45th offer, estimate 64 - 44 - 1 = 19, would already re-take). The
+    // 46th consecutive offer pins it from below: estimate 64 - 45 - 1 =
+    // 18 re-takes, so at line 18 this census would never happen.
+    let (file, examined) = opened(dir.path(), "transient-45.so");
+    assert!(
+        custody.offer_with_census(scan, examined, file, || {
+            calls.set(calls.get() + 1);
+            Ok(SegmentPolicy::from_headroom(64, 0, 0))
+        }),
+        "offer 45 refused under headroom 64"
+    );
+    assert_eq!(calls.get(), 2, "the 46th consecutive offer did not re-take");
     custody.discard_scan(scan);
     assert_eq!(owner.examined_for_test().0, 0);
+    // Freed anchors return ledger headroom: the saturating growth term
+    // only makes the post-discard estimate pessimistic, so an offer in
+    // the same scan takes without a census.
+    let (file, examined) = opened(dir.path(), "same-scan.so");
+    assert!(custody.offer_with_census(scan, examined, file, || {
+        calls.set(calls.get() + 1);
+        Ok(SegmentPolicy::from_headroom(64, 0, 0))
+    }));
+    assert_eq!(calls.get(), 2, "discard did not return ledger headroom");
+    // The per-scan rule still applies after a discard: a fresh scan
+    // re-takes the strict census even though the ledger would cover.
     let fresh = custody.begin_scan();
     let (file, examined) = opened(dir.path(), "after.so");
     assert!(custody.offer_with_census(fresh, examined, file, || {
         calls.set(calls.get() + 1);
         Ok(SegmentPolicy::from_headroom(64, 0, 0))
     }));
-    // The 45-offer count pins the take line: 64 - 44 - 1 stays covered
-    // while 64 - 45 - 1 would re-take, so without the discard the last
-    // offer would have been the second census.
-    assert_eq!(calls.get(), 1, "discard did not return ledger headroom");
-    assert_eq!(owner.examined_for_test().0, 1);
+    assert_eq!(calls.get(), 3, "fresh scan trusted the discarded census");
+    assert_eq!(owner.examined_for_test().0, 2);
+}
+
+// Per-scan census invalidation, explicit-userspace custody skip, and the
+// maintained worst candidate. Completed members keep their provider pins
+// open until bind_collection, so a cached census must not cross a scan
+// boundary; explicit userspace never attempts the kernel pass, so it
+// takes no anchors at all; and at-cap replacement compares against a
+// maintained worst instead of re-scanning every candidate's rank.
+
+#[test]
+fn custody_scan_boundary_recounts_pins_before_ledger_take() {
+    const CHILD: &str = "P11SCOPE_CUSTODY_PIN_RECENSUS_CHILD";
+    const COMPLETED: &str = "P11SCOPE_CUSTODY_PIN_RECENSUS_COMPLETED";
+    if std::env::var_os(CHILD).is_none() {
+        // The low-headroom phase lowers RLIMIT_NOFILE, which is
+        // process-global: run it in an isolated child with one harness
+        // thread so sibling tests never observe the lowered ceiling.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::kernel_identity::tests::custody_scan_boundary_recounts_pins_before_ledger_take",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pin-recensus child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == COMPLETED),
+            "pin-recensus child did not complete its assertions:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    // Guards a temporarily lowered soft RLIMIT_NOFILE, restoring the saved
+    // limit on demand and on drop. The child runs single-threaded, so no
+    // suite-wide serial is needed.
+    struct LoweredFdLimit {
+        saved: libc::rlimit,
+        restored: bool,
+    }
+    impl LoweredFdLimit {
+        fn lower_to(soft: libc::rlim_t) -> Self {
+            let mut saved = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit/setrlimit only read and write the owned
+            // structs; the soft limit is lowered, never raised past the
+            // retained hard limit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                0
+            );
+            assert!(
+                saved.rlim_cur > soft,
+                "the lowered limit must sit below the current one"
+            );
+            let lowered = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: saved.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+            Self {
+                saved,
+                restored: false,
+            }
+        }
+        fn restore(&mut self) {
+            if !self.restored {
+                // SAFETY: the saved limit was read from this process and
+                // only ever lowers-then-restores the soft ceiling.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
+                    0
+                );
+                self.restored = true;
+            }
+        }
+    }
+    impl Drop for LoweredFdLimit {
+        fn drop(&mut self) {
+            if !self.restored {
+                // SAFETY: as in restore; errors are ignored so a panic
+                // cannot turn into an abort here.
+                let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+                self.restored = true;
+            }
+        }
+    }
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = custody(64, BTreeMap::new());
+    // Phase 1: pin-like FDs retained across a begin_scan boundary force
+    // the next offer to re-take the strict census instead of trusting
+    // the cross-scan ledger.
+    let scan = custody.begin_scan();
+    let ((), first) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        for index in 0..5 {
+            let (file, examined) = opened(dir.path(), &format!("s1-{index}.so"));
+            assert!(custody.offer(scan, examined, file));
+        }
+    });
+    assert_eq!(first, 1);
+    let pin_base = tempfile::tempfile().unwrap();
+    let mut pins = Vec::new();
+    for _ in 0..8 {
+        pins.push(pin_base.try_clone().unwrap());
+    }
+    let scan2 = custody.begin_scan();
+    let (took, second) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        let (file, examined) = opened(dir.path(), "s2-0.so");
+        custody.offer(scan2, examined, file)
+    });
+    assert!(took, "ample headroom must still take after a boundary");
+    assert_eq!(
+        second, 1,
+        "the offer past begin_scan trusted a cross-scan census"
+    );
+    // Phase 2: with true headroom low, the boundary re-census refuses
+    // with FdHeadroom instead of taking from the stale ledger. The
+    // offered file opens before the ceiling drops so its open cannot
+    // fail; the lowered ceiling still leaves 32 descriptors spare.
+    let (press_file, press_examined) = opened(dir.path(), "pressured.so");
+    let held_before = custody.candidates.len();
+    let mut limit = LoweredFdLimit::lower_to((open_fds() as libc::rlim_t) + 32);
+    let scan3 = custody.begin_scan();
+    let (took3, third) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        custody.offer(scan3, press_examined, press_file)
+    });
+    limit.restore();
+    drop(pins);
+    assert_eq!(
+        third, 1,
+        "the low-headroom offer skipped its boundary census"
+    );
+    assert!(!took3, "the ledger took with true headroom below the floor");
+    assert!(!custody.failed(), "a headroom refusal closed custody");
+    assert_eq!(custody.candidates.len(), held_before);
+    assert_eq!(
+        custody.missing.get(&(scan3, press_examined.key)),
+        Some(&AnchorDeny::FdHeadroom)
+    );
+    assert!(
+        custody
+            .candidates
+            .iter()
+            .all(|held| held.file.metadata().is_ok()),
+        "the refusal dropped earlier custody"
+    );
+    println!("{COMPLETED}");
+}
+
+#[test]
+fn identity_takes_anchors_maps_all_three_selections() {
+    use crate::cli::IdentityBackendSelection;
+    use crate::inspect_system::identity_takes_anchors;
+    assert!(!identity_takes_anchors(IdentityBackendSelection::Userspace));
+    assert!(identity_takes_anchors(IdentityBackendSelection::Auto));
+    assert!(identity_takes_anchors(IdentityBackendSelection::Kernel));
+}
+
+#[test]
+fn explicit_userspace_custody_holds_no_anchors() {
+    // Explicit userspace builds zero-capacity custody: every offer
+    // refuses before any census, no file is retained, and each refusal
+    // records FdHeadroom without closing custody.
+    let dir = tempfile::tempdir().unwrap();
+    let mut custody = crate::inspect_system::build_identity_custody(BTreeMap::new(), false);
+    assert!(!custody.failed(), "creation census failed on this host");
+    assert_eq!(custody.owner.examined_capacity(), 0);
+    let owner = custody.owner.clone();
+    let scan = custody.begin_scan();
+    let mut refused = 0usize;
+    let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        for index in 0..25 {
+            let (file, examined) = opened(dir.path(), &format!("ignored-{index}.so"));
+            let key = examined.key;
+            assert!(
+                !custody.offer(scan, examined, file),
+                "offer {index} took an anchor"
+            );
+            refused += 1;
+            assert_eq!(
+                custody.missing.get(&(scan, key)),
+                Some(&AnchorDeny::FdHeadroom)
+            );
+        }
+    });
+    assert_eq!(refused, 25);
+    assert_eq!(calls, 0, "refused offers took {calls} strict censuses");
+    assert!(custody.candidates.is_empty());
+    assert_eq!(owner.examined_for_test(), (0, 0));
+    assert!(!custody.failed(), "a capacity refusal closed custody");
+}
+
+#[test]
+fn auto_kernel_custody_holds_anchors_to_cap() {
+    // The auto/kernel twin: full custody still takes anchors up to its
+    // capacity and refuses past it with AnchorCap. Late offers carry
+    // zero caller counts so they always lose the rank comparison.
+    let dir = tempfile::tempdir().unwrap();
+    let stored: Vec<_> = (0..EXAMINED_ANCHOR_CAP + 10)
+        .map(|index| opened(dir.path(), &format!("kept-{index}.so")))
+        .collect();
+    let mut callers = BTreeMap::new();
+    for (index, (_, object)) in stored.iter().enumerate() {
+        callers.insert(object.key, usize::from(index < EXAMINED_ANCHOR_CAP) * 100);
+    }
+    let mut custody = crate::inspect_system::build_identity_custody(callers, true);
+    assert!(!custody.failed(), "creation census failed on this host");
+    let cap = custody.owner.examined_capacity();
+    assert!(cap > 0, "test hosts hold anchor headroom");
+    let owner = custody.owner.clone();
+    let scan = custody.begin_scan();
+    let mut held = 0usize;
+    let mut refused = 0usize;
+    let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+        for (index, (file, examined)) in stored.into_iter().enumerate() {
+            let key = examined.key;
+            if custody.offer(scan, examined, file) {
+                held += 1;
+            } else {
+                refused += 1;
+                assert_eq!(
+                    custody.missing.get(&(scan, key)),
+                    Some(&AnchorDeny::AnchorCap),
+                    "offer {index} refused without AnchorCap"
+                );
+            }
+        }
+    });
+    assert_eq!(held, cap, "full custody held {held} of {cap}");
+    assert_eq!(custody.candidates.len(), cap);
+    assert_eq!(owner.examined_for_test(), (cap, cap));
+    assert!(calls >= 1, "no offer took the gate census");
+    // Late zero-count offers always lose once the cap fills with
+    // hundred-count anchors; on hosts whose capacity reaches the full
+    // anchor cap that is exactly the ten tail offers, while smaller
+    // hosts may additionally replace among the hundred-count offers.
+    if cap == EXAMINED_ANCHOR_CAP {
+        assert_eq!(refused, 10, "cap run refused {refused} instead of 10");
+    } else {
+        assert!(
+            refused >= 10,
+            "a zero-count tail offer took on a small host"
+        );
+    }
+}
+
+#[test]
+fn empty_and_full_custody_confirm_identically() {
+    // Parity: the userspace pass only needs the confirm plumbing —
+    // reconcile the confirm census, then grant confirm leases from the
+    // owner. An empty (explicit userspace) custody and a full (auto)
+    // custody reconcile the same census and grant identical leases:
+    // grants are bounded by the policy alone, never reduced by held
+    // anchors. (A live-scan parity fixture is impossible unprivileged:
+    // this host refuses /proc/self/map_files entry reads with EPERM,
+    // so scans record no examined objects; scan-result independence
+    // from takes follows structurally — the single offer call site
+    // ignores the return — and end-to-end edge parity is shown by the
+    // release-binary A/B in the report.)
+    let dir = tempfile::tempdir().unwrap();
+    let policy = SegmentPolicy::from_headroom(64, 4, 100);
+    let build = |take: bool| {
+        let mut custody = crate::inspect_system::build_identity_custody(BTreeMap::new(), take);
+        assert!(!custody.failed(), "creation census failed on this host");
+        let scan = custody.begin_scan();
+        for index in 0..40 {
+            let (file, examined) = opened(dir.path(), &format!("c{}-{index}.so", u8::from(take)));
+            custody.offer(scan, examined, file);
+        }
+        custody
+    };
+    let mut empty = build(false);
+    let mut full = build(true);
+    assert!(empty.candidates.is_empty());
+    assert_eq!(full.candidates.len(), 40);
+    assert_eq!(empty.owner.examined_for_test().0, 0);
+    assert_eq!(full.owner.examined_for_test().0, 40);
+    empty.reconcile_census(Ok(policy)).unwrap();
+    full.reconcile_census(Ok(policy)).unwrap();
+    let drain = |owner: &ReservationOwner| {
+        let mut held = Vec::new();
+        let mut counts = [0usize; 4];
+        while let Ok(lease) = owner.batch().pin() {
+            held.push(lease);
+            counts[0] += 1;
+        }
+        while let Ok(lease) = owner.batch().transient() {
+            held.push(lease);
+            counts[1] += 1;
+        }
+        while let Ok(lease) = owner.immediate().pin() {
+            held.push(lease);
+            counts[2] += 1;
+        }
+        while let Ok(lease) = owner.immediate().transient() {
+            held.push(lease);
+            counts[3] += 1;
+        }
+        counts
+    };
+    // Retained 53, worker pairs 4, immediate pin 1, immediate I/O 1:
+    // the policy bounds, identical with 0 or 40 held anchors.
+    assert_eq!(drain(&empty.owner), [53, 4, 1, 1]);
+    assert_eq!(drain(&full.owner), [53, 4, 1, 1]);
+}
+
+#[test]
+fn custody_worst_candidate_costs_one_rank_per_offer() {
+    // At-cap replacement must not re-scan every candidate's rank per
+    // offer: each offer evaluates its own rank exactly once (losers
+    // compare against the maintained worst), so the rank-evaluation
+    // count equals the offer count exactly while the winners stay the
+    // eight most-called keys.
+    let dir = tempfile::tempdir().unwrap();
+    let stored: Vec<_> = (0..24)
+        .map(|index| opened(dir.path(), &format!("w-{index}.so")))
+        .collect();
+    let mut callers = BTreeMap::new();
+    for (index, (_, object)) in stored.iter().enumerate() {
+        let count = match index {
+            0..=7 => index + 1,
+            8..=15 => 0,
+            _ => index + 1,
+        };
+        callers.insert(object.key, count);
+    }
+    let mut wanted: Vec<_> = stored
+        .iter()
+        .skip(16)
+        .map(|(_, object)| object.key)
+        .collect();
+    wanted.sort_unstable();
+    let mut custody = custody(8, callers);
+    let owner = custody.owner.clone();
+    let scan = custody.begin_scan();
+    let calls = Cell::new(0usize);
+    for (file, object) in stored {
+        custody.offer_with_census(scan, object, file, || {
+            calls.set(calls.get() + 1);
+            Ok(SegmentPolicy::from_headroom(10_000, 0, 0))
+        });
+    }
+    assert_eq!(calls.get(), 1, "ranked offers re-took the census");
+    assert_eq!(
+        custody.rank_evals_for_test(),
+        24,
+        "the worst-candidate search re-evaluated ranks"
+    );
+    let mut actual: Vec<_> = custody
+        .candidates
+        .iter()
+        .map(|held| held.examined.key)
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(
+        actual, wanted,
+        "the maintained worst changed the replacement order"
+    );
+    assert_eq!(owner.examined_for_test(), (8, 8));
 }

@@ -736,12 +736,10 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
                 tuple_,
             )
         elif tuple_["authority"] == "selection_count_only":
-            require(
-                tuple_["request"]["name"] == result["name"] == "exact_standard"
-                and result["version"] in {"v3_0", "v3_1", "v3_2"}
-                and result["flags"] in {"zero", "fork_safe"},
-                tuple_,
-            )
+            # Target pins and observed ordinals authorize counts independently
+            # of names, version labels and returned flag bits. A null table
+            # cannot supply such an observation; an unreadable header can.
+            require(result["version"] != "null", tuple_)
         else:
             require(tuple_["authority"] == "none", tuple_)
         for match in matches:
@@ -4727,12 +4725,23 @@ def self_test():
     count_only["evidence"]["completeness"] = "PARTIAL"
     settle_fixture_verdict(count_only)
     exact_profile_v3_selection(count_only)
+    # Retained targets are proven separately from finite returned metadata.
+    # Count-only tuples never grant API naming, inventory or semantic authority.
+    for metadata_request_name in sorted(SELECTION_NAME_CLASSES):
+        for metadata_result_name in sorted(SELECTION_NAME_CLASSES):
+            for metadata_version in sorted(SELECTION_VERSION_CLASSES - {"null"}):
+                for metadata_flags in ("zero", "fork_safe", "other"):
+                    metadata_candidate = copy.deepcopy(count_only)
+                    metadata_tuple = metadata_candidate["evidence"]["interface_selection"]["tuples"][0]
+                    metadata_tuple["request"].update(name=metadata_request_name)
+                    metadata_tuple["result"].update(name=metadata_result_name, version=metadata_version, flags=metadata_flags)
+                    settle_fixture_verdict(metadata_candidate)
+                    exact_profile_v3_selection(metadata_candidate)
     for mutate in (
-        lambda t: t["request"].update(name="other"),
-        lambda t: t["result"].update(name="other"),
-        lambda t: t["result"].update(version="v2_40"),
-        lambda t: t["result"].update(flags="other"),
         lambda t: t["result"].update(flags=0),
+        lambda t: t["result"].update(version="null"),
+        lambda t: t.update(rv=1),
+        lambda t: t.update(result=None),
     ):
         invalid = copy.deepcopy(count_only)
         mutate(invalid["evidence"]["interface_selection"]["tuples"][0])
@@ -4811,11 +4820,11 @@ def self_test():
         "`null_output` and `unreadable_interface` require `result=null`.",
         "A successful query with `result=null` permits only `null_output`, `unreadable_interface`, or `provider_changed`.",
         "Only `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, and `provider_changed` may coexist with a factual non-null result.",
-        "With a factual non-null result, `unreadable_name` requires a `null` or `unreadable` result name; `unreadable_version` requires an `unreadable` result version; and `unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.",
+        "With a factual non-null result, `unreadable_name` requires a `null` or `unreadable` result name; `unreadable_version` requires an `unreadable` result version; and `unreadable_table` requires a `null`, `v2_40`, `v3_0`, `v3_1`, `v3_2`, or `other` result version.",
         "`inventory_matches` is a sorted, unique array of at most 16 exact `{surface, name_agrees, version_agrees}` records.",
         "Authority is exactly `inventory`, `selection_count_only`, or `none`.",
         "That failure class is exactly `null_output`, `unreadable_interface`, `unreadable_name`, `unreadable_version`, `unreadable_table`, `outside_provider`, `unresolved_function`, or `provider_changed`.",
-        "Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2, its walk is exactly `full`, and it contains at most 104 function records with `semantic_authorized=false`.",
+        "Each table id is an integer from 0 through 9, its version is metadata, its walk is `full`, `known_prefix`, or `unreadable`, and it contains at most 104 canonical function records with `semantic_authorized=false`.",
         "A selector is an integer from 0 through 4 and request flags are exactly 0 or 1.",
     ):
         require(statement in normalized_allowlist,

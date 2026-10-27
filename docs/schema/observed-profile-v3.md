@@ -130,10 +130,12 @@ to this class before the record leaves the probe. Name classes are `null`, `exac
 and belong to the tuple's module. `table_match` is true exactly when this array
 is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
-one match; count-only authority has no match and is limited to a successful
-request and result whose names are both `exact_standard`, whose returned
-version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags class is `zero`
-or `fork_safe`.
+one match. Count-only authority has no match and requires a successful query
+with a non-null table observation whose targets passed identity and ABI checks.
+Names, version labels and returned flag classes do not decide count-only
+support. A null table cannot authorize counts; an unreadable version header
+can coexist with individually validated function targets. Unknown API names
+remain `unknown`, with the observed ordinals preserved.
 Count-only authority applies to a live or offline selection-only target, grants
 no inventory match, is semantically unauthorized, and forces `PARTIAL`. The
 profile tuple does not expose a helper selector or `semantic_authorized` field;

@@ -89,8 +89,12 @@ It has a bounded CK_RV. `null_output` and `unreadable_interface` require
 `provider_changed` may coexist with a factual non-null result. With a factual
 non-null result, `unreadable_name` requires a `null` or `unreadable` result
 name; `unreadable_version` requires an `unreadable` result version; and
-`unreadable_table` requires a `null`, `v3_0`, `v3_1`, or `v3_2` result version.
-Every helper failure requires `authority=none` and a null `selection_table`.
+`unreadable_table` requires a `null`, `v2_40`, `v3_0`, `v3_1`, `v3_2`, or
+`other` result version. An unreadable name/version, a short readable table or
+an unusable function word can retain a validated table with count-only
+authority. Null outputs, unreadable interface descriptors, changed provider
+identity and unproved provider ownership still have `authority=none` and a
+null `selection_table`.
 Authority is exactly `inventory`,
 `selection_count_only`, or `none`. That failure class is exactly `null_output`,
 `unreadable_interface`, `unreadable_name`, `unreadable_version`,
@@ -104,17 +108,34 @@ bounds, and both agreement fields are boolean.
 
 There are at most ten tables. Each table id is 0 through 9; a non-null
 `selection_table` refers to that exact id. Every table is referenced by a
-successful count-only query, and orphan tables are forbidden. A table has
-version 3.0, 3.1, or 3.2, a bounded walk of at
-most 104 classified standard function slots, and
-`semantic_authorized=false`. Selection records contain no raw interface names or pointers,
-addresses, function-table contents, or helper error strings. Only the
-existing offline inventory-name exception may retain raw names; selection
-queries and tables never do.
+successful count-only query, and orphan tables are forbidden. Version values
+are metadata, never proof of allocated extent. Sparse and partial observations
+retain canonical ordinals and individually resolved targets under the existing
+offline inventory identity, hash, mapping and ABI rules. A missing word is not
+an observed NULL. Query names, version classes and returned flags do not gate
+count-only observations; they grant no semantic or inventory authority.
 
-Each table id is an integer from 0 through 9, its version is 3.0, 3.1, or 3.2,
-its walk is exactly `full`, and it contains at most 104 function records with
-`semantic_authorized=false`.
+Each table id is an integer from 0 through 9, its version is metadata, its
+walk is `full`, `known_prefix`, or `unreadable`, and it contains at most 104
+canonical function records with `semantic_authorized=false`.
+
+The existing mandatory selected-table version tuple uses `(0, 0)` solely as an
+unknown-header placeholder when the referencing query says `unreadable`, its
+failure is `unreadable_version`, and its unreadable-walk diagnostic explicitly
+identifies unavailable version metadata. An actual observed version 0.0 has
+result version class `other`, so it cannot be confused with this placeholder.
+Metadata-only changes are disclosed separately from missing function words.
+
+Selection queries retain no raw interface names, pointers, table words or
+helper error strings. Tables reuse the existing bounded canonical function
+resolution records; unreadable-walk diagnostics contain fixed acquisition text
+and ordinal counts. The existing offline inventory-name exception may retain
+raw names; selection queries and tables do not. Public capture artifacts keep
+only the existing finite metadata classes and validated target summaries.
+
+This compatibility clarification follows owner OD35. The ten-query request
+matrix, capture fields, maximum 104-word bound and prohibited data are unchanged;
+allowlist-v1 is unchanged.
 
 ## Still prohibited
 

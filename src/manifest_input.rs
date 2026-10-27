@@ -39,7 +39,10 @@ pub fn read_manifest(path: &Path) -> Result<String, String> {
 /// as a shorter manifest (J-manifest_input#1). A same-length rewrite is not
 /// detected: the manifest is trusted operator input, and the provider
 /// identities it names are still checked against the pinned objects.
-fn read_bounded(reader: impl std::io::Read, expected_len: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(
+    reader: impl std::io::Read,
+    expected_len: u64,
+) -> Result<Vec<u8>, String> {
     if expected_len > MAX_MANIFEST_BYTES {
         return Err(format!(
             "manifest is {expected_len} bytes; limit is {MAX_MANIFEST_BYTES}"

@@ -1408,7 +1408,10 @@ fn prune_selection_inventory(history: &mut CaptureHistory, live_views: &BTreeSet
         .retain(|table, _| live_views.contains(&table.view));
 }
 
-fn capture_manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
+pub(crate) fn capture_manifest_object_key(
+    manifest: &Manifest,
+    object: u32,
+) -> Option<(ObjectKey, &str)> {
     let object = manifest.objects.iter().find(|record| record.id == object)?;
     let provenance = &manifest.provenance_objects[plan::provenance_of(manifest, object)?];
     Some((
@@ -5206,7 +5209,7 @@ fn manifest_targets(
 ///
 /// After this pass every manifest key lowers to the intended capture-local pin ID;
 /// `attach.rs` resolves only that ID, with no key or path fallback.
-fn retarget_to_pins(
+pub(crate) fn retarget_to_pins(
     m: &mut Manifest,
     scanned: &[&ScannedModule],
     scan_pins: &PinnedObjects,
@@ -5476,10 +5479,14 @@ pub(crate) fn scope_label(scope: &Scope) -> String {
 }
 
 /// Reads, parses and schema-checks one `--manifest`.
-fn read_manifest_file(path: &Path) -> Result<Manifest> {
+pub(crate) fn read_manifest_file(path: &Path) -> Result<Manifest> {
     let text = read_manifest(path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", path.display()))?;
-    let document: serde_json::Value = serde_json::from_str(&text)
+    parse_manifest_text(&text, path)
+}
+
+pub(crate) fn parse_manifest_text(text: &str, path: &Path) -> Result<Manifest> {
+    let document: serde_json::Value = serde_json::from_str(text)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
     if document.get("schema").and_then(serde_json::Value::as_str) != Some(SCHEMA) {
         bail!(
@@ -5488,7 +5495,7 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
             document.get("schema")
         );
     }
-    let manifest: Manifest = serde_json::from_str(&text)
+    let manifest: Manifest = serde_json::from_str(text)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
     Ok(manifest)
 }

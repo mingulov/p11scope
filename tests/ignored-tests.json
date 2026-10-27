@@ -679,6 +679,12 @@
       "cell": "performance"
     },
     {
+      "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance",
+      "reason": "private count-manifest cache helper; invoked by count_manifest_full_and_tail_share_the_scan_inspection_cache",
+      "cell": "helper"
+    },
+    {
       "file": "src/discovery/inventory_workload_tests.rs",
       "path": "discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097",
       "reason": "controller lane: privileged BPF load plus attach-scale projection at 4097 endpoints",

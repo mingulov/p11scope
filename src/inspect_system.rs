@@ -28,19 +28,20 @@ use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::confirm_shards::attribute_unselected_with_policy;
 use crate::discovery::engine::{
-    MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
-    unreadable_member_skip,
+    MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
+    select_deep_scan_candidates, sweep_process_maps, unreadable_member_skip,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
     ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
-    canonicalize_scanned_overlays, pin_scanned_view_objects,
+    canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_budget,
+    pin_scanned_view_objects,
 };
 use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped,
+    CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest, ScannedModule, Skipped,
     scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
@@ -58,11 +59,12 @@ use crate::inspect_identity::{
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
 use crate::timing::{StageKind, StageTimings};
-use anyhow::Result;
+use anyhow::{Context as _, Result, ensure};
+use p11scope_manifest::manifest::Manifest;
 use p11scope_manifest::maps::{MapEntry, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) mod inventory_cgroup;
 
@@ -74,6 +76,8 @@ const DOC_ID: &str = "p11scope/inspect-system/v1";
 /// so plainly instead of reading as a capture promise.
 pub(crate) const SCAN_ONLY_NOTE: &str =
     "scan-only admission: manifest corroboration was not consulted";
+pub(crate) const COUNT_MANIFEST_NOTE: &str =
+    "count admission includes explicit manifest targets validated against the mapped provider";
 
 /// `p11scope inspect --system` — enumerate, sweep, deep-scan, pin, lower
 /// admission scan-only, render. Exit 0 when the loop ran (even with zero
@@ -1108,7 +1112,27 @@ pub(crate) fn collect_with_budget(
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
 ) -> Result<Catalog> {
-    collect_identity(hints, hooks, max_scan_pids, policy, false, budget).map(|(catalog, _)| catalog)
+    collect_with_count_manifests(hints, hooks, max_scan_pids, policy, budget, &[])
+}
+
+pub(crate) fn collect_with_count_manifests(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
+    budget: CaptureWorkBudget,
+    manifests: &[PathBuf],
+) -> Result<Catalog> {
+    collect_identity(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        false,
+        budget,
+        manifests,
+    )
+    .map(|(catalog, _)| catalog)
 }
 
 /// Dormant opt-in collection seam for the inventory identity backend. The
@@ -1132,10 +1156,12 @@ pub(crate) fn collect_inventory_identity(
         policy,
         true,
         CaptureWorkBudget::default(),
+        &[],
     )?;
     Ok((catalog, custody.expect("opt-in collection owns custody")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_identity(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -1143,6 +1169,7 @@ fn collect_identity(
     policy: AdmissionPolicy,
     identity: bool,
     budget: CaptureWorkBudget,
+    manifests: &[PathBuf],
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = if identity {
@@ -1172,7 +1199,7 @@ fn collect_identity(
     }
     progress!("p11scope: lowering scan-only admission and rendering...");
     let bind_start = monotonic_ns();
-    let bound = bind_collection(&mut collection);
+    let mut bound = bind_collection(&mut collection);
     timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
     // The confirmation reads run here: after the deep scans, while the
     // aggregate pins (and their fds) are held, before the pure assembly.
@@ -1229,6 +1256,7 @@ fn collect_identity(
     let attributed =
         with_confirmation_pools(shards, segment_policy, proof_stat_threads(), attribute);
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
+    prepare_count_manifests(&mut collection, &mut bound, manifests);
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
@@ -1286,12 +1314,24 @@ pub(crate) fn collect_pid(
     collect_pid_with_budget(pid, hints, hooks, policy, CaptureWorkBudget::default())
 }
 
+#[cfg(test)]
 pub(crate) fn collect_pid_with_budget(
     pid: u32,
     hints: &[PathBuf],
     hooks: &HookRegistry,
     policy: AdmissionPolicy,
+    budget: CaptureWorkBudget,
+) -> Result<Catalog> {
+    collect_pid_with_count_manifests(pid, hints, hooks, policy, budget, &[])
+}
+
+pub(crate) fn collect_pid_with_count_manifests(
+    pid: u32,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    policy: AdmissionPolicy,
     mut budget: CaptureWorkBudget,
+    manifests: &[PathBuf],
 ) -> Result<Catalog> {
     progress!("p11scope: deep-scanning pid {pid}...");
     let mut noise = DiscoveryNoiseAggregator::default();
@@ -1323,7 +1363,8 @@ pub(crate) fn collect_pid_with_budget(
         sweep_unavailable: BTreeSet::new(),
         budget,
     };
-    let bound = bind_collection(&mut collection);
+    let mut bound = bind_collection(&mut collection);
+    prepare_count_manifests(&mut collection, &mut bound, manifests);
     Ok(assemble(collection, bound, None, policy))
 }
 
@@ -1335,6 +1376,7 @@ struct Bound {
     reconciled: Vec<(u32, ProcessViewId, ReconciledModule)>,
     unresolved: Vec<(u32, ProcessViewId, ScannedModule, Vec<String>)>,
     bind_gaps: Vec<PidGap>,
+    count_manifests: Vec<Manifest>,
 }
 
 /// Aggregate every view's pins and bind every module.
@@ -1402,6 +1444,211 @@ fn bind_collection(collection: &mut Collection) -> Bound {
         reconciled,
         unresolved,
         bind_gaps,
+        count_manifests: Vec::new(),
+    }
+}
+
+/// Actual document reads share the collection's byte and work allowance.
+struct CountManifestReader<'a> {
+    file: std::fs::File,
+    budget: &'a mut CaptureWorkBudget,
+    operation_bytes: u64,
+}
+
+impl std::io::Read for CountManifestReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.budget.spend(1).map_err(std::io::Error::other)?;
+        let allowed = self.budget.allowed_io(self.operation_bytes, bytes.len());
+        if allowed == 0 {
+            return Err(std::io::Error::other(IO_CEILING_REASON));
+        }
+        let read = std::io::Read::read(&mut self.file, &mut bytes[..allowed])?;
+        self.budget.record_io(read);
+        self.operation_bytes = self.operation_bytes.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+fn read_count_manifest_file(path: &Path, budget: &mut CaptureWorkBudget) -> Result<Manifest> {
+    let file = p11scope_manifest::identity::open_regular(path).map_err(anyhow::Error::msg)?;
+    let length = file.metadata()?.len();
+    let bytes = crate::manifest_input::read_bounded(
+        CountManifestReader {
+            file,
+            budget,
+            operation_bytes: 0,
+        },
+        length,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let text = String::from_utf8(bytes).context("manifest is not UTF-8")?;
+    parse_manifest_text(&text, path)
+}
+
+/// Validate explicit count inputs while the collection still owns its read
+/// allowance. Only an exact provider observed in this scope can contribute;
+/// callbacks may live in other validated files. No table-completeness test
+/// discards useful entries, and semantic/selection permissions stay elsewhere.
+fn prepare_count_manifests(collection: &mut Collection, bound: &mut Bound, paths: &[PathBuf]) {
+    for path in paths {
+        let accepted = (|| -> Result<Manifest> {
+            collection.budget.spend(1).map_err(anyhow::Error::msg)?;
+            let mut manifest = read_count_manifest_file(path, &mut collection.budget)?;
+            let units = manifest
+                .objects
+                .len()
+                .saturating_add(manifest.provenance_objects.len())
+                .saturating_add(
+                    manifest
+                        .surfaces
+                        .iter()
+                        .map(|surface| surface.functions.len())
+                        .chain(
+                            manifest
+                                .selection_evidence
+                                .tables
+                                .iter()
+                                .map(|table| table.functions.len()),
+                        )
+                        .sum::<usize>(),
+                )
+                .saturating_add(1);
+            collection
+                .budget
+                .spend(units as u64)
+                .map_err(anyhow::Error::msg)?;
+
+            // Proc-root locators must bind to the same collected generation,
+            // rather than a PID that happens to exist when its path is opened.
+            let pids: BTreeSet<u32> = manifest
+                .objects
+                .iter()
+                .filter_map(|object| {
+                    object
+                        .path
+                        .strip_prefix("/proc/")?
+                        .split_once("/root/")?
+                        .0
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            let mut views = Vec::new();
+            for pid in pids {
+                collection
+                    .budget
+                    .spend(collection.members.len() as u64 + 1)
+                    .map_err(anyhow::Error::msg)?;
+                let member = collection
+                    .members
+                    .iter()
+                    .find(|member| member.pid == pid)
+                    .context("manifest locator is outside the collected scope")?;
+                let generation = member
+                    .generation
+                    .as_ref()
+                    .context("manifest locator generation unavailable")?;
+                let view = ProcessView::open(member.view, pid).map_err(anyhow::Error::msg)?;
+                ensure!(
+                    generation.start_time.is_some()
+                        && generation.exe.is_some()
+                        && view.start_time() == generation.start_time
+                        && read_exe_identity(pid) == generation.exe,
+                    "manifest locator generation changed"
+                );
+                views.push(view);
+            }
+            let pinning = pin_count_manifest_objects_in_views_with_budget(
+                &manifest,
+                &views,
+                &mut collection.budget,
+            )
+            .map_err(|error| anyhow::anyhow!("manifest pinning refused: {:?}", error.problems()))?;
+            ensure!(
+                pinning.stale.is_empty(),
+                "manifest object identity is stale"
+            );
+            ensure!(
+                pinning.pins.check_unchanged() == Ok(true),
+                "manifest object identity changed"
+            );
+            for view in &views {
+                collection
+                    .budget
+                    .spend(collection.members.len() as u64 + 1)
+                    .map_err(anyhow::Error::msg)?;
+                let generation = collection
+                    .members
+                    .iter()
+                    .find(|member| member.pid == view.pid())
+                    .and_then(|member| member.generation.as_ref())
+                    .unwrap();
+                ensure!(
+                    view.still_the_same() && read_exe_identity(view.pid()) == generation.exe,
+                    "manifest locator generation changed during validation"
+                );
+            }
+            let own = pinning
+                .pins
+                .id_for_path(&manifest.module_path)
+                .context("manifest provider pin unavailable")?;
+            collection
+                .budget
+                .spend(bound.reconciled.len() as u64 + 1)
+                .map_err(anyhow::Error::msg)?;
+            let matching: Vec<_> = bound
+                .reconciled
+                .iter()
+                .filter(|(_, _, module)| {
+                    bound
+                        .aggregate
+                        .exactly_matches(module.object, &pinning.pins, own)
+                })
+                .map(|(_, _, module)| &module.scanned)
+                .collect();
+            ensure!(
+                !matching.is_empty(),
+                "manifest provider is not exactly mapped in the collected scope"
+            );
+            retarget_to_pins(&mut manifest, &matching, &bound.aggregate, &pinning.pins);
+            let clone_units = bound
+                .aggregate
+                .pinned()
+                .map(|pin| pin.path.len().div_ceil(16).saturating_add(8) as u64)
+                .sum::<u64>();
+            collection
+                .budget
+                .spend(clone_units)
+                .map_err(anyhow::Error::msg)?;
+            let mut candidate = bound.aggregate.clone();
+            ensure!(
+                candidate.absorb(pinning.pins).is_empty(),
+                "manifest pin union disagrees with the collection"
+            );
+            for object in &manifest.objects {
+                if let Some((key, path)) = capture_manifest_object_key(&manifest, object.id) {
+                    candidate.refile_split_manifest_alias(
+                        key,
+                        path,
+                        &mut collection.budget,
+                        &crate::discovery::identity::KernelSelfMappingProbe,
+                    );
+                }
+            }
+            collection.budget.spend(1).map_err(anyhow::Error::msg)?;
+            bound.aggregate = candidate;
+            Ok(manifest)
+        })();
+        match accepted {
+            Ok(manifest) => bound.count_manifests.push(manifest),
+            Err(error) => collection.scope_gaps.push(PidGap::scope(Skipped {
+                subject: path.display().to_string(),
+                reason: format!("count manifest refused: {error:#}"),
+            })),
+        }
     }
 }
 
@@ -1608,7 +1855,7 @@ fn coverage_prefix(total: usize, deep: usize, cap: usize, matched: usize) -> Str
     )
 }
 
-/// Lower one shared-scope plan over scan evidence only under `policy`,
+/// Lower one shared-scope plan over collected evidence and validated inputs,
 /// and project the catalog records — deep-scanned and maps-matched
 /// members alike. Pure: no `/proc` reads.
 fn assemble(
@@ -1622,6 +1869,7 @@ fn assemble(
         reconciled,
         unresolved,
         bind_gaps,
+        mut count_manifests,
     } = bound;
     let mut bind_gaps = bind_gaps;
     if attributed
@@ -1633,11 +1881,9 @@ fn assemble(
         }
     }
 
-    // The existing plan-lowering path, scan evidence only: no manifests,
-    // no history, no reserved slots, no attach. The lowering is pure over
-    // its inputs, so no narrower entry point was needed — there are no
-    // side effects to carve out. Detailed (inspect) and Inventory
-    // (inventory) differ only in the policy passed here.
+    // Inspect supplies scan evidence only. Inventory also supplies its validated
+    // count manifests. Both lower once, before admission, with no history,
+    // reserved slots, or attachment side effects.
     let inputs: Vec<ReconciledModule> = reconciled
         .iter()
         .map(|(_, _, module)| module.clone())
@@ -1646,9 +1892,31 @@ fn assemble(
         .iter()
         .map(|(pid, view, _)| (*pid, *view))
         .collect();
+    // Scoped collection may have removed members at its final permit cut.
+    // Retained input pins alone never establish that a provider remains in it.
+    count_manifests.retain(|manifest| {
+        manifest
+            .objects
+            .iter()
+            .find(|object| object.path == manifest.module_path)
+            .and_then(|object| capture_manifest_object_key(manifest, object.id))
+            .and_then(|(key, path)| aggregate.id_for_manifest(key, path))
+            .is_some_and(|object| inputs.iter().any(|module| module.object == object))
+    });
+    let operators: BTreeSet<_> = count_manifests
+        .iter()
+        .filter_map(|manifest| {
+            let own = manifest
+                .objects
+                .iter()
+                .find(|object| object.path == manifest.module_path)?;
+            let (key, path) = capture_manifest_object_key(manifest, own.id)?;
+            aggregate.id_for_manifest(key, path)
+        })
+        .collect();
     let plan = plan::build_from_sources_for_policy_scoped(
         &inputs,
-        &[],
+        &count_manifests,
         &aggregate,
         policy,
         AdmissionScope::Shared,
@@ -1700,7 +1968,11 @@ fn assemble(
         };
         let group: Vec<ReconciledModule> =
             members.iter().map(|&index| inputs[index].clone()).collect();
-        let (class, _lookalikes) = plan::classify_scanned_object(&group);
+        let class = if operators.contains(&object) {
+            "operator"
+        } else {
+            plan::classify_scanned_object(&group).0
+        };
         let Some(pin) = aggregate.summary(object) else {
             // Unreachable: every reconciled object resolves in the
             // aggregate it was bound against. Degrade to unresolved
@@ -3445,6 +3717,7 @@ impl<P: crate::discovery::confirm_shards::SegmentProof>
 /// plus userspace or kernel sweep proof per the capture-owned shared
 /// state, assembled under the Inventory policy. `inspect --system`
 /// keeps using [`collect`] (userspace-only, frozen output).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_system_with_identity(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -3452,6 +3725,7 @@ pub(crate) fn collect_system_with_identity(
     policy: AdmissionPolicy,
     shared: IdentityShared,
     budget: CaptureWorkBudget,
+    manifests: &[PathBuf],
 ) -> Result<Catalog> {
     if !matches!(policy, AdmissionPolicy::Inventory(_)) {
         return Err(anyhow::anyhow!(
@@ -3485,7 +3759,7 @@ pub(crate) fn collect_system_with_identity(
     }
     progress!("p11scope: lowering scan-only admission and rendering...");
     let bind_start = monotonic_ns();
-    let bound = bind_collection(&mut collection);
+    let mut bound = bind_collection(&mut collection);
     timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
     let confirm_start = monotonic_ns();
     // Per-pass kernel decision under the capture lock: userspace never
@@ -3568,6 +3842,7 @@ pub(crate) fn collect_system_with_identity(
         },
     );
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
+    prepare_count_manifests(&mut collection, &mut bound, manifests);
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());

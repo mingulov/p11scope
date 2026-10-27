@@ -6413,6 +6413,73 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
     budget: &mut CaptureWorkBudget,
     probe: &impl SelfMappingProbe,
 ) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(m, views, budget, probe, false)
+}
+
+/// Count collection shares the scan's inspection cache and actual read
+/// allowance. The semantic reader above retains its existing policy.
+pub(crate) fn pin_count_manifest_objects_in_views_with_budget(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(m, views, budget, &KernelSelfMappingProbe, true)
+}
+
+fn inspect_count_manifest_file(
+    file: &std::fs::File,
+    before: Pin,
+    mapping: MappingFileKey,
+    budget: &mut CaptureWorkBudget,
+) -> Result<InspectedObject, String> {
+    budget.spend(1).map_err(str::to_owned)?;
+    let key = object_key(mapping);
+    let cache_key = InspectedFileKey {
+        device: key.device,
+        inode: key.inode,
+        pin: before,
+    };
+    if let Some(inspected) = budget.inspected_file(&cache_key) {
+        if pin_of(file)? == before {
+            return Ok(inspected);
+        }
+        return Err("file changed while its cached identity was checked".into());
+    }
+    if before.size > budget.limits().per_object_bytes {
+        return Err("manifest object exceeds the collection per-object read allowance".into());
+    }
+    let mut operation_bytes = 0u64;
+    let inspected = inspect_file_with_reader_exporting(
+        file,
+        |file, bytes, offset| {
+            if let Some(reason) = budget.check_deadline_now() {
+                return Err(std::io::Error::other(reason));
+            }
+            let allowed = budget.allowed_io(operation_bytes, bytes.len());
+            if allowed == 0 {
+                return Err(std::io::Error::other(IO_CEILING_REASON));
+            }
+            let read = file.read_at(&mut bytes[..allowed], offset)?;
+            budget.record_io(read);
+            operation_bytes = operation_bytes.saturating_add(read as u64);
+            Ok(read)
+        },
+        &standard_function_names(),
+    )?;
+    if pin_of(file)? != before {
+        return Err("file changed while it was being identified".into());
+    }
+    budget.note_inspected_file(cache_key, inspected.clone());
+    Ok(inspected)
+}
+
+fn pin_manifest_objects_with_read_policy(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+    meter_identity: bool,
+) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
         return Err(ManifestPinError::Invalid(structural));
@@ -6517,11 +6584,26 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
 
     let mut opened = BTreeMap::new();
     for (object, file, pin, mountinfo) in pinned {
-        let inspected = match inspect_file_with_reader_exporting(
-            &file,
-            |file, bytes, offset| file.read_at(bytes, offset),
-            &standard_function_names(),
-        ) {
+        let count_mapping = if meter_identity {
+            match identity_of_manifest(&file, mountinfo.as_deref()) {
+                Ok(mapping) => Some(mapping),
+                Err(error) => {
+                    problems.push(format!("{}: {error}", object.path));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let inspected = match if let Some(mapping) = count_mapping {
+            inspect_count_manifest_file(&file, pin, mapping, budget)
+        } else {
+            inspect_file_with_reader_exporting(
+                &file,
+                |file, bytes, offset| file.read_at(bytes, offset),
+                &standard_function_names(),
+            )
+        } {
             Ok(inspected) => inspected,
             Err(error) => {
                 problems.push(format!(
@@ -6573,7 +6655,10 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         if !offsets_valid {
             continue;
         }
-        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
+        let mapping = match count_mapping
+            .map(Ok)
+            .unwrap_or_else(|| identity_of_manifest(&file, mountinfo.as_deref()))
+        {
             Ok(mapping) => mapping,
             Err(error) => {
                 problems.push(format!("{}: {error}", object.path));
@@ -6585,6 +6670,9 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
         };
+        let held = meter_identity
+            .then(|| budget.retained_mapped_identity(&file))
+            .flatten();
         let mut entry = match Entry::new(
             file,
             pin,
@@ -6592,7 +6680,7 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
             &inspected,
             raw,
             mapping,
-            None,
+            held,
         ) {
             Ok(entry) => entry,
             Err(error) => {
@@ -6629,7 +6717,11 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         // the fd key stays primary, and no caller stays unbound silently.
         // Never a second manifest raw: the one-manifest-raw-per-path
         // invariant behind `id_for_path` holds.
-        match self_mapped_fallback_detailed(&entry.file, key, budget, probe) {
+        match if held.is_some() {
+            SelfMappedFallback::Agrees
+        } else {
+            self_mapped_fallback_detailed(&entry.file, key, budget, probe)
+        } {
             SelfMappedFallback::Split(probed) => {
                 entry.probed_maps_key = Some(probed);
             }
@@ -8478,6 +8570,203 @@ mod tests {
         pins.by_id.get_mut(&id).expect("entry for raw alias").raw = raw.clone();
         pins.raw_to_id.insert(raw, id);
         pins
+    }
+
+    fn count_manifest_file() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Manifest,
+        p11scope_manifest::identity::InspectedObject,
+    ) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count-object.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![0u8; 1 << 20])
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let mut manifest = manifest_for(object_key(mapping));
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = path.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        (dir, path, manifest, inspected)
+    }
+
+    fn count_manifest_read_budget() -> CaptureWorkBudget {
+        let bytes = std::fs::metadata("/proc/self/mountinfo")
+            .unwrap()
+            .len()
+            .max(std::fs::read("/proc/self/mountinfo").unwrap().len() as u64)
+            + (64 << 10);
+        CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+            per_object_bytes: 8 << 20,
+            total_bytes: bytes,
+        })
+    }
+
+    fn cache_count_inspection(
+        path: &Path,
+        inspected: p11scope_manifest::identity::InspectedObject,
+        budget: &mut CaptureWorkBudget,
+    ) {
+        let file = std::fs::File::open(path).unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        assert!(budget.note_inspected_file(
+            InspectedFileKey {
+                device: key.device,
+                inode: key.inode,
+                pin: pin_of(&file).unwrap()
+            },
+            inspected
+        ));
+    }
+
+    #[test]
+    fn count_manifest_cold_identity_reads_obey_the_collection_allowance() {
+        let (_dir, path, manifest, _) = count_manifest_file();
+        let mut budget = count_manifest_read_budget();
+        assert!(std::fs::metadata(path).unwrap().len() > budget.limits().total_bytes);
+        let result = pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget);
+        assert!(
+            result.is_err(),
+            "a cold identity hash cannot bypass the read allowance"
+        );
+        assert!(budget.attempted_io_bytes() <= budget.limits().total_bytes);
+    }
+
+    #[test]
+    fn count_manifest_cache_hit_needs_no_second_whole_file_read() {
+        let (_dir, path, manifest, inspected) = count_manifest_file();
+        let mut budget = count_manifest_read_budget();
+        cache_count_inspection(&path, inspected, &mut budget);
+        let result =
+            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).unwrap();
+        assert!(result.stale.is_empty());
+        assert_eq!(result.pins.pinned().count(), 1);
+        assert!(budget.attempted_io_bytes() < std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn count_manifest_changed_file_revalidates_and_charges_the_new_bytes() {
+        use std::io::Write as _;
+        let (_dir, path, manifest, inspected) = count_manifest_file();
+        let mut budget = CaptureWorkBudget::default();
+        cache_count_inspection(&path, inspected, &mut budget);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1])
+            .unwrap();
+        let result =
+            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).unwrap();
+        assert_eq!(result.stale.len(), 1);
+        assert_eq!(result.pins.pinned().count(), 0);
+        assert!(
+            budget.attempted_io_bytes() >= std::fs::metadata(path).unwrap().len(),
+            "a changed pin must miss the inspection cache and pay for the fresh hash"
+        );
+    }
+
+    #[test]
+    fn count_manifest_same_digest_other_file_cannot_reuse_the_inspection() {
+        let (dir, path, mut manifest, inspected) = count_manifest_file();
+        let other = dir.path().join("distinct.so");
+        std::fs::copy(&path, &other).unwrap();
+        let mut budget = count_manifest_read_budget();
+        cache_count_inspection(&path, inspected, &mut budget);
+        let key = object_key(mapping_file_key(&std::fs::File::open(&other).unwrap()).unwrap());
+        manifest.module_path = other.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        assert!(
+            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).is_err(),
+            "digest equality is not an exact opened-file cache witness"
+        );
+    }
+
+    #[test]
+    #[ignore = "private count-manifest cache helper; invoked by count_manifest_full_and_tail_share_the_scan_inspection_cache"]
+    fn count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance() {
+        let paths = [
+            std::env::var("P11SCOPE_COUNT_MANIFEST_FULL")
+                .expect("an actual full-copy helper manifest"),
+            std::env::var("P11SCOPE_COUNT_MANIFEST_TAIL").expect("an actual tail helper manifest"),
+        ];
+        let manifests: Vec<_> = paths
+            .iter()
+            .map(|path| crate::discovery::engine::read_manifest_file(Path::new(path)).unwrap())
+            .collect();
+        let mut budget = count_manifest_read_budget();
+        let mut held = Vec::new();
+        let mut file_bytes = Vec::new();
+        for (manifest, expected) in manifests.iter().zip([68, 32]) {
+            assert!(validate_structure(manifest).is_empty());
+            let targets: BTreeSet<_> = manifest
+                .surfaces
+                .iter()
+                .flat_map(|surface| &surface.functions)
+                .filter_map(|function| match function.resolution {
+                    Resolution::Resolved {
+                        object,
+                        file_offset,
+                    } => Some((object, file_offset)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(targets.len(), expected);
+            assert_eq!(manifest.objects.len(), 1);
+            let path = Path::new(&manifest.module_path);
+            let file = std::fs::File::open(path).unwrap();
+            file_bytes.push(file.metadata().unwrap().len());
+            let inspected = inspect_file_with_reader_exporting(
+                &file,
+                |file, bytes, offset| file.read_at(bytes, offset),
+                &standard_function_names(),
+            )
+            .unwrap();
+            assert_eq!(inspected.identity, manifest.objects[0].identity);
+            assert_eq!(inspected.abi, ElfAbi::Lp64);
+            cache_count_inspection(path, inspected, &mut budget);
+            held.push(file);
+        }
+        assert!(file_bytes[0] > budget.limits().total_bytes);
+        for manifest in &manifests {
+            let result =
+                pin_count_manifest_objects_in_views_with_budget(manifest, &[], &mut budget)
+                    .unwrap();
+            assert!(result.stale.is_empty());
+            assert_eq!(result.pins.pinned().count(), 1);
+            assert!(result.pins.check_unchanged().unwrap());
+        }
+        assert!(budget.attempted_io_bytes() < file_bytes[0]);
+        println!(
+            "COUNT_MANIFEST_INPUTS full_bytes={} tail_bytes={} count_pin_io={} allowance={}",
+            file_bytes[0],
+            file_bytes[1],
+            budget.attempted_io_bytes(),
+            budget.limits().total_bytes
+        );
+        drop(held);
     }
 
     fn manifest_for(key: ObjectKey) -> Manifest {

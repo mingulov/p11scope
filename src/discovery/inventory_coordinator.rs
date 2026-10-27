@@ -253,8 +253,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
-    /// Explicit semantic inputs are independent of broad physical admission.
+    /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
+    /// Explicit count inputs enter the catalog's one plan before admission.
+    count_manifests: Vec<PathBuf>,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -472,6 +474,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
+            count_manifests: Vec::new(),
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -531,8 +534,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.lifecycle_high_water_bytes
     }
 
-    pub(crate) fn set_semantic_manifests(&mut self, manifests: Vec<PathBuf>) {
+    pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
+        self.count_manifests = manifests.clone();
         self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_semantic_manifests(&mut self, manifests: Vec<PathBuf>) {
+        self.set_manifests(manifests);
     }
 
     pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
@@ -2387,6 +2396,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
+        let manifests = self.count_manifests.clone();
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
         move || {
@@ -2394,15 +2404,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 bail!("cgroup inventory requires the bounded scoped collection job");
             }
             match scope {
-                InventoryScope::Pid(pid) => crate::inspect_system::collect_pid_with_budget(
-                    pid, &hints, &hooks, policy, budget,
-                ),
-                InventoryScope::System => crate::inspect_system::collect_with_budget(
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid_with_count_manifests(
+                        pid, &hints, &hooks, policy, budget, &manifests,
+                    )
+                }
+                InventoryScope::System => crate::inspect_system::collect_with_count_manifests(
                     &hints,
                     &hooks,
                     max_scan_pids,
                     policy,
                     budget,
+                    &manifests,
                 ),
             }
         }
@@ -2423,6 +2436,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
+        let manifests = self.count_manifests.clone();
         let budget = self.collector_budget(
             crate::discovery::scan::CaptureWorkBudget::default(),
             semantic_capture_live,
@@ -2432,9 +2446,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 bail!("cgroup inventory requires the bounded scoped collection job");
             }
             match scope {
-                InventoryScope::Pid(pid) => crate::inspect_system::collect_pid_with_budget(
-                    pid, &hints, &hooks, policy, budget,
-                ),
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid_with_count_manifests(
+                        pid, &hints, &hooks, policy, budget, &manifests,
+                    )
+                }
                 InventoryScope::System => crate::inspect_system::collect_system_with_identity(
                     &hints,
                     &hooks,
@@ -2442,6 +2458,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     policy,
                     shared,
                     budget,
+                    &manifests,
                 ),
             }
         }
@@ -2487,6 +2504,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 false,
             ),
             observer,
+            count_manifests: self.count_manifests.clone(),
         };
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
@@ -7996,6 +8014,499 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    struct CountManifestFixture {
+        _dir: tempfile::TempDir,
+        provider: PathBuf,
+        manifest: PathBuf,
+        child: ChildReaper,
+    }
+
+    impl CountManifestFixture {
+        fn new() -> Self {
+            use p11scope_manifest::manifest::{Manifest, Resolution};
+            let dir = tempfile::tempdir().unwrap();
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let provider = gcc(
+                dir.path(),
+                "private-tail.so",
+                &source.join("crates/discover/tests/fixture/version_matrix.c"),
+                &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=32"],
+                &[],
+            );
+            let manifest = dir.path().join("tail.json");
+            let helper = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", &provider)
+                .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", &manifest)
+                .output()
+                .unwrap();
+            assert!(helper.status.success(), "{helper:?}");
+            let acquired: Manifest =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            assert!(crate::manifest_input::validate_structure(&acquired).is_empty());
+            assert_eq!(acquired.surfaces[0].functions.len(), 68);
+            let targets: BTreeSet<_> = acquired
+                .surfaces
+                .iter()
+                .flat_map(|surface| &surface.functions)
+                .filter_map(|function| match function.resolution {
+                    Resolution::Resolved {
+                        object,
+                        file_offset,
+                    } => Some((object, file_offset)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                32,
+                "the actual helper observes32 unique bodies"
+            );
+            let driver = gcc(
+                dir.path(),
+                "holder",
+                &source.join("tests/fixtures/catalog-driver.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror"],
+                &["-ldl"],
+            );
+            let ready = dir.path().join("ready");
+            let child = ChildReaper(
+                std::process::Command::new(driver)
+                    .arg("--ready")
+                    .arg(&ready)
+                    .arg(&provider)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            wait_ready(&ready);
+            Self {
+                _dir: dir,
+                provider,
+                manifest,
+                child,
+            }
+        }
+
+        fn coordinator(&self, scope: Scope) -> InventoryCoordinator<OsProcessSource> {
+            InventoryCoordinator::new_with_budget(
+                scope,
+                HookRegistry::builtin(),
+                vec![self.provider.clone()],
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                crate::capacity::InventoryBudget::new(32, 256).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn scan_paths(
+            &self,
+            pid: u32,
+            paths: Vec<PathBuf>,
+        ) -> InventoryCoordinator<OsProcessSource> {
+            let mut coordinator = self.coordinator(Scope::Pid(pid));
+            // The same input setter the public inventory facade uses.
+            coordinator.set_manifests(paths);
+            coordinator
+                .scan_pass(
+                    &InventoryScope::Pid(pid),
+                    None,
+                    &mut UnavailableImageGuard,
+                    &mut ScanOnlyIdentity,
+                    u64::MAX,
+                    crate::discovery::caller_registry::now_ns(),
+                )
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            coordinator
+        }
+
+        fn scan(&self, manifest: bool) -> InventoryCoordinator<OsProcessSource> {
+            self.scan_paths(
+                self.child.0.id(),
+                if manifest {
+                    vec![self.manifest.clone()]
+                } else {
+                    vec![]
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn count_manifest_enters_the_collector_before_shared_admission() {
+        let fixture = CountManifestFixture::new();
+        let mut coordinator = fixture.scan(true);
+        let modules: Vec<_> = coordinator
+            .registry()
+            .modules()
+            .map(|module| {
+                (
+                    &module.paths,
+                    module.admission,
+                    module.admission_endpoints,
+                    &module.admission_reasons,
+                )
+            })
+            .collect();
+        assert_eq!(coordinator.attach_set().len(), 32, "{modules:?}");
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 32);
+        assert_eq!(delta.objects.len(), 1);
+        assert!(
+            delta
+                .endpoints
+                .iter()
+                .all(|entry| entry.abi == p11scope_manifest::elf::ElfAbi::Lp64)
+        );
+        assert!(coordinator.engine.selection_claims.is_empty());
+        assert!(
+            coordinator.engine.manifests.is_empty(),
+            "count admission grants no semantic inputs to the engine"
+        );
+        assert!(coordinator.registry().modules().all(|module| {
+            module.admission == AdmissionState::Admitted
+                && module.admission_class.as_deref() == Some("operator")
+        }));
+    }
+
+    #[test]
+    fn private_count_table_without_manifest_keeps_the_shared_reserve() {
+        let fixture = CountManifestFixture::new();
+        let coordinator = fixture.scan(false);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(coordinator.registry().modules().any(|module| {
+            module.admission == AdmissionState::Refused
+                && module
+                    .admission_reasons
+                    .iter()
+                    .any(|reason| reason.contains("reserved"))
+        }));
+    }
+
+    #[test]
+    fn count_manifest_identity_drift_refuses_input_and_keeps_raw_observations() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        document.objects[0].identity.sha256 = Some("0".repeat(64));
+        if document.objects[0].identity.kind == p11scope_manifest::IdentityKind::Sha256 {
+            document.objects[0].identity.value = Some("0".repeat(64));
+        }
+        let provider = document
+            .provenance_objects
+            .iter_mut()
+            .find(|object| object.path == document.module_path)
+            .unwrap();
+        provider.identity = document.objects[0].identity.clone();
+        assert!(
+            crate::manifest_input::validate_structure(&document).is_empty(),
+            "{:?}",
+            crate::manifest_input::validate_structure(&document)
+        );
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let coordinator = fixture.scan(true);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(
+            coordinator
+                .registry()
+                .modules()
+                .any(|module| module.paths.contains(fixture.provider.to_str().unwrap()))
+        );
+        assert!(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused"))
+        );
+        let pid = fixture.child.0.id();
+        let mut roomy = InventoryCoordinator::new_with_budget(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            vec![fixture.provider.clone()],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+            crate::capacity::InventoryBudget::new(256, 2048).unwrap(),
+        )
+        .unwrap();
+        roomy.set_manifests(vec![fixture.manifest.clone()]);
+        roomy
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut UnavailableImageGuard,
+                &mut ScanOnlyIdentity,
+                u64::MAX,
+                crate::discovery::caller_registry::now_ns(),
+            )
+            .unwrap();
+        roomy.commit_batch(false).unwrap();
+        assert_eq!(
+            roomy.attach_set().len(),
+            32,
+            "a bad manifest cannot erase independently admissible raw targets"
+        );
+    }
+
+    #[test]
+    fn count_manifest_same_bytes_replacement_is_not_the_mapped_provider() {
+        let fixture = CountManifestFixture::new();
+        let replacement = fixture._dir.path().join("replacement.so");
+        std::fs::copy(&fixture.provider, &replacement).unwrap();
+        std::fs::rename(&replacement, &fixture.provider).unwrap();
+        let coordinator = fixture.scan(true);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.reason.contains("count manifest refused")
+                    && gap.reason.contains("not exactly mapped")
+            }),
+            "{:?}",
+            coordinator.registry().gaps()
+        );
+    }
+
+    #[test]
+    fn count_manifest_aliases_share_one_physical_target_union() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let alias = fixture._dir.path().join("alias.so");
+        std::fs::hard_link(&fixture.provider, &alias).unwrap();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        let provenance = document
+            .provenance_objects
+            .iter()
+            .position(|object| object.path == document.module_path)
+            .unwrap();
+        document.module_path = alias.to_str().unwrap().into();
+        document.objects[0].path = document.module_path.clone();
+        document.provenance_objects[provenance].path = document.module_path.clone();
+        let alias_manifest = fixture._dir.path().join("alias.json");
+        std::fs::write(&alias_manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut coordinator = fixture.scan_paths(
+            fixture.child.0.id(),
+            vec![fixture.manifest.clone(), alias_manifest],
+        );
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert_eq!(coordinator.attach_set().module_records(), 1);
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused")),
+            "both actual aliases must validate"
+        );
+        let delta = coordinator.take_target_delta();
+        assert_eq!((delta.endpoints.len(), delta.objects.len()), (32, 1));
+    }
+
+    #[test]
+    fn count_manifest_proc_root_locator_uses_the_collected_generation() {
+        use p11scope_manifest::manifest::Manifest;
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        let provenance = document
+            .provenance_objects
+            .iter()
+            .position(|object| object.path == document.module_path)
+            .unwrap();
+        document.module_path = format!(
+            "/proc/{}/root{}",
+            fixture.child.0.id(),
+            fixture.provider.display()
+        );
+        document.objects[0].path = document.module_path.clone();
+        document.provenance_objects[provenance].path = document.module_path.clone();
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let coordinator = fixture.scan(true);
+        assert_eq!(
+            coordinator.attach_set().len(),
+            32,
+            "{:?}",
+            coordinator.registry().gaps()
+        );
+        let outside = fixture.scan_paths(std::process::id(), vec![fixture.manifest.clone()]);
+        assert_eq!(outside.attach_set().len(), 0);
+        assert!(outside.registry().gaps().iter().any(|gap| {
+            gap.reason
+                .contains("locator is outside the collected scope")
+        }));
+    }
+
+    #[test]
+    fn count_manifest_cannot_admit_a_provider_outside_the_collected_pid() {
+        let fixture = CountManifestFixture::new();
+        let coordinator = fixture.scan_paths(std::process::id(), vec![fixture.manifest.clone()]);
+        assert_eq!(coordinator.attach_set().len(), 0);
+        assert!(coordinator.registry().gaps().iter().any(|gap| {
+            gap.reason
+                .contains("not exactly mapped in the collected scope")
+        }));
+    }
+
+    #[test]
+    fn count_manifest_document_reads_obey_the_collector_allowance() {
+        let fixture = CountManifestFixture::new();
+        let mut bytes = vec![b' '; 1 << 20];
+        bytes.extend(std::fs::read(&fixture.manifest).unwrap());
+        std::fs::write(&fixture.manifest, bytes).unwrap();
+        let catalog = crate::inspect_system::collect_pid_with_count_manifests(
+            fixture.child.0.id(),
+            std::slice::from_ref(&fixture.provider),
+            &HookRegistry::builtin(),
+            crate::plan::AdmissionPolicy::Inventory(
+                crate::capacity::InventoryBudget::new(32, 256).unwrap(),
+            ),
+            crate::discovery::scan::CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: 8 << 20,
+                total_bytes: 256 << 10,
+            }),
+            std::slice::from_ref(&fixture.manifest),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.lowering.as_ref().unwrap().plan.slots.len(),
+            0,
+            "a valid but oversized-for-this-window document cannot bypass collection I/O"
+        );
+        assert!(
+            catalog
+                .skipped
+                .iter()
+                .any(|gap| gap.reason.contains("count manifest refused"))
+        );
+    }
+
+    #[test]
+    fn count_manifest_full_and_tail_share_the_scan_inspection_cache() {
+        use std::io::Write as _;
+        let fixture = CountManifestFixture::new();
+        let full = gcc(
+            fixture._dir.path(),
+            "full-copy.so",
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=68"],
+            &[],
+        );
+        // Keep this owned full-copy fixture larger than the helper's fresh
+        // count-read allowance. Every byte is included in the real identity.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&full)
+            .unwrap()
+            .write_all(&vec![0u8; 256 << 10])
+            .unwrap();
+        let full_manifest = fixture._dir.path().join("full.json");
+        let helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("P11SCOPE_TEST_DISCOVERY_PROVIDER", &full)
+            .env("P11SCOPE_TEST_DISCOVERY_MANIFEST", &full_manifest)
+            .output()
+            .unwrap();
+        assert!(helper.status.success(), "{helper:?}");
+        let proof = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance", "--exact", "--ignored", "--nocapture"])
+            .env_clear()
+            .env("P11SCOPE_COUNT_MANIFEST_FULL", &full_manifest)
+            .env("P11SCOPE_COUNT_MANIFEST_TAIL", &fixture.manifest)
+            .output().unwrap();
+        assert!(proof.status.success(), "{proof:?}");
+        let output = String::from_utf8(proof.stdout).unwrap();
+        assert!(output.contains("1 passed; 0 failed;"), "{output}");
+        assert!(
+            output.contains("COUNT_MANIFEST_INPUTS"),
+            "the real cache proof must execute: {output}"
+        );
+    }
+
+    #[test]
+    fn count_manifest_partial_rows_preserve_the_complete_count_only_union() {
+        use p11scope_manifest::manifest::{Manifest, WalkOutcome};
+        let fixture = CountManifestFixture::new();
+        let mut document: Manifest =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        document.surfaces[0].functions.truncate(17);
+        document.surfaces[0].walk = WalkOutcome::Unreadable {
+            detail: "remaining words unavailable".into(),
+        };
+        document.alias_groups.clear();
+        assert!(crate::manifest_input::validate_structure(&document).is_empty());
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut coordinator = fixture.coordinator(Scope::Pid(fixture.child.0.id()));
+        coordinator.set_manifests(vec![fixture.manifest.clone()]);
+        let now = crate::discovery::caller_registry::now_ns();
+        let catalog =
+            coordinator.collector(InventoryScope::Pid(fixture.child.0.id()), None)().unwrap();
+        let plan = &catalog.lowering.as_ref().unwrap().plan;
+        assert_eq!(
+            plan.slots.len(),
+            32,
+            "valid source parts merge before admission"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY)
+        );
+        coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            now,
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(coordinator.engine.selection_claims.is_empty());
+    }
+
+    #[test]
+    fn count_manifest_cgroup_final_member_cut_controls_the_same_plan() {
+        let fixture = CountManifestFixture::new();
+        let group = tempfile::tempdir().unwrap();
+        let pid = fixture.child.0.id();
+        std::fs::write(group.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let scope = crate::scope::cgroup(group.path()).unwrap();
+        let mut coordinator = fixture.coordinator(scope);
+        coordinator.set_manifests(vec![fixture.manifest.clone()]);
+        for allowed in [BTreeSet::from([pid]), BTreeSet::new()] {
+            let mut collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            collection.sample_end(&BTreeSet::from([pid]));
+            assert!(collection.permit(pid).is_some());
+            let catalog = collection.catalog(&allowed);
+            let plan = &catalog.lowering.as_ref().unwrap().plan;
+            assert_eq!(plan.slots.len(), if allowed.is_empty() { 0 } else { 32 });
         }
     }
 

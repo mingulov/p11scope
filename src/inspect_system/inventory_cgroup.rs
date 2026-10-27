@@ -243,6 +243,7 @@ pub(crate) struct CgroupCollectRequest {
     pub(crate) max_scan_pids: Option<usize>,
     pub(crate) scan_budget: CaptureWorkBudget,
     pub(crate) observer: Option<crate::cgroup_stop_acceptance::Observer>,
+    pub(crate) count_manifests: Vec<PathBuf>,
 }
 
 pub(crate) struct CgroupCollection {
@@ -479,10 +480,32 @@ impl CgroupCollection {
                 }
             }
         }
+        for manifest in &bound.count_manifests {
+            let functions = manifest
+                .surfaces
+                .iter()
+                .map(|surface| surface.functions.len())
+                .chain(
+                    manifest
+                        .selection_evidence
+                        .tables
+                        .iter()
+                        .map(|table| table.functions.len()),
+                )
+                .sum::<usize>();
+            if !self
+                .work
+                .charge(functions.saturating_mul(16).saturating_add(1))
+            {
+                return false;
+            }
+            entries = entries.saturating_add(functions);
+        }
         let modules = bound
             .reconciled
             .len()
-            .saturating_add(bound.unresolved.len());
+            .saturating_add(bound.unresolved.len())
+            .saturating_add(bound.count_manifests.len());
         let mut pins = 0usize;
         for pin in bound.aggregate.pinned() {
             if !self
@@ -621,6 +644,7 @@ fn empty_bound() -> Bound {
         reconciled: Vec::new(),
         unresolved: Vec::new(),
         bind_gaps: Vec::new(),
+        count_manifests: Vec::new(),
     }
 }
 fn scope_gap(reason: &str) -> PidGap {
@@ -825,7 +849,7 @@ fn collect_with(
         sweep_unavailable,
         budget,
     };
-    let bound = if work.charge(
+    let mut bound = if work.charge(
         collection
             .members
             .iter()
@@ -853,6 +877,7 @@ fn collect_with(
     } else {
         None
     };
+    prepare_count_manifests(&mut collection, &mut bound, &request.count_manifests);
     if collection.budget.stopped_reason().is_some() && outcome == ScopedCollectionOutcome::Complete
     {
         outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete);
@@ -1309,6 +1334,7 @@ mod tests {
                 total_bytes: 16 << 20,
             }),
             observer: None,
+            count_manifests: Vec::new(),
         }
     }
     fn fixture(pid: u32) -> (tempfile::TempDir, Arc<File>) {

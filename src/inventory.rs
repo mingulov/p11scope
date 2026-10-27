@@ -1248,7 +1248,7 @@ fn run_with_terminal_budget(
     if caller_metadata {
         coordinator.enable_caller_metadata(started_ns)?;
     }
-    coordinator.set_semantic_manifests(manifests.to_vec());
+    coordinator.set_manifests(manifests.to_vec());
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, &numbering);
@@ -7196,7 +7196,11 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "class": record.admission_class,
             "endpoints": record.admission_endpoints,
             "reasons": record.admission_reasons,
-            "note": crate::inspect_system::SCAN_ONLY_NOTE,
+            "note": if record.admission_class.as_deref() == Some("operator") {
+                crate::inspect_system::COUNT_MANIFEST_NOTE
+            } else {
+                crate::inspect_system::SCAN_ONLY_NOTE
+            },
             // Additive (v1): admission-state changes after the first
             // verdict, in order; `[]` while the first verdict stands.
             "history": record.admission_history.iter().map(|change| serde_json::json!({

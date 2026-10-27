@@ -14,6 +14,184 @@ pub(super) struct PendingLeaderExit<Pin> {
     _storage: ResourceLease,
 }
 
+impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    pub(super) fn defer_leader_exit(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        hook_ns: u64,
+        domain: NativeDomainId,
+    ) {
+        if self.leader_link_loss_noted.contains(&caller) || self.adapter.leader_exit_pending(caller)
+        {
+            return;
+        }
+        // This bit lives in the already charged caller. Failed row storage
+        // cannot accidentally restore semantic authority.
+        self.adapter.mark_leader_exit_pending(caller, true);
+        let Some(pin) = self.adapter.share_caller_pin(caller) else {
+            return;
+        };
+        let bytes = std::mem::size_of::<PendingLeaderExit<Source::Pin>>()
+            + std::mem::size_of::<CallerId>()
+            + 2 * OWNED_ALLOCATION_PADDING;
+        let Ok(storage) = self.registry.reserve_semantic_storage(bytes) else {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller), module: None, pid: Some(pid),
+                subject: "leader exit adjudication refused".into(),
+                reason: "pending-exit storage unavailable; original caller custody stays unresolved and semantic inputs refuse".into(),
+                budget: None,
+            });
+            return;
+        };
+        self.pending_leader_exits.insert(
+            caller,
+            PendingLeaderExit {
+                pid,
+                hook_ns,
+                domain,
+                pin,
+                _storage: storage,
+            },
+        );
+    }
+
+    pub(super) fn retry_pending_leader_exits(&mut self) {
+        self.retry_pending_leader_exits_with(&mut LeaderExitReadBudget::for_commit());
+    }
+
+    fn retry_pending_leader_exits_with(&mut self, work: &mut LeaderExitReadBudget) {
+        if self.stopped || self.pending_leader_exits.is_empty() {
+            return;
+        }
+        // Fair bounded scheduling, without collecting the caller population
+        // or walking the whole task set. One caller is tried once per commit.
+        const CALLERS: usize = 8;
+        let mut selected = [None; CALLERS];
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let start = self.leader_exit_cursor.map_or(Unbounded, Excluded);
+        let end = self.leader_exit_cursor.map_or(Unbounded, Included);
+        let keys = self.pending_leader_exits.range((start, Unbounded)).chain(
+            self.pending_leader_exits
+                .range((Unbounded, end))
+                .filter(|_| self.leader_exit_cursor.is_some()),
+        );
+        for (slot, (caller, _)) in selected.iter_mut().zip(keys) {
+            *slot = Some(*caller);
+        }
+        for caller in selected.into_iter().flatten() {
+            if !work.spend(1) {
+                break;
+            }
+            self.leader_exit_cursor = Some(caller);
+            let Some(pending) = self.pending_leader_exits.remove(&caller) else {
+                continue;
+            };
+            if self.adapter.live_id(pending.pid) != Some(caller)
+                || self.adapter.record(caller).is_none_or(|record| {
+                    record.retired
+                        || (self.exit_clocks_comparable && pending.hook_ns < record.admitted_ns)
+                })
+            {
+                self.adapter.mark_leader_exit_pending(caller, false);
+                continue;
+            }
+            match self
+                .adapter
+                .source()
+                .leader_exit_observation(&pending.pin, work)
+            {
+                LeaderExitObservation::GroupExited => {
+                    // The ordinary adapter retirement remains authoritative;
+                    // no inferred survivor gap or tombstone is manufactured.
+                    self.adapter.mark_leader_exit_pending(caller, false);
+                }
+                LeaderExitObservation::LiveNonleader => {
+                    self.record_live_nonleader_loss(caller, pending.pid);
+                }
+                LeaderExitObservation::Unresolved => {
+                    self.pending_leader_exits.insert(caller, pending);
+                }
+            }
+        }
+    }
+
+    fn record_live_nonleader_loss(&mut self, caller: CallerId, pid: u32) {
+        self.adapter.mark_leader_exit_pending(caller, false);
+        if self.leader_link_loss_noted.insert(caller) {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller), module: None, pid: Some(pid),
+                subject: "leader task link loss".into(),
+                reason: "the leader task exited while a same-generation nonleader was proven live and not exiting; original custody is retained with no tombstone, and a later EXEC may renew recovery".into(),
+                budget: None,
+            });
+            if self.semantic_bindings.get(caller).is_some() {
+                self.tail_uncertain.insert(caller);
+            }
+        }
+    }
+
+    pub(super) fn adjudicate_stopped_leader_exit(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        hook_ns: u64,
+        domain: NativeDomainId,
+        work: &mut LeaderExitReadBudget,
+    ) {
+        if self.leader_link_loss_noted.contains(&caller) || self.adapter.leader_exit_pending(caller)
+        {
+            return;
+        }
+        self.adapter.mark_leader_exit_pending(caller, true);
+        let observation = if work.spend(1) {
+            self.adapter
+                .share_caller_pin(caller)
+                .map_or(LeaderExitObservation::Unresolved, |pin| {
+                    self.adapter.source().leader_exit_observation(&pin, work)
+                })
+        } else {
+            LeaderExitObservation::Unresolved
+        };
+        match observation {
+            LeaderExitObservation::GroupExited => self.adapter.mark_leader_exit_pending(caller, false),
+            LeaderExitObservation::LiveNonleader => self.record_live_nonleader_loss(caller, pid),
+            LeaderExitObservation::Unresolved => self.registry.record_gap(RegistryGap {
+                caller: Some(caller), module: None, pid: Some(pid),
+                subject: "leader exit status unresolved at stop".into(),
+                reason: format!("final hook={hook_ns} domain={domain:?} had no live-worker or group-exit proof within the shared final-batch allowance; semantic inputs retain custody refusal"),
+                budget: None,
+            }),
+        }
+        // No reservation, retry row or new retained pin survives this
+        // final disposition. The caller bit keeps unproved inputs fenced.
+    }
+
+    pub(super) fn resolve_leader_exit_for_exec(&mut self, caller: CallerId) {
+        if self.adapter.leader_exit_pending(caller) && self.semantic_bindings.get(caller).is_some()
+        {
+            self.tail_uncertain.insert(caller);
+        }
+        self.pending_leader_exits.remove(&caller);
+        self.adapter.mark_leader_exit_pending(caller, false);
+    }
+
+    pub(super) fn stop_pending_leader_exits(&mut self) {
+        let count = self.pending_leader_exits.len();
+        // Retain the allocation-free fence through final H0 disposition.
+        // Stop releases retry rows, not the caller's original custody.
+        if let Some((caller, pending)) = self.pending_leader_exits.first_key_value() {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(*caller), module: None, pid: Some(pending.pid),
+                subject: "leader exit status unresolved at stop".into(),
+                reason: format!("{count} pending leader exit(s) remain unknown; first hook={} domain={:?}; semantic inputs retain custody refusal", pending.hook_ns, pending.domain),
+                budget: None,
+            });
+        }
+        self.pending_leader_exits.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::NativeScene;
@@ -320,183 +498,5 @@ mod tests {
                 .iter()
                 .any(|gap| gap.subject == "leader task link loss")
         );
-    }
-}
-
-impl<Source: ProcessSource> InventoryCoordinator<Source> {
-    pub(super) fn defer_leader_exit(
-        &mut self,
-        caller: CallerId,
-        pid: u32,
-        hook_ns: u64,
-        domain: NativeDomainId,
-    ) {
-        if self.leader_link_loss_noted.contains(&caller) || self.adapter.leader_exit_pending(caller)
-        {
-            return;
-        }
-        // This bit lives in the already charged caller. Failed row storage
-        // cannot accidentally restore semantic authority.
-        self.adapter.mark_leader_exit_pending(caller, true);
-        let Some(pin) = self.adapter.share_caller_pin(caller) else {
-            return;
-        };
-        let bytes = std::mem::size_of::<PendingLeaderExit<Source::Pin>>()
-            + std::mem::size_of::<CallerId>()
-            + 2 * OWNED_ALLOCATION_PADDING;
-        let Ok(storage) = self.registry.reserve_semantic_storage(bytes) else {
-            self.registry.record_gap(RegistryGap {
-                caller: Some(caller), module: None, pid: Some(pid),
-                subject: "leader exit adjudication refused".into(),
-                reason: "pending-exit storage unavailable; original caller custody stays unresolved and semantic inputs refuse".into(),
-                budget: None,
-            });
-            return;
-        };
-        self.pending_leader_exits.insert(
-            caller,
-            PendingLeaderExit {
-                pid,
-                hook_ns,
-                domain,
-                pin,
-                _storage: storage,
-            },
-        );
-    }
-
-    pub(super) fn retry_pending_leader_exits(&mut self) {
-        self.retry_pending_leader_exits_with(&mut LeaderExitReadBudget::for_commit());
-    }
-
-    fn retry_pending_leader_exits_with(&mut self, work: &mut LeaderExitReadBudget) {
-        if self.stopped || self.pending_leader_exits.is_empty() {
-            return;
-        }
-        // Fair bounded scheduling, without collecting the caller population
-        // or walking the whole task set. One caller is tried once per commit.
-        const CALLERS: usize = 8;
-        let mut selected = [None; CALLERS];
-        use std::ops::Bound::{Excluded, Included, Unbounded};
-        let start = self.leader_exit_cursor.map_or(Unbounded, Excluded);
-        let end = self.leader_exit_cursor.map_or(Unbounded, Included);
-        let keys = self.pending_leader_exits.range((start, Unbounded)).chain(
-            self.pending_leader_exits
-                .range((Unbounded, end))
-                .filter(|_| self.leader_exit_cursor.is_some()),
-        );
-        for (slot, (caller, _)) in selected.iter_mut().zip(keys) {
-            *slot = Some(*caller);
-        }
-        for caller in selected.into_iter().flatten() {
-            if !work.spend(1) {
-                break;
-            }
-            self.leader_exit_cursor = Some(caller);
-            let Some(pending) = self.pending_leader_exits.remove(&caller) else {
-                continue;
-            };
-            if self.adapter.live_id(pending.pid) != Some(caller)
-                || self.adapter.record(caller).is_none_or(|record| {
-                    record.retired
-                        || (self.exit_clocks_comparable && pending.hook_ns < record.admitted_ns)
-                })
-            {
-                self.adapter.mark_leader_exit_pending(caller, false);
-                continue;
-            }
-            match self
-                .adapter
-                .source()
-                .leader_exit_observation(&pending.pin, work)
-            {
-                LeaderExitObservation::GroupExited => {
-                    // The ordinary adapter retirement remains authoritative;
-                    // no inferred survivor gap or tombstone is manufactured.
-                    self.adapter.mark_leader_exit_pending(caller, false);
-                }
-                LeaderExitObservation::LiveNonleader => {
-                    self.record_live_nonleader_loss(caller, pending.pid);
-                }
-                LeaderExitObservation::Unresolved => {
-                    self.pending_leader_exits.insert(caller, pending);
-                }
-            }
-        }
-    }
-
-    fn record_live_nonleader_loss(&mut self, caller: CallerId, pid: u32) {
-        self.adapter.mark_leader_exit_pending(caller, false);
-        if self.leader_link_loss_noted.insert(caller) {
-            self.registry.record_gap(RegistryGap {
-                caller: Some(caller), module: None, pid: Some(pid),
-                subject: "leader task link loss".into(),
-                reason: "the leader task exited while a same-generation nonleader was proven live and not exiting; original custody is retained with no tombstone, and a later EXEC may renew recovery".into(),
-                budget: None,
-            });
-            if self.semantic_bindings.get(caller).is_some() {
-                self.tail_uncertain.insert(caller);
-            }
-        }
-    }
-
-    pub(super) fn adjudicate_stopped_leader_exit(
-        &mut self,
-        caller: CallerId,
-        pid: u32,
-        hook_ns: u64,
-        domain: NativeDomainId,
-        work: &mut LeaderExitReadBudget,
-    ) {
-        if self.leader_link_loss_noted.contains(&caller) || self.adapter.leader_exit_pending(caller)
-        {
-            return;
-        }
-        self.adapter.mark_leader_exit_pending(caller, true);
-        let observation = if work.spend(1) {
-            self.adapter
-                .share_caller_pin(caller)
-                .map_or(LeaderExitObservation::Unresolved, |pin| {
-                    self.adapter.source().leader_exit_observation(&pin, work)
-                })
-        } else {
-            LeaderExitObservation::Unresolved
-        };
-        match observation {
-            LeaderExitObservation::GroupExited => self.adapter.mark_leader_exit_pending(caller, false),
-            LeaderExitObservation::LiveNonleader => self.record_live_nonleader_loss(caller, pid),
-            LeaderExitObservation::Unresolved => self.registry.record_gap(RegistryGap {
-                caller: Some(caller), module: None, pid: Some(pid),
-                subject: "leader exit status unresolved at stop".into(),
-                reason: format!("final hook={hook_ns} domain={domain:?} had no live-worker or group-exit proof within the shared final-batch allowance; semantic inputs retain custody refusal"),
-                budget: None,
-            }),
-        }
-        // No reservation, retry row or new retained pin survives this
-        // final disposition. The caller bit keeps unproved inputs fenced.
-    }
-
-    pub(super) fn resolve_leader_exit_for_exec(&mut self, caller: CallerId) {
-        if self.adapter.leader_exit_pending(caller) && self.semantic_bindings.get(caller).is_some()
-        {
-            self.tail_uncertain.insert(caller);
-        }
-        self.pending_leader_exits.remove(&caller);
-        self.adapter.mark_leader_exit_pending(caller, false);
-    }
-
-    pub(super) fn stop_pending_leader_exits(&mut self) {
-        let count = self.pending_leader_exits.len();
-        // Retain the allocation-free fence through final H0 disposition.
-        // Stop releases retry rows, not the caller's original custody.
-        if let Some((caller, pending)) = self.pending_leader_exits.first_key_value() {
-            self.registry.record_gap(RegistryGap {
-                caller: Some(*caller), module: None, pid: Some(pending.pid),
-                subject: "leader exit status unresolved at stop".into(),
-                reason: format!("{count} pending leader exit(s) remain unknown; first hook={} domain={:?}; semantic inputs retain custody refusal", pending.hook_ns, pending.domain),
-                budget: None,
-            });
-        }
-        self.pending_leader_exits.clear();
     }
 }

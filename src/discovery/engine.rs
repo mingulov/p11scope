@@ -27338,7 +27338,17 @@ impl Engine {
     /// plan; without this the session holds prepared counter banks while the
     /// Engine plan — and therefore the capture's counter owner inputs —
     /// silently leaves the Counters policy.
-    fn restore_counters_policy_after_retain(&mut self, _budget: CounterBudget) -> Result<()> {
+    fn restore_counters_policy_after_retain(&mut self, budget: CounterBudget) -> Result<()> {
+        if matches!(
+            self.plan.admission_policy(),
+            plan::AdmissionPolicy::Counters(kept) if kept == budget
+        ) {
+            return Ok(());
+        }
+        self.plan = self
+            .plan
+            .with_counters_policy(budget)
+            .map_err(|refusal| anyhow!("{refusal}"))?;
         Ok(())
     }
 

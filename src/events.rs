@@ -3940,6 +3940,73 @@ mod tests {
         }
     }
 
+    /// The wire's global capacity does not authorize a legacy getter to emit
+    /// wider snapshots than its own bounded acquisition.
+    #[test]
+    fn discovery_decode_bounds_prefix_by_acquisition_origin() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_KIND_INTERFACE_RETURN, DISCOVERY_NAME_EXACT_STANDARD,
+            DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_V3_2,
+        };
+
+        for (kind, words, expected) in [
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 68, true),
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 69, false),
+            (DISCOVERY_KIND_FUNCTION_LIST_RETURN, 104, false),
+            (DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, 104, true),
+            (DISCOVERY_KIND_INTERFACE_RETURN, 104, true),
+        ] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = kind;
+            record.table_ptr = 0x1000;
+            record.usable_n = words;
+            record.completed_prefix = words;
+            record.pointers_attempted = words;
+            record.pointers[usize::from(words) - 1] = 0x2000;
+            if kind == DISCOVERY_KIND_INTERFACE_RETURN {
+                record.binding_id = 9;
+                record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+                record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                record.selection_version_class = DISCOVERY_VERSION_V3_2;
+            } else {
+                record.symbol_id = 1;
+                record.version_major = 3;
+                record.version_minor = 2;
+                if kind == DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN {
+                    record.symbol_id = 2;
+                    record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                    record.announced_count = 1;
+                }
+            }
+            assert_eq!(
+                decode_discovery(&discovery_bytes(&record)).is_some(),
+                expected,
+                "origin={kind} words={words}"
+            );
+            if kind != DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+                record.pointers_attempted = 105;
+                assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+            }
+        }
+
+        for attempted in [69, 104] {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+            record.symbol_id = 1;
+            record.table_ptr = 0x1000;
+            record.usable_n = 68;
+            record.completed_prefix = 68;
+            record.pointers_attempted = attempted;
+            record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+            record.pointers[67] = 0x2000;
+            assert!(
+                decode_discovery(&discovery_bytes(&record)).is_none(),
+                "legacy attempted={attempted} completed=68"
+            );
+        }
+    }
+
     /// Raw ring decoding must keep a nonempty read-failed prefix and its loss
     /// flag together instead of rejecting all the successfully acquired words.
     #[test]

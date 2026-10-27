@@ -755,7 +755,12 @@ fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
 }
 
 fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
-    if record.pointers_attempted as usize > DISCOVERY_POINTERS
+    let pointer_limit = if record.kind == DISCOVERY_KIND_FUNCTION_LIST_RETURN {
+        68
+    } else {
+        DISCOVERY_POINTERS
+    };
+    if record.pointers_attempted as usize > pointer_limit
         || record.completed_prefix > record.pointers_attempted
         || record.usable_n != record.completed_prefix
     {
@@ -2757,6 +2762,46 @@ mod tests {
         assert!(valid_discovery_record(&selected));
         selected.name_class = DISCOVERY_NAME_OTHER;
         assert!(!valid_discovery_record(&selected));
+    }
+
+    /// A legacy record cannot carry more words than its producer can acquire;
+    /// interface records retain their larger transport capacity.
+    #[test]
+    fn discovery_export_prefix_respects_acquisition_capacity() {
+        for (words, expected) in [(68, true), (69, false), (104, false)] {
+            let mut record = function_list_record();
+            record.version_major = 255;
+            record.version_minor = 255;
+            record.pointers_attempted = words;
+            record.completed_prefix = words;
+            record.usable_n = words;
+            record.pointers[usize::from(words) - 1] = 0x2000;
+            assert_eq!(valid_discovery_record(&record), expected, "legacy {words}");
+        }
+
+        let mut record = function_list_record();
+        record.pointers_attempted = 69;
+        record.completed_prefix = 68;
+        record.usable_n = 68;
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.pointers[67] = 0x2000;
+        assert!(!valid_discovery_record(&record), "attempted-only overflow");
+
+        record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        record.symbol_id = 2;
+        record.announced_count = 1;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.status_flags = 0;
+        record.pointers_attempted = 104;
+        record.completed_prefix = 104;
+        record.usable_n = 104;
+        record.pointers[103] = 0x3000;
+        assert!(valid_discovery_record(&record), "full interface capacity");
+        record.pointers_attempted = 105;
+        assert!(
+            !valid_discovery_record(&record),
+            "interface capacity overflow"
+        );
     }
 
     /// A finite native candidacy value must survive decoding without making

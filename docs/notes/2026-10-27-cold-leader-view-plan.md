@@ -127,3 +127,42 @@ Limits still to verify or retain explicitly:
 Next: controller-scheduled V1 compile and the exact cold/process/scan/loader
 neighbors, then one coherent future-branch peer review. The R48 retirement
 barrier/Finish lane and v0.5.0 candidate stay separate.
+
+## First source-peer residual batch
+
+The independent source review at `099b9f6c` found two blockers. The object
+opener now uses scoped `openat2` only to acquire an `O_PATH` descriptor,
+proves that inode regular, and reopens the held inode through the observer's
+own fd. The native inotify FIFO regression was RED before this change: the
+rejected FIFO still received an open event. It is now GREEN for warm and
+cold views, with regular/symlink and pathname-replacement twins. The two
+old `open_object` consumers retain its 256 MiB cap; Engine's old
+`open_regular` consumers remain governed by their existing reader budgets.
+
+The constructor now checks the passed deadline and work allowance before
+pinning. Scan, scan-object pinning, system member scans, explicit manifest
+locator validation and cgroup pin preparation use their actual passed
+allowance. The cgroup collector starts its existing shared window and
+checkpoint before pin preparation, so constructor work and later scans
+cannot each receive a separate per-PID allowance. Warm filesystem proof
+setup and validation also observe a spent or cancelled allowance.
+
+Eighteen source/native controls pass with the dependency adapters described
+above. Added controls exercise zero work, expired and cancelled controls,
+zero metadata bytes and one remaining shared allowance across two real
+cold groups. A stopped warm-constructor test was RED before the checks.
+These results validate actual constructor/filesystem source plus plumbing;
+the harness's capture-budget implementation is an adapter. The complete
+product's actual `CaptureWorkBudget` tests and fifth engine entrypoint
+regression remain **UNCOMPILED/UNRUN** under the controller's release build
+hold. They must pass before this batch is accepted. No Cargo/live run,
+FD-pressure qualification or warm-cost result is claimed.
+
+One pre-window seam is still unresolved: `Engine::open_inventory_owner`
+opens before an Inventory checkpoint exists. Its old default-budget wrapper
+must not perform a fresh cold census. Passing the inactive Inventory budget
+blindly would also refuse existing warm owners. The proposed conservative
+choice is a warm-only original-custody open at that seam, with a named cold
+refusal and the existing scan-pinned fallback. This requires controller
+adjudication before implementation; no new metadata allowance, synthetic
+window or semantic grant is introduced by this checkpoint.

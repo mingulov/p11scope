@@ -709,13 +709,31 @@ fn collect_with(
     if traversal_started && let Some(observer) = &observer {
         observer.traversed(&work.control);
     }
+    // Pin preparation uses the same scan/window and collection allowance as
+    // later reads; a cold constructor must not renew metadata work per PID.
+    let mut budget = request.scan_budget;
+    budget.set_collection_work(work.hook());
+    let scan_window = if matches!(
+        budget.policy(),
+        crate::discovery::scan::DiscoveryPolicy::Inventory(_)
+    ) {
+        let token = budget
+            .begin_window(crate::discovery::scan::WindowId::new(1), u64::MAX)
+            .expect("collector owns a fresh Inventory budget");
+        let scan = budget
+            .checkpoint(token.clone())
+            .expect("fresh collection window has no scan");
+        Some((token, scan))
+    } else {
+        None
+    };
     let mut pinned = BTreeMap::new();
     let mut requests = BTreeMap::new();
     for (index, (pid, locator)) in candidates.candidates.into_iter().enumerate() {
         if !work.charge(6) {
             break;
         }
-        match ProcessView::open(ProcessViewId(index as u32), pid) {
+        match ProcessView::open_with_budget(ProcessViewId(index as u32), pid, &mut budget) {
             Ok(view) => {
                 let generation = MemberGeneration {
                     start_time: view.start_time(),
@@ -769,22 +787,6 @@ fn collect_with(
         .max_scan_pids
         .unwrap_or(DEFAULT_DEEP_SCAN_LIMIT)
         .clamp(1, PROCESS_PIN_LIMIT);
-    let mut budget = request.scan_budget;
-    budget.set_collection_work(work.hook());
-    let scan_window = if matches!(
-        budget.policy(),
-        crate::discovery::scan::DiscoveryPolicy::Inventory(_)
-    ) {
-        let token = budget
-            .begin_window(crate::discovery::scan::WindowId::new(1), u64::MAX)
-            .expect("collector owns a fresh Inventory budget");
-        let scan = budget
-            .checkpoint(token.clone())
-            .expect("fresh collection window has no scan");
-        Some((token, scan))
-    } else {
-        None
-    };
     let mut timings = StageTimings::new();
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();

@@ -280,3 +280,100 @@ fn cold_target_object_and_cached_mountinfo_use_the_same_retained_filesystem() {
         group.call_three();
     }
 }
+
+#[test]
+fn cold_constructor_obeys_stopped_and_empty_actual_capture_allowances() {
+    use crate::discovery::scan::{CollectionWork, ScanLimits};
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let mut expired = CaptureWorkBudget::default();
+    expired.set_deadline(Some(0));
+    let mut cancelled = CaptureWorkBudget::default();
+    cancelled.set_collection_work(CollectionWork::new(|_| false));
+    let no_bytes = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 0,
+        total_bytes: 0,
+    });
+    for mut work in [
+        CaptureWorkBudget::with_work_ceiling(0),
+        expired,
+        cancelled,
+        no_bytes,
+    ] {
+        assert!(ProcessView::open_with_budget(ProcessViewId(40), group.pid(), &mut work).is_err());
+        assert_eq!(work.attempted_io_bytes(), 0);
+    }
+    let mut work = CaptureWorkBudget::default();
+    let view = ProcessView::open_with_budget(ProcessViewId(41), group.pid(), &mut work).unwrap();
+    assert!(work.attempted_io_bytes() > 0);
+    assert_eq!(view.pid(), group.pid());
+    group.call_three();
+}
+
+#[test]
+fn warm_constructor_does_not_bypass_a_stopped_capture() {
+    use crate::discovery::scan::CollectionWork;
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    let mut expired = CaptureWorkBudget::default();
+    expired.set_deadline(Some(0));
+    let mut cancelled = CaptureWorkBudget::default();
+    cancelled.set_collection_work(CollectionWork::new(|_| false));
+    for mut work in [CaptureWorkBudget::with_work_ceiling(0), expired, cancelled] {
+        assert!(ProcessView::open_with_budget(ProcessViewId(46), group.pid(), &mut work).is_err());
+        assert_eq!(work.attempted_io_bytes(), 0);
+    }
+    ProcessView::open_with_budget(
+        ProcessViewId(47),
+        group.pid(),
+        &mut CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    group.leave_leader();
+    group.call_three();
+}
+
+#[test]
+fn repeated_cold_constructors_share_one_remaining_collection_allowance() {
+    use crate::discovery::scan::CollectionWork;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let mut first = ColdLeaderSubject::spawn(1);
+    let mut second = ColdLeaderSubject::spawn(1);
+    first.leave_leader();
+    second.leave_leader();
+    let measured = Arc::new(AtomicU64::new(0));
+    let seen = measured.clone();
+    let mut calibration = CaptureWorkBudget::default();
+    calibration.set_collection_work(CollectionWork::new(move |units| {
+        seen.fetch_add(units, Ordering::SeqCst);
+        true
+    }));
+    ProcessView::open_with_budget(ProcessViewId(42), first.pid(), &mut calibration).unwrap();
+    let one = measured.load(Ordering::SeqCst);
+    assert!(one > 0);
+    let remaining = Arc::new(AtomicU64::new(one + one / 2));
+    let shared = remaining.clone();
+    let mut work = CaptureWorkBudget::default();
+    work.set_collection_work(CollectionWork::new(move |units| {
+        shared
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(units)
+            })
+            .is_ok()
+    }));
+    ProcessView::open_with_budget(ProcessViewId(43), first.pid(), &mut work).unwrap();
+    let before = work.attempted_io_bytes();
+    assert!(ProcessView::open_with_budget(ProcessViewId(44), second.pid(), &mut work).is_err());
+    assert!(work.attempted_io_bytes() >= before);
+    let stopped = work.attempted_io_bytes();
+    assert!(ProcessView::open_with_budget(ProcessViewId(45), first.pid(), &mut work).is_err());
+    assert_eq!(
+        work.attempted_io_bytes(),
+        stopped,
+        "a failed shared allowance never renews"
+    );
+    first.call_three();
+    second.call_three();
+}

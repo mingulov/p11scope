@@ -3460,7 +3460,7 @@ fn open_in_target(
     budget: &mut CaptureWorkBudget,
 ) -> Result<File, String> {
     view.with_filesystem(budget, |filesystem, _| {
-        filesystem.open_rooted(Path::new(path))
+        filesystem.open_rooted_object(Path::new(path))
     })
 }
 
@@ -4148,7 +4148,7 @@ pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let view = ProcessView::open(ProcessViewId(0), request.pid)?;
+    let view = ProcessView::open_with_budget(ProcessViewId(0), request.pid, budget)?;
     scan_process_view(request, &view, budget)
 }
 

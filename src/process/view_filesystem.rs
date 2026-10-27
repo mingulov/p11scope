@@ -351,6 +351,7 @@ impl<'a> ViewFilesystem<'a> {
         observed_z: impl FnOnce(),
     ) -> Result<Self, String> {
         let deadline = deadline.min(cold_filesystem_deadline(work));
+        spend(work, deadline, 1)?;
         if !require_cold && let Ok(namespace) = mount_namespace_id(pin.pid()) {
             if pin.original_exited()? {
                 return Err("original process exited while its filesystem was identified".into());
@@ -422,10 +423,13 @@ impl<'a> ViewFilesystem<'a> {
     pub(crate) fn validate(&self, work: &mut CaptureWorkBudget) -> Result<(), String> {
         match &self.cold {
             Some(cold) => cold.validate(work),
-            None if !self.pin.original_exited()? => {
+            None => {
+                spend(work, cold_filesystem_deadline(work), 1)?;
+                if self.pin.original_exited()? {
+                    return Err("original process exited during filesystem access".into());
+                }
                 ensure_same_mount_namespace(self.namespace, mount_namespace_id(self.pin.pid())?)
             }
-            None => Err("original process exited during filesystem access".into()),
         }
     }
 
@@ -495,6 +499,21 @@ impl<'a> ViewFilesystem<'a> {
     }
 
     pub(crate) fn open_rooted(&self, path: &Path) -> Result<std::fs::File, String> {
+        let pinned = self.pin_rooted_regular(path)?;
+        Self::open_pinned_regular(&pinned)
+    }
+
+    pub(crate) fn open_rooted_object(&self, path: &Path) -> Result<std::fs::File, String> {
+        let file = self.open_rooted(path)?;
+        let size = file.metadata().map_err(|error| error.to_string())?.len();
+        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+        if size > limit {
+            return Err(format!("object is {size} bytes; limit is {limit}"));
+        }
+        Ok(file)
+    }
+
+    fn pin_rooted_regular(&self, path: &Path) -> Result<std::fs::File, String> {
         if !path.is_absolute()
             || path
                 .components()
@@ -526,7 +545,7 @@ impl<'a> ViewFilesystem<'a> {
             resolve: u64,
         }
         let how = OpenHow {
-            flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY) as u64,
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
             mode: 0,
             // Resolve symlinks within the held target root; magic links
             // cannot redirect an internally scoped target open elsewhere.
@@ -560,12 +579,150 @@ impl<'a> ViewFilesystem<'a> {
         }
         Ok(file)
     }
+
+    fn open_pinned_regular(pinned: &std::fs::File) -> Result<std::fs::File, String> {
+        // pin_rooted_regular proved the inode before any readable open. Reopen
+        // that held inode, so pathname replacement cannot invoke special-file
+        // open semantics and ordinary provider symlinks remain supported.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+            .map_err(|error| format!("opening pinned target-root regular file: {error}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    #[test]
+    fn rooted_fifo_is_rejected_without_readable_open_side_effects() {
+        for cold in [false, true] {
+            let mut group = ColdLeaderSubject::spawn(1);
+            if cold {
+                group.leave_leader();
+            }
+            let pin = PidPin::open(group.pid()).unwrap();
+            let mut work = CaptureWorkBudget::default();
+            let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+            let fifo = group.program.with_file_name("replacement-fifo");
+            let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: internally owned path and ordinary user-only FIFO mode.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            // SAFETY: inotify returns a new owned fd, no target opens occur.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let mut watcher = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            // SAFETY: live inotify fd, owned path, finite event mask.
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN)
+                } >= 0
+            );
+            assert!(
+                proof
+                    .open_rooted(&fifo)
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+            let mut events = [0u8; 512];
+            let read = watcher.read(&mut events);
+            assert!(
+                matches!(read, Err(ref error) if error.kind() == io::ErrorKind::WouldBlock),
+                "O_PATH rejection must not invoke a readable FIFO open: {read:?}, cold={cold}"
+            );
+            proof.validate(&mut work).unwrap();
+            if !cold {
+                group.leave_leader();
+            }
+            group.call_three();
+        }
+    }
+
+    #[test]
+    fn rooted_regular_symlink_and_replacement_keep_the_pinned_inode() {
+        for cold in [false, true] {
+            let mut group = ColdLeaderSubject::spawn(1);
+            if cold {
+                group.leave_leader();
+            }
+            let pin = PidPin::open(group.pid()).unwrap();
+            let mut work = CaptureWorkBudget::default();
+            let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+            let regular = group.program.with_file_name("ordinary-object");
+            let alias = group.program.with_file_name("provider-alias");
+            std::fs::write(&regular, b"original regular inode").unwrap();
+            std::os::unix::fs::symlink(&regular, &alias).unwrap();
+            for path in [&regular, &alias] {
+                let mut file = proof.open_rooted(path).unwrap();
+                let mut body = String::new();
+                file.read_to_string(&mut body).unwrap();
+                assert_eq!(body, "original regular inode");
+            }
+
+            let pinned = proof.pin_rooted_regular(&alias).unwrap();
+            let held = pinned.metadata().unwrap();
+            std::fs::rename(&regular, regular.with_extension("held")).unwrap();
+            let replacement =
+                std::ffi::CString::new(regular.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: owned pathname; replacement occurs after the regular pin.
+            assert_eq!(unsafe { libc::mkfifo(replacement.as_ptr(), 0o600) }, 0);
+            let mut file = ViewFilesystem::open_pinned_regular(&pinned).unwrap();
+            let actual = file.metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), (held.dev(), held.ino()));
+            let mut body = String::new();
+            file.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "original regular inode");
+            assert!(
+                proof
+                    .open_rooted(&alias)
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+            proof.validate(&mut work).unwrap();
+            if !cold {
+                group.leave_leader();
+            }
+            group.call_three();
+        }
+    }
+
+    #[test]
+    fn rooted_object_retains_the_existing_size_policy() {
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+        let large = group.program.with_file_name("large-sparse-object");
+        let file = std::fs::File::create(&large).unwrap();
+        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+        file.set_len(limit + 1).unwrap();
+        assert_eq!(
+            proof.open_rooted(&large).unwrap().metadata().unwrap().len(),
+            limit + 1
+        );
+        assert!(
+            proof
+                .open_rooted_object(&large)
+                .unwrap_err()
+                .contains("limit is")
+        );
+        file.set_len(limit).unwrap();
+        assert_eq!(
+            proof
+                .open_rooted_object(&large)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            limit
+        );
+        proof.validate(&mut work).unwrap();
+        group.call_three();
+    }
 
     #[test]
     fn an_expired_shared_snapshot_cutoff_is_not_renewed_for_a_pid() {

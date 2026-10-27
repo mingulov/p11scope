@@ -6822,7 +6822,7 @@ pub fn pin_scanned_objects(
     let id = modules
         .first()
         .map_or(ProcessViewId(0), |module| module.view);
-    let view = ProcessView::open(id, pid)?;
+    let view = ProcessView::open_with_budget(id, pid, budget)?;
     let (local, mut skipped) = pin_scanned_view_objects(&view, modules, budget)?;
     let mut aggregate = PinnedObjects::empty();
     skipped.extend(aggregate.absorb(local));
@@ -7101,7 +7101,7 @@ fn pin_scanned_object(
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let (file, mountinfo) = view.open_then_cached_mountinfo(
-        |filesystem| filesystem.open_rooted(Path::new(&raw.path)),
+        |filesystem| filesystem.open_rooted_object(Path::new(&raw.path)),
         mounts,
         budget,
     )?;

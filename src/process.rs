@@ -545,6 +545,10 @@ impl ProcessView {
         pid: u32,
         work: &mut CaptureWorkBudget,
     ) -> Result<Self, String> {
+        if let Some(reason) = work.check_deadline_now() {
+            return Err(reason.into());
+        }
+        work.spend(1).map_err(str::to_owned)?;
         let ((pin, mount_namespace, cold_filesystem), admitted_ns) = validated_with_admission_time(
             || {
                 let pin = PidPin::open(pid)?;

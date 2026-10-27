@@ -155,3 +155,32 @@ fn cold_group_sweep_does_not_classify_ended_metadata_as_empty_success() {
         "an unresolved empty map snapshot stays unavailable"
     );
 }
+
+#[test]
+fn cold_scan_and_pin_entrypoints_use_the_passed_capture_budget() {
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let hooks = HookRegistry::builtin();
+    let hints = [group.program.clone()];
+    let request = crate::discovery::scan::ScanRequest {
+        pid: group.pid(),
+        hints: &hints,
+        hooks: &hooks,
+    };
+    let mut scan_budget = CaptureWorkBudget::with_work_ceiling(0);
+    assert!(crate::discovery::scan::scan_pid(&request, &mut scan_budget).is_err());
+    assert_eq!(scan_budget.attempted_io_bytes(), 0);
+    let mut pin_budget = CaptureWorkBudget::with_work_ceiling(0);
+    assert!(
+        crate::discovery::identity::pin_scanned_objects(group.pid(), &[], &mut pin_budget).is_err()
+    );
+    assert_eq!(pin_budget.attempted_io_bytes(), 0);
+    let mut healthy = CaptureWorkBudget::default();
+    let scan = crate::discovery::scan::scan_pid(&request, &mut healthy).unwrap();
+    assert!(
+        scan.modules()
+            .iter()
+            .any(|module| Path::new(&module.path) == group.program)
+    );
+    group.call_three();
+}

@@ -1145,6 +1145,64 @@ trait CaptureIo {
     }
 }
 
+// Private H0 collection keeps the lane's retained readers together.
+fn collect_attested_with<T>(
+    owner: &mut T,
+    limit: usize,
+    _dequeue: impl FnMut(&mut T) -> anyhow::Result<Option<crate::events::DiscoveryItem>>,
+    collect_events: impl FnOnce(&mut T, usize) -> Collection,
+) -> Collection {
+    collect_events(owner, limit)
+}
+
+fn collect_session_events(session: &mut Session, limit: usize) -> Collection {
+    let Ok((drain, table)) = session.event_drain_with_object_table() else {
+        return Collection {
+            records: Vec::new(),
+            status: CollectionStatus::ReadError,
+        };
+    };
+    collect_event_prefix(drain, table, limit)
+}
+
+fn collect_event_prefix<S: crate::events::RecordSource>(
+    drain: &mut crate::events::EventDrain<S>,
+    table: Option<
+        &[p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
+             p11scope_ebpf_common::MAX_DESCRIPTORS as usize],
+    >,
+    limit: usize,
+) -> Collection {
+    let malformed = drain.malformed();
+    let mut records = Vec::with_capacity(limit);
+    // Only the attested allowlisted lane decodes 608-byte records;
+    // every other lane stays 368-byte-only through the same cursor.
+    match table {
+        Some(table) => {
+            drain.poll_object_records(Some(limit), table, |record| {
+                records.push(record);
+                ControlFlow::Continue(())
+            });
+        }
+        None => {
+            drain.poll_records(Some(limit), |record| {
+                records.push(DecodedEventRecord {
+                    joint_resource: None,
+                    base: record,
+                    object: None,
+                });
+                ControlFlow::Continue(())
+            });
+        }
+    }
+    let status = if drain.malformed() != malformed {
+        CollectionStatus::Malformed
+    } else {
+        CollectionStatus::Complete
+    };
+    Collection { records, status }
+}
+
 struct SessionIo<'a> {
     session: &'a mut Session,
     targets: &'a [Arc<PidPin>],
@@ -1157,40 +1215,12 @@ impl CaptureIo for SessionIo<'_> {
         Instant::now()
     }
     fn collect(&mut self, limit: usize) -> Collection {
-        let Ok((drain, table)) = self.session.event_drain_with_object_table() else {
-            return Collection {
-                records: Vec::new(),
-                status: CollectionStatus::ReadError,
-            };
-        };
-        let malformed = drain.malformed();
-        let mut records = Vec::with_capacity(limit);
-        // Only the attested allowlisted lane decodes 608-byte records;
-        // every other lane stays 368-byte-only through the same cursor.
-        match table {
-            Some(table) => {
-                drain.poll_object_records(Some(limit), table, |record| {
-                    records.push(record);
-                    ControlFlow::Continue(())
-                });
-            }
-            None => {
-                drain.poll_records(Some(limit), |record| {
-                    records.push(DecodedEventRecord {
-                        joint_resource: None,
-                        base: record,
-                        object: None,
-                    });
-                    ControlFlow::Continue(())
-                });
-            }
-        }
-        let status = if drain.malformed() != malformed {
-            CollectionStatus::Malformed
-        } else {
-            CollectionStatus::Complete
-        };
-        Collection { records, status }
+        collect_attested_with(
+            self.session,
+            limit,
+            Session::discovery_dequeue,
+            collect_session_events,
+        )
     }
     fn health(&mut self) -> Result<Health, ()> {
         self.session.audit_image_continuity().map_err(|_| ())?;
@@ -3713,3 +3743,158 @@ pub(crate) fn deliver_collected_raw_for_resource_test(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod discovery_service_tests {
+    use super::*;
+    use crate::events::{BoundedRecordSource, DiscoveryDrain, EventDrain, ScriptedRecords};
+    use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, DiscoveryRecord, Event};
+
+    struct Readers {
+        discovery: DiscoveryDrain<ScriptedRecords>,
+        events: EventDrain<ScriptedRecords>,
+    }
+
+    impl Readers {
+        fn new(discovery: Vec<Vec<u8>>, events: Vec<Vec<u8>>) -> Self {
+            let discovery_bound = discovery.len();
+            let events_bound = events.len();
+            Self {
+                discovery: DiscoveryDrain::over(ScriptedRecords::records(
+                    discovery,
+                    discovery_bound,
+                )),
+                events: EventDrain::over(ScriptedRecords::records(events, events_bound)),
+            }
+        }
+
+        fn collect(&mut self, limit: usize) -> Collection {
+            collect_attested_with(
+                self,
+                limit,
+                |readers| Ok(readers.discovery.dequeue()),
+                |readers, limit| collect_event_prefix(&mut readers.events, None, limit),
+            )
+        }
+    }
+
+    fn lifecycle() -> Vec<u8> {
+        // This wire type contains only integer fields; all reserved bytes stay zero.
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = (7u64 << 32) | 7;
+        record.hook_ts_ns = 1;
+        record.kind = DISCOVERY_KIND_EXEC;
+        unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of::<DiscoveryRecord>(),
+            )
+        }
+        .to_vec()
+    }
+
+    fn event(ts_ns: u64) -> Vec<u8> {
+        crate::events::event_bytes(&Event {
+            ts_ns,
+            pid_tgid: (7u64 << 32) | 7,
+            event_type: event_type::CALL,
+            ..Event::default()
+        })
+    }
+
+    #[test]
+    fn live_collection_advances_owned_discovery_before_terminal_drain() {
+        let mut readers = Readers::new(vec![lifecycle(); 33], vec![event(1), event(2), event(3)]);
+        assert_eq!(readers.discovery.source().consumer(), 0);
+        for (remaining, consumed, ts_ns) in [(17, 128, 1), (1, 256, 2), (0, 264, 3)] {
+            let collected = readers.collect(1);
+            assert!(collected.status == CollectionStatus::Complete);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+            assert_eq!(readers.discovery.source().remaining(), remaining);
+            assert_eq!(readers.discovery.source().consumer(), consumed);
+        }
+    }
+
+    #[test]
+    fn malformed_discovery_spends_quantum_without_starving_events() {
+        let mut readers = Readers::new(vec![vec![0]; 34], vec![event(1), event(2), event(3)]);
+        for (remaining, ts_ns) in [(18, 1), (2, 2), (0, 3)] {
+            let collected = readers.collect(1);
+            assert!(collected.status == CollectionStatus::Malformed);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+            assert_eq!(readers.discovery.source().remaining(), remaining);
+        }
+    }
+
+    #[test]
+    fn discovery_read_error_keeps_each_events_prefix() {
+        let mut readers = Readers::new(vec![], vec![event(1), event(2)]);
+        for ts_ns in [1, 2] {
+            let collected = collect_attested_with(
+                &mut readers,
+                1,
+                |_| anyhow::bail!("owned discovery reader unavailable"),
+                |readers, limit| collect_event_prefix(&mut readers.events, None, limit),
+            );
+            assert!(collected.status == CollectionStatus::ReadError);
+            assert_eq!(collected.records.len(), 1);
+            assert_eq!(collected.records[0].base.event.ts_ns, ts_ns);
+        }
+        assert_eq!(readers.events.source().remaining(), 0);
+    }
+
+    #[test]
+    fn empty_discovery_keeps_empty_events_complete() {
+        let mut readers = Readers::new(vec![], vec![]);
+        let collected = readers.collect(1);
+        assert!(collected.status == CollectionStatus::Complete);
+        assert!(collected.records.is_empty());
+        assert_eq!(readers.discovery.source().consumer(), 0);
+        assert_eq!(readers.events.source().consumer(), 0);
+    }
+
+    #[test]
+    fn discovery_service_respects_zero_events_limit() {
+        let mut readers = Readers::new(vec![lifecycle(); 17], vec![event(1)]);
+        let collected = readers.collect(0);
+        assert!(collected.status == CollectionStatus::Complete);
+        assert!(collected.records.is_empty());
+        assert_eq!(readers.discovery.source().remaining(), 1);
+        assert_eq!(readers.events.source().remaining(), 1);
+        assert_eq!(readers.events.source().consumer(), 0);
+    }
+
+    #[test]
+    fn discovery_success_preserves_events_malformed_prefix_and_limit() {
+        let mut readers = Readers::new(vec![lifecycle()], vec![event(1), vec![0], event(2)]);
+        let collected = readers.collect(2);
+        assert!(collected.status == CollectionStatus::Malformed);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.records[0].base.event.ts_ns, 1);
+        assert_eq!(readers.events.source().remaining(), 1);
+        let next = readers.collect(1);
+        assert!(next.status == CollectionStatus::Complete);
+        assert_eq!(next.records[0].base.event.ts_ns, 2);
+    }
+
+    #[test]
+    fn discovery_malformed_preserves_events_read_error_and_prefix() {
+        let mut readers = Readers::new(vec![vec![0]], vec![event(1)]);
+        let collected = collect_attested_with(
+            &mut readers,
+            1,
+            |readers| Ok(readers.discovery.dequeue()),
+            |readers, limit| {
+                let mut collected = collect_event_prefix(&mut readers.events, None, limit);
+                // The EVENTS cursor was obtained and yielded a genuine prefix before failure.
+                collected.status = CollectionStatus::ReadError;
+                collected
+            },
+        );
+        assert!(collected.status == CollectionStatus::ReadError);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.records[0].base.event.ts_ns, 1);
+    }
+}

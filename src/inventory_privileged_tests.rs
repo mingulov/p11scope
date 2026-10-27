@@ -4465,27 +4465,28 @@ fn joint_branch(coordinator: &InventoryCoordinator<OsProcessSource>) -> JointBra
 
 /// Uniform semantic reconciliation (release-path §4.3): every entered
 /// fixture call is attributed on its edge (`api`), refused at input
-/// as count-only (`slot`), or shed in the named caller-less
-/// route-loss gap whose total the lane counts (`shed`). Only
-/// fixtures call into the providers, so the lane shed total is all
-/// fixture calls. Per-owner api/slot never exceed their ledger
-/// splits (no over-attribution, no over-refusal); the global entered
-/// equation then subsumes strict per-owner exactness when nothing
-/// sheds, and accepts exactly the disclosed outcome otherwise. A
-/// silent drop breaks the equation. Capacity shed has no counter, so
-/// any capacity gap fails; shed without a printed named gap (or with
-/// suppressed disclosure) fails too.
+/// as count-only (`slot`), refused before application for an unproven
+/// or unbound instance (`inst`, counted per call), or shed in the
+/// named caller-less route-loss gap whose total the lane counts
+/// (`shed`). Only fixtures call into the providers, so the lane shed
+/// total is all fixture calls. Per-owner api/slot never exceed their
+/// ledger splits (no over-attribution, no over-refusal); the global
+/// entered equation then subsumes strict per-owner exactness when
+/// nothing sheds, and accepts exactly the disclosed outcome
+/// otherwise. A silent drop breaks the equation. Capacity shed has
+/// no counter, so any capacity gap fails; shed without a printed
+/// named gap (or with suppressed disclosure) fails too.
 ///
-/// Owners are (name, sem, count_only, entered, api, slot).
+/// Owners are (name, sem, count_only, entered, api, slot, inst).
 fn assert_semantic_reconciled(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     lane_shed: u64,
     tag: &str,
-    owners: &[(&str, u64, u64, u64, u64, u64)],
+    owners: &[(&str, u64, u64, u64, u64, u64, u64)],
 ) -> Result<()> {
     let mut parts = Vec::new();
-    let (mut entered_sum, mut api_sum, mut slot_sum) = (0u64, 0u64, 0u64);
-    for (name, sem, count_only, entered, api, slot) in owners {
+    let (mut entered_sum, mut api_sum, mut slot_sum, mut inst_sum) = (0u64, 0u64, 0u64, 0u64);
+    for (name, sem, count_only, entered, api, slot, inst) in owners {
         ensure!(
             api <= sem,
             "{tag}: {name} never over-attributes: api {api} <= sem {sem}"
@@ -4495,11 +4496,12 @@ fn assert_semantic_reconciled(
             "{tag}: {name} never over-refuses: slot {slot} <= count-only {count_only}"
         );
         parts.push(format!(
-            "{name}(entered={entered} sem={sem} api={api} co={count_only} slot={slot})"
+            "{name}(entered={entered} sem={sem} api={api} co={count_only} slot={slot} inst={inst})"
         ));
         entered_sum += entered;
         api_sum += api;
         slot_sum += slot;
+        inst_sum += inst;
     }
     let unrouted_entries = count_callerless_gap_entries(coordinator, "semantic calls unrouted");
     let capacity_entries =
@@ -4521,9 +4523,9 @@ fn assert_semantic_reconciled(
          entries {unrouted_entries}, suppressed {suppressed}"
     );
     ensure!(
-        entered_sum == api_sum + lane_shed + slot_sum,
-        "{tag}: every entered call is attributed, slot-refused or disclosed-shed: \
-         entered {entered_sum} vs api {api_sum} + shed {lane_shed} + slot {slot_sum}"
+        entered_sum == api_sum + lane_shed + slot_sum + inst_sum,
+        "{tag}: every entered call is attributed, slot-refused, instance-refused or disclosed-shed: \
+         entered {entered_sum} vs api {api_sum} + shed {lane_shed} + slot {slot_sum} + inst {inst_sum}"
     );
     Ok(())
 }
@@ -5570,13 +5572,15 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         "slot",
         Some(caller_b),
     );
+    let inst_a = coordinator.registry().instance_calls_refused(caller_a);
+    let inst_b = coordinator.registry().instance_calls_refused(caller_b);
     assert_semantic_reconciled(
         &coordinator,
         lane.shed_calls_disclosed(),
         "r16-q2",
         &[
-            ("A", a_semantic, a_count_only, a_total, api_a, slot_a),
-            ("B", b_semantic, b_count_only, b_total, api_b, slot_b),
+            ("A", a_semantic, a_count_only, a_total, api_a, slot_a, inst_a),
+            ("B", b_semantic, b_count_only, b_total, api_b, slot_b, inst_b),
         ],
     )?;
     // Op-level asserts hold per fully attributed owner; a shed owner
@@ -5980,11 +5984,12 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         "slot",
         Some(caller_a),
     );
+    let inst_a = coordinator.registry().instance_calls_refused(caller_a);
     assert_semantic_reconciled(
         &coordinator,
         lane_a.shed_calls_disclosed(),
         "r16c-qa",
-        &[("A", a_semantic, a_count_only, a_total, api_a, slot_a)],
+        &[("A", a_semantic, a_count_only, a_total, api_a, slot_a, inst_a)],
     )?;
     if a_complete {
         let edge = edge_a_row.as_ref().expect("complete implies a row");
@@ -6291,11 +6296,12 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         "slot",
         Some(caller_b),
     );
+    let inst_b = coordinator.registry().instance_calls_refused(caller_b);
     assert_semantic_reconciled(
         coordinator,
         lane_b.shed_calls_disclosed(),
         "r16c-qb",
-        &[("B", b_semantic, b_count_only, b_total, api_b, slot_b)],
+        &[("B", b_semantic, b_count_only, b_total, api_b, slot_b, inst_b)],
     )?;
     if b_complete {
         let edge = edge_b_row.as_ref().expect("complete implies a row");
@@ -7543,6 +7549,10 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     let slot_e = slot_by_caller(caller_e);
     let slot_c = slot_by_caller(caller_c);
     let slot_h = slot_by_caller(caller_h);
+    let inst_by_caller = |caller| coordinator.registry().instance_calls_refused(caller);
+    let inst_e = inst_by_caller(caller_e);
+    let inst_c = inst_by_caller(caller_c);
+    let inst_h = inst_by_caller(caller_h);
     assert_semantic_reconciled(
         &coordinator,
         lane.shed_calls_disclosed(),
@@ -7555,9 +7565,10 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
                 e_total + 3 * gen0_probes,
                 api_e,
                 slot_e,
+                inst_e,
             ),
-            ("C", c_semantic, c_count_only, c_total, api_c, slot_c),
-            ("H", h_semantic, h_count_only, h_total, api_h, slot_h),
+            ("C", c_semantic, c_count_only, c_total, api_c, slot_c, inst_c),
+            ("H", h_semantic, h_count_only, h_total, api_h, slot_h, inst_h),
         ],
     )?;
     if joint_world {

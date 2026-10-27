@@ -2367,6 +2367,19 @@ impl CallerRegistry {
         self.staged.push(Mutation::RetireInstance(input));
     }
 
+    /// Count one call refused before application for an unproven or
+    /// unbound instance (R-59). Registration refusals never count:
+    /// only the pre-`api_returns` returns of `apply_instance_call`
+    /// call this.
+    fn count_refused_instance_call(&mut self, caller: CallerId) {
+        let entry = self
+            .instance_state
+            .instance_calls_refused
+            .entry(caller)
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
     fn instance_gap(
         &mut self,
         caller: Option<CallerId>,
@@ -2609,6 +2622,7 @@ impl CallerRegistry {
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let Some(id) = self.instance_state.by_key.get(&input.key).copied() else {
+            self.count_refused_instance_call(input.caller);
             self.instance_gap(
                 Some(input.caller),
                 self.modules_by_key.get(&input.key.module).copied(),
@@ -2620,6 +2634,7 @@ impl CallerRegistry {
         let record = &self.instance_state.records[&id];
         let module = record.module;
         if record.caller != input.caller || input.position.domain != input.key.domain {
+            self.count_refused_instance_call(input.caller);
             self.instance_gap(
                 Some(input.caller),
                 Some(module),

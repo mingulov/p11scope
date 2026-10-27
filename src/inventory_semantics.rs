@@ -1912,6 +1912,18 @@ impl AttestedSemanticLane {
         self.has_joint_machine() && !self.is_finished()
     }
 
+    /// Take the machine's retained audit frame for the exit-hold
+    /// abandon, if it holds one. Substituted lanes and frameless
+    /// machines yield None (the unapplied abandon needs no frame).
+    pub(crate) fn take_joint_frame_for_abandon(
+        &mut self,
+    ) -> Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum> {
+        self.live
+            .as_mut()
+            .and_then(|live| live.joint_machine.as_mut())
+            .and_then(|machine| machine.take_abandoned_frame())
+    }
+
     /// Force the retained-frame answer for the retire-gate tests.
     #[cfg(test)]
     pub(crate) fn set_test_joint_frame(&mut self, on: bool) {

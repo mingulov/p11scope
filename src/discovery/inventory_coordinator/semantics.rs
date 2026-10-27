@@ -2436,6 +2436,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         lane.note_shed_calls(total);
     }
 
+    /// Resolve semantic batches a latched machine stranded behind
+    /// its unfinished Joint publication, so the exit-hold abandon
+    /// strands neither a Prepared blocker nor an unpublished batch.
+    /// Stub: the twins pin the contract; the drain/drop follows with
+    /// the abandon.
+    pub(crate) fn abandon_stranded_semantic_batches(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    ) {
+        let _ = lane;
+    }
+
     /// The private semantic finalizer: consumes pending semantic batches,
     /// validates receipts through the lane owner, and alone constructs H2
     /// envelopes, staged negatives first, validated registrations second
@@ -3830,6 +3842,62 @@ mod finalizer_history_tests {
                 1
             )],
             "the drop shed keeps its drop label and route labels"
+        );
+    }
+
+    #[test]
+    fn abandon_stranded_collected_batch_drops_through_the_audited_path() {
+        use crate::discovery::instances::UnknownReason;
+        // A Collected batch stranded by the latched machine drops
+        // through the audited path at abandon: its H3 shed shadow
+        // lands immediately and its unjoined calls shed once with
+        // the abandon label, so the stop-line identity holds without
+        // a later commit.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        let batch = drop_test_batch(
+            domain,
+            vec![
+                Route::Joined(InstanceId::from_raw(1)),
+                Route::Unknown(UnknownReason::Unobserved),
+                Route::Pending,
+            ],
+        );
+        coordinator.stage_semantic_batch(batch);
+        assert!(
+            coordinator.joint_domain_has_pending_work(domain),
+            "the staged batch pends its finalization"
+        );
+        coordinator.abandon_stranded_semantic_batches(&mut lane);
+        assert!(
+            !coordinator.joint_domain_has_pending_work(domain),
+            "the abandon resolves the stranded batch"
+        );
+        assert_eq!(
+            coordinator
+                .semantic_finalizer
+                .as_ref()
+                .expect("the namespace survives the abandon")
+                .pending_drop,
+            Some((1, false)),
+            "the drop shadows the batch's lowest position"
+        );
+        assert_eq!(
+            lane.shed_calls_disclosed(),
+            2,
+            "the unknown plus the pending call shed once; the joined call stays joined"
+        );
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            unrouted_gap_reasons(&coordinator),
+            vec![(
+                "2 calls shed from a dropped abandoned batch (pending=1 unobserved=1) with 0 bindings"
+                    .to_string(),
+                1
+            )],
+            "the drop shed keeps its abandon label and route labels"
         );
     }
 

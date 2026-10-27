@@ -14382,6 +14382,83 @@ mod tests {
     }
 
     #[test]
+    fn abandon_unfinished_joint_publication_without_pending_work_is_a_quiet_noop() {
+        // Healthy twin: with no unfinished publication the abandon is
+        // a quiet no-op (no gap, nothing cleared), and the later plain
+        // commit succeeds.
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        assert!(
+            lane.take_joint_frame_for_abandon().is_none(),
+            "a substituted lane holds no frame to abandon"
+        );
+        assert!(
+            !coordinator.publication_pending(),
+            "the bare coordinator pends nothing"
+        );
+        coordinator.abandon_unfinished_joint_publication(
+            &mut lane,
+            None,
+            "test noop".to_string(),
+        );
+        assert!(
+            !coordinator.publication_pending(),
+            "the no-op clears nothing"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .iter()
+                .all(|(subject, _)| subject != "unfinished joint publication abandoned"),
+            "the no-op stages no abandon gap"
+        );
+        coordinator
+            .commit_batch(false)
+            .expect("a later plain commit succeeds");
+    }
+
+    #[test]
+    fn hold_joint_lane_for_exit_abandons_a_pending_publication_before_its_abandon_commit() {
+        // The exit hold abandons the coordinator's unfinished Joint
+        // publication before its abandon commit: the prepared physical
+        // work publishes, the abandon stages its named gap, and the
+        // later plain commit succeeds instead of refusing past the wedge.
+        let mut coordinator = coordinator();
+        coordinator.pose_pending_joint_publication_for_test();
+        assert!(
+            coordinator.publication_pending(),
+            "the pose stands in for the wedge"
+        );
+        let lane = joint_lane(WindDownIo::completing(), false);
+        let mut display = None;
+        let mut warn = WarnSink { display: &mut display };
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "test wedge",
+            "joint work abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert!(
+            !coordinator.publication_pending(),
+            "the hold abandons the unfinished publication"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .iter()
+                .any(|(subject, _)| subject == "unfinished joint publication abandoned"),
+            "the abandon stages its named gap"
+        );
+        coordinator
+            .commit_batch(false)
+            .expect("a later plain commit succeeds past the abandoned publication");
+    }
+
+    #[test]
     fn joint_poll_commit_legacy_lane_keeps_sync_commit() {
         // Lock-in: a legacy lane's poll_commit is today's sync commit
         // plus Published, with no Joint flag, begin or poll.

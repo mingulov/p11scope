@@ -2559,6 +2559,325 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
     }
 }
 
+#[test]
+fn joint_machine_abandon_cancels_an_unapplied_publication() {
+    // The exit-hold abandon cancels an unfinished publication the
+    // commit prepared but never applied: the cancel clears both
+    // halves, stages the named loss gap, and the later plain commit
+    // succeeds instead of refusing past the wedge.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.reach_phase("Audited");
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the prepared commit pends its publication"
+    );
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied(),
+        "no Audited poll applied it yet"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .is_none(),
+        "the Staging finish consumed the prepared batch"
+    );
+    assert!(
+        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        "the fixture drives its machine beside the lane, not inside it"
+    );
+    let frame = fixture.machine.take_abandoned_frame();
+    assert!(frame.is_some(), "the Audited phase retains its frame");
+    {
+        let scene = &mut fixture.scene.real;
+        scene.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut scene.lane,
+            frame,
+            "test abandon".to_string(),
+        );
+    }
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon clears the unfinished publication"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .iter()
+            .any(|(subject, _)| subject == "unfinished joint publication abandoned"),
+        "the abandon stages its named gap"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .expect("a later plain commit succeeds past the abandoned publication");
+}
+
+#[test]
+fn joint_machine_abandon_finishes_an_applied_publication() {
+    use crate::inventory_semantics::JointServiceProgress;
+    // The exit-hold abandon finishes an applied publication the seal
+    // never completed: it disposes the retained frame without seal
+    // proof, finishes the applied registry work, stages the named
+    // loss gap, and the later plain commit succeeds.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(
+        applied,
+        "the seal takes more than one poll to publish its consumers"
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the unfinished publication still pends"
+    );
+    assert!(
+        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        "the fixture drives its machine beside the lane, not inside it"
+    );
+    let frame = fixture.machine.take_abandoned_frame();
+    assert!(frame.is_some(), "the Audited phase retains its frame");
+    {
+        let scene = &mut fixture.scene.real;
+        scene.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut scene.lane,
+            frame,
+            "test abandon".to_string(),
+        );
+    }
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon finishes the applied publication"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .iter()
+            .any(|(subject, _)| subject == "unfinished joint publication abandoned"),
+        "the abandon stages its named gap"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .expect("a later plain commit succeeds past the abandoned publication");
+}
+
+#[test]
+fn joint_machine_abandon_drains_a_stranded_prepared_batch() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::H3DispositionEvidence;
+    // A Prepared batch stranded by the latch drains S1-direct and
+    // mints its H3 at abandon: no Prepared blocker survives to wedge
+    // later finalizations, and the later plain commit succeeds.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_SignInit", 2);
+    let mut stranded = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .is_some()
+        {
+            stranded = true;
+            break;
+        }
+    }
+    assert!(
+        stranded,
+        "the drive strands a prepared batch on its way to Staging"
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the prepared commit pends its publication"
+    );
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied(),
+        "the stranded batch never reached the seal"
+    );
+    assert!(
+        fixture.scene.real.lane.take_joint_frame_for_abandon().is_none(),
+        "the fixture drives its machine beside the lane, not inside it"
+    );
+    assert!(
+        fixture.machine.take_abandoned_frame().is_none(),
+        "no audit frame exists before the audit"
+    );
+    {
+        let scene = &mut fixture.scene.real;
+        scene.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut scene.lane,
+            None,
+            "test abandon".to_string(),
+        );
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .is_none(),
+        "the abandon drains the stranded batch"
+    );
+    let minted = fixture.scene.real.scene.coordinator.take_h3_disposition();
+    assert!(
+        !matches!(
+            minted,
+            H3DispositionEvidence::Clean {
+                staged_max: 0,
+                pending_floor: None,
+            }
+        ),
+        "the drain mints its H3 instead of leaving genesis: {minted:?}"
+    );
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon clears the unfinished publication"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .expect("a later plain commit succeeds past the abandoned publication");
+}
+
+#[test]
+fn joint_machine_abandon_drops_a_stranded_collected_batch() {
+    use crate::inventory_semantics::JointServiceProgress;
+    // A Collected batch stranded between preparation and staging
+    // drops through the audited path at abandon: the publication
+    // cancels, the named gap stages, and the later plain commit
+    // succeeds. The drop's H3 shed shadow is pinned at the helper.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_SignInit", 2);
+    let mut stranded = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        if coordinator.publication_pending()
+            && coordinator.prepared_semantic_batch().is_none()
+            && fixture.machine.diagnostic_snapshot_for_test().0 == "PreparingAdmissions"
+        {
+            stranded = true;
+            break;
+        }
+    }
+    assert!(
+        stranded,
+        "the drive strands a collected batch between preparation and staging"
+    );
+    {
+        let scene = &mut fixture.scene.real;
+        scene.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut scene.lane,
+            None,
+            "test abandon".to_string(),
+        );
+    }
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon clears the unfinished publication"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .iter()
+            .any(|(subject, _)| subject == "unfinished joint publication abandoned"),
+        "the abandon stages its named gap"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .expect("a later plain commit succeeds past the abandoned publication");
+}
+
 /// Final Idle work uses a real new Raw on the SAME cursor, accounts for both
 /// rings/FIFO/Engine backlog, and refuses a genuine post-Q producer movement.
 #[test]

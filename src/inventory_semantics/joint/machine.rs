@@ -1180,6 +1180,20 @@ impl LiveJointMachine {
             .note_h0_merge(before, has_pending_scans, has_future_job, has_hold)
     }
 
+    /// Take the retained audit frame for the exit-hold abandon, if
+    /// the machine holds one: only the Audited phase carries a
+    /// finished audit frame. Anything else leaves the phase
+    /// untouched and yields None (the unapplied abandon needs no
+    /// frame).
+    pub(crate) fn take_abandoned_frame(
+        &mut self,
+    ) -> Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum> {
+        match self.phase.as_mut() {
+            Some(Phase::Audited { frame, .. }) => frame.take(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn begin_commit(&mut self, engine_changed: bool) -> Result<(), JointCommitRefusal> {
         if self.finish.is_some() {
             return Err(JointCommitRefusal::OutstandingRequest);

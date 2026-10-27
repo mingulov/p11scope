@@ -5955,6 +5955,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_publication.is_some() || self.registry.publication_pending()
     }
 
+    /// Abandon an unfinished Joint publication the driver can no
+    /// longer resume, so the exit-hold abandon commit and every later
+    /// plain commit proceed past it. Stub: the twins pin the
+    /// contract; the cancel/finish follows with the abandon.
+    pub(crate) fn abandon_unfinished_joint_publication(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        frame: Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum>,
+        reason: String,
+    ) {
+        let _ = (lane, frame, reason);
+    }
+
+    /// Pose a coordinator-half pending Joint publication (no registry
+    /// phase): the hold twin's wedge stand-in. Real registry-pending
+    /// shapes are driven by the joint fixtures instead.
+    #[cfg(test)]
+    pub(crate) fn pose_pending_joint_publication_for_test(&mut self) {
+        let storage = self
+            .registry
+            .reserve_semantic_storage(std::mem::size_of::<PendingJointPublication>())
+            .expect("the test publication lease fits its budget");
+        self.joint_publication = Some(PendingJointPublication {
+            completion: PublicationCompletion {
+                cgroup: None,
+                events: Vec::new(),
+                admitted: 0,
+                scan_callers: 0,
+            },
+            cut_barrier: None,
+            finish: None,
+            _storage: storage,
+        });
+    }
+
     fn prepare_physical_publication(
         &mut self,
         engine_changed: bool,

@@ -3113,13 +3113,17 @@ impl ClassicDriver<'_> {
     /// that commit. A winding hold threads its winding's disclosed
     /// flag and joins the shared once-gate (silent past a stop,
     /// arming when it discloses); a live-lane hold passes `None` and
-    /// always discloses. Returns the first error: the disposition
-    /// where latched, else the trigger cause. Callers disclose the
-    /// skips (finished or unadmitted holds).
+    /// always discloses. Each caller names the abandon gap subject:
+    /// exit holds say "for exit"; a mid-run lane-stop conversion
+    /// says "for lane stop", so the gap never claims the run is
+    /// leaving while it continues. Returns the first error: the
+    /// disposition where latched, else the trigger cause. Callers
+    /// disclose the skips (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         cause: &str,
+        abandon_subject: &str,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
     ) -> String {
@@ -3156,7 +3160,8 @@ impl ClassicDriver<'_> {
         }
         if !lane.is_finished()
             && latched
-            && let Ok(batch) = lane.abandon_finish_for_exit(coordinator, reason)
+            && let Ok(batch) =
+                lane.abandon_finish_with_subject(coordinator, abandon_subject, reason)
         {
             coordinator.stage_semantic_batch(batch);
             if let Err(error) = commit_semantic_finish(coordinator, &mut lane) {
@@ -3231,6 +3236,7 @@ impl ClassicDriver<'_> {
                             owned,
                             coordinator,
                             "joint finish disposition required",
+                            "joint finish abandoned for exit",
                             warn,
                             winding_disclosed,
                         );
@@ -3285,6 +3291,7 @@ impl ClassicDriver<'_> {
                                 owned,
                                 coordinator,
                                 &cause,
+                                "joint finish abandoned for exit",
                                 warn,
                                 winding_disclosed,
                             ));
@@ -3319,6 +3326,7 @@ impl ClassicDriver<'_> {
                     lane,
                     coordinator,
                     "joint finish disposition required",
+                    "joint finish abandoned for exit",
                     &mut warn,
                     None,
                 );
@@ -3355,7 +3363,14 @@ impl ClassicDriver<'_> {
             display: &mut self.display,
         };
         let error =
-            Self::hold_joint_lane_for_exit(lane, &mut *self.coordinator, cause, &mut warn, None);
+            Self::hold_joint_lane_for_exit(
+                lane,
+                &mut *self.coordinator,
+                cause,
+                "joint finish abandoned for exit",
+                &mut warn,
+                None,
+            );
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
             self.coordinator.note_scope_gap(
@@ -3715,21 +3730,25 @@ impl ClassicDriver<'_> {
     }
 
     /// Convert a semantic-lane Joint commit refusal into a held lane
-    /// plus a published pass: snapshot what was seated, hold the lane
-    /// for exit (its stop counts disclose once), clear the pending
-    /// commit, name the stop in its own gap, and commit the pass's
-    /// native evidence past the held lane. Later passes continue on
-    /// the legacy path. The hold's first error is dropped on purpose:
-    /// the gap carries the disclosure, and `joint_first_error` stays
-    /// for the finish path, so a continued run never surfaces this
-    /// stale refusal as a later retained error. A broad commit
-    /// failure still fails the call.
+    /// plus a published pass: snapshot what was seated (marked Partial:
+    /// the lane stopped with declared loss for the rest of the run),
+    /// hold the lane for exit (its stop counts disclose once), clear
+    /// the pending commit, name the stop in its own gap, and commit
+    /// the pass's native evidence past the held lane. Later passes
+    /// continue on the legacy path. The hold's first error is dropped
+    /// on purpose: the gap carries the disclosure, and
+    /// `joint_first_error` stays for the finish path, so a continued
+    /// run never surfaces this stale refusal as a later retained
+    /// error. A broad commit failure still fails the call.
     fn hold_joint_commit_lane_and_publish(
         &mut self,
         engine_changed: bool,
         reason: &str,
     ) -> Result<PassCommitProgress> {
         self.snapshot_seated_summary();
+        if let Some(summary) = self.seated_summary.as_mut() {
+            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+        }
         let mut warn = WarnSink {
             display: &mut self.display,
         };
@@ -3738,13 +3757,14 @@ impl ClassicDriver<'_> {
             lane,
             &mut *self.coordinator,
             "joint commit disposition required",
+            "joint finish abandoned for lane stop",
             &mut warn,
             None,
         );
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
-            format!("{reason}; broad inventory continues"),
+            format!("{reason}; broad inventory continues; semantic probes stay attached until exit"),
         );
         self.commit(engine_changed)?;
         Ok(PassCommitProgress::Published)
@@ -3769,6 +3789,7 @@ impl ClassicDriver<'_> {
         first_error: &mut Option<String>,
         commit_retries: &mut u16,
         warn: &mut WarnSink<'_>,
+        seated_summary: &mut Option<crate::inventory_semantics::SemanticCaptureSummary>,
     ) -> NotBegunStep {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3802,6 +3823,7 @@ impl ClassicDriver<'_> {
                             live,
                             coordinator,
                             "joint finish disposition required",
+                            "joint finish abandoned for exit",
                             warn,
                             None,
                         );
@@ -3835,6 +3857,7 @@ impl ClassicDriver<'_> {
                         live,
                         coordinator,
                         "joint finish disposition required",
+                        "joint finish abandoned for exit",
                         warn,
                         None,
                     );
@@ -3852,12 +3875,22 @@ impl ClassicDriver<'_> {
                         live,
                         coordinator,
                         "joint commit disposition required",
+                        "joint finish abandoned for lane stop",
                         warn,
                         None,
                     );
+                    // The lane stopped with declared loss: the served
+                    // snapshot reads Partial, like the Poll path.
+                    if let Some(summary) = seated_summary.as_mut() {
+                        summary.status =
+                            crate::inventory_semantics::SemanticCaptureStatus::Partial;
+                    }
                     coordinator.note_scope_gap(
                         "semantic lane stopped".to_string(),
-                        format!("{}; broad inventory continues", reason.code()),
+                        format!(
+                            "{}; broad inventory continues; semantic probes stay attached until exit",
+                            reason.code()
+                        ),
                     );
                 }
                 *finish = JointFinishDriver::Abandoned;
@@ -3890,6 +3923,7 @@ impl ClassicDriver<'_> {
                     &mut self.joint_first_error,
                     &mut self.joint_commit_retries,
                     &mut warn,
+                    &mut self.seated_summary,
                 );
                 match stepped {
                     NotBegunStep::Began => {
@@ -4051,6 +4085,7 @@ impl ClassicDriver<'_> {
                             lane,
                             &mut *self.coordinator,
                             "joint finish disposition required",
+                            "joint finish abandoned for exit",
                             &mut warn,
                             Some(&mut winding.stop_disclosed),
                         );
@@ -17882,6 +17917,7 @@ mod promotion_driver_tests {
             scripted_lane(),
             &mut coordinator,
             "already disclosed",
+            "joint finish abandoned for exit",
             &mut warn,
             Some(&mut held),
         );
@@ -17904,6 +17940,7 @@ mod promotion_driver_tests {
             scripted_lane(),
             &mut coordinator,
             "owed",
+            "joint finish abandoned for exit",
             &mut warn,
             Some(&mut held),
         );
@@ -17917,6 +17954,7 @@ mod promotion_driver_tests {
             scripted_lane(),
             &mut coordinator,
             "owed",
+            "joint finish abandoned for exit",
             &mut warn,
             Some(&mut held),
         );
@@ -17980,6 +18018,7 @@ mod promotion_driver_tests {
             scripted_lane(),
             &mut coordinator,
             "tripped",
+            "joint finish abandoned for exit",
             &mut warn,
             None,
         );
@@ -18003,6 +18042,7 @@ mod promotion_driver_tests {
             scripted_lane(),
             &mut coordinator,
             "untripped",
+            "joint finish abandoned for exit",
             &mut warn,
             None,
         );

@@ -2159,6 +2159,24 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         reason: &'static str,
     ) -> Result<SemanticBatch, SemanticRefusal> {
+        self.abandon_finish_with_subject(
+            coordinator,
+            "joint finish abandoned for exit",
+            reason,
+        )
+    }
+
+    /// Abandon with an explicit gap subject: the exit hold keeps "for
+    /// exit"; a mid-run lane-stop conversion names "for lane stop",
+    /// so the gap never claims the run is leaving while it continues.
+    /// The H0 stop, justification, retention and second-call refusal
+    /// are the exit abandon's.
+    pub(crate) fn abandon_finish_with_subject(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        subject: &str,
+        reason: &'static str,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
         if self.exit_retained {
             return Err(SemanticRefusal::Unavailable);
         }
@@ -2170,7 +2188,7 @@ impl AttestedSemanticLane {
         if let Some(test) = self.test_io.as_mut() {
             let batch = test.finish(domain);
             self.finish_for_exit();
-            coordinator.note_scope_gap("joint finish abandoned for exit".into(), reason.into());
+            coordinator.note_scope_gap(subject.into(), reason.into());
             return Ok(batch);
         }
         let batch = match self.live.as_mut() {
@@ -2192,7 +2210,7 @@ impl AttestedSemanticLane {
             }
         };
         self.finish_for_exit();
-        coordinator.note_scope_gap("joint finish abandoned for exit".into(), reason.into());
+        coordinator.note_scope_gap(subject.into(), reason.into());
         Ok(batch)
     }
 

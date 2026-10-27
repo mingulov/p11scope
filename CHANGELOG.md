@@ -142,6 +142,17 @@ Known issues in this release:
 - A load, one call, unload burst inside about 1 ms reads the same as
   no calls unless the child is held with `run --pause auto` or kept
   alive past attach.
+- System identity checks through the userspace backend are slower than
+  in v0.4.0 on hosts with many processes mapping providers from btrfs
+  (about 7–14% slower confirm stage, about 5–10% slower total scan on
+  the measured host); the default `auto` backend uses kernel identity
+  where available, and a speed-up is planned for a later 0.5.x.
+- In long system-wide runs, a live publication that stops making
+  progress is abandoned after 6 seconds with a named gap; the capture
+  keeps running and coverage reads partial.
+- On some overlayfs setups before Linux 6.8, a provider whose /proc
+  maps rendering cannot be proven is skipped with an identity-mismatch
+  record, and callers mapping it may stay unbound.
 - Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
   are not qualified yet.
 

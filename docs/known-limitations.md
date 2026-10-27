@@ -82,6 +82,28 @@ missed, with no marker in the output; restarting such processes is the
 workaround, and the kernel identity backend does not help (full entry
 below).
 
+Identity checks through the userspace backend are slower than in
+v0.4.0 on hosts with many processes mapping providers from btrfs:
+each file needs extra per-file checks for btrfs to identify it
+correctly. This affects `inventory --system --identity-backend
+userspace`, and the userspace path when kernel identity is
+unavailable. Measured on Fedora (Linux 7.2.9; 10 rounds, 400
+processes by 8 providers on btrfs), the confirm stage's slowest 5%
+ran about 7–14% slower and the whole scan about 5–10% slower, but
+host noise is large: it moved an unchanged comparison run by 17%.
+The default `--identity-backend auto` uses kernel identity where
+available. These numbers will be refreshed from the final release
+measurement, and a speed-up is planned for a later 0.5.x.
+
+On some overlayfs setups before Linux 6.8, p11scope may be unable to
+prove how a provider file appears in /proc maps: the opened file and
+its mappings legitimately carry different keys there, and the kernel
+check that reconciles them can come back inconclusive. The provider
+is then skipped with an `opened object identity ... does not match
+mapped object ...` record naming the provider, and callers mapping
+that provider may stay unbound. This key split does not happen on
+Linux 6.8 and later.
+
 A `profile` or `trace` output has no per-run marker for calls made
 before a provider's probes landed, so a missed early burst reads the
 same as no calls. Inside a nested PID namespace (a kind node, a
@@ -123,6 +145,13 @@ still not exercised.
 Continuous runs are qualified for up to 30 minutes; longer runs (4 h,
 24 h) are not qualified yet. The startup and stop figures above are
 declared per kernel, not a product guarantee.
+
+In long system-wide runs, a live publication can rarely stop making
+progress. After 6 seconds without progress, p11scope abandons that
+publication with a named gap and keeps running, and the report marks
+coverage as partial. The capture does not hang, and nothing is
+silently dropped. Fixing the underlying stall is planned for a later
+release.
 
 ## Planned for later versions
 

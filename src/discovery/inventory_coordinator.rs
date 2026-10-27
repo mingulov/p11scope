@@ -3473,8 +3473,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// original custody, and make no permanent dead tombstone. A later EXEC
     /// still renews recovery, in the same or a later batch. Whole-group
     /// death (a dead pin or no live caller) is reconcile's business, never
-    /// this record's.
+    /// this record's. Under a mismatched PID numbering the record cannot
+    /// select a caller — the kernel tgid is looked up as an
+    /// observer-/proc pid — so every exit is dropped silently: no gap, no
+    /// fence.
     fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
+        if !crate::pidns::numbering().agrees() {
+            return;
+        }
         for record in &batch.records {
             if record.kind != DISCOVERY_KIND_LEADER_EXIT {
                 continue;
@@ -3550,10 +3556,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// mutually exclusive by construction and never double-mint. Stale
     /// hooks and missing callers skip silently (mirroring
     /// `note_leader_exits`); every refusal to mint is a named gap, and the
-    /// mint itself is disclosed: nothing here is silent. No `ExecProof` is
-    /// synthesized (only the binder proves exact transitions); the old
-    /// owner's image invalidates through the normal guard revalidation
-    /// instead.
+    /// mint itself is disclosed: nothing here is silent. Under a mismatched
+    /// PID numbering the hook does nothing at all (no lookup, no mint, no
+    /// gap): the kernel tgid cannot select an observer-/proc pid. No
+    /// `ExecProof` is synthesized (only the binder proves exact
+    /// transitions); the old owner's image invalidates through the normal
+    /// guard revalidation instead.
     fn apply_exec_hook(
         &mut self,
         domain: NativeDomainId,
@@ -3563,6 +3571,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
         detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Vec<CallerEvent> {
+        if !crate::pidns::numbering().agrees() {
+            return Vec::new();
+        }
         let Some(caller) = self.adapter.live_id(pid) else {
             return Vec::new();
         };
@@ -3599,6 +3610,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .is_some_and(|incarnation| hook_ts_ns < incarnation.admitted_ns)
         {
             return Vec::new();
+        }
+        // The successor's binding safety needs the staging clock (its
+        // first_seen) to be later than the hook's timestamp: at or before
+        // it, binder Rule 4 would refuse every row the successor ever
+        // reads, so a mint here could never bind. Refuse fail-closed: the
+        // proved old incarnation retires without a successor, disclosed.
+        if now_ns <= hook_ts_ns {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "successor admission refused with a stale staging clock".into(),
+                reason: "the staging clock is not later than the exec hook's timestamp, so the \
+                     successor's first_seen would be at or before the proved exec and binder \
+                     Rule 4 would refuse every row it ever reads; the proved old incarnation \
+                     retires without a successor"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
         }
         // The live guard is liveness through the held pin: the cookie
         // query checks the pidfd before and after its lookup, so a ticket

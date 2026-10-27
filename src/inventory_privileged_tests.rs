@@ -6225,11 +6225,11 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     );
     ensure!(
         has_gap_staged_or_committed(driver.coordinator, "selected promotion refused"),
-        "the scripted view refuses through the bounded path"
+        "the rebound live-pair view refuses through the bounded path"
     );
     ensure!(
         driver.lifecycle.is_idle(),
-        "no worker starts from a scripted view"
+        "no worker starts from a rebound live-pair view"
     );
     eprintln!("JOINT_R16 r16c-take b_taken=ok");
 

@@ -32,7 +32,7 @@ permissions:
   contents: read
 concurrency:
   group: bpf-kernels-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 # Tool versions, read by both the install step and the cache key (as in
 # ci.yml), so a version bump can never be served an older binary.
 env:

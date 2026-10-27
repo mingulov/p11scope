@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Exercise the combined unsupported-host controller without booting a guest."""
+import json
 import os
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -49,6 +51,51 @@ class CombinedRefusalTests(unittest.TestCase):
         self.assertEqual({r["case"] for r in rows if r["outcome"] == "offline-ok"},
                          {"help", "version", "inventory-scan", "inventory-diff"})
         self.assertFalse((self.work / "workload-ran").exists())
+
+    def test_guest_uses_private_disk_stage_and_caller_trust(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        guest = namespace["guest"]
+        observer = self.work / "p11scope"
+        observer.write_text(FAKE)
+        observer.chmod(0o700)
+        metadata = {"kernel": "v" + os.uname().release,
+                    "runner_uid": self.work.stat().st_uid,
+                    "sha256": {"p11scope": namespace["digest"](observer)}}
+        (self.work / "inputs.json").write_text(json.dumps(metadata))
+
+        def check(observer, work):
+            self.assertEqual(work.parent, self.work)
+            self.assertEqual(work.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(os.environ["TMPDIR"], str(work))
+            if metadata["runner_uid"]:
+                self.assertEqual(os.environ["SUDO_UID"], str(metadata["runner_uid"]))
+            else:
+                self.assertNotIn("SUDO_UID", os.environ)
+            return self.check(observer, work)
+
+        run = subprocess.run
+
+        def unprivileged_run(argv, **kwargs):
+            self.assertNotEqual(argv[0], "mount", "offline test must never mount")
+            return run(argv, **kwargs)
+
+        with patch.dict(os.environ), patch("os.geteuid", return_value=0), \
+                patch("subprocess.run", side_effect=unprivileged_run), \
+                patch.dict(guest.__globals__, {"check_commands": check}):
+            guest(self.work)
+        self.assertEqual(len(json.loads((self.work / "result.json").read_text())["cases"]), 20)
+        self.assertFalse(any(path.is_dir() for path in self.work.iterdir()))
+
+    def test_stage_owner_must_match_and_resolve_to_an_account(self):
+        trust = runpy.run_path(str(SCRIPT))["trust_stage_owner"]
+        owner = self.work.stat().st_uid
+        for invalid in (None, True, -1, 2**32 - 1, owner + 1):
+            with self.subTest(uid=invalid), patch.dict(os.environ):
+                with self.assertRaisesRegex(RuntimeError, "invalid stage owner"):
+                    trust(self.work, invalid)
+        with patch("pwd.getpwuid", side_effect=KeyError), patch.dict(os.environ):
+            with self.assertRaisesRegex(RuntimeError, "no account"):
+                trust(self.work, owner)
 
     def test_singles_cannot_bypass_the_host_requirement(self):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "accepts-singles"}):

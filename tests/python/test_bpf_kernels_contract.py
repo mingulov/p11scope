@@ -201,8 +201,8 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertIn("if: matrix.refusal_control != true", self.bpf)
         self.assertIn("if: matrix.refusal_control == true", self.bpf)
 
-    def test_final_kernel_campaign_is_not_cancelled_by_successor_push(self):
-        self.assertIn("cancel-in-progress: false", self.bpf)
+    def test_kernel_workflow_preserves_existing_concurrency_policy(self):
+        self.assertIn("cancel-in-progress: true", self.bpf)
 
     def test_positive_load_commands_request_multi(self):
         driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()

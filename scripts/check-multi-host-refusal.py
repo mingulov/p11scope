@@ -11,6 +11,7 @@ import json
 import os
 import re
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import subprocess
@@ -87,6 +88,22 @@ def check_commands(observer, work):
     return rows
 
 
+def trust_stage_owner(stage, runner_uid):
+    # Root's output trust policy also checks the runner-owned shared ancestors.
+    if type(runner_uid) is not int or not 0 <= runner_uid < 2**32 - 1 or stage.stat().st_uid != runner_uid:
+        raise RuntimeError("invalid stage owner UID")
+    try:
+        account = pwd.getpwuid(runner_uid)
+    except KeyError as error:
+        raise RuntimeError("stage owner UID has no account") from error
+    if account.pw_uid != runner_uid:
+        raise RuntimeError("stage owner account UID mismatch")
+    if runner_uid:
+        os.environ["SUDO_UID"] = str(runner_uid)
+    else:
+        os.environ.pop("SUDO_UID", None)
+
+
 def guest(stage):
     if os.geteuid() != 0:
         raise RuntimeError("guest root required")
@@ -98,10 +115,9 @@ def guest(stage):
     expected = metadata["kernel"].removeprefix("v")
     if kernel != expected and not kernel.startswith(expected + "-"):
         raise RuntimeError("wrong guest kernel: " + kernel)
+    trust_stage_owner(stage, metadata.get("runner_uid"))
     os.umask(0o022)
-    subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777,size=128M",
-                    "multi-refusal-work", "/tmp"], check=True)
-    with tempfile.TemporaryDirectory(prefix="multi-refusal-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="multi-refusal-", dir=stage) as temp:
         work = Path(temp)
         os.environ["TMPDIR"] = str(work)
         rows = check_commands(stage / "p11scope", work)
@@ -133,7 +149,7 @@ def main():
     stage.mkdir(mode=0o700)
     shutil.copy2(observer, stage / "p11scope")
     shutil.copy2(Path(__file__).resolve(), stage / "guest.py")
-    metadata = {"kernel": kernel,
+    metadata = {"kernel": kernel, "runner_uid": stage.stat().st_uid,
                 "sha256": {name: digest(stage / name) for name in ("p11scope", "guest.py")}}
     (stage / "inputs.json").write_text(json.dumps(metadata) + "\n")
     command = shlex.join(["python3", str(stage / "guest.py"), "--guest", str(stage)])

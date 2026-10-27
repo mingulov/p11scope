@@ -844,22 +844,10 @@ pub(crate) struct AttestedSemanticLane {
     /// Tests-only count of `service_joint` calls.
     #[cfg(test)]
     joint_service_calls: usize,
-    /// Tests-only scripted Joint-commit poll outcome: when set, each
-    /// poll answers it without a live machine, so the driver's
-    /// begin-once-then-poll wiring runs unprivileged. Sticky; tests
-    /// clear it explicitly. A scripted error never latches: the
-    /// driver's conversion owns the verdict.
-    #[cfg(test)]
-    scripted_commit_poll: Option<
-        Result<
-            crate::discovery::engine::inventory_coordinator::JointCommitProgress,
-            SemanticRefusal,
-        >,
-    >,
     /// Tests-only scripted Joint-commit poll sequence: when non-empty,
-    /// each poll pops its head without a live machine, ahead of the
-    /// sticky `scripted_commit_poll`. Multi-step commit tests script
-    /// Pending-then-Published here.
+    /// each poll pops its head without a live machine. Multi-step
+    /// commit tests script Pending-then-Published here. A scripted
+    /// error never latches: the driver's conversion owns the verdict.
     #[cfg(test)]
     scripted_commit_poll_queue: std::collections::VecDeque<
         Result<
@@ -1374,8 +1362,6 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             joint_service_calls: 0,
             #[cfg(test)]
-            scripted_commit_poll: None,
-            #[cfg(test)]
             scripted_commit_poll_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
             scripted_finish_begin: None,
@@ -1521,8 +1507,6 @@ impl AttestedSemanticLane {
             joint_commit_begin_calls: 0,
             #[cfg(test)]
             joint_service_calls: 0,
-            #[cfg(test)]
-            scripted_commit_poll: None,
             #[cfg(test)]
             scripted_commit_poll_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
@@ -1965,23 +1949,8 @@ impl AttestedSemanticLane {
         self.joint_service_calls
     }
 
-    /// Script the Joint-commit poll outcome (or clear it with
-    /// `None`): each poll answers it without a live machine.
-    #[cfg(test)]
-    pub(crate) fn set_scripted_commit_poll_for_test(
-        &mut self,
-        outcome: Option<
-            Result<
-                crate::discovery::engine::inventory_coordinator::JointCommitProgress,
-                SemanticRefusal,
-            >,
-        >,
-    ) {
-        self.scripted_commit_poll = outcome;
-    }
-
     /// Script a Joint-commit poll sequence: each poll pops its head
-    /// without a live machine, ahead of the sticky scripted outcome.
+    /// without a live machine.
     #[cfg(test)]
     pub(crate) fn set_scripted_commit_poll_queue_for_test(
         &mut self,

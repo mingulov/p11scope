@@ -3946,11 +3946,7 @@ impl AttestedSemanticLane {
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
         #[cfg(test)]
-        if let Some(scripted) = self
-            .scripted_commit_poll_queue
-            .pop_front()
-            .or(self.scripted_commit_poll)
-        {
+        if let Some(scripted) = self.scripted_commit_poll_queue.pop_front() {
             // A scripted error never latches: the driver's
             // conversion owns the verdict for commit refusals.
             return scripted;

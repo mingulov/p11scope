@@ -4719,7 +4719,7 @@ fn assert_quiet_twins_except_stopped(
                 .map_or("".to_string(), |max| format!("and <={max}")),
         );
     }
-    for gap in coordinator.registry().gaps() {
+    for (index, gap) in coordinator.registry().gaps().iter().enumerate() {
         let excused = exempt.iter().any(|exemption| {
             gap.subject == exemption.subject
                 && gap.reason == exemption.reason
@@ -4737,9 +4737,13 @@ fn assert_quiet_twins_except_stopped(
                 && !subject.contains("shed")
                 && !subject.contains("unsettled")
                 && !reason.contains("loss"),
-            "{tag}: unexpected gap {}: {}",
+            "{tag}: unexpected gap {}: {} (caller={:?} pid={:?} module={:?} repeats={:?})",
             gap.subject,
-            gap.reason
+            gap.reason,
+            gap.caller,
+            gap.pid,
+            gap.module,
+            coordinator.registry().gap_repeats().get(index),
         );
     }
     for edge in stopped {
@@ -5175,7 +5179,7 @@ fn s1_feed_check(
     for (name, pid, _) in owners {
         let caller = coordinator.adapter().live_id(*pid);
         let bound = caller.is_some_and(|id| coordinator.semantic_bindings().get(id).is_some());
-        eprintln!("JOINT_R16 {tag}-feed {name} caller={caller:?} bound={bound}");
+        eprintln!("JOINT_R16 {tag}-feed {name} pid={pid} caller={caller:?} bound={bound}");
         let Some(id) = caller else {
             continue;
         };
@@ -5279,6 +5283,36 @@ fn mapping_diagnosis(
     }
 }
 
+/// Read-only checkpoints locate the first observed phase of a retained
+/// leader-link gap. The current caller for its numeric PID may differ
+/// from the gap's historical caller; neither is inferred from A/B.
+fn first_birth_leader_gap_diagnosis(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+) {
+    let registry = coordinator.registry();
+    let mut count = 0;
+    for (index, gap) in registry.gaps().iter().enumerate() {
+        if gap.subject != "leader task link loss" {
+            continue;
+        }
+        count += 1;
+        let current = gap.pid.and_then(|pid| coordinator.adapter().live_id(pid));
+        eprintln!(
+            "JOINT_R16 {tag}-leader-gap caller={:?} pid={:?} module={:?} repeats={:?} current={current:?} reason={:?}",
+            gap.caller,
+            gap.pid,
+            gap.module,
+            registry.gap_repeats().get(index),
+            gap.reason,
+        );
+    }
+    eprintln!(
+        "JOINT_R16 {tag}-leader-gaps revision={} rows={count}",
+        registry.published_revision(),
+    );
+}
+
 /// R1.6 cell 1: the first birth through a held q1 to q2 and stop. Process
 /// A runs C_SignInit (returns at once) and enters a held C_Sign (its
 /// return is genuinely absent until the harness releases the FIFO); the
@@ -5351,6 +5385,12 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         &[],
     )?;
     drive_until_mapped(&mut coordinator, &[process_a.pid(), process_b.pid()])?;
+    mapping_diagnosis(
+        &coordinator,
+        "r16-mapped",
+        &[("A", process_a.pid()), ("B", process_b.pid())],
+    );
+    first_birth_leader_gap_diagnosis(&coordinator, "r16-mapped");
     let revision_before = coordinator.registry().published_revision();
     std::fs::write(&go, b"")?;
     process_a.wait_for("HELD ", Duration::from_secs(30))?;
@@ -5375,6 +5415,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         "r16-q1",
         &[("A", process_a.pid(), false), ("B", process_b.pid(), true)],
     )?;
+    first_birth_leader_gap_diagnosis(&coordinator, "r16-q1");
     let q1_end_ns = monotonic_ns();
     let edge_a_q1 = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so");
     let edge_b_q1 = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so");
@@ -5434,6 +5475,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
             idle_publishes += 1;
         }
     }
+    first_birth_leader_gap_diagnosis(&coordinator, "r16-idle");
     let revision_idle = coordinator.registry().published_revision();
     let h3_idle = coordinator.reference_h3_audit_state();
     let rev_advance = revision_idle.saturating_sub(revision_q1);
@@ -5533,6 +5575,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         "r16-q2",
         &[("A", process_a.pid(), true), ("B", process_b.pid(), true)],
     )?;
+    first_birth_leader_gap_diagnosis(&coordinator, "r16-q2");
     let (a_semantic, a_count_only) = ledger_semantic_split(&a_by_fn);
     let (b_semantic, b_count_only) = ledger_semantic_split(&b_by_fn);
     let edge_a = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")?;

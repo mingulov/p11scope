@@ -1343,6 +1343,13 @@ impl CaptureWorkBudget {
         allowed
     }
 
+    /// A metadata reader could not obtain its complete proof within the
+    /// allowance returned by allowed_io. Keep the actual resource refusal
+    /// distinct from a target read/identity error, preserving any earlier stop.
+    pub(crate) fn note_io_refusal(&mut self) {
+        self.set_scan_stop(IO_CEILING_REASON);
+    }
+
     pub(crate) fn record_io(&mut self, bytes: usize) {
         // Bound input/parse amplification as well as decoded work. Existing
         // I/O ceilings remain independent. Checks cannot interrupt a read.
@@ -4148,8 +4155,38 @@ pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let view = ProcessView::open_with_budget(ProcessViewId(0), request.pid, budget)?;
+    let started = Instant::now();
+    let view = match ProcessView::open_with_budget(ProcessViewId(0), request.pid, budget) {
+        Ok(view) => view,
+        Err(error) => {
+            // Construction uses this scan's allowance too. Only the actual
+            // budget stop state changes the public result scope; ordinary
+            // identity/read failures remain errors. A deadline may have passed
+            // inside the failed proof before its next budget clock poll.
+            if let Some(reason) = budget
+                .check_deadline_now()
+                .or_else(|| budget.stopped_reason())
+            {
+                return Ok(scan_stopped_before_view(started, reason));
+            }
+            return Err(error);
+        }
+    };
     scan_process_view(request, &view, budget)
+}
+
+fn scan_stopped_before_view(started: Instant, reason: &'static str) -> ScanOutcome {
+    ScanOutcome::Scanned {
+        modules: Vec::new(),
+        skipped: vec![
+            scan_skip(
+                "capture discovery",
+                format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: process view construction stopped"),
+            ),
+            scan_skip("capture discovery", reason.into()),
+        ],
+        scan_ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 // Private I/O seam: production and mutation tests share the entire acquisition loop.
@@ -6131,12 +6168,15 @@ mod tests {
             outcome.skipped()
         );
 
-        // The preprocessing itself is charged, one unit per snapshot entry.
-        // Leave one unit: every live process has multiple mappings, so the scan
-        // stops there without racing a separate read of this process's map count.
-        let mut budget = CaptureWorkBudget::default();
-        assert!(budget.charge(DEFAULT_WORK_CEILING - 1));
-        let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
+        // Isolate map preprocessing from constructor work: the retained view
+        // predates exhaustion, and this existing I/O fixture serves five real
+        // authored map rows without spending filesystem-proof work first.
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        let (outcome, examined) =
+            scan_view_with_examined(&request, &view, &mut budget, &mut fixture, true)
+                .expect("a bounded retained-view scan");
         assert!(
             outcome
                 .skipped()
@@ -6147,6 +6187,96 @@ mod tests {
             outcome.skipped()
         );
         assert!(outcome.modules().is_empty());
+        assert_eq!(
+            fixture.maps_reads, 1,
+            "the initial snapshot reached preprocessing"
+        );
+        assert!(
+            examined.is_empty(),
+            "a stopped snapshot grants no examined-object evidence"
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    #[test]
+    fn scan_pid_constructor_budget_stops_are_structured_partial_results() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+
+        for cold in [false, true] {
+            let mut group = ColdLeaderSubject::spawn(1);
+            if cold {
+                group.leave_leader();
+            }
+            let hooks = HookRegistry::builtin();
+            let request = ScanRequest {
+                pid: group.pid(),
+                hints: &[],
+                hooks: &hooks,
+            };
+            let mut sticky = CaptureWorkBudget::default();
+            assert!(!sticky.charge(u64::MAX));
+            let mut expired = CaptureWorkBudget::default();
+            expired.set_deadline(Some(0));
+            let mut cancelled = CaptureWorkBudget::default();
+            cancelled.set_collection_work(CollectionWork::new(|_| false));
+            let mut budgets = vec![
+                sticky,
+                CaptureWorkBudget::with_work_ceiling(1),
+                expired,
+                cancelled,
+            ];
+            if cold {
+                budgets.push(CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: 0,
+                    total_bytes: 0,
+                }));
+            }
+            for mut budget in budgets {
+                let outcome = scan_pid(&request, &mut budget)
+                    .expect("a capture budget stop is partial, not an unreadable-provider error");
+                assert!(outcome.modules().is_empty());
+                assert!(
+                    !outcome.mapping_scan_completed(),
+                    "no accepted current maps proof exists"
+                );
+                let reason = budget
+                    .stopped_reason()
+                    .expect("the actual budget records the refusal");
+                assert!(
+                    outcome
+                        .skipped()
+                        .iter()
+                        .any(|skip| skip.subject == "capture discovery" && skip.reason == reason),
+                    "actual stop reason is retained: {:?}",
+                    outcome.skipped()
+                );
+                if !cold {
+                    assert_eq!(budget.attempted_io_bytes(), 0);
+                }
+            }
+            let mut healthy = CaptureWorkBudget::default();
+            let outcome = scan_pid(&request, &mut healthy).unwrap();
+            assert!(
+                outcome
+                    .modules()
+                    .iter()
+                    .any(|module| Path::new(&module.path) == group.program)
+            );
+            if !cold {
+                group.leave_leader();
+            }
+            group.call_three();
+        }
+        let hooks = HookRegistry::builtin();
+        let missing = ScanRequest {
+            pid: u32::MAX,
+            hints: &[],
+            hooks: &hooks,
+        };
+        assert!(
+            scan_pid(&missing, &mut CaptureWorkBudget::default()).is_err(),
+            "ordinary identity failures retain the public error scope"
+        );
     }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its

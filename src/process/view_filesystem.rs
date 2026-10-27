@@ -115,6 +115,7 @@ fn read_bounded(
     spend(work, deadline, 1)?;
     let allowed = work.allowed_io(0, limit + 1);
     if allowed == 0 {
+        work.note_io_refusal();
         return Err("cold process filesystem metadata I/O is unavailable".into());
     }
     let mut bytes = Vec::new();
@@ -123,6 +124,9 @@ fn read_bounded(
     read.map_err(|error| format!("cold process filesystem metadata unreadable: {error}"))?;
     spend(work, deadline, 1)?;
     if bytes.len() > limit || bytes.len() == allowed {
+        if allowed <= limit && bytes.len() == allowed {
+            work.note_io_refusal();
+        }
         return Err("cold process filesystem metadata is truncated or over budget".into());
     }
     String::from_utf8(bytes).map_err(|error| error.to_string())

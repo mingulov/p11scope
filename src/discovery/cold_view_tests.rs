@@ -168,7 +168,16 @@ fn cold_scan_and_pin_entrypoints_use_the_passed_capture_budget() {
         hooks: &hooks,
     };
     let mut scan_budget = CaptureWorkBudget::with_work_ceiling(0);
-    assert!(crate::discovery::scan::scan_pid(&request, &mut scan_budget).is_err());
+    let stopped = crate::discovery::scan::scan_pid(&request, &mut scan_budget).unwrap();
+    assert!(stopped.modules().is_empty());
+    assert!(!stopped.mapping_scan_completed());
+    assert!(
+        stopped
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject == "capture discovery"
+                && skip.reason == crate::discovery::scan::WORK_CEILING_REASON)
+    );
     assert_eq!(scan_budget.attempted_io_bytes(), 0);
     let mut pin_budget = CaptureWorkBudget::with_work_ceiling(0);
     assert!(

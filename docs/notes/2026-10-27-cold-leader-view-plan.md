@@ -185,3 +185,33 @@ Cold native-owner/S1 authority is still unavailable at pre-window admission,
 and the separate CallerRegistry semantic restriction is unchanged. This is
 bounded filesystem/scan and counter-target usefulness, not whole-group native
 admission or a v0.5.0 fix.
+
+## Public scan stop contract
+
+The residual peer identified that the budgeted constructor changed public
+`scan_pid` work exhaustion from a structured partial scan into `Err`. The
+controller ruled to preserve the public stop result. Constructor failure now
+returns an empty partial scan only when the actual capture budget records a
+stop; it also polls that budget's deadline after failed construction. It does
+not classify error text or reclassify ordinary identity/read failures. The
+initial-maps-unavailable marker explicitly withholds a current mapping proof,
+and no examined-object evidence is created. Metadata readers record an actual
+I/O-allowance refusal in the same sticky budget state, preserving an earlier
+stop instead of treating a spent allowance as a target error.
+
+The actual public wrapper reproduced RED in the small harness before this
+change. Twenty-one source/native controls now pass, including warm/cold zero
+and last-unit work, cancellation, expired deadline, cold metadata-byte refusal
+and an ordinary missing-PID error control. The scanner body in that wrapper
+control is a panic sentinel: no resource-stopped constructor may enter it.
+This remains source/plumbing evidence with the earlier budget adapter, not
+the complete product's actual budget/window check.
+
+The public wrapper regression and constructor tests remain separate. The old
+preprocessing regression retains its public sticky-stop assertion, then uses
+the existing authored-maps I/O fixture with a previously retained real view
+to reach preprocessing itself. It requires one initial snapshot, no provider
+modules, no examined keys and no completed mapping proof. The real product
+wrapper matrix, lower-level regression and all other full-product, pressure,
+installed-counter and warm-cost checks remain **UNCOMPILED/UNRUN** during the
+release build/performance hold.

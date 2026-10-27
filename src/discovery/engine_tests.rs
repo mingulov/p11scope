@@ -4389,6 +4389,557 @@ fn unarmed_target_alive_is_never_ended_by_the_bound() {
     );
 }
 
+/// Twin: a cleanup that makes one drain step and then stalls still trips.
+/// The first draining tick resets the clock; the next stale tick with no
+/// further drain ends the wait with the named PARTIAL reason. Kills the
+/// deleted-baseline-refresh mutant, which would keep comparing against the
+/// stale arm snapshot and reset the clock on every later tick.
+#[test]
+fn cleanup_that_progresses_then_stalls_still_trips() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut engine, first) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    // A second attached loader context on the same view: two drain steps,
+    // so one tick can make progress while the wait stays blocked.
+    let prepared = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(10),
+            mapping: None,
+            hook: SymbolFact {
+                virtual_address: 0x2200,
+                file_offset: 0x2200,
+            },
+            state_address: None,
+        })
+        .expect("a preflighted second loader context");
+    let second = engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("a prepared second loader context");
+    engine
+        .loader_registry
+        .mark_attached(second)
+        .expect("an attached second loader context");
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view).len(),
+        2,
+        "two queued loader ids block the latch"
+    );
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.arm_expected_target_exit(view);
+    assert_eq!(engine.expected_target_exit_pending, Some(view));
+    let skips_before = engine.counters.object_skips.clone();
+    let mut session = ScriptedSession::default();
+    // One loader id clears: progress resets the clock, the wait stays armed.
+    engine
+        .loader_registry
+        .tombstone(first)
+        .expect("tombstoning the first drained loader context");
+    engine
+        .loader_registry
+        .remove(first)
+        .expect("draining the first loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a progressing drain keeps the pass open");
+    assert!(
+        !engine.expected_target_exit(),
+        "a draining tick does not trip the bound"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_some(),
+        "the wait stays armed while the drain is still blocked"
+    );
+    assert!(
+        engine
+            .expected_target_exit_since
+            .expect("the clock stays armed while the wait is pending")
+            .elapsed()
+            < EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT,
+        "the draining tick reset the no-progress clock"
+    );
+    // An equal tick with no further drain resets nothing: backdate by a
+    // fresh second so a spurious reset would be visible as a forward jump.
+    engine.expected_target_exit_since =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let since_before_equal = engine
+        .expected_target_exit_since
+        .expect("the clock stays armed while the wait is pending");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("an equal tick keeps the pass open");
+    assert!(
+        !engine.expected_target_exit(),
+        "a fresh equal tick does not trip the bound"
+    );
+    assert_eq!(
+        engine.expected_target_exit_since,
+        Some(since_before_equal),
+        "an equal tick does not reset the no-progress clock"
+    );
+    // A full bound window passes with no further drain: the stall trips.
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the trip tick succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "progress then stall still trips: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_none(),
+        "the trip disarms the wait"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_before.len() + 1,
+        "one trip reason, nothing dropped or invented: {:?}",
+        engine.counters.object_skips
+    );
+    let trip = engine
+        .counters
+        .object_skips
+        .last()
+        .expect("the trip reason");
+    assert_eq!(trip.subject, "live discovery transaction");
+    assert!(
+        trip.reason.contains("cleanup was still pending"),
+        "the reason names the pending cleanup: {:?}",
+        trip.reason
+    );
+    assert!(
+        trip.reason
+            .contains("the capture ends with the calls collected so far"),
+        "the reason keeps the collected calls: {:?}",
+        trip.reason
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the queued cleanup is untouched by the trip"
+    );
+}
+
+/// Twin: an out-and-back cycle with no net drain still trips. Growth to B
+/// is not progress; the return to A only reaches the low-water mark, so it
+/// is not progress either. The stale return leg trips instead of resetting
+/// the clock once per cycle.
+#[test]
+fn cleanup_cycle_without_net_drain_still_trips() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut engine, _first) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view).len(),
+        1,
+        "one queued loader id blocks the latch"
+    );
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.arm_expected_target_exit(view);
+    assert_eq!(engine.expected_target_exit_pending, Some(view));
+    let arm_since = engine
+        .expected_target_exit_since
+        .expect("the arm stamps the no-progress clock");
+    let skips_before = engine.counters.object_skips.clone();
+    let mut session = ScriptedSession::default();
+    // Grow to B: a second attached loader context. Growth alone is not
+    // progress and resets nothing.
+    let prepared = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(10),
+            mapping: None,
+            hook: SymbolFact {
+                virtual_address: 0x2200,
+                file_offset: 0x2200,
+            },
+            state_address: None,
+        })
+        .expect("a preflighted second loader context");
+    let second = engine
+        .loader_registry
+        .prepare(prepared)
+        .expect("a prepared second loader context");
+    engine
+        .loader_registry
+        .mark_attached(second)
+        .expect("an attached second loader context");
+    assert_eq!(
+        engine.loader_registry.ids_for_view(view).len(),
+        2,
+        "growth to two queued loader ids"
+    );
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a growth tick keeps the pass open");
+    assert!(
+        !engine.expected_target_exit(),
+        "growth alone does not trip the bound"
+    );
+    assert_eq!(
+        engine.expected_target_exit_since,
+        Some(arm_since),
+        "growth alone does not reset the no-progress clock"
+    );
+    // Backdate past the bound, then return to A. The return only reaches
+    // the low-water mark, so the stale tick trips.
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine
+        .loader_registry
+        .tombstone(second)
+        .expect("tombstoning the returned loader context");
+    engine
+        .loader_registry
+        .remove(second)
+        .expect("returning to one queued loader id");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the trip tick succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "a cycle with no net drain still trips: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_none(),
+        "the trip disarms the wait"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_before.len() + 1,
+        "one trip reason, nothing dropped or invented: {:?}",
+        engine.counters.object_skips
+    );
+    let trip = engine
+        .counters
+        .object_skips
+        .last()
+        .expect("the trip reason");
+    assert_eq!(trip.subject, "live discovery transaction");
+    assert!(
+        trip.reason.contains("cleanup was still pending"),
+        "the reason names the pending cleanup: {:?}",
+        trip.reason
+    );
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the queued cleanup is untouched by the trip"
+    );
+}
+
+/// The pure drain comparison counts any shrink below the low-water mark and
+/// nothing else: each field shrinking counts, growth only does not, equal
+/// does not, and a shrink wins even when another field grows.
+#[test]
+fn expected_target_exit_drain_counts_shrink_only() {
+    let full = ExpectedTargetExitBlocked {
+        views: 1,
+        intents: 1,
+        retirements: 1,
+        ended: true,
+        rejected: 1,
+        loader_ids: 1,
+        journal: true,
+        batch: true,
+        records: 1,
+    };
+    let shrink_cases: &[(&str, ExpectedTargetExitBlocked)] = &[
+        ("views", ExpectedTargetExitBlocked { views: 0, ..full }),
+        ("intents", ExpectedTargetExitBlocked { intents: 0, ..full }),
+        (
+            "retirements",
+            ExpectedTargetExitBlocked {
+                retirements: 0,
+                ..full
+            },
+        ),
+        (
+            "ended",
+            ExpectedTargetExitBlocked {
+                ended: false,
+                ..full
+            },
+        ),
+        (
+            "rejected",
+            ExpectedTargetExitBlocked {
+                rejected: 0,
+                ..full
+            },
+        ),
+        (
+            "loader_ids",
+            ExpectedTargetExitBlocked {
+                loader_ids: 0,
+                ..full
+            },
+        ),
+        (
+            "journal",
+            ExpectedTargetExitBlocked {
+                journal: false,
+                ..full
+            },
+        ),
+        (
+            "batch",
+            ExpectedTargetExitBlocked {
+                batch: false,
+                ..full
+            },
+        ),
+        ("records", ExpectedTargetExitBlocked { records: 0, ..full }),
+    ];
+    for (name, current) in shrink_cases {
+        assert!(
+            current.drained_since(&full),
+            "{name} shrinking counts as drain progress"
+        );
+    }
+    let low = ExpectedTargetExitBlocked {
+        views: 1,
+        intents: 1,
+        retirements: 1,
+        ended: false,
+        rejected: 1,
+        loader_ids: 1,
+        journal: false,
+        batch: false,
+        records: 1,
+    };
+    let growth_cases: &[(&str, ExpectedTargetExitBlocked)] = &[
+        ("views", ExpectedTargetExitBlocked { views: 2, ..low }),
+        ("intents", ExpectedTargetExitBlocked { intents: 2, ..low }),
+        (
+            "retirements",
+            ExpectedTargetExitBlocked {
+                retirements: 2,
+                ..low
+            },
+        ),
+        ("ended", ExpectedTargetExitBlocked { ended: true, ..low }),
+        ("rejected", ExpectedTargetExitBlocked { rejected: 2, ..low }),
+        (
+            "loader_ids",
+            ExpectedTargetExitBlocked {
+                loader_ids: 2,
+                ..low
+            },
+        ),
+        (
+            "journal",
+            ExpectedTargetExitBlocked {
+                journal: true,
+                ..low
+            },
+        ),
+        ("batch", ExpectedTargetExitBlocked { batch: true, ..low }),
+        ("records", ExpectedTargetExitBlocked { records: 2, ..low }),
+    ];
+    for (name, current) in growth_cases {
+        assert!(
+            !current.drained_since(&low),
+            "{name} growing alone does not count as drain progress"
+        );
+    }
+    let all_grown = ExpectedTargetExitBlocked {
+        views: 2,
+        intents: 2,
+        retirements: 2,
+        ended: true,
+        rejected: 2,
+        loader_ids: 2,
+        journal: true,
+        batch: true,
+        records: 2,
+    };
+    assert!(
+        !all_grown.drained_since(&low),
+        "growth in every field still does not count as drain progress"
+    );
+    assert!(
+        !full.drained_since(&full),
+        "equal snapshots do not count as drain progress"
+    );
+    assert!(
+        !low.drained_since(&low),
+        "equal snapshots do not count as drain progress"
+    );
+    assert!(
+        (ExpectedTargetExitBlocked {
+            views: 0,
+            intents: 2,
+            ..full
+        })
+        .drained_since(&full),
+        "a shrink counts even when another field grows"
+    );
+    assert!(
+        (ExpectedTargetExitBlocked {
+            ended: false,
+            views: 2,
+            ..full
+        })
+        .drained_since(&full),
+        "a clearing counts even when another field grows"
+    );
+}
+
+/// Twin: once cancellation is requested, a stalled wait never trips. The
+/// stop owns the ending; the bound only ever ends an outstanding live wait.
+/// The all-clear latch still runs everywhere.
+#[test]
+fn stalled_wait_with_cancellation_requested_does_not_trip() {
+    let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.arm_expected_target_exit(view);
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let skips_before = engine.counters.object_skips.clone();
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a cancelled tick succeeds");
+    assert!(
+        !engine.expected_target_exit(),
+        "a cancelled stall does not trip the bound"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_some(),
+        "the wait stays armed past cancellation"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_before.len(),
+        "no trip mark once cancellation is requested: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .loader_registry
+        .tombstone(context)
+        .expect("tombstoning the drained loader context");
+    engine
+        .loader_registry
+        .remove(context)
+        .expect("draining the loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the draining batch succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the all-clear latches even when cancelled"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_none(),
+        "the all-clear disarms the wait"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "no trip reason on the all-clear path: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: once the collected finish has started, a stalled wait never trips.
+/// The finish owns the ending; the bound only ever ends an outstanding live
+/// wait. The all-clear latch still runs everywhere.
+#[test]
+fn stalled_wait_during_collected_finish_does_not_trip() {
+    let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
+    let view = ProcessViewId(0);
+    engine.views.clear();
+    engine.release_view_id(view);
+    engine.retirement_intents.clear();
+    engine.scan_inputs.remove(&view);
+    engine.arm_expected_target_exit(view);
+    engine.expected_target_exit_since = Some(
+        std::time::Instant::now()
+            - EXPECTED_TARGET_EXIT_NO_PROGRESS_TIMEOUT
+            - std::time::Duration::from_secs(1),
+    );
+    engine.collected_finish_actions = Some(usize::MAX);
+    let skips_before = engine.counters.object_skips.clone();
+    let mut session = ScriptedSession::default();
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("a finish tick succeeds");
+    assert!(
+        !engine.expected_target_exit(),
+        "a stalled finish does not trip the bound"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_some(),
+        "the wait stays armed through the finish"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_before.len(),
+        "no trip mark once the finish has started: {:?}",
+        engine.counters.object_skips
+    );
+    engine
+        .loader_registry
+        .tombstone(context)
+        .expect("tombstoning the drained loader context");
+    engine
+        .loader_registry
+        .remove(context)
+        .expect("draining the loader context");
+    engine
+        .apply_quiesced_discovery(&mut session, Vec::new(), 0)
+        .expect("the draining batch succeeds");
+    assert!(
+        engine.expected_target_exit(),
+        "the all-clear latches even during the finish"
+    );
+    assert!(
+        engine.expected_target_exit_pending.is_none(),
+        "the all-clear disarms the wait"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("cleanup was still pending")),
+        "no trip reason on the all-clear path: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Twin: without the arm, empty views stay a loud failure — the yield
 /// above covers only a settled expected removal, never a disappearance
 /// nothing explains.

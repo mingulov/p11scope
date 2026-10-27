@@ -84,17 +84,23 @@ const CUSTODY_TAKE_FLOOR: usize = 3;
 /// Descriptors one deep-scan offer can hold beyond the retained custody
 /// anchors and the offered file itself: the member view pin (one pidfd at
 /// most), the /proc mem handle (one at most) and the mount-table cache
-/// file (one at most). Deep scans run serially on one thread while shard
-/// and confirmation workers only exist past the reconcile census, so no
-/// other thread grows the observer's descriptor table between two offers;
-/// the remaining slack absorbs platform and test-double variance.
+/// file (one at most). Completed members' provider pins are the
+/// cross-member term — they stay open until bind_collection — and the
+/// per-scan census (`begin_scan` invalidates the cache) counts them at
+/// each member's start, so within one scan only transients vary. Deep
+/// scans run serially on one thread while shard and confirmation workers
+/// only exist past the reconcile census, so no other thread grows the
+/// observer's descriptor table between two offers; the remaining slack
+/// absorbs platform and test-double variance.
 const CUSTODY_TRANSIENT_MARGIN: usize = 16;
 
 /// Ledger takes need this much estimated headroom: the unchanged take
 /// floor plus the full transient margin, so a cached census still refuses
-/// before the true headroom can reach the floor even if live transients
-/// exceeded the margin by its whole width. Below this line the offer
-/// re-takes the strict census and obeys it exactly, as before.
+/// before the true headroom can reach the floor. With the pinned term
+/// counted at each scan start, the line tolerates transient_delta ≤ 17
+/// within one scan (take line 19, minus the take floor 3, plus back the
+/// double-counted offered file). Below this line the offer re-takes the
+/// strict census and obeys it exactly, as before.
 const CUSTODY_LEDGER_TAKE_LINE: usize = CUSTODY_TAKE_FLOOR + CUSTODY_TRANSIENT_MARGIN;
 
 /// One shared per-pass count of actual proof target runs: whole-system
@@ -116,9 +122,17 @@ pub(crate) enum AnchorDeny {
     CaptureWatched,
 }
 
+/// Cached per-candidate rank: most callers first, then key, then
+/// ordinal. Ranks are immutable (the caller map is fixed at
+/// construction), so the at-cap search compares cached ranks instead of
+/// re-evaluating every candidate per offer.
+type CandidateRank = (Reverse<usize>, ObjectKey, u64);
+
 pub(crate) struct ExaminedCustody {
     pub(crate) owner: ReservationOwner,
     candidates: Vec<HeldExaminedObject>,
+    ranks: Vec<CandidateRank>,
+    worst: Option<usize>,
     callers: BTreeMap<ObjectKey, usize>,
     missing: BTreeMap<(u64, ObjectKey), AnchorDeny>,
     next_scan: u64,
@@ -137,6 +151,8 @@ impl ExaminedCustody {
         Self {
             owner,
             candidates: Vec::new(),
+            ranks: Vec::new(),
+            worst: None,
             callers,
             missing: BTreeMap::new(),
             next_scan: 0,
@@ -151,6 +167,14 @@ impl ExaminedCustody {
     }
 
     pub(crate) fn begin_scan(&mut self) -> u64 {
+        // A cached census must not cross a scan boundary: completed
+        // members keep their provider pins open until bind_collection,
+        // so each member's first offer re-takes the strict census and
+        // counts all previously completed members' pins. Within one
+        // member the untracked delta stays ~1 (mounts 0→1; view/mem
+        // fixed; pins land after that member's offers), covered 16× by
+        // the margin below.
+        self.census_headroom = None;
         self.next_scan += 1;
         self.next_scan
     }
@@ -165,6 +189,8 @@ impl ExaminedCustody {
             self.missing
                 .insert((held.scan, held.examined.key), AnchorDeny::FdHeadroom);
         }
+        self.ranks.clear();
+        self.worst = None;
     }
 
     pub(crate) fn close(&mut self) {
@@ -175,7 +201,7 @@ impl ExaminedCustody {
         self.failed
     }
 
-    fn rank(&self, key: ObjectKey, ordinal: u64) -> (Reverse<usize>, ObjectKey, u64) {
+    fn rank(&self, key: ObjectKey, ordinal: u64) -> CandidateRank {
         #[cfg(test)]
         self.rank_evals.set(self.rank_evals.get() + 1);
         (
@@ -183,6 +209,22 @@ impl ExaminedCustody {
             key,
             ordinal,
         )
+    }
+
+    /// Index of the worst-ranked live candidate, rescanned lazily over
+    /// cached ranks. Ranks are unique (ordinals are), so the argmax
+    /// matches the old linear search exactly.
+    fn worst_index(&mut self) -> Option<usize> {
+        debug_assert_eq!(self.candidates.len(), self.ranks.len());
+        if self.worst.is_none() && !self.ranks.is_empty() {
+            self.worst = self
+                .ranks
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, rank)| *rank)
+                .map(|(index, _)| index);
+        }
+        self.worst
     }
 
     fn offer_with_census(
@@ -199,15 +241,10 @@ impl ExaminedCustody {
         }
         let ordinal = self.ordinal;
         self.ordinal = self.ordinal.saturating_add(1);
+        let new_rank = self.rank(examined.key, ordinal);
         let replace = if self.candidates.len() >= self.cap {
-            self.candidates
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, held)| self.rank(held.examined.key, held.ordinal))
-                .filter(|(_, held)| {
-                    self.rank(examined.key, ordinal) < self.rank(held.examined.key, held.ordinal)
-                })
-                .map(|(index, _)| index)
+            self.worst_index()
+                .filter(|index| new_rank < self.ranks[*index])
         } else {
             None
         };
@@ -216,14 +253,16 @@ impl ExaminedCustody {
                 .insert((scan, examined.key), AnchorDeny::AnchorCap);
             return false;
         }
-        // One strict census per custody phase plus a local ledger: held
-        // anchors are the only descriptors custody retains between offers,
-        // so the cached headroom minus their growth (and the still-open
-        // offered file) can only overstate consumption once scan
-        // transients are covered by the take line. A ledger below the
-        // line, or no cached census yet, re-takes the strict census and
-        // obeys it exactly. Replacements keep the count, discards shrink
-        // it (saturating: freed anchors only make the ledger pessimistic).
+        // One strict census per scan plus a local ledger: within one scan
+        // the only descriptors custody retains between offers are the
+        // held anchors, so the cached headroom minus their growth (and
+        // the still-open offered file) can only overstate consumption
+        // once scan transients are covered by the take line. Completed
+        // members' pins are re-counted by the per-scan census at each
+        // member's first offer. A ledger below the line, or no cached
+        // census yet, re-takes the strict census and obeys it exactly.
+        // Replacements keep the count, discards shrink it (saturating:
+        // freed anchors only make the ledger pessimistic).
         let ledger_covers = self.census_headroom.is_some_and(|cached| {
             let grown = self.candidates.len().saturating_sub(self.census_held);
             let estimate = cached.saturating_sub(grown).saturating_sub(1);
@@ -250,6 +289,8 @@ impl ExaminedCustody {
         }
         if let Some(index) = replace {
             let removed = self.candidates.remove(index);
+            self.ranks.remove(index);
+            self.worst = None;
             self.missing
                 .insert((removed.scan, removed.examined.key), AnchorDeny::AnchorCap);
             drop(removed); // Actual FD closes before acquiring its replacement lease.
@@ -269,11 +310,20 @@ impl ExaminedCustody {
             file,
             _lease: lease,
         });
+        self.ranks.push(new_rank);
+        self.worst = None;
         true
     }
 
     pub(crate) fn discard_scan(&mut self, scan: u64) {
-        self.candidates.retain(|candidate| candidate.scan != scan);
+        // Paired removal keeps ranks aligned with candidates.
+        for index in (0..self.candidates.len()).rev() {
+            if self.candidates[index].scan == scan {
+                self.candidates.remove(index);
+                self.ranks.remove(index);
+            }
+        }
+        self.worst = None;
         self.missing
             .retain(|(missing_scan, _), _| *missing_scan != scan);
     }

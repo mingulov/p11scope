@@ -5881,7 +5881,7 @@ fn custody_scan_boundary_recounts_pins_before_ledger_take() {
             .all(|held| held.file.metadata().is_ok()),
         "the refusal dropped earlier custody"
     );
-    println!("{COMPLETED}");
+    println!("\n{COMPLETED}");
 }
 
 #[test]

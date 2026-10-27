@@ -359,7 +359,7 @@ fn collect_members(
     timings: &mut StageTimings,
     budget: CaptureWorkBudget,
 ) -> Collection {
-    collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget).0
+    collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget, false).0
 }
 
 /// Explicit userspace never attempts the kernel pass (`decide_pass_attempt`
@@ -401,7 +401,9 @@ fn collect_members_identity(
     timings: &mut StageTimings,
     identity: bool,
     mut budget: CaptureWorkBudget,
+    take_anchors: bool,
 ) -> (Collection, Option<ExaminedCustody>) {
+    debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
     let (pids, unlisted) = scope_pids(&scope);
@@ -464,22 +466,7 @@ fn collect_members_identity(
                 *callers.entry(key).or_default() += 1;
             }
         }
-        // A failed strict census starts a closed custody phase: the normal
-        // userspace scan still runs, but no partial anchor population forms.
-        match SegmentPolicy::try_snapshot(0, 0) {
-            Ok(policy) => ExaminedCustody::new(
-                ReservationOwner::for_examined(policy, EXAMINED_ANCHOR_CAP),
-                callers,
-            ),
-            Err(reason) => {
-                let mut failed = ExaminedCustody::new(
-                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(0, 0, 0), 0),
-                    callers,
-                );
-                let _ = failed.reconcile_census(Err(reason));
-                failed
-            }
-        }
+        build_identity_custody(callers, take_anchors)
     });
 
     let mut members = Vec::with_capacity(selected.len());
@@ -1159,7 +1146,15 @@ fn collect_identity(
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = if identity {
-        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true, budget)
+        collect_members_identity(
+            hints,
+            hooks,
+            max_scan_pids,
+            &mut timings,
+            true,
+            budget,
+            true,
+        )
     } else {
         (
             collect_members(hints, hooks, max_scan_pids, &mut timings, budget),
@@ -3414,9 +3409,22 @@ pub(crate) fn collect_system_with_identity(
             "physical identity collection requires inventory policy"
         ));
     }
+    // The selection is fixed for the capture, so one read serves both the
+    // custody cap below and the proof-index skip after the bind.
+    let selection = shared
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .selection;
     let mut timings = StageTimings::new();
-    let (mut collection, mut custody) =
-        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true, budget);
+    let (mut collection, mut custody) = collect_members_identity(
+        hints,
+        hooks,
+        max_scan_pids,
+        &mut timings,
+        true,
+        budget,
+        identity_takes_anchors(selection),
+    );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
         scanned: collection.scanned(),
@@ -3444,13 +3452,7 @@ pub(crate) fn collect_system_with_identity(
     // proof plan: skip the index build entirely (perf). The decide path
     // stays correct because userspace decides `Userspace` for either
     // `has_proof` value (see `d3d_userspace_selection_never_loads_or_probes`).
-    let explicit_userspace = matches!(
-        shared
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .selection,
-        crate::cli::IdentityBackendSelection::Userspace
-    );
+    let explicit_userspace = matches!(selection, crate::cli::IdentityBackendSelection::Userspace);
     let has_proof = if explicit_userspace {
         false
     } else {

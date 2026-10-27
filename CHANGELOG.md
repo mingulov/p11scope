@@ -54,12 +54,14 @@ User-facing limits live in
   else in v3 grants capture.
 - `--counter-mode counts|timestamps|latency` selects kernel-aggregated
   capture for `profile`/`run` with `--mode metrics` on 6.6+ (LP64). On
-  5.15 and 6.1 every mode refuses with the named
-  `counter-mode-unavailable-on-kernel` reason before capture setup, and
-  `run` never starts its program then. Latency banks refuse with
-  `counter-memory-limit` past the per-capture kernel-map memory cap on
-  hosts with many possible CPUs. Omit the flag to keep existing metrics
-  behavior.
+  5.15 every mode refuses with the named
+  `counter-mode-unavailable-on-kernel` reason before any counter
+  program loads; on 6.1 the same named reason is reported when the
+  kernel verifier rejects a counter program as too complex (E2BIG) at
+  load. Either way `run` never starts its program. Latency banks refuse
+  with `counter-memory-limit` past the per-capture kernel-map memory
+  cap on hosts with many possible CPUs. Omit the flag to keep existing
+  metrics behavior.
 - Startup readiness bounds are disclosed per kernel (8 s on 6.6+,
   30 s on 5.15/6.1); see
   [known limitations](docs/known-limitations.md#known-limitations-v050).
@@ -87,21 +89,60 @@ User-facing limits live in
 
 The v0.5.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-v050).
-Most important for this release:
+Known issues in this release:
 
 - Strict scale and speed numbers apply only on kernels with uprobe_multi
   (6.6 and later); older kernels stay correct but stop slowly and start
-  slowly.
-- Startup takes about 15–22 s on 5.15/6.1, about 4–7 s on 6.6+.
-- `--counter-mode` selections aggregate in the kernel on 6.6+ (LP64)
-  and refuse by name on 5.15 and 6.1; metrics behavior without the
-  flag is unchanged.
+  slowly. When the expected stop reaches 2 s, one up-front estimate
+  line is printed first.
+- Startup takes about 15–22 s on 5.15/6.1, about 4–7 s on 6.6+; the
+  declared readiness bound is 8 s on 6.6+, 30 s on 5.15/6.1.
+- `--counter-mode` selections aggregate in the kernel on 6.6+ (LP64);
+  on 5.15 they refuse by name before any counter program loads, on 6.1
+  when the kernel verifier rejects a counter program (E2BIG) at load;
+  metrics behavior without the flag is unchanged. A refused
+  counter-mode or Detailed start shows the refused state in text
+  output; the full reason is in the JSON report.
+- Per-call profile/trace capture stays fixed at 512 attach slots
+  (2,112 only in the WIDE source build); counter banks share one
+  65,536-entry return-value pool.
+- A capture follows at most 256 provider loads and tracks at most
+  16,384 program images; past either limit the report carries a named
+  gap. Stopping a very large capture can refuse its fixed graph pool
+  and end as a finite incomplete stop.
+- Processes already running when the capture attached lose their
+  first burst of calls; tools that exit before their first binding
+  cannot join.
+- A same-address unload and reload between two scans shows one
+  instance, as does a finalize/initialize cycle inside one load.
 - In containers, a process that loaded a provider before a copy-up is
   attributed to the copied-up file and its later calls are missed;
   restart such processes.
+- A provider first loaded mid-capture can lose the calls made before
+  its watch begins; the JSON states the unwatched window.
+- A `profile` or `trace` output has no per-run marker for calls made
+  before a provider's probes landed; inside a nested PID namespace
+  attach can take up to about 7 s.
 - A timed run shorter than the first full pass reports 0 callers with a
   `no complete collection pass` gap.
-- Per-call profile/trace capture stays fixed at 512 attach slots.
+- Short-lived processes missed at system scale are counted only as
+  gaps; their calls through attached providers still count.
+- Key operations cover only processes started after the observer
+  attached (already-running processes keep mechanism and API-result
+  reporting only); this version reports no key operations at all.
+- If probes failed to detach cleanly during a `--manifest` capture,
+  stopping needs a second Ctrl-C to write the report.
+- A process whose main thread had already exited when first met is not
+  admitted, and its calls are not counted.
+- A library loaded just before a process exits counts one
+  `discovery_truncated` gap; call counts stay exact.
+- A post-exec instance whose semantics cannot be proven appears as a
+  named gap, not a joined instance.
+- On 5.15, per-copy module attribution and calls held across a
+  non-leader exec stay unqualified.
+- A load, one call, unload burst inside about 1 ms reads the same as
+  no calls unless the child is held with `run --pause auto` or kept
+  alive past attach.
 - Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
   are not qualified yet.
 

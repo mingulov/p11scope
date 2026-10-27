@@ -23,9 +23,12 @@ implementation limits are code contracts, not measurements.
 
 `--counter-mode counts|timestamps|latency` selects kernel-aggregated
 capture for `profile` or `run` with `--mode metrics`, available on 6.6+
-(LP64). On 5.15 and 6.1 every mode refuses with the named
-`counter-mode-unavailable-on-kernel` reason before capture setup or
-owned-child launch. Latency banks grow with the host possible-CPU count
+(LP64). On 5.15 every mode refuses with the named
+`counter-mode-unavailable-on-kernel` reason before any counter program
+loads. On 6.1 the same named reason is reported when the kernel
+verifier rejects a counter program as too complex (E2BIG) at load.
+Either way `run` terminates its held child and never starts the
+program. Latency banks grow with the host possible-CPU count
 and refuse with `counter-memory-limit` past the per-capture kernel-map
 memory cap on hosts with many CPUs. Omit `--counter-mode` to keep
 existing metrics behavior.

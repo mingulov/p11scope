@@ -24,8 +24,10 @@ assessment and incident diagnostics.
 
 Omitting `--counter-mode` keeps existing metrics behavior. Explicit
 `counts`, `timestamps` and `latency` selections aggregate in the kernel
-on 6.6+ (LP64); on 5.15 and 6.1 they refuse with the named
-`counter-mode-unavailable-on-kernel` reason before capture setup, and
+on 6.6+ (LP64); on 5.15 they refuse with the named
+`counter-mode-unavailable-on-kernel` reason before any counter program
+loads, and on 6.1 the same named reason is reported when the kernel
+verifier rejects a counter program as too complex (E2BIG) at load.
 `run` never starts its program when a counter refusal happens.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40

@@ -14,20 +14,36 @@ proven) captures stay correct and stop in finite time, but slowly:
 teardown detaches one link at a time at about 18 ms per link (5.15
 guest) and tens of ms per link on newer kernels stopping one link at
 a time, and startup takes about 15–22 s on 5.15/6.1 versus about 4–7 s
-on 6.6+. The report always discloses which backend was used
-(`observation.attach`, `evidence.attach_backend`). On 5.15, per-copy
-module attribution and calls held across a non-leader exec stay
-unqualified (see below).
+on 6.6+. When the expected stop reaches 2 s, one up-front estimate
+line is printed first. The declared startup readiness bound is 8 s on
+6.6+ and 30 s on 5.15/6.1. The report always discloses which backend
+was used (`observation.attach`, `evidence.attach_backend`). On 5.15,
+per-copy module attribution and calls held across a non-leader exec
+stay unqualified (see below).
 
 Measurement modes aggregate in the kernel on 6.6+ (LP64):
 `--counter-mode counts|timestamps|latency` for `profile`/`run` with
-`--mode metrics`. On 5.15 and 6.1 every mode refuses with the named
-`counter-mode-unavailable-on-kernel` reason before capture setup, and
-`run` never starts its program then. Latency banks grow with the host
-possible-CPU count and refuse with `counter-memory-limit` past the
-per-capture kernel-map memory cap on hosts with many CPUs. Per-call
+`--mode metrics`. On 5.15 every mode refuses with the named
+`counter-mode-unavailable-on-kernel` reason before any counter
+program loads: the kernel lacks the bpf_loop helper the counters
+need. On 6.1 the same named reason is reported when the kernel
+verifier rejects a counter program as too complex (E2BIG) at load.
+Either way `run` never starts its program. If a counter-mode or
+Detailed start is refused, the text output shows the refused state
+and the full reason is in the JSON report. Latency banks grow with
+the host possible-CPU count and refuse with `counter-memory-limit`
+past the per-capture kernel-map memory cap on hosts with many CPUs.
+Counter banks share one 65,536-entry return-value pool, and
+saturation is reported in the collection health. Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build).
+
+A capture follows at most 256 provider loads and tracks at most
+16,384 program images; past either limit the report carries a named
+gap and reads PARTIAL (full entries below). Stopping a very large
+capture can refuse its fixed 384 MiB graph pool: the stop ends as a
+finite incomplete stop, with retired objects still reported attached
+and the measured peak disclosed (full entry below).
 
 A timed run shorter than the first full pass (5–10 s on a busy host)
 discards the collection and reports 0 callers with a `no complete
@@ -36,6 +52,31 @@ calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or
 unattributed (see below); tracking them needs a later opt-in mode.
+Short-lived processes missed at system scale are counted only as gaps
+(`pid_descendant_gaps`); their calls through attached providers still
+count. A process whose main thread had already exited when the capture
+first met it is not admitted, and its calls are not counted.
+
+A library loaded just before a process exits (glibc loads `libgcc_s`
+at a thread's first `pthread_exit`) cannot be checked against the dead
+process: the report counts one `discovery_truncated` gap with the
+loader skipped as `discovery unavailable`, and call counts stay exact.
+A post-exec instance whose semantics cannot be proven appears as a
+named gap (`gap [instance semantics refused] instance_unproven`), not
+a joined instance. If a multi-threaded program unloads and reloads a
+provider at the same address between two scans, the capture shows one
+instance; per-caller call totals are unaffected. Finalizing and
+re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
+is also one instance.
+
+Key operations (`--manifest`) cover only processes started (or exec'd)
+after the observer attached; processes already running keep mechanism
+and API-result reporting only. This version reports no key operations
+at all, so the `key operations:` line always reads `not reported by
+this version (planned for 0.5.1)`. If probes failed to detach cleanly
+during a `--manifest` capture, stopping needs a second Ctrl-C: the
+first begins the stop and the second interrupts the wait so the report
+is written.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
@@ -51,6 +92,26 @@ sweep, up to about 7 s, before its provider is attached. A late
 provider whose calls finished before its watch began shows that
 unwatched window in the JSON (`first_seen_ns` earlier than
 `since_ns`).
+
+A process that loads a provider, makes one call within about a
+millisecond, and unloads is not observed without `run --pause auto`.
+On Linux 7.0.14, for the four provider shapes measured under `p11scope
+run --trace` (32 runs at 0/10/100/1000 us load-to-call delays), all 32
+runs missed the single call (1 of 1 missed, 0 caller-attributed),
+each reporting PARTIAL with a proven drain and zero event loss: the
+transient exits before discovery attaches anything (0 slots, no
+modules). With `run --pause auto`, which holds the child at each
+loader hit until its probes attach, the same 32 runs captured the
+call every time (0 missed), but the caller stayed `Unknown executable`
+(0 attributed): a one-call transient leaves no second witness to name
+it. A repeat run on Fedora (Linux 7.2.9) with the same 32 runs showed
+the same split: with `--pause never` all 32 missed the call
+(0 attributed); with `--pause auto` all 32 captured it (0 missed) and
+the caller stayed `Unknown executable`. So for bursts of this shape,
+expect a load, one call, unload burst inside ~1 ms of the load to read
+the same as no calls unless the child is held with `--pause auto` or
+kept alive past attach. Only two kernels, four provider shapes and
+`run --trace` were measured.
 
 Container checks run for v0.5.0, each counted against an independent
 call ledger: Docker shared image layers and copy-up (Linux 7.0, and

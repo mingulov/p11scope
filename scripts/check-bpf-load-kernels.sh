@@ -48,23 +48,27 @@
 # also holds its Inventory preflight loads under other BTF ids; those
 # groups never supply Detailed coverage, so a Detailed program doctor
 # stops loading is still reported missing. Both sides fail on a refused
-# load, a missing probe row, or a count over budget. Per counter mode the 2 bank
-# roots the profile run loads, scored per object (counter-<mode>) against
-# the numeric per-kernel bank budgets in
+# load, a missing probe row, or a count over budget. Per counter mode the
+# 15 programs the profile run loads from that mode's counter object (the
+# 13 defaults, including the sched_process_exec/exit lifecycle pair that
+# loads in every counter profile run, plus the 2 bank roots), scored per
+# object (counter-<mode>) against the numeric per-kernel budgets in
 # tests/counter-bpf-verifier-budgets.json (a separate file with its own
 # kernel set, since the main file's shape pin requires one kernel set
-# for every program), so a missing program or growth FAILs. 5.15 refuses
-# before loading (no bpf_loop) and 6.1 refuses at load (verifier E2BIG);
-# both keep the specified counter-mode-unavailable-on-kernel refusal, and
-# the gate passes those kernels only when the observer log names it and
-# no bank program loaded. Known gaps, not gated:
+# for every program), so a missing program or growth FAILs. The probe
+# file's 16th load (the lone Detailed return) belongs to no counter
+# group and is ignored when scoring counter modes. 5.15 refuses before
+# loading (no bpf_loop, no counter program tried) and 6.1 refuses at
+# load with the named counter-mode-unavailable-on-kernel at-load refusal
+# (verifier E2BIG on a named counter program); the gate passes those
+# kernels only when the observer log names the token, no bank program
+# loaded, and (on 6.1) the probe file holds a non-auxiliary E2BIG row
+# for a named counter program. Known gaps, not gated:
 # p11_selected_bootstrap (loads only for a promoted live process, which
 # needs a provider mapped in the guest), the dormant
 # p11_selected_cgroup_migrate (present in the object, no load call
-# site), the lazily loaded p11_inventory_image_baseline iterator (no
-# provider in the guest loads it), and the bank lifecycle roots
-# (sched_process_exec/sched_process_exit: present in the bank objects,
-# loaded by no production path).
+# site), and the lazily loaded p11_inventory_image_baseline iterator (no
+# provider in the guest loads it).
 set -eu
 
 BUDGETS=""
@@ -356,14 +360,28 @@ for KERNEL in "$@"; do
                 REFUSED=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" | wc -l)
                 case "$KERNEL" in
                     v6.1.*)
-                        if [ "$REFUSED" -eq 0 ]; then
-                            echo "# error: counter-$MODE on $KERNEL left no at-load refusal rows (expected E2BIG)"
+                        # At-load proof: a non-auxiliary, non-unresolved row
+                        # refused with E2BIG (errno 7). Auxiliary aya probes
+                        # and the bpf_loop probe (unresolved) do not count;
+                        # only a named counter program proves the specified
+                        # at-load path ran. Prints the program name.
+                        E2BIG_PROG=$(grep -E '"loaded": ?false' "$C_PROBE_JSON" \
+                            | grep -E '"auxiliary": ?null' \
+                            | grep -v -E '"root": ?"unresolved"' \
+                            | grep -E '"errno": ?7' \
+                            | sed -n 's/.*"root": *"\([^"]*\)".*/\1/p' \
+                            | sort -u | head -n 1)
+                        if [ -z "$E2BIG_PROG" ]; then
+                            echo "# error: counter-$MODE on $KERNEL left no at-load refusal rows (expected E2BIG from a named counter program)"
                             FAILED=1
                             continue
                         fi
+                        echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED e2big-program=$E2BIG_PROG)"
+                        ;;
+                    *)
+                        echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED)"
                         ;;
                 esac
-                echo "# counter-$MODE refused as specified on $KERNEL (rc=$C_RC refusal-rows=$REFUSED)"
                 ;;
             *)
                 # A failed counter run still falls through to per-program

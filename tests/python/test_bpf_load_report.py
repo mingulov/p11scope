@@ -28,19 +28,30 @@ OBSERVER = "ab" * 32
 EXPECTED_BUDGET_KERNELS = frozenset({
     "v5.15.221", "v6.1.188", "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
 })
-# Counter banks load only where the verifier accepts them (6.6+); the old
-# kernels keep the specified refusal, so the counter file pins its own set.
+# Counter objects load only where the verifier accepts them (6.6+); the
+# old kernels keep the specified refusal, so the counter file pins its
+# own kernel set. Each counter object loads 15 programs (the 13 defaults
+# plus the 2 bank roots, including the sched lifecycle pair that every
+# counter profile run loads); the probe file's 16th load is the lone
+# Detailed return, which BTF grouping ignores when scoring counter
+# modes. Every loaded counter program has a cell for each 6.6+ kernel
+# and nothing else.
 EXPECTED_COUNTER_BUDGET_KERNELS = frozenset({
     "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
 })
-EXPECTED_COUNTER_BUDGET_PROGRAMS = frozenset({
-    "counter-counts/p11_counter_bank_entry",
-    "counter-counts/p11_counter_bank_return",
-    "counter-timestamps/p11_counter_bank_entry",
-    "counter-timestamps/p11_counter_bank_return",
-    "counter-latency/p11_counter_bank_entry",
-    "counter-latency/p11_counter_bank_return",
-})
+_COUNTER_MODES = ("counts", "timestamps", "latency")
+_COUNTER_ROOTS = (
+    "dl_debug_state", "function_list_entry", "function_list_return",
+    "interface_entry", "interface_list_entry", "interface_list_return",
+    "interface_list_worker", "interface_return",
+    "p11_counter_bank_entry", "p11_counter_bank_return",
+    "p11_entry", "p11_return",
+    "sched_process_exec", "sched_process_exit", "task_newtask",
+)
+EXPECTED_COUNTER_BUDGET_PROGRAMS = frozenset(
+    f"counter-{mode}/{root}"
+    for mode in _COUNTER_MODES for root in _COUNTER_ROOTS
+)
 
 
 def budgets_files():
@@ -553,6 +564,62 @@ class ReportTests(unittest.TestCase):
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn("at-load refusal rows", text)
+
+    def test_driver_requires_named_e2big_program_on_61(self):
+        # The 6.1 at-load proof must name a non-auxiliary, non-unresolved
+        # counter program refused with E2BIG: auxiliary aya rows and the
+        # bpf_loop probe alone do not prove the specified path ran. The
+        # driver prints the program name.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('"auxiliary": ?null', text)
+        self.assertIn('"root": ?"unresolved"', text)
+        self.assertIn('"errno": ?7', text)
+        self.assertIn("e2big-program=", text)
+
+    def e2big_program_via_driver_pipeline(self, probe_path):
+        # The driver's 6.1 at-load extraction, mirrored here so the twin
+        # proves the grep logic distinguishes a real E2BIG counter row
+        # from auxiliary-only refused rows. The pin test above ensures
+        # the driver uses these same patterns.
+        pipeline = (
+            f"grep -E '\"loaded\": ?false' {probe_path} "
+            f"| grep -E '\"auxiliary\": ?null' "
+            f"| grep -v -E '\"root\": ?\"unresolved\"' "
+            f"| grep -E '\"errno\": ?7' "
+            f"| sed -n 's/.*\"root\": *\"\\([^\"]*\\)\".*/\\1/p' "
+            f"| sort -u | head -n 1"
+        )
+        result = subprocess.run(
+            pipeline, shell=True, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_61_e2big_extraction_names_the_counter_program(self):
+        # Positive: auxiliary refused rows plus the bpf_loop probe plus
+        # a real E2BIG counter row yield the counter program name.
+        aux = aux_row("aya-helper113", loaded=False, errno=13)
+        probe = self.bpf_loop_probe_row(13)
+        refused = load_row("function_list_return", loaded=False, errno=7,
+                           stats_present=True, processed=1000001,
+                           btf_id=41)
+        path = self.write_loads("probe-61.jsonl", [aux, probe, refused])
+        self.assertEqual(
+            self.e2big_program_via_driver_pipeline(path),
+            "function_list_return")
+
+    def test_61_e2big_extraction_with_only_auxiliary_rows_finds_nothing(self):
+        # Twin: auxiliary refused rows plus the bpf_loop probe, but no
+        # E2BIG counter row, yield nothing, so the driver's 6.1 arm
+        # FAILs instead of passing trivially.
+        aux = aux_row("aya-helper113", loaded=False, errno=13)
+        probe = self.bpf_loop_probe_row(13)
+        loaded = load_row("p11_return", processed=645449, btf_id=40)
+        path = self.write_loads("probe-aux-only.jsonl",
+                                [aux, probe, loaded])
+        self.assertEqual(
+            self.e2big_program_via_driver_pipeline(path), "")
 
     def test_driver_checks_old_kernel_counter_runs_for_crashes(self):
         # Old-kernel refusal arms carry the same crash grep as the 6.6+

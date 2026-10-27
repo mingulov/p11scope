@@ -314,6 +314,11 @@ enum RecordedState<Io: ShardableIo> {
         pin: ReservedPin<Io::Pin>,
         before: crate::discovery::caller_registry::ExeIdentity,
         maps: Result<Transcript, String>,
+        /// The worker's proof ranges for a clean read, carried so the
+        /// preview replays the transcript without recomputing them from
+        /// the same entries. `None` when the read was not clean: the
+        /// preview then recomputes from its replay exactly as before.
+        ranges: Option<Vec<(u64, u64)>>,
     },
     Failed(Confirmation),
 }
@@ -407,7 +412,7 @@ fn record<Io: ShardableIo, F: Fn() -> Io>(
                     )
                 })?;
                 let maps = match io.open_maps(pid) {
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => (Err(error.to_string()), None),
                     Ok(maps) => {
                         let maps = LeasedReader {
                             inner: maps,
@@ -421,27 +426,40 @@ fn record<Io: ShardableIo, F: Fn() -> Io>(
                             &|| io.maps_now(),
                             &mut bufs,
                         );
-                        let result = unclean
-                            .or_else(|| transcript.clean_result().cloned())
-                            .unwrap_or_else(|| Err(DIVERGED.into()));
-                        if let Ok(entries) = result {
-                            for _ in proof_ranges(&entries, prove) {
-                                if shadow.spend(1).is_err() {
-                                    break;
-                                }
+                        // Borrow, never clone: the transcript keeps the
+                        // entries for the preview; only the small range
+                        // list is carried, and only for a clean read.
+                        // Unclean reads keep the exact previous behavior:
+                        // charged here, recomputed from the replay there.
+                        let (ranges, carry) = match (
+                            &unclean,
+                            transcript.clean_result(),
+                        ) {
+                            (_, Some(Ok(entries))) => {
+                                (proof_ranges(entries, prove), true)
+                            }
+                            (Some(Ok(entries)), _) => {
+                                (proof_ranges(entries, prove), false)
+                            }
+                            _ => (Vec::new(), false),
+                        };
+                        for _ in &ranges {
+                            if shadow.spend(1).is_err() {
+                                break;
                             }
                         }
-                        Ok(transcript)
+                        (Ok(transcript), carry.then_some(ranges))
                     }
                 };
                 Ok((pin, before, maps))
             })();
             match prepared {
-                Ok((pin, before, maps)) => RecordedState::Confirm {
+                Ok((pin, before, (maps, ranges))) => RecordedState::Confirm {
                     io,
                     pin,
                     before,
                     maps,
+                    ranges,
                 },
                 Err(confirmation) => RecordedState::Failed(confirmation),
             }
@@ -483,6 +501,7 @@ fn preview<Io: ShardableIo>(
             pin,
             before,
             maps,
+            ranges: carried,
         } => {
             let mut bufs = MapsReadBuffers::default();
             let entries = match maps {
@@ -507,9 +526,14 @@ fn preview<Io: ShardableIo>(
                     }
                 }),
                 Ok(entries) => {
-                    #[cfg(test)]
-                    record_preview_recompute_for_test();
-                    let ranges = proof_ranges(&entries, prove);
+                    let ranges = match carried {
+                        Some(ranges) => ranges,
+                        None => {
+                            #[cfg(test)]
+                            record_preview_recompute_for_test();
+                            proof_ranges(&entries, prove)
+                        }
+                    };
                     let mut failed = None;
                     for _ in &ranges {
                         if let Err(reason) = journal.spend() {

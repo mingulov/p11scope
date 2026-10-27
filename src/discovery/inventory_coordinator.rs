@@ -17707,6 +17707,58 @@ exit 0
         }
     }
 
+    /// A normal single-thread exit reaches sched_process_exit before
+    /// exit_notify makes its pidfd readable. The source's still-held pin
+    /// scripts that interval; it is not a positive live-worker witness.
+    #[test]
+    fn automatic_exec_single_thread_exit_before_pidfd_ready_has_no_link_loss() {
+        let (mut native, caller) = NativeScene::boxed();
+        native.scene.source.poison_reopen();
+        let opens_before = native.scene.source.reopen_attempts();
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 1_500;
+        record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+        // The ordinary exit is not complete yet: the original pin still
+        // holds, but no non-leader liveness proof has been supplied.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let adapter = &native.scene.coordinator.adapter;
+        assert_eq!(adapter.live_id(7), Some(caller), "original custody stays");
+        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+        assert!(!adapter.record(caller).unwrap().retired, "no tombstone");
+
+        // Now the same ordinary exit completes. A later empty lifecycle
+        // pass must not leave an irreversible false worker-loss history.
+        native.scene.source.kill(7);
+        let receipt = native.drain();
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.source.reopen_attempts(),
+            opens_before,
+            "exit adjudication never reopens the numeric PID"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.caller != Some(caller) || gap.subject != "leader task link loss"),
+            "a held pin during ordinary exit is not evidence of surviving workers: {:?}",
+            native.scene.coordinator.registry.gaps(),
+        );
+    }
+
     /// H6 slice 2: leader exit with live sibling keeps original custody and
     /// explicit link loss; later EXEC in the same and a later batch restores
     /// useful endpoints. Whole-group death and delayed pre-admission EXEC

@@ -151,8 +151,8 @@ Known issues in this release:
   progress is abandoned after 6 seconds with a named gap; the capture
   keeps running and coverage reads partial.
 - On some overlayfs setups before Linux 6.8, a provider whose /proc
-  maps rendering cannot be proven is skipped with an identity-mismatch
-  record, and callers mapping it may stay unbound.
+  maps rendering cannot be proven carries an explicit unproven-maps
+  note, and callers mapping it may stay unbound.
 - Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
   are not qualified yet.
 

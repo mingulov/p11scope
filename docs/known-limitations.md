@@ -99,10 +99,9 @@ On some overlayfs setups before Linux 6.8, p11scope may be unable to
 prove how a provider file appears in /proc maps: the opened file and
 its mappings legitimately carry different keys there, and the kernel
 check that reconciles them can come back inconclusive. The provider
-is then skipped with an `opened object identity ... does not match
-mapped object ...` record naming the provider, and callers mapping
-that provider may stay unbound. This key split does not happen on
-Linux 6.8 and later.
+pin then carries the note `provider's maps rendering unproven;
+callers mapping it may stay unbound`, and callers mapping that provider
+may stay unbound. This key split does not happen on Linux 6.8 and later.
 
 A `profile` or `trace` output has no per-run marker for calls made
 before a provider's probes landed, so a missed early burst reads the

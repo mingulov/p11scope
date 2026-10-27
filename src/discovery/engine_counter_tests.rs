@@ -707,3 +707,77 @@ fn counter_growth_without_fresh_tail_stages_nothing() {
         "a no-op stages no PARTIAL"
     );
 }
+
+/// The counter re-admission wiring in the real start path.
+/// `start_session_with` captures the counter start budget before the
+/// attach-preparation retain loop and re-admits the retained plan under
+/// that unchanged budget afterwards; deleting the restore call reintroduces
+/// the stale-view policy loss (the first collection read bails) with no
+/// other test failing. A runtime test through `start_session_with` cannot
+/// observe this without a successful session start — fake pins fail first
+/// and the failure path restores the pre-conversion snapshot plan — so this
+/// pins the wiring itself: removing the restore call fails this test.
+#[test]
+fn counter_start_wiring_readmits_the_retained_plan_after_the_retain_loop() {
+    let source = include_str!("engine.rs");
+    let route = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("\n    }\n}")
+        .expect("start_session_with body ends")
+        .0;
+    let capture = route
+        .find("let counter_budget = if counter.is_some()")
+        .expect("start budget captured before the retain loop");
+    let retain = route
+        .find("start_retained_with(self,")
+        .expect("attach-preparation retain loop runs the start");
+    let restore = route
+        .find("self.restore_counters_policy_after_retain(budget)")
+        .expect("retained plan re-admitted after the retain loop");
+    assert!(
+        capture < retain && retain < restore,
+        "budget capture, retain loop, and re-admission stay in order"
+    );
+    assert!(
+        route[retain..restore].contains("if let Some(budget) = counter_budget"),
+        "re-admission runs only for counter starts"
+    );
+    assert!(
+        route[restore..].contains("finish_start_capture_attempt(snapshot, Err(error))"),
+        "a re-admission refusal restores the pre-attempt plan"
+    );
+}
+
+/// Failure twin of the healthy re-admission path: restoring the Counters
+/// policy under a budget smaller than the retained plan refuses with the
+/// named capacity reason and leaves the Detailed plan untouched
+/// (`with_counters_policy` validates before cloning). Three slots, budget
+/// for two.
+#[test]
+fn counter_retain_restore_refuses_an_over_budget_plan_with_its_named_reason() {
+    let mut engine = Engine::empty_for_test();
+    engine.plan = detailed_plan(3);
+    let before = engine.plan.clone();
+    let budget = crate::capacity::CounterBudget::new(2).unwrap();
+    let error = engine
+        .restore_counters_policy_after_retain(budget)
+        .expect_err("over-budget re-admission refuses");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("counter plan requires 3 counter endpoints but only 2 are available"),
+        "refusal names the budget: {text}"
+    );
+    assert!(
+        matches!(
+            engine.plan.admission_policy(),
+            plan::AdmissionPolicy::Detailed
+        ),
+        "refusal leaves the Detailed plan untouched"
+    );
+    assert_eq!(
+        engine.plan.slots, before.slots,
+        "slots untouched on refusal"
+    );
+}

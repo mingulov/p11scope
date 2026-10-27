@@ -1024,6 +1024,21 @@ impl InstanceRouter {
         self.fail_pending(|_| true, UnknownReason::CoverageFault)
     }
 
+    /// The scoped twin of [`Self::fail_image_coverage`] for a collected
+    /// quantum whose audit proves a bounded loss with stable eras: fail
+    /// this quantum's history (observations cleared, every pending call
+    /// shed as CoverageFault) without latching. The caller advances the
+    /// fault era, so old stamps stay refused while fresh scans re-prove
+    /// and later quanta route normally.
+    pub(crate) fn fail_quantum_coverage(&mut self) -> Vec<(u64, Route)> {
+        self.observed.clear();
+        self.absent.clear();
+        self.absence_overflowed = false;
+        self.ranges = 0;
+        self.debug_check_absent_subset();
+        self.fail_pending(|_| true, UnknownReason::CoverageFault)
+    }
+
     pub(crate) fn refuse_exhaustion(&mut self) -> Vec<(u64, Route)> {
         self.authority_failed = true;
         self.observed.clear();

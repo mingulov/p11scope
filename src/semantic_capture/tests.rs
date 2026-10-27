@@ -3278,6 +3278,105 @@ fn joint_collected_leaf_pending_fault_preserves_original_call_position() {
 }
 
 #[test]
+fn collected_transient_discard_fails_its_quantum_then_recovers() {
+    use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+    use std::collections::VecDeque;
+    use std::ops::Deref;
+    /// One lost reservation behind genuine records, like ring pressure:
+    /// the drain reports the loss only after the queued bytes.
+    struct DiscardingRecords {
+        queue: VecDeque<Vec<u8>>,
+        discarded: u64,
+    }
+    impl RecordSource for DiscardingRecords {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            if let Some(record) = self.queue.pop_front() {
+                return Some(record);
+            }
+            self.discarded = 1;
+            None
+        }
+        fn discarded(&self) -> u64 {
+            self.discarded
+        }
+    }
+    struct Fault;
+    impl crate::semantics_objects::journal::FaultEpoch for Fault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(0)
+        }
+    }
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    // Prime: a healthy quantum binds and joins, fault era 0.
+    io.semantic_call("C_SignInit", 0, 0);
+    io.semantic_call("C_Sign", 0, 0);
+    let (mut primed, _, _) = retained_joint_quantum(&mut io);
+    let joined = capture.tick_collected_with(&mut io, &mut primed).unwrap();
+    assert_eq!(joined.calls().count(), 2);
+    assert!(
+        joined
+            .calls()
+            .all(|call| matches!(call.route(), Route::Joined(_)))
+    );
+    // Failed quantum: one genuine call behind one discarded reservation.
+    io.semantic_call("C_Sign", 0, 0);
+    let records: Vec<_> = io
+        .records
+        .drain(..)
+        .map(|record| record_bytes(&record.base))
+        .collect();
+    let events = EventsDomain::test_standin(0xef01);
+    let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+    let mut drain = EventDrain::over_domain(
+        DiscardingRecords {
+            queue: records.into(),
+            discarded: 0,
+        },
+        events,
+    );
+    let pool = SemanticResourcePool::default();
+    let mut failed = RawJointQuantum::collect(
+        &mut drain,
+        &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+        4_096,
+        &Fault,
+        &producers,
+        |bytes| pool.reserve(bytes),
+    )
+    .unwrap();
+    let shed = capture.tick_collected_with(&mut io, &mut failed).unwrap();
+    assert_eq!(shed.calls().count(), 1);
+    assert_eq!(
+        shed.calls().next().unwrap().route(),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    assert!(
+        shed.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            TickOutcome::Invalidation(loss)
+                if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+        )),
+        "the failed quantum discloses its coverage loss"
+    );
+    // Recovery: the next healthy quantum audits, re-scans, and joins.
+    io.semantic_call("C_Sign", 0, 1);
+    let (mut healed, _, _) = retained_joint_quantum(&mut io);
+    let recovered = capture.tick_collected_with(&mut io, &mut healed).unwrap();
+    assert!(
+        !capture.image_failed,
+        "a bounded per-quantum loss must not latch coverage"
+    );
+    assert_eq!(recovered.calls().count(), 1);
+    assert!(
+        matches!(recovered.calls().next().unwrap().route(), Route::Joined(_)),
+        "the post-loss quantum joins against a fresh observation"
+    );
+}
+
+#[test]
 fn merge_stash_records_shed_floor_and_exhaustion() {
     // C5: merged-overflow sheds record their minimum position; a
     // shed outcome without a position records exhaustion.

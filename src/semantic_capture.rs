@@ -1329,6 +1329,12 @@ pub(crate) struct SemanticCapture {
     sticky: u64,
     image_failed: bool,
     exhausted: bool,
+    /// A scoped quantum failure failed this tick's batch: every call in it
+    /// routes CoverageFault exactly as under `image_failed`, but the flag
+    /// clears when the batch ends, so the next tick audits normally. Set
+    /// only by `fail_quantum_coverage`, only for a collected delivery
+    /// whose audit proves a bounded loss.
+    batch_failed: bool,
     stopped: bool,
     continuity_cuts: u64,
     /// Last tick's scan count and refusals, for the stuck-transaction
@@ -1416,6 +1422,7 @@ impl SemanticCapture {
             sticky: 0,
             image_failed: false,
             exhausted: false,
+            batch_failed: false,
             stopped: false,
             continuity_cuts: 0,
             #[cfg(test)]
@@ -2867,6 +2874,21 @@ impl SemanticCapture {
         self.resolve(resolved, report);
         self.jobs.clear();
     }
+    /// The scoped twin of [`Self::fail_coverage`] for a collected delivery
+    /// whose quantum audit proves a bounded loss with stable eras: this
+    /// tick behaves exactly as under coverage failure (its batch routes
+    /// CoverageFault, history is failed, the fault era advances, the loss
+    /// is disclosed), but nothing latches, so the next tick audits
+    /// normally and fresh scans re-prove. Legacy drain failures keep the
+    /// permanent path: without the quantum audit the scope is unknowable.
+    fn fail_quantum_coverage(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) {
+        self.invalidate(InvalidationScope::CoverageFailed, report);
+        let _ = io.raise_fault();
+        let resolved = self.router.fail_quantum_coverage();
+        self.resolve(resolved, report);
+        self.jobs.clear();
+        self.batch_failed = true;
+    }
     fn exhaust(&mut self, report: &mut TickReport) {
         if !self.exhausted {
             let position = self.allocate_position();
@@ -3247,7 +3269,7 @@ impl SemanticCapture {
         let mut report = TickReport::default();
         let owned;
         let is_collected = collected.is_some();
-        let (records, status, mut positions, birth_cut) = match collected {
+        let (records, status, mut positions, birth_cut, failed_permanent) = match collected {
             Some(input) => (
                 input.records,
                 if input.failed {
@@ -3257,10 +3279,13 @@ impl SemanticCapture {
                 },
                 Some(input.positions),
                 input.birth_cut.map(|cut| (cut, input.quantum)),
+                input.failed_permanent,
             ),
             None => {
                 owned = io.collect(self.limits.records);
-                (owned.records.as_slice(), owned.status, None, None)
+                // Legacy drain failures stay permanent: without the
+                // quantum audit their scope is unknowable.
+                (owned.records.as_slice(), owned.status, None, None, true)
             }
         };
         let collection_failed =
@@ -3291,8 +3316,14 @@ impl SemanticCapture {
         let mut joined_interests = BTreeMap::new();
         // A malformed/read-error prefix still contains genuine consumed
         // records. Keep their positions, then forbid every positive route.
+        // A collected delivery whose audit proves a bounded loss fails
+        // scoped (this tick only); anything else latches coverage.
         if collection_failed {
-            self.fail_coverage(io, &mut report);
+            if failed_permanent {
+                self.fail_coverage(io, &mut report);
+            } else {
+                self.fail_quantum_coverage(io, &mut report);
+            }
         }
         // Collection never routes; every batch (including empty batches) audits.
         let _ = self.audit(io, &mut report);
@@ -3341,7 +3372,14 @@ impl SemanticCapture {
                 ip: EntryIp::new(record.base.continuity.entry_ip),
                 attached_offset: endpoint.map(|e| e.offset),
             };
-            let route = self.router.route(facts);
+            // A scoped quantum failure routes this tick's batch exactly
+            // as latched coverage would; the flag clears below, so the
+            // next tick routes normally again.
+            let route = if self.batch_failed {
+                Route::Unknown(UnknownReason::CoverageFault)
+            } else {
+                self.router.route(facts)
+            };
             if route != Route::Pending {
                 if matches!(route, Route::Joined(_)) {
                     let endpoint = endpoint.expect("checked owned endpoint");
@@ -3404,6 +3442,7 @@ impl SemanticCapture {
                 });
             }
         }
+        self.batch_failed = false;
         self.prune_jobs();
         let expired: Vec<_> = self
             .jobs

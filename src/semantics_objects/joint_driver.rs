@@ -130,6 +130,12 @@ impl H0Positions<'_> {
 pub(crate) struct H0Delivery<'a> {
     pub(crate) records: &'a [DecodedEventRecord],
     pub(crate) failed: bool,
+    /// The quantum audit proves the failure is unrecoverable: the fault
+    /// cell itself is unreadable or saturated, so no later era can be
+    /// proven either. Any other failure is a bounded per-quantum loss
+    /// (malformed/discard/counter/era move) that H0 fails scoped and
+    /// recovers from; the failed quantum's own content still sheds.
+    pub(crate) failed_permanent: bool,
     pub(crate) positions: H0Positions<'a>,
     pub(crate) birth_cut: Option<super::JournalBirthCut>,
     pub(crate) quantum: RawQuantumIdentity,
@@ -1241,6 +1247,16 @@ impl RawJointQuantum {
             || self.audit.fault_before != self.audit.fault_after
     }
 
+    /// A failed collection that no later quantum can recover from: the
+    /// fault cell itself is unreadable or saturated, so fault eras are
+    /// unprovable from here on. Every other failure is a bounded loss
+    /// inside this quantum (the drain bracket proves the eras around
+    /// it), which H0 fails scoped: this quantum's content sheds, the
+    /// fault era advances, and later quanta audit normally.
+    fn collection_failed_permanent(&self) -> bool {
+        self.audit.fault_error.is_some()
+    }
+
     fn contiguous_stream(&self, adapter: &JournalAdapter) -> bool {
         self.cuts.as_ref().is_some_and(|cuts| {
             adapter.accepts_birth_cut(&cuts.birth)
@@ -1362,10 +1378,12 @@ impl RawJointQuantum {
     ) -> Result<H0Delivery<'_>, RawQuantumRefusal> {
         self.h0_input(native, limit)?;
         let failed = self.collection_failed();
+        let failed_permanent = failed && self.collection_failed_permanent();
         let birth_cut = self.birth_cut().cloned();
         Ok(H0Delivery {
             records: &self.ordinary,
             failed,
+            failed_permanent,
             birth_cut,
             quantum: self.identity,
             positions: H0Positions {

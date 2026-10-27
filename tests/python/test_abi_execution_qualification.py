@@ -9,8 +9,11 @@ profile documents. No root, no BPF, no observer: every live behavior is
 covered by the guest qualification run instead.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -791,6 +794,46 @@ class BuildRuleTests(unittest.TestCase):
             with self.assertRaisesRegex(driver.DriverRefusal, "prebuilt"):
                 driver._prebuilt(tmp, ["lp64"])
 
+    def test_rv64_mode_pins_absolute_ledger_rvs(self):
+        """The rv64 ledger itself must hold the designed high-bit values.
+
+        The installed join only proves ledger == observed, so a fixture
+        regression to small return values would still pass; this twin
+        pins the absolute per-entry ledger values at both widths.
+        """
+        driver = require_driver(self)
+        oracle = require_oracle(self)
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        expected = {
+            "lp64": [(0, 0x8000000000000001), (1, 0xFFFFFFFFFFFFFFFF),
+                     (2, 0x80000000), (3, 0)],
+            "ia32": [(0, 0x80000000), (1, 0xFFFFFFFF), (2, 0), (3, 0)],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            built = driver.build_all("gcc", str(ROOT / "tests" / "fixtures"),
+                                     str(Path(tmp) / "fix"), ["lp64", "ia32"])
+            for arch in ("lp64", "ia32"):
+                with self.subTest(arch=arch):
+                    ledger = Path(tmp) / f"rv64-{arch}.jsonl"
+                    try:
+                        completed = subprocess.run(
+                            [built[arch]["fixture"], built[arch]["hibit"],
+                             str(ledger), "", "rv64"],
+                            capture_output=True, text=True, timeout=60)
+                    except OSError:
+                        if arch == "ia32":
+                            self.skipTest("32-bit execution is not supported here")
+                        raise
+                    self.assertEqual(completed.returncode, 1, completed.stderr)
+                    self.assertIn("READY pid=", completed.stdout)
+                    with open(ledger, encoding="utf-8") as stream:
+                        rows = oracle.read_ledger(stream)
+                    oracle.validate_ledger(rows)
+                    calls = [(row["entry"], row["rv"]) for row in rows
+                             if row.get("kind") == "call"]
+                    self.assertEqual(calls, expected[arch])
+
 
 class AggregationTests(unittest.TestCase):
     def test_all_pass_aggregates(self):
@@ -833,6 +876,251 @@ class WaitHelperTests(unittest.TestCase):
             path.write_text("nothing here\n", encoding="utf-8")
             line = driver.wait_for_match(str(path), r"^READY pid=", 1)
         self.assertIsNone(line)
+
+
+class BlockReleaseBoundTests(unittest.TestCase):
+    def test_release_wait_expires_with_a_named_reason(self):
+        """The provider-side block wait must be bounded in-fixture.
+
+        With no release file forthcoming, the provider must give up on
+        its own (the timeout knob shortens the 300 s default for the
+        test) and say so; the emitter then exits 0 with the entry row
+        written, so a live cell would fail honestly at the in-flight
+        proof instead of hanging.
+        """
+        driver = require_driver(self)
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        with tempfile.TemporaryDirectory() as tmp:
+            built = driver.build_all("gcc", str(ROOT / "tests" / "fixtures"),
+                                     str(Path(tmp) / "fix"), ["lp64"])
+            ledger = Path(tmp) / "ledger.jsonl"
+            entered = Path(tmp) / "entered"
+            env = dict(os.environ,
+                       P11SCOPE_FIXTURE_BLOCK_ENTERED=str(entered),
+                       P11SCOPE_FIXTURE_BLOCK_RELEASE=str(Path(tmp) / "never"),
+                       P11SCOPE_FIXTURE_BLOCK_TIMEOUT_MS="200")
+            completed = subprocess.run(
+                [built["lp64"]["fixture"], built["lp64"]["stub"],
+                 str(ledger), "", "blocked"],
+                capture_output=True, text=True, timeout=30, env=env)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(entered.is_file())
+            self.assertIn("block wait expired", completed.stderr)
+
+
+class StartupTests(unittest.TestCase):
+    def test_list_cells_needs_no_paths(self):
+        driver = require_driver(self)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = driver.main(["--list-cells"])
+        self.assertEqual(code, 0)
+        listed = out.getvalue()
+        self.assertEqual(len(driver.COND_ORDER), 13)
+        for cond in driver.COND_ORDER:
+            self.assertIn(cond, listed)
+
+    def test_main_without_paths_is_refused(self):
+        driver = require_driver(self)
+        with self.assertRaises(SystemExit) as raised:
+            driver.main([])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_missing_oracle_script_is_refused(self):
+        driver = require_driver(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = Path(tmp) / "cell"
+            cell_dir.mkdir()
+            record = driver.run_cell(
+                observer="no-observer", fixture="no-fixture",
+                provider="no-provider", scripts_dir=tmp, cond="threads",
+                arch="lp64", cell_dir=cell_dir, duration=1)
+        self.assertFalse(record["passed"])
+        self.assertIn("oracle", record["reason"])
+
+    def test_missing_pin_script_is_refused(self):
+        driver = require_driver(self)
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(ORACLE_PATH, Path(tmp) / driver.ORACLE_NAME)
+            cell_dir = Path(tmp) / "cell"
+            cell_dir.mkdir()
+            record = driver.run_cell(
+                observer="no-observer", fixture="no-fixture",
+                provider="no-provider", scripts_dir=tmp, cond="threads",
+                arch="lp64", cell_dir=cell_dir, duration=1)
+        self.assertFalse(record["passed"])
+        self.assertIn("pin", record["reason"])
+
+
+class RunLogTests(unittest.TestCase):
+    def test_run_log_appends_one_json_line_per_run(self):
+        driver = require_driver(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cell" / "runs.jsonl"
+            first = {"cell": "full", "arch": "ia32", "passed": False,
+                     "known_issue": None, "reason": "flake"}
+            second = {"cell": "full", "arch": "ia32", "passed": True,
+                      "known_issue": None, "reason": "oracle accepted"}
+            driver.append_run_log(log, first)
+            driver.append_run_log(log, second)
+            with open(log, encoding="utf-8") as stream:
+                lines = stream.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0]), first)
+        self.assertEqual(json.loads(lines[1]), second)
+
+    def test_cell_rate_counts_every_run_as_it_happened(self):
+        driver = require_driver(self)
+        records = [
+            {"cell": "full", "arch": "ia32", "passed": False,
+             "known_issue": None},
+            {"cell": "full", "arch": "ia32", "passed": True,
+             "known_issue": None},
+            {"cell": "full", "arch": "ia32", "passed": False,
+             "known_issue": "r57-exit-time-loader-truncation"},
+            {"cell": "threads", "arch": "ia32", "passed": True,
+             "known_issue": None},
+        ]
+        rate = driver.cell_rate(records, "full", "ia32")
+        self.assertEqual(rate, {"runs": 3, "passed": 1, "known_issue": 1,
+                               "failed": 1})
+
+
+def known_shape_report(driver):
+    """The proved exit-time loader signature: exactly one truncation,
+    counts exact, every skipped row the discovery subject, and the
+    pinned causes plus exactly the two the truncation entails."""
+    report = build_evidence(
+        driver, [function_row(8, "C_GetMechanismInfo", 3,
+                              {"0000000000000000": 3})])
+    evidence = report["evidence"]
+    evidence["discovery_truncated"] = 1
+    evidence["skipped"] = [{"name": "discovery subject",
+                            "reason": "discovery unavailable"}] * 2
+    EVIDENCE.settle_fixture_verdict(report)
+    evidence["completeness"] = \
+        EVIDENCE.expected_terminal_completeness(evidence)
+    return report
+
+
+class ExitTimeTruncationTests(unittest.TestCase):
+    KNOWN_CAUSES = {"unprotected_live_windows", "loader_discovery",
+                    "interface_selection", "skipped", "discovery_truncated"}
+
+    def test_exact_signature_is_shaped_as_proved(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        self.assertEqual(
+            set(report["evidence"]["gap_classes"]["observation"]["causes"]),
+            self.KNOWN_CAUSES)
+
+    def test_exact_signature_classified_known_issue(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        match = driver.match_exit_time_truncation(report, PIN)
+        self.assertEqual(match["rule"], driver.KNOWN_ISSUE_RULE)
+        self.assertEqual(match["discovery_truncated"], 1)
+        self.assertEqual(match["skipped_rows"], 2)
+
+    def test_exact_signature_still_refused_by_the_strict_gate(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        with self.assertRaisesRegex(driver.DriverRefusal,
+                                    "discovery_truncated"):
+            driver.check_s1_report(report, PIN)
+
+    def test_second_truncation_stays_fail(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        report["evidence"]["discovery_truncated"] = 2
+        EVIDENCE.settle_fixture_verdict(report)
+        with self.assertRaises(driver.DriverRefusal):
+            driver.match_exit_time_truncation(report, PIN)
+
+    def test_extra_cause_stays_fail(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        report["evidence"]["modules_skipped"] = [{"reason": "x"}]
+        EVIDENCE.settle_fixture_verdict(report)
+        with self.assertRaises(driver.DriverRefusal):
+            driver.match_exit_time_truncation(report, PIN)
+
+    def test_non_discovery_skip_stays_fail(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        report["evidence"]["skipped"] = [
+            {"name": "C_GetSlotInfo",
+             "reason": "function entry unavailable"}]
+        EVIDENCE.settle_fixture_verdict(report)
+        with self.assertRaises(driver.DriverRefusal):
+            driver.match_exit_time_truncation(report, PIN)
+
+    def test_truncation_without_skipped_rows_stays_fail(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = known_shape_report(driver)
+        report["evidence"]["skipped"] = []
+        EVIDENCE.settle_fixture_verdict(report)
+        with self.assertRaises(driver.DriverRefusal):
+            driver.match_exit_time_truncation(report, PIN)
+
+    def test_pass_shape_is_not_a_known_issue(self):
+        driver = require_driver(self)
+        require_evidence(self)
+        report = build_evidence(
+            driver, [function_row(8, "C_GetMechanismInfo", 3,
+                                  {"0000000000000000": 3})])
+        driver.check_s1_report(report, PIN)
+        with self.assertRaises(driver.DriverRefusal):
+            driver.match_exit_time_truncation(report, PIN)
+
+    def test_counts_off_by_one_refuse_the_join(self):
+        require_driver(self)
+        oracle = require_oracle(self)
+        rows = build_ledger([(8, "C_GetMechanismInfo", 0)] * 3,
+                            cond="thread-exit", cell="cond-thread-exit")
+        exact = [{"kind": "counts", "cell": "cond-thread-exit", "entry": 8,
+                  "fn": "C_GetMechanismInfo", "calls": 3, "returns": 3,
+                  "rv": [0, 0, 0]}]
+        result = oracle.compare_abi(rows, exact)
+        self.assertEqual((result["calls"], result["returns"]), (3, 3))
+        short = [{"kind": "counts", "cell": "cond-thread-exit", "entry": 8,
+                  "fn": "C_GetMechanismInfo", "calls": 2, "returns": 2,
+                  "rv": [0, 0]}]
+        with self.assertRaisesRegex(oracle.LedgerError, "calls disagree"):
+            oracle.compare_abi(rows, short)
+
+
+class KnownIssueAggregationTests(unittest.TestCase):
+    def test_known_issue_excluded_from_failed(self):
+        driver = require_driver(self)
+        results = [{"cell": "thread-exit", "arch": "lp64", "passed": False,
+                    "known_issue": driver.KNOWN_ISSUE_RULE},
+                   {"cell": "threads", "arch": "lp64", "passed": True,
+                    "known_issue": None}]
+        overall = driver.aggregate(results)
+        self.assertTrue(overall["passed"])
+        self.assertEqual(overall["failed"], [])
+        self.assertEqual(overall["known_issue"], ["thread-exit/lp64"])
+
+    def test_fail_still_fails_beside_known_issue(self):
+        driver = require_driver(self)
+        results = [{"cell": "thread-exit", "arch": "lp64", "passed": False,
+                    "known_issue": driver.KNOWN_ISSUE_RULE},
+                   {"cell": "full", "arch": "ia32", "passed": False,
+                    "known_issue": None, "reason": "x"}]
+        overall = driver.aggregate(results)
+        self.assertFalse(overall["passed"])
+        self.assertEqual(overall["failed"], ["full/ia32"])
+        self.assertEqual(overall["known_issue"], ["thread-exit/lp64"])
 
 
 if __name__ == "__main__":

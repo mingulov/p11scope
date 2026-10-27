@@ -2697,6 +2697,9 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// leader row in place; the dispatcher is a plain tail again) and the
 /// timing cfg gates together: 123365 B, sha256 below, measured with
 /// this actual lexer.
+/// Re-baselined for getter-ABI acquisition bounds, verifier-visible index
+/// guards without panic subprograms, and ordinary-base preservation on a
+/// refused object join: 123958 B, measured with the unchanged lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2706,8 +2709,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            123365,
-            "f9fb42f14d9054ce0375c24032da25b950acce0310e606f1e2b9ffe345936707"
+            123958,
+            "53f8218b0827374f5178d89d5547e0c993654ad43ce939c96cb042f07e2e23a9"
         ),
         "stripped BPF dump must stay byte-identical"
     );

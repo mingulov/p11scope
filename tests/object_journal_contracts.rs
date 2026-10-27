@@ -1179,8 +1179,9 @@ fn object_journal_marker_build_uses_one_gate() {
 /// refusal and missing START, and the three in-halves lost-call arms
 /// (ordinary identity mismatch, ordinary ring loss, object ring loss
 /// with settled removal) each name their arm; deleting any one call
-/// fails. The halves gap in place so no lost code crosses to the root
-/// (the 6.1/5.15 verifier shape). E2/R2 are covered live, and the six
+/// fails. The refused-base output-loss arm instead runs the shared
+/// fault callback before attempting output, so it already refuses births.
+/// The halves keep their gaps in place. E2/R2 are covered live, and the
 /// fault-only object arms are a different row class.
 #[test]
 fn object_journal_marker_drop_arms_call_the_gap() {
@@ -1215,6 +1216,19 @@ fn object_journal_marker_drop_arms_call_the_gap() {
     let returned = &lines[return_at..accounting_at];
     let ordinary = &lines[ordinary_at..object_at];
     let object = &lines[object_at..fork_at];
+    let refused_at = object
+        .iter()
+        .position(|line| line.trim() == "if !joined {")
+        .expect("refused object continuity arm");
+    assert_eq!(
+        object
+            .iter()
+            .filter(|line| line.contains("bump_evidence(EVIDENCE_RING_LOSS);"))
+            .count(),
+        2,
+        "both object ring-loss arms need their own birth-refusal accounting"
+    );
+    assert!(refused_base_ring_loss_is_fault_covered(&object.join("\n")));
     // (region, arm anchor, expected arms, gap above the anchor).
     let arms: &[(&[&str], &str, usize, bool)] = &[
         (entry, "bump_evidence(EVIDENCE_ABI_REFUSALS);", 3, true),
@@ -1234,7 +1248,12 @@ fn object_journal_marker_drop_arms_call_the_gap() {
             false,
         ),
         (ordinary, "bump_evidence(EVIDENCE_RING_LOSS);", 1, false),
-        (object, "bump_evidence(EVIDENCE_RING_LOSS);", 1, false),
+        (
+            &object[..refused_at],
+            "bump_evidence(EVIDENCE_RING_LOSS);",
+            1,
+            false,
+        ),
     ];
     for (region, anchor, expected, above) in arms {
         let hits: Vec<usize> = region
@@ -1260,6 +1279,96 @@ fn object_journal_marker_drop_arms_call_the_gap() {
                 "drop arm {anchor} must call the scope gap within six lines"
             );
         }
+    }
+}
+
+fn refused_base_ring_loss_is_fault_covered(object: &str) -> bool {
+    let Some((_, refused)) = object.split_once("if !joined {") else {
+        return false;
+    };
+    let Some((refused, _)) = refused.split_once("let tail =") else {
+        return false;
+    };
+    let code: String = refused
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let fault = "preserve_refused_base(||owned_start_remove(&key,true).is_ok(),||unsafe{p11_object_fault()},";
+    let output = "||EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok(),";
+    let loss = "ifoutcome==RefusedBaseOutcome::OutputFailed{bump_evidence(EVIDENCE_RING_LOSS);}";
+    match (
+        code.find(fault),
+        code.find(output),
+        code.find("entry.discard(0);"),
+        code.find(loss),
+    ) {
+        (Some(fault), Some(output), Some(discard), Some(loss)) => {
+            fault < output
+                && output < discard
+                && discard < loss
+                && code.matches("bump_evidence(EVIDENCE_RING_LOSS);").count() == 1
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn object_journal_refused_base_loss_stays_fault_covered() {
+    use p11scope_ebpf_common::object_flow::{RefusedBaseOutcome, preserve_refused_base};
+
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let (_, object) = source.split_once("fn object_return(").expect("object half");
+    let (object, _) = object
+        .split_once("pub extern \"C\" fn p11_link_fork_allowed")
+        .expect("object half end");
+    assert!(refused_base_ring_loss_is_fault_covered(object));
+    for (before, after) in [
+        ("|| unsafe { p11_object_fault() },", "|| {},"),
+        (
+            "RefusedBaseOutcome::OutputFailed",
+            "RefusedBaseOutcome::Emitted",
+        ),
+        ("            bump_evidence(EVIDENCE_RING_LOSS);", ""),
+    ] {
+        let (head, refused) = object.split_once("if !joined {").expect("refused arm");
+        assert!(
+            refused.contains(before),
+            "mutant must change the refused arm"
+        );
+        let mutant = format!("{head}if !joined {{ {}", refused.replacen(before, after, 1));
+        assert!(
+            !refused_base_ring_loss_is_fault_covered(&mutant),
+            "the refused-base loss guard must reject mutation of {before}"
+        );
+    }
+    for (retired, emitted, expected) in [
+        (false, false, RefusedBaseOutcome::RetirementFailed),
+        (true, false, RefusedBaseOutcome::OutputFailed),
+        (true, true, RefusedBaseOutcome::Emitted),
+    ] {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let actual = preserve_refused_base(
+            || {
+                calls.borrow_mut().push("retire");
+                retired
+            },
+            || calls.borrow_mut().push("fault"),
+            || {
+                calls.borrow_mut().push("output");
+                emitted
+            },
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(
+            calls.into_inner(),
+            if retired {
+                vec!["retire", "fault", "output"]
+            } else {
+                vec!["retire", "fault"]
+            },
+            "every refused base faults before output; failed retirement cannot output"
+        );
     }
 }
 

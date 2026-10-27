@@ -391,7 +391,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=ef896389717739f3859a76f54cf46072cbd1448f
+          BASELINE=869a79cae71e4ce566f896274768241131de87c2
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

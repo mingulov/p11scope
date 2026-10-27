@@ -124,7 +124,7 @@ passed. A manual dispatch always runs the full matrix.
 
 `bpf-noninterference` follows `tests`, including when tests fail. It first
 runs the repeat-baseline control on reviewed baseline
-`ef896389717739f3859a76f54cf46072cbd1448f` twice, then compares that
+`869a79cae71e4ce566f896274768241131de87c2` twice, then compares that
 baseline with the exact candidate commit in a fresh integration snapshot.
 Advance the baseline only after reviewing intentional BPF changes, not to
 clear an arbitrary comparison failure. All bytes

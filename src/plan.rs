@@ -31,7 +31,7 @@ pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ObjectExports, ScannedEntry, ScannedInterface, ScannedTable, TableEvidenceScore,
     export_agreement, order_tables_by_evidence, standard_ordinal, table_evidence_score,
-    table_linkage, table_name_authorized,
+    table_linkage, table_name_authorized, table_observation_authorized,
 };
 use crate::inventory_semantics::SemanticRefusal;
 use crate::kinds::AliasAgreement;
@@ -334,9 +334,8 @@ enum AdmissionClass {
     /// under the named-scope rule.
     Operator,
     /// At least one table with publication evidence, and no closure-array
-    /// excess of unresolved lookalikes: the single [`table_name_authorized`]
-    /// predicate, so any linkage the scan learns counts here too. Evidence
-    /// beats count — a corroborated table is never a lookalike.
+    /// excess of unresolved lookalikes. Observation authorization is independent
+    /// of the permission to present ordinal names as API names.
     Corroborated,
     /// Only unresolved heuristic tables, at most [`MAX_TABLES_PER_OBJECT`].
     Heuristic,
@@ -363,37 +362,44 @@ impl AdmissionClass {
 /// shared-scope within-class order and the closure-array refusal message,
 /// both of which are about lookalikes.
 fn admission_class(group: &[Discovered<'_>]) -> (AdmissionClass, usize) {
-    let mut unresolved = BTreeSet::new();
-    let mut corroborated = false;
+    let mut observations = BTreeMap::<TableKey, bool>::new();
     for (piece, module) in group.iter().enumerate() {
         let Some(evidence) = &module.scan_evidence else {
             continue;
         };
         for (index, table) in evidence.tables.iter().enumerate() {
-            let authorized = table_name_authorized(&table_evidence_score(
-                index,
-                evidence.tables,
-                evidence.interfaces,
-                &[],
-                &[],
-                &evidence.exports,
-            ));
-            corroborated |= authorized;
-            if !authorized {
-                unresolved.insert(table_key(piece, index, table));
-            }
+            let authorized = table_observation_authorized(
+                table,
+                &table_evidence_score(
+                    index,
+                    evidence.tables,
+                    evidence.interfaces,
+                    &[],
+                    &[],
+                    &evidence.exports,
+                ),
+            );
+            observations
+                .entry(table_key(piece, index, table))
+                .and_modify(|known| *known |= authorized)
+                .or_insert(authorized);
         }
     }
+    let unresolved = observations
+        .values()
+        .filter(|authorized| !**authorized)
+        .count();
+    let corroborated = observations.values().any(|authorized| *authorized);
     let class = if group.iter().any(|module| module.scan_evidence.is_none()) {
         AdmissionClass::Operator
-    } else if unresolved.len() > MAX_TABLES_PER_OBJECT {
+    } else if unresolved > MAX_TABLES_PER_OBJECT {
         AdmissionClass::ClosureArray
     } else if corroborated {
         AdmissionClass::Corroborated
     } else {
         AdmissionClass::Heuristic
     };
-    (class, unresolved.len())
+    (class, unresolved)
 }
 
 impl AdmissionClass {
@@ -2520,8 +2526,10 @@ fn merge(
                 // scan-only capture of never-called legacy providers keeps working.
                 // One object seen from several views decodes the same tables
                 // repeatedly: distinct tables admit once, scored by the strongest
-                // instance, so linkage observed from any view counts.
-                let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize)> = BTreeMap::new();
+                // instance. Publication is retained independently: a weaker
+                // opaque observation must survive a stronger unobserved view.
+                let mut distinct: BTreeMap<TableKey, (TableEvidenceScore, usize, bool)> =
+                    BTreeMap::new();
                 let mut sequence = 0usize;
                 for (piece, module) in group.iter().enumerate() {
                     let Some(evidence) = &module.scan_evidence else {
@@ -2543,24 +2551,34 @@ fn merge(
                             &evidence.exports,
                         );
                         let key = table_key(piece, index, &evidence.tables[index]);
+                        let observed =
+                            table_observation_authorized(&evidence.tables[index], &score);
                         distinct
                             .entry(key)
-                            .and_modify(|slot| slot.0 = slot.0.max(score))
+                            .and_modify(|slot| {
+                                slot.0 = slot.0.max(score);
+                                slot.2 |= observed;
+                            })
                             .or_insert_with(|| {
-                                let slot = (score, sequence);
+                                let slot = (score, sequence, observed);
                                 sequence += 1;
                                 slot
                             });
                     }
                 }
-                let mut ordered: Vec<(TableKey, TableEvidenceScore, usize)> = distinct
+                let mut ordered: Vec<(TableKey, TableEvidenceScore, usize, bool)> = distinct
                     .into_iter()
-                    .map(|(key, (score, sequence))| (key, score, sequence))
+                    .map(|(key, (score, sequence, observed))| (key, score, sequence, observed))
                     .collect();
-                // Strongest evidence first; ties keep first-seen order, so scoring
-                // never reorders what it cannot distinguish.
-                ordered
-                    .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+                // Actual observations precede heuristics even when their API
+                // names are uncertain. Remaining ties retain evidence order.
+                ordered.sort_by(|left, right| {
+                    right
+                        .3
+                        .cmp(&left.3)
+                        .then_with(|| right.1.cmp(&left.1))
+                        .then_with(|| left.2.cmp(&right.2))
+                });
                 // Every scan target of this group, by distinct table, for marginal
                 // budget accounting across views of one object.
                 let mut keys_of: BTreeMap<TableKey, BTreeSet<AttachKey>> = BTreeMap::new();
@@ -2602,13 +2620,12 @@ fn merge(
                                 .collect()
                         })
                 };
-                let is_published = table_name_authorized;
                 // All-or-nothing refusal survives only here: when even the strongest
                 // table exceeds the remaining global budget, the module — scan and
                 // manifest parts alike — is refused whole (or, with endpoints to keep,
                 // kept on them alone, above). A manifest subset must not reattach an
                 // oversized scan as a prefix.
-                if let Some((top, _, _)) = ordered.first() {
+                if let Some((top, _, _, _)) = ordered.first() {
                     let top_fresh: BTreeSet<AttachKey> = keys_of
                         .get(top)
                         .map(|keys| keys.iter().filter(|key| is_fresh(key)).copied().collect())
@@ -2630,8 +2647,8 @@ fn merge(
                 let mut admitted: BTreeSet<TableKey> = BTreeSet::new();
                 let published: Vec<TableKey> = ordered
                     .iter()
-                    .filter(|(_, score, _)| is_published(score))
-                    .map(|(key, _, _)| *key)
+                    .filter(|(_, _, _, observed)| *observed)
+                    .map(|(key, _, _, _)| *key)
                     .collect();
                 let mut published_union = fresh.clone();
                 for key in &published {
@@ -2662,7 +2679,7 @@ fn merge(
                 // nothing either way and admit, never spilling.
                 if whole {
                     let mut scan_union = fresh.clone();
-                    for (key, _, _) in &ordered {
+                    for (key, _, _, _) in &ordered {
                         if let Some(keys) = keys_of.get(key) {
                             scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
                         }
@@ -2674,12 +2691,12 @@ fn merge(
                         break 'refused scan_union;
                     }
                     fresh = scan_union;
-                    admitted.extend(ordered.iter().map(|(key, _, _)| *key));
+                    admitted.extend(ordered.iter().map(|(key, _, _, _)| *key));
                 } else {
                     let mut heuristic_admitted = 0usize;
                     let mut spent = false;
-                    for (key, score, _) in &ordered {
-                        if is_published(score) {
+                    for (key, _, _, observed) in &ordered {
+                        if *observed {
                             continue;
                         }
                         // A heuristic table with no attachable target costs nothing either
@@ -11203,6 +11220,92 @@ mod tests {
             })
             .collect();
         module
+    }
+
+    fn opaque_fifth_publication() -> ReconciledModule {
+        let mut module = provider_with_tables(91, "/opt/opaque-published.so", 5, 1, false);
+        for table in &mut module.scanned.tables {
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .filter(|field| field.name != "C_Sign")
+                .map(|field| field.name)
+                .collect();
+        }
+        module.scanned.tables[4].live_return = true;
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "other",
+            name_lossy: None,
+            name_private: Some(b"OTHER".to_vec()),
+            flags: 0,
+            table: Some(4),
+        });
+        module
+    }
+
+    #[test]
+    fn observed_opaque_fifth_table_survives_cap_without_semantic_permission() {
+        let observed = opaque_fifth_publication();
+        let name_score = TableEvidenceScore {
+            linked: false,
+            live_return: false,
+            manifest: false,
+            exports: false,
+            full_walk: true,
+        };
+        assert!(!table_name_authorized(&name_score));
+        assert!(crate::discovery::scan::table_observation_authorized(
+            &observed.scanned.tables[4],
+            &name_score
+        ));
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&observed));
+        assert_eq!(plan.slots.len(), 5);
+        assert_eq!(plan.uncorroborated_candidates, 0);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| !slot.semantic_authorized && slot.descriptor_index == 0)
+        );
+
+        let mut raw = observed;
+        raw.scanned.tables[4].live_return = false;
+        assert!(!crate::discovery::scan::table_observation_authorized(
+            &raw.scanned.tables[4],
+            &name_score
+        ));
+        let plan = build_from_reconciled_modules(&[raw]);
+        assert_eq!(plan.slots.len(), 4);
+        assert_eq!(plan.uncorroborated_candidates, 1);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME] && !slot.semantic_authorized)
+        );
+    }
+
+    #[test]
+    fn observed_publication_survives_a_stronger_unobserved_view_of_the_same_table() {
+        let mut observed = opaque_fifth_publication();
+        observed.scanned.tables[4].walk = "known_prefix";
+        observed.scanned.tables[4]
+            .null_entries
+            .retain(|name| *name != "C_GetInfo");
+        observed.scanned.tables[4].unpinned.push(Skipped {
+            subject: "C_GetInfo".into(),
+            reason: "unmapped".into(),
+        });
+        let mut raw = opaque_fifth_publication();
+        raw.scanned.tables[4].live_return = false;
+        raw.scanned.view = ProcessViewId(7);
+        for modules in [[observed.clone(), raw.clone()], [raw, observed]] {
+            let pieces: Vec<_> = modules.iter().map(lower_scanned).collect();
+            let (class, lookalikes) = admission_class(&pieces);
+            assert_eq!(class, AdmissionClass::Corroborated);
+            assert_eq!(lookalikes, 4);
+            let plan = build_from_reconciled_modules(&modules);
+            assert_eq!(plan.slots.len(), 5);
+            assert_eq!(plan.uncorroborated_candidates, 0);
+        }
     }
 
     /// The multiple-interface/closure-array precedence problem: a provider

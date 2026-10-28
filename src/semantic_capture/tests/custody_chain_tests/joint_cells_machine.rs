@@ -1535,3 +1535,375 @@ fn joint_machine_refused_first_file_birth_keeps_sibling_joint() {
 fn joint_machine_refused_second_file_birth_keeps_sibling_joint() {
     two_births_one_refused(1);
 }
+
+/// The extra modeled call on the refused provider must not cost a different
+/// incarnation its Joint feed. Real prepared proofs, rather than file/router
+/// aliases, establish which subjects are distinct before birth or audit.
+fn journaled_refusal_keeps_joint_sibling(refused_file: u32, unrelated_image: bool) {
+    use crate::key_operation_projection::ObsStatus;
+
+    let mut scene = if unrelated_image {
+        MachineScene::with_initial_files(1, &[0], true)
+    } else {
+        MachineScene::with_initial_files(2, &[0, 1], true)
+    };
+    let refused_pid = std::process::id();
+    let child = unrelated_image.then(OwnedStoppedChild::new);
+    let healthy_pid = if let Some(child) = &child {
+        // Mirror the machine's initial physical setup: retain the actual
+        // pidfd and mapping, then let the collected original bind H3. A
+        // legacy pre-bind would scan New before these calls arrive.
+        let caller = scene.scene.real.scene.admit(child.id(), 50);
+        let (module, path) = &scene.scene.real.modules[0];
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .note_mapping(
+                caller,
+                child.id(),
+                ModuleInfo {
+                    path: path.clone(),
+                    key: module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("held-provider".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(5),
+                    admission_reasons: Vec::new(),
+                },
+                60,
+            );
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .commit_batch(false)
+            .unwrap();
+        let candidate = scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepare_legacy_semantic_candidate(caller, scene.scene.real.lane.domain())
+            .unwrap();
+        scene.scene.real.h0.0.borrow_mut().io.targets.insert(
+            child.id(),
+            (
+                candidate.pin(),
+                ImageIdentity {
+                    task_cookie: 73,
+                    exec_id: 0,
+                },
+            ),
+        );
+        drop(candidate);
+        child.id()
+    } else {
+        refused_pid
+    };
+    let mut sequence = 1;
+    for subject in 0..2 {
+        let file = if unrelated_image { 0 } else { subject };
+        let pid = if subject == refused_file {
+            refused_pid
+        } else {
+            healthy_pid
+        };
+        if subject == refused_file {
+            // This original makes the native birth observation refuse.
+            push_bare_call_on(&mut scene, pid, file, "C_GetSessionInfo", sequence);
+        } else {
+            scene.scene.push(pid, file, "C_SignInit", sequence);
+        }
+        sequence += 1;
+        // Unlike the prerequisite twin, the refused provider has its own
+        // genuine BEGIN/END and admitted affecting call in this frame.
+        scene.scene.push(pid, file, "C_SignInit", sequence);
+        sequence += 1;
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let prepared = coordinator.prepared_semantic_batch().unwrap();
+    let inputs = prepared.admissions().cloned().collect::<Vec<_>>();
+    let proofs = prepared
+        .claims()
+        .map(|(_, proof)| (*proof).expect("all four original admissions have genuine claims"))
+        .collect::<Vec<_>>();
+    assert_eq!((inputs.len(), proofs.len()), (4, 4));
+    for (input, proof) in inputs.iter().zip(&proofs) {
+        assert!(proof.matches_admitted(input));
+        assert_eq!(
+            input.journal_binding().0,
+            scene.scene.producers.native_domain()
+        );
+    }
+    assert_eq!(proofs[0], proofs[1]);
+    assert_eq!(proofs[2], proofs[3]);
+    assert_ne!(
+        proofs[0], proofs[2],
+        "actual admitted incarnation keys differ"
+    );
+    assert_eq!(
+        inputs[0].journal_binding().1 == inputs[2].journal_binding().1,
+        !unrelated_image,
+        "the control changes the actual process image, not a router label"
+    );
+    reach_any(&mut scene, &["Staging"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let refused_proof = proofs[(refused_file * 2) as usize];
+    eprintln!(
+        "journaled_refusal pre_audit refused_file={refused_file} unrelated_image={unrelated_image} \
+         births={:?} refusals={:?} remaining_current={:?}",
+        scene.native.birth_outcomes,
+        staged_birth_refusals(coordinator),
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .current_receipts()
+            .iter()
+            .map(|receipt| (receipt.image(), receipt.birth_quantum().is_some()))
+            .collect::<Vec<_>>(),
+    );
+    for input in &inputs {
+        assert_eq!(
+            coordinator.registry().admitted_feed_is_s1only(input),
+            refused_proof.matches_admitted(input),
+            "only the genuinely refused incarnation lacks its original grant"
+        );
+    }
+    let mut decisions = scene
+        .native
+        .birth_outcomes
+        .iter()
+        .map(|(file, result)| (*file, result.as_ref().err().copied()))
+        .collect::<Vec<_>>();
+    decisions.sort_by_key(|(file, _)| *file);
+    if unrelated_image {
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|(file, _)| *file == 0));
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|(_, refusal)| *refusal == Some(BirthObservationRefusal::MarkerNotReady))
+                .count(),
+            1,
+            "the other real image uses the same physical provider without sharing its incarnation"
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|(_, refusal)| refusal.is_none())
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            decisions,
+            (0..2)
+                .map(|file| {
+                    (
+                        file,
+                        (file == refused_file).then_some(BirthObservationRefusal::MarkerNotReady),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "both original births are decided before any refusal fanout"
+        );
+    }
+    reach_any(&mut scene, &["Audited"]);
+    let audit = scene.machine.diagnostic_audit_for_test();
+    scene.published_labeled("journaled-refused-sibling", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let mut counts = registry
+        .instance_semantic_edges()
+        .map(|record| record.api_returns)
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [Some(2), Some(2)],
+        "all four original API returns survive"
+    );
+    let refusals = registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(refusals, ["joint_birth_native_MarkerNotReady"]);
+    assert_eq!(
+        scene.native.birth_outcomes.len(),
+        2,
+        "no repeated birth read"
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    eprintln!(
+        "journaled_refusal refused_file={refused_file} unrelated_image={unrelated_image} \
+         decisions={decisions:?} audit={audit:?} feeds={} counts={counts:?} observation={:?}/{}",
+        registry.joint_feeds(),
+        observations.status,
+        observations.reason,
+    );
+    assert_eq!(
+        (
+            registry.joint_feeds(),
+            observations.status,
+            observations.reason
+        ),
+        (1, ObsStatus::Populated, "none"),
+        "a different admitted incarnation retains its healthy Joint observations"
+    );
+}
+
+#[test]
+fn joint_machine_journaled_refused_first_file_keeps_sibling_joint() {
+    journaled_refusal_keeps_joint_sibling(0, false);
+}
+
+#[test]
+fn joint_machine_journaled_refused_second_file_keeps_sibling_joint() {
+    journaled_refusal_keeps_joint_sibling(1, false);
+}
+
+#[test]
+fn joint_machine_journaled_refusal_keeps_unrelated_image_joint() {
+    journaled_refusal_keeps_joint_sibling(0, true);
+}
+
+/// A live Joint key is structurally excluded from the S1Only marking gate.
+/// Its own failed fresh native read still falls back. Once S1Only, later
+/// admitted originals can name that exact retained key and take the real
+/// S1Only-subject path without ever reactivating its Joint history.
+#[test]
+fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let mut scene = MachineScene::with_initial_files(1, &[0], false);
+    let pid = std::process::id();
+    for sequence in [1, 2] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("same-incarnation-initial-birth", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let targets = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 1);
+    let target = targets[0];
+    let proof = target.bootstrap().proof();
+    assert_eq!(scene.native.birth_outcomes.len(), 1);
+    assert!(scene.native.birth_outcomes[0].1.is_ok());
+
+    for sequence in [3, 4] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let prepared = coordinator.prepared_semantic_batch().unwrap();
+    assert_eq!(prepared.admissions().count(), 2);
+    for input in prepared.admissions() {
+        assert!(proof.matches_admitted(input));
+        assert!(input.joint_resource_origin().is_some());
+        assert!(
+            !coordinator.registry().admitted_feed_is_s1only(input),
+            "the exact still-Joint incarnation cannot enter S1Only disposition"
+        );
+    }
+    for (_, claim) in prepared.claims() {
+        assert_eq!(*claim, Ok(proof), "same actual retained key and era");
+    }
+    let generation = scene.scene.attached.as_ref().unwrap().generation();
+    let (row, control, _) = scene
+        .native
+        .publisher
+        .publish_stamped(&["0", "0", "0", "0", "1"], generation);
+    assert!(
+        scene
+            .native
+            .rows
+            .insert(
+                target.bootstrap().domain(),
+                NativeBirthRows { row, control }
+            )
+            .is_some(),
+        "replace only the selected incarnation's real native read leaf"
+    );
+    scene.published_labeled("same-incarnation-native-read-refusal", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let registry = scene.scene.real.scene.coordinator.registry();
+    assert_eq!(registry.joint_feeds(), 0);
+    assert_eq!(
+        registry.feed_mode_for_test(target.id()),
+        Some(FeedMode::S1Only)
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    eprintln!(
+        "same_incarnation native_read_refusal observation={:?}/{}",
+        observations.status, observations.reason
+    );
+    assert_eq!(observations.status, ObsStatus::Unavailable);
+
+    for sequence in [5, 6] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let prepared = coordinator.prepared_semantic_batch().unwrap();
+    assert_eq!(prepared.admissions().count(), 2);
+    for input in prepared.admissions() {
+        assert!(
+            proof.matches_admitted(input),
+            "actual same-key S1Only original"
+        );
+        assert!(input.joint_resource_origin().is_some());
+        assert!(coordinator.registry().admitted_feed_is_s1only(input));
+    }
+    reach_any(&mut scene, &["Audited"]);
+    let audit = scene.machine.diagnostic_audit_for_test().unwrap();
+    assert_eq!(audit.0, Some(JournalGap::ImageTainted));
+    scene.published_labeled("same-incarnation-s1only-history", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let history = registry.joint_history_targets().collect::<Vec<_>>();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].0.id(), target.id());
+    assert!(history[0].0.bootstrap() == target.bootstrap());
+    assert_eq!(history[0].1, FeedMode::S1Only);
+    let records = registry.instance_semantic_edges().collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].api_returns, Some(6));
+    assert_eq!(registry.joint_feeds(), 0);
+    assert_eq!(
+        scene.native.birth_outcomes.len(),
+        1,
+        "no rebirth after refusal"
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    eprintln!(
+        "same_incarnation s1only_subject audit={audit:?} observation={:?}/{}",
+        observations.status, observations.reason
+    );
+    assert_eq!(observations.status, ObsStatus::Unavailable);
+    scene.scene.assert_claims(&[]);
+}

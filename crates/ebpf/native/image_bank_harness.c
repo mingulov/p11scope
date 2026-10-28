@@ -448,8 +448,7 @@ static void scenario_select_flip_admit(void)
     CHECK(plain == 1, "steady_select_stays_current");
     CHECK(p11_bank_admit(&G, 8, 7002, plain, &other) == P11_BANK_OK,
           "second_bank_identity_admits");
-    CHECK(!(out.bank == 0 && out.incarnation == other.incarnation &&
-              out.ticket == other.ticket),
+    CHECK(!(first.incarnation == out.incarnation && first.ticket == out.ticket),
           "no_identity_collision_across_banks");
     held = &G.start0[7000];
     CHECK(held->present && held->bank == 0 && held->incarnation == 1 &&

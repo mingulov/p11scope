@@ -570,7 +570,7 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         return Err("BPF comparison must follow tests, including failed tests, unless cancelled/deduplicated".into());
     }
     for marker in [
-        "    runs-on: ubuntu-24.04\n",
+        "    runs-on: ubuntu-26.04\n",
         "          fetch-depth: 0\n",
         "rustup toolchain install \"$(cat .release-rust-version)\" --profile minimal",
         "rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src",

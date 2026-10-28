@@ -170,7 +170,7 @@ fn ci_has_no_stale_toolchain_job() {
     validate_ci_toolchain_selectors(&ci).unwrap();
     let with_msrv = ci.replacen(
         "\n  lint:\n",
-        "\n  msrv:\n    runs-on: ubuntu-24.04\n  lint:\n",
+        "\n  msrv:\n    runs-on: ubuntu-26.04\n  lint:\n",
         1,
     );
     assert!(

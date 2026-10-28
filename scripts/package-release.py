@@ -28,8 +28,8 @@ OFFICIAL_P11SCOPE_FEATURES = {
     "p0": ("stub-object-attributes",),
 }
 OFFICIAL_SCOPE = {
-    "full": "FULL official build with object-attribute capture enabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. Consult release notes for qualified lanes; system-wide tracing remains preview.",
-    "p0": "P0 official build with object-attribute capture disabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. Consult release notes for qualified lanes; system-wide tracing remains preview.",
+    "full": "FULL official build with object-attribute capture enabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. `--system` selects whole-machine scope. Consult release notes for qualified lanes and known limitations.",
+    "p0": "P0 official build with object-attribute capture disabled. Live capture requires a Multi-capable Linux x86-64 host (normally 6.6+ or working backports), BTF and privileges; safe scoped Singles is available on eligible hosts. Offline/helper commands do not require live capability. `--system` selects whole-machine scope. Consult release notes for qualified lanes and known limitations.",
 }
 
 

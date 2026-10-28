@@ -224,6 +224,10 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertIn("object-attribute capture enabled", release["scope"])
         self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
         self.assertIn("Offline/helper commands", release["scope"])
+        self.assertIn("`--system` selects whole-machine scope.", release["scope"])
+        self.assertIn("Consult release notes for qualified lanes and known limitations.",
+                      release["scope"])
+        self.assertNotIn("system-wide tracing remains preview", release["scope"])
         self.assertNotIn("stub-object-attributes", json.dumps(release))
         for name in ("p11scope-0.1.0-x86_64-linux-musl.tar.gz",
                      "p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz",
@@ -244,6 +248,10 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertIn("P0", release["scope"])
         self.assertIn("object-attribute capture disabled", release["scope"])
         self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
+        self.assertIn("`--system` selects whole-machine scope.", release["scope"])
+        self.assertIn("Consult release notes for qualified lanes and known limitations.",
+                      release["scope"])
+        self.assertNotIn("system-wide tracing remains preview", release["scope"])
 
     def test_receipt_capture_mode_must_match_the_flag(self):
         cases = (

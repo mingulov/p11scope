@@ -614,8 +614,9 @@ impl LifetimeRegistry {
         Ok(())
     }
 
-    /// Cancel a prepared-but-never-attached context. The charge frees; the
-    /// burned generation never rolls back.
+    /// Cancel a prepared-but-never-attached context only after its producer,
+    /// queued-work and scan custody settles. Staged binding metadata may be
+    /// discarded; the burned generation never rolls back.
     pub(crate) fn cancel_prepared(
         &mut self,
         domain: LifetimeDomain,
@@ -629,6 +630,21 @@ impl LifetimeRegistry {
                 expected: "Prepared",
                 actual: context.phase,
             });
+        }
+        if context.short_refs != 0 || context.long_refs != 0 {
+            return Err(LifetimeError::ProducersActive {
+                short: context.short_refs,
+                long: context.long_refs,
+            });
+        }
+        for queue in QueueKind::ALL {
+            let count = context.queued[queue.index()];
+            if count != 0 {
+                return Err(LifetimeError::RecordsPending { queue, count });
+            }
+        }
+        if context.pending_scans != 0 {
+            return Err(LifetimeError::ScansPending(context.pending_scans));
         }
         let generation = context.token.generation();
         self.slots[usize::from(slot)] = Slot::Free { generation };

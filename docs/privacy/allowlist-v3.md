@@ -411,7 +411,9 @@ and attach generation; the calibration cell also carries the observer's own
 calibration thread id and hit count. The flags word is checked and
 discarded; none of these values is emitted.
 
-When the post-attach birth marker ships (Detailed only), an in-scope exec
+The post-attach birth marker is deferred to 0.5.1 and is excluded from the
+v0.5.0 build. Its planned Detailed-only amendment is as follows:
+an in-scope exec
 after closure reads the leader's exec generation onto its continuity row;
 any out-of-scope or refused call dirties the row instead, with no
 exec-generation read on that path. The marker word and the admission

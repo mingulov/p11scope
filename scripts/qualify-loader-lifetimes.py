@@ -836,6 +836,17 @@ def check_g16_l4_receipts(evidence, expected):
     reclaims = _l4_counter(evidence, "loader_reclaims")
     peak = _l4_counter(evidence, "loader_retained_peak")
     refusals = _l4_counter(evidence, "loader_refusals")
+    # Known contradictions are failures even when another receipt is
+    # unavailable. Evaluate relations only with their operands present.
+    if arms is not _MISSING and arms != expected:
+        _fail("L4 loader arms differ from independent ledger")
+    if peak is not _MISSING and peak > G16_MAX_RETAINED:
+        _fail("L4 retained peak exceeds 8")
+    if refusals is not _MISSING and refusals != 0:
+        _fail("L4 loader refusals are unexplained loss")
+    if arms is not _MISSING and reclaims is not _MISSING:
+        if reclaims > arms or (peak is not _MISSING and reclaims < arms - peak):
+            _fail("L4 loader reclaims disagree with arms and retained peak")
     if any(value is _MISSING
            for value in (arms, reclaims, peak, refusals)):
         _blocked("missing native seam: per-lifetime loader arming/admission "
@@ -844,14 +855,6 @@ def check_g16_l4_receipts(evidence, expected):
                  "transition counters, L4); retained controlled contexts "
                  "(at most 8), held-return cutoff and delayed-record ack "
                  "(LoaderRetirementFence) likewise have no public proof")
-    if arms != expected:
-        _fail("L4 loader arms differ from independent ledger")
-    if peak > G16_MAX_RETAINED:
-        _fail("L4 retained peak exceeds 8")
-    if refusals != 0:
-        _fail("L4 loader refusals are unexplained loss")
-    if not arms - peak <= reclaims <= arms:
-        _fail("L4 loader reclaims disagree with arms and retained peak")
 
 
 def check_g17_l4_receipts(evidence, expected):
@@ -860,6 +863,16 @@ def check_g17_l4_receipts(evidence, expected):
     cuts = _l4_counter(evidence, "image_bank_cuts")
     refusals = _l4_counter(evidence, "image_bank_refusals")
     invocation = _l4_receipt(evidence, "invocation")
+    if issued is not _MISSING and issued < expected:
+        _fail("L4 ticket issuance never crossed 16,384")
+    if cuts is not _MISSING and cuts != 1:
+        _fail("L4 bank cuts are not exactly one")
+    if refusals is not _MISSING and refusals != 0:
+        _fail("L4 bank refusals are unexplained loss")
+    if invocation is not _MISSING and (
+            type(invocation) is not dict or type(invocation.get("id")) is not str
+            or not invocation["id"]):
+        _fail("L4 invocation receipt is malformed")
     if any(value is _MISSING
            for value in (issued, cuts, refusals, invocation)):
         _blocked("missing native seam: successful ticket issuance across 16,384 "
@@ -868,15 +881,6 @@ def check_g17_l4_receipts(evidence, expected):
                  "aggregated profile or starttime-less trace rows; single-capture "
                  "guarantee against hidden session restart needs an observer "
                  "invocation receipt")
-    if issued < expected:
-        _fail("L4 ticket issuance never crossed 16,384")
-    if cuts != 1:
-        _fail("L4 bank cuts are not exactly one")
-    if refusals != 0:
-        _fail("L4 bank refusals are unexplained loss")
-    if (type(invocation) is not dict or type(invocation.get("id")) is not str
-            or not invocation["id"]):
-        _fail("L4 invocation receipt is malformed")
 
 
 def judge(cell, ledger_rows, *, report_text=None, trace_text=None):

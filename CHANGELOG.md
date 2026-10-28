@@ -156,8 +156,9 @@ Known issues in this release:
   no calls unless the child is held with `run --pause auto` or kept
   alive past attach.
 - System identity checks through the userspace backend have a measured btrfs
-  regression. The GNU comparison at `b58ef1b5`, built with Rust 1.99.1 on Fedora
-  Linux 7.2.9, used 400 processes × 8 mock providers and 10 matched rounds with
+  regression. The comparison on Fedora Linux 7.2.9 used GNU builds at
+  `b58ef1b5`, compiled with Rust 1.99.1, and 400 processes × 8 mock providers
+  over 10 matched rounds with
   equal coverage. Confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%);
   whole-pass p95 rose from 255.444 to 288.012 ms (+12.75%). These are scoped
   measurements, not bounds for every host. The default `auto` backend uses

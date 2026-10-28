@@ -4,6 +4,7 @@
 
 import copy
 import json
+import os
 import re
 import sys
 import tempfile
@@ -292,22 +293,21 @@ TRACE_TERMINAL_KEYS = {
 # attaches (every induced-gap lane, and every lane whose target is released by a
 # go-file). This slice scans once, at attach time, so the scan finds nothing in
 # scope: the manifest is the only source, and it is `uncorroborated` because
-# nothing was there to confirm it. Thirteen surfaces, 988 entries — the helper's
-# own numbers, unchanged from v1.
+# nothing was there to confirm it. Thirteen surfaces, 1056 entries: the
+# acquired 4.0-labelled interface retains its known common 68-entry prefix.
 VERSION_SURFACES = Counter(
     {
         ("full", 68): 2,
         ("full", 92): 2,
         ("full", 104): 2,
-        ("known_prefix", 68): 1,
+        ("known_prefix", 68): 2,
         ("known_prefix", 92): 2,
         ("known_prefix", 104): 2,
-        ("refused", 0): 1,
         ("not_walked", 0): 1,
     }
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
-# sources describe it. LP64 scans three file-backed tables and reports one
+# sources describe it. LP64 scans three complete tables and reports one
 # conflict; ILP32 also scans the 3.1, 3.2 and future-minor 3.9 tables and agrees
 # with the manifest. These exact subsets describe the selected compiled
 # fixtures' file-backed page tails, not a version restriction in the scanner.
@@ -317,19 +317,21 @@ VERSION_SURFACES = Counter(
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
 # sources named it. `surfaces` keeps the per-source records, so the scan adds
-# three LP64 surfaces (13 -> 16) or six ILP32 surfaces (13 -> 19).
+# three baseline LP64 surfaces (13 -> 16) or six ILP32 surfaces (13 -> 19).
+# A terminal LP64 3.1 table can additionally contribute a complete or
+# page-bounded partial observation; validate its own extent below.
 # `table_entries` counts exact target occurrences across sources, so neither
-# scan subset changes the 988-entry union.
+# scan subset changes the 1056-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
 VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
     {("full", 92): 1, ("full", 104): 1, ("known_prefix", 104): 1}
 )
-VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
-VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+VERSION_SHAPE_MANIFEST_ONLY = (1056, 104, 208, VERSION_SURFACES, 1, "ok")
+VERSION_SHAPE_SCANNED = (1056, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 VERSION_SHAPE_SCANNED_IA32 = (
-    988,
+    1056,
     104,
     208,
     VERSION_SURFACES_SCANNED_IA32,
@@ -344,7 +346,7 @@ VERSION_TABLES_MANIFEST_ONLY = Counter(
         ("manifest", (3, 1), 92): 2,
         ("manifest", (3, 2), 104): 3,
         ("manifest", (3, 9), 104): 1,
-        ("manifest", (4, 0), 0): 1,
+        ("manifest", (4, 0), 68): 1,
     }
 )
 VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
@@ -1784,6 +1786,70 @@ def table_signature(evidence):
     )
 
 
+def version_canary_scan_shape(evidence, target_bits):
+    """Keep the fixed matrix union exact and bound its terminal raw row.
+
+    Only this controlled LP64 fixture's final 3.1 observation varies with
+    the file/BSS boundary. A partial row must end at that page boundary;
+    a complete row may cross pages because no VMA-end witness is published.
+    """
+    require(len(evidence["discovery"]) == 1, "version fixture needs one provider")
+    module = evidence["discovery"][0]
+    tables = module["tables"]
+    for table in tables:
+        version = table["version"]
+        require(isinstance(version, list) and len(version) == 2
+                and all(type(part) is int and 0 <= part <= 255 for part in version),
+                "invalid version fixture table metadata")
+        require(u64(table["entries"]), "invalid version fixture table extent")
+    base_tables = (VERSION_TABLES_SCANNED_IA32 if target_bits == 32
+                   else VERSION_TABLES_SCANNED)
+    base_surfaces = (VERSION_SURFACES_SCANNED_IA32 if target_bits == 32
+                     else VERSION_SURFACES_SCANNED)
+    actual = table_signature(evidence)
+    require(not base_tables - actual, "version fixture lost a required table")
+    extra = actual - base_tables
+    require(not extra or (target_bits == 64 and sum(extra.values()) == 1),
+            "unrelated or duplicate version fixture table")
+
+    word = target_bits // 8
+    spans = []
+    raw = [table for table in tables if table["source"] == "scan"]
+    for table in raw:
+        offset, count = table.get("file_offset"), table["entries"]
+        require(u64(offset) and offset % word == 0, "invalid raw table offset")
+        end = offset + word * (count + 1)
+        require(u64(end), "raw table extent overflows")
+        spans.append((offset, end))
+    ordered = sorted(spans)
+    require(all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:])),
+            "duplicate or overlapping raw fixture tables")
+    if not extra:
+        return base_surfaces, base_tables
+
+    ((source, version, count), multiplicity), = extra.items()
+    require(source == "scan" and version == (3, 1) and multiplicity == 1
+            and 0 < count <= 92, "unrelated terminal fixture prefix")
+    prefix, = [table for table in raw if table["version"] == [3, 1]]
+    offset = prefix["file_offset"]
+    require(offset == max(span[0] for span in spans),
+            "fixture prefix is not the terminal raw table")
+    walk = "full" if count == 92 else "known_prefix"
+    if count < 92:
+        page = os.sysconf("SC_PAGE_SIZE")
+        require(word * (count + 1) == page - offset % page,
+                "partial fixture prefix does not end at its page boundary")
+    # This is structural classification of a full row, not proof of a
+    # mapping end. In particular, a full row is allowed to cross a page.
+    require(sum(surface == {"source": module["path"] + " table 3.1",
+                            "acquisition": "ok", "walk": walk,
+                            "functions": count}
+                for surface in evidence["surfaces"]) == 1,
+            "terminal fixture prefix lacks its exact source surface")
+    return (base_surfaces + Counter({(walk, count): 1}),
+            base_tables + Counter({("scan", (3, 1), count): 1}))
+
+
 def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interface_list):
     for name, wanted in (
         ("table_entries", table_entries),
@@ -2846,12 +2912,12 @@ def validate_canary(lane, document, target_bits=64):
         exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
-    scanned_shape = VERSION_SHAPE_SCANNED_IA32 if target_bits == 32 else VERSION_SHAPE_SCANNED
-    exact_shape(evidence, *(scanned_shape if scanned else VERSION_SHAPE_MANIFEST_ONLY))
-    scanned_tables = (
-        VERSION_TABLES_SCANNED_IA32 if target_bits == 32 else VERSION_TABLES_SCANNED
-    )
-    wanted_tables = scanned_tables if scanned else VERSION_TABLES_MANIFEST_ONLY
+    if scanned:
+        surfaces, wanted_tables = version_canary_scan_shape(evidence, target_bits)
+        exact_shape(evidence, 1056, 104, 208, surfaces, 1, "ok")
+    else:
+        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
+        wanted_tables = VERSION_TABLES_MANIFEST_ONLY
     require(
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
@@ -3269,6 +3335,16 @@ def kernel_control_fixture():
         "identity_budget_exhausted": False,
         "root_affiliation_failures": [],
     }
+
+
+def version_tables_fixture(counter):
+    tables = [{"source": source, "version": list(version), "entries": entries}
+              for (source, version, entries), count in counter.items()
+              for _ in range(count)]
+    # Disjoint synthetic offsets, not a claim about one linker layout.
+    for index, table in enumerate(table for table in tables if table["source"] == "scan"):
+        table["file_offset"] = 4096 * (index + 1)
+    return tables
 
 
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
@@ -4264,13 +4340,9 @@ def self_test():
         sources=("scan", "manifest"),
         discovery_skipped=0,
     )
-    version["discovery"][0]["tables"] = [
-        {"source": source, "version": list(table_version), "entries": entries}
-        for (source, table_version, entries), count in VERSION_TABLES_SCANNED.items()
-        for _ in range(count)
-    ]
+    version["discovery"][0]["tables"] = version_tables_fixture(VERSION_TABLES_SCANNED)
     version.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -4302,13 +4374,8 @@ def self_test():
             )
         ]
     )
-    safe32["evidence"]["discovery"][0]["tables"].extend(
-        [
-            {"source": "scan", "version": [3, 1], "entries": 92},
-            {"source": "scan", "version": [3, 2], "entries": 104},
-            {"source": "scan", "version": [3, 9], "entries": 104},
-        ]
-    )
+    safe32["evidence"]["discovery"][0]["tables"] = version_tables_fixture(
+        VERSION_TABLES_SCANNED_IA32)
     safe32["evidence"]["discovery"][0].update(
         corroborated=True,
         corroboration=["agreed"],
@@ -4317,8 +4384,8 @@ def self_test():
     require(
         surface_signature(safe32["evidence"]) == Counter({
             ("full", 68): 4, ("full", 92): 4, ("full", 104): 3,
-            ("known_prefix", 68): 1, ("known_prefix", 92): 2,
-            ("known_prefix", 104): 3, ("refused", 0): 1, ("not_walked", 0): 1,
+            ("known_prefix", 68): 2, ("known_prefix", 92): 2,
+            ("known_prefix", 104): 3, ("not_walked", 0): 1,
         }),
         "the IA32 matrix has exactly nineteen independently specified surfaces",
     )
@@ -4879,7 +4946,7 @@ def self_test():
     bad = copy.deepcopy(safe)
     bad["evidence"]["table_entries"] = 1216
     rejected(lambda: validate_canary("default-safe-profile", bad))
-    print("canary matrix 988/104/208 with 16 mixed surfaces: OK")
+    print("canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK")
     # The scan's own contribution is not optional: dropping the three exact
     # source-labelled tables it decoded, or the conflict they imply, must fail.
     bad = copy.deepcopy(safe)
@@ -4899,13 +4966,10 @@ def self_test():
 
     # The freeze lane: same provider, same policy, manifest alone.
     freeze_evidence = evidence_fixture(VERSION_SURFACES, sources=("manifest",))
-    freeze_evidence["discovery"][0]["tables"] = [
-        {"source": source, "version": list(table_version), "entries": entries}
-        for (source, table_version, entries), count in VERSION_TABLES_MANIFEST_ONLY.items()
-        for _ in range(count)
-    ]
+    freeze_evidence["discovery"][0]["tables"] = version_tables_fixture(
+        VERSION_TABLES_MANIFEST_ONLY)
     freeze_evidence.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -4917,7 +4981,7 @@ def self_test():
     validate_canary("freeze-unsafe-profile", freeze)
     rejected(lambda: validate_canary("feature-unsafe-profile", freeze))
     rejected(lambda: validate_canary("freeze-unsafe-profile", safe))
-    print("canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK")
+    print("canary freeze lane is manifest-only 1056/104/208 with 13 surfaces: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["unregistered_mechanisms"] = 3
     rejected(lambda: validate_canary("default-safe-profile", bad))

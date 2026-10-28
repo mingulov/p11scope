@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from unittest import mock
 
 
@@ -98,13 +99,10 @@ def owned_metrics_document(bits, calls=30):
         sources=("scan", "manifest"),
         discovery_skipped=0,
     )
-    evidence["discovery"][0]["tables"] = [
-        {"source": source, "version": list(version), "entries": entries}
-        for (source, version, entries), count in subject.VERSION_TABLES_SCANNED.items()
-        for _ in range(count)
-    ]
+    evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
+        subject.VERSION_TABLES_SCANNED)
     evidence.update(
-        table_entries=988,
+        table_entries=1056,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -137,11 +135,8 @@ def owned_metrics_document(bits, calls=30):
                 (3, 1, 92, "full"), (3, 2, 104, "full"),
                 (3, 9, 104, "known_prefix"))
         ])
-        evidence["discovery"][0]["tables"].extend([
-            {"source": "scan", "version": [3, 1], "entries": 92},
-            {"source": "scan", "version": [3, 2], "entries": 104},
-            {"source": "scan", "version": [3, 9], "entries": 104},
-        ])
+        evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
+            subject.VERSION_TABLES_SCANNED_IA32)
         evidence["discovery"][0].update(corroborated=True, corroboration=["agreed"])
     document = subject.document_fixture(
         evidence,
@@ -3362,6 +3357,126 @@ class RingLayoutTests(unittest.TestCase):
                 retained, "default-safe-profile", 0x555, positions)
 
 
+class VersionCanaryPrefixTests(unittest.TestCase):
+    def profile(self, bits=64, boundary=None):
+        subject = load_capture_checker()
+        manifest = [
+            ((2, 40), 68, "full"), ((2, 40), 68, "full"),
+            ((3, 0), 92, "full"), ((3, 1), 92, "full"),
+            ((3, 2), 104, "full"), ((3, 9), 104, "known_prefix"),
+            ((4, 0), 68, "known_prefix"), ((3, 2), 104, "known_prefix"),
+            ((3, 0), 92, "known_prefix"), ((3, 1), 92, "known_prefix"),
+            ((2, 40), 68, "known_prefix"), ((0, 0), 0, "not_walked"),
+            ((3, 2), 104, "full"),
+        ]
+        raw = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
+               ((3, 0), 92, "full")]
+        if bits == 32:
+            raw += [((3, 1), 92, "full"), ((3, 2), 104, "full"),
+                    ((3, 9), 104, "known_prefix")]
+        surfaces = Counter((walk, count) for _, count, walk in manifest + raw)
+        evidence = subject.evidence_fixture(
+            surfaces, sources=("scan", "manifest"), discovery_skipped=0)
+        module = evidence["discovery"][0]
+        module["tables"] = [
+            {"source": "manifest", "version": list(version), "entries": count}
+            for version, count, _ in manifest
+        ] + [
+            {"source": "scan", "version": list(version), "entries": count,
+             "file_offset": 4096 * (index + 1)}
+            for index, (version, count, _) in enumerate(raw)
+        ]
+        if boundary is not None:
+            offset, count, walk = boundary
+            module["tables"].append({
+                "source": "scan", "version": [3, 1], "entries": count,
+                "file_offset": offset,
+            })
+            evidence["surfaces"].append({
+                "source": module["path"] + " table 3.1", "acquisition": "ok",
+                "walk": walk, "functions": count,
+            })
+        module.update(corroborated=True,
+                      corroboration=["conflict"] if bits == 64 else ["agreed"])
+        evidence.update(table_entries=1056, slots=104, active_slots=104,
+                        attached_probes=208, vendor_interfaces=1,
+                        interface_list="ok", discovery_conflicts=int(bits == 64),
+                        drain_proven=True,
+                        stop_quiescence={"state": "proven", "post_q_events": False,
+                                         "post_q_discovery": False},
+                        **subject.SAFE_ALLOWANCES)
+        return subject, subject.document_fixture(evidence)
+
+    def test_exact_manifest_keeps_the_acquired_unknown_label_prefix(self):
+        for bits in (32, 64):
+            with self.subTest(bits=bits):
+                subject, document = self.profile(bits)
+                subject.validate_canary("default-safe-profile", document, bits)
+
+    def test_terminal_partial_and_full_rows_have_distinct_boundary_rules(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        for offset, count, walk in (
+            (8 * page - 8 * 60, 59, "known_prefix"),
+            (8 * page - 8 * 32, 31, "known_prefix"),
+            # Full rows can cross a page; the report has no VMA-end witness.
+            (8 * page - 8 * 60, 92, "full"),
+            (7 * page, 92, "full"),
+        ):
+            with self.subTest(offset=offset, count=count, walk=walk):
+                subject, document = self.profile(boundary=(offset, count, walk))
+                subject.validate_canary("default-safe-profile", document)
+
+    def test_terminal_prefix_refuses_invalid_extents_and_unrelated_rows(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        offset = 8 * page - 8 * 60
+        subject, healthy = self.profile(boundary=(offset, 59, "known_prefix"))
+        subject.validate_canary("default-safe-profile", healthy)
+        # Bind each loop value before storing a mutation.
+        mutations = [
+            (lambda d, n=n: d["evidence"]["discovery"][0]["tables"][-1].update(entries=n))
+            for n in (0, -1, 93, True, 1.5, 58)
+        ] + [
+            (lambda d, value=value: d["evidence"]["discovery"][0]["tables"][-1].update(file_offset=value))
+            for value in (None, -8, True, 8.0, offset + 1, (1 << 64) - 8)
+        ] + [
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 2]),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+            lambda d: d["evidence"]["discovery"][0]["tables"].append(
+                dict(d["evidence"]["discovery"][0]["tables"][-1])),
+            lambda d: d["evidence"]["surfaces"][-1].update(walk="full"),
+            lambda d: d["evidence"]["surfaces"][-1].update(source="unrelated table 3.1"),
+            lambda d: d["evidence"]["surfaces"].append(dict(d["evidence"]["surfaces"][-1])),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset - 8),
+            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset + 4096),
+            lambda d: d["evidence"]["discovery"][0]["tables"].pop(-2),
+            lambda d: next(t for t in d["evidence"]["discovery"][0]["tables"]
+                           if t["source"] == "manifest" and t["version"] == [4, 0]).update(entries=0),
+            lambda d: next(s for s in d["evidence"]["surfaces"]
+                           if s["walk"] == "known_prefix" and s["functions"] == 68).update(
+                               walk="refused", functions=0),
+            lambda d: d["evidence"].update(table_entries=988),
+            lambda d: d["evidence"].update(slots=103),
+            lambda d: d["evidence"].update(attached_probes=206),
+            lambda d: d["evidence"].update(event_loss=1),
+            lambda d: d["evidence"].update(drain_proven=False),
+            lambda d: d["capture"].update(privacy_mode="unsafe-unvalidated-metadata"),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                document = copy.deepcopy(healthy)
+                mutate(document)
+                self.assertNotEqual(document, healthy)
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary("default-safe-profile", document)
+        subject, full = self.profile(boundary=(offset, 92, "full"))
+        full["evidence"]["surfaces"][-1]["walk"] = "known_prefix"
+        with self.assertRaises(AssertionError):
+            subject.validate_canary("default-safe-profile", full)
+        subject, ia32 = self.profile(32, boundary=(offset, 59, "known_prefix"))
+        with self.assertRaises(AssertionError):
+            subject.validate_canary("default-safe-profile", ia32, 32)
+
+
 class OwnedMetricsOracleTests(unittest.TestCase):
     def test_owned_metrics_fixture_keeps_abi_specific_future_minor_scan(self):
         for bits, surfaces in ((64, 16), (32, 19)):
@@ -3372,7 +3487,8 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                 future = [table for table in evidence["discovery"][0]["tables"]
                           if table["source"] == "scan" and table["version"] == [3, 9]]
                 self.assertEqual(future, ([{"source": "scan", "version": [3, 9],
-                                           "entries": 104}] if bits == 32 else []))
+                                           "entries": 104, "file_offset": 6 * 4096}]
+                                         if bits == 32 else []))
                 capture.validate_canary("owned-default-metrics", document, bits)
                 if bits == 32:
                     bad = copy.deepcopy(document)

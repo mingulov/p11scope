@@ -1059,6 +1059,118 @@ class C8GatePredicateTests(unittest.TestCase):
         oracle = runpy.run_path(str(ORACLE))
         self.assertEqual(self.gate['EXEC_REASONS'], oracle['COUNTED_EXEC_CHAIN_REASONS'])
 
+    def gen2_quiet(self, *, inherited=False, registered=True):
+        self.successor_progress()
+        previous = self.select('post')
+        old = copy.deepcopy(self.context)
+        old['lifecycle'] = 'exec_retired'
+        self.exe = {**self.exe, 'path': '/owned/ledger2', 'ino': 102}
+        self.context.update(id='c2', incarnation=2)
+        self.context['executable'].update(path=self.exe['path'], ino=self.exe['ino'])
+        self.want.update(gen=2, exe=self.exe, previous=previous)
+        self.want.pop('pre', None)
+        self.add('caller_event', {'event': 'exec_retired', 'old': 'c1', 'new': 'c2',
+            'identity_context': {'version': 1, 'old': old, 'new': self.context}}, 260)
+        edge = self.edge()
+        if inherited:
+            edge['entries']['coverage'].update(state='unknown', reason='use_before_admission', since_ns=None)
+        self.add('edge_observed', edge, 270)
+        instance = {'id': 'i2', 'caller': 'c2', 'module': 'm0', 'state': 'observed',
+                    'reason': None, 'first_seen_ns': 271, 'last_seen_ns': 271}
+        child = {'caller': 'c2', 'module': 'm0', 'instance': 'i2',
+            'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+            'api_returns': {'count': None, 'historical_only_returns': 0, 'saturated': False, 'unit': 'api_returns'},
+            'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+            'coverage': {'lossy': False, 'reasons': ['no_calls']}}
+        if registered:
+            self.add('instance_observed', instance, 275)
+            self.add('semantic_edge_observed', child, 276)
+        self.add('pass_committed', {'pass': 5}, 280)
+        return instance, child
+
+    def test_gen2_requires_both_quiet_registrations_and_their_following_commit(self):
+        instance, child = self.gen2_quiet(registered=False)
+        self.assertIsNone(self.select())  # A physical watch and pass are insufficient.
+        self.add('instance_observed', instance, 290)
+        self.add('pass_committed', {'pass': 6}, 300)
+        self.assertIsNone(self.select())
+        self.add('semantic_edge_observed', child, 310)
+        self.assertIsNone(self.select())
+        self.add('pass_committed', {'pass': 7}, 320)
+        proof = self.select()
+        self.assertEqual((proof['proof'], proof['instance']), ('quiet_ready', 'i2'))
+
+    def test_gen2_preserves_inherited_zero_coverage_without_inventing_a_watch(self):
+        self.gen2_quiet(inherited=True)
+        proof = self.select()
+        self.assertIsNotNone(proof)
+        self.assertEqual((proof['coverage_state'], proof['coverage_reason']), ('unknown', 'use_before_admission'))
+        self.assertEqual(proof['count'], 0)
+
+    def test_gen2_rejects_stale_wrong_pair_ambiguous_retired_and_nonquiet_children(self):
+        self.gen2_quiet()
+        baseline = copy.deepcopy(self.rows)
+        mutations = [('instance', 'caller', 'c9'), ('instance', 'module', 'm9'),
+            ('instance', 'state', 'retired'), ('instance', 'first_seen_ns', 200),
+            ('child', 'caller', 'c9'), ('child', 'module', 'm9'), ('child', 'instance', 'i9'),
+            ('child', 'semantics', 'observed'), ('child', 'mechanisms', []), ('child', 'operations', {}),
+            ('entries', 'count', 0), ('returns', 'count', 1), ('returns', 'historical_only_returns', 1),
+            ('returns', 'historical_only_returns', False), ('returns', 'saturated', True),
+            ('returns', 'saturated', 0), ('coverage', 'lossy', True), ('coverage', 'lossy', 0),
+            ('coverage', 'reasons', ['semantic_loss'])]
+        for area, key, value in mutations:
+            with self.subTest(area=area, key=key):
+                self.rows = copy.deepcopy(baseline)
+                instance = next(r['event'] for r in self.rows if r['kind'] == 'instance_observed')
+                child = next(r['event'] for r in self.rows if r['kind'] == 'semantic_edge_observed')
+                target = {'instance': instance, 'child': child, 'entries': child['entries'],
+                          'returns': child['api_returns'], 'coverage': child['coverage']}[area]
+                target[key] = value
+                self.assertIsNone(self.select())
+        self.rows = baseline
+        extra = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
+        extra['id'] = 'i3'
+        self.add('instance_observed', extra, 290)
+        self.add('pass_committed', {'pass': 6}, 300)
+        self.assertIsNone(self.select())
+
+    def test_gen2_latest_retirement_child_update_and_final_pass_invalidate_quiet_proof(self):
+        self.gen2_quiet()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('instance', 'child', 'caller', 'final'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                self.assertIsNotNone(self.select())
+                if change == 'instance':
+                    item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
+                    item.update(state='retired', reason='task_retired')
+                    self.add('instance_observed', item, 290)
+                elif change == 'child':
+                    item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'semantic_edge_observed'))
+                    item['api_returns']['historical_only_returns'] = 1
+                    self.add('semantic_edge_observed', item, 290)
+                elif change == 'caller':
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c2'}, 290)
+                self.add('pass_committed', {'pass': 6, 'final': change == 'final'}, 300)
+                self.assertIsNone(self.select())
+
+    def test_gen2_other_unknowns_positive_entries_and_original_deadline_still_refuse(self):
+        self.gen2_quiet(inherited=True)
+        baseline = copy.deepcopy(self.rows)
+        for field, value in [('count', 1), ('first_seen_ns', 270), ('last_seen_ns', 270),
+                             ('in_flight', True), ('saturated', True), ('reason', 'pending_first_use')]:
+            with self.subTest(field=field):
+                self.rows = copy.deepcopy(baseline)
+                entries = next(r['event']['entries'] for r in reversed(self.rows) if r['kind'] == 'edge_observed')
+                (entries['coverage'] if field == 'reason' else entries)[field] = value
+                self.assertIsNone(self.select())
+        self.rows = baseline
+        for times in ((1000,), (999, 1000)):
+            clock = iter(times)
+            self.gate['monotonic_ns'] = lambda: next(clock)
+            with self.assertRaisesRegex(ValueError, 'deadline'):
+                self.select()
+
 
 class C8GateFixtureTests(unittest.TestCase):
     @classmethod
@@ -1323,8 +1435,10 @@ class C8GateFixtureTests(unittest.TestCase):
         publisher.start()
         self.addCleanup(publisher.join, 5)
         self.addCleanup(stopped.set)
+        actual_clock = ns['monotonic_ns']
         if not delay_ms: ns['monotonic_ns'] = lambda: time.monotonic_ns() + 9_000_000_000
         gate('pre', 1)
+        ns['monotonic_ns'] = actual_clock
         proof = json.loads(Path(str(prefix) + '.1.pre.json').read_text())
         self.assertEqual(proof['proof'], 'native_ready')
         self.assertNotIn('caller', proof)
@@ -1340,6 +1454,61 @@ class C8GateFixtureTests(unittest.TestCase):
         proof = json.loads(Path(str(prefix) + '.1.post.json').read_text())
         self.assertEqual(proof['proof'], 'publication_progress')
         self.assertNotIn('count', proof)
+        physical_seen, instance_seen = threading.Event(), threading.Event()
+        original_select = ns['select_gate']
+        def observe_gen2(rows, want, phase):
+            result = original_select(rows, want, phase)
+            if want['gen'] == 2 and any(r['kind'] == 'edge_observed'
+                    and r['event'].get('caller') == 'c2' for r in rows):
+                registered = any(r['kind'] == 'instance_observed' for r in rows)
+                child = any(r['kind'] == 'semantic_edge_observed' for r in rows)
+                if not registered or not child:
+                    if result is not None: errors.append(AssertionError('gen2 released before quiet S1 registration'))
+                    (instance_seen if registered else physical_seen).set()
+            return result
+        ns['select_gate'] = observe_gen2
+        def publish_quiet_gen2():
+            try:
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+                if stopped.is_set(): return
+                old = copy.deepcopy(edge['identity_context']['caller'])
+                old['lifecycle'] = 'exec_retired'
+                current = copy.deepcopy(old)
+                exe = json.loads((ledger.parent / 'pins.json').read_text())['pins']['L2']['exe']
+                current.update(id='c2', incarnation=2, lifecycle='mapped')
+                current['executable'].update(path=exe['path'], ino=exe['ino'], dev=exe['dev'],
+                    mtime_secs=exe['mtime_ns'] // 1_000_000_000, mtime_nanos=exe['mtime_ns'] % 1_000_000_000)
+                append('caller_event', {'event': 'exec_retired', 'old': 'c1', 'new': 'c2',
+                    'identity_context': {'version': 1, 'old': old, 'new': current}})
+                edge.update(caller='c2')
+                edge['identity_context']['caller'] = current
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 4})
+                for observed in (physical_seen, instance_seen):
+                    if not observed.wait(2):
+                        if stopped.is_set(): return
+                        raise AssertionError('controller did not inspect incomplete gen2 registration')
+                    if stopped.is_set(): return
+                    if any(x.startswith('LEDGER ') and ' gen=2 ' in x for x in ledger.read_text().splitlines()):
+                        raise AssertionError('gen2 APIs ran before quiet S1 readiness')
+                    now = time.monotonic_ns()
+                    if observed is physical_seen:
+                        append('instance_observed', {'id': 'i2', 'caller': 'c2', 'module': 'm0',
+                            'state': 'observed', 'reason': None, 'first_seen_ns': now, 'last_seen_ns': now})
+                    else:
+                        append('semantic_edge_observed', {'caller': 'c2', 'module': 'm0', 'instance': 'i2',
+                            'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+                            'api_returns': {'count': None, 'historical_only_returns': 0,
+                                            'saturated': False, 'unit': 'api_returns'},
+                            'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+                            'coverage': {'lossy': False, 'reasons': ['no_calls']}})
+                    append('pass_committed', {'pass': 5 if observed is physical_seen else 6})
+            except BaseException as error:
+                errors.append(error)
+        quiet_publisher = threading.Thread(target=publish_quiet_gen2)
+        quiet_publisher.start()
+        self.addCleanup(quiet_publisher.join, 5)
+        self.addCleanup(stopped.set)
         if immediate_next:
             # POST has just released .1.next. The original 300ms quiet gap
             # still holds L; PRE must wait for real ledger2 readiness itself.
@@ -1361,6 +1530,12 @@ class C8GateFixtureTests(unittest.TestCase):
             self.assertFalse(Path(str(prefix) + '.2.go').exists())
             pins.write_text(saved)
             gate('pre', 2)
+        proof = json.loads(Path(str(prefix) + '.2.pre.json').read_text())
+        self.assertEqual(proof['proof'], 'quiet_ready')
+        self.assertEqual(proof['instance'], 'i2')
+        quiet_publisher.join(2)
+        self.assertFalse(quiet_publisher.is_alive())
+        self.assertEqual(errors, [])
         self.wait(child, ledger, 'WATCH_READY', gen=2, phase='next')
         calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
                  if x.startswith('LEDGER ') and ' gen=2 ' in x]

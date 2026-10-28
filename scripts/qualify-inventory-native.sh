@@ -126,9 +126,37 @@ def select_gate(records, want, phase):
     return result
 
 
+def quiet_registration(instances, children, invalid, cid, mid, previous, commit):
+    current = [(iid, event, row) for iid, (event, row) in instances.items()
+               if event.get('caller') == cid and event.get('module') == mid and event.get('state') == 'observed']
+    if len(current) != 1:
+        return None
+    iid, instance, publication = current[0]
+    child, child_row = children.get(iid, ({}, {}))
+    returns, coverage = child.get('api_returns') or {}, child.get('coverage') or {}
+    if (iid in invalid or instance.get('reason') is not None
+            or not integer(instance.get('first_seen_ns')) or not integer(instance.get('last_seen_ns'))
+            or not previous['done_ns'] < instance['first_seen_ns'] <= instance['last_seen_ns'] <= publication['at_ns']
+            or child.get('caller') != cid or child.get('module') != mid
+            or not previous['seq'] < publication['seq'] < commit['seq']
+            or not previous['seq'] < child_row.get('seq', -1) < commit['seq']):
+        return None
+    if (child.get('entries') != {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'}
+            or not integer(returns.get('historical_only_returns')) or returns['historical_only_returns'] != 0
+            or returns.get('saturated') is not False or coverage.get('lossy') is not False
+            or child.get('api_returns') != {'count': None, 'historical_only_returns': 0,
+                                          'saturated': False, 'unit': 'api_returns'}
+            or child.get('semantics') != 'unknown (no calls observed)'
+            or child.get('mechanisms') is not None or child.get('operations') is not None
+            or child.get('coverage') != {'lossy': False, 'reasons': ['no_calls']}):
+        return None
+    return {'instance': iid, 'instance_seq': publication['seq'], 'semantic_edge_seq': child_row['seq']}
+
+
 def select_publication(records, want, phase, observed_ns):
     dead, candidates, edges, inconsistent = set(), {}, {}, set()
     gaps, witnesses = set(), []
+    instances, children, invalid_instances = {}, {}, set()
     last_at, commit = 0, None
     previous = want.get('previous')
     pre = want.get('pre')
@@ -207,6 +235,15 @@ def select_publication(records, want, phase, observed_ns):
                     inconsistent.add(key)  # Identity disagreement, not an unready coverage state.
                 if provider_matches or known_pair:
                     edges[key] = (event, row) if valid else None
+        elif kind in ('instance_observed', 'semantic_edge_observed'):
+            iid = event.get('id' if kind == 'instance_observed' else 'instance')
+            if isinstance(iid, str):
+                for old_event, _old_row in (store[iid] for store in (instances, children) if iid in store):
+                    if (old_event.get('caller'), old_event.get('module')) != (event.get('caller'), event.get('module')):
+                        invalid_instances.add(iid)
+                if kind == 'instance_observed' and event.get('state') == 'retired':
+                    invalid_instances.add(iid)
+                (instances if kind == 'instance_observed' else children)[iid] = (event, row)
         elif kind == 'gap_recorded':
             if (event.get('pid') is None and re.search(r'unidentified caller|unbound (caller|witness)',
                     f"{event.get('subject', '')} {event.get('reason', '')}", re.I)):
@@ -256,17 +293,27 @@ def select_publication(records, want, phase, observed_ns):
                     return dict(base, proof='publication_progress', done_ns=want['done_ns'],
                         unbound_watermark=witness['seq'],
                         witness={'seq': witness['seq'], 'module': item['module'], 'reason': item['reason']})
+        inherited_zero = (phase == 'pre' and want['gen'] == 2
+            and coverage.get('state') == 'unknown' and coverage.get('reason') == 'use_before_admission'
+            and coverage.get('since_ns') is None and coverage.get('lossy') is None)
+        timed_coverage = (coverage.get('reason') is None and integer(coverage.get('since_ns'))
+                          and coverage['since_ns'] > 0)
         if (entries.get('saturated') is not False
                 or entries.get('in_flight') is not False or not integer(entries.get('count'))
-                or coverage.get('until_ns') is not None or coverage.get('reason') is not None
-                or coverage.get('detail') is not None or not integer(coverage.get('since_ns'))
-                or coverage['since_ns'] <= 0):
+                or coverage.get('until_ns') is not None or coverage.get('detail') is not None
+                or not (timed_coverage or inherited_zero)):
             continue
         if phase == 'pre':
-            if (coverage.get('state') != 'watched_no_use' or coverage.get('lossy') is not None
+            if ((not inherited_zero and coverage.get('state') != 'watched_no_use') or coverage.get('lossy') is not None
                     or entries['count'] != 0 or entries.get('first_seen_ns') is not None
                     or entries.get('last_seen_ns') is not None):
                 continue
+            if want['gen'] == 2:
+                quiet = quiet_registration(instances, children, invalid_instances, cid, edge['module'], previous, commit)
+                if quiet is None:
+                    continue
+                return dict(base, proof='quiet_ready', count=0, coverage_state=coverage['state'],
+                            coverage_reason=coverage.get('reason'), **quiet)
         elif (coverage.get('state') != 'counted' or coverage.get('lossy') is not False
                 or entries['count'] != want['count'] or publication['seq'] <= floor
                 or publication['at_ns'] < want['last_entry_ns']
@@ -444,7 +491,7 @@ def main():
                                 first_entry_ns=min(int(r['t0']) for r in calls),
                                 last_entry_ns=max(int(r['t1']) for r in calls))
                     complete = True
-            phase = 'native' if operation == 'pre' and gen else operation
+            phase = 'native' if operation == 'pre' and gen == 1 else operation
             proof = select_gate(records, want, phase) if records and ready and complete else None
             verify()
             if proof:

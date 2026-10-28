@@ -10,7 +10,8 @@ static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static unsigned ready;
 static unsigned released;
-static unsigned tids[2];
+#define MAX_WORKERS 129
+static unsigned tids[MAX_WORKERS];
 
 typedef unsigned long (*callback)(void *);
 struct table { unsigned char version[2]; callback functions[68]; };
@@ -70,16 +71,24 @@ static void *worker(void *argument) {
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     unsigned count = (unsigned)strtoul(argv[1], NULL, 10);
-    if (count > 2) return 3;
-    pthread_t threads[2];
-    unsigned indices[2] = {0, 1};
-    for (unsigned index = 0; index < count; index++)
-        if (pthread_create(&threads[index], NULL, worker, &indices[index])) return 4;
+    if (count > MAX_WORKERS) return 3;
+    pthread_t threads[MAX_WORKERS];
+    unsigned indices[MAX_WORKERS];
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes)) return 26;
+    if (count > 2 && pthread_attr_setstacksize(&attributes, 64 * 1024)) return 27;
+    for (unsigned index = 0; index < count; index++) {
+        indices[index] = index;
+        if (pthread_create(&threads[index], &attributes, worker, &indices[index])) return 4;
+    }
+    if (pthread_attr_destroy(&attributes)) return 28;
     if (pthread_mutex_lock(&gate)) return 5;
     while (ready != count)
         if (pthread_cond_wait(&changed, &gate)) return 6;
-    printf("READY tgid=%u count=%u tid0=%u tid1=%u table=%p callback=%p\n",
-           (unsigned)getpid(), count, tids[0], tids[1], (void *)&sparse, (void *)C_Initialize);
+    printf("READY tgid=%u count=%u", (unsigned)getpid(), count);
+    for (unsigned index = 0; index < (count < 2 ? 2 : count); index++)
+        printf(" tid%u=%u", index, tids[index]);
+    printf(" table=%p callback=%p\n", (void *)&sparse, (void *)C_Initialize);
     if (fflush(stdout)) return 7;
     if (pthread_mutex_unlock(&gate)) return 8;
     char command;

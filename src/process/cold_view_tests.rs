@@ -20,7 +20,7 @@ pub(crate) struct ColdLeaderSubject {
 
 impl ColdLeaderSubject {
     pub(crate) fn spawn(workers: u32) -> Self {
-        assert!(workers <= 2);
+        assert!(workers <= 129);
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("cold-leader");
         assert!(
@@ -67,15 +67,40 @@ impl ColdLeaderSubject {
         assert_eq!(words[0], "READY");
         assert_eq!(words[1], format!("tgid={}", fixture.pid()));
         assert_eq!(words[2], format!("count={workers}"));
-        fixture.table_address =
-            u64::from_str_radix(words[5].strip_prefix("table=0x").unwrap(), 16).unwrap();
-        fixture.callback_address =
-            u64::from_str_radix(words[6].strip_prefix("callback=0x").unwrap(), 16).unwrap();
+        fixture.table_address = u64::from_str_radix(
+            words
+                .iter()
+                .find_map(|word| word.strip_prefix("table=0x"))
+                .unwrap(),
+            16,
+        )
+        .unwrap();
+        fixture.callback_address = u64::from_str_radix(
+            words
+                .iter()
+                .find_map(|word| word.strip_prefix("callback=0x"))
+                .unwrap(),
+            16,
+        )
+        .unwrap();
         fixture.tids = words[3..3 + workers as usize]
             .iter()
             .map(|word| word.split_once('=').unwrap().1.parse().unwrap())
             .collect();
-        assert!(fixture.tids.iter().all(|tid| *tid != fixture.pid()));
+        assert!(
+            fixture
+                .tids
+                .iter()
+                .all(|tid| *tid != 0 && *tid != fixture.pid())
+        );
+        assert_eq!(
+            fixture
+                .tids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            workers as usize,
+        );
         fixture
     }
 
@@ -108,7 +133,7 @@ impl ColdLeaderSubject {
                 return String::from_utf8(line).unwrap();
             }
             line.push(byte[0]);
-            assert!(line.len() <= 256, "fixture line exceeded its fixed bound");
+            assert!(line.len() <= 4096, "fixture line exceeded its fixed bound");
         }
     }
 

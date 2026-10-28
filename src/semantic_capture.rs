@@ -3811,9 +3811,6 @@ pub(crate) fn deliver_collected_raw_for_resource_test(
 }
 
 #[cfg(test)]
-mod tests;
-
-#[cfg(test)]
 mod discovery_service_tests {
     use super::*;
     use crate::events::{BoundedRecordSource, DiscoveryDrain, EventDrain, ScriptedRecords};
@@ -3967,3 +3964,6 @@ mod discovery_service_tests {
         assert_eq!(collected.records[0].base.event.ts_ns, 1);
     }
 }
+
+#[cfg(test)]
+mod tests;

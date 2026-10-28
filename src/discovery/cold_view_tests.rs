@@ -10,8 +10,22 @@ fn cold_group_sweep_reads_live_member_maps_as_advisory_hints() {
     group.leave_leader();
     let mut budget = CaptureWorkBudget::default();
 
-    let (snapshots, unavailable, skipped) =
-        sweep_process_maps(&[group.pid()], &mut budget).into_selection_with_unavailable();
+    let sweep = sweep_process_maps(&[group.pid()], &mut budget);
+    eprintln!(
+        "R56 live-survivor sweep: leader_maps_bytes={:?}, snapshots={:?}, io={}, stop={:?}",
+        std::fs::read(format!("/proc/{}/maps", group.pid())).map(|bytes| bytes.len()),
+        sweep
+            .snapshots
+            .iter()
+            .map(|(_, snapshot)| match snapshot {
+                MapsSnapshot::Read(maps) => Some(maps.len()),
+                MapsSnapshot::Unavailable => None,
+            })
+            .collect::<Vec<_>>(),
+        budget.attempted_io_bytes(),
+        budget.stopped_reason(),
+    );
+    let (snapshots, unavailable, skipped) = sweep.into_selection_with_unavailable();
 
     assert!(unavailable.is_empty(), "{skipped:?}");
     let maps = &snapshots
@@ -146,8 +160,22 @@ fn cold_group_sweep_does_not_classify_ended_metadata_as_empty_success() {
     group.leave_leader();
     let mut budget = CaptureWorkBudget::default();
 
-    let (_, unavailable, skipped) =
-        sweep_process_maps(&[group.pid()], &mut budget).into_selection_with_unavailable();
+    let sweep = sweep_process_maps(&[group.pid()], &mut budget);
+    eprintln!(
+        "R56 ended-group sweep: leader_maps_bytes={:?}, snapshots={:?}, io={}, stop={:?}",
+        std::fs::read(format!("/proc/{}/maps", group.pid())).map(|bytes| bytes.len()),
+        sweep
+            .snapshots
+            .iter()
+            .map(|(_, snapshot)| match snapshot {
+                MapsSnapshot::Read(maps) => Some(maps.len()),
+                MapsSnapshot::Unavailable => None,
+            })
+            .collect::<Vec<_>>(),
+        budget.attempted_io_bytes(),
+        budget.stopped_reason(),
+    );
+    let (_, unavailable, skipped) = sweep.into_selection_with_unavailable();
 
     assert!(unavailable.contains(&group.pid()));
     assert!(

@@ -37766,11 +37766,13 @@ fn probationary_probe_refuses_without_a_complete_scan() {
     engine.next_view_id = 2;
     engine.exploratory_dirty.insert(ProcessViewId(1));
     let seed_pid = engine.views[0].pid();
-    let mut head = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn provider-free newcomer");
-    let head_pid = head.id();
+    let head = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn provider-free newcomer"),
+    );
+    let head_pid = head.pid();
     let dir = tempfile::tempdir().expect("a scope directory");
     let listing = format!("{seed_pid}\n{filler}\n{head_pid}\n");
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
@@ -37781,6 +37783,14 @@ fn probationary_probe_refuses_without_a_complete_scan() {
     assert!(engine.request_refresh_consumed(head_pid, Some(1_200)));
     let scans_before = engine.deep_scans;
     refresh_inventory_once(&mut engine);
+    eprintln!(
+        "R56 probationary refusal: scans_before={scans_before}, scans_after={}, io={}, stop={:?}, request_retained={}, completions={}",
+        engine.deep_scans,
+        engine.budget.attempted_io_bytes(),
+        engine.budget.stopped_reason(),
+        engine.refresh_requested.contains_key(&head_pid),
+        engine.probationary_completions,
+    );
     assert!(
         engine.refresh_requested.contains_key(&head_pid),
         "a refused probe retains the request"
@@ -37794,8 +37804,47 @@ fn probationary_probe_refuses_without_a_complete_scan() {
         "refusal never completes viewlessly"
     );
     assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
-    let _ = head.kill();
-    let _ = head.wait();
+}
+
+#[test]
+fn probationary_constructor_refusal_does_not_run_a_deep_scan() {
+    let children = e06_spawn_sleeps(1);
+    let pid = children[0].pid();
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let mut stopped = Engine::empty();
+    stopped.module_hints = vec![executable.clone()];
+    stopped.budget.set_deadline(Some(0));
+    let (proven_free, skipped) = stopped.probe_newcomer_provider_free(pid);
+    eprintln!(
+        "R56 direct expired probe: proven_free={proven_free}, scans={}, io={}, stop={:?}, skips={}",
+        stopped.deep_scans,
+        stopped.budget.attempted_io_bytes(),
+        stopped.budget.stopped_reason(),
+        skipped.len(),
+    );
+    assert!(!proven_free, "constructor refusal grants no absence proof");
+    assert_eq!(
+        stopped.deep_scans, 0,
+        "the actual scan entrypoint was never reached"
+    );
+    assert_eq!(stopped.budget.attempted_io_bytes(), 0);
+    assert_eq!(stopped.budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+
+    // A separate fresh capture exercises the healthy side; the stopped
+    // capture above never renews its sticky allowance.
+    let mut healthy = Engine::empty();
+    healthy.module_hints = vec![executable];
+    let (proven_free, skipped) = healthy.probe_newcomer_provider_free(pid);
+    eprintln!(
+        "R56 direct healthy probe: proven_free={proven_free}, scans={}, io={}, stop={:?}, skips={}",
+        healthy.deep_scans,
+        healthy.budget.attempted_io_bytes(),
+        healthy.budget.stopped_reason(),
+        skipped.len(),
+    );
+    assert!(proven_free, "the actual healthy sleep scan proves absence");
+    assert_eq!(healthy.deep_scans, 1);
+    assert!(healthy.budget.attempted_io_bytes() > 0);
 }
 
 /// H5 zero-quantum: a service pass that cannot attempt any scan defers

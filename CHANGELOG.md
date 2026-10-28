@@ -177,14 +177,26 @@ Known issues in this release:
 - On some overlayfs setups before Linux 6.8, a provider whose /proc
   maps rendering cannot be proven carries an explicit unproven-maps
   note, and callers mapping it may stay unbound.
-- Qualification of continuous runs up to 30 minutes is conditional on the final
-  1,800-second SYSTEM+manifest soak, which remains pending for v0.5.0. An earlier
-  run failed exact-count and final-drain checks. The 4 h and 24 h runs remain
-  unqualified.
+- The final 1,800-second SYSTEM+manifest soak passed on Fedora Linux 7.2.9
+  with a 1,860-second observation window, exact physical call counts and a
+  proven final drain. Semantic sheds and named-budget refusals remain disclosed
+  in [known limitations](docs/known-limitations.md). The earlier failed run
+  remains historical; 4 h and 24 h runs remain unqualified.
 
 ### Qualification of this release
 
-The kernels, lanes and results this release was qualified on are recorded here at release time.
+The following scoped checks passed during release preparation:
+
+| Environment | Checked behavior |
+| --- | --- |
+| Linux 6.6.157, 6.12.111 and 6.18.58 guests | 75 BPF roots per kernel: object loading and the declared verifier budgets. |
+| Linux 7.0.0-38-generic | Four IA32 object canaries: FULL and P0 completion and blocked START, with exact counts, privacy checks and owned cleanup. |
+| Fedora Linux 7.2.9 | Filtered-sibling and late-filter return-probe safety, short and 1,800-second SYSTEM+manifest soaks. |
+| Ubuntu 26.04 GitHub-hosted runner | PID/system × metrics/profile capture: 20,000 exact calls per cell, zero event loss and proven final drain. |
+
+Complete host CI, coverage, the full privacy matrix and extracted-package
+recipient checks are separate release gates. The limitation disclosures above
+also apply to successful captures.
 
 ## [0.4.0] - 2026-10-21
 

@@ -117,6 +117,7 @@ RUN = [
     ("test_public_cli_oracle.py", []),
     ("test_python_suite_registry.py", []),
     ("test_release_matrix_contract.py", []),
+    ("test_release_build_jobs.py", []),
     ("test_release_notices.py", []),
     ("test_release_recipient.py", []),
     ("test_residual_gates.py", []),

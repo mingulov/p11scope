@@ -310,6 +310,21 @@ scripts/build-release.sh /var/tmp/p11scope-release/v0.5.0
 # P0 variant: scripts/build-release.sh --capture-mode p0 /var/tmp/p11scope-release/v0.5.0-p0
 ```
 
+Use `--jobs N` before the evidence-root argument to select a Cargo build budget
+of 1 through 16 jobs, for example `--jobs 2`. Only canonical decimal integers
+are accepted; duplicate, missing and out-of-range values fail before the
+driver creates its receipt or starts work. The selected budget reaches the
+sealed host builds, nested BPF builds and both owned discover-helper build
+containers. The standalone helper driver accepts the same option before
+`--lane14-facts ABSENT_ARTIFACTS_FILE`.
+
+Omitting `--jobs` keeps Cargo's existing scheduler defaults. Inherited
+`CARGO_BUILD_JOBS` is removed by the release seal; select the option explicitly.
+The parent receipt and helper facts record `build_jobs` as the selected integer
+or `cargo-default` when omitted. The upper bound is a policy limit, not a CPU
+or memory reservation: follow the build host's lane and concurrency rules.
+This option does not change target directories or Docker daemon settings.
+
 The body prints `=== build-release: ALL OK ===` before the finalizer runs.
 Accept the build only when the script exits zero, the receipt's `status` file
 contains `0`, and `facts.log` records `terminal_status` and `checker_status`

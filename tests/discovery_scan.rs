@@ -289,9 +289,14 @@ fn assert_legacy_shared_words(so: &Path, table: &ScannedTable, owner: ObjectKey)
     // and a raw 67 layout never invents the typed route's ordinal 67 as NULL.
 }
 
-/// Compare only positions both routes actually observed. Extra positions are
-/// checked by scanned_word_oracle, never inferred NULL in the shorter route.
-fn observed_prefix_agrees(
+/// Fixture-specific interface-fullness oracle, not a general raw-full implies
+/// helper-full rule. The main matrix has full interface acquisitions for every
+/// recognized raw full layout; the sparse 2.40 twin has an exact full legacy 68.
+/// Legacy 3.x common 68 acquisitions instead use assert_legacy_shared_words:
+/// those real raw-full 92/104 positives keep every independently read raw word.
+/// Compare only shared positions here; raw extras are independently checked by
+/// scanned_word_oracle and never inferred NULL in a shorter helper route.
+fn matrix_interface_prefix_agrees(
     observed: &[FunctionRecord],
     version: (u8, u8),
     walk: &str,
@@ -529,7 +534,7 @@ fn sparse_words_keep_null_ordinals_but_unknown_raw_headers_still_need_an_anchor(
                 module.key,
                 &BTreeMap::new(),
             );
-            assert!(observed_prefix_agrees(
+            assert!(matrix_interface_prefix_agrees(
                 &observed,
                 table.version,
                 table.walk,
@@ -639,7 +644,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         let (observed, available, anchor_limit) =
             scanned_word_oracle(table, &maps, &object_ids, module.key, &exports);
         let matching = walked.iter().copied().find(|surface| {
-            observed_prefix_agrees(&observed, table.version, table.walk, surface, available, anchor_limit)
+            matrix_interface_prefix_agrees(&observed, table.version, table.walk, surface, available, anchor_limit)
         }).unwrap_or_else(|| {
             panic!("{:?}: {} observed slots/{} disagree with shared helper positions; VMA words={available}, anchor={anchor_limit}, helper={helper:?}", table.version, observed.len(), table.walk)
         });
@@ -655,7 +660,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
     // their actual addresses and read bounds (63 on the failing CI host).
     let prefix = &complete[..63];
     let agrees = |words: &[FunctionRecord], walk, available| {
-        observed_prefix_agrees(words, (3, 0), walk, typed, available, anchor_limit)
+        matrix_interface_prefix_agrees(words, (3, 0), walk, typed, available, anchor_limit)
     };
     assert!(agrees(prefix, "known_prefix", 63));
     assert!(!agrees(prefix, "full", 63));
@@ -693,7 +698,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         .find(|surface| surface.version == Some(Version { major: 4, minor: 0 }))
         .unwrap();
     assert_eq!(common.functions.len(), 68);
-    assert!(observed_prefix_agrees(
+    assert!(matrix_interface_prefix_agrees(
         &complete,
         (4, 0),
         "known_prefix",
@@ -702,7 +707,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         anchor_limit
     ));
     assert!(
-        !observed_prefix_agrees(&complete, (4, 0), "known_prefix", common, 92, 68),
+        !matrix_interface_prefix_agrees(&complete, (4, 0), "known_prefix", common, 92, 68),
         "extra raw extent needs its own extension anchor"
     );
 }

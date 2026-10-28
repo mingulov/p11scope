@@ -808,7 +808,11 @@ impl IngestedJointQuantum {
         key: super::JournalDomainKey,
     ) -> Option<super::JournalDomainProof> {
         let raw = self.raw_failure.as_ref()?;
-        if raw.gap != JournalGap::ImageTainted || raw.h3_voided.is_some() {
+        if !matches!(
+            raw.gap,
+            JournalGap::ImageTainted | JournalGap::DomainTainted
+        ) || raw.h3_voided.is_some()
+        {
             return None;
         }
         let state = adapter.keys.get(&key)?;
@@ -818,7 +822,7 @@ impl IngestedJointQuantum {
         };
         (state.refused
             && !state.era_ended
-            && adapter.is_tainted((key.cookie, key.exec))
+            && (raw.gap == JournalGap::DomainTainted || adapter.is_tainted((key.cookie, key.exec)))
             && self.pending_raw_scope_contains(proof.domain()))
         .then_some(proof)
     }
@@ -889,10 +893,12 @@ impl IngestedJointQuantum {
                 failure.h3_voided.is_some()
                     || disposition_of(failure.gap) == SealFailureDisposition::HistoryLoss
             })
-            || self
-                .raw_failure
-                .as_ref()
-                .is_some_and(|raw| raw.gap != JournalGap::ImageTainted)
+            || self.raw_failure.as_ref().is_some_and(|raw| {
+                !matches!(
+                    raw.gap,
+                    JournalGap::ImageTainted | JournalGap::DomainTainted
+                )
+            })
         {
             return false;
         }

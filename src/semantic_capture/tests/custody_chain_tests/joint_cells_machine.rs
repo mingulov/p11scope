@@ -1864,46 +1864,59 @@ fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
     );
     assert_eq!(observations.status, ObsStatus::Unavailable);
 
-    for sequence in [5, 6] {
-        scene.scene.push(pid, 0, "C_SignInit", sequence);
-    }
-    scene.machine.begin_commit(true).unwrap();
-    reach_any(&mut scene, &["Births"]);
-    let coordinator = &scene.scene.real.scene.coordinator;
-    let prepared = coordinator.prepared_semantic_batch().unwrap();
-    assert_eq!(prepared.admissions().count(), 2);
-    for input in prepared.admissions() {
-        assert!(
-            proof.matches_admitted(input),
-            "actual same-key S1Only original"
+    for (sequences, count) in [([5, 6], 6), ([7, 8], 8)] {
+        for sequence in sequences {
+            scene.scene.push(pid, 0, "C_SignInit", sequence);
+        }
+        scene.machine.begin_commit(true).unwrap();
+        reach_any(&mut scene, &["Births"]);
+        let coordinator = &scene.scene.real.scene.coordinator;
+        let prepared = coordinator.prepared_semantic_batch().unwrap();
+        assert_eq!(prepared.admissions().count(), 2);
+        for input in prepared.admissions() {
+            assert!(
+                proof.matches_admitted(input),
+                "actual same-key S1Only original"
+            );
+            assert!(input.joint_resource_origin().is_some());
+            assert!(coordinator.registry().admitted_feed_is_s1only(input));
+        }
+        reach_any(&mut scene, &["Audited"]);
+        let audit = scene.machine.diagnostic_audit_for_test().unwrap();
+        assert_eq!(audit.0, Some(JournalGap::DomainTainted));
+        scene.published_labeled("same-incarnation-s1only-history", None);
+        assert!(matches!(
+            scene.poll_commit(0).unwrap(),
+            JointCommitProgress::Published(_)
+        ));
+        let coordinator = &scene.scene.real.scene.coordinator;
+        let registry = coordinator.registry();
+        let history = registry.joint_history_targets().collect::<Vec<_>>();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.id(), target.id());
+        assert!(history[0].0.bootstrap() == target.bootstrap());
+        assert_eq!(history[0].1, FeedMode::S1Only);
+        let records = registry.instance_semantic_edges().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].api_returns, Some(count));
+        assert_eq!(registry.joint_feeds(), 0);
+        assert_eq!(
+            scene.native.birth_outcomes.len(),
+            1,
+            "no rebirth after refusal"
         );
-        assert!(input.joint_resource_origin().is_some());
-        assert!(coordinator.registry().admitted_feed_is_s1only(input));
+        assert!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .proof_refused_for_test(proof)
+        );
+        let observations = registry.joint_observations(registry.published_revision());
+        eprintln!(
+            "same_incarnation s1only_subject audit={audit:?} observation={:?}/{}",
+            observations.status, observations.reason
+        );
+        assert_eq!(observations.status, ObsStatus::Unavailable);
+        scene.scene.assert_claims(&[]);
     }
-    reach_any(&mut scene, &["Audited"]);
-    let audit = scene.machine.diagnostic_audit_for_test().unwrap();
-    assert_eq!(audit.0, Some(JournalGap::ImageTainted));
-    scene.published_labeled("same-incarnation-s1only-history", None);
-    let registry = scene.scene.real.scene.coordinator.registry();
-    let history = registry.joint_history_targets().collect::<Vec<_>>();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].0.id(), target.id());
-    assert!(history[0].0.bootstrap() == target.bootstrap());
-    assert_eq!(history[0].1, FeedMode::S1Only);
-    let records = registry.instance_semantic_edges().collect::<Vec<_>>();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].api_returns, Some(6));
-    assert_eq!(registry.joint_feeds(), 0);
-    assert_eq!(
-        scene.native.birth_outcomes.len(),
-        1,
-        "no rebirth after refusal"
-    );
-    let observations = registry.joint_observations(registry.published_revision());
-    eprintln!(
-        "same_incarnation s1only_subject audit={audit:?} observation={:?}/{}",
-        observations.status, observations.reason
-    );
-    assert_eq!(observations.status, ObsStatus::Unavailable);
-    scene.scene.assert_claims(&[]);
 }

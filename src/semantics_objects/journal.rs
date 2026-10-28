@@ -1607,14 +1607,19 @@ impl JournalAdapter {
         })
     }
 
-    /// One bulk original negative. All image subjects and the full retained
-    /// domain union are observed before any state.refused change. Claimed A
-    /// rows remain H8-owned for actual bounded fallback; only the exact
-    /// S1Only originals (with at most their own exact claim) are disposed here.
+    /// One bulk original negative. A retained exact key has a durable refusal
+    /// tombstone; an unbound subject still taints its image conservatively.
+    /// Freeze the complete retained domain union before state/model changes.
+    /// Claimed sibling rows remain H8-owned for bounded fallback; only the
+    /// exact S1Only originals (with at most their own claim) are disposed here.
     fn refuse_s1only_subjects(&mut self, model: &mut ObjectSemantics) -> Option<SealFailure> {
         if !self.has_s1only_subjects() {
             return None;
         }
+        // Audit preflight paid for at most keys.len() domains. Sorted unique
+        // insertion never needs a subject-sized side table or a new key.
+        let mut domains = Vec::with_capacity(self.keys.len());
+        let mut image_fallback = false;
         let mut after = None;
         loop {
             let next = match after {
@@ -1627,58 +1632,60 @@ impl JournalAdapter {
                     ))
                     .next(),
             }
-            .map(|(native, entry)| {
-                (
-                    *native,
-                    entry.s1only_subject.map(|key| (key.cookie, key.exec)),
-                )
-            });
-            let Some((native, image)) = next else {
+            .map(|(native, entry)| (*native, entry.s1only_subject));
+            let Some((native, subject)) = next else {
                 break;
             };
             after = Some(native);
-            if let Some(image) = image {
-                self.note_image_taint(image);
-            }
-        }
-        let mut domains = Vec::with_capacity(self.keys.len());
-        domains.extend(
-            self.keys
-                .iter()
-                .filter(|(key, _)| self.is_tainted((key.cookie, key.exec)))
-                .map(|(key, state)| {
-                    JournalDomainProof {
-                        key: *key,
+            if let Some(key) = subject {
+                if let Some(state) = self.keys.get(&key) {
+                    let domain = JournalDomainProof {
+                        key,
                         era: state.era,
                     }
-                    .domain()
-                }),
+                    .domain();
+                    if let Err(at) = domains.binary_search(&domain) {
+                        domains.insert(at, domain);
+                    }
+                } else {
+                    image_fallback = true;
+                    self.note_image_taint((key.cookie, key.exec));
+                }
+            }
+        }
+        // Independent image/overflow evidence keeps its full existing union,
+        // even when every marked subject itself had a retained exact key.
+        for (key, state) in &self.keys {
+            if self.is_tainted((key.cookie, key.exec)) {
+                image_fallback = true;
+                let domain = JournalDomainProof {
+                    key: *key,
+                    era: state.era,
+                }
+                .domain();
+                if let Err(at) = domains.binary_search(&domain) {
+                    domains.insert(at, domain);
+                }
+            }
+        }
+        assert!(
+            domains.len() <= self.keys.len(),
+            "original refusal union was prepaid"
         );
-        // The pending continuation checks this original union by typed domain
-        // without a target-vector scan for each retained physical claim.
-        domains.sort_unstable();
         let mut effects = ObjectEffects::default();
-        let taints = &self.tainted_images;
-        let overflow = self.taint_overflow;
-        let sightings = &self.sightings;
         for (key, state) in &mut self.keys {
-            let image = (key.cookie, key.exec);
-            if !taints.contains(&image) && !(overflow && !sightings.contains_key(&image)) {
+            let domain = JournalDomainProof {
+                key: *key,
+                era: state.era,
+            }
+            .domain();
+            if domains.binary_search(&domain).is_err() {
                 continue;
             }
             if !state.refused && state.model_registered {
-                effects.effects.extend(
-                    model
-                        .abandon_domain(
-                            JournalDomainProof {
-                                key: *key,
-                                era: state.era,
-                            }
-                            .domain(),
-                            &mut self.ledger,
-                        )
-                        .effects,
-                );
+                effects
+                    .effects
+                    .extend(model.abandon_domain(domain, &mut self.ledger).effects);
             }
             state.refused = true;
         }
@@ -1721,7 +1728,11 @@ impl JournalAdapter {
         }
         Some(SealFailure {
             scope: SealFailureScope::AffectedDomains(domains),
-            gap: JournalGap::ImageTainted,
+            gap: if image_fallback {
+                JournalGap::ImageTainted
+            } else {
+                JournalGap::DomainTainted
+            },
             effects,
             h3_voided: None,
         })

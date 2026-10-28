@@ -491,11 +491,33 @@ PY
 
 [ "${1-}" != "--self-test" ] || { [ "$#" -eq 1 ] || exit 2; self_test; }
 
-[ "$#" -eq 2 ] && [ "$1" = --lane14-facts ] || {
-    echo "usage: $0 --self-test | --lane14-facts ABSENT_ARTIFACTS_FILE" >&2
+discover_usage() {
+    echo "usage: $0 --self-test | [--jobs 1..16] --lane14-facts ABSENT_ARTIFACTS_FILE" >&2
     exit 2
 }
-LANE14_FACTS=$2
+DISCOVER_BUILD_JOBS=cargo-default
+LANE14_FACTS=
+DISCOVER_FACTS_SELECTED=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --jobs)
+            [ "$#" -ge 2 ] && [ "$DISCOVER_BUILD_JOBS" = cargo-default ] || discover_usage
+            case $2 in
+                [1-9]|1[0-6]) DISCOVER_BUILD_JOBS=$2 ;;
+                *) discover_usage ;;
+            esac
+            shift 2
+            ;;
+        --lane14-facts)
+            [ "$#" -ge 2 ] && [ "$DISCOVER_FACTS_SELECTED" -eq 0 ] || discover_usage
+            LANE14_FACTS=$2
+            DISCOVER_FACTS_SELECTED=1
+            shift 2
+            ;;
+        *) discover_usage ;;
+    esac
+done
+[ "$DISCOVER_FACTS_SELECTED" -eq 1 ] || discover_usage
 LANE14_ARTIFACTS=${LANE14_FACTS%/*}
 [ "${LANE14_FACTS##*/}" = discover.facts ] || exit 1
 [ "${LANE14_ARTIFACTS##*/}" = artifacts ] || exit 1
@@ -508,6 +530,7 @@ chmod 600 "$LANE14_FACTS"
 LANE14_FACTS_ID=$(stat -Lc %d:%i "$LANE14_FACTS")
 printf 'facts_identity\t%s\nstarted_utc\t%s\n' "$LANE14_FACTS_ID" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LANE14_FACTS"
+printf 'build_jobs\t%s\n' "$DISCOVER_BUILD_JOBS" >> "$LANE14_FACTS"
 # docker refuses a relative -v source, so the receipt mount must be absolute: a
 # supplied base is required to be absolute (the sibling gates' contract) and the
 # standalone default is rooted in a private 0700 directory on sticky /tmp rather
@@ -723,9 +746,15 @@ sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
 create_discover_network
 
 echo "=== glibc: build in $DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE, run in $DISCOVER_GLIBC_RUN_PLATFORM_IMAGE ==="
+set --
+if [ "$DISCOVER_BUILD_JOBS" != cargo-default ]; then
+    # Explicit values, rather than inherited host environment, cross into
+    # these two owned build containers. The runtime-only container needs none.
+    set -- -e "CARGO_BUILD_JOBS=$DISCOVER_BUILD_JOBS"
+fi
 GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
     --network "$NETWORK_ID" \
-    --platform linux/amd64 -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
+    --platform linux/amd64 "$@" -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
     "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE" sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
@@ -764,7 +793,7 @@ timeout --signal=TERM --kill-after=5s 300s docker start -a "$GLIBC_RUN_ID"
 echo "=== musl-dynamic: build + run in $DISCOVER_MUSL_PLATFORM_IMAGE ==="
 MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
     --network "$NETWORK_ID" \
-    --platform linux/amd64 -e ALPINE_MAIN_REPOSITORY="$ALPINE_MAIN_REPOSITORY" \
+    --platform linux/amd64 "$@" -e ALPINE_MAIN_REPOSITORY="$ALPINE_MAIN_REPOSITORY" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
     "$DISCOVER_MUSL_PLATFORM_IMAGE" sh -ec '
   # Base is Alpine 3.22 (apk v2), matching the pinned v3.22 repository.

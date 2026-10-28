@@ -591,13 +591,14 @@ receipt_finalize() {
 }
 
 receipt_release_usage() {
-    echo "usage: $0 [--capture-mode full|p0] ABSENT_EVIDENCE_ROOT | --self-test" >&2
+    echo "usage: $0 [--capture-mode full|p0] [--jobs 1..16] ABSENT_EVIDENCE_ROOT | --self-test" >&2
     exit 2
 }
 
 receipt_receipt_run() {
     RELEASE_CAPTURE_MODE=full
     RELEASE_CAPTURE_SELECTED=0
+    RELEASE_BUILD_JOBS=cargo-default
     while [ "$#" -gt 0 ]; do
         case $1 in
             --capture-mode)
@@ -609,13 +610,26 @@ receipt_receipt_run() {
                 RELEASE_CAPTURE_SELECTED=1
                 shift 2
                 ;;
+            --jobs)
+                [ "$#" -ge 2 ] && [ "$RELEASE_BUILD_JOBS" = cargo-default ] || receipt_release_usage
+                case $2 in
+                    [1-9]|1[0-6]) RELEASE_BUILD_JOBS=$2 ;;
+                    *) receipt_release_usage ;;
+                esac
+                shift 2
+                ;;
             --*) receipt_release_usage ;;
             *) break ;;
         esac
     done
     [ "$#" -eq 1 ] || receipt_release_usage
     if [ -z "${P11SCOPE_RECEIPT_SEALED-}" ]; then
-        if [ "$RELEASE_CAPTURE_SELECTED" -eq 1 ]; then
+        if [ "$RELEASE_BUILD_JOBS" != cargo-default ]; then
+            if [ "$RELEASE_CAPTURE_SELECTED" -eq 1 ]; then
+                set -- --capture-mode "$RELEASE_CAPTURE_MODE" "$@"
+            fi
+            receipt_seal_and_reexec --jobs "$RELEASE_BUILD_JOBS" "$@"
+        elif [ "$RELEASE_CAPTURE_SELECTED" -eq 1 ]; then
             receipt_seal_and_reexec --capture-mode "$RELEASE_CAPTURE_MODE" "$1"
         else
             receipt_seal_and_reexec "$1"
@@ -662,6 +676,7 @@ receipt_receipt_run() {
     receipt_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     receipt_fact argv "$P11SCOPE_RECEIPT_CALLER_ARGV0 $1"; receipt_fact cwd "$(pwd -P)"
     receipt_fact capture_mode "$RELEASE_CAPTURE_MODE"
+    receipt_fact build_jobs "$RELEASE_BUILD_JOBS"
     receipt_fact sealed_bin "$P11SCOPE_RECEIPT_SEALED_BIN"
     receipt_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_RECEIPT_SEALED_BIN")"
     receipt_fact sealed_environment "$(echo $RECEIPT_SEALED_ENVIRONMENT)"
@@ -709,7 +724,15 @@ receipt_receipt_run() {
     ATTACH_WORK=$WORK
     DISCOVER_BASE=$WORK
     DISCOVER_WORK="$DISCOVER_BASE/discover"
-    release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    if [ "$RELEASE_BUILD_JOBS" = cargo-default ]; then
+        release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    else
+        # Set the validated budget only for the build body and its children,
+        # including prepared builds and build.rs's nested BPF Cargo. Keep the
+        # receipt shell's exact sealed environment unchanged.
+        CARGO_BUILD_JOBS="$RELEASE_BUILD_JOBS" \
+            release_body > "$RECEIPT_ROOT/stdout.log" 2> "$RECEIPT_ROOT/stderr.log"
+    fi
     exec 8< "$RECEIPT_ROOT/artifacts/discover.facts"
     RECEIPT_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8) || exit 1
     [ "$RECEIPT_CHILD_FACTS_ID" = "$(awk -F '\t' '$1=="facts_identity"{print $2; exit}' /proc/$$/fd/8)" ] || exit 1
@@ -819,8 +842,12 @@ ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforce
 cp "$P11SCOPE_STATIC" "$DIST/p11scope"
 
 echo "=== p11scope-discover: dynamic glibc + dynamic musl builds ==="
+set --
+if [ "$RELEASE_BUILD_JOBS" != cargo-default ]; then
+    set -- --jobs "$RELEASE_BUILD_JOBS"
+fi
 P11SCOPE_RECEIPT_WORK="$DISCOVER_BASE" \
-    sh scripts/verify-discover-containers.sh \
+    sh scripts/verify-discover-containers.sh "$@" \
     --lane14-facts "$RECEIPT_ROOT/artifacts/discover.facts"
 GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
 MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover

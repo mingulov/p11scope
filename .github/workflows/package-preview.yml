@@ -1,0 +1,150 @@
+name: package-preview
+on:
+  workflow_dispatch:
+    inputs:
+      accepted_ci_run_id:
+        description: Completed successful ci.yml run on this exact commit (positive decimal ID)
+        type: string
+        required: true
+      capture_mode:
+        description: Official package modes to build
+        type: choice
+        options: [full, p0, both]
+        default: both
+      jobs:
+        description: Cargo build jobs (canonical integer 1 through 16)
+        type: string
+        default: '2'
+permissions:
+  contents: read
+  actions: read
+env:
+  CI_TOOL_BPF_LINKER: 0.10.4
+jobs:
+  validate:
+    runs-on: ubuntu-26.04
+    outputs:
+      sha: ${{ steps.accept.outputs.sha }}
+      tree: ${{ steps.accept.outputs.tree }}
+      jobs: ${{ steps.accept.outputs.jobs }}
+      matrix: ${{ steps.accept.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate accepted ordinary CI
+        id: accept
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+          ACCEPTED_CI_RUN_ID: ${{ inputs.accepted_ci_run_id }}
+          CAPTURE_MODE: ${{ inputs.capture_mode }}
+          BUILD_JOBS: ${{ inputs.jobs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          accepted=$(python3 -I scripts/check-package-preview-ci.py \
+            --repository "$EXPECTED_REPOSITORY" --sha "$EXPECTED_SHA" \
+            --accepted-ci-run-id "$ACCEPTED_CI_RUN_ID" \
+            --capture-mode "$CAPTURE_MODE" --jobs "$BUILD_JOBS")
+          printf '%s\n' "$accepted" >>"$GITHUB_OUTPUT"
+  package:
+    name: package-${{ matrix.mode }}
+    needs: validate
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    env:
+      EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+      EXPECTED_TREE: ${{ needs.validate.outputs.tree }}
+      CAPTURE_MODE: ${{ matrix.mode }}
+      BUILD_JOBS: ${{ needs.validate.outputs.jobs }}
+      PUBLIC_DIRECTORY: ${{ matrix.public }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify package checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked --jobs "$BUILD_JOBS"
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml softhsm2
+      - name: Install packaged bpftool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y linux-tools-generic
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
+          test -x "$bpftool_source"
+          sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
+          bpftool version
+          sudo bpftool version
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # These are the existing release-preview pins; no build or capture logs
+      # leave this runner. The official builder retains every final-byte gate.
+      - name: Download verified package tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/release-tools"
+          mkdir -m 700 "$tools"
+          curl -fsSL --retry 3 -o "$tools/cargo-about.tar.gz" \
+            https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af  $tools/cargo-about.tar.gz" | sha256sum --check
+          tar -xzf "$tools/cargo-about.tar.gz" -C "$tools" \
+            cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about
+          install -m 0755 "$tools/cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about" "$tools/cargo-about"
+          curl -fsSL --retry 3 -o "$tools/musl-1.2.5.tar.gz" \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  $tools/musl-1.2.5.tar.gz" | sha256sum --check
+      - name: Build and assemble public package
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          evidence="$RUNNER_TEMP/release-evidence"
+          mkdir -m 700 "$evidence"
+          TMPDIR="$evidence" scripts/build-release.sh \
+            --capture-mode "$CAPTURE_MODE" --jobs "$BUILD_JOBS" "$evidence/receipt"
+          python3 -I scripts/export-source.py --output "$evidence/source.tar.gz"
+          python3 -I scripts/release-notices.py \
+            --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
+            --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
+            --output "$evidence/notices"
+          python3 -I scripts/package-release.py \
+            --capture-mode "$CAPTURE_MODE" --receipt "$evidence/receipt" \
+            --notices "$evidence/notices" --source "$evidence/source.tar.gz" \
+            --output "$evidence/$PUBLIC_DIRECTORY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/release-evidence/${{ matrix.public }}/
+          if-no-files-found: error
+          retention-days: 30

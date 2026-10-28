@@ -195,7 +195,7 @@ class ReleaseSealFixture:
         shutil.copyfile(FIXTURES / "inert.sh", destination)
         destination.chmod(0o700)
 
-    def run_to_sudo_probe(self, extra_env=()):
+    def run_to_sudo_probe(self, extra_env=(), *, arguments=None):
         caller_path = ":".join((str(self.tripwire_bin), str(self.fake_bin), os.environ.get("PATH", ""),
                                 "/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin"))
         overrides = {"PATH": caller_path, "HOME": str(self.home), "TMPDIR": str(self.seal_parent)}
@@ -204,6 +204,7 @@ class ReleaseSealFixture:
         for name in BUILD_INPUT_VARIABLES:
             environment.pop(name, None)
         environment.update(overrides)
-        output = self.command(["/bin/sh", str(self.repo / "scripts/build-release.sh"), str(self.root)],
+        output = self.command(["/bin/sh", str(self.repo / "scripts/build-release.sh"),
+                               *(arguments if arguments is not None else [str(self.root)])],
                               environment=environment, overrides=overrides, removed=BUILD_INPUT_VARIABLES)
         return SealedDriverRun(self, output)

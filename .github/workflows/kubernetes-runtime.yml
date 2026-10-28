@@ -1,0 +1,227 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Kubernetes runtime
+
+# Artifact consumer only: no ordinary CI, release preview or Rust rebuild.
+# The shared download-runtime-observer.py prerequisite must be integrated
+# before activation. A missing or rejected FULL artifact fails preparation.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact full source SHA of the successful artifact producer
+        required: true
+        type: string
+      artifact_run_id:
+        description: Successful same-repository CI run with the matching FULL preview artifact
+        required: true
+        type: string
+      run_k2:
+        description: Also run the attach-pod exact, idle and late-provider cell on a separate VM
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # Official release inputs, checked 2026-10-29:
+  # https://github.com/kubernetes-sigs/kind/releases/tag/v0.33.0
+  # https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+  # https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl.sha256
+  # Same-minor client: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+  KIND_VERSION: "0.33.0"
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_VERSION: v1.37.0
+  KUBECTL_SHA256: 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
+  NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+
+jobs:
+  runtime:
+    name: Kubernetes ${{ matrix.cell }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.run_k2 && '{"include":[{"cell":"K1","timeout":45},{"cell":"K2","timeout":35}]}' || '{"include":[{"cell":"K1","timeout":45}]}') }}
+    env:
+      CELL: ${{ matrix.cell }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - name: Create private disk workspace
+        id: workspace
+        run: |
+          set -euo pipefail
+          umask 022
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          [[ -z "${KUBECONFIG:-}" ]]
+          [[ -z "${DOCKER_HOST:-}" ]]
+          [[ -z "${DOCKER_CONTEXT:-}" || "$DOCKER_CONTEXT" == default ]]
+          [[ -z "${DOCKER_DEFAULT_PLATFORM:-}" || "$DOCKER_DEFAULT_PLATFORM" == linux/amd64 ]]
+          runtime_root=$(mktemp -d "/var/tmp/p11scope-kubernetes-${CELL,,}-XXXXXX")
+          mkdir -m 0700 "$runtime_root/tmp" "$runtime_root/tools"
+          {
+            echo "RUNTIME_ROOT=$runtime_root"
+            echo "TMPDIR=$runtime_root/tmp"
+            echo "RUNTIME_TOKEN=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_ENV"
+      - name: Consume matching validated FULL static observer
+        id: observer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 022
+          observer=$(python3 -I scripts/download-runtime-observer.py \
+            --repository "$GITHUB_REPOSITORY" --run-id "$ARTIFACT_RUN_ID" \
+            --sha "$CANDIDATE_SHA" --output "$RUNTIME_ROOT/observer")
+          [[ "$observer" == "$RUNTIME_ROOT/observer/p11scope" ]]
+          [[ -f "$observer" && -x "$observer" && ! -L "$observer" ]]
+          [[ "$(realpath "$observer")" == "$observer" ]]
+          echo "P11SCOPE_K8S_OBSERVER_BIN=$observer" >> "$GITHUB_ENV"
+      - name: Install checksum verified pinned kind and kubectl
+        id: tools
+        run: |
+          set -euo pipefail
+          umask 022
+          python3 -I - <<'PY'
+          import os, tomllib
+          with open("mise.toml", "rb") as source:
+              assert tomllib.load(source)["tools"]["kind"] == os.environ["KIND_VERSION"]
+          PY
+          sudo -n apt-get update
+          sudo -n apt-get install -y ca-certificates curl jq python3 bpftool
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            "https://github.com/kubernetes-sigs/kind/releases/download/v$KIND_VERSION/kind-linux-amd64" \
+            --output "$RUNTIME_ROOT/tools/kind"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl" \
+            --output "$RUNTIME_ROOT/tools/kubectl"
+          printf '%s  %s\n' "$KIND_SHA256" "$RUNTIME_ROOT/tools/kind" \
+            "$KUBECTL_SHA256" "$RUNTIME_ROOT/tools/kubectl" | sha256sum --check --status
+          chmod 0755 "$RUNTIME_ROOT/tools/kind" "$RUNTIME_ROOT/tools/kubectl"
+          echo "$RUNTIME_ROOT/tools" >> "$GITHUB_PATH"
+      - name: Check host Docker and capture prerequisites
+        id: host
+        run: |
+          set -euo pipefail
+          umask 022
+          ulimit -n 65536
+          [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]
+          sudo -n true
+          test -r /sys/kernel/btf/vmlinux
+          test "$(stat -f -c '%T' /sys/fs/cgroup)" = cgroup2fs
+          test "$(stat -f -c '%T' "$TMPDIR")" != tmpfs
+          endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
+          [[ "$endpoint" == unix:///var/run/docker.sock || "$endpoint" == unix:///run/docker.sock ]]
+          docker version
+          docker info --format '{{json .}}' > "$RUNTIME_ROOT/docker-info.json"
+          python3 -I - "$RUNTIME_ROOT/docker-info.json" <<'PY'
+          import json, os, re, resource, sys
+          from pathlib import Path
+          info = json.load(open(sys.argv[1]))
+          assert info['OSType'] == 'linux' and info['Architecture'] == 'x86_64', 'Docker host architecture'
+          assert info['CgroupVersion'] == '2', 'Docker must expose cgroup v2'
+          assert isinstance(info['Driver'], str) and info['Driver'], 'Docker storage driver missing'
+          facts = Path('/proc/meminfo').read_bytes()
+          assert len(facts) <= 65536, 'meminfo exceeds bound'
+          rows = [row for row in facts.splitlines() if row.startswith(b'MemAvailable:')]
+          assert len(rows) == 1, 'one MemAvailable field required'
+          match = re.fullmatch(rb'MemAvailable:[ \t]+([0-9]{1,20})[ \t]+kB', rows[0])
+          assert match, 'malformed MemAvailable KiB field'
+          assert int(match[1]) * 1024 >= 1024**3, 'insufficient available runtime memory'
+          for path in (Path(os.environ['RUNTIME_ROOT']), Path(info['DockerRootDir'])):
+              fs = os.statvfs(path)
+              assert fs.f_bavail * fs.f_frsize >= 2 * 1024**3, 'insufficient runtime disk'
+          assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] >= 65536, 'nofile too low'
+          processes = resource.getrlimit(resource.RLIMIT_NPROC)
+          assert processes[0] == resource.RLIM_INFINITY or processes[0] >= 1024, 'process limit too low'
+          print("Docker image store:", info.get("Driver"), info.get("DriverStatus"))
+          # Retain the original transport; a store-specific load failure is a
+          # failed setup. Never restart/reconfigure the daemon or retry capture.
+          PY
+          {
+            uname -a
+            df -h "$RUNTIME_ROOT"
+            free -b
+            ulimit -a
+          } | tee "$RUNTIME_ROOT/host.txt"
+          if pgrep -x 'cargo|rustc' >/dev/null; then
+            echo "compiler still active before capture" >&2
+            exit 1
+          else
+            [[ "$?" == 1 ]]
+          fi
+      - name: Run original K1 or selected K2 with owned cleanup
+        id: capture
+        run: |
+          set -euo pipefail
+          umask 022
+          # One privileged lane for this VM, across doctor, setup, capture and
+          # cleanup. K1's intentional concurrent isolation captures stay intact.
+          flock -n "$RUNTIME_ROOT/privileged.lock" \
+            python3 -I scripts/kubernetes-runtime.py run --cell "$CELL" \
+            --observer "$P11SCOPE_K8S_OBSERVER_BIN" --node-image "$NODE_IMAGE" \
+            --work "$RUNTIME_ROOT/runtime" --token "$RUNTIME_TOKEN"
+      - name: Verify owned cleanup even after failure
+        id: cleanup
+        if: ${{ always() && steps.workspace.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 022
+          flock -n "$RUNTIME_ROOT/privileged.lock" \
+            python3 -I scripts/kubernetes-runtime.py cleanup --work "$RUNTIME_ROOT/runtime"
+      - name: Report cell result and retain bounded diagnostics
+        if: ${{ always() && steps.workspace.outcome == 'success' }}
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        run: |
+          set -euo pipefail
+          umask 022
+          python3 -I - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNTIME_ROOT"])
+          output = root / "diagnostics"
+          output.mkdir(mode=0o700, exist_ok=True)
+          paths = [root / "host.txt", root / "docker-info.json"]
+          runtime = root / "runtime"
+          paths += [runtime / name for name in ("runtime.log", "doctor.txt", "result.json")]
+          paths += [runtime / "cell" / name for name in ("summary.jsonl", "facts.log", "posture.txt")]
+          paths += sorted((runtime / "cell").glob("*.err"))[:16]
+          # Deliberately omit kubeconfigs, credentials and the downloaded binary.
+          for index, path in enumerate(paths):
+              if path.is_file() and not path.is_symlink():
+                  with path.open("rb") as source:
+                      source.seek(max(0, path.stat().st_size - 262144))
+                      (output / f"{index:02d}-{path.name}").write_bytes(source.read(262144))
+          result = json.loads((runtime / "result.json").read_text()) if (runtime / "result.json").is_file() else {}
+          verdict = "PASS" if (result.get("ok") is True and os.environ["CAPTURE_OUTCOME"] == "success"
+                               and os.environ["CLEANUP_OUTCOME"] == "success") else "FAIL / UNRUN"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Kubernetes {os.environ['CELL']}: **{verdict}**. Source `{os.environ['CANDIDATE_SHA']}`.\n\n")
+              summary.write("kind uses the runner's kernel in nested namespaces; this is deployment and runtime coverage. "
+                            "K1 retains exact counts and PID refusal; K2 retains exact/idle and disclosed late-provider legs. "
+                            "An unselected K2 supplies no positive.\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.workspace.outcome == 'success' }}
+        with:
+          name: kubernetes-${{ matrix.cell }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RUNTIME_ROOT }}/diagnostics/
+          if-no-files-found: error
+          retention-days: 3

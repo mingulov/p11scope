@@ -7075,6 +7075,32 @@ mod tests {
     }
 
     #[test]
+    fn n5_nonfinite_math_does_not_qualify_full_cell() {
+        // A valid finite input can still overflow the ratio when
+        // negative scheduling noise is divided by a tiny denominator.
+        let production = super::n5_production_ns(Some("1e-320")).expect("positive finite input");
+        let pct = super::n5_run_pct_production(-100.0, production).expect("ratio");
+        assert_eq!(pct, f64::NEG_INFINITY, "ratio overflows negatively");
+        let overflow = super::n5_verdict(&[-100.0; 5], &[pct; 5]);
+        assert!(!overflow.pass, "overflow cannot qualify full N5");
+
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let ratio = super::n5_verdict(&[200.0; 5], &[invalid; 5]);
+            assert!(!ratio.pass, "nonfinite percentage cannot qualify");
+            assert_eq!(super::n5_verdict_label(&ratio), "UNQUALIFIED");
+            let added = super::n5_verdict(&[invalid; 5], &[10.0; 5]);
+            assert!(!added.pass, "nonfinite added cost cannot qualify");
+            assert!(!added.absolute_pass, "nonfinite absolute cost cannot pass");
+            let diagnostic = super::n5_verdict_ns_only(&[invalid; 5]);
+            assert!(!diagnostic.absolute_pass, "invalid absolute diagnostic");
+        }
+
+        let noise = super::n5_verdict(&[-100.0; 5], &[-10.0; 5]);
+        assert!(noise.pass, "finite negative scheduling noise stays valid");
+        assert_eq!(super::n5_verdict_label(&noise), "PASS");
+    }
+
+    #[test]
     fn n5_verdict_ns_only_covers_the_added_gate() {
         let pass = super::n5_verdict_ns_only(&[200.0; 5]);
         assert!(pass.absolute_pass, "within the absolute budget passes");

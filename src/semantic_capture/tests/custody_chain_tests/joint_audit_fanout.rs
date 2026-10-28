@@ -8286,6 +8286,152 @@ fn joint_birth_first_refused_claim_blocks_later_same_key_original() {
     scene.assert_claims(&[]);
 }
 
+/// The staged retained-S1 birth disclosures, in stage order.
+fn staged_birth_refusals<Source: crate::discovery::caller_registry::ProcessSource>(
+    coordinator: &crate::discovery::engine::inventory_coordinator::InventoryCoordinator<Source>,
+) -> Vec<String> {
+    coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "Joint birth unavailable; retained S1")
+        .map(|(_, reason)| reason)
+        .collect()
+}
+
+/// A refused first claim keeps its incarnation S1 and names why: an
+/// observed New candidate is never dropped without a disclosure. Same
+/// shape as `joint_birth_first_refused_claim_blocks_later_same_key_original`.
+#[test]
+fn joint_birth_refused_claim_discloses_retained_s1() {
+    use crate::inventory_semantics::RetainedJointBirths;
+    let (mut scene, ingested, attached, _) =
+        prepared_birth_with_claim_predecessor(1, true, false, true);
+    let coordinator = &mut scene.real.scene.coordinator;
+    assert!(staged_birth_refusals(coordinator).is_empty());
+    let charged = coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    let claims = coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    let roles = coordinator.joint_capture().ledger().roles_for_test();
+    let mut births = RetainedJointBirths::new();
+    let result = coordinator
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a refused first claim cannot consume New"),
+        )
+        .unwrap();
+    assert_eq!(result.installed, 0);
+    assert!(births.as_slice().is_empty());
+    assert!(
+        coordinator
+            .registry()
+            .pending_joint_receipts_for_test()
+            .is_empty()
+    );
+    assert_eq!(
+        coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        charged,
+        "the temporary paid association is released before disclosure returns"
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        claims,
+        "refusal leaves the original successful sibling claim owned"
+    );
+    assert_eq!(coordinator.joint_capture().ledger().roles_for_test(), roles);
+    assert_eq!(
+        staged_birth_refusals(coordinator),
+        ["joint_birth_claim_ClaimsExhausted"],
+        "the refused claim is disclosed exactly once"
+    );
+    let repeated = coordinator
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a repeated decision cannot consume New"),
+        )
+        .unwrap();
+    assert_eq!(repeated.installed, 0);
+    assert_eq!(
+        staged_birth_refusals(coordinator),
+        ["joint_birth_claim_ClaimsExhausted"],
+        "births_decided prevents a duplicate disclosure"
+    );
+    assert_eq!(
+        coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes,
+        charged
+    );
+    coordinator.dispose_prepared_claims_s1();
+    while coordinator.stage_next_prepared_admission() {}
+    assert!(coordinator.finish_prepared_semantic_batch(&scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
+        .unwrap();
+    assert_eq!(coordinator.registry().joint_feeds(), 0);
+    assert_eq!(
+        coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.api_returns)
+            .collect::<Vec<_>>(),
+        [Some(2)],
+        "both original calls retain their S1 API counts"
+    );
+    assert_eq!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+            .map(|gap| gap.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["joint_birth_claim_ClaimsExhausted"],
+        "the disclosure publishes with the S1 facts"
+    );
+    scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .io
+        .script
+        .fault_cell
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let fault = DisposedNativeFault(scene.real.h0.clone());
+    let mut frame = coordinator
+        .audit_ingested_quantum(ingested, &scene.producers, &attached, &fault)
+        .unwrap_or_else(|(_, reason)| panic!("original disclosed fault: {reason:?}"));
+    let mut ports = coordinator.joint_frame_ports(&scene.producers).unwrap();
+    frame.bind_targets(&ports).unwrap();
+    frame
+        .finish_frame(&mut ports)
+        .unwrap_or_else(|(_, reason)| {
+            panic!("actual negative finishes both originals: {reason:?}")
+        });
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test()[..4],
+        [0, 0, 0, 0]
+    );
+    scene.assert_claims(&[]);
+}
+
 #[test]
 fn joint_birth_install_refuses_same_quantum_sibling_witness() {
     use crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal;
@@ -8625,6 +8771,101 @@ fn joint_birth_full_registration_table_refuses_before_new() {
             .count(),
         2
     );
+}
+
+/// A full registration table keeps the newcomer S1 and names why. Same
+/// shape as `joint_birth_full_registration_table_refuses_before_new`.
+#[test]
+fn joint_birth_full_registration_table_discloses_retained_s1() {
+    use crate::inventory_semantics::RetainedJointBirths;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .reference_instance_limit(2);
+    let child = OwnedStoppedChild::new();
+    let pid = child.id();
+    let caller = fixture.scene.real.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 73,
+            exec_id: 0,
+        },
+        0,
+    );
+    fixture.scene.push(pid, 0, "C_CreateObject", 1);
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture.scene.admit_providers(pid, caller, &[0]);
+    fixture.scene.prepare_batch(batch, 1);
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original C input: {reason:?}"));
+    while coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    assert!(staged_birth_refusals(coordinator).is_empty());
+    let mut births = RetainedJointBirths::new();
+    let result = coordinator
+        .prepare_joint_births(
+            &ingested,
+            &fixture.scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a full registration table refuses before New"),
+        )
+        .unwrap();
+    assert_eq!(result.installed, 0);
+    assert_eq!(
+        staged_birth_refusals(coordinator),
+        ["joint_birth_registration_Capacity"],
+        "the refused registration is disclosed exactly once"
+    );
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    assert_eq!(coordinator.registry().joint_feeds(), 2);
+    let mut frame = coordinator
+        .audit_ingested_quantum(
+            ingested,
+            &fixture.scene.producers,
+            &fixture.attached,
+            &BirthFault,
+        )
+        .unwrap_or_else(|(_, reason)| {
+            panic!("capacity negative remains with the original audit: {reason:?}")
+        });
+    {
+        let ports = coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    fixture.finish_bounded_batch(frame, false);
 }
 
 #[test]

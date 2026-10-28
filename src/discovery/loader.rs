@@ -10,7 +10,15 @@ use p11scope_manifest::maps::MapEntry;
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::process::ProcessViewId;
 
+use super::loader_lifetime::LoaderToken;
+
 pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
+/// Generation pinned by the pre-reuse token adapter: production allocation
+/// issues each context exactly once and never recycles storage, so every
+/// allocated context is its slot's first incarnation.
+// Staged until reuse activation wires the adapter; only tests use it now.
+#[allow(dead_code)]
+pub(crate) const LOADER_ADAPTER_GENERATION: u32 = 1;
 const MIN_STATE_DELTA: i64 = -(1_i64 << 54);
 const MAX_STATE_DELTA: i64 = (1_i64 << 54) - 1;
 
@@ -389,6 +397,31 @@ impl LoaderRegistry {
     }
 }
 
+// Staged pre-reuse token adapter: converts identities only, never delegates
+// to the generation registry. Reuse activation wires it; until then only
+// tests resolve through it.
+#[allow(dead_code)]
+impl LoaderRegistry {
+    /// Token view of one allocated context. Generation is fixed at
+    /// [`LOADER_ADAPTER_GENERATION`]; never-allocated and removed ids refuse
+    /// without touching the registry.
+    pub(crate) fn token_for(&self, id: LoaderContextId) -> Option<LoaderToken> {
+        self.context(id)?;
+        LoaderToken::new(LOADER_ADAPTER_GENERATION, (id.get() - 1) as u8)
+    }
+
+    /// Context view of one adapter token. Only generation-1 tokens for
+    /// allocated storage resolve; every other token refuses.
+    pub(crate) fn id_for_token(&self, token: LoaderToken) -> Option<LoaderContextId> {
+        if token.generation() != LOADER_ADAPTER_GENERATION {
+            return None;
+        }
+        let id = LoaderContextId::from_case_id(token.slot());
+        self.context(id)?;
+        Some(id)
+    }
+}
+
 fn expected_hook_ip(mapping: &MapEntry, hook_file_offset: u64) -> Result<u64, String> {
     if mapping.permissions[2] != b'x' || mapping.inode == 0 {
         return Err("loader hook mapping is not a file-backed executable mapping".into());
@@ -643,5 +676,38 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn loader_registry_token_adapter_resolves_generation_one_and_refuses_the_rest() {
+        let mut registry = LoaderRegistry::default();
+        let unallocated = LoaderContextId::from_case_id(0);
+        assert_eq!(registry.token_for(unallocated), None);
+        assert_eq!(registry.id_for_token(LoaderToken::new(1, 0).unwrap()), None);
+
+        let id = prepare(&mut registry, spec(None));
+        let token = registry
+            .token_for(id)
+            .expect("allocated context has a token");
+        assert_eq!(token.generation(), LOADER_ADAPTER_GENERATION);
+        assert_eq!(token.slot(), 0);
+        assert_eq!(token.bits(), 0x100);
+        assert_eq!(registry.id_for_token(token), Some(id));
+
+        // Prepared, attached and tombstoned storage all resolve; only the
+        // generation and the allocation are checked.
+        registry.mark_attached(id).unwrap();
+        assert_eq!(registry.token_for(id), Some(token));
+        registry.tombstone(id).unwrap();
+        assert_eq!(registry.id_for_token(token), Some(id));
+
+        // Any other generation refuses, even for the allocated slot.
+        assert_eq!(registry.id_for_token(LoaderToken::new(2, 0).unwrap()), None);
+        // Generation-1 tokens past the allocation refuse.
+        assert_eq!(registry.id_for_token(LoaderToken::new(1, 5).unwrap()), None);
+        // Removed storage loses its token.
+        registry.remove(id).unwrap();
+        assert_eq!(registry.token_for(id), None);
+        assert_eq!(registry.id_for_token(token), None);
     }
 }

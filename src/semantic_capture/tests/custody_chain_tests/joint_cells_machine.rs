@@ -1433,3 +1433,105 @@ fn joint_machine_followup_collects_row_landed_after_idle_poll() {
         "q2 publishes exactly one more revision"
     );
 }
+
+/// One bare CALL row on `file` (an ordinary record without a journal
+/// BEGIN/END).
+fn push_bare_call_on(scene: &mut MachineScene, pid: u32, file: u32, name: &str, seq: u64) {
+    use p11scope_ebpf_common::object_journal::JournalRecord;
+    let descriptors = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+    let (_, end) = scene.scene.encoded(pid, file, name, seq);
+    let payload =
+        match p11scope_ebpf_common::object_journal::decode_journal_record(&end, &descriptors) {
+            Some(JournalRecord::End(end)) => end.payload_base(),
+            other => panic!("the shaped END decodes: {other:?}"),
+        };
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(crate::events::record_bytes(&payload));
+}
+
+/// Two observed births in one batch, one refused natively (its only call
+/// is the fixture's unmarked `C_GetSessionInfo`). Every New candidate
+/// installs a Joint feed or names its refusal: disclosing one refusal must
+/// not cost the sibling its birth. Both orders run, because the births
+/// are decided in descending receipt order and only a disclosure that
+/// precedes the sibling's reservation can disturb it. The refused
+/// provider makes no journaled call: the image-scoped fallback caused by
+/// journaled S1Only calls belongs to the separate F2 regression. This
+/// fixture isolates the sibling's birth decision.
+fn two_births_one_refused(refused_file: u32) {
+    let mut scene = MachineScene::with_initial_files(2, &[0, 1], true);
+    let pid = std::process::id();
+    let mut seq = 1u64;
+    for file in 0..2u32 {
+        if file == refused_file {
+            // Proved irrelevant: an ordinary row, never a journal entry.
+            push_bare_call_on(&mut scene, pid, file, "C_GetSessionInfo", seq);
+            seq += 1;
+            continue;
+        }
+        for name in ["C_SignInit", "C_SignInit"] {
+            scene.scene.push(pid, file, name, seq);
+            seq += 1;
+        }
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("two-births-one-refused", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let refusals: Vec<&str> = registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.as_str())
+        .collect();
+    assert_eq!(
+        scene.native.birth_outcomes.len(),
+        2,
+        "both New candidates reach native observation: {:?} refusals {refusals:?}",
+        scene.native.birth_outcomes
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "only the refused birth is disclosed: {refusals:?}"
+    );
+    assert!(
+        refusals[0].starts_with("joint_birth_native_"),
+        "the refusal names its native cause: {refusals:?}"
+    );
+    assert_eq!(
+        registry.joint_feeds(),
+        1,
+        "the sibling's birth installs its Joint feed"
+    );
+    // (Joint, API returns, reduced) per edge: the refused provider made
+    // one call, the sibling two, so the Joint edge names the sibling.
+    let mut edges: Vec<(bool, Option<u64>, u64)> = registry
+        .instance_semantic_edges()
+        .map(|record| {
+            (
+                record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
+                record.api_returns,
+                record.feed.reduced(),
+            )
+        })
+        .collect();
+    edges.sort();
+    assert_eq!(
+        edges,
+        [(false, Some(1), 0), (true, Some(2), 2)],
+        "the refused provider stays S1Only; the sibling is Joint and reduces both calls"
+    );
+}
+
+#[test]
+fn joint_machine_refused_first_file_birth_keeps_sibling_joint() {
+    two_births_one_refused(0);
+}
+
+#[test]
+fn joint_machine_refused_second_file_birth_keeps_sibling_joint() {
+    two_births_one_refused(1);
+}

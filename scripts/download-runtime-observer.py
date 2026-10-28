@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Consume one successful same-source FULL release-preview; never build.
+"""Consume one completed same-source FULL package producer; never build.
 
 Print only the absolute staged observer path on stdout. The caller owns the
 private output parent. This consumes the existing public package format; it
@@ -29,6 +29,12 @@ SPEC = importlib.util.spec_from_file_location("package_release", ROOT / "scripts
 PACKAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGE)
 ARTIFACT = "release-preview-public-assets"
+CI_WORKFLOW = ".github/workflows/ci.yml"
+PACKAGE_WORKFLOW = ".github/workflows/package-preview.yml"
+PACKAGE_GATES = {
+    "validate": ("Validate accepted ordinary CI",),
+    "package-full": ("Verify package checkout", "Build and assemble public package"),
+}
 MAX_ARCHIVE = 512 * 1024 * 1024
 MAX_FILE = 256 * 1024 * 1024
 
@@ -46,41 +52,85 @@ def api(endpoint):
     result = subprocess.run(["gh", "api", endpoint], check=True, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=60)
     require(len(result.stdout) <= 4 * 1024 * 1024, "API response exceeds bound")
-    return PACKAGE.parse_json(result.stdout)
+    value = PACKAGE.parse_json(result.stdout)
+    require(isinstance(value, dict), "API response must be an object")
+    return value
 
 
 def complete_list(document, key):
     rows = document.get(key)
     require(isinstance(rows, list) and type(document.get("total_count")) is int
-            and len(rows) == document["total_count"] <= 100,
+            and len(rows) == document["total_count"] <= 100
+            and all(isinstance(row, dict) for row in rows),
             "incomplete or excessive " + key + " listing")
     return rows
 
 
-def select_artifact(repository, run_id, sha):
-    prefix = f"repos/{repository}/actions"
-    run = api(f"{prefix}/runs/{run_id}")
-    require(run.get("id") == run_id and run.get("head_sha") == sha,
+def check_run(run, repository, run_id, sha, tree, workflow):
+    require(positive(run.get("id")) and run["id"] == run_id and run.get("head_sha") == sha,
             "preview run ID/source mismatch")
-    require(run.get("path") == ".github/workflows/ci.yml"
-            and run.get("event") == "workflow_dispatch"
-            and run.get("status") == "completed" and run.get("conclusion") == "success",
-            "successful completed CI preview dispatch required")
+    path = workflow["path"]
+    require(run.get("path") == path and positive(run.get("workflow_id"))
+            and run["workflow_id"] == workflow["id"], "preview workflow identity mismatch")
+    conclusions = ("success", "failure") if path == PACKAGE_WORKFLOW else ("success",)
+    require(run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
+            and run.get("conclusion") in conclusions, "completed eligible preview dispatch required")
     repo, head_repo = run.get("repository", {}), run.get("head_repository", {})
-    require(repo.get("full_name") == repository and positive(repo.get("id"))
+    require(isinstance(repo, dict) and isinstance(head_repo, dict)
+            and repo.get("full_name") == repository and positive(repo.get("id"))
             and head_repo.get("full_name") == repository and head_repo.get("id") == repo["id"],
             "same-repository preview required")
+    commit = run.get("head_commit")
+    require(isinstance(commit, dict) and commit.get("id") == sha and commit.get("tree_id") == tree,
+            "preview commit/tree mismatch")
     attempt = run.get("run_attempt")
     require(positive(attempt), "preview attempt missing")
+    return attempt
+
+
+def package_gate(job, required_steps):
+    # Reuse the accepted producer's execution/timestamp/step-shape contract;
+    # its successful validate step binds ordinary and coverage CI to this SHA.
+    spec = importlib.util.spec_from_file_location("package_preview_ci", ROOT / "scripts/check-package-preview-ci.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    checker.check_gate(job)
+    for name in required_steps:
+        steps = [step for step in job["steps"] if step["name"] == name]
+        require(len(steps) == 1 and steps[0]["conclusion"] == "success",
+                "package producer gate step did not run: " + name)
+
+
+def select_artifact(repository, run_id, sha, tree):
+    prefix = f"repos/{repository}/actions"
+    run = api(f"{prefix}/runs/{run_id}")
+    path = run.get("path")
+    require(path in (CI_WORKFLOW, PACKAGE_WORKFLOW), "unrecognized package producer workflow")
+    workflow = api(f"{prefix}/workflows/{path.rsplit('/', 1)[1]}")
+    require(positive(workflow.get("id")) and workflow.get("path") == path,
+            "invalid package producer workflow identity")
+    attempt = check_run(run, repository, run_id, sha, tree, workflow)
     jobs = complete_list(api(f"{prefix}/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"), "jobs")
-    preview = [job for job in jobs if job.get("name") == "release-preview"]
-    require(len(preview) == 1, "one exact release-preview job required")
-    job = preview[0]
-    # The endpoint binds the attempt. GitHub's documented job response may
-    # omit run_attempt; when supplied it must agree with that endpoint.
-    require(job.get("run_id") == run_id and job.get("head_sha") == sha
-            and job.get("run_attempt", attempt) == attempt and job.get("status") == "completed"
-            and job.get("conclusion") == "success", "matching successful preview job required")
+    by_name, identifiers = {}, set()
+    for job in jobs:
+        name, identifier = job.get("name"), job.get("id")
+        require(isinstance(name, str) and name and name not in by_name
+                and positive(identifier) and identifier not in identifiers, "duplicate/invalid preview job")
+        # The endpoint binds the attempt. A missing optional run_attempt is
+        # accepted, while a supplied contradiction (including bool) refuses.
+        job_attempt = job.get("run_attempt", attempt)
+        require(positive(job.get("run_id")) and job["run_id"] == run_id and job.get("head_sha") == sha
+                and positive(job_attempt) and job_attempt == attempt, "stale preview job identity")
+        by_name[name] = job
+        identifiers.add(identifier)
+    required = tuple(PACKAGE_GATES) if path == PACKAGE_WORKFLOW else ("release-preview",)
+    require(set(required) <= by_name.keys(), "required successful preview jobs missing")
+    for name in required:
+        job = by_name[name]
+        require(job.get("status") == "completed" and job.get("conclusion") == "success",
+                "matching successful preview job required: " + name)
+        if path == PACKAGE_WORKFLOW:
+            package_gate(job, PACKAGE_GATES[name])
     artifacts = complete_list(api(f"{prefix}/runs/{run_id}/artifacts?per_page=100"), "artifacts")
     matches = [item for item in artifacts if item.get("name") == ARTIFACT]
     require(len(matches) == 1, "one exact FULL public artifact required")
@@ -88,14 +138,14 @@ def select_artifact(repository, run_id, sha):
     require(positive(artifact.get("id")) and artifact.get("expired") is False,
             "artifact missing, invalid or expired")
     binding = artifact.get("workflow_run", {})
-    require(binding.get("id") == run_id and binding.get("head_sha") == sha
-            and binding.get("repository_id") == repo["id"]
-            and binding.get("head_repository_id") == repo["id"], "artifact run/source mismatch")
+    require(isinstance(binding, dict) and binding.get("id") == run_id and binding.get("head_sha") == sha
+            and binding.get("repository_id") == run["repository"]["id"]
+            and binding.get("head_repository_id") == run["repository"]["id"], "artifact run/source mismatch")
     require(positive(artifact.get("size_in_bytes")) and artifact["size_in_bytes"] <= MAX_ARCHIVE,
             "artifact archive size exceeds bound")
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", "")) is not None,
             "artifact archive digest missing")
-    return artifact
+    return artifact, run, workflow
 
 
 def static_elf(data):
@@ -156,7 +206,8 @@ def public_observer(path, sha, tree, version, rust, bpf_rust):
             "public package checksum mismatch")
     release_bytes = files["RELEASE.json"]
     release = PACKAGE.parse_json(release_bytes)
-    require(release.get("schema_version") == 1 and release.get("head") == sha
+    require(isinstance(release, dict), "RELEASE must be an object")
+    require(type(release.get("schema_version")) is int and release["schema_version"] == 1 and release.get("head") == sha
             and release.get("tree") == tree and release.get("version") == version,
             "RELEASE source/tree/version mismatch")
     require(release.get("p11scope_features") == list(PACKAGE.OFFICIAL_P11SCOPE_FEATURES["full"])
@@ -164,7 +215,7 @@ def public_observer(path, sha, tree, version, rust, bpf_rust):
             and release.get("rust") == rust and release.get("bpf_rust") == bpf_rust,
             "RELEASE must name successful default FULL and pinned compilers")
     hashes = release.get("artifacts", {})
-    require(set(hashes) == set(PACKAGE.ARTIFACTS)
+    require(isinstance(hashes, dict) and set(hashes) == set(PACKAGE.ARTIFACTS)
             and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                     for value in hashes.values()), "RELEASE binary hashes missing")
     seen, selected = set(), {}
@@ -191,7 +242,7 @@ def public_observer(path, sha, tree, version, rust, bpf_rust):
 
 
 def download(args):
-    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository) is not None,
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.{1,2}$)[A-Za-z0-9_.-]+", args.repository) is not None,
             "invalid repository")
     require(re.fullmatch(r"[0-9a-f]{40}", args.sha) is not None and args.run_id > 0,
             "explicit source SHA and positive run ID required")
@@ -207,7 +258,7 @@ def download(args):
             and parent.stat().st_uid == os.getuid() and parent.stat().st_mode & 0o077 == 0,
             "absolute output with private owned canonical parent required")
     require(not output.exists() and not output.is_symlink(), "output already exists")
-    artifact = select_artifact(args.repository, args.run_id, args.sha)
+    artifact, run, workflow = select_artifact(args.repository, args.run_id, args.sha, tree)
     with tempfile.TemporaryDirectory(prefix="runtime-artifact-", dir=parent) as temporary:
         path = Path(temporary) / "artifact.zip"
         with path.open("xb") as stream:
@@ -217,6 +268,14 @@ def download(args):
         require(PACKAGE.digest(path.read_bytes()) == artifact["digest"].removeprefix("sha256:"),
                 "downloaded artifact digest mismatch")
         binary, release = public_observer(path, args.sha, tree, version, rust, bpf_rust)
+        final_run = api(f"repos/{args.repository}/actions/runs/{args.run_id}")
+        require(check_run(final_run, args.repository, args.run_id, args.sha, tree, workflow) == run["run_attempt"]
+                and final_run["conclusion"] == run["conclusion"]
+                and final_run["repository"]["id"] == run["repository"]["id"],
+                "preview run changed while validating")
+        require(PACKAGE.git(ROOT, "rev-parse", "HEAD").decode().strip() == args.sha
+                and PACKAGE.git(ROOT, "rev-parse", "HEAD^{tree}").decode().strip() == tree,
+                "checkout source changed while validating")
         output.mkdir(mode=0o700)
         try:
             (output / "p11scope").write_bytes(binary)

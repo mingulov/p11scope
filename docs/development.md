@@ -90,13 +90,21 @@ Historical 5.15/6.1 results retain their original outcomes.
 
 [Docker runtime](../.github/workflows/docker-runtime.yml) runs the existing
 minimum container capture directly on an `ubuntu-26.04` hosted VM, using its
-local Docker daemon. Supply `preview_run_id` from a completed, successful
-same-repository CI release-preview run at the exact SHA selected for dispatch.
-The workflow fails if that input is absent, expired, mismatched or P0. It
-validates the existing FULL public package, source/tree, compiler pins,
-checksums and static x86-64 observer before executing it. It neither starts
-a preview nor builds a replacement observer. This public package consumer
-does not provide default/WIDE libtest fanout artifacts.
+local Docker daemon. Supply `preview_run_id` for this exact source SHA from
+either a successful same-repository CI release-preview or a completed
+[package-preview](../.github/workflows/package-preview.yml) run. The latter
+requires successful `validate` and `package-full` jobs with their real gate
+steps in the selected attempt; an independently failed or absent P0 job does
+not invalidate FULL. Package-preview's validation already binds successful
+ordinary and coverage CI to that source. The consumer never guesses another
+covering CI run, and the CI release-preview route still requires overall success.
+
+The consumer verifies the recognized workflow identity, source/tree, attempt,
+FULL public package, compiler pins, checksums and static x86-64 observer. It
+rechecks the run's source, attempt and terminal state after package validation,
+before creating executable output. Absent, expired, mismatched or P0 artifacts
+fail. It neither starts a preview nor builds a replacement observer. This
+public package consumer does not provide default/WIDE libtest fanout artifacts.
 
 The job holds one owned privileged lane, uses private disk work directories,
 and checks actual Docker/cgroup/storage, BTF, resources, functional Multi,

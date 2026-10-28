@@ -64,10 +64,14 @@ class DownloadTests(unittest.TestCase):
                                       "p11scope-discover-glibc": "2" * 64,
                                       "p11scope-discover-musl": "3" * 64}}
         repository = {"id": 10, "full_name": REPO}
-        self.run = {"id": 12, "run_attempt": 1, "path": ".github/workflows/ci.yml",
+        self.run = {"id": 12, "run_attempt": 1, "workflow_id": 71, "path": ".github/workflows/ci.yml",
                     "head_sha": HEAD, "event": "workflow_dispatch", "status": "completed",
                     "conclusion": "success", "repository": repository,
-                    "head_repository": copy.deepcopy(repository)}
+                    "head_repository": copy.deepcopy(repository),
+                    "head_commit": {"id": HEAD, "tree_id": TREE}}
+        self.run_after = None
+        self.workflows = {"ci": {"id": 71, "path": ".github/workflows/ci.yml"},
+                          "package-preview": {"id": 72, "path": ".github/workflows/package-preview.yml"}}
         self.jobs = {"total_count": 2, "jobs": [
             {"id": 21, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
              "name": "release-preview", "status": "completed", "conclusion": "success"},
@@ -80,6 +84,7 @@ class DownloadTests(unittest.TestCase):
         self.extra_zip = {}
         self.artifacts = [self.artifact]
         self.transport_tamper = False
+        self.artifact_overrides = {}
         self.bad_checksum = False
         self.archive_release = None
         gh = self.tools / "gh"
@@ -95,13 +100,22 @@ if args[:1] != ["api"]:
 endpoint = args[1]
 mapping = {
     "repos/mingulov/p11scope/actions/runs/12": "run.json",
+    "repos/mingulov/p11scope/actions/workflows/ci.yml": "ci.json",
+    "repos/mingulov/p11scope/actions/workflows/package-preview.yml": "package-preview.json",
     "repos/mingulov/p11scope/actions/runs/12/attempts/1/jobs?per_page=100": "jobs.json",
     "repos/mingulov/p11scope/actions/runs/12/artifacts?per_page=100": "artifacts.json",
     "repos/mingulov/p11scope/actions/artifacts/31/zip": "artifact.zip",
 }
 if endpoint not in mapping:
     sys.exit(91)
-sys.stdout.buffer.write((base / mapping[endpoint]).read_bytes())
+name = mapping[endpoint]
+if name == "run.json":
+    counter = base / "run-reads"
+    count = int(counter.read_text())
+    counter.write_text(str(count + 1))
+    if count and (base / "run-after.json").exists():
+        name = "run-after.json"
+sys.stdout.buffer.write((base / name).read_bytes())
 ''')
         gh.chmod(0o755)
 
@@ -135,11 +149,21 @@ sys.stdout.buffer.write((base / mapping[endpoint]).read_bytes())
                 zipped.writestr(name, data)
         raw = (self.base / "artifact.zip").read_bytes()
         self.artifact.update(size_in_bytes=len(raw), digest="sha256:" + digest(raw))
+        self.artifact.update(self.artifact_overrides)
         if self.transport_tamper:
             (self.base / "artifact.zip").write_bytes(raw[:-1] + b"!")
         for name, data in (("run", self.run), ("jobs", self.jobs),
                            ("artifacts", {"total_count": len(self.artifacts), "artifacts": self.artifacts})):
             (self.base / (name + ".json")).write_text(json.dumps(data))
+        for name, data in self.workflows.items():
+            (self.base / (name + ".json")).write_text(json.dumps(data))
+        (self.base / "run-reads").write_text("0")
+        (self.base / "calls").unlink(missing_ok=True)
+        after = self.base / "run-after.json"
+        if self.run_after is not None:
+            after.write_text(json.dumps(self.run_after))
+        else:
+            after.unlink(missing_ok=True)
 
     def invoke(self, *extra):
         self.prepare()
@@ -156,13 +180,195 @@ sys.stdout.buffer.write((base / mapping[endpoint]).read_bytes())
         self.assertFalse(self.output.exists(), "refused input left executable output")
         return result
 
-    def test_exact_successful_full_artifact_stages_only_matching_static_observer(self):
+    def accepted(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str(self.output / "p11scope"))
         self.assertEqual((self.output / "p11scope").read_bytes(), self.binary)
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o700)
         self.assertTrue(os.access(self.output / "p11scope", os.X_OK))
+        return result
+
+    def package_preview(self, *, conclusion="success", p0="success"):
+        self.run.update(workflow_id=72, path=".github/workflows/package-preview.yml", conclusion=conclusion)
+        self.jobs = {"total_count": 2, "jobs": []}
+        for identifier, name, gates in (
+            (21, "validate", ("Validate accepted ordinary CI",)),
+            (22, "package-full", ("Verify package checkout", "Build and assemble public package")),
+        ):
+            self.jobs["jobs"].append({
+                "id": identifier, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+                "name": name, "status": "completed", "conclusion": "success",
+                "started_at": "2026-10-28T10:00:00Z", "completed_at": "2026-10-28T10:02:00Z",
+                "steps": [
+                    {"name": step, "number": number, "status": "completed", "conclusion": "success"}
+                    for number, step in enumerate(("Set up job", *gates, "Complete job"), 1)
+                ],
+            })
+        if p0 is not None:
+            self.jobs["jobs"].append({"id": 23, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+                                        "name": "package-p0", "status": "completed", "conclusion": p0})
+            self.jobs["total_count"] += 1
+
+    def test_exact_successful_full_artifact_stages_only_matching_static_observer(self):
+        self.accepted()
+
+    def test_successful_package_full_is_accepted_independently_of_failed_p0(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        self.accepted()
+        calls = [json.loads(row) for row in (self.base / "calls").read_text().splitlines()]
+        self.assertEqual([call[1] for call in calls], [
+            "repos/mingulov/p11scope/actions/runs/12",
+            "repos/mingulov/p11scope/actions/workflows/package-preview.yml",
+            "repos/mingulov/p11scope/actions/runs/12/attempts/1/jobs?per_page=100",
+            "repos/mingulov/p11scope/actions/runs/12/artifacts?per_page=100",
+            "repos/mingulov/p11scope/actions/artifacts/31/zip",
+            "repos/mingulov/p11scope/actions/runs/12",
+        ], "package admission must retain its successful validate gate, without searching older CI")
+
+    def test_successful_package_full_with_missing_p0_is_accepted(self):
+        self.package_preview(p0=None)
+        self.accepted()
+
+    def test_successful_package_full_and_p0_are_accepted(self):
+        self.package_preview()
+        self.accepted()
+
+    def test_canonical_repository_rejects_path_segments_before_api_calls(self):
+        for repository in ("../p11scope", "mingulov/..", "mingulov/.", "mingulov/repo/extra", ".owner/repo"):
+            with self.subTest(repository=repository):
+                result = self.invoke("--repository", repository)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.base / "calls").exists(), "invalid repository reached API")
+                self.assertFalse(self.output.exists())
+
+    def test_boolean_release_schema_version_is_not_version_one(self):
+        self.release["schema_version"] = True
+        self.refused()
+
+    def test_run_rerun_or_source_race_refuses_after_validation_without_output(self):
+        for key, value in (("run_attempt", 2), ("head_sha", "f" * 40),
+                           ("status", "in_progress"), ("conclusion", "cancelled")):
+            with self.subTest(key=key):
+                self.run_after = copy.deepcopy(self.run)
+                self.run_after[key] = value
+                self.refused()
+                calls = [json.loads(row) for row in (self.base / "calls").read_text().splitlines()]
+                self.assertIn(["api", "repos/mingulov/p11scope/actions/artifacts/31/zip"], calls)
+
+    def test_package_workflow_repository_commit_tree_and_terminal_identity_are_required(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        baseline = copy.deepcopy(self.run)
+        for mutation in (
+            {"workflow_id": 71}, {"path": ".github/workflows/other.yml"},
+            {"event": "push"}, {"status": "in_progress"}, {"status": "queued"},
+            {"conclusion": "cancelled"}, {"conclusion": "timed_out"},
+            {"repository": {"id": 10, "full_name": "elsewhere/p11scope"}},
+            {"head_repository": {"id": 99, "full_name": REPO}},
+            {"head_sha": "a" * 40}, {"head_commit": {"id": HEAD, "tree_id": "b" * 40}},
+            {"head_commit": None}, {"run_attempt": True}, {"run_attempt": "1"},
+        ):
+            with self.subTest(mutation=mutation):
+                self.run = baseline | mutation
+                self.refused()
+                self.assertNotIn("/zip", (self.base / "calls").read_text())
+        self.run = baseline
+        self.workflows["package-preview"]["id"] = 99
+        self.refused()
+        self.workflows["package-preview"] = {"id": 72, "path": ".github/workflows/other.yml"}
+        self.refused()
+
+    def test_package_validate_and_full_must_run_their_real_gates(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        baseline = copy.deepcopy(self.jobs)
+        for index in (0, 1):
+            for change in ("missing", "failure", "skipped", "running", "no-steps", "setup-only",
+                           "checkout-only", "skipped-gate", "wrong-run", "wrong-sha", "wrong-attempt", "bool-attempt"):
+                with self.subTest(job=index, change=change):
+                    self.jobs = copy.deepcopy(baseline)
+                    job = self.jobs["jobs"][index]
+                    if change == "missing":
+                        self.jobs["jobs"].pop(index)
+                        self.jobs["total_count"] -= 1
+                    elif change in ("failure", "skipped"):
+                        job["conclusion"] = change
+                    elif change == "running":
+                        job["status"] = "in_progress"
+                    elif change == "no-steps":
+                        job["steps"] = []
+                    elif change == "setup-only":
+                        job["steps"] = [job["steps"][0], job["steps"][-1]]
+                    elif change == "checkout-only":
+                        job["steps"] = [{"name": "Run actions/checkout@pinned", "number": 1,
+                                         "status": "completed", "conclusion": "success"}]
+                    elif change == "skipped-gate":
+                        job["steps"][-2]["conclusion"] = "skipped"
+                    elif change == "wrong-run":
+                        job["run_id"] = 13
+                    elif change == "wrong-sha":
+                        job["head_sha"] = "f" * 40
+                    else:
+                        job["run_attempt"] = True if change == "bool-attempt" else 2
+                    self.refused()
+                    self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_package_missing_optional_job_attempt_is_accepted(self):
+        self.package_preview(p0=None)
+        for job in self.jobs["jobs"]:
+            job.pop("run_attempt")
+        self.accepted()
+
+    def test_package_partial_duplicate_and_invalid_job_lists_refuse(self):
+        self.package_preview(p0=None)
+        baseline = copy.deepcopy(self.jobs)
+        for change in ("partial", "duplicate-name", "duplicate-id", "invalid-row"):
+            with self.subTest(change=change):
+                self.jobs = copy.deepcopy(baseline)
+                if change == "partial":
+                    self.jobs["total_count"] += 1
+                elif change == "duplicate-name":
+                    self.jobs["jobs"].append(copy.deepcopy(self.jobs["jobs"][0]))
+                    self.jobs["total_count"] += 1
+                elif change == "duplicate-id":
+                    self.jobs["jobs"][1]["id"] = self.jobs["jobs"][0]["id"]
+                else:
+                    self.jobs["jobs"][1] = None
+                self.refused()
+
+    def test_package_run_race_refuses_after_full_payload_checks(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        for mutation in ({"run_attempt": 2}, {"conclusion": "success"},
+                         {"workflow_id": 71}, {"head_commit": {"id": HEAD, "tree_id": "a" * 40}},
+                         {"repository": {"id": 99, "full_name": REPO},
+                          "head_repository": {"id": 99, "full_name": REPO}}):
+            with self.subTest(mutation=mutation):
+                self.run_after = self.run | mutation
+                self.refused()
+                self.assertIn("/zip", (self.base / "calls").read_text())
+
+    def test_package_artifact_configuration_schema_and_digest_still_refuse(self):
+        self.package_preview()
+        self.artifact["name"] = "release-preview-public-assets-p0"
+        self.refused()
+        self.artifact["name"] = "release-preview-public-assets"
+        for mutation in ({"p11scope_features": ["stub-object-attributes"]}, {"schema_version": True},
+                         {"schema_version": "1"}, {"tree": "e" * 40}):
+            with self.subTest(mutation=mutation):
+                saved = copy.deepcopy(self.release)
+                self.release.update(mutation)
+                self.refused()
+                self.release = saved
+        self.artifact_overrides = {"digest": "sha256:" + "0" * 64}
+        self.refused()
+
+    def test_package_wrong_metadata_object_types_refuse_cleanly(self):
+        self.package_preview()
+        binding = self.artifact["workflow_run"]
+        self.artifact["workflow_run"] = None
+        self.refused()
+        self.artifact["workflow_run"] = binding
+        self.release["artifacts"] = list(self.release["artifacts"])
+        self.refused()
 
     def test_run_repository_sha_workflow_event_and_success_are_required(self):
         for key, value in (("head_sha", "a" * 40), ("id", 13), ("status", "in_progress"),

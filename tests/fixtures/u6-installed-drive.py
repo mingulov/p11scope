@@ -65,8 +65,7 @@ OUTPUT_LIMIT = 4 * 1024 * 1024
 HEX40 = re.compile(r"[0-9a-f]{40}")
 BASE_TMP = Path(os.environ.get("TMPDIR", "/var/tmp/p11scope-ws-tmp"))
 
-# Native qualify cells backing U6 twin verdicts, plus the extended twins that
-# need qualify-matrix support before they can run live.
+# Native qualify cells backing the complete U6 named-trace journey.
 U6_TRACE_NATIVE_CELLS = ("stable", "onecall", "exec", "run")
 U6_TRACE_EXTENDED_TWINS = ("mapped-only", "unreadable", "duplicate-basename", "slow-reader")
 U6_TRACE_PLAN = (
@@ -74,10 +73,10 @@ U6_TRACE_PLAN = (
     ("unknown-honest", "onecall", "Unknown reported, never forced; zero false names"),
     ("exec-generations", "exec", "both images named; zero wrong names"),
     ("run-parity", "run", "public route parity with zero false names"),
-    ("mapped-only", None, "mapped-but-never-called image contributes zero call events"),
-    ("unreadable", None, "unreadable-exe rows stay Unknown, never an invented label"),
-    ("duplicate-basename", None, "same-basename paths stay distinct full paths"),
-    ("slow-reader", None, "delivered rows stay exact; loss is accounted, never silent"),
+    ("mapped-only", "mapped-only", "mapped-but-never-called image contributes zero call events"),
+    ("unreadable", "unreadable", "unreadable-exe rows stay Unknown, never an invented label"),
+    ("duplicate-basename", "duplicate-basename", "same-basename paths stay distinct full paths"),
+    ("slow-reader", "slow-reader", "delivered rows stay exact; loss is accounted, never silent"),
 )
 RED_PROOF_ENV = "P11SCOPE_U6_RED_PROOF"
 INSTALLED_ENV = "P11SCOPE_U6_INSTALLED_BINARY"
@@ -862,7 +861,7 @@ def dry_run_plan(args, journeys, binary):
                     "trusted-manifest inputs absent: supply --provider/--caller/--manifest/--manifest-helper/--helper-source-revision/--uid/--gid")
             native = load_module(QUALIFY_TRACE)["CELLS"]
             for name, cell, rule in U6_TRACE_PLAN:
-                if cell is None:
+                if cell not in native:
                     plan["cells"].append({"cell": name, "rule": rule,
                                          "wiring": "twin-verdict-ready",
                                          "live": "needs-qualify-support"})
@@ -1095,11 +1094,13 @@ def live_named_trace(args, binary, out):
     revision = args.source_revision or os.environ.get(REVISION_ENV, "")
     require(HEX40.fullmatch(revision or ""), "live mode requires the exact 40-hex source revision")
     inputs = trace_inputs(args, live=True)
-    requested = (args.cells or ",".join(U6_TRACE_NATIVE_CELLS + U6_TRACE_EXTENDED_TWINS)).split(",")
+    requested = (args.cells if args.cells is not None else
+                 ",".join(U6_TRACE_NATIVE_CELLS + U6_TRACE_EXTENDED_TWINS)).split(",")
+    require(all(requested) and len(set(requested)) == len(requested),
+            "trace cells must be nonempty and unique")
     native = load_module(QUALIFY_TRACE)["CELLS"]
-    blocked = [name for name in requested if name not in native and name in U6_TRACE_EXTENDED_TWINS]
-    unknown = [name for name in requested if name not in native and name not in U6_TRACE_EXTENDED_TWINS]
-    require(not unknown, f"unknown trace cells: {unknown}")
+    unsupported = [name for name in requested if name not in native]
+    require(not unsupported, f"qualify matrix lacks requested trace cells: {unsupported}")
     info = {"path": str(resolved), "sha256": sha256_file(resolved),
             "role": binary_role(resolved), "source_revision": revision}
     cells = []
@@ -1110,45 +1111,44 @@ def live_named_trace(args, binary, out):
 
     qualify_out = out / "qualify"
     qualify_out.mkdir(mode=0o755)
-    native_requested = [name for name in requested if name in native]
-    if native_requested:
-        argv = [sys.executable, "-I", str(QUALIFY_TRACE), "--binary", str(resolved),
-               "--provider", inputs["provider"], "--caller", inputs["caller"],
-               "--source-revision", revision]
-        for manifest in inputs["manifests"]:
-            argv += ["--manifest", manifest]
-        argv += ["--manifest-helper", inputs["helper"],
-                "--helper-source-revision", args.helper_source_revision,
-                "--uid", str(args.uid), "--gid", str(args.gid),
-                "--cells", ",".join(native_requested),
-                "--out", str(qualify_out)]
-        code, stdout, stderr = run(argv, timeout=900, output_limit=16 * 1024 * 1024)
-        record("qualify-native-cells", code == 0,
-               {"exit": code, "tail": (stdout + stderr)[-1024:].decode("utf-8", "replace")})
-        require(code == 0, f"installed trace qualification failed with exit {code}")
-    else:
-        record("qualify-native-cells", False, {"skipped": "no native cells requested"})
+    argv = [sys.executable, "-I", str(QUALIFY_TRACE), "--binary", str(resolved),
+           "--provider", inputs["provider"], "--caller", inputs["caller"],
+           "--source-revision", revision]
+    for manifest in inputs["manifests"]:
+        argv += ["--manifest", manifest]
+    argv += ["--manifest-helper", inputs["helper"],
+            "--helper-source-revision", args.helper_source_revision,
+            "--uid", str(args.uid), "--gid", str(args.gid),
+            "--cells", ",".join(requested),
+            "--out", str(qualify_out)]
+    code, stdout, stderr = run(argv, timeout=900, output_limit=16 * 1024 * 1024)
+    record("qualify-native-cells", code == 0,
+           {"exit": code, "tail": (stdout + stderr)[-1024:].decode("utf-8", "replace")})
+    require(code == 0, f"installed trace qualification failed with exit {code}")
     for twin, cell, rule in U6_TRACE_PLAN:
-        if cell is None:
-            record(twin, False, {"blocked": "needs qualify-matrix support", "rule": rule})
-            continue
         if cell not in requested:
+            record(twin, False, {"not_requested": cell, "rule": rule})
             continue
-        result = json.loads((qualify_out / cell / "result.json").read_text())
+        result = json.loads(read_bounded(qualify_out / cell / "result.json"))
+        require(isinstance(result, dict), f"native trace result must be an object: {cell}")
+        errors = result.get("errors")
         detail = {"pass": result.get("pass"), "calls": result.get("calls"),
                   "named": result.get("named"), "unknown": result.get("unknown"),
                   "false_names": result.get("false_names"),
-                  "errors": result.get("errors", [])[:3]}
-        ok = bool(result.get("pass")) and result.get("false_names") == 0
-        if twin == "named-positive":
-            ok = ok and (result.get("named") or 0) > 0
+                  "errors": errors[:3] if isinstance(errors, list) else ["invalid result errors"]}
+        counts = [result.get(key) for key in ("calls", "named", "unknown", "false_names")]
+        valid_counts = all(type(value) is int and value >= 0 for value in counts)
+        ok = (result.get("cell") == cell and result.get("pass") is True
+              and valid_counts and counts[0] > 0 and counts[1] + counts[2] == counts[0]
+              and counts[3] == 0 and errors == [])
+        if twin == "named-positive" or twin in U6_TRACE_EXTENDED_TWINS:
+            ok = ok and counts[1] > 0
         elif twin == "exec-generations":
             generations = result.get("image_generation_populations", {})
-            ok = ok and bool(generations) and all(pop.get("named", 0) > 0
-                                                 for pop in generations.values())
+            ok = (ok and isinstance(generations, dict) and len(generations) >= 2
+                  and all(isinstance(pop, dict) and type(pop.get("named")) is int
+                          and pop["named"] > 0 for pop in generations.values()))
         record(twin, ok, dict(detail, rule=rule))
-    for name in blocked:
-        record(name, False, {"blocked": "qualify matrix lacks this twin cell"})
     pair = live_pair(args, resolved, out)
     record("two-real-saved-inventory-diff", pair[0], pair[1])
     receipt = {"mode": "live", "journey": "named-trace", "binary": info,

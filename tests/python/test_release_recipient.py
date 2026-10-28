@@ -7,7 +7,8 @@ path (the extracted candidate bytes), never through PATH. A decoy
 `p11scope` placed earlier in PATH must stay unexecuted while the journey
 receipt binds the exact executed path and digest. Drives the accepted U6
 installed-journey harness (tests/fixtures/u6-installed-drive.py) in
---dry-run shape over staged fixture binaries; no capture, no privilege.
+--dry-run shape over staged fixture binaries and composes real native-result
+files at its substituted qualification boundary; no capture, no privilege.
 
 Run: python3 -I tests/python/test_release_recipient.py -v
 """
@@ -232,6 +233,131 @@ class ReleaseRecipientTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    @staticmethod
+    def trace_results():
+        names = ("stable", "onecall", "exec", "run", "mapped-only", "unreadable",
+                 "duplicate-basename", "slow-reader")
+        rows = {name: {"cell": name, "pass": True, "calls": 3, "named": 2, "unknown": 1,
+                       "false_names": 0, "errors": []} for name in names}
+        rows["onecall"].update(calls=1, named=0, unknown=1)
+        rows["exec"]["image_generation_populations"] = {
+            "first": {"named": 1}, "second": {"named": 1}}
+        return rows
+
+    def compose_named_trace(self, *, selected=None, results=None, missing=(), supported=None):
+        """Run the real receipt composer with only its native boundary substituted."""
+        stage = stage_pair(self.root, f"live-{len(list(self.root.iterdir()))}")
+        args = DRIVER.build_parser().parse_args([
+            "--journey", "named-trace", "--source-revision", "a" * 40,
+            "--helper-source-revision", "b" * 40, "--uid", "1000", "--gid", "1000"])
+        args.cells = selected
+        out = Path(tempfile.mkdtemp(prefix="live-receipt-", dir=self.root))
+        inputs = {"provider": str(self.root / "provider.so"),
+                  "caller": str(self.root / "caller"),
+                  "manifests": [str(self.root / "manifest.json")],
+                  "helper": str(self.root / "manifest-helper")}
+        rows = self.trace_results() if results is None else results
+        commands = []
+
+        def qualify(argv, **_bounds):
+            self.assertEqual(argv[:3], [sys.executable, "-I", str(DRIVER.QUALIFY_TRACE)])
+            self.assertEqual(argv[argv.index("--binary") + 1], str(stage["selected"].resolve()))
+            self.assertEqual(argv[argv.index("--manifest") + 1], inputs["manifests"][0])
+            commands.append(argv)
+            directory = Path(argv[argv.index("--out") + 1])
+            for name in argv[argv.index("--cells") + 1].split(","):
+                if name in missing:
+                    continue
+                (directory / name).mkdir()
+                (directory / name / "result.json").write_text(json.dumps(rows[name]))
+            return 0, b"native results written", b""
+
+        with patch.object(DRIVER, "trace_inputs", return_value=inputs) as validate, \
+                patch.object(DRIVER, "load_module", return_value={
+                    "CELLS": tuple(self.trace_results()) if supported is None else supported}), \
+                patch.object(DRIVER, "run", side_effect=qualify), \
+                patch.object(DRIVER, "live_pair", return_value=(True, {"exit": 0})), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = DRIVER.live_named_trace(args, str(stage["selected"]), out)
+        validate.assert_called_once_with(args, live=True)
+        return code, json.loads((out / "receipt.json").read_text()), commands
+
+    def test_named_trace_live_maps_all_eight_supported_cells(self):
+        code, receipt, commands = self.compose_named_trace()
+        self.assertEqual(code, 0)
+        self.assertTrue(receipt["pass"])
+        self.assertEqual(commands[0][commands[0].index("--cells") + 1],
+                         "stable,onecall,exec,run,mapped-only,unreadable,duplicate-basename,slow-reader")
+        expected = {"named-positive", "unknown-honest", "exec-generations", "run-parity",
+                    "mapped-only", "unreadable", "duplicate-basename", "slow-reader"}
+        rows = {row["cell"]: row for row in receipt["cells"] if row["cell"] in expected}
+        self.assertEqual(set(rows), expected)
+        for name, row in rows.items():
+            self.assertTrue(row["pass"], name)
+            self.assertEqual(row["detail"]["false_names"], 0)
+            self.assertEqual(row["detail"]["errors"], [])
+        self.assertEqual(receipt["binary"]["source_revision"], "a" * 40)
+
+    def test_named_trace_subset_is_an_incomplete_full_gate(self):
+        code, receipt, commands = self.compose_named_trace(selected="stable")
+        self.assertEqual(code, 1)
+        self.assertFalse(receipt["pass"])
+        self.assertEqual(commands[0][commands[0].index("--cells") + 1], "stable")
+        rows = {row["cell"]: row for row in receipt["cells"]}
+        self.assertTrue(rows["named-positive"]["pass"])
+        for name in ("unknown-honest", "exec-generations", "run-parity", "mapped-only",
+                     "unreadable", "duplicate-basename", "slow-reader"):
+            self.assertFalse(rows[name]["pass"], name)
+            self.assertIn("not_requested", rows[name]["detail"])
+
+    def test_named_trace_selected_result_refusals_cannot_hide_behind_other_cells(self):
+        for key, value in (("cell", "unreadable"), ("pass", False), ("pass", 1), ("false_names", 1),
+                           ("false_names", False), ("calls", 0), ("calls", "3"),
+                           ("named", 0), ("unknown", 0), ("errors", ["capture loss"])):
+            with self.subTest(field=key, value=value):
+                results = self.trace_results()
+                results["slow-reader"][key] = value
+                code, receipt, _ = self.compose_named_trace(results=results)
+                self.assertEqual(code, 1)
+                rows = {row["cell"]: row for row in receipt["cells"]}
+                self.assertFalse(rows["slow-reader"]["pass"])
+                self.assertTrue(rows["mapped-only"]["pass"])
+                self.assertTrue(rows["unreadable"]["pass"])
+                self.assertTrue(rows["duplicate-basename"]["pass"])
+
+    def test_named_trace_missing_or_malformed_native_result_refuses(self):
+        with self.assertRaises(FileNotFoundError):
+            self.compose_named_trace(missing=("unreadable",))
+        results = self.trace_results()
+        results["unreadable"] = []
+        with self.assertRaisesRegex(AssertionError, "result.*object"):
+            self.compose_named_trace(results=results)
+
+    def test_named_trace_invalid_or_unsupported_selection_refuses_before_execution(self):
+        for selected in ("", "stable,stable", "stable,"):
+            with self.subTest(selected=selected), self.assertRaisesRegex(
+                    AssertionError, "nonempty and unique"):
+                self.compose_named_trace(selected=selected)
+        with self.assertRaisesRegex(AssertionError, "lacks requested trace cells.*unknown-cell"):
+            self.compose_named_trace(selected="unknown-cell")
+        supported = tuple(name for name in self.trace_results() if name != "unreadable")
+        with self.assertRaisesRegex(AssertionError, "lacks requested trace cells.*unreadable"):
+            self.compose_named_trace(supported=supported)
+
+    def test_named_trace_dry_run_recognizes_supported_extended_cells(self):
+        stage = stage_trace_pair(self.root, "future-cells")
+        original = DRIVER.load_module
+
+        def supported(path):
+            return {"CELLS": tuple(self.trace_results())} if path == DRIVER.QUALIFY_TRACE else original(path)
+
+        with patch.object(DRIVER, "load_module", side_effect=supported):
+            plan = dry_run_named_trace(stage["selected"])
+        rows = {row["cell"]: row for row in plan["cells"]}
+        for name in ("mapped-only", "unreadable", "duplicate-basename", "slow-reader"):
+            self.assertEqual(rows[name]["qualify_cell"], name)
+            self.assertEqual(rows[name]["wiring"], "validated")
+
     def check_selected_binding(self, plan, stage):
         """The receipt binds the executed selected path; the decoy stays cold."""
         selected = stage["selected"].resolve()
@@ -422,7 +548,12 @@ class ReleaseRecipientTests(unittest.TestCase):
                 self.assertIn("qualify_cell", by_cell[name])
             for name in ("mapped-only", "unreadable", "duplicate-basename",
                          "slow-reader"):
-                self.assertEqual(by_cell[name]["wiring"], "twin-verdict-ready", name)
+                native = DRIVER.load_module(DRIVER.QUALIFY_TRACE)["CELLS"]
+                if name in native:
+                    self.assertEqual(by_cell[name]["wiring"], "validated", name)
+                    self.assertEqual(by_cell[name]["qualify_cell"], name)
+                else:
+                    self.assertEqual(by_cell[name]["wiring"], "twin-verdict-ready", name)
             twins = {twin["twin"] for twin in plan["twins"]}
             for name in ("trace-green-named-positive", "trace-red-false-name",
                          "diff-green-known-change", "diff-red-empty-population"):

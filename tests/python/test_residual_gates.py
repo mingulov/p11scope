@@ -222,6 +222,13 @@ class ResidualGates(unittest.TestCase):
                     self.assertLessEqual(output.stat().st_size, 16384)
                     self.assertNotIn(b"PRIVATE_UNSELECTED_CONTENT", output.read_bytes())
 
+    def test_hosted_step_env_does_not_call_if_only_status_functions(self):
+        # GitHub Context availability permits these functions in steps.if,
+        # not steps.env. YAML and shell parsing cannot validate that API.
+        block = hosted_job().split("      - name: Collect bounded capture context\n", 1)[1]
+        environment = block.split("        env:\n", 1)[1].split("        run:", 1)[0]
+        self.assertNotRegex(environment, r"\b(?:always|cancelled|failure|success)\s*\(")
+
     def test_release_preview_job_exists(self):
         """F-28: release-preview CI job (musl/docker/SBOM/build-release)."""
         text = ci_text()

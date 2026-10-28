@@ -968,7 +968,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         env:
-          CAPTURE_FAILED: ${{ failure() }}
+          CAPTURE_FAILED: ${{ job.status == 'failure' }}
         run: |
           set -euo pipefail
           python3 -I - "$TMPDIR" <<'PY'

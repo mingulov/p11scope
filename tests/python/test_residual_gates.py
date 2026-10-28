@@ -139,6 +139,128 @@ class PackagedBpftool(unittest.TestCase):
                     self.assertEqual(result.returncode, int(status), result.stderr)
 
 
+class KnativeManifestSchema(unittest.TestCase):
+    def schema(self):
+        return {"type": "object", "properties": {"spec": {"type": "object",
+                "required": ["template"], "properties": {"template": {"type": "object"}}}}}
+
+    def crd(self):
+        return {"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                "metadata": {"name": "services.serving.knative.dev"},
+                "spec": {"group": "serving.knative.dev", "names": {"kind": "Service"},
+                         "versions": [{"name": "v1", "served": True,
+                                       "schema": {"openAPIV3Schema": self.schema()}}]}}
+
+    def exercise(self, documents, *, bad_digest=False, validator_status=0):
+        import hashlib
+
+        block = ci_text().split("\n  release-preview:\n", 1)[1]
+        marker = "      - name: Validate Kubernetes and Knative manifests\n"
+        if marker not in block:
+            self.fail("release preview lacks the scoped Knative schema input")
+        step = block.split(marker, 1)[1].split("\n      - ", 1)[0]
+        lines = []
+        for line in step.split("        run: |\n", 1)[1].splitlines():
+            if line and not line.startswith("          "):
+                break
+            lines.append(line)
+        program = textwrap.dedent("\n".join(lines)) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            source = root / "crds.yaml"
+            source.write_text("\n---\n".join(json.dumps(row) for row in documents))
+            digest = "0" * 64 if bad_digest else hashlib.sha256(source.read_bytes()).hexdigest()
+            (root / "scripts/knative-e2e.sh").write_text(
+                f"KNATIVE_VERSION=knative-v1.23.0\nCRDS_SHA256={digest}\n")
+            tools = root / "tools"
+            tools.mkdir()
+            curl = tools / "curl"
+            curl.write_text(textwrap.dedent("""\
+                #!/usr/bin/python3
+                import os, pathlib, shutil, sys
+                pathlib.Path(os.environ['STUB_URL']).write_text(sys.argv[-1])
+                shutil.copyfile(os.environ['STUB_SOURCE'], sys.argv[sys.argv.index('-o') + 1])
+                """))
+            curl.chmod(0o755)
+            release_tools = root / "release-tools"
+            release_tools.mkdir()
+            validator = release_tools / "kubeconform"
+            validator.write_text(textwrap.dedent("""\
+                #!/usr/bin/python3
+                import json, os, pathlib, sys
+                template = sys.argv[sys.argv.index('default') + 2]
+                schemas = pathlib.Path(template.split('/{{', 1)[0])
+                files = {str(p.relative_to(schemas)): json.loads(p.read_text())
+                         for p in schemas.rglob('*.json')}
+                pathlib.Path(os.environ['STUB_LOG']).write_text(json.dumps([sys.argv[1:], files]))
+                sys.exit(int(os.environ['STUB_VALIDATOR_STATUS']))
+                """))
+            validator.chmod(0o755)
+            environment = os.environ | {"PATH": str(tools) + ":/usr/bin:/bin",
+                                        "RUNNER_TEMP": str(root), "STUB_SOURCE": str(source),
+                                        "STUB_LOG": str(root / "validator.json"),
+                                        "STUB_URL": str(root / "url.txt"),
+                                        "STUB_VALIDATOR_STATUS": str(validator_status)}
+            result = subprocess.run(["bash", "-c", program], cwd=root, env=environment,
+                                    text=True, capture_output=True, timeout=10)
+            log = root / "validator.json"
+            return (result, json.loads(log.read_text()) if log.exists() else None,
+                    (root / "url.txt").read_text())
+
+    def test_only_served_knative_service_v1_is_materialized_with_scoped_fallback(self):
+        irrelevant = self.crd()
+        irrelevant["metadata"]["name"] = "configurations.serving.knative.dev"
+        irrelevant["spec"]["names"]["kind"] = "Configuration"
+        crd = self.crd()
+        crd["spec"]["versions"].append({"name": "v1beta1", "served": True,
+                                        "schema": {"openAPIV3Schema": {"type": "string"}}})
+        result, log, url = self.exercise([irrelevant, crd])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments, files = log
+        self.assertEqual(arguments[:4], ["-summary", "-schema-location", "default", "-schema-location"])
+        self.assertTrue(arguments[4].endswith("/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"))
+        self.assertEqual(arguments[5:], ["deploy/k8s/"])
+        self.assertEqual(files, {"serving.knative.dev/service_v1.json": self.schema()})
+        self.assertEqual(url, "https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml")
+
+    def test_wrong_identity_unserved_or_missing_schema_refuses_before_validation(self):
+        for mutation in ("group", "kind", "unserved", "schema"):
+            with self.subTest(mutation=mutation):
+                crd = self.crd()
+                if mutation == "group":
+                    crd["spec"]["group"] = "foreign.example"
+                elif mutation == "kind":
+                    crd["spec"]["names"]["kind"] = "Configuration"
+                elif mutation == "unserved":
+                    crd["spec"]["versions"][0]["served"] = False
+                else:
+                    del crd["spec"]["versions"][0]["schema"]
+                result, log, _ = self.exercise([crd])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(log)
+
+    def test_duplicate_crd_or_served_version_refuses_before_validation(self):
+        crd = self.crd()
+        duplicate_version = self.crd()
+        duplicate_version["spec"]["versions"] *= 2
+        for documents in ([crd, crd], [duplicate_version]):
+            with self.subTest(documents=documents):
+                result, log, _ = self.exercise(documents)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(log)
+
+    def test_crd_digest_mismatch_refuses_before_validation(self):
+        result, log, _ = self.exercise([self.crd()], bad_digest=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(log)
+
+    def test_validator_failure_is_the_step_failure(self):
+        result, log, _ = self.exercise([self.crd()], validator_status=7)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIsNotNone(log)
+
+
 class ResidualGates(unittest.TestCase):
     def test_privileged_e2e_job_exists(self):
         """F-04: one privileged CI E2E job running the gated capture cells."""

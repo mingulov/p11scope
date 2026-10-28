@@ -631,7 +631,7 @@ jobs:
       - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 python3-yaml shellcheck softhsm2
       # Cache keys (see the header): the runner image, and the apt C toolchain
       # that build scripts invoke.
       - name: Cache keys
@@ -1032,7 +1032,7 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml softhsm2
       # Ubuntu 26 packages bpftool separately; older images use a versioned
       # linux-tools executable. Select the package-owned binary, not the
       # common wrapper that dispatches by the runner's Azure kernel name.
@@ -1323,7 +1323,47 @@ jobs:
           path: ${{ runner.temp }}/sbom-observer-container-preview.spdx.json
           if-no-files-found: error
           retention-days: 30
-      - run: '"$RUNNER_TEMP/release-tools/kubeconform" -summary deploy/k8s/'
+      - name: Validate Kubernetes and Knative manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse the live Knative lane's official release and content pin.
+          version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)
+          digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)
+          [[ "$version" =~ ^knative-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+          schemas=$(mktemp -d "$RUNNER_TEMP/knative-schema.XXXXXX")
+          trap 'rm -rf "$schemas"' EXIT
+          curl -fsSL --retry 3 -o "$schemas/serving-crds.yaml" \
+            "https://github.com/knative/serving/releases/download/$version/serving-crds.yaml"
+          printf '%s  %s\n' "$digest" "$schemas/serving-crds.yaml" | sha256sum --check
+          # Materialize only served Service/v1, preserving the pinned schema.
+          /usr/bin/python3 -I - "$schemas" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          import yaml
+
+          root = Path(sys.argv[1])
+          documents = yaml.safe_load_all((root / "serving-crds.yaml").read_text())
+          crds = [row for row in documents if isinstance(row, dict)
+                  and row.get("apiVersion") == "apiextensions.k8s.io/v1"
+                  and row.get("kind") == "CustomResourceDefinition"
+                  and row.get("metadata", {}).get("name") == "services.serving.knative.dev"]
+          assert len(crds) == 1, "expected one official Knative Service CRD"
+          spec = crds[0]["spec"]
+          assert spec["group"] == "serving.knative.dev" and spec["names"]["kind"] == "Service"
+          versions = [row for row in spec["versions"] if row["name"] == "v1"]
+          assert len(versions) == 1 and versions[0]["served"] is True, "expected served Service/v1"
+          schema = versions[0]["schema"]["openAPIV3Schema"]
+          assert isinstance(schema, dict) and schema.get("type") == "object"
+          destination = root / "serving.knative.dev/service_v1.json"
+          destination.parent.mkdir()
+          destination.write_text(json.dumps(schema) + "\n")
+          PY
+          # Group and version prevent a core Service from using the CRD schema.
+          "$RUNNER_TEMP/release-tools/kubeconform" -summary -schema-location default \
+            -schema-location "$schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" deploy/k8s/
   # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
   # .coverage-floor (raise it, never lower it); the gate fails the workflow
   # when workspace line coverage drops below it. Include the existing CLI and

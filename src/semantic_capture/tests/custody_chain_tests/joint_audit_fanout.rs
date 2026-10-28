@@ -13939,6 +13939,23 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
         .registry()
         .joint_feed_targets()
         .collect::<Vec<_>>();
+    let healthy = targets
+        .iter()
+        .copied()
+        .find(|target| {
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(target.caller())
+                .unwrap()
+                .pin()
+                .pid()
+                == fixture._child.id()
+        })
+        .unwrap();
     let child = OwnedStoppedChild::new();
     let caller = fixture.scene.real.bind(
         child.id(),
@@ -13948,13 +13965,15 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
         },
         0,
     );
-    let (mut begin, end) = fixture
+    let (begin, _) = fixture
         .scene
         .encoded(std::process::id(), 0, "C_SignInit", 2);
-    let original_ip = u64::from_le_bytes(begin[56..64].try_into().unwrap());
-    begin[56..64].copy_from_slice(&(original_ip + 1).to_le_bytes());
+    // A genuine duplicate START taints the old image before the unrelated
+    // exact subject is disposed, without adding an ordinary A return to
+    // this batch's ownership and delivery obligations.
     fixture.scene.drain.source_mut().push_record(begin.to_vec());
-    fixture.scene.drain.source_mut().push_record(end.to_vec());
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    fixture.scene.push(fixture._child.id(), 0, "C_SignInit", 2);
     fixture.scene.push(child.id(), 0, "C_SignInit", 1);
     let raw = fixture.scene.collect_with_fault(&BirthFault);
     fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
@@ -13978,14 +13997,12 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             &fixture.grant,
         )
         .unwrap_or_else(|(_, reason)| panic!("original independent image taint: {reason:?}"));
-    assert_eq!(
-        coordinator
-            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
-            .unwrap()
-            .unwrap()
-            .1,
-        Err(AttestationRefusal::ImageTainted)
-    );
+    let (healthy_at, healthy_claim) = coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(healthy_at, 3);
+    assert_eq!(healthy_claim, Ok(healthy.bootstrap().proof()));
     let (at, proof) = coordinator
         .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
         .unwrap()
@@ -14044,6 +14061,16 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             .registry()
             .joint_feeds(),
         1
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .feed_mode_for_test(healthy.id()),
+        Some(crate::semantics_key_use::FeedMode::Joint)
     );
     assert!(
         fixture

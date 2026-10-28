@@ -1920,3 +1920,332 @@ fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
         scene.scene.assert_claims(&[]);
     }
 }
+
+fn add_initial_machine_image(scene: &mut MachineScene, pid: u32, image: ImageIdentity) {
+    let caller = scene.scene.real.scene.admit(pid, 50);
+    let (module, path) = &scene.scene.real.modules[0];
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: path.clone(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("held-provider".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(5),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .unwrap();
+    let candidate = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepare_legacy_semantic_candidate(caller, scene.scene.real.lane.domain())
+        .unwrap();
+    scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(pid, (candidate.pin(), image));
+}
+
+#[test]
+fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let mut scene = MachineScene::with_initial_files(1, &[0], true);
+    let c_pid = std::process::id();
+    let child_b = OwnedStoppedChild::new();
+    let child_a = OwnedStoppedChild::new();
+    add_initial_machine_image(
+        &mut scene,
+        child_b.id(),
+        ImageIdentity {
+            task_cookie: 72,
+            exec_id: 0,
+        },
+    );
+    add_initial_machine_image(
+        &mut scene,
+        child_a.id(),
+        ImageIdentity {
+            task_cookie: 74,
+            exec_id: 0,
+        },
+    );
+    for (pid, sequence) in [(c_pid, 1), (c_pid, 2), (child_b.id(), 1), (child_b.id(), 2)] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    push_bare_call_on(&mut scene, child_a.id(), 0, "C_GetSessionInfo", 1);
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let prepared = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let a_input = prepared
+        .admissions()
+        .find(|input| input.journal_binding().1.task_cookie == 74)
+        .unwrap()
+        .clone();
+    let a_proof = prepared
+        .claims()
+        .find(|(at, _)| *at == a_input.h0_ordinal())
+        .unwrap()
+        .1
+        .as_ref()
+        .copied()
+        .expect("the irrelevant A original binds its actual retained key");
+    scene.published_labeled("mixed-scope-original-births", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let targets = coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    let c = targets
+        .iter()
+        .copied()
+        .find(|target| {
+            coordinator
+                .semantic_bindings()
+                .get(target.caller())
+                .unwrap()
+                .image()
+                .task_cookie
+                == 71
+        })
+        .unwrap();
+    let b = targets
+        .iter()
+        .copied()
+        .find(|target| target.id() != c.id())
+        .unwrap();
+    let c_proof = c.bootstrap().proof();
+    assert_ne!(a_proof, c_proof);
+
+    for (pid, sequence) in [(c_pid, 3), (c_pid, 4), (child_b.id(), 3), (child_b.id(), 4)] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let prepared = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let c_input = prepared
+        .admissions()
+        .find(|input| c_proof.matches_admitted(input))
+        .unwrap()
+        .clone();
+    let (row, control, _) = scene.native.publisher.publish_stamped(
+        &["0", "0", "0", "0", "1"],
+        scene.scene.attached.as_ref().unwrap().generation(),
+    );
+    assert!(
+        scene
+            .native
+            .rows
+            .insert(c.bootstrap().domain(), NativeBirthRows { row, control })
+            .is_some()
+    );
+    scene.published_labeled("mixed-scope-native-c-refusal", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let coordinator = &mut scene.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.registry().feed_mode_for_test(c.id()),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(
+        coordinator.registry().feed_mode_for_test(b.id()),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&c_input),
+        Ok(c_proof),
+        "C retains its original key-era without an image taint"
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&a_input),
+        Ok(a_proof)
+    );
+
+    let child_e = OwnedStoppedChild::new();
+    let e_image = ImageIdentity {
+        task_cookie: 75,
+        exec_id: 0,
+    };
+    scene.scene.real.bind(child_e.id(), e_image, 0);
+    let (begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_SignInit", 2);
+    scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    scene.scene.push(child_b.id(), 0, "C_SignInit", 5);
+    scene.scene.push(c_pid, 0, "C_SignInit", 5);
+    scene.scene.push(child_e.id(), 0, "C_SignInit", 1);
+    let mut raw = scene.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut held = scene.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *held;
+        io.script.fail_cookie = Some(e_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 2);
+        assert_eq!(first.awaiting_floor(), Some(12));
+        first
+    };
+    {
+        let mut held = scene.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *held;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().count(), 1);
+        assert_eq!(completed.calls().next().unwrap().position(), Some(12));
+        assert_eq!(completed.allocated_below(), 13);
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert_eq!(stash.min_outcome_position(), Some(12));
+    }
+    let coordinator = &mut scene.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(
+        SemanticBatch::from_tick_report(
+            scene.scene.real.lane.domain(),
+            first,
+            Vec::new(),
+            now_ns(),
+        )
+        .unwrap(),
+    );
+    coordinator
+        .prepare_staged_semantic_batch(&mut scene.scene.real.lane, None)
+        .unwrap();
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &scene.scene.producers,
+            scene.machine.retained_drain_grant_for_test().unwrap(),
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original mixed-scope raw: {reason:?}"));
+    let mut claims = Vec::new();
+    while let Some(claim) = coordinator
+        .claim_next_prepared_admission(&scene.scene.producers, &ingested)
+        .unwrap()
+    {
+        claims.push(claim);
+    }
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0], (10, Ok(b.bootstrap().proof())));
+    let exact = coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .find(|input| input.h0_ordinal() == 11)
+        .unwrap();
+    assert!(c_proof.matches_admitted(exact));
+    assert!(coordinator.registry().admitted_feed_is_s1only(exact));
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&scene.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&scene.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut scene.scene.real.lane))
+        .unwrap();
+    let attached = scene.scene.attached.as_ref().unwrap();
+    let mut frame = coordinator
+        .audit_ingested_quantum(ingested, &scene.scene.producers, attached, &BirthFault)
+        .unwrap_or_else(|(_, reason)| panic!("original mixed-scope audit: {reason:?}"));
+    let failures = frame.original_failures_for_test().collect::<Vec<_>>();
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.gap)
+            .collect::<Vec<_>>(),
+        [JournalGap::ImageTainted, JournalGap::H3Pending]
+    );
+    assert!(failures[0].affects_proof_for_test(&a_proof));
+    assert!(failures[0].affects_proof_for_test(&c_proof));
+    assert!(!failures[0].affects_domain(b.bootstrap().domain()));
+    assert!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(c_proof)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&c_input),
+        Ok(c_proof),
+        "the exact refused C image is still untainted and keeps its era"
+    );
+    let work =
+        failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();
+    let mut ports = coordinator
+        .joint_frame_ports(&scene.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    for _ in 0..work {
+        if frame.negative_effects_complete_for_test(c.bootstrap().domain()) == Some(true) {
+            break;
+        }
+        let mut remaining = 1;
+        frame
+            .deliver_next_bounded(&mut ports, &mut remaining)
+            .unwrap();
+    }
+    assert_eq!(
+        frame.negative_effects_complete_for_test(c.bootstrap().domain()),
+        Some(true)
+    );
+    assert_eq!(
+        frame.defer_pending_h3(&mut ports, &scene.scene.real.lane),
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the mixed union preserves exact-key negative delivery and original pending custody"
+    );
+    frame
+        .finish_pending_h3(&mut ports, &scene.scene.real.lane)
+        .unwrap_or_else(|(_, reason)| panic!("original mixed pending finish: {reason:?}"));
+}

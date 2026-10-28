@@ -1085,7 +1085,7 @@ class C8GateFixtureTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def start(self, *, chain=False, seconds=10, stale=False):
+    def start(self, *, chain=False, seconds=10, stale=False, delay_ms=0):
         root = Path(tempfile.mkdtemp(dir=self.base, prefix="case-"))
         prefix, ledger = root / "gate", root / "ledger.out"
         if stale: Path(str(prefix) + ".0.go").touch()
@@ -1097,7 +1097,8 @@ class C8GateFixtureTests(unittest.TestCase):
             "--gate", str(shared), "--ledger-singletons", "--c8-gate-prefix", str(prefix),
             "--c8-gated-images", "3" if chain else "1", "--c8-deadline",
             str(time.monotonic_ns() + int(seconds * 1e9))]
-        if chain: args += ["--chain", f"leader:{self.driver},leader:{self.other},thread:{self.driver}"]
+        if chain: args += ["--chain", f"leader:{self.driver},leader:{self.other},thread:{self.driver}",
+                           "--delay-ms", str(delay_ms)]
         else: args += ["--hold"]
         child = subprocess.Popen(args, stdout=output, stderr=errors,
             env={**os.environ, "SOFTHSM2_CONF": str(self.conf)})
@@ -1213,9 +1214,9 @@ class C8GateFixtureTests(unittest.TestCase):
                 self.assertNotEqual(child.wait(timeout=3), 0)
                 self.assertNotIn("LEDGER ", ledger.read_text())
 
-    def controller_inputs(self):
+    def controller_inputs(self, *, delay_ms=0):
         """Real owned processes/FDs; JSONL is explicitly controlled unit input."""
-        child, prefix, ledger = self.start(chain=True)
+        child, prefix, ledger = self.start(chain=True, delay_ms=delay_ms)
         self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
         ready = next(parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith("WATCH_READY "))
         root = ledger.parent
@@ -1271,7 +1272,13 @@ class C8GateFixtureTests(unittest.TestCase):
         return child, observer, prefix, ledger, ns, edge, append, gate
 
     def test_successor_publisher_waits_for_real_native_use_instead_of_deadlocking_pre(self):
-        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs()
+        self.successor_controller_case()
+
+    def test_next_executable_pre_waits_through_the_real_previous_image_quiet_gap(self):
+        self.successor_controller_case(delay_ms=300, immediate_next=True)
+
+    def successor_controller_case(self, *, delay_ms=0, immediate_next=False):
+        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs(delay_ms=delay_ms)
         gate('pre')
         self.wait(child, ledger, 'WATCH_READY', gen=0, phase='next')
         calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
@@ -1316,7 +1323,7 @@ class C8GateFixtureTests(unittest.TestCase):
         publisher.start()
         self.addCleanup(publisher.join, 5)
         self.addCleanup(stopped.set)
-        ns['monotonic_ns'] = lambda: time.monotonic_ns() + 9_000_000_000
+        if not delay_ms: ns['monotonic_ns'] = lambda: time.monotonic_ns() + 9_000_000_000
         gate('pre', 1)
         proof = json.loads(Path(str(prefix) + '.1.pre.json').read_text())
         self.assertEqual(proof['proof'], 'native_ready')
@@ -1333,18 +1340,27 @@ class C8GateFixtureTests(unittest.TestCase):
         proof = json.loads(Path(str(prefix) + '.1.post.json').read_text())
         self.assertEqual(proof['proof'], 'publication_progress')
         self.assertNotIn('count', proof)
-        self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
-        # The other executable's native PRE needs no imagined new public watch.
-        pins = ledger.parent / 'pins.json'
-        saved = pins.read_text()
-        wrong = json.loads(saved)
-        wrong['pins']['A']['provider']['ino'] += 1
-        pins.write_text(json.dumps(wrong))
-        with self.assertRaisesRegex(ValueError, 'provider code mapping'):
+        if immediate_next:
+            # POST has just released .1.next. The original 300ms quiet gap
+            # still holds L; PRE must wait for real ledger2 readiness itself.
+            self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(self.driver))
+            self.assertFalse(any(x.startswith('WATCH_READY ') and ' gen=2 ' in x
+                                 for x in ledger.read_text().splitlines()))
             gate('pre', 2)
-        self.assertFalse(Path(str(prefix) + '.2.go').exists())
-        pins.write_text(saved)
-        gate('pre', 2)
+            self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(self.other))
+        else:
+            self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+            # The other executable's native PRE needs no imagined new public watch.
+            pins = ledger.parent / 'pins.json'
+            saved = pins.read_text()
+            wrong = json.loads(saved)
+            wrong['pins']['A']['provider']['ino'] += 1
+            pins.write_text(json.dumps(wrong))
+            with self.assertRaisesRegex(ValueError, 'provider code mapping'):
+                gate('pre', 2)
+            self.assertFalse(Path(str(prefix) + '.2.go').exists())
+            pins.write_text(saved)
+            gate('pre', 2)
         self.wait(child, ledger, 'WATCH_READY', gen=2, phase='next')
         calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
                  if x.startswith('LEDGER ') and ' gen=2 ' in x]

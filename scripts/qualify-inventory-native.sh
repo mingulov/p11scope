@@ -353,20 +353,20 @@ def main():
         provider_pin = h['FilePin'](Path(provider['path']))
         owner = h['OwnedProcess'](pid, int(parent), int(uid))
         observer = h['OwnedProcess'](state['observer']['pid'], int(parent), os.geteuid())
-        def verify(current=False):
+        def verify(require_image=False):
             check_deadline(deadline)
             if owner.wait_exit(0): raise ValueError('owned C8 actor died before gate')
             if observer.wait_exit(0): raise ValueError('C8 observer died before gate')
             owner.verify()
             observer.verify()
             h['assert_process_identity'](state['observer'], observer.identity)
-            for original, current in ((exe, pin), (provider, provider_pin)):
-                current.verify()
+            for original, held_pin in ((exe, pin), (provider, provider_pin)):
+                held_pin.verify()
                 if (fd_identity(original['fd']) != original['identity']
-                        or fd_identity(current.fd) != original['identity']
-                        or current.digest != original['sha256']):
+                        or fd_identity(held_pin.fd) != original['identity']
+                        or held_pin.digest != original['sha256']):
                     raise ValueError('original C8 held file changed')
-            if current:
+            if require_image:
                 pin.image_receipt({'image': gen}, owner)
                 with (Path('/proc') / str(pid) / 'maps').open() as mapped:
                     text = mapped.read(LIMIT + 1)
@@ -430,7 +430,7 @@ def main():
                 raise ValueError('native C8 current image/provider readiness differs')
             if ready and previous and int(ready[0]['t']) <= previous['done_ns']:
                 raise ValueError('native C8 successor predates the completed generation')
-            if ready: verify(current=True)
+            if ready: verify(require_image=True)
             complete = operation == 'pre'
             if operation == 'pre' and calls: raise ValueError('C8 calls preceded their native gate')
             if operation == 'post':
@@ -455,7 +455,7 @@ def main():
                 gate = Path(str(prefix) + f'.{gen}.' + ('go' if operation == 'pre' else 'next'))
                 if gate.exists(): raise ValueError('C8 gate already exists')
                 write_new(receipt, proof)
-                verify(current=True)
+                verify(require_image=True)
                 gate.touch(exist_ok=False)
                 print(json.dumps(proof))
                 return

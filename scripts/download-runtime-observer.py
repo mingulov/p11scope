@@ -88,17 +88,34 @@ def check_run(run, repository, run_id, sha, tree, workflow):
     return attempt
 
 
-def package_gate(job, required_steps):
-    # Reuse the accepted producer's execution/timestamp/step-shape contract;
-    # its successful validate step binds ordinary and coverage CI to this SHA.
+def producer_checker():
     spec = importlib.util.spec_from_file_location("package_preview_ci", ROOT / "scripts/check-package-preview-ci.py")
     checker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checker)
+    return checker
+
+
+def package_gate(job, required_steps):
+    # Reuse the accepted producer's execution/timestamp/step-shape contract;
+    # its successful validate step binds ordinary and coverage CI to this SHA.
+    checker = producer_checker()
     checker.check_gate(job)
     for name in required_steps:
         steps = [step for step in job["steps"] if step["name"] == name]
         require(len(steps) == 1 and steps[0]["conclusion"] == "success",
                 "package producer gate step did not run: " + name)
+
+
+def artifact_freshness(artifact, job):
+    checker = producer_checker()
+    started = checker.timestamp(job.get("started_at"))
+    completed = checker.timestamp(job.get("completed_at"))
+    created = checker.timestamp(artifact.get("created_at"))
+    updated = checker.timestamp(artifact.get("updated_at"))
+    require(started <= created <= completed,
+            "artifact creation is outside the selected FULL producer job interval")
+    # Updates cannot confer freshness on an artifact created by an old attempt.
+    require(created <= updated, "artifact update precedes creation")
 
 
 def select_artifact(repository, run_id, sha, tree):
@@ -141,6 +158,8 @@ def select_artifact(repository, run_id, sha, tree):
     require(isinstance(binding, dict) and binding.get("id") == run_id and binding.get("head_sha") == sha
             and binding.get("repository_id") == run["repository"]["id"]
             and binding.get("head_repository_id") == run["repository"]["id"], "artifact run/source mismatch")
+    producer = "package-full" if path == PACKAGE_WORKFLOW else "release-preview"
+    artifact_freshness(artifact, by_name[producer])
     require(positive(artifact.get("size_in_bytes")) and artifact["size_in_bytes"] <= MAX_ARCHIVE,
             "artifact archive size exceeds bound")
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", "")) is not None,

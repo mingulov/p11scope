@@ -101,6 +101,8 @@ covering CI run, and the CI release-preview route still requires overall success
 
 The consumer verifies the recognized workflow identity, source/tree, attempt,
 FULL public package, compiler pins, checksums and static x86-64 observer. It
+requires artifact creation within the selected FULL producer job's execution
+interval, excluding artifacts left by earlier attempts of the same run. It
 rechecks the run's source, attempt and terminal state after package validation,
 before creating executable output. Absent, expired, mismatched or P0 artifacts
 fail. It neither starts a preview nor builds a replacement observer. This

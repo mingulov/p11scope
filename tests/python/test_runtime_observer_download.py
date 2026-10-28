@@ -74,10 +74,12 @@ class DownloadTests(unittest.TestCase):
                           "package-preview": {"id": 72, "path": ".github/workflows/package-preview.yml"}}
         self.jobs = {"total_count": 2, "jobs": [
             {"id": 21, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
-             "name": "release-preview", "status": "completed", "conclusion": "success"},
+             "name": "release-preview", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-28T10:00:00Z", "completed_at": "2026-10-28T10:02:00Z"},
             {"id": 22, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
              "name": "lint", "status": "completed", "conclusion": "success"}]}
         self.artifact = {"id": 31, "name": "release-preview-public-assets", "expired": False,
+                         "created_at": "2026-10-28T10:01:00Z", "updated_at": "2026-10-28T10:01:00Z",
                          "workflow_run": {"id": 12, "head_sha": HEAD,
                                           "repository_id": 10, "head_repository_id": 10}}
         self.extra_members = {}
@@ -103,6 +105,7 @@ mapping = {
     "repos/mingulov/p11scope/actions/workflows/ci.yml": "ci.json",
     "repos/mingulov/p11scope/actions/workflows/package-preview.yml": "package-preview.json",
     "repos/mingulov/p11scope/actions/runs/12/attempts/1/jobs?per_page=100": "jobs.json",
+    "repos/mingulov/p11scope/actions/runs/12/attempts/2/jobs?per_page=100": "jobs.json",
     "repos/mingulov/p11scope/actions/runs/12/artifacts?per_page=100": "artifacts.json",
     "repos/mingulov/p11scope/actions/artifacts/31/zip": "artifact.zip",
 }
@@ -233,6 +236,76 @@ sys.stdout.buffer.write((base / name).read_bytes())
     def test_successful_package_full_and_p0_are_accepted(self):
         self.package_preview()
         self.accepted()
+
+    def second_attempt(self):
+        self.run["run_attempt"] = 2
+        for job in self.jobs["jobs"]:
+            job["run_attempt"] = 2
+            if job["name"] in ("release-preview", "validate", "package-full"):
+                job.update(started_at="2026-10-28T11:00:00Z", completed_at="2026-10-28T11:02:00Z")
+        self.artifact.update(created_at="2026-10-28T11:01:00Z", updated_at="2026-10-28T11:01:00Z")
+
+    def test_package_current_attempt_refuses_prior_attempt_artifact_before_download(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        self.second_attempt()
+        # Same source/name/digest and freshly updated, but created by attempt 1.
+        self.artifact["created_at"] = "2026-10-28T10:01:00Z"
+        self.refused()
+        self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_ci_current_attempt_refuses_prior_attempt_artifact_before_download(self):
+        self.second_attempt()
+        self.artifact["created_at"] = "2026-10-28T10:01:00Z"
+        self.refused()
+        self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_current_package_attempt_accepts_its_full_artifact_with_failed_p0(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        self.second_attempt()
+        self.accepted()
+
+    def test_current_ci_attempt_accepts_its_own_artifact(self):
+        self.second_attempt()
+        self.accepted()
+
+    def test_package_artifact_must_fall_inside_full_job_not_other_job_intervals(self):
+        self.package_preview(conclusion="failure", p0="failure")
+        self.jobs["jobs"][0].update(started_at="2026-10-28T09:00:00Z", completed_at="2026-10-28T12:00:00Z")
+        self.jobs["jobs"][2].update(started_at="2026-10-28T09:00:00Z", completed_at="2026-10-28T12:00:00Z")
+        self.artifact.update(created_at="2026-10-28T10:03:00Z", updated_at="2026-10-28T10:03:00Z")
+        self.refused()
+        self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_missing_malformed_and_inconsistent_freshness_timestamps_refuse_before_download(self):
+        baseline_jobs = copy.deepcopy(self.jobs)
+        baseline_artifact = copy.deepcopy(self.artifact)
+        for package_route in (False, True):
+            if package_route:
+                self.package_preview(conclusion="failure", p0="failure")
+            else:
+                self.jobs = copy.deepcopy(baseline_jobs)
+            selected_jobs = copy.deepcopy(self.jobs)
+            producer_index = 1 if package_route else 0
+            for owner, field, value in (
+                ("artifact", "created_at", "missing"), ("artifact", "created_at", None),
+                ("artifact", "created_at", "not-a-time"), ("artifact", "updated_at", "missing"),
+                ("artifact", "updated_at", "2026-10-28T10:01:00+01:00"),
+                ("artifact", "updated_at", "2026-10-28T09:59:00Z"),
+                ("producer", "started_at", "missing"), ("producer", "started_at", "not-a-time"),
+                ("producer", "completed_at", None), ("producer", "completed_at", "not-a-time"),
+                ("producer", "completed_at", "2026-10-28T09:59:00Z"),
+            ):
+                with self.subTest(package_route=package_route, owner=owner, field=field, value=value):
+                    self.jobs = copy.deepcopy(selected_jobs)
+                    self.artifact = copy.deepcopy(baseline_artifact)
+                    self.artifacts = [self.artifact]
+                    target = self.artifact if owner == "artifact" else self.jobs["jobs"][producer_index]
+                    if value == "missing":
+                        target.pop(field)
+                    else:
+                        target[field] = value
+                    self.refused()
+                    self.assertNotIn("/zip", (self.base / "calls").read_text())
 
     def test_canonical_repository_rejects_path_segments_before_api_calls(self):
         for repository in ("../p11scope", "mingulov/..", "mingulov/.", "mingulov/repo/extra", ".owner/repo"):

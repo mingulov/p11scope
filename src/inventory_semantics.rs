@@ -2295,6 +2295,28 @@ impl AttestedSemanticLane {
         self.exit_retained = true;
     }
 
+    /// Service only the classic lane's own DISCOVERY reader while an original
+    /// batch is retained. No EVENTS read, batch or Inventory authority results.
+    pub(crate) fn service_live_discovery(&mut self) {
+        if self.exit_retained || self.is_finished() || self.has_joint_machine() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if !self.test_gated {
+                test.service_live_discovery();
+            }
+            return;
+        }
+        if let Some(live) = self.live.as_mut()
+            && !live.gated
+            && !live.finished
+            && live.joint_machine.is_none()
+        {
+            live.capture.service_live_discovery(&mut live.session);
+        }
+    }
+
     /// One H0 collect→audit→route quantum over the bound callers' stable
     /// custody Arcs. The only producer of lane call batches; a gated,
     /// finished or shell lane refuses instead of inventing calls.

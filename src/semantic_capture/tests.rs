@@ -5296,6 +5296,35 @@ mod custody_chain_tests {
         discovery_service_while_batch_is_staged(false);
     }
 
+    #[test]
+    fn live_discovery_service_keeps_joint_gated_and_finished_readers_owned() {
+        for state in ["joint", "gated", "finished"] {
+            let mut fixture = bound_lane_scene(ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            });
+            let mut h0 = H0TestIo::new(fixture.lane.domain());
+            h0.discovery = Some(discovery_records(1));
+            h0.io.call_image(7, 1, 0);
+            retain_scripted_event_cursor(&mut h0.io);
+            let engagement = h0.engagement.clone();
+            fixture.lane.install_test_io(Box::new(h0));
+            match state {
+                "joint" => fixture.lane.set_test_joint_machine(true),
+                "gated" => fixture.lane.request_semantic_stop(),
+                "finished" => {
+                    assert!(fixture.lane.finish_semantic_stop().is_some());
+                }
+                _ => unreachable!(),
+            }
+            fixture.lane.service_live_discovery();
+            let observed = engagement.borrow();
+            assert_eq!(observed.discovery_consumer, 0, "{state}");
+            assert_eq!(observed.events_consumer, 0, "{state}");
+            assert_eq!(observed.ticks, 0, "{state}");
+        }
+    }
+
     /// Published semantic edge rows: (api returns, historical-only
     /// returns, lossy, started, completed).
     fn operation_edge_rows(scene: &CustodyScene) -> Vec<(Option<u64>, u64, bool, u64, u64)> {

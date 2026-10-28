@@ -1075,6 +1075,15 @@ enum CollectionStatus {
     Malformed,
     ReadError,
 }
+impl CollectionStatus {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadError, _) | (_, Self::ReadError) => Self::ReadError,
+            (Self::Malformed, _) | (_, Self::Malformed) => Self::Malformed,
+            _ => Self::Complete,
+        }
+    }
+}
 struct Collection {
     records: Vec<DecodedEventRecord>,
     status: CollectionStatus,
@@ -1178,15 +1187,7 @@ fn collect_attested_with<T>(
     // Even an unavailable DISCOVERY reader must not starve the genuine EVENTS
     // prefix. Preserve it and let H0's existing failure path forbid routing.
     let mut collection = collect_events(owner, limit);
-    collection.status = match (collection.status, discovery_status) {
-        (CollectionStatus::ReadError, _) | (_, CollectionStatus::ReadError) => {
-            CollectionStatus::ReadError
-        }
-        (CollectionStatus::Malformed, _) | (_, CollectionStatus::Malformed) => {
-            CollectionStatus::Malformed
-        }
-        _ => CollectionStatus::Complete,
-    };
+    collection.status = collection.status.combine(discovery_status);
     collection
 }
 
@@ -1400,6 +1401,9 @@ pub(crate) struct SemanticCapture {
     /// only by `fail_quantum_coverage`, only for a collected delivery
     /// whose audit proves a bounded loss.
     batch_failed: bool,
+    /// A discovery-only live service can run while the previous H0 batch is
+    /// retained. Keep failures until the next collection audits its real prefix.
+    pending_discovery_status: CollectionStatus,
     stopped: bool,
     continuity_cuts: u64,
     /// Last tick's scan count and refusals, for the stuck-transaction
@@ -1488,6 +1492,7 @@ impl SemanticCapture {
             image_failed: false,
             exhausted: false,
             batch_failed: false,
+            pending_discovery_status: CollectionStatus::Complete,
             stopped: false,
             continuity_cuts: 0,
             #[cfg(test)]
@@ -1498,10 +1503,25 @@ impl SemanticCapture {
             last_refusal_by_key_for_test: BTreeMap::new(),
         })
     }
+    /// The classic attested lane owns this Session and its sole cursor. This
+    /// hook never reads EVENTS, allocates positions or constructs a batch.
+    pub(crate) fn service_live_discovery(&mut self, session: &mut Session) {
+        if self.stopped || session.native_domain() != Some(self.router.domain()) {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+            return;
+        }
+        self.service_live_discovery_with(|| session.discovery_dequeue());
+    }
+
     fn service_live_discovery_with(
         &mut self,
-        _dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+        dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
     ) {
+        let status = service_discovery_quantum(
+            crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            dequeue,
+        );
+        self.pending_discovery_status = self.pending_discovery_status.combine(status);
     }
 
     pub(crate) fn router(&self) -> &InstanceRouter {
@@ -2983,6 +3003,10 @@ impl SemanticCapture {
         self.jobs.clear();
     }
     fn audit(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) -> bool {
+        if self.pending_discovery_status != CollectionStatus::Complete {
+            self.fail_coverage(io, report);
+            return false;
+        }
         let Ok(health) = io.health() else {
             self.fail_coverage(io, report);
             return false;
@@ -3344,7 +3368,7 @@ impl SemanticCapture {
         // One storage_null snapshot per scan pass for the Q1(b) gate.
         self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();
-        let owned;
+        let mut owned;
         let is_collected = collected.is_some();
         let (records, status, mut positions, birth_cut, failed_permanent) = match collected {
             Some(input) => (
@@ -3360,6 +3384,10 @@ impl SemanticCapture {
             ),
             None => {
                 owned = io.collect(self.limits.records);
+                owned.status = owned.status.combine(std::mem::replace(
+                    &mut self.pending_discovery_status,
+                    CollectionStatus::Complete,
+                ));
                 // Legacy drain failures stay permanent: without the
                 // quantum audit their scope is unknowable.
                 (owned.records.as_slice(), owned.status, None, None, true)

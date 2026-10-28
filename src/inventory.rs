@@ -5385,6 +5385,12 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             }
             return;
         }
+        // The classic lane's own DISCOVERY reader must flow while a semantic
+        // batch waits for publication. This does not collect another EVENTS
+        // prefix or change the retained batch; Joint owns its separate path.
+        if let Some(lane) = self.semantic.as_mut() {
+            lane.service_live_discovery();
+        }
         // Bound the wait for staged evidence even when collection runs
         // long. Failed commits retry at the next staleness deadline
         // instead of gap-spamming.

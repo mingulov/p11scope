@@ -5204,9 +5204,9 @@ fn capture_evidence_checker_self_test() {
         "lane13 rejects a multiplier argument: OK",
         // The scan contributes three per-source table records, while exact
         // target occurrences remain deduplicated across scan and manifest.
-        "canary matrix 988/104/208 with 16 mixed surfaces: OK",
+        "canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK",
         "canary scan contribution is required: OK",
-        "canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK",
+        "canary freeze lane is manifest-only 1056/104/208 with 13 surfaces: OK",
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
         "canary aggregate exact baseline: OK",
@@ -8833,7 +8833,7 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
     assert!(lanes.contains("scan-only hostile output contract: OK"));
-    assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
+    assert!(lanes.contains("canary baseline matrix 1056/104/208 with 16 mixed surfaces: OK"));
     // The 15 classes below run together as one native lane, so `unittest`
     // prints a single combined "Ran N tests" summary for all of them, not one
     // per class. This floor is that combined total, not a per-class count for

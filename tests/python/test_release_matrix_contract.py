@@ -2833,8 +2833,7 @@ int main(int argc, char **argv) {
                 evidence = capture["evidence_fixture"](shape[3], sources=("scan", "manifest"))
                 evidence.update(table_entries=shape[0], slots=104, attached_probes=208, vendor_interfaces=1,
                     interface_list="ok", discovery_conflicts=int(bits == 64), orphan_ops=1, operation_state_imports=1)
-                evidence["discovery"][0]["tables"] = [{"source": source, "version": list(version), "entries": entries}
-                    for (source, version, entries), count in tables.items() for _ in range(count)]
+                evidence["discovery"][0]["tables"] = capture["version_tables_fixture"](tables)
                 evidence["discovery"][0].update(corroborated=True, corroboration=["agreed" if bits == 32 else "conflict"])
                 report = capture["document_fixture"](evidence)
                 report["functions"] = capture["function_items"](

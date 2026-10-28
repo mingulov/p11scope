@@ -49,6 +49,96 @@ def hosted_python(name):
     return hosted_step(name).split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
 
 
+class PackagedBpftool(unittest.TestCase):
+    def install_step(self, job):
+        block = ci_text().split(f"\n  {job}:\n", 1)[1]
+        step = block.split("      - name: Install packaged bpftool\n", 1)[1]
+        return textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+
+    def exercise(self, job, layout="standalone", **overrides):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "tools"
+            tools.mkdir()
+            (root / "usr/local/bin").mkdir(parents=True)
+            source = root / ("usr/lib/linux-tools/6.8.0-90-generic/bpftool"
+                             if layout.startswith("legacy") else "usr/sbin/bpftool")
+            source.parent.mkdir(parents=True)
+            source.write_text('#!/bin/sh\nprintf "version\\n" >> "$STUB_LOG"\nexit "${STUB_VERSION_RC:-0}"\n')
+            source.chmod(0o644 if layout == "not-executable" else 0o755)
+            package = tools / "dpkg-query"
+            package.write_text(textwrap.dedent("""\
+                #!/bin/sh
+                if [ "$1" = -L ] && [ "$2" = bpftool ]; then
+                    case $STUB_LAYOUT in
+                        legacy*) exit 1 ;;
+                        query-error) exit 2 ;;
+                        missing) exit 0 ;;
+                        foreign) printf '%s/usr/local/bin/bpftool\n' "$STUB_ROOT" ;;
+                        duplicate) printf '%s/usr/sbin/bpftool\n%s/usr/bin/bpftool\n' "$STUB_ROOT" "$STUB_ROOT" ;;
+                        *) printf '%s/usr/sbin/bpftool\n' "$STUB_ROOT" ;;
+                    esac
+                elif [ "$1" = -W ]; then
+                    if [ "$STUB_LAYOUT" = legacy-malformed ]; then printf 'unrelated-package\n'
+                    else printf 'linux-tools-6.8.0-90-generic\n'; fi
+                elif [ "$1" = -L ] && [ "$2" = linux-tools-6.8.0-90-generic ]; then
+                    if [ "$STUB_LAYOUT" = legacy-unowned ]; then printf '/foreign/bpftool\n'
+                    else printf '%s/usr/lib/linux-tools/6.8.0-90-generic/bpftool\n' "$STUB_ROOT"; fi
+                else exit 2; fi
+                """))
+            package.chmod(0o755)
+            sudo = tools / "sudo"
+            sudo.write_text(textwrap.dedent("""\
+                #!/bin/sh
+                printf '%s\n' "$*" >> "$STUB_LOG"
+                if [ "$1" = apt-get ]; then exit "${STUB_APT_RC:-0}"; fi
+                if [ "$1" = bpftool ] && [ "${STUB_SUDO_VERSION_RC:-0}" != 0 ]; then
+                    exit "$STUB_SUDO_VERSION_RC"
+                fi
+                exec "$@"
+                """))
+            sudo.chmod(0o755)
+            # Rebase only fixed system paths into the owned fixture; execute
+            # the actual shell discovery, file checks, install and probes.
+            program = self.install_step(job).replace("/usr/", str(root) + "/usr/")
+            environment = os.environ | {"PATH": os.pathsep.join((str(root / "usr/local/bin"),
+                                            str(tools), "/usr/bin", "/bin")),
+                                        "STUB_LAYOUT": layout, "STUB_ROOT": str(root),
+                                        "STUB_LOG": str(root / "commands.log")} | overrides
+            result = subprocess.run(["bash", "-c", program], env=environment,
+                                    text=True, capture_output=True, timeout=10)
+            log = (root / "commands.log").read_text().splitlines()
+            installed = root / "usr/local/bin/bpftool"
+            return result, log, installed.read_bytes() if installed.exists() else None, source.read_bytes()
+
+    def test_standalone_and_legacy_packages_execute_both_version_probes(self):
+        for job in ("bpf-noninterference", "release-preview"):
+            for layout in ("standalone", "legacy"):
+                with self.subTest(job=job, layout=layout):
+                    result, log, installed, source = self.exercise(job, layout)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(installed, source)
+                    self.assertEqual(log.count("version"), 2)
+                    self.assertIn("bpftool version", log)
+
+    def test_invalid_package_layout_never_runs_a_version_probe(self):
+        for job in ("bpf-noninterference", "release-preview"):
+            for layout in ("missing", "foreign", "duplicate", "not-executable", "query-error",
+                           "legacy-malformed", "legacy-unowned"):
+                with self.subTest(job=job, layout=layout):
+                    result, log, _, _ = self.exercise(job, layout)
+                    self.assertNotEqual(result.returncode, 0, "invalid package layout was accepted")
+                    self.assertNotIn("version", log)
+
+    def test_package_install_and_each_version_probe_failures_propagate(self):
+        for job in ("bpf-noninterference", "release-preview"):
+            for variable, status in (("STUB_APT_RC", "3"), ("STUB_VERSION_RC", "7"),
+                                     ("STUB_SUDO_VERSION_RC", "8")):
+                with self.subTest(job=job, variable=variable):
+                    result, _, _, _ = self.exercise(job, **{variable: status})
+                    self.assertEqual(result.returncode, int(status), result.stderr)
+
+
 class ResidualGates(unittest.TestCase):
     def test_privileged_e2e_job_exists(self):
         """F-04: one privileged CI E2E job running the gated capture cells."""

@@ -412,17 +412,27 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      # Azure kernel tools omit bpftool. Select the generic package's real
-      # executable instead of the common wrapper that dispatches by uname.
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
       # The BTF-order fallback shells to bpftool for its canonical C dump.
       - name: Install packaged bpftool
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get install -y linux-tools-generic
-          tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
-          [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
-          bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
           test -x "$bpftool_source"
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
@@ -1023,16 +1033,26 @@ jobs:
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 softhsm2
-      # Azure kernel tools omit bpftool. Select the generic package's real
-      # executable instead of the common wrapper that dispatches by uname.
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
       - name: Install packaged bpftool
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get install -y linux-tools-generic
-          tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
-          [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
-          bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
           test -x "$bpftool_source"
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version

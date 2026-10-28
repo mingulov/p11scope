@@ -124,8 +124,10 @@ passed. A manual dispatch always runs the full matrix.
 
 `bpf-noninterference` follows `tests`, including when tests fail. It first
 runs the repeat-baseline control on reviewed baseline
-`869a79cae71e4ce566f896274768241131de87c2` twice, then compares that
+`ad01d1b65bf980403aa652f140ce06088e9d591d` twice, then compares that
 baseline with the exact candidate commit in a fresh integration snapshot.
+Use the reviewed `BASELINE` in `.github/workflows/ci.yml`; earlier baseline
+results retain their actual revisions.
 Advance the baseline only after reviewing intentional BPF changes, not to
 clear an arbitrary comparison failure. All bytes
 of the three default BPF objects must match in the same pinned tool/header environment;
@@ -176,8 +178,11 @@ The preview workflow passes a version-neutral `source.tar.gz` from the exporter
 to the packager. The packager validates the archive's recorded revision and
 derives the public source filename from the manifests. Inspect the actual output
 `RELEASE.json` and `SHA256SUMS` for the candidate's version and source identity.
-`privileged-e2e` needs a `[self-hosted, bpf]` runner; select it only if one
-exists. Record the run URLs and exact source SHA for the release notes. A job
+Select `privileged_e2e` in the manual dispatch for the four actual
+PID/system × metrics/profile capture cells. The `privileged-e2e` job runs on
+ordinary GitHub-hosted `ubuntu-26.04`; no external or self-hosted runner is
+required. Missing capabilities or failed count/window checks fail the job.
+Record the run URLs and exact source SHA for the release notes. A job
 judged environmental (a flaky coverage run, for example) is an explicit,
 written decision, never an ignored red badge.
 
@@ -190,12 +195,21 @@ scratch.
 
 ## 4. Run the privileged qualification
 
-On a quiet BPF-capable host, run the source-level qualification against the
-frozen commit: the release-matrix lanes
-(`scripts/qualify-release-matrix.sh`, seven lanes — 5.15.221, 6.1.188,
-6.6.157, Ubuntu 6.8.0-142-generic, 6.12.111, 7.2.6 and the host; see
-[docs/qualification/release-matrix.md](docs/qualification/release-matrix.md)),
-privacy canaries, container lanes and overhead re-bench. Start with a plan.
+On a quiet Linux x86-64 host, live capture requires demonstrated
+`uprobe_multi` load and self-link capability under the current credentials,
+normally Linux 6.6+ or a working backport. Kernel version alone does not admit
+a host. Safe scoped Singles remains available on eligible hosts; PID Multi
+also requires its independent kernel PID-filter proof.
+
+Run the planned source-level qualification against the frozen commit: the
+selected release-matrix assertions (`scripts/qualify-release-matrix.sh`;
+see [docs/qualification/release-matrix.md](docs/qualification/release-matrix.md)),
+privacy canaries, container lanes and overhead re-bench. The matrix's six
+default positive lanes are 6.6.157, Ubuntu 6.8.0-142-generic, 6.12.111,
+6.18.58, 7.2.6 and the host. Keep the separate unsupported-host refusal/offline
+control; do not restart stock 5.15/6.1 positive or verifier-headroom campaigns.
+Older registered labels serve explicitly selected backport or historical
+inputs, not a claim of current stock old-kernel live support. Start with a plan.
 For prebuilt execution, set `candidate_sha`, `bin_dir` and `candidate_receipt`
 to the selected commit, binary directory and its actual build-produced receipt;
 guest storage/account prerequisites are described in the matrix guide:

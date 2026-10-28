@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/system-test-manifest/v1",
-  "ledger_sha256": "7be02ab50d7daf4378c9121848840f4e0a6b39c49043b650f8a9a4fda6b1ecae",
+  "ledger_sha256": "cfcb543b6617ea2612762bb5baa89e2815d722c9559b9e89c9fb15b2e1f0d39b",
   "deferred_sha256": "b4d79c724341bc850542f3777d2cc2ecc3b76b48a7411e7865637de2201e5750",
   "bounded_scope_sha256": "f33d5e79154056422784cacc6ffd87ba356123f105e3e3ded8ba9a1df1be89a2",
   "subject": null,

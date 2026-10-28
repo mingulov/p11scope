@@ -24,10 +24,10 @@
     },
     {
       "id": "F-04",
-      "title": "no hosted E2E in CI",
+      "title": "manual Ubuntu 26.04 hosted E2E configured",
       "disposition": "source-fixed",
       "owner_task": "T13",
-      "check": "`ci.yml` privileged-e2e job"
+      "check": "`ci.yml` privileged-e2e four-cell count/window job"
     },
     {
       "id": "F-05",

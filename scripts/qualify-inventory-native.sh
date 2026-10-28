@@ -77,6 +77,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import stat
 import sys
@@ -84,6 +85,10 @@ import time
 
 monotonic_ns = time.monotonic_ns
 LIMIT = 16 * 1024 * 1024
+# Same allowed exec reasons as inventory-native-oracle.py; progress is not its
+# global allocation or an API count. Registered controls check this interface.
+EXEC_REASONS = ('exec_after_admission', 'exec_transition', 'exec_coverage_gap',
+                'cookie_mismatch', 'before_admission', 'no_live_caller')
 
 
 def integer(value):
@@ -123,10 +128,14 @@ def select_gate(records, want, phase):
 
 def select_publication(records, want, phase, observed_ns):
     dead, candidates, edges, inconsistent = set(), {}, {}, set()
+    gaps, witnesses = set(), []
     last_at, commit = 0, None
     previous = want.get('previous')
     pre = want.get('pre')
-    floor = (pre if phase == 'post' else previous or {}).get('seq', -1)
+    native_pre = pre and pre.get('proof') == 'native_ready'
+    expected_module = (pre or {}).get('module', (previous or {}).get('module'))
+    floor = (pre if phase == 'post' and not native_pre else previous or {}).get('seq', -1)
+    watermark = max(want.get('unbound_watermark', -1), (previous or {}).get('unbound_watermark', -1))
     origin = None
     for index, row in enumerate(records):
         if (row.get('schema') != 'p11scope/inventory-events/v1' or row.get('seq') != index
@@ -186,9 +195,9 @@ def select_publication(records, want, phase, observed_ns):
                 and [module.get('device_major'), module.get('device_minor')] == pin['dev'])
             valid = (provider_matches and type(context.get('version')) is int and context['version'] == 1
                 and caller.get('id') == cid and module.get('id') == mid and same_caller(caller, want))
-            if cid in candidates or (pre and cid == pre['caller']):
+            if cid in candidates or (pre and cid == pre.get('caller')):
                 key = (cid, mid)
-                known_pair = key in edges or (pre and key == (pre['caller'], pre['module']))
+                known_pair = key in edges or (pre and key == (pre.get('caller'), pre.get('module')))
                 expected_identity = {'id': mid, 'path': pin['path'], 'inode': pin['ino'],
                                      'device_major': pin['dev'][0], 'device_minor': pin['dev'][1]}
                 identity_changed = any(module.get(k) is not None
@@ -198,16 +207,28 @@ def select_publication(records, want, phase, observed_ns):
                     inconsistent.add(key)  # Identity disagreement, not an unready coverage state.
                 if provider_matches or known_pair:
                     edges[key] = (event, row) if valid else None
+        elif kind == 'gap_recorded':
+            if (event.get('pid') is None and re.search(r'unidentified caller|unbound (caller|witness)',
+                    f"{event.get('subject', '')} {event.get('reason', '')}", re.I)):
+                gaps.add(event.get('module'))
         elif kind == 'pass_committed':
             if event.get('final') is True:
                 return None
             if integer(event.get('pass')) and event['pass'] >= 0 and event.get('final', False) is False:
                 commit = row
-    if phase == 'post' and pre:
+                for item in event.get('unbound_rows') or []:
+                    if (isinstance(item, dict) and integer(item.get('rows')) and item['rows'] > 0
+                            and item.get('reason') in EXEC_REASONS):
+                        witnesses.append((row, item))
+    if phase == 'native' and previous and commit is not None:
+        return {'proof': 'native_ready', 'module': previous['module'], 'seq': commit['seq'],
+            'origin': origin, 'deadline': want['deadline'], 'pid': want['pid'], 'start': want['start'],
+            'gen': want['gen'], 'exe': want['exe']}
+    if phase == 'post' and pre and not native_pre:
         candidates = {pre['caller']: ({'incarnation': pre['incarnation']}, pre['seq'])}
     for cid, (caller, admitted_seq) in sorted(candidates.items(), key=lambda item: item[1][1], reverse=True):
         pairs = [pair for key, pair in edges.items() if key[0] == cid and pair is not None
-                 and key not in inconsistent and (phase != 'post' or key[1] == pre['module'])]
+                 and key not in inconsistent and (phase != 'post' or key[1] == expected_module)]
         if cid in dead or len(pairs) != 1 or commit is None:
             continue
         edge, publication = pairs[0]
@@ -215,11 +236,31 @@ def select_publication(records, want, phase, observed_ns):
             continue
         entries = edge.get('entries') or {}
         coverage = entries.get('coverage') or {}
-        if (edge.get('mapping', {}).get('state') != 'mapped' or entries.get('saturated') is not False
+        if (edge.get('mapping', {}).get('state') != 'mapped'
+                or not admitted_seq < publication['seq'] < commit['seq']):
+            continue
+        base = {'caller': cid, 'incarnation': caller['incarnation'], 'module': edge['module'],
+            'seq': commit['seq'], 'edge_seq': publication['seq'], 'origin': origin,
+            'deadline': want['deadline'], 'pid': want['pid'], 'start': want['start'],
+            'gen': want['gen'], 'exe': want['exe'], 'unbound_watermark': watermark}
+        # The native PID and public caller identify this held image, not the
+        # anonymous row. Only the unchanged final oracle allocates that row.
+        if (phase == 'post' and native_pre and publication['seq'] > floor
+                and coverage.get('state') != 'counted'
+                and commit['at_ns'] >= want['done_ns']
+                and (edge['module'] in gaps or (coverage.get('state') == 'unknown'
+                     and coverage.get('reason') == 'use_before_admission'))):
+            for witness, item in witnesses:
+                if (item['module'] == edge['module'] and witness['seq'] > max(floor, watermark)
+                        and witness['at_ns'] >= want['first_entry_ns'] and witness['seq'] <= commit['seq']):
+                    return dict(base, proof='publication_progress', done_ns=want['done_ns'],
+                        unbound_watermark=witness['seq'],
+                        witness={'seq': witness['seq'], 'module': item['module'], 'reason': item['reason']})
+        if (entries.get('saturated') is not False
                 or entries.get('in_flight') is not False or not integer(entries.get('count'))
                 or coverage.get('until_ns') is not None or coverage.get('reason') is not None
                 or coverage.get('detail') is not None or not integer(coverage.get('since_ns'))
-                or coverage['since_ns'] <= 0 or not admitted_seq < publication['seq'] < commit['seq']):
+                or coverage['since_ns'] <= 0):
             continue
         if phase == 'pre':
             if (coverage.get('state') != 'watched_no_use' or coverage.get('lossy') is not None
@@ -229,12 +270,10 @@ def select_publication(records, want, phase, observed_ns):
         elif (coverage.get('state') != 'counted' or coverage.get('lossy') is not False
                 or entries['count'] != want['count'] or publication['seq'] <= floor
                 or publication['at_ns'] < want['last_entry_ns']
-                or commit['at_ns'] < want['done_ns'] or (pre and edge['module'] != pre['module'])):
+                or commit['at_ns'] < want['done_ns'] or edge['module'] != expected_module):
             continue
-        return {'caller': cid, 'incarnation': caller['incarnation'], 'module': edge['module'],
-            'seq': commit['seq'], 'edge_seq': publication['seq'], 'origin': origin,
-            'deadline': want['deadline'], 'pid': want['pid'], 'start': want['start'],
-            'gen': want['gen'], 'exe': want['exe'], 'count': entries['count']}
+        return dict(base, proof='watch' if phase == 'pre' else 'bound_exact', count=entries['count'],
+                    **({'done_ns': want['done_ns']} if phase == 'post' else {}))
     return None
 
 
@@ -307,13 +346,14 @@ def main():
     ledger_path, prefix = Path(ledger_path), Path(prefix)
     deadline = state['deadline']
     exe, provider = state['pins'][exe_role], state['pins'][provider_role]
+    maps_line = runpy.run_path(str(Path(root) / 'scripts/mapped-provider-pin.py'))['MAPS_LINE']
     pin = provider_pin = owner = observer = None
     try:
         pin = h['FilePin'](Path(exe['path']))
         provider_pin = h['FilePin'](Path(provider['path']))
         owner = h['OwnedProcess'](pid, int(parent), int(uid))
         observer = h['OwnedProcess'](state['observer']['pid'], int(parent), os.geteuid())
-        def verify():
+        def verify(current=False):
             check_deadline(deadline)
             if owner.wait_exit(0): raise ValueError('owned C8 actor died before gate')
             if observer.wait_exit(0): raise ValueError('C8 observer died before gate')
@@ -326,12 +366,24 @@ def main():
                         or fd_identity(current.fd) != original['identity']
                         or current.digest != original['sha256']):
                     raise ValueError('original C8 held file changed')
-            pin.image_receipt({'image': gen}, owner)
+            if current:
+                pin.image_receipt({'image': gen}, owner)
+                with (Path('/proc') / str(pid) / 'maps').open() as mapped:
+                    text = mapped.read(LIMIT + 1)
+                if len(text) > LIMIT: raise ValueError('owned C8 maps exceed original byte bound')
+                mappings = [maps_line.fullmatch(line) for line in text.splitlines()]
+                if any(row is None for row in mappings): raise ValueError('malformed owned C8 maps')
+                if not any(row[3][2] == 'x' and int(row[7]) == provider['provider']['ino']
+                        and [int(row[5], 16), int(row[6], 16)] == provider['provider']['dev']
+                        for row in mappings):
+                    raise ValueError('owned C8 actor has no held provider code mapping')
             check_deadline(deadline)
         previous = (json.loads(Path(str(prefix) + f'.{gen-1}.post.json').read_text())
                     if gen else None)
         pre = (json.loads(Path(str(prefix) + f'.{gen}.pre.json').read_text())
                if operation == 'post' else None)
+        if previous and (previous['pid'] != pid or previous['gen'] != gen - 1):
+            raise ValueError('C8 prior completed generation differs')
         stream = state['stream']
         saved = pre or previous or {}
         last_size = observed_bytes = saved.get('stream_bytes', 0)
@@ -365,24 +417,35 @@ def main():
                             raise ValueError('native C8 image differs from original held birth/file')
                         native.append((parts[0], row))
             ready = [r for k, r in native if k == 'WATCH_READY' and r.get('phase') == ('go' if operation == 'pre' else 'next')]
+            mapped = [r for k, r in native if k == 'MAPPED' and r.get('module') == provider['path']
+                      and r.get('ino') == str(provider['identity'][1])]
+            identified = [r for k, r in native if k == 'IDENT']
+            calls = [r for k, r in native if k == 'LEDGER']
             want = {'pid': pid, 'start': owner.identity['start_time'], 'gen': gen, 'exe': exe['exe'],
                     'provider': provider['provider'], 'origin': state['origin'], 'deadline': deadline,
                     'previous': previous, 'pre': pre}
             if previous and previous['start'] != want['start']: raise ValueError('C8 birth changed across exec')
             if ready and int(ready[0]['deadline']) != deadline: raise ValueError('native C8 deadline renewed')
+            if ready and (len(ready) != 1 or len(mapped) != 1 or len(identified) != 1):
+                raise ValueError('native C8 current image/provider readiness differs')
+            if ready and previous and int(ready[0]['t']) <= previous['done_ns']:
+                raise ValueError('native C8 successor predates the completed generation')
+            if ready: verify(current=True)
             complete = operation == 'pre'
+            if operation == 'pre' and calls: raise ValueError('C8 calls preceded their native gate')
             if operation == 'post':
                 done = [r for k, r in native if k == 'DONE' and r.get('status') == 'ok']
-                calls = [r for k, r in native if k == 'LEDGER']
                 expected = 18 + gen * 10
                 if done and calls:
                     if (len(calls) != expected or any(r['n'] != '1' or r['bad'] != '0'
                             or r['t0'] != r['t1'] or r['module'] != provider['path'] for r in calls)):
                         raise ValueError('C8 original singleton call plan differs')
                     want.update(count=expected, done_ns=int(done[0]['t']),
+                                first_entry_ns=min(int(r['t0']) for r in calls),
                                 last_entry_ns=max(int(r['t1']) for r in calls))
                     complete = True
-            proof = select_gate(records, want, operation) if records and ready and complete else None
+            phase = 'native' if operation == 'pre' and gen else operation
+            proof = select_gate(records, want, phase) if records and ready and complete else None
             verify()
             if proof:
                 if fd_identity(stream['fd'])[2] != size:
@@ -392,7 +455,7 @@ def main():
                 gate = Path(str(prefix) + f'.{gen}.' + ('go' if operation == 'pre' else 'next'))
                 if gate.exists(): raise ValueError('C8 gate already exists')
                 write_new(receipt, proof)
-                verify()
+                verify(current=True)
                 gate.touch(exist_ok=False)
                 print(json.dumps(proof))
                 return
@@ -811,11 +874,11 @@ if [ "$LANE" = native ]; then
         if [ "$c8_gen" != 0 ]; then
             c8_gate pre "$C8_PINS" P5 "$C8_P5_PID" "$c8_gen" "$c8_exe" A \
                 "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
-                > "$OBS/c8-P5-$c8_gen-pre.log" || die "P5 image$c8_gen provider watch unproved"
+                > "$OBS/c8-P5-$c8_gen-pre.log" || die "P5 image$c8_gen native image/provider readiness unproved"
         fi
         c8_gate post "$C8_PINS" P5 "$C8_P5_PID" "$c8_gen" "$c8_exe" A \
             "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
-            > "$OBS/c8-P5-$c8_gen-post.log" || die "P5 image$c8_gen full count unproved"
+            > "$OBS/c8-P5-$c8_gen-post.log" || die "P5 image$c8_gen count/publication progress unproved"
     done
 fi
 for c in P1 P2 P3 P7 LX P5; do waitfor "$OBS/ledgers/$c.out" '^DONE .*gen=0' 60 || echo "$c: no DONE" >&2; done

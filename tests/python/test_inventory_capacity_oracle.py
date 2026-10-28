@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -959,6 +960,105 @@ class C8GatePredicateTests(unittest.TestCase):
         self.assertIsNone(self.gate['records_from'](data[:-1]))
         self.assertEqual(self.gate['records_from'](data), self.rows)
 
+    def successor_progress(self, *, bound=False):
+        self.successor()
+        self.want.update(pre={'proof': 'native_ready', 'seq': 8}, count=28,
+                         first_entry_ns=210, last_entry_ns=230, done_ns=240)
+        edge = self.edge(counted=bound, count=28 if bound else 0)
+        if not bound:
+            edge['entries']['coverage'].update(state='unknown', reason='use_before_admission', since_ns=None)
+        self.add('edge_observed', edge, 232)
+        self.add('pass_committed', {'pass': 3, 'unbound_rows': [
+            {'module': 'm0', 'reason': 'before_admission', 'rows': 1}]}, 235)
+        self.add('pass_committed', {'pass': 4}, 250)
+
+    def test_successor_post_accepts_exact_bound_count_without_a_public_pre_watch(self):
+        self.successor_progress(bound=True)
+        proof = self.select('post')
+        self.assertEqual(proof['proof'], 'bound_exact')
+        self.assertEqual(proof['count'], 28)
+
+    def test_bound_successor_cannot_borrow_anonymous_rows_to_hide_a_bad_count(self):
+        self.successor_progress(bound=True)
+        self.add('gap_recorded', {'module': 'm0', 'pid': None,
+                                  'subject': 'unidentified caller image'}, 260)
+        self.add('pass_committed', {'pass': 5}, 270)
+        self.assertEqual(self.select('post')['proof'], 'bound_exact')
+        self.rows[9]['event']['entries']['count'] = 27
+        self.assertIsNone(self.select('post'))
+
+    def test_successor_post_retains_anonymous_delta_before_done_without_claiming_api_count(self):
+        self.successor_progress()
+        proof = self.select('post')
+        self.assertEqual(proof['proof'], 'publication_progress')
+        self.assertEqual(proof['caller'], 'c1')
+        self.assertEqual(proof['witness']['seq'], 10)
+        self.assertNotIn('count', proof)
+        self.assertEqual(proof['seq'], 11)
+
+    def test_anonymous_progress_requires_later_done_seal_and_disclosure(self):
+        self.successor_progress()
+        self.assertIsNotNone(self.select('post'))
+        seal = self.rows.pop()
+        self.assertIsNone(self.select('post'))
+        self.rows.append(seal)
+        self.rows[9]['event']['entries']['coverage']['reason'] = 'pending_first_use'
+        self.assertIsNone(self.select('post'))
+        self.add('gap_recorded', {'module': 'm0', 'pid': None,
+                                  'subject': 'unidentified caller image', 'reason': 'before_admission'}, 260)
+        self.add('pass_committed', {'pass': 5}, 270)
+        self.assertIsNotNone(self.select('post'))
+        self.rows[-2]['event']['pid'] = 101
+        self.assertIsNone(self.select('post'))
+
+    def test_delta_pass_itself_seals_done_when_its_timestamp_already_covers_done(self):
+        self.successor_progress()
+        self.rows.pop()
+        self.want['done_ns'] = 235
+        proof = self.select('post')
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['witness']['seq'], proof['seq'])
+
+    def test_anonymous_progress_rejects_missing_old_reused_wrong_module_and_bad_rows(self):
+        self.successor_progress()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('missing', 'old', 'reused', 'wrong_module', 'wrong_reason', 'zero', 'bool'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                item = self.rows[10]['event']['unbound_rows'][0]
+                extra = {}
+                if change == 'missing': self.rows[10]['event']['unbound_rows'] = []
+                elif change == 'old': extra['first_entry_ns'] = 236
+                elif change == 'reused': extra['unbound_watermark'] = 10
+                elif change == 'wrong_module': item['module'] = 'm9'
+                elif change == 'wrong_reason': item['reason'] = 'caller_exited'
+                elif change == 'zero': item['rows'] = 0
+                elif change == 'bool': item['rows'] = True
+                self.assertIsNone(self.select('post', **extra))
+
+    def test_anonymous_progress_needs_fresh_identity_and_refuses_retired_final_and_late(self):
+        self.successor_progress()
+        baseline = copy.deepcopy(self.rows)
+        for change in ('identity', 'retired', 'final', 'deadline'):
+            with self.subTest(change=change):
+                self.rows = copy.deepcopy(baseline)
+                if change == 'identity':
+                    self.rows[6]['event']['identity_context']['new']['incarnation'] = 0
+                elif change == 'retired':
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c1'}, 260)
+                elif change == 'final':
+                    self.add('pass_committed', {'pass': 5, 'final': True}, 260)
+                else:
+                    self.gate['monotonic_ns'] = lambda: 1000
+                    with self.assertRaisesRegex(ValueError, 'deadline'):
+                        self.select('post')
+                    continue
+                self.assertIsNone(self.select('post'))
+
+    def test_anonymous_reasons_match_the_unchanged_final_oracle(self):
+        oracle = runpy.run_path(str(ORACLE))
+        self.assertEqual(self.gate['EXEC_REASONS'], oracle['COUNTED_EXEC_CHAIN_REASONS'])
+
 
 class C8GateFixtureTests(unittest.TestCase):
     @classmethod
@@ -1154,7 +1254,8 @@ class C8GateFixtureTests(unittest.TestCase):
             rows.append({'schema': 'p11scope/inventory-events/v1', 'seq': len(rows),
                          'at_ns': time.monotonic_ns() if at is None else at,
                          'kind': kind, 'event': copy.deepcopy(event)})
-            stream.write_text(''.join(json.dumps(x) + '\n' for x in rows))
+            with stream.open('a') as output:
+                output.write(json.dumps(rows[-1]) + '\n')
         origin = int(ready['deadline']) - 10_000_000_000
         append('started', {'started_ns': origin, 'clock': {'basis': 'CLOCK_MONOTONIC', 'unit': 'ns'}}, origin)
         append('caller_event', {'event': 'admitted', 'caller': 'c0',
@@ -1164,9 +1265,90 @@ class C8GateFixtureTests(unittest.TestCase):
         fd = os.open(stream, os.O_RDONLY)
         self.addCleanup(os.close, fd)
         invoke('start', stream, fd, 10, observer.pid, os.getpid())
-        def gate(phase):
-            return invoke(phase, 'P5', child.pid, 0, 'L', 'A', ledger, prefix, os.getpid(), os.getuid())
+        def gate(phase, gen=0):
+            return invoke(phase, 'P5', child.pid, gen, 'L2' if gen == 2 else 'L',
+                          'A', ledger, prefix, os.getpid(), os.getuid())
         return child, observer, prefix, ledger, ns, edge, append, gate
+
+    def test_successor_publisher_waits_for_real_native_use_instead_of_deadlocking_pre(self):
+        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs()
+        gate('pre')
+        self.wait(child, ledger, 'WATCH_READY', gen=0, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        edge['entries'].update(count=18, first_seen_ns=int(calls[0]['t0']) + 1,
+                               last_seen_ns=int(calls[-1]['t1']) + 1)
+        edge['entries']['coverage'].update(state='counted', lossy=False, since_ns=int(calls[0]['t0']) + 1)
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 1})
+        gate('post')
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        # The controlled publisher cannot mint the successor before its first
+        # actual native call. The old public-PRE wait therefore expires here.
+        ready = next(parse_native_row(x) for x in ledger.read_text().splitlines()
+                     if x.startswith('WATCH_READY ') and ' gen=1 ' in x)
+        stopped, errors = threading.Event(), []
+        def publish_after_native_use():
+            try:
+                while not stopped.wait(.002):
+                    if any(x.startswith('LEDGER ') and ' gen=1 ' in x for x in ledger.read_text().splitlines()):
+                        break
+                else:
+                    return
+                self.wait(child, ledger, 'WATCH_READY', gen=1, phase='next')
+                old = copy.deepcopy(edge['identity_context']['caller'])
+                old['lifecycle'] = 'exec_retired'
+                current = copy.deepcopy(old)
+                current.update(id='c1', incarnation=1, lifecycle='mapped')
+                append('caller_event', {'event': 'exec_retired', 'old': 'c0', 'new': 'c1',
+                    'identity_context': {'version': 1, 'old': old, 'new': current}})
+                edge.update(caller='c1')
+                edge['identity_context']['caller'] = current
+                edge['entries'].update(count=0, first_seen_ns=None, last_seen_ns=None)
+                edge['entries']['coverage'].update(state='unknown', reason='use_before_admission',
+                                                     lossy=None, since_ns=None)
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 2, 'unbound_rows': [
+                    {'module': 'm0', 'reason': 'before_admission', 'rows': 1}]})
+                append('pass_committed', {'pass': 3})
+            except BaseException as error:
+                errors.append(error)
+        publisher = threading.Thread(target=publish_after_native_use)
+        publisher.start()
+        self.addCleanup(publisher.join, 5)
+        self.addCleanup(stopped.set)
+        ns['monotonic_ns'] = lambda: time.monotonic_ns() + 9_000_000_000
+        gate('pre', 1)
+        proof = json.loads(Path(str(prefix) + '.1.pre.json').read_text())
+        self.assertEqual(proof['proof'], 'native_ready')
+        self.assertNotIn('caller', proof)
+        self.assertEqual(proof['deadline'], int(ready['deadline']))
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                 if x.startswith('LEDGER ') and ' gen=1 ' in x]
+        self.assertEqual(len(calls), 28)
+        publisher.join(2)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(errors, [])
+        gate('post', 1)
+        proof = json.loads(Path(str(prefix) + '.1.post.json').read_text())
+        self.assertEqual(proof['proof'], 'publication_progress')
+        self.assertNotIn('count', proof)
+        self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+        # The other executable's native PRE needs no imagined new public watch.
+        pins = ledger.parent / 'pins.json'
+        saved = pins.read_text()
+        wrong = json.loads(saved)
+        wrong['pins']['A']['provider']['ino'] += 1
+        pins.write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError, 'provider code mapping'):
+            gate('pre', 2)
+        self.assertFalse(Path(str(prefix) + '.2.go').exists())
+        pins.write_text(saved)
+        gate('pre', 2)
+        self.wait(child, ledger, 'WATCH_READY', gen=2, phase='next')
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                 if x.startswith('LEDGER ') and ' gen=2 ' in x]
+        self.assertEqual(len(calls), 38)
 
     def test_actual_embedded_controller_releases_only_after_current_watch_and_full_count(self):
         child, _observer, prefix, ledger, _ns, edge, append, gate = self.controller_inputs()

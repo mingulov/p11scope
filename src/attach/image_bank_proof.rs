@@ -864,6 +864,9 @@ pub(crate) struct N5Verdict {
     pub median_pct: f64,
     pub min_pct: f64,
     pub max_pct: f64,
+    /// Independent 250 ns diagnostic, including without a denominator.
+    pub absolute_pass: bool,
+    /// Full qualification: both the absolute and measured percentage gates.
     pub pass: bool,
 }
 
@@ -874,7 +877,8 @@ fn n5_verdict(added_ns: &[f64], pct: &[f64]) -> N5Verdict {
     let (min_pct, max_pct) = n5_spread(pct).unwrap_or((f64::NAN, f64::NAN));
     // Both gates are inclusive; a NaN median (empty input) compares
     // false, so it never passes.
-    let pass = median_added_ns <= N5_ADDED_BUDGET_NS && median_pct <= N5_PCT_BUDGET;
+    let absolute_pass = median_added_ns <= N5_ADDED_BUDGET_NS;
+    let pass = absolute_pass && median_pct <= N5_PCT_BUDGET;
     N5Verdict {
         median_added_ns,
         min_added_ns,
@@ -882,7 +886,19 @@ fn n5_verdict(added_ns: &[f64], pct: &[f64]) -> N5Verdict {
         median_pct,
         min_pct,
         max_pct,
+        absolute_pass,
         pass,
+    }
+}
+
+/// A missing percentage gate cannot be reported as a full N5 PASS.
+fn n5_verdict_label(verdict: &N5Verdict) -> &'static str {
+    if !verdict.median_pct.is_finite() {
+        "UNQUALIFIED"
+    } else if verdict.pass {
+        "PASS"
+    } else {
+        "FAIL"
     }
 }
 
@@ -926,7 +942,8 @@ pub(crate) const SEED_FAILURE_STATUS: u32 = 8;
 /// `scripts/bench-count-overhead.sh` method (observed minus
 /// unobserved on the `mt_count` workload) on the same host and
 /// window. Absent or unparsable input leaves the percentage
-/// not-computed and gates the 250 ns budget only.
+/// not-computed; the independent 250 ns diagnostic is still reported,
+/// but the full N5 cell remains unqualified.
 pub(crate) const N5_PRODUCTION_ENV_1: &str = "P11_BANK_N5_PRODUCTION_NS_1";
 pub(crate) const N5_PRODUCTION_ENV_4: &str = "P11_BANK_N5_PRODUCTION_NS_4";
 
@@ -1032,13 +1049,13 @@ fn n5_run_pct_production(added_ns: f64, production_ns: f64) -> Option<f64> {
 }
 
 /// N5 verdict without a production input: medians and spreads plus
-/// PASS/FAIL over the 250 ns added gate only; the pct fields are
-/// NaN and never gate.
+/// the independent 250 ns diagnostic. The pct fields are NaN, so
+/// this result can never pass full N5 qualification.
 fn n5_verdict_ns_only(added_ns: &[f64]) -> N5Verdict {
     let median_added_ns = n5_median(added_ns).unwrap_or(f64::NAN);
     let (min_added_ns, max_added_ns) = n5_spread(added_ns).unwrap_or((f64::NAN, f64::NAN));
     // The 250 ns gate only; a NaN median (empty input) never passes.
-    let pass = median_added_ns <= N5_ADDED_BUDGET_NS;
+    let absolute_pass = median_added_ns <= N5_ADDED_BUDGET_NS;
     N5Verdict {
         median_added_ns,
         min_added_ns,
@@ -1046,7 +1063,8 @@ fn n5_verdict_ns_only(added_ns: &[f64]) -> N5Verdict {
         median_pct: f64::NAN,
         min_pct: f64::NAN,
         max_pct: f64::NAN,
-        pass,
+        absolute_pass,
+        pass: false,
     }
 }
 
@@ -4574,9 +4592,10 @@ mod tests {
         // the proof dispatcher plus the same bank programs
         // (dispatcher on). Added cost is (c)-(b) per completed call;
         // the percentage divides by the production traced per-call
-        // cost input (R-47), or reports not-computed and gates
-        // 250 ns only. Both thread counts print their verdict before
-        // the cell asserts, so a FAIL log still shows every number.
+        // cost input (R-47). Without that input, the 250 ns diagnostic
+        // remains useful but full qualification is UNQUALIFIED. Both
+        // thread counts print before the cell asserts, so a failed or
+        // unqualified log still shows every measured number.
         require_root();
         let release = kernel_release();
         let cpus = std::thread::available_parallelism()
@@ -4741,7 +4760,7 @@ mod tests {
                 }
             };
             println!(
-                "P11_BANK_N5_verdict threads={threads} runs={} calls={} median_a_ns={:.3} median_b_ns={:.3} median_c_ns={:.3} median_added_ns={:.3} min_added_ns={:.3} max_added_ns={:.3} median_pct={:.3} min_pct={:.3} max_pct={:.3} production_ns={} verdict={}",
+                "P11_BANK_N5_verdict threads={threads} runs={} calls={} median_a_ns={:.3} median_b_ns={:.3} median_c_ns={:.3} median_added_ns={:.3} min_added_ns={:.3} max_added_ns={:.3} median_pct={:.3} min_pct={:.3} max_pct={:.3} production_ns={} absolute={} qualification={} verdict={}",
                 N5_RUNS_PER_LEG,
                 N5_CALLS_PER_RUN,
                 n5_median(&leg_a).expect("five untraced runs"),
@@ -4757,14 +4776,24 @@ mod tests {
                     .map(|cost| cost.to_string())
                     .as_deref()
                     .unwrap_or("none"),
-                if verdict.pass { "PASS" } else { "FAIL" }
+                if verdict.absolute_pass {
+                    "PASS"
+                } else {
+                    "FAIL"
+                },
+                if production.is_some() {
+                    "full"
+                } else {
+                    "absolute-only"
+                },
+                n5_verdict_label(&verdict)
             );
             thread_pass.push((threads, verdict.pass));
         }
         for (threads, pass) in thread_pass {
             assert!(
                 pass,
-                "N5 threads={threads}: dispatcher overhead over budget (see P11_BANK_N5_verdict)"
+                "N5 threads={threads}: full qualification requires both added and production percentage gates (see P11_BANK_N5_verdict)"
             );
         }
     }
@@ -6649,6 +6678,8 @@ mod tests {
     fn n5_verdict_needs_both_budgets() {
         let pass = super::n5_verdict(&[200.0; 5], &[10.0; 5]);
         assert!(pass.pass, "within both budgets passes");
+        assert!(pass.absolute_pass, "independent absolute gate passes");
+        assert_eq!(super::n5_verdict_label(&pass), "PASS");
         assert_eq!(pass.median_added_ns, 200.0, "added median");
         assert_eq!(
             (pass.min_added_ns, pass.max_added_ns),
@@ -6660,11 +6691,19 @@ mod tests {
         let over_added = super::n5_verdict(&[300.0, 100.0, 300.0, 100.0, 300.0], &[10.0; 5]);
         assert_eq!(over_added.median_added_ns, 300.0, "added median over 250");
         assert!(!over_added.pass, "median added over budget fails");
+        assert!(!over_added.absolute_pass, "absolute diagnostic fails");
+        assert_eq!(super::n5_verdict_label(&over_added), "FAIL");
         let over_pct = super::n5_verdict(&[200.0; 5], &[30.0, 1.0, 30.0, 1.0, 30.0]);
         assert_eq!(over_pct.median_pct, 30.0, "pct median over 15");
         assert!(!over_pct.pass, "median pct over budget fails");
+        assert!(
+            over_pct.absolute_pass,
+            "absolute pass cannot waive percentage"
+        );
+        assert_eq!(super::n5_verdict_label(&over_pct), "FAIL");
         let empty = super::n5_verdict(&[], &[]);
         assert!(!empty.pass, "empty inputs never pass");
+        assert_eq!(super::n5_verdict_label(&empty), "UNQUALIFIED");
     }
 
     #[test]
@@ -6673,6 +6712,7 @@ mod tests {
         // pass.
         let exact = super::n5_verdict(&[250.0; 5], &[15.0; 5]);
         assert!(exact.pass, "exactly the added and pct budgets passes");
+        assert_eq!(super::n5_verdict_label(&exact), "PASS");
     }
 
     #[test]
@@ -7037,7 +7077,9 @@ mod tests {
     #[test]
     fn n5_verdict_ns_only_covers_the_added_gate() {
         let pass = super::n5_verdict_ns_only(&[200.0; 5]);
-        assert!(pass.pass, "within the added budget passes");
+        assert!(pass.absolute_pass, "within the absolute budget passes");
+        assert!(!pass.pass, "the percentage gate remains unqualified");
+        assert_eq!(super::n5_verdict_label(&pass), "UNQUALIFIED");
         assert_eq!(pass.median_added_ns, 200.0, "added median");
         assert_eq!(
             (pass.min_added_ns, pass.max_added_ns),
@@ -7051,10 +7093,14 @@ mod tests {
         );
         let over = super::n5_verdict_ns_only(&[300.0, 100.0, 300.0, 100.0, 300.0]);
         assert_eq!(over.median_added_ns, 300.0, "added median over 250");
-        assert!(!over.pass, "median added over budget fails");
+        assert!(!over.absolute_pass, "median added over budget fails");
+        assert!(!over.pass, "no full qualification without percentage");
+        assert_eq!(super::n5_verdict_label(&over), "UNQUALIFIED");
         let exact = super::n5_verdict_ns_only(&[250.0; 5]);
-        assert!(exact.pass, "exactly the added budget passes");
+        assert!(exact.absolute_pass, "exactly the added budget passes");
+        assert!(!exact.pass, "the percentage gate remains unqualified");
         let empty = super::n5_verdict_ns_only(&[]);
+        assert!(!empty.absolute_pass, "empty absolute input never passes");
         assert!(!empty.pass, "empty inputs never pass");
     }
 
@@ -7376,7 +7422,8 @@ mod tests {
         // The 15% denominator is the production traced per-call cost
         // (bench method on the same host and window), taken as an
         // input per thread count; without it the cell prints its ns
-        // numbers with a named not-computed line and gates 250 ns.
+        // numbers with a named not-computed line, reports the absolute
+        // diagnostic, and leaves full qualification unqualified.
         let source = include_str!("image_bank_proof.rs");
         let body = fn_body_between(
             source,

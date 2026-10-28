@@ -11610,8 +11610,8 @@ mod tests {
     // promotion tests; only the coordinator stays local (it would
     // collide with this module's own).
     use super::promotion_driver_tests::{
-        CountingSource, WindDownIo, driver_with_display, gaps, headless_display, joint_lane,
-        queue_request, wind_down_lane,
+        CountingSource, WindDownIo, completed_joint_lane, driver_with_display, gaps,
+        headless_display, joint_lane, queue_request, wind_down_lane,
     };
     use crate::inventory_capture::{
         BlockDisposition, ClassicCompletion, ClassicOutcome, FacadeLane, LoopClock, Publish,
@@ -12265,7 +12265,9 @@ mod tests {
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coord, headless.display);
         driver.display = None;
-        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let io = WindDownIo::completing();
+        let detach_polls = std::rc::Rc::clone(&io.polls);
+        driver.semantic = Some(completed_joint_lane(io));
         driver.joint_finish = JointFinishDriver::Polling;
         let outcome = super::tests::retain_with_cause(
             &mut driver,
@@ -12310,15 +12312,14 @@ mod tests {
             .filter(|(subject, _)| subject == ZERO_PASS_GAP_SUBJECT)
             .collect();
         assert_eq!(zeros.len(), 1, "one zero-pass gap: {:?}", gaps(&mut driver));
-        assert!(
-            driver.semantic.is_some(),
-            "the polling lane is kept, never spuriously abandoned"
-        );
+        assert!(driver.semantic.is_none(), "the joined lane hands off");
+        assert!(detach_polls.get() > 0, "the original detach was polled");
         assert_eq!(
             driver.joint_finish,
-            JointFinishDriver::Polling,
-            "no latch means no finite stop"
+            JointFinishDriver::Published,
+            "the finished lane completes without abandonment"
         );
+        assert!(driver.joint_first_error.is_none());
 
         // A synchronous first stop of an unfinished Joint lane also
         // returns its abandoned Finish error through the consumer.
@@ -12366,7 +12367,9 @@ mod tests {
         let mut coord = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coord, headless.display);
-        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        let io = WindDownIo::completing();
+        let detach_polls = std::rc::Rc::clone(&io.polls);
+        driver.semantic = Some(completed_joint_lane(io));
         driver.joint_finish = JointFinishDriver::Polling;
         let outcome = super::tests::retain_with_cause(
             &mut driver,
@@ -12409,10 +12412,10 @@ mod tests {
             driver.display.as_ref().expect("display").account().ticks > display_ticks,
             "retained service still ticks the dashboard display"
         );
-        assert!(
-            driver.semantic.is_some(),
-            "the polling lane is kept, never spuriously abandoned"
-        );
+        assert!(driver.semantic.is_none(), "the joined lane hands off");
+        assert!(detach_polls.get() > 0, "the original detach was polled");
+        assert_eq!(driver.joint_finish, JointFinishDriver::Published);
+        assert!(driver.joint_first_error.is_none());
     }
 
     #[test]
@@ -12716,7 +12719,7 @@ mod tests {
         let mut coord = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coord, headless.display);
-        driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+        driver.semantic = Some(completed_joint_lane(WindDownIo::completing()));
         driver.joint_finish = JointFinishDriver::Polling;
         let outcome = retain_with_cause(&mut driver, ZeroPassCause::Deadline, None);
         let (run, error) = retained_run_of(outcome);
@@ -12769,6 +12772,8 @@ mod tests {
             .filter(|(subject, _)| subject == ZERO_PASS_GAP_SUBJECT)
             .collect();
         assert_eq!(zeros.len(), 1, "one zero-pass gap: {:?}", gaps(&mut driver));
+        assert!(driver.semantic.is_none(), "the finished lane hands off");
+        assert_eq!(driver.joint_finish, JointFinishDriver::Published);
 
         // Twin: a retained first error is never overwritten by the
         // zero-pass staging, which stays suppressed under error.
@@ -12776,7 +12781,7 @@ mod tests {
             let mut coordinator2 = coordinator();
             let headless = headless_display();
             let mut driver = driver_with_display(&mut coordinator2, headless.display);
-            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            driver.semantic = Some(completed_joint_lane(WindDownIo::completing()));
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_cause(
                 &mut driver,
@@ -12915,7 +12920,9 @@ mod tests {
             let mut coordinator2 = coordinator();
             let headless = headless_display();
             let mut driver = driver_with_display(&mut coordinator2, headless.display);
-            driver.semantic = Some(joint_lane(WindDownIo::completing(), true));
+            let io = WindDownIo::completing();
+            let detach_polls = std::rc::Rc::clone(&io.polls);
+            driver.semantic = Some(completed_joint_lane(io));
             driver.joint_finish = JointFinishDriver::Polling;
             let outcome = retain_with_error_no_stop(&mut driver, "the retained failure");
             let (mut run, error) = retained_run_of(outcome);
@@ -12950,6 +12957,9 @@ mod tests {
                 }
                 _ => panic!("the no-op arm drains"),
             }
+            assert!(driver.semantic.is_none(), "the finished lane hands off");
+            assert_eq!(driver.joint_finish, JointFinishDriver::Published);
+            assert!(detach_polls.get() > 0, "the original detach was polled");
         }
     }
 
@@ -15523,6 +15533,18 @@ mod promotion_driver_tests {
         lane
     }
 
+    /// A completed machine has no retained Joint frame in production.
+    /// The held-frame fixture above deliberately overrides that query for
+    /// ownership negatives; healthy terminal consumers must clear only that
+    /// override. The original detach still has to poll and join before take.
+    pub(crate) fn completed_joint_lane(
+        io: WindDownIo,
+    ) -> crate::inventory_semantics::AttestedSemanticLane {
+        let mut lane = joint_lane(io, true);
+        lane.set_test_joint_frame(false);
+        lane
+    }
+
     /// Live, quiescent finalizer state for `domain` through the real
     /// stage/finalize path, with the seal evidence drained: a
     /// retire-Ok scene. Returns nothing; the coordinator holds it.
@@ -17416,6 +17438,82 @@ mod promotion_driver_tests {
             "the final broad commit follows handoff"
         );
         assert!(driver.joint_first_error.is_none());
+    }
+
+    #[test]
+    fn retained_finished_modes_keep_frame_and_detach_ownership() {
+        // A completed machine can still owe a native detach. Separately,
+        // deliberate held-frame fixtures (with or without a machine seam)
+        // must stay owned even after their detach completes. Never repair a
+        // healthy consumer by weakening either of those terminal gates.
+        for (machine, held_frame) in [(true, false), (true, true), (false, true)] {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let (mut io, gate) = if held_frame {
+                (WindDownIo::completing(), None)
+            } else {
+                let (io, gate) = WindDownIo::gated();
+                (io, Some(gate))
+            };
+            let polls = Rc::clone(&io.polls);
+            let drops = Rc::new(Cell::new(0));
+            io.drop_spy = Some(Rc::clone(&drops));
+            let mut lane = if held_frame {
+                joint_lane(io, true)
+            } else {
+                completed_joint_lane(io)
+            };
+            lane.set_test_joint_machine(machine);
+            driver.semantic = Some(lane);
+            driver.joint_finish = JointFinishDriver::Polling;
+            let mut outcome = retained_at_lane_stopped(&mut driver);
+            for _ in 0..8 {
+                outcome = poll_one_retained_action(&mut driver, outcome);
+            }
+            assert!(outcome.retained.is_some(), "the original run stays owned");
+            assert!(driver.semantic.is_some());
+            assert_eq!(driver.joint_finish, JointFinishDriver::Published);
+            assert!(!driver.publication_pending());
+            assert!(polls.get() > 0, "the actual detach has been polled");
+            assert_eq!(drops.get(), 0);
+            assert_eq!(driver.joint_commit_polls, 0);
+            assert_eq!(driver.commit_calls, 0);
+            assert!(driver.joint_first_error.is_none());
+
+            if held_frame {
+                // This negative has no frame-completion proof. Only the
+                // existing typed abandon can finish it, with an error and
+                // the original owner held, rather than a joined handoff.
+                driver.escalate_joint_finish("owned held-frame disposition");
+            } else {
+                // The frame is already gone; release only this test's
+                // original detach gate and let the real take verify it.
+                release_gate(gate.as_ref().unwrap());
+            }
+            let stop = || false;
+            let clock = super::tests::consume_clock(&stop);
+            let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(driver.semantic.is_none());
+            if held_frame {
+                assert_eq!(driver.joint_finish, JointFinishDriver::Abandoned);
+                assert!(
+                    error
+                        .unwrap()
+                        .to_string()
+                        .contains("owned held-frame disposition")
+                );
+                assert_eq!(
+                    drops.get(),
+                    0,
+                    "an abandoned frame never releases its owner"
+                );
+            } else {
+                assert_eq!(driver.joint_finish, JointFinishDriver::Published);
+                assert!(error.is_none());
+                assert_eq!(drops.get(), 1, "joined handoff releases the original owner");
+            }
+        }
     }
 
     #[test]

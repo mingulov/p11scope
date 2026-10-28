@@ -1110,7 +1110,7 @@ def live_named_trace(args, binary, out):
         return ok
 
     qualify_out = out / "qualify"
-    qualify_out.mkdir(mode=0o755)
+    # The qualifier owns new-only directory creation and refuses reuse.
     argv = [sys.executable, "-I", str(QUALIFY_TRACE), "--binary", str(resolved),
            "--provider", inputs["provider"], "--caller", inputs["caller"],
            "--source-revision", revision]

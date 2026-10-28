@@ -13,6 +13,7 @@ files at its substituted qualification boundary; no capture, no privilege.
 Run: python3 -I tests/python/test_release_recipient.py -v
 """
 import argparse
+import ast
 import contextlib
 import errno
 import hashlib
@@ -244,7 +245,8 @@ class ReleaseRecipientTests(unittest.TestCase):
             "first": {"named": 1}, "second": {"named": 1}}
         return rows
 
-    def compose_named_trace(self, *, selected=None, results=None, missing=(), supported=None):
+    def compose_named_trace(self, *, selected=None, results=None, missing=(), supported=None,
+                            occupied=None):
         """Run the real receipt composer with only its native boundary substituted."""
         stage = stage_pair(self.root, f"live-{len(list(self.root.iterdir()))}")
         args = DRIVER.build_parser().parse_args([
@@ -258,19 +260,42 @@ class ReleaseRecipientTests(unittest.TestCase):
                   "helper": str(self.root / "manifest-helper")}
         rows = self.trace_results() if results is None else results
         commands = []
+        self.last_trace_out, self.last_qualify_commands = out, commands
+        if occupied is not None:
+            target = out / ('qualify' if occupied == 'directory' else 'prior-output')
+            target.mkdir()
+            (target / 'preserve').write_text('original input')
+            if occupied == 'symlink':
+                (out / 'qualify').symlink_to(target, target_is_directory=True)
+        # Execute the actual qualifier's new-only creation expression in a
+        # child. A fake writer under a parent-created directory missed the
+        # ownership conflict between these two real command boundaries.
+        tree = ast.parse(DRIVER.QUALIFY_TRACE.read_text())
+        creates = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Attribute)
+                   and ast.unparse(node.func) == 'args.out.mkdir']
+        self.assertEqual(len(creates), 1)
+        child = ('import json, sys\nfrom pathlib import Path\n'
+                 'from types import SimpleNamespace\n'
+                 'args = SimpleNamespace(out=Path(sys.argv[1]))\n'
+                 + ast.unparse(creates[0]) + '\n'
+                 'rows, names, missing = map(json.loads, sys.argv[2:])\n'
+                 'for name in names:\n'
+                 '    if name in missing: continue\n'
+                 '    (args.out / name).mkdir()\n'
+                 '    (args.out / name / "result.json").write_text(json.dumps(rows[name]))\n')
 
         def qualify(argv, **_bounds):
             self.assertEqual(argv[:3], [sys.executable, "-I", str(DRIVER.QUALIFY_TRACE)])
             self.assertEqual(argv[argv.index("--binary") + 1], str(stage["selected"].resolve()))
             self.assertEqual(argv[argv.index("--manifest") + 1], inputs["manifests"][0])
             commands.append(argv)
-            directory = Path(argv[argv.index("--out") + 1])
-            for name in argv[argv.index("--cells") + 1].split(","):
-                if name in missing:
-                    continue
-                (directory / name).mkdir()
-                (directory / name / "result.json").write_text(json.dumps(rows[name]))
-            return 0, b"native results written", b""
+            result = subprocess.run([
+                sys.executable, '-I', '-c', child, argv[argv.index('--out') + 1],
+                json.dumps(rows), json.dumps(argv[argv.index('--cells') + 1].split(',')),
+                json.dumps(missing)], capture_output=True, timeout=10)
+            self.last_qualify_result = result
+            return result.returncode, result.stdout, result.stderr
 
         with patch.object(DRIVER, "trace_inputs", return_value=inputs) as validate, \
                 patch.object(DRIVER, "load_module", return_value={
@@ -297,6 +322,19 @@ class ReleaseRecipientTests(unittest.TestCase):
             self.assertEqual(row["detail"]["false_names"], 0)
             self.assertEqual(row["detail"]["errors"], [])
         self.assertEqual(receipt["binary"]["source_revision"], "a" * 40)
+
+    def test_named_trace_qualifier_refuses_existing_directory_and_symlink(self):
+        for occupied in ('directory', 'symlink'):
+            with self.subTest(occupied=occupied):
+                with self.assertRaisesRegex(AssertionError, 'installed trace qualification failed'):
+                    self.compose_named_trace(occupied=occupied)
+                self.assertEqual(len(self.last_qualify_commands), 1)
+                self.assertNotEqual(self.last_qualify_result.returncode, 0)
+                self.assertIn(b'FileExistsError', self.last_qualify_result.stderr)
+                target = self.last_trace_out / 'qualify'
+                self.assertEqual((target / 'preserve').read_text(), 'original input')
+                self.assertEqual(target.is_symlink(), occupied == 'symlink')
+                self.assertFalse((self.last_trace_out / 'receipt.json').exists())
 
     def test_named_trace_subset_is_an_incomplete_full_gate(self):
         code, receipt, commands = self.compose_named_trace(selected="stable")

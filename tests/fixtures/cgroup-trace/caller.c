@@ -5,7 +5,8 @@
  * rows carry the observed vaddr alongside the file offset).
  * Interactive: calls|spaced FUNCTION COUNT DELAY_MS PHASE SCOPE;
  * exec|thread-exec PATH; stop. Auto: --start-gate PATH --auto-gate PATH
- * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE]. */
+ * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE].
+ * --map-only 1 maps the provider without calling PKCS#11; only stop is accepted. */
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dlfcn.h>
@@ -129,6 +130,18 @@ static void setup(void) {
     (slots[0], 6, NULL, NULL, &session); call("C_OpenSession", rv, "setup", t, session);
   header("ready"); printf(",\"t\":%llu}\n", now_ns()); fflush(stdout);
 }
+static int mapped_only(void) {
+  /* Keep the handle mapped until process exit, just as normal setup does. */
+  void *handle = dlopen(module, RTLD_NOW | RTLD_LOCAL);
+  if (!handle) { fprintf(stderr, "provider load failed\n"); return 1; }
+  void *symbol = dlsym(handle, "C_GetFunctionList");
+  if (!symbol || target("C_GetFunctionList", symbol)) return 1;
+  header("ready"); printf(",\"t\":%llu}\n", now_ns()); fflush(stdout);
+  char line[8192];
+  if (!fgets(line, sizeof line, stdin) || strcmp(line, "stop\n")) return 2;
+  ack("done");
+  return 0;
+}
 static void teardown(void) {
   unsigned long long t = now_ns(); CK_RV rv = F(13, CK_RV (*)(CK_SESSION_HANDLE))(session);
   call("C_CloseSession", rv, "teardown", t, session);
@@ -210,6 +223,7 @@ int main(int argc, char **argv) {
   if (sizeof(void *) != 8 || sizeof(unsigned long) != 8 || argc < 4) return 2;
   module = argv[1]; image = strtoul(argv[2], NULL, 10); scope = argv[3];
   const char *gate = NULL, *start_gate = NULL;
+  int map_only = 0;
   unsigned long long load_deadline = 0;
   unsigned long auto_count = 20, auto_delay = 200;
   for (int i = 4; i < argc; i += 2) {
@@ -218,6 +232,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--start-gate")) start_gate = argv[i + 1];
     else if (!strcmp(argv[i], "--auto-count")) auto_count = strtoul(argv[i + 1], NULL, 10);
     else if (!strcmp(argv[i], "--auto-delay-ms")) auto_delay = strtoul(argv[i + 1], NULL, 10);
+    else if (!strcmp(argv[i], "--map-only")) {
+      if (map_only || strcmp(argv[i + 1], "1")) return 2;
+      map_only = 1;
+    }
     else if (!strcmp(argv[i], "--h6-load-deadline")) {
       if (load_deadline || !argv[i + 1][0]) return 2;
       for (const unsigned char *p = (const unsigned char *)argv[i + 1]; *p; p++)
@@ -239,7 +257,9 @@ int main(int argc, char **argv) {
   if (env) private_buffer[62] ^= (unsigned char)env[0];
   if (!auto_count || auto_count > 10000 || auto_delay > 10000 || auto_count * auto_delay > 125000UL) return 2;
   if (load_deadline && (image || gate || start_gate)) return 2;
+  if (map_only && (gate || start_gate || load_deadline)) return 2;
   observed_image();
+  if (map_only) return mapped_only();
   if (start_gate) wait_gate(start_gate, 5000000000ULL);
   if (load_deadline && !initial_load(load_deadline)) return 0;
   setup();

@@ -45717,6 +45717,100 @@ impl Drop for CollectedFinishRetirementCase {
 }
 
 #[test]
+fn collected_finish_failed_ordinary_barrier_is_terminal_without_releasing_quarantine() {
+    for fail_return in [false, true] {
+        let mut case = CollectedFinishRetirementCase::new(fail_return, false);
+        let mut original = collected_finish_leader_exit(case._child.pid());
+        original.hook_ts_ns = 551;
+        let held = case
+            .engine
+            .service_collected_finish_records(&mut case.session, vec![original], 0, 1)
+            .unwrap();
+        assert!(held.pending && !held.progressed);
+        case.release();
+        case.returned
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let terminal = loop {
+            let result =
+                case.engine
+                    .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1);
+            if result.is_err()
+                || case.engine.pending_global_retirement.is_none()
+                || case
+                    .engine
+                    .counters
+                    .object_skips
+                    .iter()
+                    .any(|skip| skip.subject == "global native retirement")
+            {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual worker verdict"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(case.engine.pending_discovery_records.len(), 1);
+        assert_eq!(
+            case.engine.pending_discovery_records[0].record.hook_ts_ns,
+            551
+        );
+        if fail_return {
+            assert!(
+                terminal.is_err(),
+                "a failed native barrier must end Finish, not wait for a second stop"
+            );
+            assert!(
+                terminal
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ordinary native retirement failed")
+            );
+            let ticket = case.engine.pending_global_retirement.as_ref().unwrap();
+            let mut native = case
+                .session
+                .global_retirement
+                .as_ref()
+                .unwrap()
+                .borrow_mut();
+            assert!(native.blocking(), "failure retains original native custody");
+            assert_eq!(native.poll(ticket), RetirementPoll::Refused);
+            assert!(
+                native.begin(&case.engine.plan.slots).is_err(),
+                "replacement stays blocked"
+            );
+            drop(native);
+            assert!(case.engine.collected_finish_backlog_pending(0));
+            let live = case
+                .engine
+                .service_backlog_quantum(&mut case.session)
+                .unwrap();
+            assert!(
+                live.pending && !live.progressed,
+                "ordinary live quarantine is unchanged"
+            );
+        } else {
+            assert!(terminal.is_ok());
+            assert!(case.engine.pending_global_retirement.is_none());
+            assert!(
+                !case
+                    .session
+                    .global_retirement
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .blocking()
+            );
+        }
+        assert!(case.session.attached_slots.is_empty());
+        assert!(case.session.replaced_slot_indices.is_empty());
+    }
+}
+
+#[test]
 fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     // Native failure is never converted to terminal readiness. A successful
     // native receipt also cannot hide a different retained Engine assessment.
@@ -45771,29 +45865,36 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let progress = case
-                .engine
-                .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1)
-                .unwrap();
+            let result =
+                case.engine
+                    .service_collected_finish_records(&mut case.session, Vec::new(), 0, 1);
+            if fail_return && let Err(error) = &result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("ordinary native retirement failed")
+                );
+                assert!(case.engine.pending_global_retirement.is_some());
+                assert!(case.engine.collected_finish_backlog_pending(0));
+                assert!(case.engine.pending_leader_exit_views.contains(&view));
+                assert!(
+                    case.engine
+                        .counters
+                        .object_skips
+                        .iter()
+                        .any(|skip| skip.subject == "global native retirement"
+                            && skip.reason == "original static ownership remains uncertain; replacement admission is blocked")
+                );
+                break;
+            }
+            let progress = result.unwrap();
             if !case.engine.pending_leader_exit_views.is_empty() {
                 assert!(
                     progress.pending,
                     "a settled native ticket cannot hide the still-owned matched assessment"
                 );
             }
-            if fail_return {
-                if case
-                    .engine
-                    .counters
-                    .object_skips
-                    .iter()
-                    .any(|skip| skip.subject == "global native retirement"
-                        && skip.reason == "original static ownership remains uncertain; replacement admission is blocked")
-                {
-                    assert!(case.engine.pending_global_retirement.is_some() && progress.pending);
-                    break;
-                }
-            } else if case.engine.pending_global_retirement.is_none() {
+            if !fail_return && case.engine.pending_global_retirement.is_none() {
                 break;
             }
             assert!(

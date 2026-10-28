@@ -19495,15 +19495,17 @@ impl Engine {
         std::mem::take(&mut self.immediate_exec_recovery_frame)
     }
 
-    /// Poll only the current Session allocation's ticket. A pending or refused
-    /// close is a readiness wait; successful settlement requests one ordinary
-    /// scoped frame, without replaying the candidate or crediting discovery.
+    /// Poll only the current Session allocation's ticket. Ordinary live work
+    /// stays blocked on both pending and refused ownership. Carry the actual
+    /// verdict so collected Finish can end incompletely on refusal while
+    /// retaining the quarantine. Only settlement owes an ordinary scoped frame.
     fn poll_global_retirement_barrier(
         &mut self,
         session: &mut dyn EngineSession,
-    ) -> Option<BacklogOutcome> {
+    ) -> Option<(RetirementPoll, BacklogOutcome)> {
         let ticket = self.pending_global_retirement.as_ref()?;
-        let settled = match session.poll_global_retirement(ticket) {
+        let poll = session.poll_global_retirement(ticket);
+        let settled = match poll {
             RetirementPoll::Pending => false,
             RetirementPoll::Refused => {
                 if !self.counters.object_skips.iter().any(|skip| skip.subject == "global native retirement" && skip.reason == "original static ownership remains uncertain; replacement admission is blocked") {
@@ -19523,11 +19525,14 @@ impl Engine {
                 true
             }
         };
-        Some(BacklogOutcome {
-            changed: false,
-            progressed: settled,
-            pending: self.discovery_backlog_pending(session.staged_discovery_len()),
-        })
+        Some((
+            poll,
+            BacklogOutcome {
+                changed: false,
+                progressed: settled,
+                pending: self.discovery_backlog_pending(session.staged_discovery_len()),
+            },
+        ))
     }
 
     /// Keep recovery work owed by a later matched EXEC. This only retains an
@@ -26403,9 +26408,16 @@ impl Engine {
         // neither drops inputs nor polls a ticket/advances an assessment.
         self.update_counter_snapshot(session)?;
         if self.pending_global_retirement.is_some() {
-            let mut outcome = self
+            let (poll, mut outcome) = self
                 .poll_global_retirement_barrier(session)
                 .expect("the original pending ticket was just checked");
+            if poll == RetirementPoll::Refused {
+                // Refusal is terminal for Finish, never proof of native
+                // closure. Original records, ticket and ownership stay held.
+                bail!(
+                    "ordinary native retirement failed to prove completion; original static ownership remains uncertain; replacement admission is blocked"
+                );
+            }
             // Ordinary polling intentionally has narrower readiness. Finish
             // must still account for journals, assessments and retained graph.
             outcome.pending = self.collected_finish_backlog_pending(session.staged_discovery_len());
@@ -26750,6 +26762,7 @@ impl Engine {
             self.update_counter_snapshot(session)?;
             let outcome = self
                 .poll_global_retirement_barrier(session)
+                .map(|(_, outcome)| outcome)
                 .unwrap_or(BacklogOutcome {
                     changed: false,
                     progressed: false,

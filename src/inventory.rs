@@ -4897,11 +4897,13 @@ impl ClassicDriver<'_> {
         }
     }
 
-    /// Fold the Joint first error into a retained outcome's error
-    /// channel: the retained error (if any) predates the I2 verdict,
-    /// so it stays first. Synchronous outcomes keep today's reads.
+    /// Fold the Joint first error into a retained outcome or an abandoned
+    /// terminal Finish. An earlier outcome error stays first. Ordinary
+    /// completion must not revive a prior promotion-winding refusal.
     fn fold_retained_joint_error(&mut self, error: Option<anyhow::Error>) -> Option<anyhow::Error> {
-        if self.suspended {
+        if self.suspended
+            || (self.stop_requested && matches!(self.joint_finish, JointFinishDriver::Abandoned))
+        {
             error.or_else(|| {
                 self.joint_first_error
                     .take()
@@ -17485,6 +17487,371 @@ mod promotion_driver_tests {
             driver.joint_step_calls, 3,
             "Pending, refusal, then the latch-observing step"
         );
+    }
+
+    #[test]
+    fn normal_first_stop_finish_refusal_returns_nonzero_without_retained_publication() {
+        for (refused, prior_winding_error) in [(false, false), (false, true), (true, false)] {
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            if prior_winding_error {
+                driver.joint_first_error = Some("earlier promotion winding refusal".into());
+            }
+            if refused {
+                let mut lane = joint_lane(WindDownIo::completing(), false);
+                lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+                lane.set_scripted_finish_poll_queue_for_test(vec![Err(
+                    crate::inventory_semantics::SemanticRefusal::Unavailable,
+                )]);
+                driver.semantic = Some(lane);
+                driver.coordinator.note_scope_gap(
+                    "global native retirement".into(),
+                    "original static ownership remains uncertain; replacement admission is blocked"
+                        .into(),
+                );
+            }
+            driver.second_signal = Some(&|| false);
+            assert!(!driver.suspended);
+            assert_eq!(driver.joint_finish, JointFinishDriver::NotBegun);
+            let stop_now = || true;
+            let clock = super::tests::consume_clock(&stop_now);
+            let outcome: ClassicOutcome<FacadeLane> =
+                run_classic_finalizing(&mut driver, None, &clock, None, &mut |_, _| Ok(()));
+            assert!(
+                outcome.retained.is_none(),
+                "the actual normal stop finalized"
+            );
+            assert!(!driver.suspended, "no posed retained publication");
+            let (stopped, error, zero_pass) =
+                driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+            assert!(stopped.is_none(), "no native completion was manufactured");
+            assert!(
+                zero_pass.is_some(),
+                "the informational pass-zero fact stays"
+            );
+            if refused {
+                assert_eq!(driver.joint_finish, JointFinishDriver::Abandoned);
+                assert!(
+                    driver.semantic.is_none(),
+                    "uncertain custody is held for exit"
+                );
+                assert_eq!(driver.joint_begin_calls, 1);
+                assert_eq!(driver.joint_step_calls, 2, "no second signal or backstop");
+            }
+            let terminal = combine_semantic_terminal_errors(error, Ok(()));
+            assert_eq!(
+                terminal.is_err(),
+                refused,
+                "a refused normal first stop must return its terminal error"
+            );
+            if let Err(error) = terminal {
+                assert_eq!(crate::run::failure_exit_code(&error), 1);
+            }
+            if prior_winding_error {
+                assert_eq!(
+                    driver.joint_first_error.as_deref(),
+                    Some("earlier promotion winding refusal"),
+                    "a normal stop without terminal abandonment leaves the prior refusal alone"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_finish_refusal_completes_first_stop_without_second_signal_or_backstop() {
+        struct TerminalWriter {
+            bytes: Vec<u8>,
+            fail: bool,
+            report: PathBuf,
+            drops: Rc<Cell<usize>>,
+            order: Rc<RefCell<Vec<&'static str>>>,
+        }
+        impl std::io::Write for TerminalWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(self.drops.get(), 0, "custody survives output attempts");
+                assert!(
+                    self.report.exists(),
+                    "the independent report committed first"
+                );
+                self.order.borrow_mut().push("stdout attempted");
+                if self.fail {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The separate actual-worker regression owns Refused, the original
+        // ticket and replacement refusal. This composed consumer proof maps
+        // that failure through the existing substituted Finish seam; it does
+        // not construct a Session/Q/native domain or a native completion.
+        for (refused, normal) in [(true, false), (false, false), (true, true), (false, true)] {
+            for json in [true, false] {
+                for stdout_fails in [false, true] {
+                    let case = format!(
+                        "refused={refused}, normal={normal}, json={json}, stdout_fails={stdout_fails}"
+                    );
+                    let mut coordinator = coordinator();
+                    let mut stream_state = StreamState::new();
+                    // Production installs this opening view before any
+                    // refusal/publication staging. A pending final must reuse
+                    // it instead of taking a fresh read through the guard.
+                    stream_state.last_stream_view =
+                        Some(Presentation::capture(&coordinator, "system", 1, 1, 0));
+                    let headless = headless_display();
+                    let mut driver = driver_with_display(&mut coordinator, headless.display);
+                    let drops = Rc::new(Cell::new(0));
+                    let custody = if refused {
+                        let mut io = WindDownIo::completing();
+                        io.drop_spy = Some(Rc::clone(&drops));
+                        let counts = (
+                            Rc::clone(&io.submits),
+                            Rc::clone(&io.polls),
+                            Rc::clone(&io.completes),
+                        );
+                        let mut lane = joint_lane(io, false);
+                        if normal {
+                            lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+                        }
+                        lane.set_scripted_finish_poll_queue_for_test(vec![Err(
+                            crate::inventory_semantics::SemanticRefusal::Unavailable,
+                        )]);
+                        driver.semantic = Some(lane);
+                        if !normal {
+                            driver.joint_finish = JointFinishDriver::Polling;
+                        }
+                        driver.coordinator.note_scope_gap(
+                            "global native retirement".into(),
+                            "original static ownership remains uncertain; replacement admission is blocked".into(),
+                        );
+                        Some(counts)
+                    } else {
+                        None
+                    };
+                    driver.second_signal = Some(&|| false);
+                    let stop_now = || normal;
+                    let clock = super::tests::consume_clock(&stop_now);
+                    let mut publish = |driver: &mut ClassicDriver<'_>, point: Publish<'_>| {
+                        match point {
+                            Publish::Pass { now_ns, .. } | Publish::Stop { now_ns, .. } => {
+                                let _ = stream_view_guarded(
+                                    driver,
+                                    &mut stream_state,
+                                    "system",
+                                    1,
+                                    now_ns,
+                                );
+                            }
+                            Publish::Retiring { .. } => {}
+                        }
+                        Ok(())
+                    };
+                    let mut outcome = if normal {
+                        assert!(!driver.suspended);
+                        assert_eq!(driver.joint_finish, JointFinishDriver::NotBegun);
+                        run_classic_finalizing(&mut driver, None, &clock, None, &mut publish)
+                    } else {
+                        super::tests::retain_with_cause(
+                            &mut driver,
+                            crate::inventory_capture::ZeroPassCause::OperatorStop,
+                            None,
+                        )
+                    };
+                    if normal {
+                        assert!(outcome.retained.is_none(), "real normal first stop: {case}");
+                        assert!(!driver.suspended, "no posed retained publication: {case}");
+                    }
+                    if refused && !normal {
+                        let run = outcome
+                            .retained
+                            .as_mut()
+                            .expect("the stop retains its owner");
+                        assert_eq!(
+                            run.stop_cause,
+                            Some(crate::inventory_capture::ZeroPassCause::OperatorStop)
+                        );
+                        // The existing I2 disposal row: same run and owners,
+                        // never a fabricated completion receipt.
+                        run.block = Some(RetainedBlock::Publication);
+                    }
+                    let (stopped, error, zero_pass) =
+                        driver.consume_outcome(outcome, &clock, &mut publish);
+                    assert!(stopped.is_none(), "no native completion: {case}");
+                    let zero = zero_pass.expect("the scan-only fixture completed zero passes");
+                    assert_eq!(
+                        zero.cause,
+                        crate::inventory_capture::ZeroPassCause::OperatorStop
+                    );
+                    assert_eq!(zero.discarded, 0);
+                    assert!(
+                        zero.stderr_line()
+                            .contains("stopped with 0 completed passes")
+                    );
+                    if refused {
+                        assert_eq!(driver.joint_finish, JointFinishDriver::Abandoned);
+                        assert!(driver.semantic.is_none(), "the lane is held for exit");
+                        assert_eq!(driver.joint_step_calls, 2, "no signal or backstop: {case}");
+                        assert!(
+                            error.as_ref().is_some_and(|error| error
+                                .to_string()
+                                .contains("joint finish disposition required")),
+                            "the consumer returned its original failure: {case}"
+                        );
+                    } else {
+                        assert!(error.is_none(), "healthy zero-pass twin: {case}");
+                    }
+
+                    // Read the real guarded publication. In particular, do
+                    // not use the gaps() helper: it publishes staged registry
+                    // work and would hide a missing terminal publication.
+                    let presentation = final_view_guarded(&driver, &stream_state, "system", 1, 2);
+                    let directory = tempfile::tempdir().unwrap();
+                    std::fs::set_permissions(
+                        directory.path(),
+                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                    )
+                    .unwrap();
+                    let report = directory.path().join("terminal.json");
+                    let sink = AtomicFile::create(&report).unwrap();
+                    let order = Rc::new(RefCell::new(Vec::new()));
+                    let mut stdout = TerminalWriter {
+                        bytes: Vec::new(),
+                        fail: stdout_fails,
+                        report: report.clone(),
+                        drops: Rc::clone(&drops),
+                        order: Rc::clone(&order),
+                    };
+                    let output = crate::inventory_capture::finish_native(
+                        stopped,
+                        |native| {
+                            assert!(native.is_none(), "no detach/drain evidence: {case}");
+                            order.borrow_mut().push("output begins");
+                            let output = finish_output(
+                                Some(sink),
+                                &mut EventLogState::new(None),
+                                &mut stream_state,
+                                &presentation,
+                                json,
+                                false,
+                                &mut WriterStdout(&mut stdout),
+                                native,
+                                None,
+                            );
+                            order.borrow_mut().push("output returned");
+                            output
+                        },
+                        &|| {
+                            assert_eq!(order.borrow().last(), Some(&"output returned"));
+                            assert!(report.exists());
+                            assert_eq!(drops.get(), 0, "no release before output: {case}");
+                            order.borrow_mut().push("outputs attempted");
+                        },
+                        &mut |_| panic!("no invented detach progress: {case}"),
+                        |_| panic!("no stopped native owner to release: {case}"),
+                    );
+                    assert_eq!(output.report_committed, Some(true), "{case}");
+                    assert_eq!(output.exit_code(), i32::from(stdout_fails), "{case}");
+                    assert_eq!(order.borrow().last(), Some(&"outputs attempted"));
+                    assert!(order.borrow().contains(&"stdout attempted"), "{case}");
+                    if stdout_fails {
+                        assert!(
+                            output.failures().iter().any(|failure| {
+                                failure.contains("stdout failed")
+                                    && failure.contains("accepted 0 of")
+                            }),
+                            "the independent sink failure is disclosed: {case}"
+                        );
+                    }
+                    let bytes = std::fs::read(&report).unwrap();
+                    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(document["observation"]["passes"], 0);
+                    for field in ["lane", "settlement", "retirement", "attach", "lifecycle"] {
+                        assert!(
+                            document["observation"].get(field).is_none(),
+                            "no native completion receipt: {field}, {case}"
+                        );
+                    }
+                    assert_ne!(
+                        document["observation"]["semantic_capture"]["final_drain"],
+                        true
+                    );
+                    assert_ne!(
+                        document["observation"]["semantic_capture"]["stop_quiescence"],
+                        "quiesced"
+                    );
+                    let gaps = document["gaps"].as_array().unwrap();
+                    assert!(
+                        gaps.iter().any(|gap| {
+                            gap["subject"] == crate::inventory_capture::ZERO_PASS_GAP_SUBJECT
+                        }),
+                        "the actual report retains the pass-0 fact: {case}"
+                    );
+                    for subject in [
+                        "global native retirement",
+                        "joint finish abandoned for exit",
+                    ] {
+                        assert_eq!(
+                            gaps.iter().any(|gap| gap["subject"] == subject),
+                            refused,
+                            "uncertainty is reported exactly when present: {subject}, {case}"
+                        );
+                    }
+                    if refused {
+                        assert!(gaps.iter().any(|gap| {
+                            gap["subject"] == "global native retirement"
+                                && gap["reason"].as_str().unwrap().contains(
+                                    "original static ownership remains uncertain; replacement admission is blocked"
+                                )
+                        }));
+                    }
+                    assert!(
+                        gaps.iter().all(|gap| {
+                            gap["subject"] != "joint finish settle bound reached"
+                                && !gap["reason"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("second stop during joint finish")
+                        }),
+                        "no second signal/backstop: {case}"
+                    );
+                    if !stdout_fails {
+                        if json {
+                            assert_eq!(stdout.bytes, bytes, "both sinks agree: {case}");
+                        } else {
+                            let text = String::from_utf8(stdout.bytes).unwrap();
+                            assert!(text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT));
+                            assert_eq!(text.contains("global native retirement"), refused);
+                            assert_eq!(text.contains("joint finish abandoned for exit"), refused);
+                        }
+                    }
+                    // The command combines its primary error AFTER output;
+                    // a truthful pass-0 disclosure cannot make it successful.
+                    let terminal = combine_semantic_terminal_errors(error, Ok(()));
+                    let status = match &terminal {
+                        Err(error) => crate::run::failure_exit_code(error),
+                        Ok(()) => output.exit_code(),
+                    };
+                    assert_eq!(terminal.is_err(), refused, "{case}");
+                    assert_eq!(status, i32::from(refused || stdout_fails), "{case}");
+                    if let Some((submits, polls, completes)) = custody {
+                        assert_eq!(submits.get(), 0, "no terminal cleanup invented");
+                        assert_eq!(polls.get(), 0, "no detach join attempted");
+                        assert_eq!(completes.get(), 0, "no native completion minted");
+                    }
+                    assert_eq!(
+                        drops.get(),
+                        0,
+                        "uncertain custody survives final output: {case}"
+                    );
+                }
+            }
+        }
     }
 
     /// Nonzero live-derived stop counts for the disclosure twins: the

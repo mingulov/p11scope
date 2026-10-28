@@ -409,13 +409,13 @@ The old bounds are measurements, not a product startup SLA.
   0-probe runs take the same time (5.15 14.8–21.5 s under host load),
   showing that these historical runs spent most startup time loading
   programs, rather than attaching probes.
-- Current FULL32 setup-only samples on the supported development host
+- Current FULL32 setup-only samples on Linux 7.0.0-38-generic with 12 visible CPUs
   took 7.512, 13.133 and 17.217 s from observer launch to readiness.
   The 7.512 s attempt had no usable syscall attribution. A separate
   complete 13.133 s measurement attributed 96.5% of its post-discovery
   interval to `BPF_PROG_LOAD`; it did not distinguish verifier, JIT or
   other work inside that syscall. No GO was released in these diagnostics.
-- **Inactive proposal, requiring owner approval:** use a 20 s observer
+- **Owner-approved test allowance, 2026-10-28:** use a 20 s observer
   readiness bound for the harness's existing modern-kernel timer class,
   preserving the preliminary borrowed-workload allowance at 8 s. Both
   legacy timer allowances stay 30 s; that is historical test policy,

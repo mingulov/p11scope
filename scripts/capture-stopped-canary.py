@@ -91,8 +91,8 @@ STOP_SECONDS = 30
 # legacy bound holds margin over those measured maxima under load. Current
 # FULL32 whole-observer setup samples on a supported host were 7.512, 13.133
 # and 17.217 s; the complete syscall diagnostic attributed 96.5% of the
-# post-discovery interval to BPF_PROG_LOAD. The proposed 20 s observer bound
-# is inactive until owner approval; the original 8 s canary failure remains.
+# post-discovery interval to BPF_PROG_LOAD. The owner approved the measured
+# 20 s observer allowance on 2026-10-28; the original 8 s failure remains.
 # Preliminary borrowed-workload roster/custody checks keep their old 8 s
 # allowance rather than composing two 20 s phases before the native GO bound.
 READY_SECONDS = 20

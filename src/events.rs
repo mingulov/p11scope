@@ -1024,7 +1024,8 @@ impl<S: RecordSource> EventDrain<S> {
     /// One-cursor dispatch poll (H8): each consumed record goes to exactly
     /// one consumer by length — 368/608-byte forms through the existing
     /// object decoder to `ordinary`, journal forms through the frozen
-    /// journal validators to `journal` — with the same quantum, malformed
+    /// journal validators, with UNJOURNALED ENDs normalized to `ordinary`
+    /// and tracked forms sent to `journal` — with the same quantum, malformed
     /// counting and stop semantics as the single-consumer polls. No second
     /// cursor and no decoded-count inference: consumption order is
     /// reservation order for every form. Activation-gated: production H0/H3
@@ -1081,6 +1082,9 @@ impl<S: RecordSource> EventDrain<S> {
                             let completed = project_journal_end_payload(end, descriptors)?;
                             if let Some(tap) = &self.trace_tap {
                                 tap.observe_call(&completed.base.event);
+                            }
+                            if end.unjournaled() {
+                                return Some(ordinary(completed));
                             }
                         }
                         Some(journal(record))
@@ -1401,7 +1405,8 @@ pub(crate) fn poll_object_records_to_position<S: BoundedRecordSource>(
 /// same proven-Q bounded drain over the same owned consumer, but each
 /// record goes to exactly one consumer by length — 368/608-byte forms
 /// through the existing object decoder to `ordinary`, journal forms
-/// through the frozen journal validators to `journal`. Same proven-Q
+/// through the frozen journal validators, with UNJOURNALED ENDs normalized
+/// to `ordinary` and tracked forms sent to `journal`. Same proven-Q
 /// contract, same malformed accounting, same single cursor. In
 /// particular a BUSY (Pending) record below no admitted writer stops the
 /// drain with the cursor held: the journal frontier cannot pass it.
@@ -1438,8 +1443,14 @@ pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
                     JOURNAL_BEGIN_BYTES
                     | JOURNAL_END_FULL_BYTES
                     | JOURNAL_END_COMPACT_BYTES
-                    | JOURNAL_ABANDON_BYTES => decode_journal_record(&item, descriptors)
-                        .map_or(Delivered::Malformed, Delivered::Journal),
+                    | JOURNAL_ABANDON_BYTES => match decode_journal_record(&item, descriptors) {
+                        Some(JournalRecord::End(end)) if end.unjournaled() => {
+                            project_journal_end_payload(&end, descriptors)
+                                .map_or(Delivered::Malformed, Delivered::Ordinary)
+                        }
+                        Some(record) => Delivered::Journal(record),
+                        None => Delivered::Malformed,
+                    },
                     _ => decode_object_record(&item, descriptors)
                         .map_or(Delivered::Malformed, Delivered::Ordinary),
                 }),
@@ -3374,6 +3385,247 @@ mod tests {
         }
     }
 
+    // Authored future-producer wire only: obtain the exact existing completed
+    // payload first, then mark it ordinary and clear the journal identity.
+    // This exercises transport decoding without activating a producer.
+    fn unjournaled_end_fixture(absent: bool, compact: bool) -> (Vec<u8>, DecodedEventRecord) {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::object_journal::{JOURNAL_END_UNJOURNALED, pack_compact_end};
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, publish_object_descriptors};
+        let rows = publish_object_descriptors();
+        let function = tests::function_id(if absent { "C_Sign" } else { "C_CreateObject" });
+        let begin = tests::begin_bytes(1, 1, function, 0);
+        let full = if absent {
+            tests::end_bytes_absent(&begin, 0, tests::ENTRY_NS + 100)
+        } else {
+            tests::end_bytes(&begin, OBJECT_ACTION_CREATE, 0, tests::ENTRY_NS + 100)
+        };
+        let JournalRecord::End(end) = decode_journal_record(&full, &rows).unwrap() else {
+            panic!("existing completed payload fixture")
+        };
+        let expected = project_journal_end_payload(&end, &rows).unwrap();
+        let mut wire = if compact {
+            pack_compact_end(1, 1, full[5], &full[24..])
+                .unwrap()
+                .to_vec()
+        } else {
+            full.to_vec()
+        };
+        wire[5] |= JOURNAL_END_UNJOURNALED;
+        wire[8..24].fill(0);
+        (wire, expected)
+    }
+
+    #[test]
+    fn unjournaled_end_is_exact_ordinary_once_before_live_and_q_callbacks() {
+        use crate::semantics_objects::journal::JournalIngestItem;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for absent in [false, true] {
+            for compact in [false, true] {
+                let (wire, expected) = unjournaled_end_fixture(absent, compact);
+                for bounded in [false, true] {
+                    let source = CursorScript::scripted([wire.clone()]);
+                    let cursor = source.cursor.clone();
+                    let mut drain = EventDrain::over(source);
+                    let mut staged = Vec::new();
+                    let mut ordinary = |decoded: DecodedEventRecord| {
+                        assert!(decoded.same_decoded_payload(&expected));
+                        assert!(decoded.joint_resource.is_none());
+                        assert_eq!(cursor.get(), if bounded { 8 } else { 0 });
+                        staged.push(JournalIngestItem::Ordinary(decoded));
+                        ControlFlow::Continue(())
+                    };
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                8,
+                                Some(2),
+                                &rows,
+                                &mut ordinary,
+                                |_| panic!("unjournaled END cannot acquire a journal key"),
+                            )
+                            .unwrap(),
+                            (false, false)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(2),
+                                &rows,
+                                &mut ordinary,
+                                |_| panic!("unjournaled END cannot enter journal sightings"),
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: false
+                            }
+                        );
+                    }
+                    assert_eq!(staged.len(), 1);
+                    assert!(matches!(staged[0], JournalIngestItem::Ordinary(_)));
+                    assert_eq!(cursor.get(), 8);
+                    assert_eq!(drain.malformed(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_end_identity_flags_and_tail_refusals_are_atomic() {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for compact in [false, true] {
+            let (good, _) = unjournaled_end_fixture(false, compact);
+            // Positive control rejects a decoder that simply refuses all
+            // new flags while making every malformed-input twin pass.
+            assert!(matches!(
+                decode_journal_record(&good, &rows),
+                Some(JournalRecord::End(_))
+            ));
+            let mut cases = Vec::new();
+            for (thread, sequence) in [(1u64, 0u64), (0, 1), (1, 1)] {
+                let mut bad = good.clone();
+                bad[8..16].copy_from_slice(&thread.to_le_bytes());
+                bad[16..24].copy_from_slice(&sequence.to_le_bytes());
+                cases.push(bad);
+            }
+            let mut unknown_flag = good.clone();
+            unknown_flag[5] |= 0x08;
+            cases.push(unknown_flag);
+            let mut absent_with_tail = good.clone();
+            absent_with_tail[5] |= JOURNAL_END_TAIL_ABSENT;
+            cases.push(absent_with_tail);
+            let mut bad_tail = good.clone();
+            let tail = if compact { 24 + 368 - 160 } else { 24 + 368 };
+            bad_tail[tail] = 0xff;
+            cases.push(bad_tail);
+            let mut flagged_begin =
+                tests::begin_bytes(1, 1, tests::function_id("C_CreateObject"), 0);
+            flagged_begin[5] = JOURNAL_END_UNJOURNALED;
+            cases.push(flagged_begin.to_vec());
+            for bad in cases {
+                assert!(decode_journal_record(&bad, &rows).is_none());
+                for bounded in [false, true] {
+                    let source = CursorScript::scripted([bad.clone()]);
+                    let cursor = source.cursor.clone();
+                    let mut drain = EventDrain::over(source);
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                8,
+                                Some(1),
+                                &rows,
+                                |_| panic!("malformed envelope cannot leak an ordinary prefix"),
+                                |_| panic!("malformed envelope cannot acquire journal authority"),
+                            )
+                            .unwrap(),
+                            (false, true)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(1),
+                                &rows,
+                                |_| panic!("malformed envelope cannot leak an ordinary prefix"),
+                                |_| panic!("malformed envelope cannot acquire journal authority"),
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: true
+                            }
+                        );
+                    }
+                    assert_eq!(cursor.get(), 8);
+                    assert_eq!(drain.malformed(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_break_and_quantum_preserve_wire_order() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_END_UNJOURNALED;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for compact in [false, true] {
+            let (unjournaled, expected) = unjournaled_end_fixture(false, compact);
+            let mut tracked = unjournaled.clone();
+            tracked[5] &= !JOURNAL_END_UNJOURNALED;
+            tracked[8..16].copy_from_slice(&1u64.to_le_bytes());
+            tracked[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let ordinary = record_bytes(&expected.base);
+            for bounded in [false, true] {
+                let source = CursorScript::scripted([
+                    unjournaled.clone(),
+                    tracked.clone(),
+                    ordinary.clone(),
+                ]);
+                let cursor = source.cursor.clone();
+                let mut drain = EventDrain::over(source);
+                let delivered = std::cell::RefCell::new(Vec::new());
+                for (index, quantum) in [4, 1, 2].into_iter().enumerate() {
+                    let mut on_ordinary = |record: DecodedEventRecord| {
+                        assert_ne!(index, 1);
+                        assert_eq!(record_bytes(&record.base), record_bytes(&expected.base));
+                        assert_eq!(record.object.is_some(), index == 0);
+                        assert!(record.joint_resource.is_none());
+                        assert_eq!(cursor.get(), (index + usize::from(bounded)) * 8);
+                        delivered.borrow_mut().push("ordinary");
+                        if index == 0 {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    };
+                    let mut on_journal = |record| {
+                        assert_eq!(index, 1);
+                        assert!(matches!(record, JournalRecord::End(_)));
+                        assert_eq!(cursor.get(), (index + usize::from(bounded)) * 8);
+                        delivered.borrow_mut().push("journal");
+                        ControlFlow::Continue(())
+                    };
+                    if bounded {
+                        assert_eq!(
+                            poll_dispatched_records_to_position(
+                                &mut drain,
+                                24,
+                                Some(quantum),
+                                &rows,
+                                &mut on_ordinary,
+                                &mut on_journal,
+                            )
+                            .unwrap(),
+                            (false, index < 2)
+                        );
+                    } else {
+                        assert_eq!(
+                            drain.poll_dispatched_quantum(
+                                Some(quantum),
+                                &rows,
+                                &mut on_ordinary,
+                                &mut on_journal,
+                            ),
+                            DispatchPoll {
+                                attempted: 1,
+                                backlog: index < 2
+                            }
+                        );
+                    }
+                    assert_eq!(cursor.get(), (index + 1) * 8);
+                }
+                assert_eq!(delivered.into_inner(), ["ordinary", "journal", "ordinary"]);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
     #[test]
     fn dispatched_end_payload_full_compact_and_absent_are_exact() {
         use crate::semantics_objects::journal::tests::{
@@ -3563,6 +3815,63 @@ mod tests {
                                 |_| panic!("END has one original journal delivery"),
                                 &mut journal,
                             )
+                            .backlog
+                    );
+                }
+                assert_eq!(seen, 1);
+                assert_eq!(cursor.get(), 8);
+                assert_eq!(drain.malformed(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unjournaled_trace_precedes_the_original_ordinary_callback_at_live_and_q_boundaries() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_END_UNJOURNALED;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        for bounded in [false, true] {
+            for compact in [false, true] {
+                let (proof, view, pending) = cgroup_proof_cursor_fixture();
+                let mut event = proof_call(view.pid(), 101, 11, 0);
+                event.event_type = event_type::CALL;
+                let mut wire = projected_end_wire(&event, compact);
+                wire[5] |= JOURNAL_END_UNJOURNALED;
+                wire[8..24].fill(0);
+                let source = CursorScript::scripted([wire]);
+                let cursor = source.cursor.clone();
+                let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+                drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+                assert_eq!(proof.test_witness(pending.id()), None);
+                let rows = publish_object_descriptors();
+                let mut seen = 0;
+                let mut ordinary = |record: DecodedEventRecord| {
+                    assert_eq!(record.base.event.event_type, event_type::CALL);
+                    assert!(record.object.is_none());
+                    assert!(record.joint_resource.is_none());
+                    assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 101)));
+                    assert_eq!(cursor.get(), if bounded { 8 } else { 0 });
+                    seen += 1;
+                    ControlFlow::Continue(())
+                };
+                if bounded {
+                    assert_eq!(
+                        poll_dispatched_records_to_position(
+                            &mut drain,
+                            8,
+                            Some(2),
+                            &rows,
+                            &mut ordinary,
+                            |_| panic!("unjournaled return has no original journal delivery"),
+                        )
+                        .unwrap(),
+                        (false, false)
+                    );
+                } else {
+                    assert!(
+                        !drain
+                            .poll_dispatched_quantum(Some(2), &rows, &mut ordinary, |_| panic!(
+                                "unjournaled return has no journal delivery"
+                            ),)
                             .backlog
                     );
                 }

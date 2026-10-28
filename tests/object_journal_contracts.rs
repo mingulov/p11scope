@@ -609,6 +609,98 @@ fn object_journal_decode_dispatches_forms() {
     assert!(decode(&bad_action).is_none());
 }
 
+#[test]
+fn object_journal_unjournaled_identity_is_disjoint() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JournalRecord, decode_journal_record,
+        pack_compact_end,
+    };
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+
+    let rows = publish_object_descriptors();
+    for absent in [false, true] {
+        let mut tracked = valid_end_full();
+        if absent {
+            tracked[5] = JOURNAL_END_TAIL_ABSENT;
+            tracked[24 + 368..].fill(0);
+        }
+        let expected = &tracked[24..];
+        for compact in [false, true] {
+            let wire = if compact {
+                pack_compact_end(THREAD, SEQUENCE, tracked[5], expected)
+                    .unwrap()
+                    .to_vec()
+            } else {
+                tracked.to_vec()
+            };
+            let Some(JournalRecord::End(end)) = decode_journal_record(&wire, &rows) else {
+                panic!("tracked END remains valid")
+            };
+            assert!(!end.unjournaled());
+            assert_eq!((end.thread(), end.sequence()), (THREAD, SEQUENCE));
+            assert_eq!(end.payload_bytes().as_slice(), expected);
+
+            let mut unjournaled = wire.clone();
+            unjournaled[5] |= JOURNAL_END_UNJOURNALED;
+            unjournaled[8..24].fill(0);
+            let Some(JournalRecord::End(end)) = decode_journal_record(&unjournaled, &rows) else {
+                panic!("only the flagged END can carry the zero key")
+            };
+            assert!(end.unjournaled());
+            assert_eq!((end.thread(), end.sequence()), (0, 0));
+            assert_eq!(end.payload_bytes().as_slice(), expected);
+            assert_eq!(end.tail_absent(), absent);
+            assert_eq!(end.compact(), compact);
+
+            for (thread, sequence) in [(0, 0), (THREAD, 0), (0, SEQUENCE)] {
+                let mut bad = wire.clone();
+                put_u64(&mut bad, 8, thread);
+                put_u64(&mut bad, 16, sequence);
+                assert!(decode_journal_record(&bad, &rows).is_none());
+            }
+            for (thread, sequence) in [(THREAD, 0), (0, SEQUENCE), (THREAD, SEQUENCE)] {
+                let mut bad = unjournaled.clone();
+                put_u64(&mut bad, 8, thread);
+                put_u64(&mut bad, 16, sequence);
+                assert!(decode_journal_record(&bad, &rows).is_none());
+            }
+            for bit in [0x01, 0x08, 0x80] {
+                let mut bad = unjournaled.clone();
+                bad[5] |= bit;
+                assert!(decode_journal_record(&bad, &rows).is_none());
+            }
+            let mut reserved = unjournaled;
+            reserved[6] = 1;
+            assert!(decode_journal_record(&reserved, &rows).is_none());
+        }
+
+        let packed = pack_compact_end(0, 0, tracked[5] | JOURNAL_END_UNJOURNALED, expected)
+            .expect("the compact packer uses the same flag/key relation");
+        assert!(decode_journal_record(&packed, &rows).is_some());
+        for (thread, sequence, flags) in [
+            (0, 0, tracked[5]),
+            (THREAD, 0, tracked[5]),
+            (0, SEQUENCE, tracked[5]),
+            (THREAD, SEQUENCE, tracked[5] | JOURNAL_END_UNJOURNALED),
+            (THREAD, 0, tracked[5] | JOURNAL_END_UNJOURNALED),
+            (0, SEQUENCE, tracked[5] | JOURNAL_END_UNJOURNALED),
+            (0, 0, tracked[5] | JOURNAL_END_UNJOURNALED | 0x08),
+        ] {
+            assert!(pack_compact_end(thread, sequence, flags, expected).is_none());
+        }
+    }
+
+    let mut begin = valid_begin();
+    begin[5] |= JOURNAL_END_UNJOURNALED;
+    assert!(decode_journal_record(&begin, &rows).is_none());
+    let mut abandon = [0u8; JOURNAL_ABANDON_BYTES];
+    header(&mut abandon, JOURNAL_KIND_ABANDON, JOURNAL_ABANDON_BYTES, 0);
+    put_u32(&mut abandon, 52, 1);
+    assert!(decode_journal_record(&abandon, &rows).is_some());
+    abandon[5] = JOURNAL_END_UNJOURNALED;
+    assert!(decode_journal_record(&abandon, &rows).is_none());
+}
+
 /// Minimal valid neutral BEGIN: C_Sign descriptor on the no-row path with
 /// all-zero requested lists and a VALUE session.
 fn valid_neutral_begin() -> [u8; JOURNAL_BEGIN_BYTES] {

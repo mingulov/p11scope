@@ -1828,12 +1828,87 @@ fn ordinary_matches_refused(
 // Production conversion: validated wire to model facts (H9's sealed input)
 // ---------------------------------------------------------------------------
 
-/// Whether one END's repeated entry evidence agrees exactly with its BEGIN:
-/// image, key, descriptor, session, inputs, slot, mechanism, capture,
-/// layout, entry address/stamp, requested lists, slot identity, flags and
-/// user type. Entry time is not repeated (the END carries return time, not
-/// entry time), so it is not compared; the model still rejects a return
-/// older than its entry as malformed.
+fn returned_word_fits_layout(word: u64, layout: u8) -> bool {
+    use p11scope_ebpf_common::object_wire::{OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64};
+    match layout {
+        OBJECT_LAYOUT_LP64 => true,
+        OBJECT_LAYOUT_ILP32 => word <= u64::from(u32::MAX),
+        _ => false,
+    }
+}
+
+/// Match the session/mechanism rewrites made by capture_return_facts.
+/// Unreadable entry evidence is never an absent session; capture states are
+/// enums, and a captured VALUE (including zero or MECH_NONE's numeric value)
+/// stays exact. Other capture bits, ordinary corroboration and ingress are
+/// unchanged; asynchronous capture-state rewriting is a separate packet.
+fn returned_fields_agree(
+    begin: &ValidatedJournalBegin,
+    event: &p11scope_ebpf_common::Event,
+) -> bool {
+    use p11scope_ebpf_common::object_capture::handle_status;
+    use p11scope_ebpf_common::{ARG_NONE, MECH_NONE, SESSION_NONE, lifecycle};
+
+    let Some(semantics) = crate::kinds::DESCRIPTORS.get(begin.descriptor() as usize) else {
+        return false;
+    };
+    let absent_session = semantics.session_arg == ARG_NONE
+        && begin.session_status() == handle_status::ABSENT
+        && begin.session_word() == 0;
+    let session_agrees = event.session == begin.session_word()
+        || (absent_session
+            && (event.session == SESSION_NONE
+                || (semantics.lifecycle == lifecycle::OPEN_SESSION
+                    && begin.capture() & capture::OUTPUT_MASK == capture::OUTPUT_NON_NULL
+                    && matches!(event.rv, 0 | 0x204)
+                    && returned_word_fits_layout(event.session, begin.layout()))));
+    if !session_agrees {
+        return false;
+    }
+
+    if event.mechanism == begin.entry_mechanism() && event.capture == begin.capture() {
+        return true;
+    }
+    let before = begin.capture();
+    let after = event.capture;
+    let entry_state = before & capture::MECHANISM_MASK;
+    let return_state = after & capture::MECHANISM_MASK;
+    let entry_failed = before & capture::ARG_READ_FAILURE != 0;
+    let return_failed = after & capture::ARG_READ_FAILURE != 0;
+    if (before ^ after) & !(capture::MECHANISM_MASK | capture::ARG_READ_FAILURE) != 0
+        || (entry_failed && !return_failed)
+        || semantics.mechanism_arg == ARG_NONE
+        || !p11scope_ebpf_common::return_allows_mechanism(event.rv)
+    {
+        return false;
+    }
+    if entry_state == capture::MECHANISM_VALUE {
+        if event.mechanism != begin.entry_mechanism() {
+            return false;
+        }
+    } else if !matches!(
+        entry_state,
+        capture::MECHANISM_NONE | capture::MECHANISM_UNREADABLE
+    ) || begin.entry_mechanism() != MECH_NONE
+    {
+        return false;
+    }
+    match return_state {
+        capture::MECHANISM_VALUE => {
+            entry_failed == return_failed
+                && returned_word_fits_layout(event.mechanism, begin.layout())
+        }
+        capture::MECHANISM_UNREADABLE => {
+            return_failed && event.mechanism == begin.entry_mechanism()
+        }
+        _ => false,
+    }
+}
+
+/// Whether one END agrees with the BEGIN's immutable evidence and the
+/// producer's finite scalar return rewrites. Entry time is not repeated
+/// (the END carries return time), so the existing lower bound remains;
+/// ordinary corroboration retains its exact entry-time reconstruction.
 fn end_agrees_with_begin(begin: &ValidatedJournalBegin, end: &ValidatedJournalEnd) -> bool {
     let base = end.payload_base();
     let tail = end.payload_tail();
@@ -1841,10 +1916,8 @@ fn end_agrees_with_begin(begin: &ValidatedJournalBegin, end: &ValidatedJournalEn
     if event.image.task_cookie != begin.image_cookie()
         || event.image.exec_id != begin.image_exec()
         || event.pid_tgid != begin.pid_tgid()
-        || event.session != begin.session_word()
         || event.slot != begin.slot()
-        || event.mechanism != begin.entry_mechanism()
-        || event.capture != begin.capture()
+        || !returned_fields_agree(begin, event)
         || event.slot_id != begin.slot_id()
         || event.flags != begin.call_flags()
         || event.user_type != begin.user_type()
@@ -6395,6 +6468,556 @@ pub(crate) mod tests {
         bytes[5] = JOURNAL_END_TAIL_ABSENT;
         bytes[24 + 368..].fill(0);
         bytes
+    }
+
+    /// Producer field audit for P0a (no journal producer is activated):
+    ///
+    /// - START image, slot/slot-id, flags and user type survive fill_call_event
+    ///   exactly; the BEGIN also retains the entry IP/stamp and H7 inputs.
+    /// - START's entry time becomes BEGIN.entry_ns; END has return time and
+    ///   the duration measured from that original entry.
+    /// - H7 absent session is 0/status 0; S1's absent word is SESSION_NONE.
+    ///   OpenSession alone can replace that word after a successful out-read.
+    /// - Safe entry retains MECH_NONE and its pointer. capture_return_facts
+    ///   can set VALUE or UNREADABLE; the optional unsafe entry can already
+    ///   hold either state. Mechanism bits are an enum, not a monotonic mask.
+    /// - Return preserves output/async-session bits. Only mechanism state,
+    ///   ARG_READ_FAILURE and ASYNC_VALUE_UNREADABLE can change there.
+    ///
+    /// The S1 bytes below come from the actual shared return constructor,
+    /// not payload_for's equality-by-copy fixture. H7 tails still use the
+    /// existing validated fixture; this is not a live BEGIN producer proof.
+    fn producer_agreement_pair(
+        name: &str,
+        rewrite: impl FnOnce(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        ),
+    ) -> ([u8; 224], [u8; 632]) {
+        use p11scope_ebpf_common::object_capture::handle_status;
+        use p11scope_ebpf_common::object_flow::{ReturnEventFacts, fill_call_event};
+        use p11scope_ebpf_common::{ARG_NONE, CallStart, EventRecord, MECH_NONE, SESSION_NONE};
+        assert!(matches!(
+            name,
+            "C_SignInit"
+                | "C_OpenSession"
+                | "C_Finalize"
+                | "C_CloseAllSessions"
+                | "C_CreateObject"
+                | "C_GetSessionInfo"
+        ));
+        let function = function_id(name);
+        let semantics = crate::kinds::DESCRIPTORS[function as usize + 1];
+        let rows = publish_object_descriptors();
+        let mut begin = begin_bytes(1, 1, function, 0);
+        // The generic BEGIN helper leaves inputs absent. Actual H7 entry
+        // capture gives every descriptor-present nonzero handle VALUE;
+        // the END tail must carry that same entry observation.
+        for (index, argument) in rows[function as usize + 1].input_args.iter().enumerate() {
+            if *argument != ARG_NONE {
+                put_u64(&mut begin, 88 + 8 * index, SESSION + index as u64);
+                begin[126 + index] = handle_status::VALUE;
+            }
+        }
+        let entry_ns = u64::from_le_bytes(begin[48..56].try_into().unwrap());
+        let mut start = CallStart {
+            ts_ns: entry_ns,
+            session: if semantics.session_arg == ARG_NONE {
+                SESSION_NONE
+            } else {
+                SESSION
+            },
+            slot_id: if semantics.slot_arg == ARG_NONE {
+                0
+            } else {
+                SLOT_ID
+            },
+            mechanism: MECH_NONE,
+            mechanism_ptr: if semantics.mechanism_arg == ARG_NONE {
+                0
+            } else {
+                0x1000
+            },
+            flags: if semantics.flags_arg == ARG_NONE {
+                0
+            } else {
+                4
+            },
+            user_type: p11scope_ebpf_common::USER_TYPE_NONE,
+            target_function: function,
+            image: ImageIdentity {
+                task_cookie: COOKIE,
+                exec_id: EXEC,
+            },
+            ..Default::default()
+        };
+        if semantics.output_arg != ARG_NONE {
+            start.capture |= capture::OUTPUT_NON_NULL;
+            if semantics.lifecycle == p11scope_ebpf_common::lifecycle::OPEN_SESSION {
+                start.out_ptr = 0x2000;
+            }
+        }
+        let mut facts = ReturnEventFacts {
+            ts_ns: entry_ns + 100,
+            duration_ns: 100,
+            rv: 0,
+            mechanism: if start.mechanism_ptr == 0 {
+                MECH_NONE
+            } else {
+                1
+            },
+            session: if start.out_ptr == 0 {
+                start.session
+            } else {
+                0x9090
+            },
+            async_value: 0,
+            capture_flags: if start.mechanism_ptr == 0 {
+                start.capture
+            } else {
+                (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE
+            },
+            pid_tgid: invocation_pid(1),
+            cgroup_id: 1,
+            root_affiliation: 0,
+        };
+        rewrite(&mut start, &mut facts);
+        put_u64(
+            &mut begin,
+            80,
+            if start.session == SESSION_NONE {
+                0
+            } else {
+                start.session
+            },
+        );
+        begin[125] = u8::from(start.session != SESSION_NONE);
+        put_u64(&mut begin, 112, start.mechanism);
+        put_u32(&mut begin, 120, start.capture);
+        put_u64(&mut begin, 200, start.slot_id);
+        put_u64(&mut begin, 208, start.flags);
+        put_u32(&mut begin, 216, start.user_type);
+
+        let mut base = EventRecord::default();
+        // SAFETY: exclusively owned, aligned Event; the production helper
+        // fills every byte of this padding-free wire value.
+        unsafe {
+            fill_call_event(
+                &mut base.event,
+                &start,
+                u32::from_le_bytes(begin[104..108].try_into().unwrap()),
+                &facts,
+            )
+        };
+        base.continuity.entry_ip = ENTRY_IP;
+        base.continuity.entry_stamp = InstanceStamp {
+            epoch: 7,
+            global: 8,
+            fault: 9,
+            file_slot_plus1: 3,
+            flags: STAMP_VALID,
+        };
+        base.continuity.return_stamp = base.continuity.entry_stamp;
+        let action = rows[function as usize + 1].action;
+        let mut end = if action == 0 {
+            end_bytes_absent(&begin, facts.rv, ENTRY_NS + 100)
+        } else {
+            end_bytes(&begin, action, facts.rv, ENTRY_NS + 100)
+        };
+        // SAFETY: EventRecord is the initialized, padding-free 368-byte
+        // kernel wire value, with the same layout pinned by common tests.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&base as *const EventRecord).cast::<u8>(),
+                std::mem::size_of::<EventRecord>(),
+            )
+        };
+        end[24..24 + bytes.len()].copy_from_slice(bytes);
+        (begin, end)
+    }
+
+    fn producer_pair_agrees(begin: &[u8; 224], end: &[u8; 632]) -> bool {
+        let rows = publish_object_descriptors();
+        let JournalRecord::Begin(begin) =
+            decode_journal_record(begin, &rows).expect("valid producer BEGIN")
+        else {
+            panic!("BEGIN shape")
+        };
+        let JournalRecord::End(end) =
+            decode_journal_record(end, &rows).expect("valid producer END")
+        else {
+            panic!("END shape")
+        };
+        end_agrees_with_begin(&begin, &end)
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_producer_return_rewrites() {
+        for name in [
+            "C_SignInit",
+            "C_OpenSession",
+            "C_Finalize",
+            "C_CloseAllSessions",
+        ] {
+            let (begin, end) = producer_agreement_pair(name, |_, _| {});
+            assert!(
+                producer_pair_agrees(&begin, &end),
+                "legitimate return rewrite: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_producer_unsafe_mechanism_transitions() {
+        for entry_readable in [true, false] {
+            let (begin, end) = producer_agreement_pair("C_SignInit", |start, facts| {
+                if entry_readable {
+                    start.mechanism = 1;
+                    start.capture =
+                        (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+                    facts.mechanism = 1;
+                    facts.capture_flags = (facts.capture_flags & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_UNREADABLE
+                        | capture::ARG_READ_FAILURE;
+                } else {
+                    start.capture = (start.capture & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_UNREADABLE
+                        | capture::ARG_READ_FAILURE;
+                    facts.capture_flags |= capture::ARG_READ_FAILURE;
+                }
+            });
+            assert!(
+                producer_pair_agrees(&begin, &end),
+                "entry readable={entry_readable}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_safe_unreadable_mechanism_return() {
+        let (begin, end) = producer_agreement_pair("C_SignInit", |_, facts| {
+            facts.mechanism = p11scope_ebpf_common::MECH_NONE;
+            facts.capture_flags = (facts.capture_flags & !capture::MECHANISM_MASK)
+                | capture::MECHANISM_UNREADABLE
+                | capture::ARG_READ_FAILURE;
+        });
+        assert!(producer_pair_agrees(&begin, &end));
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_producer_open_session_outcomes() {
+        use p11scope_ebpf_common::SESSION_NONE;
+        for outcome in [
+            "pending-out-read",
+            "failed-rv",
+            "null-out",
+            "entry-unreadable-out",
+            "return-unreadable-word",
+        ] {
+            let (begin, end) =
+                producer_agreement_pair("C_OpenSession", |start, facts| match outcome {
+                    "pending-out-read" => facts.rv = 0x204,
+                    "failed-rv" => {
+                        facts.rv = 5;
+                        facts.session = SESSION_NONE;
+                    }
+                    "null-out" | "entry-unreadable-out" => {
+                        start.out_ptr = 0;
+                        start.capture = if outcome == "null-out" {
+                            capture::OUTPUT_NULL
+                        } else {
+                            capture::OUTPUT_UNREADABLE | capture::ARG_READ_FAILURE
+                        };
+                        facts.capture_flags = start.capture;
+                        facts.session = SESSION_NONE;
+                    }
+                    "return-unreadable-word" => facts.session = SESSION_NONE,
+                    _ => unreachable!(),
+                });
+            assert!(
+                producer_pair_agrees(&begin, &end),
+                "legitimate OpenSession outcome: {outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_agreement_keeps_producer_identity_exact() {
+        for name in ["C_CreateObject", "C_GetSessionInfo"] {
+            let (begin, end) = producer_agreement_pair(name, |_, _| {});
+            assert!(
+                producer_pair_agrees(&begin, &end),
+                "unchanged producer call agrees: {name}"
+            );
+            for offset in [16, 32, 40, 56, 104, 112, 288, 296, 328, 336] {
+                let mut changed = end;
+                changed[24 + offset] ^= 1;
+                assert!(
+                    !producer_pair_agrees(&begin, &changed),
+                    "immutable {name} field at {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_journal_producer_ordinary_matching_keeps_entry_and_session_exact() {
+        use p11scope_ebpf_common::SESSION_NONE;
+        let (begin, end) = producer_agreement_pair("C_GetSessionInfo", |_, _| {});
+        for session in [0, SESSION_NONE] {
+            let mut changed = end;
+            put_u64(&mut changed, 24 + 32, session);
+            assert!(
+                !producer_pair_agrees(&begin, &changed),
+                "GetSessionInfo is not sessionless: {session}"
+            );
+        }
+        let rows = publish_object_descriptors();
+        let JournalRecord::Begin(begin) = decode_journal_record(&begin, &rows).unwrap() else {
+            panic!("BEGIN")
+        };
+        let JournalRecord::End(end) = decode_journal_record(&end, &rows).unwrap() else {
+            panic!("END")
+        };
+        let event = end.payload_base().event;
+        assert!(ordinary_matches_begin(&event, 2, &begin, 1));
+        let mut wrong_entry = event;
+        wrong_entry.duration_ns += 1;
+        assert!(
+            !ordinary_matches_begin(&wrong_entry, 2, &begin, 1),
+            "a later return with another entry is not corroboration"
+        );
+        for session in [0, SESSION_NONE, event.session ^ 1] {
+            let mut changed = event;
+            changed.session = session;
+            assert!(
+                !ordinary_matches_begin(&changed, 2, &begin, 1),
+                "session argument 0 remains exact: {session}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_agreement_refuses_unrelated_return_capture_changes() {
+        let (begin, end) = producer_agreement_pair("C_CreateObject", |_, facts| {
+            facts.capture_flags |= capture::ARG_READ_FAILURE;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "no mechanism-read failure on CreateObject"
+        );
+        for added in [capture::OUTPUT_NON_NULL, capture::ASYNC_SESSION] {
+            let (begin, end) = producer_agreement_pair("C_SignInit", |_, facts| {
+                facts.capture_flags |= added;
+            });
+            assert!(
+                !producer_pair_agrees(&begin, &end),
+                "entry-only capture bit {added}"
+            );
+        }
+        let (begin, end) = producer_agreement_pair("C_SignInit", |start, facts| {
+            start.mechanism = 0;
+            start.capture = (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+            facts.mechanism = 1;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "mechanism zero is a captured value, not NONE"
+        );
+    }
+
+    #[test]
+    fn object_journal_agreement_refuses_unwritten_open_session_results() {
+        let (begin, end) = producer_agreement_pair("C_OpenSession", |_, facts| {
+            facts.rv = 5;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "failed return cannot rewrite session"
+        );
+        let (begin, end) = producer_agreement_pair("C_OpenSession", |start, facts| {
+            start.out_ptr = 0;
+            start.capture = capture::OUTPUT_NULL;
+            facts.capture_flags = start.capture;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "NULL out-pointer cannot supply a new handle"
+        );
+    }
+
+    #[test]
+    fn object_journal_return_rewrites_follow_native_rv_and_output_gates() {
+        for rv in [0, 0x204, 5, 0x150] {
+            let (begin, end) = producer_agreement_pair("C_SignInit", |_, facts| facts.rv = rv);
+            assert_eq!(producer_pair_agrees(&begin, &end), matches!(rv, 0 | 0x204));
+            let (begin, end) = producer_agreement_pair("C_OpenSession", |_, facts| facts.rv = rv);
+            assert_eq!(producer_pair_agrees(&begin, &end), matches!(rv, 0 | 0x204));
+        }
+        for output in [
+            capture::OUTPUT_NONE,
+            capture::OUTPUT_NULL,
+            capture::OUTPUT_UNREADABLE,
+        ] {
+            let (begin, end) = producer_agreement_pair("C_OpenSession", |start, facts| {
+                start.out_ptr = 0;
+                start.capture = output;
+                facts.capture_flags = output;
+            });
+            assert!(!producer_pair_agrees(&begin, &end));
+        }
+        for status in [
+            p11scope_ebpf_common::object_capture::handle_status::UNREADABLE,
+            p11scope_ebpf_common::object_capture::handle_status::INVALID_SPAN,
+        ] {
+            let (mut begin, end) = producer_agreement_pair("C_Finalize", |_, _| {});
+            begin[125] = status;
+            assert!(!producer_pair_agrees(&begin, &end), "unknown is not absent");
+        }
+        let (mut begin, end) = producer_agreement_pair("C_GetSessionInfo", |start, facts| {
+            start.session = 0;
+            facts.session = 0;
+        });
+        begin[125] = p11scope_ebpf_common::object_capture::handle_status::INVALID_ZERO;
+        assert!(
+            producer_pair_agrees(&begin, &end),
+            "argument zero stays zero"
+        );
+    }
+
+    #[test]
+    fn object_journal_return_rewrites_keep_captured_zero_and_sentinel_exact() {
+        for captured in [0, 1, u64::MAX] {
+            for unreadable in [false, true] {
+                let (begin, end) = producer_agreement_pair("C_SignInit", |start, facts| {
+                    start.mechanism = captured;
+                    start.capture = capture::MECHANISM_VALUE;
+                    facts.mechanism = captured;
+                    facts.capture_flags = if unreadable {
+                        capture::MECHANISM_UNREADABLE | capture::ARG_READ_FAILURE
+                    } else {
+                        capture::MECHANISM_VALUE
+                    };
+                });
+                assert!(producer_pair_agrees(&begin, &end));
+            }
+            let (begin, end) = producer_agreement_pair("C_SignInit", |start, facts| {
+                start.mechanism = captured;
+                start.capture = capture::MECHANISM_VALUE;
+                facts.mechanism = captured ^ 1;
+            });
+            assert!(
+                !producer_pair_agrees(&begin, &end),
+                "captured VALUE={captured}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_return_rewrites_refuse_unproduced_capture_transitions() {
+        for poison in [
+            "cleared-entry-failure",
+            "new-success-failure",
+            "unreadable-without-failure",
+            "null-to-value",
+            "unreadable-changed-word",
+            "uncaptured-nonsentinel",
+            "async-return-bit",
+            "unknown-bit",
+        ] {
+            let (begin, end) = producer_agreement_pair("C_SignInit", |start, facts| match poison {
+                "cleared-entry-failure" => {
+                    start.capture = capture::MECHANISM_UNREADABLE | capture::ARG_READ_FAILURE;
+                    facts.capture_flags = capture::MECHANISM_VALUE;
+                }
+                "new-success-failure" => facts.capture_flags |= capture::ARG_READ_FAILURE,
+                "unreadable-without-failure" => {
+                    facts.mechanism = start.mechanism;
+                    facts.capture_flags = capture::MECHANISM_UNREADABLE;
+                }
+                "null-to-value" => start.capture = capture::MECHANISM_NULL,
+                "unreadable-changed-word" => {
+                    facts.capture_flags = capture::MECHANISM_UNREADABLE | capture::ARG_READ_FAILURE;
+                }
+                "uncaptured-nonsentinel" => start.mechanism = 0,
+                "async-return-bit" => facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE,
+                "unknown-bit" => facts.capture_flags |= 0x80,
+                _ => unreachable!(),
+            });
+            assert!(!producer_pair_agrees(&begin, &end), "{poison}");
+        }
+        let (begin, end) = producer_agreement_pair("C_GetSessionInfo", |_, facts| {
+            facts.mechanism = 1;
+            facts.capture_flags = capture::MECHANISM_VALUE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "no mechanism argument");
+    }
+
+    #[test]
+    fn object_journal_return_rewrites_bound_new_ilp32_words() {
+        use p11scope_ebpf_common::object_wire::OBJECT_LAYOUT_ILP32;
+        // Structural word-width coverage, not live ILP32 Joint admission.
+        for returned in [0, u64::from(u32::MAX), u64::from(u32::MAX) + 1] {
+            let (mut begin, end) = producer_agreement_pair("C_OpenSession", |start, facts| {
+                start.slot_id = 7;
+                facts.session = returned;
+            });
+            begin[124] = OBJECT_LAYOUT_ILP32;
+            assert_eq!(
+                producer_pair_agrees(&begin, &end),
+                returned <= u64::from(u32::MAX)
+            );
+
+            let (mut begin, mut end) = producer_agreement_pair("C_SignInit", |start, facts| {
+                start.session = 42;
+                facts.session = 42;
+                facts.mechanism = returned;
+            });
+            // Use native-width H7 entry facts as well as the real S1
+            // constructor. The mechanism is the only varying return word.
+            begin[124] = OBJECT_LAYOUT_ILP32;
+            put_u64(&mut begin, 56, 0x4000);
+            put_u64(&mut begin, 88, 7);
+            put_u64(&mut end, 24 + 328, 0x4000);
+            put_u64(&mut end, 24 + 368 + 16, 7);
+            end[24 + 368 + 12] = OBJECT_LAYOUT_ILP32;
+            assert_eq!(
+                producer_pair_agrees(&begin, &end),
+                returned <= u64::from(u32::MAX)
+            );
+            if returned <= u64::from(u32::MAX) {
+                end[24 + 368 + 12] = OBJECT_LAYOUT_LP64;
+                assert!(!producer_pair_agrees(&begin, &end), "layout is immutable");
+            }
+        }
+    }
+
+    #[test]
+    fn object_journal_return_rewrites_preserve_exact_tail_evidence() {
+        let (begin, end) = producer_agreement_pair("C_SignInit", |_, _| {});
+        assert!(producer_pair_agrees(&begin, &end));
+        let mut changed_input = end;
+        changed_input[24 + 368 + 16] ^= 1;
+        assert!(!producer_pair_agrees(&begin, &changed_input));
+        let mut changed_status = end;
+        put_u64(&mut changed_status, 24 + 368 + 16, 0);
+        changed_status[24 + 368 + 112] =
+            p11scope_ebpf_common::object_capture::handle_status::UNREADABLE;
+        assert!(!producer_pair_agrees(&begin, &changed_status));
+        let mut changed_descriptor = end;
+        put_u32(
+            &mut changed_descriptor,
+            24 + 368 + 4,
+            function_id("C_VerifyInit") + 1,
+        );
+        assert!(!producer_pair_agrees(&begin, &changed_descriptor));
+
+        let (begin, mut end) = producer_agreement_pair("C_CreateObject", |_, _| {});
+        end[24 + 368 + 128 + 33] = p11scope_ebpf_common::object_wire::OBJECT_ATTR_LIST_UNINSPECTED;
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "requested lists are immutable"
+        );
     }
 
     pub(crate) fn abandon_bytes(
@@ -11935,6 +12558,85 @@ pub(crate) mod tests {
             !source.contains(&needle),
             "scripted bindings remain in journal.rs"
         );
+    }
+
+    #[test]
+    fn unjournaled_normalization_precedes_adapter_sightings_and_key_accounting() {
+        use p11scope_ebpf_common::object_journal::{JOURNAL_END_UNJOURNALED, pack_compact_end};
+        // Composed decoder/adapter coverage only: no producer, live Session,
+        // kernel Q attestation or semantic object-tail authority is activated.
+        for absent in [false, true] {
+            let begin = begin_bytes(
+                1,
+                1,
+                function_id(if absent { "C_Sign" } else { "C_CreateObject" }),
+                0,
+            );
+            let full = if absent {
+                end_bytes_absent(&begin, 0, ENTRY_NS + 100)
+            } else {
+                end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100)
+            };
+            for compact in [false, true] {
+                let mut wire = if compact {
+                    pack_compact_end(1, 1, full[5], &full[24..])
+                        .unwrap()
+                        .to_vec()
+                } else {
+                    full.to_vec()
+                };
+                wire[5] |= JOURNAL_END_UNJOURNALED;
+                wire[8..24].fill(0);
+                for bounded in [false, true] {
+                    let mut scene = Scene::new(image_default());
+                    let _proof = scene.attest();
+                    scene.bind_session_drain();
+                    let keys_before = scene.adapter.keys.len();
+                    assert!(scene.adapter.sightings.is_empty());
+                    if bounded {
+                        let mut drain = crate::events::EventDrain::over_test_domain(
+                            BusyScript::new(vec![wire.clone()]),
+                            scene.retained_events.id(),
+                        );
+                        assert_eq!(
+                            scene.drain_bounded_to(&mut drain, 8).unwrap(),
+                            (false, false)
+                        );
+                        assert_eq!(drain.malformed(), 0);
+                        assert_eq!(
+                            crate::events::BoundedRecordSource::consumer(drain.source()),
+                            8
+                        );
+                    } else {
+                        let mut drain = crate::events::EventDrain::over_test_domain(
+                            crate::events::ScriptedRecords::records([wire.clone()], 1),
+                            scene.retained_events.id(),
+                        );
+                        let collection = scene.adapter.collect_from_drain(
+                            &mut drain,
+                            &scene.descriptors,
+                            Some(1),
+                            &ScriptedFaultCell::steady(0),
+                            scene.fixture.h0_allocated_below(),
+                        );
+                        assert_eq!((collection.ingested, collection.ordinary), (0, 1));
+                        assert_eq!(collection.malformed_delta, 0);
+                        assert_eq!(collection.discarded_delta, 0);
+                    }
+                    assert_eq!(scene.adapter.consumed_through, 1);
+                    let sighting = scene.adapter.sightings.get(&(COOKIE, EXEC)).unwrap();
+                    assert_eq!(sighting.first_seen, 1);
+                    assert_eq!(sighting.first_affecting, Some(1));
+                    assert_eq!(scene.adapter.sightings.len(), 1);
+                    assert_eq!(scene.adapter.keys.len(), keys_before);
+                    assert!(scene.adapter.open.is_empty());
+                    assert!(scene.adapter.floors.is_empty());
+                    assert!(scene.adapter.physical_return_floors.is_empty());
+                    assert!(scene.adapter.refused.is_empty());
+                    assert!(!scene.adapter.is_tainted((COOKIE, EXEC)));
+                }
+            }
+        }
     }
 
     #[test]

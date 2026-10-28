@@ -54,6 +54,10 @@ pub const JOURNAL_BEGIN_NO_END: u8 = 0x01;
 /// END header bit1: the 240-byte object tail is absent (all zero). Requires
 /// the no-object-descriptor path; a present tail uses the exact H7 validator.
 pub const JOURNAL_END_TAIL_ABSENT: u8 = 0x02;
+/// END header bit2: the completed payload has no journal invocation key.
+/// Both identity words must be zero; dispatch treats the validated payload
+/// as one ordinary record, never a BEGIN/END transaction.
+pub const JOURNAL_END_UNJOURNALED: u8 = 0x04;
 
 /// Finite ABANDON reasons. Wire carries the code only, never a string; the
 /// reason-to-disposition matrix lives with the journal consumer, and a wire
@@ -255,12 +259,12 @@ pub struct ValidatedJournalEnd {
 }
 
 impl ValidatedJournalEnd {
-    /// Physical-task lifetime ticket.
+    /// Physical-task lifetime ticket, or zero for an unjournaled payload.
     pub fn thread(&self) -> u64 {
         journal_u64(&self.raw, 8)
     }
 
-    /// Per-thread affecting-entry sequence.
+    /// Per-thread affecting-entry sequence, or zero for an unjournaled payload.
     pub fn sequence(&self) -> u64 {
         journal_u64(&self.raw, 16)
     }
@@ -273,6 +277,13 @@ impl ValidatedJournalEnd {
     /// Whether the object tail is absent (all-zero tail, no object row).
     pub fn tail_absent(&self) -> bool {
         self.raw[5] & JOURNAL_END_TAIL_ABSENT != 0
+    }
+
+    /// Whether this validated END carries an ordinary completed payload
+    /// instead of a journal invocation. Its thread and sequence are both
+    /// zero, so consumers must normalize it before journal accounting.
+    pub fn unjournaled(&self) -> bool {
+        self.raw[5] & JOURNAL_END_UNJOURNALED != 0
     }
 
     /// The exact validated wire bytes of this END (either length).
@@ -489,7 +500,8 @@ pub fn validate_begin(
 /// 608-byte H7 completed payload: event type CALL, affiliation at most 1,
 /// and either a validated all-zero absent tail (only with `descriptor`
 /// `None` and the absent bit set) or the exact H7 tail validator against
-/// the frozen row.
+/// the frozen row. A tracked END has a nonzero key; only UNJOURNALED has
+/// both key words zero and is delivered through ordinary transport.
 pub fn validate_end(
     bytes: &[u8],
     descriptor: Option<&ObjectDescriptorWire>,
@@ -497,10 +509,9 @@ pub fn validate_end(
     if bytes.len() != JOURNAL_END_FULL_BYTES && bytes.len() != JOURNAL_END_COMPACT_BYTES {
         return None;
     }
-    if !valid_common_header(bytes, bytes.len(), JOURNAL_KIND_END) {
-        return None;
-    }
-    if bytes[5] & !JOURNAL_END_TAIL_ABSENT != 0 {
+    if !valid_common_header_shape(bytes, bytes.len(), JOURNAL_KIND_END)
+        || !valid_end_identity(bytes[5], journal_u64(bytes, 8), journal_u64(bytes, 16))
+    {
         return None;
     }
     let tail_absent = bytes[5] & JOURNAL_END_TAIL_ABSENT != 0;
@@ -561,17 +572,15 @@ pub fn end_compact_eligible(payload: &[u8]) -> bool {
 
 /// Pack one compact END record from an eligible 608-byte payload: the
 /// header plus the payload with the 160-byte omitted span removed. Refuses
-/// ineligible payloads, zero identity and non-END header flags.
+/// ineligible payloads, non-END flags and any identity tuple inconsistent
+/// with UNJOURNALED. This does not activate compact production emission.
 pub fn pack_compact_end(
     thread: u64,
     sequence: u64,
     flags: u8,
     payload: &[u8],
 ) -> Option<[u8; JOURNAL_END_COMPACT_BYTES]> {
-    if thread == 0 || sequence == 0 {
-        return None;
-    }
-    if flags & !JOURNAL_END_TAIL_ABSENT != 0 {
+    if !valid_end_identity(flags, thread, sequence) {
         return None;
     }
     if !end_compact_eligible(payload) {
@@ -666,12 +675,29 @@ const fn compact_tail_index_offset() -> usize {
 
 /// Exact version/length/kind, zero reserved word and nonzero identity.
 fn valid_common_header(bytes: &[u8], len: usize, kind: u8) -> bool {
+    valid_common_header_shape(bytes, len, kind)
+        && journal_u64(bytes, 8) != 0
+        && journal_u64(bytes, 16) != 0
+}
+
+fn valid_common_header_shape(bytes: &[u8], len: usize, kind: u8) -> bool {
     journal_u16(bytes, 0) == JOURNAL_VERSION
         && journal_u16(bytes, 2) == len as u16
         && bytes[4] == kind
         && journal_u16(bytes, 6) == 0
-        && journal_u64(bytes, 8) != 0
-        && journal_u64(bytes, 16) != 0
+}
+
+/// Only END permits a zero key, and only with the exact ordinary-payload
+/// flag. BEGIN/ABANDON retain their nonzero common-header invariant.
+fn valid_end_identity(flags: u8, thread: u64, sequence: u64) -> bool {
+    if flags & !(JOURNAL_END_TAIL_ABSENT | JOURNAL_END_UNJOURNALED) != 0 {
+        return false;
+    }
+    if flags & JOURNAL_END_UNJOURNALED != 0 {
+        thread == 0 && sequence == 0
+    } else {
+        thread != 0 && sequence != 0
+    }
 }
 
 /// The H7 handle rule for one copied entry word: a finite status, VALUE if

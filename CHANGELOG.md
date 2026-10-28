@@ -62,6 +62,9 @@ or a product startup SLA.
   survivors remain unadmitted in live capture.
 - The example Kubernetes DaemonSet raises the observer memory limit to
   768Mi.
+- Knative qualification requires exact warm counts (1,200/1,200 observed).
+  The first cold request observed 84/1,200 before probes attached, with no
+  kernel event loss; this remains a disclosed coverage limitation.
 
 ### Privacy and capture
 

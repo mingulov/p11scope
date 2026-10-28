@@ -29,13 +29,6 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
-fn self_binary_budget() -> CaptureWorkBudget {
-    CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: u64::MAX,
-        total_bytes: u64::MAX,
-    })
-}
-
 /// Build a .so with a caller-chosen build-id so two builds differ.
 fn cc_so(dir: &Path, name: &str, body: &str) -> PathBuf {
     let _guard = CC_LOCK.lock().unwrap();
@@ -1127,21 +1120,40 @@ fn scan_and_manifest_pins_merge_into_one_set() {
     let manifest_pins =
         p11scope::discovery::identity::pin_manifest_objects(&manifest_for(&so)).unwrap();
 
-    let (exe, modules) = scan_self();
-    let (mut pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
+    let child = ScannedChild::new("manifest_pinning_absorb_scan", None);
+    let exe = &child.exe;
+    let modules = child.scan();
+    let (mut pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        child.pid(),
         &modules,
-        &mut self_binary_budget(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
-    pinned.absorb(manifest_pins);
+    assert!(
+        skipped.is_empty(),
+        "scan pins refused before merge: {skipped:?}"
+    );
+    let scanned_id = pinned
+        .pinned()
+        .find(|pin| pin.path == exe.display().to_string())
+        .expect("the scanned object must be pinned before the merge")
+        .id;
+    let scanned_attach = pinned.attach_path_for(scanned_id).unwrap();
+    let merge_skips = pinned.absorb(manifest_pins);
+    assert!(
+        merge_skips.is_empty(),
+        "merge refused pins: {merge_skips:?}"
+    );
 
     assert!(
         pinned.pinned().any(|s| s.path == exe.display().to_string()),
         "the scanned object survives the merge"
     );
+    assert_eq!(pinned.attach_path_for(scanned_id).unwrap(), scanned_attach);
+    assert_eq!(pinned.pinned().count(), 2);
     let key = manifest_key(&so);
     let id = pinned.pinned().find(|pin| pin.key == key).unwrap().id;
+    assert_ne!(id, scanned_id, "the manifest receives a distinct local ID");
     let attach = pinned
         .attach_path_for(id)
         .expect("the manifest's object still resolves after the merge");
@@ -2137,45 +2149,130 @@ fn a_pid_pin_detects_process_exit() {
     }
 }
 
-/// Our own executable is a file-backed mapping with a stable identity; scan our
-/// process with it as the hint, so the modules are the scan's real view of us.
-fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
-    use p11scope::discovery::hooks::HookRegistry;
-    use p11scope::discovery::scan::{ScanOutcome, ScanRequest, scan_pid};
+/// Scan an owned child's stable mappings. Scanning the test process itself races
+/// the observer's temporary ELF/identity mappings (including other test threads),
+/// correctly refusing changed mappings before pinning or merging can be tested.
+struct ScannedChild {
+    child: std::process::Child,
+    exe: PathBuf,
+}
 
-    let hooks = HookRegistry::builtin();
-    let exe = std::env::current_exe().unwrap();
-    let outcome = scan_pid(
-        &ScanRequest {
-            pid: std::process::id(),
-            hints: std::slice::from_ref(&exe),
-            hooks: &hooks,
-        },
-        &mut self_binary_budget(),
-    )
-    .unwrap();
-    let ScanOutcome::Scanned { modules, .. } = outcome else {
-        panic!("/proc/self/mem is always readable")
-    };
-    (exe, modules)
+impl ScannedChild {
+    fn new(name: &str, sparse_len: Option<u64>) -> Self {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::process::Stdio;
+
+        let dir = tmpdir(name);
+        let source = dir.join("hold.c");
+        let executable = dir.join("hold");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { char ready = 'R', stop; if (write(1, &ready, 1) != 1) return 2; return read(0, &stop, 1) == 1 ? 0 : 3; }\n",
+        )
+        .unwrap();
+        {
+            let _guard = CC_LOCK.lock().unwrap();
+            assert!(
+                Command::new("gcc")
+                    .arg("-o")
+                    .arg(&executable)
+                    .arg(&source)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        if let Some(len) = sparse_len {
+            // Extend before exec: the tail is outside the loaded ELF segments.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&executable)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+        let mut child = Self {
+            child: Command::new(&executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            exe: executable,
+        };
+        let stdout = child.child.stdout.as_mut().unwrap();
+        let mut poll = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the child pipe stays open and poll borrows one initialized fd.
+        let ready_events = unsafe { libc::poll(&mut poll, 1, 5000) };
+        assert_eq!(ready_events, 1, "child readiness deadline or poll failure");
+        assert_ne!(poll.revents & libc::POLLIN, 0, "child closed before ready");
+        let mut ready = [0];
+        stdout.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'R']);
+        child.exe = std::fs::read_link(format!("/proc/{}/exe", child.pid())).unwrap();
+        child
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn scan(&self) -> Vec<p11scope::discovery::scan::ScannedModule> {
+        use p11scope::discovery::hooks::HookRegistry;
+        use p11scope::discovery::scan::{ScanOutcome, ScanRequest, scan_pid};
+
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid: self.pid(),
+                hints: std::slice::from_ref(&self.exe),
+                hooks: &HookRegistry::builtin(),
+            },
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Scanned {
+            modules, skipped, ..
+        } = outcome
+        else {
+            panic!("the owned child's memory must be readable: {outcome:?}")
+        };
+        assert_eq!(
+            modules.len(),
+            1,
+            "the hinted child executable must be selected before testing pinning: {skipped:?}"
+        );
+        assert_eq!(modules[0].path, self.exe.display().to_string());
+        modules
+    }
+}
+
+impl Drop for ScannedChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
 fn scanned_objects_are_pinned_hashed_and_attachable() {
-    let (exe, modules) = scan_self();
+    let child = ScannedChild::new("manifest_pinning_scanned", None);
+    let exe = &child.exe;
+    let modules = child.scan();
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
+        child.pid(),
         &modules,
-        &mut self_binary_budget(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(
         skipped.is_empty(),
-        "nothing about our own process should be unpinnable: {skipped:?}"
+        "the stable child must be pinnable: {skipped:?}"
     );
-    // The hint is our own executable, so the scan always names at least that object.
-    // (Measured: it is the only one — the test binary maps no PKCS#11 table, so no
-    // table entry names a second object. Its identity resolves via "mountinfo".)
+    // The fixture has no function table, so the hint names exactly its executable.
     assert!(
         pinned.pinned().any(|s| s.path == exe.display().to_string()),
         "the hinted executable must be pinned"
@@ -2295,41 +2392,6 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
 
 #[test]
 fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
-    use p11scope::discovery::hooks::HookRegistry;
-    use p11scope::discovery::scan::{ScanLimits, ScanRequest, scan_pid};
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
-    use std::process::Stdio;
-
-    // The budget check needs a mapped object. A child owns stable mappings while
-    // other tests in this binary run, and is reaped even if an assertion fails.
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let dir = tmpdir("byte-budget-child");
-    let source = dir.join("hold.c");
-    let executable = dir.join("hold");
-    std::fs::write(
-        &source,
-        "#include <unistd.h>\nint main(void) { char ready = 'R', stop; if (write(1, &ready, 1) != 1) return 2; return read(0, &stop, 1) == 1 ? 0 : 3; }\n",
-    )
-    .unwrap();
-    {
-        let _guard = CC_LOCK.lock().unwrap();
-        assert!(
-            Command::new("gcc")
-                .arg("-o")
-                .arg(&executable)
-                .arg(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
     // The per-object cap also bounds every mount-table read (read_mountinfo_with
     // caps a table at min(per_object_bytes, MAX_MOUNTINFO_BYTES)), and pinning
     // reads the child's mountinfo before it can judge the object. A ~16 KB
@@ -2344,54 +2406,11 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
             .contains("const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;"),
         "MOUNT_TABLE_CEILING must track scan.rs MAX_MOUNTINFO_BYTES"
     );
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&executable)
-        .unwrap()
-        .set_len(MOUNT_TABLE_CEILING + 2)
-        .unwrap();
-    let mut child = ChildGuard(
-        Command::new(&executable)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let stdout = child.0.stdout.as_mut().unwrap();
-    let mut poll = libc::pollfd {
-        fd: stdout.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the child pipe remains open and poll borrows one initialized fd.
-    let ready_events = unsafe { libc::poll(&mut poll, 1, 5000) };
-    assert_eq!(ready_events, 1, "child readiness deadline or poll failure");
-    assert_ne!(poll.revents & libc::POLLIN, 0, "child closed before ready");
-    let mut ready = [0];
-    stdout.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [b'R']);
-    let pid = child.0.id();
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
-    let hooks = HookRegistry::builtin();
-    let outcome = scan_pid(
-        &ScanRequest {
-            pid,
-            hints: std::slice::from_ref(&exe),
-            hooks: &hooks,
-        },
-        &mut self_binary_budget(),
-    )
-    .unwrap();
-    let modules = outcome.modules();
-    assert_eq!(
-        modules.len(),
-        1,
-        "the hinted child executable must be selected before testing pinning: {:?}",
-        outcome.skipped()
-    );
-    assert_eq!(modules[0].path, exe.display().to_string());
+    let child = ScannedChild::new("byte-budget-child", Some(MOUNT_TABLE_CEILING + 2));
+    let modules = child.scan();
+    let exe = &child.exe;
     // Sized from live data: one byte under the object the scan actually reported.
-    let len = std::fs::metadata(&exe).unwrap().len();
+    let len = std::fs::metadata(exe).unwrap().len();
     assert!(
         len - 1 > MOUNT_TABLE_CEILING,
         "hold was not extended: {len}"
@@ -2401,8 +2420,8 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
         total_bytes: u64::MAX,
     };
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        pid,
-        modules,
+        child.pid(),
+        &modules,
         &mut CaptureWorkBudget::new(limits),
     )
     .unwrap();
@@ -2425,32 +2444,19 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
 fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
     use p11scope::discovery::scan::ScanLimits;
 
-    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
-    // modules under parallel load. Retry bounded; a deterministically
-    // broken scan still fails the assertions below on the last scan.
-    let (exe, modules) = {
-        let mut scan = scan_self();
-        for _ in 0..49 {
-            if !scan.1.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            scan = scan_self();
-        }
-        scan
-    };
-    let len = std::fs::metadata(exe).unwrap().len();
+    // As in the per-object case, the budget must fit any allowed mount table
+    // before it can exercise the hash. The child's mappings remain small.
+    let child = ScannedChild::new("hash-prefix-child", Some(64 * 1024 * 1024 + 2));
+    let modules = child.scan();
+    let len = std::fs::metadata(&child.exe).unwrap().len();
     let total_bytes = len - 1;
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: len,
         total_bytes,
     });
-    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
-        &modules,
-        &mut budget,
-    )
-    .unwrap();
+    let (pinned, skipped) =
+        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+            .unwrap();
     assert_eq!(
         pinned.pinned().count(),
         0,
@@ -2471,28 +2477,13 @@ fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
 
 #[test]
 fn expired_deadline_refuses_pin_hash_before_reading() {
-    // Flake hardening: a transient empty /proc/self/maps snapshot scans 0
-    // modules under parallel load. Retry bounded; a deterministically
-    // broken scan still fails the assertions below on the last scan.
-    let (_, modules) = {
-        let mut scan = scan_self();
-        for _ in 0..49 {
-            if !scan.1.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            scan = scan_self();
-        }
-        scan
-    };
-    let mut budget = self_binary_budget();
+    let child = ScannedChild::new("hash-deadline-child", None);
+    let modules = child.scan();
+    let mut budget = CaptureWorkBudget::default();
     budget.set_deadline(Some(0));
-    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-        std::process::id(),
-        &modules,
-        &mut budget,
-    )
-    .unwrap();
+    let (pinned, skipped) =
+        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+            .unwrap();
     assert_eq!(pinned.pinned().count(), 0);
     assert_eq!(budget.attempted_io_bytes(), 0);
     assert!(

@@ -8,9 +8,11 @@ campaign with integer-exact counts renders a verdict. Run as a script:
 
     python3 -I tests/python/test_bench_count_overhead.py -v
 """
+import io
 import runpy
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -198,6 +200,63 @@ class CountOverheadOracle(unittest.TestCase):
         self.assertTrue(any("workload denominator" in problem for problem in problems),
                         problems)
 
+
+DEN_CELLS = ("relevant-call-t1", "relevant-call-t4")
+
+
+def dencampaign_log(cells=DEN_CELLS, rounds=5):
+    """One exact denominator campaign: on/unobserved ABBA per round.
+
+    Odd rounds run on/unobserved/unobserved/on, even rounds the
+    mirror. t1 diffs run 100..190 over alternating bare walls (the
+    subtraction is per pair, not against a median); t4 is flat 300.
+    """
+    log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+    log += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
+    for cell in cells:
+        threads, pad = WORKLOADS[cell]
+        pair = 0
+        for rnd in range(1, rounds + 1):
+            arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                "unobserved", "on", "on", "unobserved")
+            on_queue, bare_queue = [], []
+            for _ in range(2):
+                if cell == "relevant-call-t1":
+                    bare = 1000000 + (pair % 2) * 10000
+                    diff = 100 + 10 * pair
+                else:
+                    bare = 1000000
+                    diff = 300
+                on_queue.append(bare + diff * 1000 // threads)
+                bare_queue.append(bare)
+                pair += 1
+            for arm in arms:
+                if arm == "on":
+                    log += sample(cell, arm, rnd, threads, 1000, on_queue.pop(0),
+                                  pad=pad, **counted(threads, 1000), **bpf())
+                else:
+                    log += sample(cell, arm, rnd, threads, 1000, bare_queue.pop(0),
+                                  pad=pad, lane="none")
+    return log
+
+
+class TracedCostOracle(unittest.TestCase):
+    def test_traced_cost_reports_parseable_lines_end_to_end(self):
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(dencampaign_log())
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = ANALYZE["main"](["--traced-cost", "--cells",
+                                      "relevant-call-t1,relevant-call-t4",
+                                      "--rounds", "5", str(path)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            buffer.getvalue().splitlines(),
+            ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
+             "p10_ns=109.0 p90_ns=181.0 samples=10",
+             "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
+             "p10_ns=300.0 p90_ns=300.0 samples=10"])
 
 if __name__ == "__main__":
     unittest.main()

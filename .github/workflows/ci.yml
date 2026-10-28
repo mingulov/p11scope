@@ -378,11 +378,12 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Reviewed provider acquisition retains bounded partial table entries;
-      # refused object continuity preserves the original S1 base record. The
-      # latter passed actual 6.6 entry/return and one-shed controls. These
-      # intentional changes supersede the previous feature baseline; they did
-      # not pass historical whole-object equality. Pin their integrated source.
+      # Reviewed WIDE cleanup reuses the existing bounded callbacks. Across
+      # seven default-profile objects, identity stayed byte-identical; the other
+      # six changed only two task_owner.c MD5 entries in .debug_line. All other
+      # sections, including code/data/relocations/symbols/BTF, stayed identical.
+      # Pin the integrated source of this change; prior baseline receipts keep
+      # their historical boundary. The strict checker still includes debug.
       # Later changes must preserve all three complete baseline objects.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
@@ -391,7 +392,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=6a2a9ef6deb29265dd4447132538cfeb28302373
+          BASELINE=bf7426b8818bb899a26f14f2f320bd4ae167c26b
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

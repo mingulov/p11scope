@@ -146,7 +146,7 @@ def select_publication(records, want, phase, observed_ns):
             return None
         if kind == 'caller_event':
             context = event.get('identity_context') or {}
-            if event.get('event') in ('exited', 'unloaded', 'exec_retired', 'reused'):
+            if event.get('event') in ('retired', 'exited', 'unloaded', 'exec_retired', 'reused'):
                 old = event.get('old', event.get('caller'))
                 if isinstance(old, str): dead.add(old)
             subject = None
@@ -199,6 +199,8 @@ def select_publication(records, want, phase, observed_ns):
                 if provider_matches or known_pair:
                     edges[key] = (event, row) if valid else None
         elif kind == 'pass_committed':
+            if event.get('final') is True:
+                return None
             if integer(event.get('pass')) and event['pass'] >= 0 and event.get('final', False) is False:
                 commit = row
     if phase == 'post' and pre:

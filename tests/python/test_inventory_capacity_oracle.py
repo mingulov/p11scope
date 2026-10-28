@@ -813,6 +813,33 @@ class C8GatePredicateTests(unittest.TestCase):
         for index, row in enumerate(self.rows): row["seq"] = index
         self.assertIsNone(self.select())
 
+    def test_later_retired_event_invalidates_healthy_watch_and_count(self):
+        for phase in ('pre', 'post'):
+            with self.subTest(phase=phase):
+                rows, want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if phase == 'post': self.post()
+                    self.assertIsNotNone(self.select(phase))
+                    retired = copy.deepcopy(self.context)
+                    retired['lifecycle'] = 'exec_retired'
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c0',
+                        'identity_context': {'version': 1, 'caller': retired}}, 180)
+                    self.assertIsNone(self.select(phase))
+                finally:
+                    self.rows, self.want = rows, want
+
+    def test_later_final_pass_invalidates_healthy_watch_and_count(self):
+        for phase in ('pre', 'post'):
+            with self.subTest(phase=phase):
+                rows, want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if phase == 'post': self.post()
+                    self.assertIsNotNone(self.select(phase))
+                    self.add('pass_committed', {'pass': 2, 'final': True}, 180)
+                    self.assertIsNone(self.select(phase))
+                finally:
+                    self.rows, self.want = rows, want
+
     def test_wrong_owned_birth_executable_and_provider_are_refused(self):
         for area, field, value in (("caller", "pid", 102), ("caller", "start_time", 78),
                 ("caller", "id", "c9"), ("module", "id", "m9"),

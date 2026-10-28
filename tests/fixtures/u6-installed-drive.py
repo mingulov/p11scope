@@ -1164,7 +1164,7 @@ def live_pair(args, binary, out):
         before, after = Path(args.before), Path(args.after)
     elif args.pair_prebuilt:
         pair_out = out / "pair"
-        pair_out.mkdir(mode=0o755)
+        # The capture driver owns new-only directory creation and refuses reuse.
         revision = args.source_revision or os.environ.get(REVISION_ENV, "")
         code, stdout, stderr = run([sys.executable, "-I", str(CAPTURE_PAIR),
                                    "--binary", str(binary),

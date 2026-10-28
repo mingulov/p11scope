@@ -165,6 +165,10 @@ def main(argv):
     if rest == ["inventory", "--help"]:
         print(INVENTORY)
         return 0
+    if rest == ["inventory", "diff", "--help"]:
+        print("BEFORE.json AFTER.json offline --json -o independent windows "
+              "absence does not prove removal")
+        return 0
     if rest == ["trace", "--help"]:
         print(TRACE)
         return 0
@@ -395,6 +399,95 @@ class ReleaseRecipientTests(unittest.TestCase):
         for name in ("mapped-only", "unreadable", "duplicate-basename", "slow-reader"):
             self.assertEqual(rows[name]["qualify_cell"], name)
             self.assertEqual(rows[name]["wiring"], "validated")
+
+    def compose_saved_pair(self, *, occupied=None, fail_child=False, explicit=False):
+        stage = stage_trace_pair(self.root, f'pair-{len(list(self.root.iterdir()))}')
+        out = Path(tempfile.mkdtemp(prefix='pair-receipt-', dir=self.root))
+        args = argparse.Namespace(before=None, after=None, pair_prebuilt=self.root / 'prebuilt',
+                                  source_revision='a' * 40)
+        fixture = ROOT / 'tests/fixtures/inventory-diff/scan-current.json'
+        if occupied is not None:
+            target = out / ('pair' if occupied == 'directory' else 'prior-output')
+            target.mkdir()
+            (target / 'preserve').write_text('original input')
+            if occupied == 'symlink':
+                (out / 'pair').symlink_to(target, target_is_directory=True)
+        if explicit:
+            args.before, args.after = out / 'before.json', out / 'after.json'
+            for path in (args.before, args.after):
+                path.write_bytes(fixture.read_bytes())
+        tree = ast.parse(DRIVER.CAPTURE_PAIR.read_text())
+        creates = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Attribute)
+                   and ast.unparse(node.func) == 'args.out.mkdir']
+        self.assertEqual(len(creates), 1)
+        child = ('import json, sys\nfrom pathlib import Path\n'
+                 'from types import SimpleNamespace\n'
+                 'args = SimpleNamespace(out=Path(sys.argv[1]))\n'
+                 + ast.unparse(creates[0]) + '\n'
+                 'if sys.argv[3] == "fail":\n'
+                 '    print("injected capture failure", file=sys.stderr)\n'
+                 '    raise SystemExit(23)\n'
+                 'for name in ("before", "after"):\n'
+                 '    directory = args.out / name\n'
+                 '    directory.mkdir()\n'
+                 '    (directory / "snapshot.json").write_bytes(Path(sys.argv[2]).read_bytes())\n')
+        commands, original_run = [], DRIVER.run
+
+        def run(argv, **bounds):
+            commands.append(argv)
+            self.assertEqual(argv[:2], [sys.executable, '-I'])
+            self.assertEqual(argv[argv.index('--binary') + 1], str(stage['selected']))
+            if argv[2] == str(DRIVER.CAPTURE_PAIR):
+                self.assertEqual(argv[argv.index('--prebuilt') + 1], str(args.pair_prebuilt))
+                self.assertEqual(argv[argv.index('--source-revision') + 1], args.source_revision)
+                result = subprocess.run([
+                    sys.executable, '-I', '-c', child, argv[argv.index('--out') + 1],
+                    str(fixture), 'fail' if fail_child else 'pass'],
+                    capture_output=True, timeout=10)
+                return result.returncode, result.stdout, result.stderr
+            self.assertEqual(argv[2], str(DRIVER.CROSS_DRIVE))
+            return original_run(argv, **bounds)
+
+        with patch.object(DRIVER, 'run', side_effect=run):
+            result = DRIVER.live_pair(args, stage['selected'], out)
+        return result, commands, stage, out
+
+    def test_saved_pair_shortcut_lets_child_create_fresh_output(self):
+        (ok, detail), commands, stage, out = self.compose_saved_pair()
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(detail['before'], str(out / 'pair/before/snapshot.json'))
+        self.assertEqual(detail['after'], str(out / 'pair/after/snapshot.json'))
+        self.assertTrue(stage['selected_log'].exists())
+        self.assertFalse(stage['decoy_log'].exists())
+
+    def test_saved_pair_shortcut_refuses_existing_directory_and_symlink(self):
+        for occupied in ('directory', 'symlink'):
+            with self.subTest(occupied=occupied):
+                (ok, detail), commands, _stage, out = self.compose_saved_pair(occupied=occupied)
+                self.assertFalse(ok)
+                self.assertEqual(len(commands), 1)
+                self.assertNotEqual(detail['capture_exit'], 0)
+                self.assertIn('FileExistsError', detail['stderr'])
+                self.assertEqual((out / 'pair/preserve').read_text(), 'original input')
+                self.assertEqual((out / 'pair').is_symlink(), occupied == 'symlink')
+                self.assertFalse((out / 'pair/before').exists())
+
+    def test_saved_pair_failed_child_never_runs_diff(self):
+        (ok, detail), commands, stage, _out = self.compose_saved_pair(fail_child=True)
+        self.assertFalse(ok)
+        self.assertEqual(detail['capture_exit'], 23)
+        self.assertIn('injected capture failure', detail['stderr'])
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(stage['selected_log'].exists())
+
+    def test_saved_explicit_pair_bypasses_capture_shortcut(self):
+        (ok, detail), commands, _stage, out = self.compose_saved_pair(explicit=True)
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][2], str(DRIVER.CROSS_DRIVE))
+        self.assertFalse((out / 'pair').exists())
 
     def check_selected_binding(self, plan, stage):
         """The receipt binds the executed selected path; the decoy stays cold."""

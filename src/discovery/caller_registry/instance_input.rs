@@ -167,10 +167,6 @@ pub(crate) struct JointRegistrationPlan<'a> {
 }
 
 impl JointRegistrationPlan<'_> {
-    pub(crate) fn registry_mut(&mut self) -> &mut CallerRegistry {
-        self.registry
-    }
-
     fn position(
         &self,
         input: &AdmittedInstanceCall,

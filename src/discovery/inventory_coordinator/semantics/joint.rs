@@ -526,6 +526,43 @@ struct BirthAssociation {
     router: u64,
     current: usize,
     entry: Option<usize>,
+    // Only the group's first link holds its finite refusal. Publish it
+    // after the registration plan releases the original staging index.
+    refusal: Option<(Option<CallerId>, BirthRefusal)>,
+}
+
+/// Why one observed New candidate retained S1. Keep the paid association
+/// finite; format the disclosure only after registration ownership ends.
+#[derive(Clone, Copy)]
+enum BirthRefusal {
+    NoAdmission,
+    Claim(Option<AttestationRefusal>),
+    Unbound,
+    AdmissionMismatch,
+    Resource,
+    Registration(crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal),
+    Candidate,
+    Native(crate::attach::BirthObservationRefusal),
+    OriginalMismatch,
+    Install(crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal),
+}
+
+impl BirthRefusal {
+    fn reason(self) -> String {
+        match self {
+            Self::NoAdmission => "joint_birth_no_admission".into(),
+            Self::Claim(Some(refusal)) => format!("joint_birth_claim_{refusal:?}"),
+            Self::Claim(None) => "joint_birth_claim_missing".into(),
+            Self::Unbound => "joint_birth_unbound".into(),
+            Self::AdmissionMismatch => "joint_birth_admission_mismatch".into(),
+            Self::Resource => "semantic_resource_capacity".into(),
+            Self::Registration(refusal) => format!("joint_birth_registration_{refusal:?}"),
+            Self::Candidate => "joint_birth_candidate_missing".into(),
+            Self::Native(reason) => format!("joint_birth_native_{reason:?}"),
+            Self::OriginalMismatch => "joint_birth_original_mismatch".into(),
+            Self::Install(refusal) => format!("joint_birth_install_{refusal:?}"),
+        }
+    }
 }
 
 fn disclose_s1_birth_refusal(
@@ -1020,6 +1057,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     router: router.get(),
                     current,
                     entry: None,
+                    refusal: None,
                 });
             }
         }
@@ -1065,8 +1103,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
         let mut registrations = match self.registry.joint_registration_plan() {
             Ok(registrations) => registrations,
-            Err(_) => {
+            Err(refusal) => {
                 batch.births_decided = true;
+                disclose_s1_birth_refusal(
+                    &mut self.registry,
+                    None,
+                    BirthRefusal::Registration(refusal).reason(),
+                );
                 return Ok(PreparedBirthDisposition { installed: 0 });
             }
         };
@@ -1074,45 +1117,66 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut installed = 0;
         let mut cursor = 0;
         while cursor < association.len() {
+            // A refusal may not stage a gap while the registration plan
+            // retains its original positions: the next sibling still
+            // needs that same unchanged index.
+            let first = cursor;
             let current = association[cursor].current;
             let entry = association[cursor].entry;
             while cursor < association.len() && association[cursor].current == current {
                 cursor += 1;
             }
             let Some(entry) = entry else {
+                let receipt = &batch.current[current];
+                association[first].refusal = Some((
+                    self.semantic_bindings
+                        .find_by_image(batch.domain, receipt.image())
+                        .map(|binding| binding.caller()),
+                    BirthRefusal::NoAdmission,
+                ));
                 continue;
             };
             let Some(Ok(input)) = batch.entries[entry].input.as_ref() else {
                 unreachable!("original index was checked");
             };
-            let Some(Ok(proof)) = batch.entries[entry].claim else {
+            let caller = Some(input.journal_binding().3);
+            let proof = match batch.entries[entry].claim {
+                Some(Ok(proof)) => proof,
                 // The FIRST actual same-key original governs permanent feed
                 // selection. A later Ok cannot replace a refused claim.
-                continue;
+                claim => {
+                    association[first].refusal =
+                        Some((caller, BirthRefusal::Claim(claim.and_then(Result::err))));
+                    continue;
+                }
             };
             let Some(binding) = self.semantic_bindings.get(input.journal_binding().3) else {
+                association[first].refusal = Some((caller, BirthRefusal::Unbound));
                 continue;
             };
             let receipt = &batch.current[current];
             if !receipt.matches_birth_admission(input, binding, &proof) {
+                association[first].refusal = Some((caller, BirthRefusal::AdmissionMismatch));
                 continue;
             }
             let Ok(mut slot) = births.reserve_for_current(&reserve, receipt) else {
-                disclose_s1_birth_refusal(
-                    registrations.registry_mut(),
-                    Some(input.journal_binding().3),
-                    "semantic_resource_capacity".into(),
-                );
+                association[first].refusal = Some((caller, BirthRefusal::Resource));
                 continue;
             };
-            let Ok(reservation) = registrations.reserve(input, &batch.registrations) else {
-                continue;
+            let reservation = match registrations.reserve(input, &batch.registrations) {
+                Ok(reservation) => reservation,
+                Err(refusal) => {
+                    association[first].refusal =
+                        Some((caller, BirthRefusal::Registration(refusal)));
+                    continue;
+                }
             };
             let receipt = batch.current.swap_remove(current);
             let candidate = match receipt.into_birth_candidate() {
                 Ok(candidate) => candidate,
                 Err(receipt) => {
                     batch.current.push(receipt);
+                    association[first].refusal = Some((caller, BirthRefusal::Candidate));
                     continue;
                 }
             };
@@ -1122,29 +1186,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Err(reason) => {
                     drop(reservation);
                     drop(slot);
-                    disclose_s1_birth_refusal(
-                        registrations.registry_mut(),
-                        Some(input.journal_binding().3),
-                        format!("joint_birth_native_{reason:?}"),
-                    );
+                    association[first].refusal = Some((caller, BirthRefusal::Native(reason)));
                     continue;
                 }
             };
             if !witness.matches_original(input, binding, &proof) || !slot.accepts(&witness) {
                 drop(reservation);
                 drop(slot);
-                disclose_s1_birth_refusal(
-                    registrations.registry_mut(),
-                    Some(input.journal_binding().3),
-                    "joint_birth_original_mismatch".into(),
-                );
+                association[first].refusal = Some((caller, BirthRefusal::OriginalMismatch));
                 continue;
             }
-            if reservation.install(input, &witness).is_err() {
+            if let Err((reservation, refusal)) = reservation.install(input, &witness) {
+                drop(reservation);
+                association[first].refusal = Some((caller, BirthRefusal::Install(refusal)));
                 continue;
             }
             slot.retain(witness);
             installed += 1;
+        }
+        drop(registrations);
+        for link in &association {
+            if let Some((caller, refusal)) = link.refusal {
+                disclose_s1_birth_refusal(&mut self.registry, caller, refusal.reason());
+            }
         }
         births.order_for_native_reads();
         Ok(PreparedBirthDisposition { installed })

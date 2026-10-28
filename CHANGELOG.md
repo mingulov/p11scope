@@ -96,6 +96,10 @@ or a product startup SLA.
 
 ### Fixed
 
+- Return-probe attachment requires the functional kernel safety assessment
+  even when the process leader has no seccomp filter. Shared Detailed capture
+  paths enforce the same check, covering filtered siblings and filters
+  installed after attachment.
 - An ordinary native-retirement refusal during a `--manifest` capture writes
   the incomplete report and returns nonzero on the first stop. Original
   ownership remains quarantined and replacement admission remains blocked.

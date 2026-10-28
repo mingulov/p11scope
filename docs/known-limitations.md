@@ -146,11 +146,17 @@ with no kernel event loss. That cold result is a disclosed pre-attachment
 coverage limit; it does not establish complete cold-start capture. Warm
 qualification still requires exact counts.
 
-Qualification of continuous runs up to 30 minutes is conditional on the final
-1,800-second SYSTEM+manifest soak, which remains pending for v0.5.0. An earlier
-run failed exact-count and final-drain checks. Longer runs (4 h, 24 h) remain
-unqualified. The startup and stop figures above are declared per kernel, not
-a product guarantee.
+The final 1,800-second SYSTEM+manifest soak passed on Fedora Linux 7.2.9
+with the default FULL build: a 1,860-second observation window captured
+162,003 calls from each of two callers, with zero lifecycle ring loss and a
+proven final drain. Maximum sampled RSS was 75.5 MiB (78.9 MiB recorded
+high-water mark). Semantic accounting separately
+reported 324,004 joined calls, two shed calls and 651 named-budget refusals;
+key operations remained unavailable. This is a measured 30-minute workload,
+not complete semantic attribution or a guarantee for other workloads. The
+earlier failed exact-count/final-drain run remains a historical failure.
+Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
+declared per kernel, not a product guarantee.
 
 In long system-wide runs, a live publication can rarely stop making
 progress. After 6 seconds without progress, p11scope abandons that

@@ -15,6 +15,7 @@ Run: python3 -I tests/python/test_release_recipient.py -v
 import argparse
 import ast
 import contextlib
+import copy
 import errno
 import hashlib
 import importlib.util
@@ -232,11 +233,248 @@ def self_test(journeys, binary):
     return code, json.loads(out.getvalue())
 
 
+def compact_data(layout='compact'):
+    """Source-shaped frames: compact uses separate application/module rows."""
+    doc = {'callers': [{'id': 'c17', 'pid': 501}, {'id': 'c18', 'pid': 502}],
+           'modules': [{'id': 'm11'}, {'id': 'm12'}],
+           'edges': [{'caller': 'c17', 'module': 'm11'}, {'caller': 'c18', 'module': 'm12'}]}
+    if layout == 'compact':
+        lines = ['p11scope inventory pid=501 (minimal)',
+                 'totals: 2 callers 2 modules 2 edges', 'coverage: 0 gaps 0 refusals 0 suppressed',
+                 'application app-one [c17]', 'module provider-one [m11]', 'observed 3 entries',
+                 'application app-two [c18]', 'module provider-two [m12]', 'observed 2 entries',
+                 '', '', 'summary 1-2/2 | j/k tab q quit']
+    else:
+        lines = ['p11scope inventory pid=501 | 2 passes | 2 callers 2 modules 2 edges',
+                 'coverage: 0 gaps 0 refusals 0 suppressed',
+                 'app-one [c17] -> provider-one [m11]',
+                 'app-two [c18] -> provider-two [m12]']
+    transcript = ('\x1b[?1049h\x1b[H' + '\n'.join(line + '\x1b[K' for line in lines)
+                  + '\x1b[?1049l').encode()
+    ledger = ('IDENT cell=U6 pid=501 start=5777 gen=0 exe=/wl/one\n'
+              'IDENT cell=U6 pid=502 start=5778 gen=0 exe=/wl/two\n')
+    return doc, transcript, ledger
+
+
 class ReleaseRecipientTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="release-recipient-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def compose_ledger(self, journey, *, c8_exit=0, failure=None, c8_base=True):
+        """Run actual live dispatch with owned files and substituted captures."""
+        stage = stage_pair(self.root, f"ledger-{len(list(self.root.iterdir()))}")
+        out = self.root / f"ledger-output-{len(list(self.root.iterdir()))}"
+        ledger, module = self.root / 'calls.ledger', self.root / 'provider.so'
+        ledger.write_text('')
+        module.write_text('owned provider stand-in')
+        gate = self.root / 'ledger.go'
+        config = self.root / 'coordinator.json'
+        config.write_text(json.dumps(dict(pid=501, modules=[str(module)],
+                                         ledger=str(ledger), gate=str(gate))))
+        argv = ['u6-installed-drive.py', '--journey', journey,
+                '--binary', str(stage['selected']), '--source-revision', 'a' * 40,
+                '--workload-coordinator', str(config), '--out', str(out)]
+        if c8_base:
+            argv += ['--c8-base', str(self.root / 'c8')]
+        commands = []
+        self.last_ledger_out, self.last_ledger_commands, self.last_ledger_gate = out, commands, gate
+
+        def capture(command, **bounds):
+            commands.append((command, bounds))
+            if command[0] == str(DRIVER.QUALIFY_INVENTORY):
+                self.assertEqual(command[1:], [str(stage['selected']), '--lane', 'native',
+                                               '--base', str(self.root / 'c8')])
+                self.assertEqual(bounds, dict(timeout=1500, output_limit=16 * 1024 * 1024))
+                self.assertFalse(gate.exists())
+                return c8_exit, b'actual C8 boundary substituted', b''
+            self.assertTrue(gate.exists())
+            self.assertEqual(bounds, dict(timeout=120))
+            if command[0] == str(stage['selected']):
+                self.assertEqual(command[1:5], ['inventory', '--pid', '501', '--module'])
+                self.assertEqual(command[command.index('--module') + 1], str(module))
+                self.assertEqual(command[command.index('--duration') + 1], '20s')
+                self.assertEqual(command[-4:], ['--event-rotate-bytes', '1K', '--event-max-files', '3'])
+                if failure == 'rotation-capture':
+                    return 23, b'', b'capture failed'
+                doc, _files, text = DRIVER.rotation_fixture(
+                    out / 'rotation', missing_use=failure == 'rotation-verdict')
+                doc['observation'] = dict(lane='native', started_ns=10, ended_ns=20)
+                (out / 'rotation/report.json').write_text(json.dumps(doc))
+                ledger.write_text(text)
+                return 0, b'', b''
+            self.assertEqual(command[:4], [sys.executable, '-I', str(DRIVER.INVENTORY_ORACLE),
+                                          'record-pty'])
+            self.assertEqual(command[5:10], ['12', '48', '60', '20', '--'])
+            self.assertEqual(command[10:14], [str(stage['selected']), 'inventory', '--pid', '501'])
+            self.assertEqual(command[command.index('--duration') + 1], '25s')
+            if failure == 'pty-capture':
+                return 23, b'rc=0', b''
+            doc, transcript, _ledger = compact_data()
+            if failure == 'compact-verdict':
+                doc['callers'][0]['pid'] = 599
+            (out / 'compact-pty/report.json').write_text(json.dumps(doc))
+            Path(command[4]).write_bytes(transcript)
+            if failure == 'receipt-sink':
+                (out / 'receipt.json').mkdir()
+            return 0, b'rc=0', b''
+
+        with patch.object(sys, 'argv', argv), patch.object(DRIVER, 'run', side_effect=capture), \
+                patch.dict(os.environ, {DRIVER.INSTALLED_ENV: str(stage['selected'])}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                code = DRIVER.main()
+            except SystemExit as error:
+                self.fail(f'live {journey} must dispatch, not exit {error.code}')
+        return code, json.loads((out / 'receipt.json').read_text()), commands
+
+    def test_ledger_component_live_dispatch_reports_only_the_four_tail_cells(self):
+        code, receipt, commands = self.compose_ledger('ledger-component', c8_base=False)
+        self.assertEqual(code, 0)
+        self.assertIs(receipt['pass'], True)
+        self.assertEqual((receipt['mode'], receipt['journey'], receipt['qualification']),
+                         ('live', 'ledger-component', 'component_only'))
+        self.assertEqual(receipt['covers'], ['rotation', 'compact-pty'])
+        self.assertEqual(receipt['not_evaluated'], ['c8-system-dashboard-stop'])
+        self.assertEqual([row['cell'] for row in receipt['cells']], [
+            'rotation-capture', 'rotation-conserves-ledger',
+            'u6-compact-pty-capture', 'u6-compact-pty-matches-ledger'])
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(receipt['binary']['source_revision'], 'a' * 40)
+        self.assertEqual(receipt['binary']['role'], 'installed_candidate')
+
+    def test_full_ledger_still_runs_real_c8_boundary_before_the_same_tail(self):
+        code, receipt, commands = self.compose_ledger('ledger')
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['journey'], 'ledger')
+        self.assertNotIn('qualification', receipt)
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(receipt['cells'][0]['cell'], 'c8-system-dashboard-stop')
+        self.assertEqual(len(receipt['cells']), 5)
+        self.assertTrue(all(row['pass'] is True for row in receipt['cells']))
+
+    def test_full_ledger_c8_failure_and_missing_base_never_release_tail(self):
+        for options, reason in (({'c8_exit': 23}, 'exit 23'),
+                                ({'c8_base': False}, '--c8-base')):
+            with self.subTest(options=options), self.assertRaisesRegex(AssertionError, reason):
+                self.compose_ledger('ledger', **options)
+            self.assertFalse(self.last_ledger_gate.exists())
+            self.assertFalse((self.last_ledger_out / 'rotation').exists())
+            self.assertFalse((self.last_ledger_out / 'receipt.json').exists())
+
+    def test_ledger_component_capture_and_real_rotation_refusals_never_write_pass(self):
+        for failure in ('rotation-capture', 'rotation-verdict', 'pty-capture', 'compact-verdict'):
+            with self.subTest(failure=failure), self.assertRaises(AssertionError):
+                self.compose_ledger('ledger-component', failure=failure, c8_base=False)
+            self.assertFalse((self.last_ledger_out / 'receipt.json').exists())
+            self.assertTrue(all(command[0] != str(DRIVER.QUALIFY_INVENTORY)
+                                for command, _bounds in self.last_ledger_commands))
+
+    def test_ledger_component_refuses_synthetic_modes_before_output_or_execution(self):
+        for mode in ('--self-test', '--dry-run'):
+            out = self.root / 'synthetic-component'
+            errors = io.StringIO()
+            with self.subTest(mode=mode), patch.object(sys, 'argv', [
+                    'u6-installed-drive.py', '--journey', 'ledger-component', mode,
+                    '--out', str(out)]), patch.object(DRIVER, 'run') as run, \
+                    contextlib.redirect_stderr(errors):
+                with self.assertRaises(SystemExit) as error:
+                    DRIVER.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('ledger-component is live-only', errors.getvalue())
+                run.assert_not_called()
+                self.assertFalse(out.exists())
+
+    def test_ledger_component_receipt_sink_failure_cannot_report_a_pass(self):
+        with self.assertRaises(OSError):
+            self.compose_ledger('ledger-component', failure='receipt-sink', c8_base=False)
+        self.assertFalse((self.last_ledger_out / 'receipt.json').is_file())
+        self.assertEqual(len(self.last_ledger_commands), 2)
+
+    def compact_verdict(self, doc, transcript, ledger):
+        path = self.root / 'compact.ledger'
+        path.write_text(ledger)
+        return DRIVER.compact_pty_verdict(doc, transcript, {'ledger': str(path)})
+
+    def test_compact_oracle_joins_real_frame_references_to_document_pids(self):
+        for layout in ('compact', 'full'):
+            doc, transcript, ledger = compact_data(layout)
+            parser = DRIVER.inventory_oracle_module()
+            # The shared full parser exposes c17, never the PID 501. Actual
+            # 48x12 output instead uses render_minimal's three-line blocks.
+            full_frames = parser['parse_frames'](transcript)
+            if layout == 'full':
+                self.assertEqual(parser['FRAME']['identity'].match(full_frames[0][2]).group(2), 'c17')
+            else:
+                self.assertEqual(full_frames, [])
+            with self.subTest(layout=layout):
+                ok, detail = self.compact_verdict(doc, transcript, ledger)
+                self.assertTrue(ok, detail)
+                self.assertEqual(detail['frame_pids'], [501, 502])
+                self.assertEqual(detail['ledger_pids'], [501, 502])
+
+    def test_compact_oracle_refuses_unknown_duplicate_malformed_and_unbound_references(self):
+        for layout in ('compact', 'full'):
+            original, transcript, ledger = compact_data(layout)
+            cases = []
+            for field, rows in (('callers', [original['callers'][0]]),
+                                ('modules', [original['modules'][0]]),
+                                ('edges', [original['edges'][0]])):
+                doc = copy.deepcopy(original)
+                doc[field] += rows
+                cases.append((field + '-duplicate', doc, transcript, ledger))
+            for value in (None, True, '501', 0, -1):
+                doc = copy.deepcopy(original)
+                doc['callers'][0]['pid'] = value
+                cases.append(('invalid-pid', doc, transcript, ledger))
+            for old, new in ((b'[c17]', b'[c999]'), (b'[m11]', b'[m999]'),
+                             (b'[c17]', b'[c17x]'), (b'[m11]', b'[11]'),
+                             (b'[m11]', b'[m12]')):
+                cases.append(('unbound-frame', original, transcript.replace(old, new), ledger))
+            for field, index, key, value in (('callers', 0, 'id', '501'),
+                                            ('modules', 0, 'id', '11'),
+                                            ('edges', 0, 'caller', 'c999'),
+                                            ('edges', 0, 'module', 'm999')):
+                doc = copy.deepcopy(original)
+                doc[field][index][key] = value
+                cases.append(('invalid-document-ref', doc, transcript, ledger))
+            row = (b'application extra [bad]\x1b[K\nmodule extra [m11]\x1b[K\n'
+                   if layout == 'compact' else b'extra [bad] -> extra [m11]\x1b[K\n')
+            cases.append(('malformed-extra', original,
+                          transcript.replace(b'\x1b[?1049l', row + b'\x1b[?1049l'), ledger))
+            for label, doc, frame, text in cases:
+                with self.subTest(layout=layout, mutation=label):
+                    ok, detail = self.compact_verdict(doc, frame, text)
+                    self.assertFalse(ok, detail)
+
+    def test_compact_oracle_keeps_totals_session_and_ledger_agreement_hard(self):
+        for layout in ('compact', 'full'):
+            doc, transcript, ledger = compact_data(layout)
+            for label, frame, text in (
+                    ('totals', transcript.replace(b'2 callers', b'3 callers'), ledger),
+                    ('no-alt-exit', transcript.replace(b'\x1b[?1049l', b''), ledger),
+                    ('unledgered-pid', transcript, ledger.replace('pid=501', 'pid=599')),
+                    ('malformed-ledger-pid', transcript, ledger.replace('pid=501', 'pid=bad')),
+                    ('empty-ledger', transcript, '')):
+                with self.subTest(layout=layout, mutation=label):
+                    ok, detail = self.compact_verdict(doc, frame, text)
+                    self.assertFalse(ok, detail)
+
+    def test_compact_blocks_never_pair_across_application_or_frame_boundaries(self):
+        doc, transcript, ledger = compact_data()
+        app = b'application app-one [c17]\x1b[K'
+        mod = b'module provider-one [m11]\x1b[K'
+        split = (b'\x1b[Hp11scope inventory pid=501 (minimal)\x1b[K\n'
+                 b'totals: 2 callers 2 modules 2 edges\x1b[K\n')
+        for label, frame in (
+                ('cross-frame', transcript.replace(app + b'\n' + mod, app + b'\n' + split + mod)),
+                ('cross-application', transcript.replace(mod, b'application other [c18]\x1b[K\n' + mod)),
+                ('module-first', transcript.replace(app + b'\n' + mod, mod + b'\n' + app)),
+                ('duplicate-pair', transcript.replace(mod, mod + b'\n' + app + b'\n' + mod))):
+            with self.subTest(mutation=label):
+                ok, detail = self.compact_verdict(doc, frame, ledger)
+                self.assertFalse(ok, detail)
 
     @staticmethod
     def trace_results():

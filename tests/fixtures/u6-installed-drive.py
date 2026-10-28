@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """U6 installed journey cells: all-modes-vs-ledger and named-trace/false-name twins.
 
-Two journeys, three modes each:
+Two full journeys, three modes each:
 
 - ``--self-test`` runs synthetic twin red-green only. No binary, no root and
   no capture, except the diff twin's OFFLINE ``inventory diff`` which needs an
@@ -20,6 +20,9 @@ Two journeys, three modes each:
 Ledger journey cells (``--journey ledger``): pipe-JSON, PTY dashboard (80x24
 and the U6 compact 48x12), event-log rotation and exec generations, every
 population matched against the owned workload ledger.
+
+The live-only ``--journey ledger-component`` runs just the shared rotation and
+compact PTY cells. Its component-only receipt does not qualify C8 or full U6.
 
 Named-trace journey cells (``--journey named-trace``): named-trace positives
 plus false-name twins (mapped-only, unreadable, unknown, exec,
@@ -972,25 +975,8 @@ def dry_run_pair(args, binary):
 # Live execution (installed gate only; never runs unprivileged here).
 # ---------------------------------------------------------------------------
 
-def live_ledger(args, binary, out):
-    resolved = resolve_binary(binary)
-    revision = args.source_revision or os.environ.get(REVISION_ENV, "")
-    require(HEX40.fullmatch(revision or ""), "live mode requires the exact 40-hex source revision")
-    require(args.c8_base and Path(args.c8_base).is_absolute(), "live mode requires --c8-base")
-    cells = []
-    info = {"path": str(resolved), "sha256": sha256_file(resolved),
-            "role": binary_role(resolved), "source_revision": revision}
-
-    def record(name, ok, detail):
-        cells.append({"cell": name, "pass": bool(ok), "detail": detail})
-        return ok
-
-    code, stdout, stderr = run([str(QUALIFY_INVENTORY), str(resolved), "--lane", "native",
-                                "--base", str(args.c8_base)],
-                               timeout=1500, output_limit=16 * 1024 * 1024)
-    record("c8-system-dashboard-stop", code == 0,
-           {"exit": code, "tail": (stdout + stderr)[-1024:].decode("utf-8", "replace")})
-    require(code == 0, f"installed inventory qualification failed with exit {code}")
+def capture_ledger_cells(args, resolved, out, record):
+    """Shared installed rotation/compact cells; no C8 prerequisite here."""
     coordinator = validate_coordinator(args.workload_coordinator)
     config = json.loads(read_bounded(args.workload_coordinator))
     if config.get("gate"):
@@ -1044,6 +1030,29 @@ def live_ledger(args, binary, out):
                                   read_bounded(pty_out), config)
     record("u6-compact-pty-matches-ledger", compact[0], compact[1])
     require(compact[0], f"installed U6 compact PTY cell failed: {compact[1]}")
+    return coordinator
+
+
+def live_ledger(args, binary, out):
+    resolved = resolve_binary(binary)
+    revision = args.source_revision or os.environ.get(REVISION_ENV, "")
+    require(HEX40.fullmatch(revision or ""), "live mode requires the exact 40-hex source revision")
+    require(args.c8_base and Path(args.c8_base).is_absolute(), "live mode requires --c8-base")
+    cells = []
+    info = {"path": str(resolved), "sha256": sha256_file(resolved),
+            "role": binary_role(resolved), "source_revision": revision}
+
+    def record(name, ok, detail):
+        cells.append({"cell": name, "pass": bool(ok), "detail": detail})
+        return ok
+
+    code, stdout, stderr = run([str(QUALIFY_INVENTORY), str(resolved), "--lane", "native",
+                                "--base", str(args.c8_base)],
+                               timeout=1500, output_limit=16 * 1024 * 1024)
+    record("c8-system-dashboard-stop", code == 0,
+           {"exit": code, "tail": (stdout + stderr)[-1024:].decode("utf-8", "replace")})
+    require(code == 0, f"installed inventory qualification failed with exit {code}")
+    coordinator = capture_ledger_cells(args, resolved, out, record)
     receipt = {"mode": "live", "journey": "ledger", "binary": info,
                "coordinator": coordinator, "cells": cells,
                "pass": all(cell["pass"] for cell in cells)}
@@ -1052,32 +1061,138 @@ def live_ledger(args, binary, out):
     return 0 if receipt["pass"] else 1
 
 
+def live_ledger_component(args, binary, out):
+    resolved = resolve_binary(binary)
+    revision = args.source_revision or os.environ.get(REVISION_ENV, "")
+    require(HEX40.fullmatch(revision or ""), "live mode requires the exact 40-hex source revision")
+    cells = []
+    info = {"path": str(resolved), "sha256": sha256_file(resolved),
+            "role": binary_role(resolved), "source_revision": revision}
+
+    def record(name, ok, detail):
+        cells.append({"cell": name, "pass": bool(ok), "detail": detail})
+        return ok
+
+    coordinator = capture_ledger_cells(args, resolved, out, record)
+    receipt = {"mode": "live", "journey": "ledger-component", "qualification": "component_only",
+               "covers": ["rotation", "compact-pty"], "not_evaluated": ["c8-system-dashboard-stop"],
+               "binary": info, "coordinator": coordinator, "cells": cells,
+               "pass": all(cell["pass"] for cell in cells)}
+    (out / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps(receipt))
+    return 0 if receipt["pass"] else 1
+
+
 def compact_pty_verdict(doc, transcript, config):
-    """U6 48x12 frame/document/ledger agreement on a real PTY transcript."""
+    """Join full/48x12 dashboard references to saved identities and the ledger."""
     module = inventory_oracle_module()
-    frames = module["parse_frames"](transcript)
     table = module["FRAME"]
+    frames = module["parse_frames"](transcript)
     errors = []
+    minimal = []
+    # The shared parser recognizes full-layout headers. The 48x12 renderer
+    # uses render_minimal's separate totals and application/module rows.
+    body = transcript.split(table["alt_off"], 1)[0]
+    for chunk in body.split(table["repaint"])[1:]:
+        lines = table["ansi"].sub(b"", chunk).replace(b"\r", b"").decode("utf-8", "replace").split("\n")
+        if lines and re.fullmatch(r"p11scope inventory .+ \(minimal\)", lines[0]):
+            minimal.append(lines)
+        elif lines and lines[0].startswith("p11scope inventory") and not table["header"].match(lines[0]):
+            errors.append("unrecognized dashboard frame header")
+    if minimal:
+        if frames:
+            errors.append("mixed full and compact dashboard layouts")
+        frames = minimal
     if not frames or table["alt_on"] not in transcript or table["alt_off"] not in transcript:
         errors.append("no complete alternate-screen dashboard session")
-    header = table["header"].search("\n".join(frames[-1])) if frames else None
-    if not header:
+
+    def identities(name, pattern):
+        result = {}
+        rows = doc.get(name)
+        if not isinstance(rows, list) or not rows:
+            errors.append("missing saved identity population")
+            return result
+        for row in rows:
+            identity = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(identity, str) or not re.fullmatch(pattern, identity) or identity in result:
+                errors.append("invalid or duplicate saved identity reference")
+                continue
+            result[identity] = row
+        return result
+
+    callers, modules = identities("callers", r"c[0-9]+"), identities("modules", r"m[0-9]+")
+    for caller in callers.values():
+        if type(caller.get("pid")) is not int or caller["pid"] <= 0:
+            errors.append("saved caller lacks a valid PID")
+    pairs = set()
+    edges = doc.get("edges")
+    if not isinstance(edges, list) or not edges:
+        errors.append("missing saved edge population")
+    else:
+        for edge in edges:
+            pair = (edge.get("caller"), edge.get("module")) if isinstance(edge, dict) else (None, None)
+            if (not all(isinstance(ref, str) for ref in pair) or pair[0] not in callers
+                    or pair[1] not in modules or pair in pairs):
+                errors.append("invalid or duplicate saved edge reference")
+            else:
+                pairs.add(pair)
+    totals = (re.fullmatch(r"totals: (\d+) callers (\d+) modules (\d+) edges", frames[-1][1])
+              if minimal and len(frames[-1]) > 1 else
+              table["header"].match(frames[-1][0]) if frames else None)
+    if not totals:
         errors.append("final frame lacks the coverage header totals")
     else:
-        _scope, _passes, callers, modules, edges = header.groups()
-        if (int(callers), int(modules), int(edges)) != (len(doc.get("callers", [])),
-                                                       len(doc.get("modules", [])),
-                                                       len(doc.get("edges", []))):
+        counts = totals.groups() if minimal else totals.groups()[2:]
+        if tuple(map(int, counts)) != (len(callers), len(modules), len(edges) if isinstance(edges, list) else 0):
             errors.append("frame totals disagree with the saved document")
-    ledger_pids = {int(line.split("pid=", 1)[1].split()[0])
-                   for line in read_bounded(config["ledger"]).decode().splitlines()
-                   if line.startswith("IDENT ")}
-    frame_pids = set()
+
+    ledger_pids, frame_pids = set(), set()
+    for line in read_bounded(config["ledger"]).decode().splitlines():
+        if line.startswith("IDENT "):
+            pid = re.search(r"(?:^| )pid=([0-9]+)(?: |$)", line)
+            if pid is None or int(pid.group(1)) <= 0:
+                errors.append("ledger identity lacks a valid PID")
+            else:
+                ledger_pids.add(int(pid.group(1)))
+
+    def bind(pair, shown):
+        if pair not in pairs or pair in shown:
+            errors.append("frame pair is missing, duplicated or not a saved edge")
+            return
+        shown.add(pair)
+        pid = callers[pair[0]].get("pid")
+        if type(pid) is int and pid > 0:
+            frame_pids.add(pid)
+
     for lines in frames:
+        shown, pending = set(), None
         for line in lines:
-            match = table["identity"].match(line)
-            if match:
-                frame_pids.add(int(match.group(2)))
+            if minimal:
+                if line.startswith(("application ", "> application ")):
+                    if pending is not None:
+                        errors.append("compact application lacks its module row")
+                    match = re.fullmatch(r"(?:> )?application .* \[(c\d+)\]", line)
+                    pending = match.group(1) if match else None
+                    if match is None:
+                        errors.append("malformed compact caller reference")
+                elif line.startswith("module "):
+                    match = re.fullmatch(r"module .* \[(m\d+)\]", line)
+                    if pending is None or match is None:
+                        errors.append("malformed or unpaired compact module reference")
+                    else:
+                        bind((pending, match.group(1)), shown)
+                    pending = None
+                elif pending is not None:
+                    errors.append("compact application lacks its module row")
+                    pending = None
+            else:
+                match = table["identity"].match(line)
+                if match:
+                    bind((match.group(2), match.group(4)), shown)
+                elif " -> " in line:
+                    errors.append("malformed full dashboard identity reference")
+        if pending is not None:
+            errors.append("compact application lacks its module row")
     if not frame_pids:
         errors.append("frames name no caller pids")
     for pid in sorted(frame_pids - ledger_pids):
@@ -1190,8 +1305,8 @@ def live_pair(args, binary, out):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--journey", choices=["ledger", "named-trace"],
-                        help="U6 journey (self-test defaults to both)")
+    parser.add_argument("--journey", choices=["ledger", "ledger-component", "named-trace"],
+                        help="U6 journey (ledger-component is live-only; self-test defaults to both full journeys)")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--binary", help="explicit candidate path")
@@ -1219,6 +1334,8 @@ def main():
     args = parser.parse_args()
     if args.self_test and args.dry_run:
         parser.error("--self-test and --dry-run are exclusive")
+    if args.journey == "ledger-component" and (args.self_test or args.dry_run):
+        parser.error("ledger-component is live-only and does not qualify C8 or full U6")
     if os.environ.get(RED_PROOF_ENV) and not (args.self_test or args.dry_run):
         parser.error(f"{RED_PROOF_ENV} is proof-only; live mode refuses it")
     journeys = [args.journey] if args.journey else (["ledger", "named-trace"]
@@ -1243,6 +1360,8 @@ def main():
     out.mkdir(mode=0o755, parents=True)
     if journeys == ["ledger"]:
         return live_ledger(args, binary, out)
+    if journeys == ["ledger-component"]:
+        return live_ledger_component(args, binary, out)
     return live_named_trace(args, binary, out)
 
 

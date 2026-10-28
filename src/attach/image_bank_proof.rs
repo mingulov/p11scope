@@ -875,10 +875,10 @@ fn n5_verdict(added_ns: &[f64], pct: &[f64]) -> N5Verdict {
     let (min_added_ns, max_added_ns) = n5_spread(added_ns).unwrap_or((f64::NAN, f64::NAN));
     let median_pct = n5_median(pct).unwrap_or(f64::NAN);
     let (min_pct, max_pct) = n5_spread(pct).unwrap_or((f64::NAN, f64::NAN));
-    // Both gates are inclusive; a NaN median (empty input) compares
-    // false, so it never passes.
-    let absolute_pass = median_added_ns <= N5_ADDED_BUDGET_NS;
-    let pass = absolute_pass && median_pct <= N5_PCT_BUDGET;
+    // Both gates are inclusive, but nonfinite measurements cannot
+    // qualify, including negative overflow of the percentage ratio.
+    let absolute_pass = median_added_ns.is_finite() && median_added_ns <= N5_ADDED_BUDGET_NS;
+    let pass = absolute_pass && median_pct.is_finite() && median_pct <= N5_PCT_BUDGET;
     N5Verdict {
         median_added_ns,
         min_added_ns,
@@ -893,7 +893,7 @@ fn n5_verdict(added_ns: &[f64], pct: &[f64]) -> N5Verdict {
 
 /// A missing percentage gate cannot be reported as a full N5 PASS.
 fn n5_verdict_label(verdict: &N5Verdict) -> &'static str {
-    if !verdict.median_pct.is_finite() {
+    if !verdict.median_added_ns.is_finite() || !verdict.median_pct.is_finite() {
         "UNQUALIFIED"
     } else if verdict.pass {
         "PASS"
@@ -1054,8 +1054,8 @@ fn n5_run_pct_production(added_ns: f64, production_ns: f64) -> Option<f64> {
 fn n5_verdict_ns_only(added_ns: &[f64]) -> N5Verdict {
     let median_added_ns = n5_median(added_ns).unwrap_or(f64::NAN);
     let (min_added_ns, max_added_ns) = n5_spread(added_ns).unwrap_or((f64::NAN, f64::NAN));
-    // The 250 ns gate only; a NaN median (empty input) never passes.
-    let absolute_pass = median_added_ns <= N5_ADDED_BUDGET_NS;
+    // Invalid or absent measurements cannot pass the absolute diagnostic.
+    let absolute_pass = median_added_ns.is_finite() && median_added_ns <= N5_ADDED_BUDGET_NS;
     N5Verdict {
         median_added_ns,
         min_added_ns,

@@ -801,8 +801,8 @@ Limits that matter in pods:
 
   The header also carries a key-operation summary line. In this
   version key operations are never reported, so it reads
-  `key operations: not reported by this version (planned for 0.5.1)`.
-  From 0.5.1, once populated, it counts completions per operation
+  `key operations: not reported by this version (planned for 0.6.0)`.
+  From 0.6.0, once populated, it counts completions per operation
   category, e.g.
   `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
   The line shows counts per operation category from the

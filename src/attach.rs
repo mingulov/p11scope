@@ -2452,7 +2452,7 @@ pub(crate) struct AttachedSemanticSet {
     /// linked attachment may install key-operation (Joint) feeds. OD33/R-50:
     /// v0.5.0 links the object-journal producer into no BPF flavor, so the
     /// production seal marks every attachment unlinked; the test sealer
-    /// marks its attachments linked for the 0.5.1 Joint suites.
+    /// marks its attachments linked for the 0.6.0 Joint suites.
     journal_linked: bool,
 }
 
@@ -2476,7 +2476,7 @@ impl AttachedSemanticSet {
     }
 
     /// Whether a journal producer is linked for this attachment. The
-    /// v0.5.0 production seal always marks false (OD33/R-50); 0.5.1
+    /// v0.5.0 production seal always marks false (OD33/R-50); 0.6.0
     /// wires the sealed value through to the lane.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn journal_linked(&self) -> bool {
@@ -2665,7 +2665,7 @@ impl SessionDrainProducers {
     /// native domain plus its retained test EVENTS domain. The
     /// common-owner check still runs at mint — this pairs values, it
     /// never authorizes a splice. Linked, like the test sealer, so the
-    /// Joint suites keep exercising the linked 0.5.1 world.
+    /// Joint suites keep exercising the linked 0.6.0 world.
     #[cfg(test)]
     pub(crate) fn test_pair(
         native: crate::attach::capture::NativeDomainId,
@@ -3038,7 +3038,7 @@ pub(crate) fn seal_attached_subset_with(
         domain,
         subset,
         generation: 0,
-        // The test seal models the linked 0.5.1 world, so the Joint
+        // The test seal models the linked 0.6.0 world, so the Joint
         // suites keep exercising birth-to-grant mapping.
         journal_linked: true,
     };
@@ -18792,7 +18792,7 @@ mod tests {
 
     /// OD33/R-50: v0.5.0 links the object-journal producer into no BPF
     /// flavor, so the one production seal marks its attachment not
-    /// journal-linked. The sealed flag gates the Joint birth path (0.5.1
+    /// journal-linked. The sealed flag gates the Joint birth path (0.6.0
     /// wires seal to lane); the live BPF seal needs privilege, so this
     /// pins the sealed literal in the production sealer instead.
     #[test]
@@ -18880,7 +18880,7 @@ mod tests {
     /// constructor marks its producers not journal-linked. The live
     /// guard reads this flag (via `AttestedSemanticLane::initialize_joint`
     /// and `prepare_joint_births`), while the sealed attachment flag has
-    /// no production reader in v0.5.0 (0.5.1 wires seal to lane), so a
+    /// no production reader in v0.5.0 (0.6.0 wires seal to lane), so a
     /// flipped literal here would install Joint feeds on wedged lanes.
     /// `Session` retains no sealed attachment, so this literal cannot
     /// derive from the seal without a wider change; pin it instead.
@@ -18952,7 +18952,7 @@ mod tests {
     }
 
     /// The #[cfg(test)] sealer marks its attachment journal-linked, so
-    /// the Joint unit suites keep exercising the linked 0.5.1 world.
+    /// the Joint unit suites keep exercising the linked 0.6.0 world.
     #[test]
     fn test_seal_is_journal_linked() {
         let fixture = crate::semantics_objects::journal::tests::AttestationFixture::new(

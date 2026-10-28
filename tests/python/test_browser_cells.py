@@ -1338,7 +1338,7 @@ class BrowserS1Oracle(unittest.TestCase):
     """S1 oracle twins: unprivileged, run everywhere (no gate).
 
     The v0.5.0 S1 proof over the profile report's S1 sections: no
-    Joint content anywhere (key-operation populations are 0.5.1), no
+    Joint content anywhere (key-operation populations are 0.6.0), no
     mechanism use and no logins in enumeration flows, and balanced
     session accounting with a per-cell opened floor.
     """

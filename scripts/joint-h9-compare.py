@@ -38,7 +38,7 @@ joint-machine text in either position, every gaps_suppressed reads 0,
 and the reported S1 returns/categories equal the fixture ledgers'
 per-call tallies (the two-feed fixture declares no mechanism, so its
 category is the attribution dimension). The Joint mode above stays for
-0.5.1.
+0.6.0.
 """
 
 import argparse

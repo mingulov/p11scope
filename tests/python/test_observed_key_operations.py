@@ -694,7 +694,7 @@ def s1_current_doc():
                gaps=[{"subject": "exact image authority unavailable",
                       "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
                       "caller": None, "module": None, "pid": None, "repeats": 1},
-                     {"subject": "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results",
+                     {"subject": "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results",
                       "reason": "joint_journal_unavailable", "caller": None,
                       "module": None, "pid": None, "repeats": 1},
                      {"subject": "semantic input refused", "reason": "slot",

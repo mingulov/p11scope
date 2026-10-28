@@ -45,8 +45,8 @@ or a product startup SLA.
 
 - Text snapshots carry a `key operations:` summary line. This version
   never reports key operations, so it always reads `key operations:
-  not reported by this version (planned for 0.5.1)`; per-category
-  completed/failed/active counts are planned for 0.5.1. JSON reports
+  not reported by this version (planned for 0.6.0)`; per-category
+  completed/failed/active counts are planned for 0.6.0. JSON reports
   `object_observations.status: "unavailable"` with reason
   `journal_unavailable` and empty object/key-operation rows.
 - A combined key label is withheld when the class and key type are
@@ -149,7 +149,7 @@ Known issues in this release:
   `no complete collection pass` gap.
 - Short-lived processes missed at system scale are counted only as
   gaps; their calls through attached providers still count.
-- This version reports no key operations (planned for 0.5.1);
+- This version reports no key operations (planned for 0.6.0);
   mechanisms and API results are reported as before.
 - A process whose main thread had already exited when first met is not
   admitted, and its calls are not counted.

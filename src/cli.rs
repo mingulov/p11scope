@@ -549,7 +549,7 @@ Quiet cgroup usage remains unknown: endpoint samples do not prove continuous mem
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
-In this version it adds per-edge mechanisms and API results; key operations are planned for 0.5.1.
+In this version it adds per-edge mechanisms and API results; key operations are planned for 0.6.0.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
@@ -1744,7 +1744,7 @@ mod tests {
         assert!(
             help.contains(
                 "In this version it adds per-edge mechanisms and API results; \
-                 key operations are planned for 0.5.1."
+                 key operations are planned for 0.6.0."
             ),
             "{help}"
         );

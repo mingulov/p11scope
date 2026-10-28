@@ -246,7 +246,7 @@ fn key_ops_line_journal_unavailable_names_planned_version() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: not reported by this version (planned for 0.5.1)",
+        "key operations: not reported by this version (planned for 0.6.0)",
         "journal_unavailable names the planned version:\n{snapshot}"
     );
 }

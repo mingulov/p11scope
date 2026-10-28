@@ -203,55 +203,55 @@
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties",
-      "reason": "R52 deferred to 0.5.1: requires a marker-enabled BPF build",
+      "reason": "R52 deferred to 0.6.0: requires a marker-enabled BPF build",
       "cell": "privileged"
     },
     {

@@ -31,7 +31,7 @@ pub(crate) const OBSERVATIONS_VERSION: u8 = 1;
 /// Frozen machine reasons. `none` only when populated.
 /// `journal_unavailable` (OD33/R-50) names the v0.5.0 world: no journal
 /// producer is linked, so no key-operation feed exists;
-/// `bootstrap_unavailable` keeps its 0.5.1 meaning (linked, no birth
+/// `bootstrap_unavailable` keeps its 0.6.0 meaning (linked, no birth
 /// yet).
 pub(crate) const REASON_LABELS: [&str; 9] = [
     "none",
@@ -790,7 +790,7 @@ pub(crate) mod producer {
     /// unknown-key S1 facts, never a refusal); with no Joint feed
     /// the reason names the loss. Rows aggregate per-operation
     /// reducer state into frozen aggregate rows; budgets measure.
-    /// The linked entry (the 0.5.1 world the committed suites model);
+    /// The linked entry (the 0.6.0 world the committed suites model);
     /// lanes commit here when linked, else through
     /// `commit_with_journal_linked`.
     pub(crate) fn commit(

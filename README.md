@@ -15,7 +15,7 @@ snapshots support offline comparison; detailed profiles support investigation.
 
 > **Status: v0.5.0** adds FULL object-attribute capture in release builds
 > (P0 stays an explicit option), a `key operations:` line in text inventory
-> snapshots (reading `not reported by this version (planned for 0.5.1)`),
+> snapshots (reading `not reported by this version (planned for 0.6.0)`),
 > a named `--max-endpoints` hint on over-budget plans, and
 > kernel-thread handling and discovery through a retained single live
 > survivor after an already-observed leader exits. Groups first met after
@@ -76,7 +76,7 @@ refund Inventory IDs during a capture.
 | --- | --- | --- |
 | Automatic discovery | Mapped providers, observed usage and physical entry counts; `profile`/`trace` add observed return values and timing | Complete coverage of every process or early call; names need separate layout/export evidence |
 | An explicitly accepted `--manifest` for the exact provider | Named offsets and admitted mechanism/API semantics | Trust in arbitrary provider code or recovery of calls before attachment |
-| FULL attribute capture | The approved bounded attribute reads | Public live per-key results: these remain unavailable in v0.5.0 and planned for 0.5.1 |
+| FULL attribute capture | The approved bounded attribute reads | Public live per-key results: these remain unavailable in v0.5.0 and planned for 0.6.0 |
 
 A mapped library is not proof of use. Zero observed calls or zero event loss
 does not establish that no calls happened before probes attached. Check the

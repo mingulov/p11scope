@@ -19,7 +19,7 @@ rv64 cells the high-bit stub tests/fixtures/abi-execution/
 abi-rv64-provider.c. SoftHSM cannot drive these cells.
 
 Judging is at the level v0.5.0 ships: native per-function call counts plus
-the plain S1 proof, not the 0.5.1 key-operation journal. Per cell, in
+the plain S1 proof, not the 0.6.0 key-operation journal. Per cell, in
 order: (1) the gated workload must exit as designed (0, or 1 for rv64
 whose high-bit returns are unhealthy by construction) with an
 oracle-valid ledger bound to the expected (cond, cell) population tag;

@@ -12377,7 +12377,7 @@ fn joint_capture_owner_seal_replay_resource_refusal_disposes_head_keeps_joint() 
 /// journal producer reports `unavailable` with the frozen reason
 /// `journal_unavailable`. The Rust table and the frozen schema enum
 /// carry it together (`key_operation_schema_contract` pins the sets
-/// equal); `bootstrap_unavailable` keeps its 0.5.1 meaning (journal
+/// equal); `bootstrap_unavailable` keeps its 0.6.0 meaning (journal
 /// linked, no birth yet).
 #[test]
 fn reason_enum_pins_journal_unavailable() {
@@ -12387,7 +12387,7 @@ fn reason_enum_pins_journal_unavailable() {
     );
     assert!(
         crate::key_operation_projection::REASON_LABELS.contains(&"bootstrap_unavailable"),
-        "bootstrap_unavailable keeps its 0.5.1 meaning"
+        "bootstrap_unavailable keeps its 0.6.0 meaning"
     );
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schema: serde_json::Value = serde_json::from_str(
@@ -12432,6 +12432,6 @@ fn producer_commit_without_linked_journal_reports_journal_unavailable() {
     assert_eq!(linked.status, ObsStatus::Unavailable);
     assert_eq!(
         linked.reason, "bootstrap_unavailable",
-        "linked without births keeps its 0.5.1 meaning"
+        "linked without births keeps its 0.6.0 meaning"
     );
 }

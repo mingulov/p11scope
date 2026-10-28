@@ -286,7 +286,7 @@ class IgnoredTestsTests(unittest.TestCase):
         reasons = {entry["path"]: entry["reason"] for entry in entries
                    if entry["path"] in deferred}
         self.assertEqual(set(reasons), deferred)
-        self.assertTrue(all("0.5.1" in reason for reason in reasons.values()))
+        self.assertTrue(all("0.6.0" in reason for reason in reasons.values()))
 
     def test_checked_in_inventory_matches_the_sources(self):
         result = run_checker(ROOT)

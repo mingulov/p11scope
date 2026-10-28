@@ -25,7 +25,7 @@ Six fail-closed gates:
   (last-quartile median within margin of the first quartile, with the
   third quartile confirming a sustained rise rather than a spike).
 - journal_disclosure: key operations stay honestly unavailable with
-  the journal_unavailable reason (they arrive in 0.5.1).
+  the journal_unavailable reason (they arrive in 0.6.0).
 - clean_exit: the sampler and every workload exited 0 (the observer
   outcome belongs to finite_stop so each gate fails alone).
 
@@ -396,7 +396,7 @@ def gate_journal_disclosure(evidence):
     reason = observations.get("reason")
     if status != "unavailable" or reason != "journal_unavailable":
         return False, f"object_observations is {status}/{reason}, not unavailable/journal_unavailable"
-    return True, "key operations unavailable/journal_unavailable (0.5.1 scope)"
+    return True, "key operations unavailable/journal_unavailable (0.6.0 scope)"
 
 
 def gate_clean_exit(evidence):

@@ -705,7 +705,7 @@ non-null values needs a new allowlist row.
   with `journal_unavailable` (no key-operation feed exists; S1
   mechanisms and API results are unaffected), and the lane records
   one `joint_journal_unavailable` gap. `bootstrap_unavailable` keeps
-  its 0.5.1 meaning (journal linked, no birth yet).
+  its 0.6.0 meaning (journal linked, no birth yet).
 
 ## Semantic instances (additive within v1)
 

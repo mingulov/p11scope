@@ -731,7 +731,7 @@ const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
 /// [`BUILD_LIMIT_ROWS`] member). A stale or mismatched object fails the
 /// row with the same reason capture setup refuses with.
 /// OD33/R-50: v0.5.0 reads attributes but reports key operations only
-/// from 0.5.1, and the OK detail says so.
+/// from 0.6.0, and the OK detail says so.
 fn object_capture_check() -> Check {
     match crate::attach::checked_embedded_flavor() {
         Err(error) => Check {
@@ -741,7 +741,7 @@ fn object_capture_check() -> Check {
         Ok(flavor) if !flavor.stubbed => Check {
             name: "object-attribute capture".into(),
             status: Status::Ok(
-                "enabled (read only; key operations are reported from 0.5.1)".into(),
+                "enabled (read only; key operations are reported from 0.6.0)".into(),
             ),
         },
         Ok(_) => Check {
@@ -2572,7 +2572,7 @@ mod tests {
     /// FULL builds, a by-design warning in P0 (stub) builds that
     /// extra-strict qualification excuses (no host can clear it).
     /// OD33/R-50: v0.5.0 reads attributes but reports key operations
-    /// only from 0.5.1, so the OK detail says so.
+    /// only from 0.6.0, so the OK detail says so.
     #[test]
     fn object_capture_check_matches_build() {
         let check = object_capture_check();
@@ -2583,7 +2583,7 @@ mod tests {
         match available {
             true => assert_eq!(
                 check.status,
-                Status::Ok("enabled (read only; key operations are reported from 0.5.1)".into()),
+                Status::Ok("enabled (read only; key operations are reported from 0.6.0)".into()),
                 "{check:?}"
             ),
             false => {

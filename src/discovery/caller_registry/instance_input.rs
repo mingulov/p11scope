@@ -1464,7 +1464,7 @@ pub(super) struct InstanceState {
     /// Whether a journal producer is linked for this lane, latched from
     /// the lane's drain producers on the Joint birth path. Only a linked
     /// lane installs key-operation (Joint) feeds. OD33/R-50: production
-    /// v0.5.0 is never linked; test fixtures model the linked 0.5.1 world
+    /// v0.5.0 is never linked; test fixtures model the linked 0.6.0 world
     /// unless a test latches unlinked.
     journal_linked: bool,
     /// Whether the lane already disclosed its unlinked journal: the
@@ -1503,7 +1503,7 @@ impl Default for InstanceState {
             identity_exhausted: false,
             // OD33/R-50: production v0.5.0 links the object-journal
             // producer into no BPF flavor, so production lanes start
-            // unlinked. Test fixtures start linked (the 0.5.1 world the
+            // unlinked. Test fixtures start linked (the 0.6.0 world the
             // Joint suites exercise); the Births guard re-latches from
             // the lane's producers every quantum, and tests latch
             // unlinked explicitly.
@@ -1935,7 +1935,7 @@ impl CallerRegistry {
             caller: None,
             module: None,
             pid: None,
-            subject: "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results"
+            subject: "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results"
                 .into(),
             reason: "joint_journal_unavailable".into(),
             budget: None,
@@ -2306,7 +2306,7 @@ impl CallerRegistry {
     /// Capture the guarded H9 section: commit from retained Joint
     /// evidence, or unavailable exactly as before without it. Without a
     /// linked journal the reason is `journal_unavailable` (OD33/R-50);
-    /// `bootstrap_unavailable` keeps its 0.5.1 meaning (linked, no
+    /// `bootstrap_unavailable` keeps its 0.6.0 meaning (linked, no
     /// birth yet). Status stays unavailable either way.
     pub(crate) fn joint_observations(
         &self,
@@ -3978,7 +3978,7 @@ mod journal_unavailable_tests {
     };
 
     const PLAN_TEXT: &str =
-        "key operations are planned for 0.5.1; this capture keeps S1 mechanisms and API results";
+        "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results";
     const MECHANISM: u64 = 0x40;
     const RV_OK: u64 = 0;
     const RV_SIGNATURE_INVALID: u64 = 0xc0;
@@ -4390,7 +4390,7 @@ mod journal_unavailable_tests {
         });
         assert!(
             fixture.attachment().journal_linked(),
-            "the test sealer stays journal-linked for 0.5.1 suites"
+            "the test sealer stays journal-linked for 0.6.0 suites"
         );
         let mut scene = UnlinkedScene::new();
         scene
@@ -4409,7 +4409,7 @@ mod journal_unavailable_tests {
     }
 
     /// Without a linked journal the observations read unavailable with
-    /// `journal_unavailable`; linked without births keeps 0.5.1's
+    /// `journal_unavailable`; linked without births keeps 0.6.0's
     /// `bootstrap_unavailable`. Status stays unavailable either way.
     #[test]
     fn reason_is_journal_unavailable_without_linked_journal() {
@@ -4430,7 +4430,7 @@ mod journal_unavailable_tests {
         assert_eq!(linked.status, ObsStatus::Unavailable);
         assert_eq!(
             linked.reason, "bootstrap_unavailable",
-            "linked without births keeps its 0.5.1 meaning"
+            "linked without births keeps its 0.6.0 meaning"
         );
         let _ = ObjectObservations::unavailable(0, "journal_unavailable");
     }

@@ -5325,7 +5325,7 @@ fn first_birth_leader_gap_diagnosis(
 /// disclosed); the lane stops finite with joined same-owner cleanup.
 /// v0.5.0 runs the S1 branch below (`journal_linked() == false`, pinned
 /// by `production_seal_is_not_journal_linked`); the Joint asserts stay
-/// behind the flag for 0.5.1.
+/// behind the flag for 0.6.0.
 #[test]
 #[ignore = "privileged: live Joint first birth through a held q1 to q2 and stop"]
 fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
@@ -5677,7 +5677,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     let observations = coordinator.registry().joint_observations(revision);
     // v0.5.0 seals every production attachment without a journal
     // producer (OD33/R-50): the S1 branch below runs, and the Joint
-    // asserts stay for the 0.5.1 linked world. The branch selector is
+    // asserts stay for the 0.6.0 linked world. The branch selector is
     // trusted: a linked latch with zero installs is the unattributed
     // test default (total shed), not a linked world.
     match joint_branch(&coordinator) {
@@ -5956,7 +5956,7 @@ fn live_pair_promotion_view_queues_through_verification() -> Result<()> {
 /// useful calls published. A retires before B is admitted.
 /// v0.5.0 runs the S1 branches below (`journal_linked() == false`,
 /// pinned by `production_seal_is_not_journal_linked`); the Joint asserts
-/// stay behind the flag for 0.5.1.
+/// stay behind the flag for 0.6.0.
 #[test]
 #[ignore = "privileged: live Joint promotion retires A before B is admitted"]
 fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
@@ -6074,7 +6074,7 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     }
     // v0.5.0 seals every production attachment without a journal
     // producer (OD33/R-50): the S1 branch below runs, and the Joint
-    // asserts stay for the 0.5.1 linked world. The branch selector is
+    // asserts stay for the 0.6.0 linked world. The branch selector is
     // trusted: a linked latch with zero installs is the unattributed
     // test default (total shed), not a linked world.
     match joint_branch(&coordinator) {
@@ -6396,7 +6396,7 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
     let observations = coordinator.registry().joint_observations(revision);
     // v0.5.0 seals every production attachment without a journal
     // producer (OD33/R-50): the S1 branch below runs, and the Joint
-    // asserts stay for the 0.5.1 linked world. The branch selector is
+    // asserts stay for the 0.6.0 linked world. The branch selector is
     // trusted: a linked latch with zero installs is the unattributed
     // test default (total shed), not a linked world.
     match joint_branch(coordinator) {
@@ -7164,7 +7164,7 @@ fn joint_edge_census(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec
 /// revision each, then a finite stop with joined same-owner cleanup.
 /// v0.5.0 runs the S1 branches below (`journal_linked() == false`,
 /// pinned by `production_seal_is_not_journal_linked`); the Joint asserts
-/// stay behind the flag for 0.5.1.
+/// stay behind the flag for 0.6.0.
 #[test]
 #[ignore = "privileged: live Joint absence and S1Only siblings beside an exec"]
 fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
@@ -7520,7 +7520,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     let caller_h = caller_of(&coordinator, process_h.pid())?;
     // v0.5.0 seals every production attachment without a journal
     // producer (OD33/R-50): the S1 branches below run, and the Joint
-    // asserts stay for the 0.5.1 linked world. The branch selector is
+    // asserts stay for the 0.6.0 linked world. The branch selector is
     // trusted: a linked latch with zero installs is the unattributed
     // test default (total shed), not a linked world.
     let joint_world = matches!(joint_branch(&coordinator), JointBranch::Linked);
@@ -7555,7 +7555,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     );
     // E-post (exec-ordering race): attributed, or its miss is disclosed
     // as a named gap — never dropped silently. The strict Joint shape
-    // stays for the 0.5.1 linked world.
+    // stays for the 0.6.0 linked world.
     let e_attributed = edge_e.api_returns == Some(e_semantic);
     if joint_world {
         diagnose(

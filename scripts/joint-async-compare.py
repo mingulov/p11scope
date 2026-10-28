@@ -29,7 +29,7 @@ proves the S1-active case: both sections read
 unavailable/journal_unavailable with no rows, no gap carries the denied
 joint-machine text in either position, every gaps_suppressed reads 0,
 and the reported S1 returns/mechanisms equal the fixture ledgers'
-per-call tallies. The Joint mode above stays for 0.5.1.
+per-call tallies. The Joint mode above stays for 0.6.0.
 """
 
 import argparse

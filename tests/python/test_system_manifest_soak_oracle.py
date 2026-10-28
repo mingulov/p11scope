@@ -20,7 +20,7 @@ evidence directory into a verdict. Six fail-closed gates:
 - resource_accounting: the 1 Hz RSS/FD trace spans the window, RSS
   stays within 256 MiB, and neither RSS nor FDs grow steadily.
 - journal_disclosure: key operations stay honestly unavailable with
-  the journal_unavailable reason (0.5.1 scope).
+  the journal_unavailable reason (0.6.0 scope).
 - clean_exit: observer, sampler and every workload exited 0.
 
 Healthy and failing twins run unignored with small owned inputs only:

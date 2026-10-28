@@ -281,7 +281,7 @@ CR_ENUMERATION_FLOORS = {
 # across runs), so only the login/signing absences are pinned.
 
 #: Top-level report keys that would publish object facts. Profile never
-#: publishes them (key-operation browser populations are 0.5.1); their
+#: publishes them (key-operation browser populations are 0.6.0); their
 #: presence fails the S1 proof below.
 JOINT_CONTENT_KEYS = ("object_observations", "key_operations",
                       "unknown_key_operations")
@@ -302,7 +302,7 @@ def _u64(value: Any) -> bool:
 def check_no_joint_content(report: dict[str, Any]) -> list[str]:
     """The report publishes no object facts (the S1-active negative half).
 
-    Key-operation browser populations arrive in 0.5.1; a v0.5.0
+    Key-operation browser populations arrive in 0.6.0; a v0.5.0
     profile report carrying a Joint section fails instead of passing
     with the S1 checks blind to it.
     """

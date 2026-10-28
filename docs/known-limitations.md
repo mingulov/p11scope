@@ -64,7 +64,7 @@ re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
 is also one instance.
 
 This version reports no key operations, so the `key operations:`
-line always reads `not reported by this version (planned for 0.5.1)`;
+line always reads `not reported by this version (planned for 0.6.0)`;
 mechanisms and API results are reported as before. An ordinary native-retirement
 refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
@@ -167,8 +167,8 @@ release.
 
 ## Planned for later versions
 
-- Live key operations (key type and size, sign/verify per key) in 0.5.1.
-- Promoting one endpoint to full detail during a counter capture, in 0.5.1.
+- Live key operations (key type and size, sign/verify per key) in 0.6.0.
+- Promoting one endpoint to full detail during a counter capture, in 0.6.0.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.
@@ -700,7 +700,7 @@ The old bounds are measurements, not a product startup SLA.
 - Disclosure: `evidence.kernel_control` (`identity_budget_exhausted`,
   `identity_unavailable`, `owner_admission_failures`), gaps, `PARTIAL`.
 - Workaround: `--pid` or a narrow `--cgroup`, or split the capture.
-- Planned: reusable identity slots are planned for 0.5.1; v0.5.0 keeps
+- Planned: reusable identity slots are planned for 0.6.0; v0.5.0 keeps
   the 16,384 budget with the named gaps above.
 
 ### Provisional P/N defaults (DR-07)
@@ -731,7 +731,7 @@ The old bounds are measurements, not a product startup SLA.
   (`OneProcess` scope, deep-scanned views only).
 - Disclosure: `discovery_truncated`, `evidence.skipped`, `PARTIAL`.
 - Workaround: narrower scope, longer-lived providers.
-- Planned: reusable loader contexts are planned for 0.5.1; v0.5.0 keeps
+- Planned: reusable loader contexts are planned for 0.6.0; v0.5.0 keeps
   the 256 limit with the named gap above.
 
 ### Stop-time graph pool is one fixed 384 MiB accounting limit

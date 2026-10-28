@@ -1346,7 +1346,7 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             if observations.reason == "journal_unavailable" {
                 let _ = writeln!(
                     out,
-                    "key operations: not reported by this version (planned for 0.5.1)"
+                    "key operations: not reported by this version (planned for 0.6.0)"
                 );
             } else {
                 let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);

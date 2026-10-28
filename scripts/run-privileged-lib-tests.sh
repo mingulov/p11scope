@@ -365,7 +365,7 @@ discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_i
 
 # Static skips: external prerequisites or explicitly deferred build cells.
 SKIP_TESTS=(
-# R52: preserve the marker assertions for the 0.5.1 marker-enabled build.
+# R52: preserve the marker assertions for the 0.6.0 marker-enabled build.
 attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
 attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
 attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
@@ -465,15 +465,15 @@ metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
 )
 SKIP_REASONS=(
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"

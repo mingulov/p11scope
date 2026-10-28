@@ -2229,16 +2229,15 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 43
-    assert len(UNSAFE_MAPS) == 45
-    assert len(WIDE_MAPS) == 43
-    assert len(WIDE_UNSAFE_MAPS) == 45
+    assert len(SAFE_MAPS) == 42
+    assert len(UNSAFE_MAPS) == 44
+    assert len(WIDE_MAPS) == 42
+    assert len(WIDE_UNSAFE_MAPS) == 44
     assert len(SAFE_PROGRAMS) == 20
     assert len(UNSAFE_PROGRAMS) == 25
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
-            | REQUIRED_GLOBAL_MARKER_HELPERS)
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -2252,8 +2251,7 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
-        | REQUIRED_GLOBAL_MARKER_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -2262,8 +2260,7 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS
-                         | REQUIRED_GLOBAL_MARKER_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):

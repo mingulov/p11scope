@@ -84,10 +84,11 @@ struct FixtureSet {
 fn build_fixtures(dir: &Path, corroborated: bool) -> FixtureSet {
     let matrix = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates/discover/tests/fixture/version_matrix.c");
-    let called_matrix = if corroborated {
-        fixture_source("catalog-version-matrix.c")
+    let called_matrix = fixture_source("catalog-version-matrix.c");
+    let export_mode = if corroborated {
+        "-DCATALOG_PARTIAL_EXPORTS=0"
     } else {
-        matrix.clone()
+        "-DCATALOG_PARTIAL_EXPORTS=1"
     };
     let driver = gcc(
         dir,
@@ -100,14 +101,14 @@ fn build_fixtures(dir: &Path, corroborated: bool) -> FixtureSet {
         dir,
         "v1.so",
         &called_matrix,
-        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40", export_mode],
         &[],
     );
     let v2 = gcc(
         dir,
         "v2.so",
         &called_matrix,
-        &["-shared", "-fPIC", "-DLEGACY_MINOR=41"],
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=41", export_mode],
         &[],
     );
     let tless = gcc(dir, "tless.so", &matrix, &["-shared", "-fPIC"], &[]);

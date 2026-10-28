@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Catalog's corroborated positive: each retained 3.0 target has its actual
- * standard export at that same address. The shared matrix keeps its private
- * stubs and three acquisition anchors for partial-export/ABI consumers. */
+/* Catalog-only three-table surface. Full mode gives each retained 3.0 target
+ * its actual standard export; partial mode keeps only the three getters.
+ * The shared ABI matrix remains unchanged for its oversized/sparse tests. */
 #include "../../crates/discover/tests/fixture/version_matrix.c"
 
+#ifndef CATALOG_PARTIAL_EXPORTS
+#define CATALOG_PARTIAL_EXPORTS 0
+#endif
+
+#if !CATALOG_PARTIAL_EXPORTS
 /* The three acquisition functions already have their standard exports. */
 #define A(name, target) extern __typeof__(target) name __attribute__((alias(#target)));
 A(C_Initialize, s00)
@@ -96,11 +101,27 @@ A(C_VerifyMessageBegin, s89)
 A(C_VerifyMessageNext, s90)
 A(C_MessageVerifyFinal, s91)
 #undef A
+#endif
 
-/* Keep the physical surface at the same 92 targets: after constructing the
- * real tables, erase the raw builder array so it cannot itself look like an
- * additional headerless table (including its unused getter-slot stubs). */
+/* The raw scanner correctly recovers useful entries beyond a version label
+ * when their actual exports anchor them. This fixture promises exactly the
+ * legacy 68, 2.40/68 and 3.0/92 surface: do not leave the shared matrix's dormant
+ * 104-slot tails or partially mapped 3.1 table as additional observations.
+ * fill() sets its private done guard before this pruning. Every later getter
+ * calls that same guarded fill(), so none can repopulate the cleared data.
+ * The owned driver completes this constructor and its getter before READY. */
 __attribute__((constructor)) static void catalog_initialize(void) {
     fill();
+    memset(legacy.functions + 68, 0,
+           sizeof(legacy.functions) - 68 * sizeof(legacy.functions[0]));
+    memset(t240.functions + 68, 0,
+           sizeof(t240.functions) - 68 * sizeof(t240.functions[0]));
+    memset(t30.functions + 92, 0,
+           sizeof(t30.functions) - 92 * sizeof(t30.functions[0]));
+    memset(&t31, 0, sizeof(t31));
+    memset(&t32, 0, sizeof(t32));
+    memset(&tfuture, 0, sizeof(tfuture));
+    memset(&tunknown, 0, sizeof(tunknown));
+    memset(&tbad, 0, sizeof(tbad));
     memset(stubs, 0, sizeof(stubs));
 }

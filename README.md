@@ -15,7 +15,9 @@ assessment and incident diagnostics.
 > (P0 stays an explicit option), a `key operations:` line in text inventory
 > snapshots (reading `not reported by this version (planned for 0.5.1)`),
 > a named `--max-endpoints` hint on over-budget plans, and
-> discovery for kernel threads and zombie leaders. Read the
+> kernel-thread handling and discovery through a retained single live
+> survivor after an already-observed leader exits. Groups first met after
+> leader exit remain unadmitted. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
 > capture. `--system` selects whole-machine scope;
@@ -516,7 +518,8 @@ overlay instances, so every such collapse is published as uncertainty and forces
 Initial discovery and `p11scope inspect` scan provider tables already mapped in
 the target and make zero PKCS #11 calls. The explicit unprivileged
 `p11scope-discover` helper alone performs exactly ten bounded `C_GetInterface`
-compatibility queries before any provider initialization. For a command the observer owns, `p11scope run`
+compatibility queries when that export is available and never calls
+`C_Initialize`. For a command the observer owns, `p11scope run`
 starts capture before releasing the child and loader/export hooks react to
 later loads. The
 optional unprivileged helper (`p11scope-discover`) can prepare a manifest

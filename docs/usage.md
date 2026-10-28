@@ -1317,11 +1317,11 @@ is described under [PID namespaces](#pid-namespaces).
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |
-| T0 offline | host attach failed | Offline helper, inspect, and report work only; no live-call evidence. |
-| T1 host attach | supported kernel, real embedded BPF object/maps/program load, and an actual self-uprobe | Live observation works on this host; target readability is failed or unassessed. |
+| T0 offline | host load/link preflight failed | Offline helper, inspect, and report work only; no live-call evidence. |
+| T1 host attach | eligible host, real embedded BPF object/maps/program load, and an actual self-uprobe link | Host load/link preflight passed; target readability failed or is unassessed, and workload event delivery is unmeasured. |
 | T2 target readable | T1 plus one stable target generation, readable `maps`, `mem`, and `root`, and exact executable/provider identity opens through that root | The target can be planned; lifecycle changes may be missed, so an attempted capture can be `PARTIAL`. |
-| T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Base lifecycle coverage works; a requested scope-specific lane is unavailable or degraded. |
-| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and process-creation tracing when required | Current mechanisms preflighted; this is neither leased/hardened authority nor a `COMPLETE` promise. |
+| T3 lifecycle | T2 plus successful real exec and exit lifecycle links | Lifecycle links preflighted; a requested scope-specific lane is unavailable or degraded. Event delivery remains unmeasured. |
+| T4 current full | T3 plus every requested scope operation, including filter publication, cgroup access, and process-creation tracing when required | Requested load/link and scope operations preflighted; workload delivery, leased or hardened authority and `COMPLETE` coverage are not established. |
 
 The doctor runs the real embedded BPF object/map/program inventory and drops a
 temporary session after preflighting exec/exit lifecycle links and every
@@ -1337,11 +1337,14 @@ callers are counted as `map_files_unavailable` losses and discovery stays
 incomplete rather than guessed.
 There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 
-The attach backend is probe-decided. In `auto` mode the product selects
-uprobe-multi through functional probes, including process-wide PID filtering
-for PID scopes, and falls back to per-probe `perf_event` uprobes when multi is
-unsupported or its required probes fail (`src/attach.rs`:
-`select_session_backend`). Both matrices below were measured by
+The attach backend is probe-decided after the host passes the Multi load and
+self-link eligibility gate. On such a host, `auto` selects Multi when its
+scope requirements pass, including process-wide PID filtering for PID scopes.
+If that PID filter is unavailable, `auto` can use safe target-bound Singles;
+a safe scoped startup retry can also select per-probe `perf_event` uprobes
+(`src/attach.rs`: `select_session_backend`). Other required permissions and
+scope features still apply. A host that fails Multi eligibility exits nonzero
+with `uprobe-multi-required`. Both historical matrices below were measured by
 `scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
 with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
 `kernel.yama.ptrace_scope=1`.
@@ -1496,10 +1499,12 @@ report read/diff and genuine `inventory --capture scan` remain usable without
 the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
 release commitment is made.
 
-The following permission measurements are historical diagnostics. Their
-old floor hints do not define current host admission.
+The following permission measurements are historical diagnostics. Their old
+5.15 floor hints and exit-0 partial-capture behavior predate current host
+admission. A live attempt on a host without usable Multi now exits nonzero with
+`uprobe-multi-required` before capture or workload side effects.
 
-What actually happens today, measured on a real host
+These earlier measurements came from a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,
 and the historical 136 identical unexplained lines — were found while reproducing these
 and fixed, not just described):
@@ -1526,10 +1531,10 @@ attach failed (slot 0): p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `
 p11scope: 68/68 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `perf_event_open` failed: Permission denied (os error 13)
 ```
 
-The tool keeps running with `attached_probes: 0`,
-`evidence.completeness: "PARTIAL"` — a real, reported partial capture,
-never a silent zero-count report that reads as healthy. Exit code 0
-(unchanged; `scripts/matrix/verify-fork-scope.sh` depends on this).
+The historical tool kept running with `attached_probes: 0` and
+`evidence.completeness: "PARTIAL"`, returning exit code 0. That measured
+behavior is retained here for diagnosis; live attempts on hosts without usable
+Multi now refuse early and nonzero as described above.
 
 **Missing BTF, kernel lockdown, kernel < 5.15** — not inducible on the
 host this was measured on (BTF is present, no lockdown LSM loaded, kernel

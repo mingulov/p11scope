@@ -141,9 +141,11 @@ node-wide late provider that stays a reported boundary. They use one
 kind node; multi-node clusters, CRI-O and the cgroupfs driver are
 still not exercised.
 
-Continuous runs are qualified for up to 30 minutes; longer runs (4 h,
-24 h) are not qualified yet. The startup and stop figures above are
-declared per kernel, not a product guarantee.
+Qualification of continuous runs up to 30 minutes is conditional on the final
+1,800-second SYSTEM+manifest soak, which remains pending for v0.5.0. An earlier
+run failed exact-count and final-drain checks. Longer runs (4 h, 24 h) remain
+unqualified. The startup and stop figures above are declared per kernel, not
+a product guarantee.
 
 In long system-wide runs, a live publication can rarely stop making
 progress. After 6 seconds without progress, p11scope abandons that

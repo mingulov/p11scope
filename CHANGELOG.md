@@ -22,8 +22,9 @@ v0.5.0: official release builds read object attributes by default (FULL),
 with the P0 build staying an explicit option. Text inventory snapshots
 carry a `key operations:` summary line, over-budget inventory plans name
 `--max-endpoints`, `--counter-mode` selections aggregate in the kernel
-on eligible LP64 hosts, and discovery handles
-kernel threads and processes whose main thread already exited.
+on eligible LP64 hosts. Discovery handles kernel threads and can retain a
+single surviving thread's process view after an already-observed leader exits.
+Groups first met after leader exit remain unadmitted.
 User-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
@@ -45,8 +46,9 @@ or a product startup SLA.
 - Text snapshots carry a `key operations:` summary line. This version
   never reports key operations, so it always reads `key operations:
   not reported by this version (planned for 0.5.1)`; per-category
-  completed/failed/active counts arrive in 0.5.1. `--json` keeps the
-  full rows.
+  completed/failed/active counts are planned for 0.5.1. JSON reports
+  `object_observations.status: "unavailable"` with reason
+  `journal_unavailable` and empty object/key-operation rows.
 - A combined key label is withheld when the class and key type are
   incompatible, instead of printing a misleading label.
 - Edwards and Montgomery key types are recognized at their standard
@@ -54,9 +56,10 @@ or a product startup SLA.
 
 ### Identity and containers
 
-- Discovery follows a surviving thread when the target's main thread
-  already exited, and confirms member-carrying reads through the member
-  executable only.
+- Discovery can use a retained single live survivor after an already-observed
+  leader exits, and confirms member-carrying reads through that member's
+  executable. Groups first met after leader exit and groups with multiple live
+  survivors remain unadmitted in live capture.
 - The example Kubernetes DaemonSet raises the observer memory limit to
   768Mi.
 
@@ -146,24 +149,29 @@ Known issues in this release:
   `discovery_truncated` gap; call counts stay exact.
 - A post-exec instance whose semantics cannot be proven appears as a
   named gap, not a joined instance.
-- On 5.15, per-copy module attribution and calls held across a
-  non-leader exec stay unqualified.
+- Historical 5.15 per-copy attribution and non-leader exec results remain
+  unqualified; stock 5.15 is outside current live support and refuses with
+  `uprobe-multi-required`.
 - A load, one call, unload burst inside about 1 ms reads the same as
   no calls unless the child is held with `run --pause auto` or kept
   alive past attach.
-- System identity checks through the userspace backend are slower than
-  in v0.4.0 on hosts with many processes mapping providers from btrfs
-  (earlier candidate runs measured about 7–14% slower confirm stage
-  and about 5–10% slower total scan); the default `auto` backend uses kernel identity
-  where available, and a speed-up is planned for a later 0.5.x.
+- System identity checks through the userspace backend have a measured btrfs
+  regression. The GNU comparison at `b58ef1b5`, built with Rust 1.99.1 on Fedora
+  Linux 7.2.9, used 400 processes × 8 mock providers and 10 matched rounds with
+  equal coverage. Confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%);
+  whole-pass p95 rose from 255.444 to 288.012 ms (+12.75%). These are scoped
+  measurements, not bounds for every host. The default `auto` backend uses
+  kernel identity where available; further speed work is planned for 0.5.x.
 - In long system-wide runs, a live publication that stops making
   progress is abandoned after 6 seconds with a named gap; the capture
   keeps running and coverage reads partial.
 - On some overlayfs setups before Linux 6.8, a provider whose /proc
   maps rendering cannot be proven carries an explicit unproven-maps
   note, and callers mapping it may stay unbound.
-- Continuous runs are qualified for up to 30 minutes; 4 h and 24 h runs
-  are not qualified yet.
+- Qualification of continuous runs up to 30 minutes is conditional on the final
+  1,800-second SYSTEM+manifest soak, which remains pending for v0.5.0. An earlier
+  run failed exact-count and final-drain checks. The 4 h and 24 h runs remain
+  unqualified.
 
 ### Qualification of this release
 

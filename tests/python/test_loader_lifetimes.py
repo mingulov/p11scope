@@ -579,6 +579,20 @@ class L4ReceiptTests(unittest.TestCase):
         report = json.dumps(valid_report(count, l4=l4))
         return ORACLE.judge(cell, rows, report_text=report)
 
+    def judge_cli_verdict(self, cell, count, l4):
+        with tempfile.TemporaryDirectory(prefix="p11scope-l4-verdict-") as raw:
+            ledger = Path(raw) / "ledger.jsonl"
+            ledger.write_text("".join(json.dumps(row) + "\n"
+                                      for row in valid_ledger(cell, count)))
+            report = Path(raw) / "report.json"
+            report.write_text(json.dumps(valid_report(count, l4=l4)))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/qualify-loader-lifetimes.py"),
+                 "judge", "--cell", cell, "--ledger", str(ledger),
+                 "--report", str(report)],
+                capture_output=True, text=True, timeout=30)
+        return result.returncode, json.loads(result.stdout)
+
     def with_receipt(self, cell, count, dotted, value):
         l4 = valid_l4_transitions(cell, count)
         node = l4
@@ -587,6 +601,49 @@ class L4ReceiptTests(unittest.TestCase):
             node = node[hop]
         node[hops[-1]] = value
         return l4
+
+    def test_l4_present_contradictions_fail_before_missing_receipts(self):
+        cases = (
+            ("g16", 300, "loader_transitions.arms", 299, "loader_transitions.reclaims"),
+            ("g16", 300, "loader_transitions.retained_peak", 9, "loader_transitions.arms"),
+            ("g16", 300, "loader_transitions.refusals", 1, "loader_transitions.retained_peak"),
+            ("g16", 300, "loader_transitions.reclaims", 301, "loader_transitions.retained_peak"),
+            ("g16", 300, "loader_transitions.reclaims", 298, "loader_transitions.refusals"),
+            ("g17", 16385, "image_transitions.tickets_issued", 16384, "image_transitions.bank_cuts"),
+            ("g17", 16385, "image_transitions.bank_cuts", 2, "image_transitions.tickets_issued"),
+            ("g17", 16385, "image_transitions.bank_refusals", 1, "invocation_receipt"),
+            ("g17", 16385, "invocation_receipt", [], "image_transitions.bank_refusals"),
+            ("g17", 16385, "invocation_receipt.id", "", "image_transitions.bank_cuts"),
+        )
+        for cell, count, field, value, missing in cases:
+            with self.subTest(cell=cell, field=field, missing=missing):
+                l4 = self.with_receipt(cell, count, field, value)
+                node = l4
+                hops = missing.split(".")
+                for hop in hops[:-1]:
+                    node = node[hop]
+                del node[hops[-1]]
+                code, verdict = self.judge_cli_verdict(cell, count, l4)
+                self.assertEqual((code, verdict["pass"], verdict["qualification"]),
+                                 (1, False, "failed"))
+
+    def test_l4_consistent_missing_receipts_stay_blocked(self):
+        cases = (
+            ("g16", 300, {}),
+            ("g16", 300, {"loader_transitions": {"arms": 300}}),
+            ("g16", 300, {"loader_transitions": {"arms": 300, "retained_peak": 1,
+                                                 "refusals": 0}}),
+            ("g17", 16385, {}),
+            ("g17", 16385, {"image_transitions": {"tickets_issued": 16385,
+                                                   "bank_cuts": 1, "bank_refusals": 0}}),
+            ("g17", 16385, {"invocation_receipt": {"id": "invocation-1"}}),
+            ("g17", 16385, {"image_transitions": {"tickets_issued": 16386}}),
+        )
+        for cell, count, l4 in cases:
+            with self.subTest(cell=cell, receipts=l4):
+                code, verdict = self.judge_cli_verdict(cell, count, l4)
+                self.assertEqual((code, verdict["pass"], verdict["qualification"]),
+                                 (2, False, "blocked"))
 
     def test_l4_loader_arms_short_is_fail(self):
         l4 = self.with_receipt("g16", 300, "loader_transitions.arms", 299)

@@ -329,6 +329,12 @@ class ReleaseRecipientTests(unittest.TestCase):
                 self.fail(f'live {journey} must dispatch, not exit {error.code}')
         return code, json.loads((out / 'receipt.json').read_text()), commands
 
+    def emitted_rotation_fixture(self, name, **options):
+        """Use the event.identity_context shape emitted by edge_observed."""
+        root = self.root / name
+        root.mkdir()
+        return DRIVER.rotation_fixture(root, **options)
+
     def test_ledger_component_live_dispatch_reports_only_the_four_tail_cells(self):
         code, receipt, commands = self.compose_ledger('ledger-component', c8_base=False)
         self.assertEqual(code, 0)
@@ -439,6 +445,65 @@ class ReleaseRecipientTests(unittest.TestCase):
                 self.assertTrue(any(('edges_unretained' if mutation == 'unretained'
                                      else 'ledgered use has no retained record') in error
                                     for error in detail['errors']), detail)
+
+    def test_rotation_accepts_emitted_nested_identity_context_and_binds_report_ids(self):
+        doc, files, ledger = self.emitted_rotation_fixture('rotation-emitted')
+        ok, detail = DRIVER.rotation_verdict(doc, files, ledger)
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail['uses'], 2)
+
+    def test_rotation_rejects_missing_malformed_unknown_and_contradictory_context(self):
+        mutations = ('missing', 'malformed', 'unknown-caller', 'unknown-module',
+                     'unknown-version', 'contradictory-caller', 'caller-report-mismatch',
+                     'module-report-mismatch', 'top-level-only')
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                doc, files, ledger = self.emitted_rotation_fixture(
+                    'rotation-negative-' + mutation)
+                if mutation == 'top-level-only':
+                    for path in files:
+                        rows = [json.loads(line) for line in path.read_text().splitlines()]
+                        for row in rows:
+                            if row.get('kind') == 'edge_observed':
+                                row['identity_context'] = row['event'].pop('identity_context')
+                        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                changed = False
+                for path in files:
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    for row in rows:
+                        if row.get('kind') != 'edge_observed' or changed:
+                            continue
+                        event = row['event']
+                        context = event.get('identity_context')
+                        if mutation == 'missing':
+                            del event['identity_context']
+                        elif mutation == 'malformed':
+                            event['identity_context'] = ['malformed']
+                        elif mutation == 'unknown-caller':
+                            context['caller']['id'] = 'c99'
+                            event['caller'] = 'c99'
+                        elif mutation == 'unknown-module':
+                            context['module']['id'] = 'm99'
+                            event['module'] = 'm99'
+                        elif mutation == 'unknown-version':
+                            context['version'] = 2
+                        elif mutation == 'contradictory-caller':
+                            event['caller'] = 'c1' if context['caller']['id'] == 'c0' else 'c0'
+                        elif mutation == 'caller-report-mismatch':
+                            for caller in doc['callers']:
+                                if caller['id'] == context['caller']['id']:
+                                    caller['pid'] = 599
+                        elif mutation == 'module-report-mismatch':
+                            for module in doc['modules']:
+                                if module['id'] == context['module']['id']:
+                                    module['paths'] = ['/elsewhere/provider.so']
+                        elif mutation == 'top-level-only':
+                            pass
+                        changed = True
+                    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.assertTrue(changed, mutation)
+                ok, detail = DRIVER.rotation_verdict(doc, files, ledger)
+                self.assertFalse(ok, detail)
 
     def compact_verdict(self, doc, transcript, ledger):
         path = self.root / 'compact.ledger'

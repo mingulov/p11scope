@@ -513,10 +513,11 @@ def ledger_uses_in_window(text, window):
 def rotation_verdict(doc, files, ledger_text, window=None):
     """Conservation plus exact retained-population match against the ledger.
 
-    Returns (ok, detail); raises only on malformed inputs. Every retained
-    edge_observed record must match a ledgered use, every ledgered in-window
-    use must retain a record, and retained + accounted must equal emitted.
-    Without a window every ledgered use is in-window (twin shorthand).
+    Returns (ok, detail); raises only on malformed inputs. Each retained
+    edge_observed record binds its nested schema-v1 identity context to the
+    event IDs and report PID/path, then matches a ledgered use. Every ledgered
+    in-window use must retain a record, and retained + accounted must equal
+    emitted. Without a window every ledgered use is in-window (twin shorthand).
     """
     errors = []
     records = []
@@ -565,14 +566,36 @@ def rotation_verdict(doc, files, ledger_text, window=None):
     for record in records:
         if record.get("kind") != "edge_observed":
             continue
-        context = record.get("identity_context", {})
-        caller, module = context.get("caller", {}), context.get("module", {})
-        pid, path = caller.get("pid"), module.get("path")
-        if not isinstance(pid, int) or not path:
+        event = event_of(record)
+        context = event.get("identity_context")
+        if (not isinstance(context, dict)
+                or type(context.get("version")) is not int
+                or context["version"] != 1):
+            errors.append("edge_observed lacks supported caller pid/module path context")
+            continue
+        caller, module = context.get("caller"), context.get("module")
+        if not isinstance(caller, dict) or not isinstance(module, dict):
             errors.append("edge_observed lacks caller pid/module path context")
             continue
-        if caller.get("id") not in callers or module.get("id") not in modules:
+        caller_id, module_id = caller.get("id"), module.get("id")
+        pid, path = caller.get("pid"), module.get("path")
+        if (not isinstance(caller_id, str) or not caller_id
+                or not isinstance(module_id, str) or not module_id
+                or type(pid) is not int or not isinstance(path, str) or not path):
+            errors.append("edge_observed lacks caller pid/module path context")
+            continue
+        if caller_id != event.get("caller") or module_id != event.get("module"):
+            errors.append("edge_observed ids contradict identity context")
+            continue
+        if caller_id not in callers or module_id not in modules:
             errors.append("edge_observed references unknown caller/module ids")
+            continue
+        if callers[caller_id].get("pid") != pid:
+            errors.append("edge_observed caller pid disagrees with report")
+            continue
+        module_paths = modules[module_id].get("paths")
+        if not isinstance(module_paths, list) or path not in module_paths:
+            errors.append("edge_observed module path disagrees with report")
             continue
         retained.add((pid, path))
     uses = (parse_ledger_uses(ledger_text) if window is None
@@ -608,10 +631,10 @@ def rotation_fixture(root, *, drop_seq=None, duplicate_seq=None, phantom=False,
 
     def edge(pid, cid, module, mid, seq):
         return {"schema": EVENTS_SCHEMA, "seq": seq, "kind": "edge_observed",
-                "event": {"caller": cid, "module": mid},
-                "identity_context": {"version": 1,
-                                     "caller": {"id": cid, "pid": pid},
-                                     "module": {"id": mid, "path": module}}}
+                "event": {"caller": cid, "module": mid,
+                          "identity_context": {"version": 1,
+                                               "caller": {"id": cid, "pid": pid},
+                                               "module": {"id": mid, "path": module}}}}
 
     seq = [0]
 
@@ -622,8 +645,9 @@ def rotation_fixture(root, *, drop_seq=None, duplicate_seq=None, phantom=False,
 
     evicted = [numbered("started", {}),
                numbered("edge_observed", {"caller": "c0", "module": "m0"})]
-    evicted[1]["identity_context"] = {"version": 1, "caller": {"id": "c0", "pid": 501},
-                                      "module": {"id": "m0", "path": "/prov/a/libsofthsm2.so"}}
+    evicted[1]["event"]["identity_context"] = {
+        "version": 1, "caller": {"id": "c0", "pid": 501},
+        "module": {"id": "m0", "path": "/prov/a/libsofthsm2.so"}}
     first = [numbered("rotated", {"prior_file": "events.jsonl.1", "prior_events": 2,
                                   "prior_bytes": 10, "rotation_seq": 1}),
              numbered("retention_evicted", {"evicted_file": "events.jsonl.1",

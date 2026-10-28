@@ -1220,7 +1220,8 @@ NODE=$(node_name) || unrun "kind cluster has no single node"
 record_node_facts || unrun "node image identity unavailable"
 say "=== load holder image ==="
 timeout --signal=TERM --kill-after=10s 1200s \
-    kind load docker-image --name "$CLUSTER" "$HOLD_IMAGE" || unrun "image load failed"
+    python3 -I scripts/kubernetes-runtime.py load-images --cluster "$CLUSTER" \
+    ${NODE_IMAGE:+--node-image "$NODE_IMAGE"} "$HOLD_IMAGE" || unrun "image load failed"
 
 say "=== apply workloads ==="
 sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" "$WORKLOADS" > "$WORK/workloads.yaml"

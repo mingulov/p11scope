@@ -45,6 +45,7 @@
 # Usage: scripts/kind-e2e.sh [--keep] | --self-test
 #   --keep  keep the cluster and images for debugging (prints how to delete)
 # Environment:
+#   P11SCOPE_K8S_TOKEN         optional owned image token (short DNS label)
 #   P11SCOPE_K8S_CLUSTER       cluster name (default p11scope-e2e-<time>-<pid>);
 #                              refused if a cluster of that name already exists
 #   P11SCOPE_K8S_OBSERVER_BIN  prebuilt static x86-64 p11scope to package
@@ -204,7 +205,8 @@ for command in docker kind kubectl python3 timeout; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
 
-TOKEN=$(date +%s)-$$
+TOKEN=${P11SCOPE_K8S_TOKEN:-$(date +%s)-$$}
+valid_cluster "$TOKEN" || { echo "image token must be a short DNS label" >&2; exit 1; }
 CLUSTER=${P11SCOPE_K8S_CLUSTER:-p11scope-e2e-$TOKEN}
 valid_cluster "$CLUSTER" || { echo "cluster name must be a short DNS label: $CLUSTER" >&2; exit 1; }
 NODE=$CLUSTER-control-plane
@@ -327,7 +329,8 @@ timeout --signal=TERM --kill-after=10s 900s kind create cluster --name "$CLUSTER
 unlock_step
 lock_step
 timeout --signal=TERM --kill-after=10s 1200s \
-    kind load docker-image --name "$CLUSTER" "$OBS_IMAGE" "$HOLD_IMAGE"
+    python3 -I scripts/kubernetes-runtime.py load-images --cluster "$CLUSTER" \
+    ${P11SCOPE_K8S_NODE_IMAGE:+--node-image "$P11SCOPE_K8S_NODE_IMAGE"} "$OBS_IMAGE" "$HOLD_IMAGE"
 unlock_step
 
 echo "=== apply deploy/k8s as documented (directory apply; image names rendered) ==="

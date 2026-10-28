@@ -101,6 +101,8 @@ RUN = [
     ("test_joint_promotion_oracle.py", []),
     ("test_joint_two_provider_oracle.py", []),
     ("test_key_operation_ledger.py", []),
+    ("test_kubernetes_runtime.py", []),
+    ("test_kubernetes_runtime_workflow.py", []),
     ("test_loader.py", []),
     ("test_loader_lifetimes.py", []),
     ("test_measure_e03.py", []),

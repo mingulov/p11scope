@@ -1821,6 +1821,77 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                     f"({sorted(exe_ids)}) and no unbound gap naming this pid or this window")
 
 
+def attested_semantic_evidence(view, edge):
+    """Select one S1 witness without rolling child history into a parent.
+
+    The schema permits retained positive mechanisms on a lossy instance.
+    This checks their presence, never complete semantic coverage or entries.
+    """
+    if edge.get("semantics") == SEMANTICS_OBSERVED:
+        return edge, "ok"
+    withheld = "unknown (per-edge summary withheld; see semantic children)"
+    if (edge.get("semantics") != withheld or edge.get("mechanisms") is not None
+            or edge.get("operations") is not None):
+        return None, "parent has no observed or explicitly child-owned semantic claim"
+    children, instances = view.doc.get("semantic_edges"), view.doc.get("instances")
+    if (not isinstance(children, list) or not all(isinstance(row, dict) for row in children)
+            or not isinstance(instances, list) or not all(isinstance(row, dict) for row in instances)):
+        return None, "missing or malformed semantic child/instance arrays"
+    candidates = [row for row in children if (row.get("caller"), row.get("module"))
+                  == (edge["caller"], edge["module"])]
+    if len(candidates) != 1:
+        return None, "expected one semantic child for this exact caller/module; no sibling merging"
+    child = candidates[0]
+    instance = child.get("instance")
+    if not isinstance(instance, str) or not re.fullmatch(r"i[0-9]+", instance):
+        return None, "invalid registered instance reference"
+    registrations = [row for row in instances if row.get("id") == instance]
+    if (len(registrations) != 1
+            or sum(row.get("instance") == instance for row in children) != 1
+            or (registrations[0].get("caller"), registrations[0].get("module"))
+            != (edge["caller"], edge["module"])
+            or registrations[0].get("state") not in {"observed", "uncertain", "retired"}):
+        return None, "missing, conflicting or differently owned instance registration"
+    if child.get("semantics") != SEMANTICS_OBSERVED:
+        return None, "semantic child is unknown; populated fields cannot authorize it"
+    if child.get("entries") != {"unit": "api_entries", "count": None, "observation": "unavailable"}:
+        return None, "semantic child must not claim physical entries"
+    returns, operations = child.get("api_returns"), child.get("operations")
+    if (not isinstance(returns, dict) or returns.get("unit") != "api_returns"
+            or type(returns.get("count")) is not int or not 0 < returns["count"] <= U64_MAX
+            or type(returns.get("saturated")) is not bool
+            or type(returns.get("historical_only_returns")) is not int
+            or not 0 <= returns["historical_only_returns"] <= returns["count"]
+            or not isinstance(operations, dict) or type(operations.get("calls")) is not int
+            or not 0 < operations["calls"] <= U64_MAX):
+        return None, "semantic child lacks observed API-return/operation evidence"
+    coverage = child.get("coverage")
+    if not isinstance(coverage, dict) or type(coverage.get("lossy")) is not bool:
+        return None, "semantic child lacks typed coverage disclosure"
+    reasons = coverage.get("reasons")
+    if (not isinstance(reasons, list) or not all(isinstance(reason, str) and reason for reason in reasons)
+            or reasons != sorted(set(reasons)) or coverage["lossy"] != bool(reasons)):
+        return None, "semantic child loss/reasons are missing or inconsistent"
+    mechanisms = child.get("mechanisms")
+    if not isinstance(mechanisms, list) or not mechanisms:
+        return None, "semantic child has no mechanism evidence"
+    seen = set()
+    for mechanism in mechanisms:
+        if (not isinstance(mechanism, dict) or type(mechanism.get("mechanism")) is not int
+                or not 0 <= mechanism["mechanism"] <= U64_MAX
+                or mechanism["mechanism"] in seen):
+            return None, "invalid or duplicate semantic child mechanism"
+        seen.add(mechanism["mechanism"])
+        operations = mechanism.get("operations")
+        if (not isinstance(operations, list) or not operations
+                or not all(isinstance(operation, str) and operation for operation in operations)
+                or len(operations) != len(set(operations))):
+            return None, "invalid semantic child mechanism operations"
+    detail = (f"registered child {instance}: mechanism presence only; "
+              f"{'partial; ' if coverage['lossy'] else ''}lossy={str(coverage['lossy']).lower()}; reasons={reasons}")
+    return child, detail
+
+
 def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_delivery, res):
     run = view.name
     cov = coverage(edge)
@@ -1922,12 +1993,16 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
                and edge["entries"].get("observation") != OBSERVATION_OBSERVED,
                f"{ctag}: witnessed edge claims a count/observation {edge['entries'].get('count')}")
     if attested:
-        mechs = {m.get("mechanism"): set(m.get("operations") or []) for m in edge.get("mechanisms") or []}
+        semantic, detail = attested_semantic_evidence(view, edge)
+        mechs = {m.get("mechanism"): set(m.get("operations") or []) for m in (semantic or {}).get("mechanisms") or []}
         missing = {hex(k): sorted(v - mechs.get(k, set())) for k, v in use.mechs.items() if not v <= mechs.get(k, set())}
         extra = sorted(hex(k) for k in mechs if k not in use.mechs)
+        extra_ops = {hex(k): sorted(ops - use.mechs[k]) for k, ops in mechs.items()
+                     if semantic is not edge and k in use.mechs and ops - use.mechs[k]}
         res.ok(run, cell, "SEMANTICS-ATTESTED",
-               edge.get("semantics") == SEMANTICS_OBSERVED and not missing and not extra,
-               f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
+               semantic is not None and not missing and not extra and not extra_ops,
+               f"{ctag}: semantics {edge.get('semantics')!r}; {detail}; "
+               f"missing mechanism/ops {missing}; unledgered {extra}; unledgered operations {extra_ops}", detail)
 
 
 def check_no_preadmission_positive(view, cell, ctag, edge, res):
@@ -4496,6 +4571,87 @@ def self_test():
         def cid(s, cell, gen=0, idx=0):
             keys = sorted(k for k in s.ids if k[0] == cell and k[2] == gen)
             return s.ids[keys[idx]]
+
+        def semantic_child(s, doc, dash, lossy=False):
+            # Current production shape: one registered child owns S1 history;
+            # the physical parent keeps its independent entry count.
+            parent = _edge(doc, cid(s, "P7"), s.mid["A"])
+            child = {"caller": parent["caller"], "module": parent["module"], "instance": "i0",
+                     "entries": {"unit": "api_entries", "count": None, "observation": "unavailable"},
+                     "api_returns": {"unit": "api_returns", "count": 45, "saturated": False,
+                                     "historical_only_returns": 0},
+                     "semantics": "observed", "mechanisms": _deep(parent["mechanisms"]),
+                     "operations": {"calls": 45, "started": 20, "completed": 20, "failed": 0,
+                                    "active": [], "unknown": 0, "cancelled": 0, "dropped": 0,
+                                    "orphans": 0},
+                     "coverage": {"lossy": lossy,
+                                  "reasons": ["capture_stopped", "semantic_loss"] if lossy else []}}
+            calls = {0x250: 8, 0x251: 8, 0x350: 4, 0x1080: 4, 0x1087: 8}
+            for row in child["mechanisms"]:
+                row["calls"] = calls[row["mechanism"]]
+            doc["instances"] = [{"id": "i0", "caller": parent["caller"], "module": parent["module"],
+                                 "state": "uncertain" if lossy else "observed",
+                                 "reason": "semantic_loss" if lossy else None,
+                                 "first_seen_ns": parent["entries"]["first_seen_ns"],
+                                 "last_seen_ns": parent["entries"]["last_seen_ns"]}]
+            doc["semantic_edges"] = [child]
+            parent.update(semantics="unknown (per-edge summary withheld; see semantic children)",
+                          mechanisms=None, operations=None)
+
+        def child_mutation(edit):
+            def mutate(s, doc, dash):
+                semantic_child(s, doc, dash, lossy=True)
+                edit(doc["semantic_edges"][0], doc)
+            return mutate
+
+        case("attested-instance-child", None, semantic_child)
+        child_loss = case("attested-instance-child-lossy-history", None,
+                          lambda s, d, dash: semantic_child(s, d, dash, lossy=True))
+        loss_row = next((row for row in child_loss.rows
+                         if row["cell"] == "P7" and row["check"] == "SEMANTICS-ATTESTED"), {})
+        loss_disclosed = (loss_row.get("status") == "pass"
+                          and all(text in loss_row.get("detail", "")
+                                  for text in ("partial", "capture_stopped", "semantic_loss")))
+        print(f"self-test {'ok  ' if loss_disclosed else 'FAIL'} attested-child-loss-disclosure")
+        if not loss_disclosed:
+            failures.append("attested-child-loss-disclosure")
+        for name, edit in (
+                ("wrong-caller", lambda child, doc: child.update(caller="c999")),
+                ("wrong-module", lambda child, doc: child.update(module="m999")),
+                ("missing-instance", lambda child, doc: doc.update(instances=[])),
+                ("wrong-instance", lambda child, doc: child.update(instance="i999")),
+                ("instance-owner", lambda child, doc: doc["instances"][0].update(caller="c999")),
+                ("missing-child", lambda child, doc: doc.update(semantic_edges=[])),
+                ("duplicate-child", lambda child, doc: doc["semantic_edges"].append(_deep(child))),
+                ("duplicate-instance", lambda child, doc: doc["instances"].append(_deep(doc["instances"][0]))),
+                ("unknown", lambda child, doc: child.update(semantics="unknown (semantic capture withheld)")),
+                ("missing-operations", lambda child, doc: child.update(operations=None)),
+                ("invalid-operation-count", lambda child, doc: child["operations"].update(calls=True)),
+                ("missing-returns", lambda child, doc: child["api_returns"].update(count=None)),
+                ("wrong-return-unit", lambda child, doc: child["api_returns"].update(unit="api_entries")),
+                ("wrong-operation", lambda child, doc: child["mechanisms"][0].update(operations=["decrypt"])),
+                ("extra-operation", lambda child, doc: child["mechanisms"][0].update(operations=["digest", "decrypt"])),
+                ("missing-mechanism", lambda child, doc: child["mechanisms"].pop()),
+                ("extra-mechanism", lambda child, doc: child["mechanisms"].append(
+                    dict(_deep(child["mechanisms"][0]), mechanism=0x80000001))),
+                ("duplicate-mechanism", lambda child, doc: child["mechanisms"].append(_deep(child["mechanisms"][0]))),
+                ("physical-count-copy", lambda child, doc: child["entries"].update(count=48, observation="observed")),
+                ("missing-coverage", lambda child, doc: child.pop("coverage")),
+                ("invalid-loss-type", lambda child, doc: child["coverage"].update(lossy=1)),
+                ("hidden-loss", lambda child, doc: child["coverage"].update(lossy=False)),
+                ("missing-loss-reasons", lambda child, doc: child["coverage"].update(reasons=[])),
+                ("unknown-parent", lambda child, doc: _edge(doc, child["caller"], child["module"]).update(
+                    semantics="unknown (semantic capture withheld)"))):
+            case("attested-child-" + name, "SEMANTICS-ATTESTED", child_mutation(edit))
+
+        def split_children(child, doc):
+            sibling = _deep(child)
+            sibling["instance"] = "i1"
+            sibling["mechanisms"] = child["mechanisms"][2:]
+            child["mechanisms"] = child["mechanisms"][:2]
+            doc["semantic_edges"].append(sibling)
+            doc["instances"].append(dict(_deep(doc["instances"][0]), id="i1"))
+        case("attested-child-no-sibling-merging", "SEMANTICS-ATTESTED", child_mutation(split_children))
 
         # Malformed gaps must produce a named oracle input failure instead of
         # escaping from one of the many consumers as a Python exception.

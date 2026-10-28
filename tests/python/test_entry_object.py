@@ -127,6 +127,20 @@ def consumer_contract(variant, suffix, disassembly=None):
     return CHECKER["consumer_contract"](consumer, variant, blocks, initial, outlined)
 
 
+def object_return_proof(variant, disassembly=None):
+    """Run the actual outlined CFG, including its refused ordinary-base arm."""
+    consumer, initial, _, _ = consumer_case(variant, "object_return", disassembly)
+    reads = [pc for pc, text in consumer.insns if pc in consumer.helper and text == "call 0x70"]
+    if len(reads) != 6:
+        raise AssertionError((consumer.name, reads))
+    # Independent LP64/IA32 retained-return ABI, as specified by the producer.
+    sites = dict(zip(reads, ((0x30, 12, 1), (0x20, None, 1), (0x30, 1, 1),
+                            (0x20, None, 0), (0x30, 1, 0), (0x30, 12, 0))))
+    proof = CHECKER["_ReturnProof"](0, True, 7, "object", sites)
+    facts = consumer.facts(initial | {("live", 7): True}, proof)
+    return consumer, facts, proof
+
+
 def entry_role_contract(variant, name, role, disassembly=None):
     original, _, blocks, _ = consumer_case(variant, name, disassembly)
     consumer = CHECKER["_OwnedCaller"](original.section, name, original.lines, original.calls)
@@ -256,6 +270,82 @@ def mutate(disassembly, function, pc, old, new, internal_call=False, helper_call
 
 
 class EntryObjectTests(unittest.TestCase):
+    def test_object_return_paths_keep_exactly_one_retirement(self):
+        for variant in OBJECTS:
+            with self.subTest(variant=variant, control="actual object operations"):
+                report = consumer_contract(variant, "object_return")
+                operations = [role for _, role in report["operations"]]
+                self.assertEqual(operations.count("START.remove1"), 8)
+                self.assertEqual(operations.count("EVENTS.output"), 1)
+                self.assertEqual(operations.count("EVENTS.discard"), 2)
+                self.assertEqual(operations.count("EVENTS.submit"), 1)
+            consumer, _, proof = object_return_proof(variant)
+            self.assertTrue(proof.submits, "the actual joined object path remains reachable")
+            name, texts = consumer.name, consumer.text
+            output = next(pc for pc, text in consumer.insns if text == "call 0x82")
+            retire = max(pc for pc, target in consumer.calls.items()
+                         if pc < output and target == "p11_owner_start_remove")
+            guard = next((pc, text) for pc, text in consumer.insns if retire < pc < output
+                         and re.fullmatch(r"if r6 != 0x0 goto .*", text))
+            first = min(pc for pc, target in consumer.calls.items() if target == "p11_owner_start_remove")
+            arguments = max(pc for pc, text in consumer.insns if pc < first and text == "r1 = r10")
+            changes = [
+                ("missing retirement", retire, "r0 = 0x0", "fault before retirement attempt"),
+                ("failed retirement cannot output", guard[0], "goto +0x0", "base output.*checked retirement"),
+                ("second retirement on one return", guard[0], f"goto {arguments-guard[0]-1:+#x}", "required single retirement attempt"),
+            ]
+            for control, pc, new, reason in changes:
+                with self.subTest(variant=variant, control=control), self.assertRaisesRegex(RuntimeError, reason):
+                    object_return_proof(variant, mutate(OBJECTS[variant], name, pc, texts[pc], new))
+
+    def test_refused_object_base_output_is_bounded(self):
+        for variant in OBJECTS:
+            consumer, facts, proof = object_return_proof(variant)
+            output = next(pc for pc, text in consumer.insns if text == "call 0x82")
+            self.assertTrue(facts[output], "the actual ordinary-base output must be checked")
+            consumer.proof = proof
+            try:
+                for state in facts[output].values():
+                    consumer.step(output, state)
+                    for control, changed in (
+                        ("foreign map", {"r1": ("map", "STATS")}),
+                        ("base offset", {"r2": ("event", 8)}),
+                        ("foreign buffer", {"r2": ("stack", -368)}),
+                        ("object tail disclosure", {"r3": ("constant", 608)}),
+                        ("output flags", {"r4": ("constant", 1)}),
+                        ("retirement not attempted", {("retired",): False}),
+                        ("retirement failed", {("settled",): False}),
+                        ("object continuity not faulted", {("fault",): False}),
+                    ):
+                        with self.subTest(variant=variant, control=control), self.assertRaisesRegex(RuntimeError, "return.*base output"):
+                            consumer.step(output, state | changed)
+            finally:
+                consumer.proof = None
+
+    def test_object_return_reservation_is_disposed_once(self):
+        for variant in OBJECTS:
+            consumer, facts, proof = object_return_proof(variant)
+            discards = [pc for pc, text in consumer.insns if text == "call 0x85"]
+            self.assertEqual(len(discards), 2)
+            for pc in discards:
+                with self.subTest(variant=variant, discard=pc, control="missing disposal"), self.assertRaisesRegex(RuntimeError, "return.*reservation"):
+                    object_return_proof(variant, mutate(OBJECTS[variant], consumer.name, pc,
+                                                       consumer.text[pc], "r0 = 0x0"))
+                consumer.proof = proof
+                try:
+                    for state in facts[pc].values():
+                        disposed = consumer.step(pc, state)
+                        for control, changed in (
+                            ("wrong reservation", {"r1": ("event", 8)}),
+                            ("discard flags", {"r2": ("constant", 1)}),
+                        ):
+                            with self.subTest(variant=variant, discard=pc, control=control), self.assertRaisesRegex(RuntimeError, "return.*reservation"):
+                                consumer.step(pc, state | changed)
+                        with self.subTest(variant=variant, discard=pc, control="duplicate disposal"), self.assertRaisesRegex(RuntimeError, "return.*reservation"):
+                            consumer.step(pc, disposed | {"r1": state["r1"], "r2": state["r2"]})
+                finally:
+                    consumer.proof = None
+
     def _assert_publication_joins(self):
         for variant in OBJECTS:
             original, _, _, _ = consumer_case(variant, "p11_entry")

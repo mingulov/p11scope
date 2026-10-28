@@ -2750,10 +2750,11 @@ class _ReturnProof(SinkProof):
         super().__init__("return", abi, present, ("owned", owner, 0), kind="return")
         self.return_role, self.retained_sites = role, sites
         self.submits = set()
+        self.base_outputs = set()
         self.emission_roles = ("object_fill_return", "object_tail_fill", "object_emit_find", "object_emit_get_attributes")
 
     def partition(self, state):
-        return super().partition(state) + tuple(state.get((key,)) for key in ("retired", "settled", "fault", "emitted"))
+        return super().partition(state) + tuple(state.get((key,)) for key in ("retired", "settled", "fault", "emitted", "reservation"))
 
     def transfer(self, consumer, pc, before, state):
         text, target = consumer.text[pc], consumer.calls.get(pc, "")
@@ -2773,7 +2774,8 @@ class _ReturnProof(SinkProof):
             allowed = target in ("memset", "p11_link_current_identity", "p11_owner_start_remove", "p11_object_fault",
                                  "p11_object_side_get", "p11_instance_return", "p11_root_current_tag") or any(target.endswith(role) for role in self.emission_roles)
             require(allowed if pc not in consumer.helper else text in ("call 0x1", "call 0x2", "call 0x5", "call 0xe",
-                    "call 0x50", "call 0x70", "call 0x83", "call 0x84", "call 0x85", "call 0xae"), error("unknown callee/helper footprint"))
+                    "call 0x50", "call 0x70", "call 0x83", "call 0x84", "call 0x85", "call 0xae")
+                    or self.return_role == "object" and text == "call 0x82", error("unknown callee/helper footprint"))
         if match := STORE.fullmatch(text):
             pointer = address(before, match[2], match[3], match[4])
             require(pointer and pointer[0] in ("stack", "event")
@@ -2826,6 +2828,26 @@ class _ReturnProof(SinkProof):
         if text == "call 0x83" and pc in consumer.helper:
             require(before.get("r1") == ("map", "EVENTS")
                     and before.get("r2") == ("constant", 608 if self.return_role == "object" else 368), error("record reserve size"))
+            require(before.get(("reservation",)) is None, error("reservation acquired twice"))
+            state[("reservation",)] = "unchecked"
+        if text == "call 0x82" and pc in consumer.helper:
+            # A refused object join may preserve only its initialized ordinary
+            # base. Output does not consume the original 608-byte reservation.
+            require(self.return_role == "object"
+                    and before.get("r1") == ("map", "EVENTS")
+                    and before.get("r2") == ("event", 0)
+                    and before.get("r3") == ("constant", 368)
+                    and before.get("r4") == ("constant", 0)
+                    and before.get(("reservation",)) == "live"
+                    and before.get(("retired",)) and before.get(("settled",)) and before.get(("fault",)),
+                    error("base output needs the bounded original base and checked retirement/fault"))
+            require(before.get(("event_slot",)) == ("low", consumer.identity), error("Event.slot corrupted before submit (ordinary base output)"))
+            require(before.get(("event_user_type",)) == ("retained", 0x38, 32), error("base output user_type was not copied unchanged"))
+            self.base_outputs.add(pc)
+        if text in ("call 0x84", "call 0x85") and pc in consumer.helper:
+            require(before.get("r1") == ("event", 0) and before.get("r2") == ("constant", 0)
+                    and before.get(("reservation",)) == "live", error("reservation disposal needs its original live record and zero flags"))
+            state[("reservation",)] = "disposed"
         if text == "call 0x84" and pc in consumer.helper:
             require(before.get("r1") == ("event", 0) and before.get(("settled",)), error("submit before successful retirement"))
             require(before.get(("event_slot",)) == ("low", consumer.identity), error("Event.slot corrupted before submit"))
@@ -2836,11 +2858,23 @@ class _ReturnProof(SinkProof):
         if text == "exit":
             require(before.get(("retired",)) and (before.get(("settled",)) or before.get(("fault",))),
                     error("exit bypassed checked retirement/fault"))
+            require(before.get(("reservation",)) in (None, "disposed"), error("reservation left without disposal"))
         return super().transfer(consumer, pc, before, state)
 
     def edges(self, consumer, pc, before, after):
         branch = BRANCH.fullmatch(consumer.text[pc])
         for successor, state in super().edges(consumer, pc, before, after):
+            if branch and value(before, branch[1]) == ("event", 0):
+                require(branch[1].startswith("r") and branch[2] in ("==", "!=")
+                        and value(before, branch[3]) == ("constant", 0)
+                        and before.get(("reservation",)) == "unchecked",
+                        consumer.label(pc) + ": return reservation needs its original full-width null test")
+                absent = (successor == D.relative_target(pc, consumer.text[pc])) == (branch[2] == "==")
+                state[("reservation",)] = None if absent else "live"
+                if absent:
+                    for key, fact in list(state.items()):
+                        if fact == ("event", 0):
+                            state[key] = ("constant", 0)
             if branch and (side := value(before, branch[1])) and side[0] == "side":
                 require(branch[1].startswith("r") and branch[2] in ("==", "!=")
                         and value(before, branch[3]) == ("constant", 0),
@@ -2863,6 +2897,8 @@ class _ReturnProof(SinkProof):
 
     def finish(self, consumer):
         require(self.submits, consumer.name+": return no positive submit witness")
+        if self.return_role == "object":
+            require(self.base_outputs, consumer.name+": return no checked refused-base output witness")
         if self.present:
             require(self.boundaries == {pc for pc, (_, _, abi) in self.retained_sites.items() if abi == self.abi},
                     consumer.name+": retained read inventory/layout differs")
@@ -2896,7 +2932,9 @@ def retained_contract(consumer, variant, selectors, internal_blocks, internal_ca
         require(len(helpers) == 6, body.name+": retained read helper inventory")
         sites = dict(zip(helpers, inventory[role]))
         retires = [pc for pc, target in body.calls.items() if target == "p11_owner_start_remove"]
-        require(len(retires) == (1 if role == "ordinary" else 7), body.name+": return retirement inventory")
+        # LLVM clones the unconditional final cleanup for emission outcomes;
+        # _ReturnProof still requires exactly one checked attempt per path.
+        require(len(retires) == (1 if role == "ordinary" else 8), body.name+": return retirement inventory")
         for selector in selectors:
             abi = int(selector == 0x23)
             for present in (False, True):
@@ -3130,10 +3168,17 @@ def operation_contract(consumer, facts, variant, internal_blocks):
             records.append((pc, "START."+role))
         if pc in consumer.helper:
             name = state.get("r1", (None, None))
-            if name[0] == "map" and name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"):
+            if text != "call 0x82" and name[0] == "map" and name[1] in ("STATS", "RV_COUNTS", "DESCRIPTORS", "EVENTS"):
                 require(pc in reachable, consumer.label(pc)+": unreachable map operation")
                 maps[(name[1], text)] += 1
                 records.append((pc, name[1]+"."+text))
+            if text == "call 0x82":
+                require(pc in reachable and consumer.section == ".text" and consumer.name.endswith("object_return")
+                        and state.get("r1") == ("map", "EVENTS") and state.get("r2") == ("event", 0)
+                        and state.get("r3") == ("constant", 368) and state.get("r4") == ("constant", 0),
+                        consumer.label(pc)+": bounded ordinary-base output arguments")
+                maps[("EVENTS", text)] += 1
+                records.append((pc, "EVENTS.output"))
             if text in ("call 0x84", "call 0x85"):
                 require(state.get("r1") == ("event", 0), consumer.label(pc)+": submitted/discarded event address")
                 if text == "call 0x84":
@@ -3143,7 +3188,7 @@ def operation_contract(consumer, facts, variant, internal_blocks):
     name = consumer.name
     outlined = consumer.section == ".text" and name.endswith(("ordinary_return", "object_return"))
     if outlined:
-        expected_owner = Counter({"remove1": 7 if name.endswith("object_return") else 1})
+        expected_owner = Counter({"remove1": 8 if name.endswith("object_return") else 1})
     elif name == "p11_return":
         expected_owner = Counter({"remove0": 2, "get0-specialized" if variant == "default" else "get0": 1})
     elif name == "p11_entry_template_second":
@@ -3160,7 +3205,8 @@ def operation_contract(consumer, facts, variant, internal_blocks):
         expected_maps.update({("RV_COUNTS", "call 0x1"): 2, ("RV_COUNTS", "call 0x2"): 1,
                               ("EVENTS", "call 0x83"): 1, ("EVENTS", "call 0x84"): 1})
         if name.endswith("object_return"):
-            expected_maps[("EVENTS", "call 0x85")] = 1
+            expected_maps[("EVENTS", "call 0x82")] = 1
+            expected_maps[("EVENTS", "call 0x85")] = 2
     require(owner == expected_owner, name+f": START operation inventory {owner}, expected {expected_owner}")
     require(maps == expected_maps, name+f": distinct map operation inventory differs: {maps}")
     require(len(keys) == 1 and len(values) == int("begin" in expected_owner), name+": START operation key/seed wiring differs")

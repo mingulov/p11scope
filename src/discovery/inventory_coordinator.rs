@@ -1623,6 +1623,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             attached_at: BTreeMap::new(),
             failed: BTreeSet::new(),
             unproven: None,
+            original_pid_exit: None,
             changed_objects: BTreeSet::new(),
             health_unproven: None,
             pairs_unproven: None,
@@ -1809,17 +1810,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// After stop it stages nothing: ended intervals are frozen facts.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
     pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
-        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+        let Some(capture) = self.capture.as_mut() else {
             return;
         };
+        // Revocation precedes every sticky-loss early return. A later generic
+        // loss cannot leave the earlier historical exit allowance behind.
+        let exit = match custody {
+            ScopeCustody::PidExited { proof, .. } => Some(*proof),
+            ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. } => {
+                capture.original_pid_exit = None;
+                None
+            }
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => return,
+        };
+        if capture.stopped {
+            capture.original_pid_exit = None;
+            return;
+        }
+        if capture.unproven.is_some() {
+            if capture.original_pid_exit != exit {
+                capture.original_pid_exit = None;
+            }
+            return;
+        }
         let (at_ns, reason) = match custody {
             ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => return,
+            ScopeCustody::PidExited { at_ns, .. } => (
+                *at_ns,
+                "PID custody lost: the PID target exited".to_string(),
+            ),
             ScopeCustody::PidUnproven { at_ns, reason } => (*at_ns, reason.clone()),
             ScopeCustody::PidLost { at_ns, reason } => (*at_ns, reason.clone()),
         };
-        if capture.unproven.is_some() {
-            return;
-        }
+        capture.original_pid_exit = exit.filter(|proof| {
+            matches!(capture.scope, CaptureScopeCoverage::Pid(scope) if scope == proof.scope())
+        });
         capture.unproven = Some(reason.clone());
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
@@ -2022,10 +2047,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// unknown, the loss is a gap, and — sticky — no watch starts again in
     /// this capture. Only the first loss stages anything.
     fn note_lifecycle_loss(&mut self, loss: &LifecycleLoss) {
-        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+        let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        if capture.unproven.is_some() {
+        capture.original_pid_exit = None;
+        if capture.stopped || capture.unproven.is_some() {
             return;
         }
         capture.unproven = Some(loss.reason.clone());
@@ -4042,6 +4068,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Err(()) => false,
             };
             if confirmed {
+                // Retaining a proved exit before adapter classification is
+                // pending work, not permission for this earlier staging arm.
+                if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.unproven.is_some())
+                    && !self.recoveries.get(&key).is_some_and(|recovery| {
+                        self.retirement_exit_clean(key, recovery)
+                            && self.original_pid_exit_matches(key, recovery)
+                    })
+                {
+                    continue;
+                }
                 // Once current retirement authority is involved, its exact
                 // guards and immutable fence decide growth in the single
                 // reconciliation slice. Sticky deferral alone is not
@@ -4245,6 +4284,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             || recovery.epoch_pending
             || recovery.fence.is_some()
             || recovery.receipt_refused
+    }
+
+    fn original_pid_exit_matches(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        let Some(capture) = self.capture.as_ref().filter(|capture| !capture.stopped) else {
+            return false;
+        };
+        let Some(proof) = capture.original_pid_exit else {
+            return false;
+        };
+        if !self.binder.domain_active(key.image.domain())
+            || proof.domain() != key.image.domain()
+            || capture.bound != Some(recovery.caller)
+        {
+            return false;
+        }
+        let scope = proof.scope();
+        if !matches!(capture.scope, CaptureScopeCoverage::Pid(held) if held == scope)
+            || !self.adapter.record(recovery.caller).is_some_and(|record| {
+                record.pid == scope.pid && record.start_time == scope.start_time
+            })
+        {
+            return false;
+        }
+        matches!(self.pair_targets.get(&key), Some(PairTarget::Bound {
+            caller, module, endpoint, ..
+        }) if *caller == recovery.caller
+            && self.registry.module_id_for(module) == Some(recovery.carrier)
+            && *endpoint == recovery.endpoint
+            && self.attach_set.endpoint(*endpoint).is_some_and(|entry| entry.object.index() == key.object
+                && !capture.changed_objects.contains(&entry.object)))
     }
 
     fn remember_retirement_advance(&mut self, key: PairKey, count: PairCount, advanced: bool) {
@@ -5204,12 +5273,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         && self.adapter.live_id(record.pid) == Some(recovery.caller)
                         && self.adapter.live_pin(record.pid).is_some()
                 });
+            let original_exit_history = (exit_clean || classification_pending)
+                && self.original_pid_exit_matches(key, &recovery);
             let canceled = recovery.receipt_refused
                 || (live.is_none() && !exit_clean && !classification_pending)
                 || !self.binder.domain_active(key.image.domain())
                 || self.capture.as_ref().is_some_and(|capture| {
                     capture.stopped
-                        || capture.unproven.is_some()
+                        || (capture.unproven.is_some() && !original_exit_history)
                         || self
                             .attach_set
                             .endpoint(recovery.endpoint)
@@ -7200,6 +7271,9 @@ struct CaptureCoverage {
     /// exec or leader exit of the PID target, lifecycle loss — PID or
     /// system scope).
     unproven: Option<String>,
+    /// A proved original-pidfd exit only excuses historical count retention.
+    /// The watch loss stays sticky and every later uncertainty revokes this.
+    original_pid_exit: Option<crate::attach::capture::OriginalPidExit>,
     /// Sticky: objects modified in place after they were attached.
     changed_objects: BTreeSet<AttachObjectId>,
     /// The last witness batch's unproven health (not sticky).

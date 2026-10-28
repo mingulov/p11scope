@@ -398,7 +398,10 @@ fn pid_scope_excludes_foreign_and_reused_pid(backend: AttachBackend) -> Result<(
             .is_some_and(|reason| reason.contains("custody")),
         "{refused:?}"
     );
-    ensure!(matches!(capture.custody(), ScopeCustody::PidLost { .. }));
+    ensure!(matches!(
+        capture.custody(),
+        ScopeCustody::PidLost { .. } | ScopeCustody::PidExited { .. }
+    ));
     ensure!(capture.failure().is_some() && capture.phase() == CapturePhase::Retiring);
     eprintln!("C3_PID_REUSE_EXCLUDED backend={backend:?} pid={pid} rows=0 custody=lost");
     reused.finish()?;
@@ -846,7 +849,7 @@ fn privileged_inventory_capture_stop_before_activation_repolls_custody_lp64() ->
     target.wait()?;
     let terminal = retired.read_witnesses(read_window());
     ensure!(
-        matches!(&terminal.custody, ScopeCustody::PidLost { reason, .. } if reason.contains("exited")),
+        matches!(&terminal.custody, ScopeCustody::PidExited { proof, .. } if proof.scope().pid == pid),
         "{:?}",
         terminal.custody
     );

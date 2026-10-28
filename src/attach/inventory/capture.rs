@@ -573,6 +573,12 @@ pub(crate) enum ScopeCustody {
     /// The original pidfd is live, its leader thread is alive, and no
     /// lifecycle record was lost or seen: every entry link fires for it.
     PidHeld,
+    /// The retained original pidfd proved exit without earlier uncertainty.
+    /// This preserves only historical counts of its already-bound image.
+    PidExited {
+        at_ns: u64,
+        proof: OriginalPidExit,
+    },
     /// The process lives, but coverage from `at_ns` on is unproven: an
     /// exec of the target (a nonleader exec replaces the task the entries
     /// were bound to), its leader thread exited (OneProcess entries stop
@@ -586,6 +592,44 @@ pub(crate) enum ScopeCustody {
         at_ns: u64,
         reason: String,
     },
+}
+
+/// An irreversible fact about the capture's original pin, never current
+/// process or semantic authority. Only a successful original-pidfd poll mints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalPidExit {
+    domain: NativeDomainId,
+    scope: ScopeIncarnation,
+}
+
+impl OriginalPidExit {
+    fn from_poll(
+        domain: NativeDomainId,
+        scope: ScopeIncarnation,
+        pin: &PidPin,
+        poll: &CustodyPoll,
+    ) -> Option<Self> {
+        (matches!(poll, CustodyPoll::Exited)
+            && pin.pidfd().is_ok()
+            && scope.start_time.is_some()
+            && scope.pid == pin.pid()
+            && scope.start_time == pin.start_time())
+        .then_some(Self { domain, scope })
+    }
+
+    pub(crate) fn domain(self) -> NativeDomainId {
+        self.domain
+    }
+
+    pub(crate) fn scope(self) -> ScopeIncarnation {
+        self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, scope: ScopeIncarnation) -> Self {
+        assert!(scope.start_time.is_some());
+        Self { domain, scope }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1107,6 +1151,7 @@ struct CaptureBook {
     /// Endpoints that failed: never retried. Bounded by N.
     failed: BTreeMap<u32, String>,
     custody_lost: Option<(u64, String)>,
+    original_exit: Option<OriginalPidExit>,
     /// First reason PID-scope coverage became unproven (sticky).
     unproven: Option<(u64, String)>,
     /// System scope: the earliest-dated lifecycle loss (sticky).
@@ -1232,6 +1277,7 @@ impl CaptureBook {
             attached: BTreeSet::new(),
             failed: BTreeMap::new(),
             custody_lost: None,
+            original_exit: None,
             unproven: None,
             lifecycle_lost: None,
             held_ns: now_ns,
@@ -1288,6 +1334,16 @@ impl CaptureBook {
             HeldCaptureScope::Pid(_) => {}
         }
         if let Some((lost_ns, lost)) = &self.custody_lost {
+            if self.unproven.is_none()
+                && self.lifecycle_lost.is_none()
+                && self.changed_objects.is_empty()
+                && let Some(proof) = self.original_exit
+            {
+                return ScopeCustody::PidExited {
+                    at_ns: *lost_ns,
+                    proof,
+                };
+            }
             // Lost custody never hides an earlier-dated unproven one: the
             // earliest instant coverage stopped being proven stands.
             return match &self.unproven {
@@ -1313,6 +1369,7 @@ impl CaptureBook {
     /// PID scope only; the earliest instant (and its reason) stands, so a
     /// later-found loss dated earlier is never masked (C5.2 closure I-1b).
     fn mark_unproven(&mut self, at_ns: u64, reason: String) {
+        self.original_exit = None;
         if self.incarnation().is_some() {
             keep_earliest(&mut self.unproven, at_ns, reason);
         }
@@ -1338,6 +1395,7 @@ impl CaptureBook {
     }
 
     fn mark_lost(&mut self, reason: String) {
+        self.original_exit = None;
         if self.incarnation().is_some() && self.custody_lost.is_none() {
             self.custody_lost = Some((self.held_ns, reason));
         }
@@ -1352,6 +1410,7 @@ impl CaptureBook {
                 }
             }
             CustodyPoll::Unproven(reason) => self.mark_unproven(self.held_ns, reason),
+            CustodyPoll::Exited => self.mark_lost("PID custody lost: the PID target exited".into()),
             CustodyPoll::Lost(reason) => self.mark_lost(format!("PID custody lost: {reason}")),
         }
     }
@@ -1431,6 +1490,7 @@ fn keep_earliest(slot: &mut Option<(u64, String)>, at_ns: u64, reason: String) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CustodyPoll {
     Held,
+    Exited,
     Unproven(String),
     Lost(String),
 }
@@ -1477,13 +1537,13 @@ fn poll_custody_with(
 ) -> CustodyPoll {
     match exited() {
         Ok(false) => {}
-        Ok(true) => return CustodyPoll::Lost("the PID target exited".into()),
+        Ok(true) => return CustodyPoll::Exited,
         Err(error) => return CustodyPoll::Lost(error),
     }
     let leader = leader();
     match exited() {
         Ok(false) => {}
-        Ok(true) => return CustodyPoll::Lost("the PID target exited".into()),
+        Ok(true) => return CustodyPoll::Exited,
         Err(error) => return CustodyPoll::Lost(error),
     }
     match leader {
@@ -1512,6 +1572,7 @@ fn poll_custody_with(
 /// One custody poll into the book. The instant is taken before the poll:
 /// a held verdict proves custody up to the start of its reads, never past
 /// them.
+#[cfg(test)]
 fn poll_into(
     book: &mut CaptureBook,
     clock: &mut dyn FnMut() -> u64,
@@ -2169,10 +2230,26 @@ impl InventoryCapture {
 /// machine, or once custody is lost). Every read polls first, whatever
 /// the phase, so its custody and proof instant are its own.
 fn poll_book(book: &mut CaptureBook, pin: Option<&PidPin>) {
-    if book.incarnation().is_none() || book.custody_lost.is_some() {
+    // Revalidate the original pin while an exit fact can authorize a tail.
+    // Once custody is uncertain, later polls cannot upgrade that loss.
+    if book.incarnation().is_none() || (book.custody_lost.is_some() && book.original_exit.is_none())
+    {
         return;
     }
-    poll_into(book, &mut monotonic_ns, || poll_custody(pin));
+    let now_ns = monotonic_ns();
+    let poll = poll_custody(pin);
+    let proof = book
+        .incarnation()
+        .filter(|_| {
+            book.unproven.is_none()
+                && book.lifecycle_lost.is_none()
+                && book.changed_objects.is_empty()
+        })
+        .and_then(|scope| {
+            pin.and_then(|pin| OriginalPidExit::from_poll(book.domain, scope, pin, &poll))
+        });
+    book.absorb_poll(poll, now_ns);
+    book.original_exit = proof;
 }
 
 fn pid_pin_of(state: &CaptureState) -> Option<&PidPin> {

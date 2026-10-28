@@ -5301,6 +5301,290 @@ fn cnt1_dead_pin_tick_and_publication_abandon_retain_terminal_count() {
     dead_pin_tick_then_terminal_count(true);
 }
 
+fn pid_tail_read(scene: &mut Cnt1Steady, count: u64, custody: ScopeCustody) {
+    let NativeBatch::Witness(mut batch) = scene.native.stamps.read(scene.native.domain, Vec::new())
+    else {
+        unreachable!()
+    };
+    batch.custody = custody;
+    batch.counts = vec![CallerCountUpdate {
+        image: p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 41,
+            exec_id: 1,
+        },
+        object: scene.native.scene.delta.endpoints[0].object,
+        count,
+    }];
+    scene.native.stage(NativeBatch::Witness(batch));
+}
+
+fn capture_tail_scene(scope: CaptureScopeCoverage) -> Cnt1Steady {
+    let mut scene = Cnt1Steady::new();
+    scene.native.scene.coordinator.begin_capture_coverage(scope);
+    let custody = match scope {
+        CaptureScopeCoverage::System => ScopeCustody::System,
+        CaptureScopeCoverage::Pid(_) => ScopeCustody::PidHeld,
+        CaptureScopeCoverage::Cgroup => unreachable!(),
+    };
+    scene.native.scene.attach_all(70, custody);
+    scene.pass(100);
+    scene.pass(200);
+    scene.pass_row(220);
+    scene.pass_count(230, 1894);
+    assert_eq!(scene.edge_count(), 1894);
+    scene
+}
+
+fn original_exit_custody(scene: &Cnt1Steady) -> ScopeCustody {
+    ScopeCustody::PidExited {
+        at_ns: 230,
+        proof: crate::attach::capture::OriginalPidExit::scripted(
+            scene.native.domain,
+            crate::attach::capture::ScopeIncarnation {
+                pid: 7,
+                start_time: Some(500),
+            },
+        ),
+    }
+}
+
+fn classify_exit_and_read_tail(scene: &mut Cnt1Steady, custody: ScopeCustody) {
+    QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut crate::discovery::engine::inventory::UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "cannot inventory pid 7: the process could not be read",
+        2000,
+    );
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(scene.caller)
+            .unwrap()
+            .lifecycle,
+        crate::discovery::caller_registry::CallerLifecycle::Exited
+    );
+    pid_tail_read(scene, 2002, custody);
+    scene.commit();
+}
+
+fn pid_tail_scene() -> Cnt1Steady {
+    capture_tail_scene(CaptureScopeCoverage::Pid(
+        crate::attach::capture::ScopeIncarnation {
+            pid: 7,
+            start_time: Some(500),
+        },
+    ))
+}
+
+#[test]
+fn cnt1_pid_exit_custody_before_classification_preserves_terminal_count() {
+    let mut scene = pid_tail_scene();
+    scene.native.scene.source.kill(7);
+    let custody = original_exit_custody(&scene);
+    // Actual PID capture ordering: custody is lost before the adapter has
+    // classified the dead original, and before its last absolute read.
+    pid_tail_read(&mut scene, 1894, custody.clone());
+    assert_eq!(scene.edge_count(), 1894, "no early count credit");
+    assert!(
+        !scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(scene.caller)
+            .unwrap()
+            .retired
+    );
+    classify_exit_and_read_tail(&mut scene, custody);
+    assert_eq!(
+        scene.edge_count(),
+        2002,
+        "original PID history retains the final 108-call tail"
+    );
+    assert!(scene.owner_unproven_gaps().is_empty());
+    let (module, verdict) = scene.native.scene.verdicts.iter().next().unwrap();
+    assert!(
+        matches!(
+            scene.native.scene.coordinator.capture_coverage_note(
+                ScopeVerdict::Inside,
+                module,
+                Some(verdict),
+            ),
+            Some(CoverageNote::Unknown(UnknownReason::Loss(_)))
+        ),
+        "historical count credit must not restore a watched interval"
+    );
+}
+
+#[test]
+fn cnt1_pid_exit_custody_waits_for_classification_before_publishing_advance() {
+    let mut scene = pid_tail_scene();
+    scene.native.scene.source.kill(7);
+    let custody = original_exit_custody(&scene);
+    pid_tail_read(&mut scene, 2002, custody.clone());
+    scene.commit();
+    assert!(
+        !scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(scene.caller)
+            .unwrap()
+            .retired
+    );
+    assert_eq!(
+        scene.edge_count(),
+        1894,
+        "an unclassified original exit stays pending even at publication"
+    );
+    classify_exit_and_read_tail(&mut scene, custody);
+    assert_eq!(scene.edge_count(), 2002);
+    assert!(scene.owner_unproven_gaps().is_empty());
+}
+
+#[test]
+fn cnt1_pid_uncertainty_with_an_advancing_read_never_publishes_the_tail() {
+    for custody in [
+        ScopeCustody::PidLost {
+            at_ns: 230,
+            reason: "owned pidfd poll failed".into(),
+        },
+        ScopeCustody::PidUnproven {
+            at_ns: 230,
+            reason: "an earlier exec was unproven".into(),
+        },
+    ] {
+        let mut scene = pid_tail_scene();
+        scene.native.scene.source.kill(7);
+        pid_tail_read(&mut scene, 2002, custody.clone());
+        scene.commit();
+        assert_eq!(scene.edge_count(), 1894);
+        classify_exit_and_read_tail(&mut scene, custody);
+        assert_eq!(scene.edge_count(), 1894);
+        assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    }
+}
+
+#[test]
+fn cnt1_system_capture_coverage_preserves_terminal_count() {
+    let mut scene = capture_tail_scene(CaptureScopeCoverage::System);
+    scene.native.scene.source.kill(7);
+    scene.drain();
+    classify_exit_and_read_tail(&mut scene, ScopeCustody::System);
+    assert_eq!(scene.edge_count(), 2002);
+    assert!(scene.owner_unproven_gaps().is_empty());
+}
+
+#[test]
+fn cnt1_pid_exit_custody_never_upgrades_prior_uncertainty() {
+    for prior in [
+        ScopeCustody::PidLost {
+            at_ns: 230,
+            reason: "owned pidfd poll failed".into(),
+        },
+        ScopeCustody::PidUnproven {
+            at_ns: 230,
+            reason: "an earlier exec was unproven".into(),
+        },
+    ] {
+        let mut scene = pid_tail_scene();
+        scene.native.scene.source.kill(7);
+        pid_tail_read(&mut scene, 1894, prior);
+        let custody = original_exit_custody(&scene);
+        classify_exit_and_read_tail(&mut scene, custody);
+        assert_eq!(scene.edge_count(), 1894);
+        assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    }
+}
+
+#[test]
+fn cnt1_pid_exit_custody_is_revoked_by_later_uncertainty() {
+    for later in [
+        ScopeCustody::PidLost {
+            at_ns: 240,
+            reason: "owned pidfd poll failed".into(),
+        },
+        ScopeCustody::PidUnproven {
+            at_ns: 220,
+            reason: "an earlier exec arrived late".into(),
+        },
+    ] {
+        let mut scene = pid_tail_scene();
+        scene.native.scene.source.kill(7);
+        let custody = original_exit_custody(&scene);
+        pid_tail_read(&mut scene, 1894, custody.clone());
+        pid_tail_read(&mut scene, 1894, later);
+        classify_exit_and_read_tail(&mut scene, custody);
+        assert_eq!(scene.edge_count(), 1894);
+        assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    }
+}
+
+#[test]
+fn cnt1_pid_exit_custody_does_not_survive_lifecycle_loss_object_drift_or_stop() {
+    for cause in 0..3 {
+        let mut scene = pid_tail_scene();
+        scene.native.scene.source.kill(7);
+        let custody = original_exit_custody(&scene);
+        pid_tail_read(&mut scene, 1894, custody.clone());
+        match cause {
+            0 => scene.native.scene.coordinator.note_lifecycle_loss(
+                &crate::attach::capture::LifecycleLoss {
+                    at_ns: 220,
+                    reason: "lifecycle loss arrived after the exit poll".into(),
+                },
+            ),
+            1 => scene.native.scene.coordinator.end_capture_coverage(240),
+            _ => {
+                let NativeBatch::Witness(mut batch) =
+                    scene.native.stamps.read(scene.native.domain, Vec::new())
+                else {
+                    unreachable!()
+                };
+                batch.custody = custody.clone();
+                batch
+                    .changed_objects
+                    .push(scene.native.scene.delta.endpoints[0].object);
+                scene.native.stage(NativeBatch::Witness(batch));
+            }
+        }
+        classify_exit_and_read_tail(&mut scene, custody);
+        assert_eq!(scene.edge_count(), 1894);
+        assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    }
+}
+
+#[test]
+fn cnt1_pid_exit_custody_requires_the_original_scope_and_domain() {
+    for wrong_domain in [false, true] {
+        let mut scene = pid_tail_scene();
+        scene.native.scene.source.kill(7);
+        let custody = ScopeCustody::PidExited {
+            at_ns: 230,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                if wrong_domain {
+                    NativeDomainId::mint()
+                } else {
+                    scene.native.domain
+                },
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(if wrong_domain { 500 } else { 501 }),
+                },
+            ),
+        };
+        pid_tail_read(&mut scene, 1894, custody.clone());
+        classify_exit_and_read_tail(&mut scene, custody);
+        assert_eq!(scene.edge_count(), 1894);
+        assert_eq!(scene.owner_unproven_gaps().len(), 1);
+    }
+}
+
 #[test]
 fn cnt1_exec_transition_does_not_authorize_late_old_image_count() {
     let mut scene = Cnt1Steady::new();

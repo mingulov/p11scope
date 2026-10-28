@@ -1524,7 +1524,7 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
                 stat('S', 7)
             }
         ),
-        CustodyPoll::Lost(_)
+        CustodyPoll::Exited
     ));
     assert!(!read, "an exited pidfd is never followed by a stat read");
     let polls = std::cell::Cell::new(0);
@@ -1538,7 +1538,7 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
                 },
                 || stat('Z', 7)
             ),
-            CustodyPoll::Lost(_)
+            CustodyPoll::Exited
         ),
         "an exit during the stat read voids it"
     );
@@ -1568,6 +1568,99 @@ fn custody_polls_prove_the_pidfd_and_the_leader_thread() {
     let mut system = test_book(8, 8, None);
     system.absorb_poll(CustodyPoll::Unproven("x".into()), 1);
     assert_eq!(system.custody(), ScopeCustody::System);
+}
+
+#[test]
+fn original_pid_exit_fact_requires_the_retained_pidfd_and_exact_scope() {
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    let pin = PidPin::open(child.0.id()).unwrap();
+    let scope = ScopeIncarnation {
+        pid: pin.pid(),
+        start_time: pin.start_time(),
+    };
+    let budget = InventoryBudget::new(1, 8).unwrap();
+    let mut book = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut book, Some(&pin));
+    assert_eq!(book.custody(), ScopeCustody::PidHeld);
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    poll_book(&mut book, Some(&pin));
+    let ScopeCustody::PidExited { proof, .. } = book.custody() else {
+        panic!("a successful original pidfd poll must retain the exit fact");
+    };
+    assert_eq!((proof.domain(), proof.scope()), (book.domain, scope));
+    let mut missing_after_exit = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut missing_after_exit, Some(&pin));
+    assert!(matches!(
+        missing_after_exit.custody(),
+        ScopeCustody::PidExited { .. }
+    ));
+    poll_book(&mut missing_after_exit, None);
+    assert!(
+        matches!(missing_after_exit.custody(), ScopeCustody::PidLost { .. }),
+        "a later missing original pin must revoke the exit fact"
+    );
+    let fallback = PidPin::test_proc_only(std::process::id());
+    let fallback_scope = ScopeIncarnation {
+        pid: fallback.pid(),
+        start_time: fallback.start_time(),
+    };
+    assert!(
+        OriginalPidExit::from_poll(book.domain, fallback_scope, &fallback, &CustodyPoll::Exited)
+            .is_none()
+    );
+    for wrong in [
+        ScopeIncarnation {
+            pid: scope.pid + 1,
+            ..scope
+        },
+        ScopeIncarnation {
+            start_time: scope.start_time.map(|start| start + 1),
+            ..scope
+        },
+        ScopeIncarnation {
+            start_time: None,
+            ..scope
+        },
+    ] {
+        assert!(
+            OriginalPidExit::from_poll(book.domain, wrong, &pin, &CustodyPoll::Exited).is_none()
+        );
+    }
+    let failed_poll = poll_custody_with(
+        scope.start_time,
+        || Err("owned pidfd poll failed".into()),
+        || stat('S', scope.start_time.unwrap()),
+    );
+    assert!(matches!(failed_poll, CustodyPoll::Lost(_)));
+    assert!(OriginalPidExit::from_poll(book.domain, scope, &pin, &failed_poll).is_none());
+    // An error after the exit fact revokes it even though the first loss
+    // and its public text remain sticky.
+    book.absorb_poll(failed_poll, 200);
+    assert!(matches!(book.custody(), ScopeCustody::PidLost { .. }));
+    let mut earlier = CaptureBook::new(budget, 1, Some(scope), 100);
+    earlier.mark_unproven(90, "an earlier exec was unproven".into());
+    poll_book(&mut earlier, Some(&pin));
+    assert!(matches!(earlier.custody(), ScopeCustody::PidLost { .. }));
+    let mut missing = CaptureBook::new(budget, 1, Some(scope), 100);
+    poll_book(&mut missing, None);
+    poll_book(&mut missing, Some(&pin));
+    assert!(
+        matches!(missing.custody(), ScopeCustody::PidLost { .. }),
+        "later exit cannot upgrade an earlier missing pin"
+    );
 }
 
 #[test]

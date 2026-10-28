@@ -1,15 +1,17 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # p11scope
 
-Observe the real PKCS#11 dependency surface of a running Linux application —
-functions, mechanisms, errors, latency and safe policy metadata — **without
-replacing its module or changing its configuration**.
+Find which running Linux applications use PKCS#11 providers, then inspect their
+observed calls, errors, latency and bounded metadata — **without replacing the
+provider or changing each application's configuration**.
 
-`p11scope` is a non-interposing PKCS#11 workload profiler and diagnostic
-observer built on eBPF uprobes. It discovers the provider's actual function
-table (including stripped providers with no `C_*` symbols), attaches probes by
-file offset, and produces a versioned `observed-profile.json` for migration
-assessment and incident diagnostics.
+`p11scope` is a system-wide PKCS#11 observability tool built on eBPF uprobes.
+Its inventory connects applications to physical provider files and separates
+loaded libraries from observed use. From that view, select a process or
+provider for profiling, tracing and mechanism diagnostics. Discovery uses
+available function-table or export evidence, including stripped providers
+when their tables can be acquired; probes attach by file offset. Saved inventory
+snapshots support offline comparison; detailed profiles support investigation.
 
 > **Status: v0.5.0** adds FULL object-attribute capture in release builds
 > (P0 stays an explicit option), a `key operations:` line in text inventory
@@ -53,6 +55,39 @@ targets remain useful as unknown, count-only observations. Alternate, null or
 unreadable interface names alone do not discard those targets. The explicit
 offline helper makes ten fixed `C_GetInterface` queries when that export is
 available and never calls `C_Initialize`; live observation remains passive.
+
+## First useful result
+
+After installing, start with a whole-machine inventory, then inspect a process
+you found there (`12345` below is a placeholder):
+
+```sh
+sudo p11scope inventory --system --duration 30s
+sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
+```
+
+Inventory has 4,096 physical endpoint IDs by default, configurable from 1 to
+8,192 with `--max-endpoints`. An endpoint is a provider object plus function
+offset, not a process. Detailed per-call capture has a separate 512-slot limit
+in release builds. These are different modes and budgets; unloading does not
+refund Inventory IDs during a capture.
+
+| Input | What it adds | What it does not establish |
+| --- | --- | --- |
+| Automatic discovery | Mapped providers, observed usage and physical entry counts; `profile`/`trace` add observed return values and timing | Complete coverage of every process or early call; names need separate layout/export evidence |
+| An explicitly accepted `--manifest` for the exact provider | Named offsets and admitted mechanism/API semantics | Trust in arbitrary provider code or recovery of calls before attachment |
+| FULL attribute capture | The approved bounded attribute reads | Public live per-key results: these remain unavailable in v0.5.0 and planned for 0.5.1 |
+
+A mapped library is not proof of use. Zero observed calls or zero event loss
+does not establish that no calls happened before probes attached. Check the
+reported watch interval and gaps; `profile` and `trace` currently lack a
+separate pre-attachment marker. See the [coverage limits](docs/known-limitations.md).
+
+Counts describe provider API entries or completed calls, as labelled. A call
+through a forwarding layer such as p11-kit and then a backend can be observed
+at both providers. Adding those counts does not give a count of distinct HSM
+operations; queries, retries and multipart calls also differ from completed
+cryptographic operations.
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release contains and its
 known limitations, [Install](#install) to build and install it, and
@@ -227,8 +262,13 @@ glibc providers, and on a musl system such as Alpine for musl providers.
 sudo install -m 0755 target/release/p11scope-discover /usr/local/bin/
 ```
 
-The helper runs unprivileged and drops groups, IDs, and capabilities before
-loading provider code. Never give it capabilities or a set-id bit.
+The helper runs as an unprivileged identity with capabilities cleared. An
+elevated invocation also clears supplementary groups before changing IDs;
+an ordinary invocation can retain the user's non-root groups. This is not a
+seccomp or Landlock sandbox: library
+constructors and discovery exports execute with the helper user's access.
+Use it only with provider code you trust to run as that user. The observer
+does not launch it automatically. Never give it capabilities or a set-id bit.
 
 **Kernel and privileges.** Live capture requires a Multi-capable Linux x86-64
 host (normally 6.6+ or a working backport), BTF (`/sys/kernel/btf/vmlinux`) and
@@ -264,6 +304,10 @@ If you installed the optional helper, also run
 
 ## Why
 
+- **System-wide visibility** — find which applications map and actually call
+  PKCS#11 providers, distinguish observed use from unknown or unwatched
+  activity, and compare saved inventories. Start with `inventory --system`,
+  then narrow the investigation to an application or provider.
 - **Black-box diagnostics** — "this app intermittently fails against our HSM;
   what is it actually doing?" Calls, return codes, latency distributions,
   concurrency, session lifecycle — with zero app changes.
@@ -343,7 +387,10 @@ reads. FULL keeps them enabled in `profile`, `trace` and `run` with
 Discovery reads the target's `/proc/<pid>/maps` and bounded bytes of its
 readable provider mappings via `/proc/<pid>/mem` (function tables, interface
 descriptors, offsets); interface-name bytes are classified in userspace and
-only finite classes ever leave discovery.
+profile, metrics and trace publish only finite classification consequences.
+`inspect` and an explicit offline manifest can show bounded discovered names.
+Reports can include application/module paths and requested cgroup metadata;
+these can identify workloads even though secret bytes are excluded.
 
 The previous unvalidated parameter/template decoders still exist, but only
 behind **both** an off-by-default Cargo feature and an explicit
@@ -419,7 +466,9 @@ report format.
   ceiling and is refused whole, while the later-fitting SoftHSM2 backend
   attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
   layer was captured.
-- A capture has 512 attach slots. `--pid`, `run`, and any capture aimed with
+- Detailed per-call capture has 512 attach slots in release builds; this is
+  separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
+  and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
   `--module` admit providers in discovery order. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table
@@ -438,7 +487,8 @@ report format.
   memory scans and scan-sourced file hashes across all selected processes and
   retries, with at most 256 MiB per scan/hash operation. It also stops at 512 accepted
   table candidates, 53,248 decoded entries, 512 interface records, 256 cgroup
-  members, and 512 attach slots. Any bounded omission is evidence and forces
+  members, and the selected capture policy's attach capacity (512 for release
+  Detailed capture; Inventory has its separate endpoint budget). Any bounded omission is evidence and forces
   `PARTIAL`; a retry never renews the allowance.
 - A named PID's generation is retained through scan, pin, and attach and is
   rechecked before and after session creation. Cgroup members use the same
@@ -491,14 +541,20 @@ report format.
 
 ## Containers and Kubernetes
 
-Uprobes bind to the file inode, so attaching to a provider `.so` in a shared
-image layer observes every container on that node using that layer —
-including pods started later (e.g. Knative scale-from-zero). That
-inode-sharing property is the headline bet; it depends on the `overlay2`
-storage driver and is validated, with exact call counts, against a real
-Docker container, two containers sharing one image layer, a Kubernetes pod
-(kind), and a Knative service's scale-from-zero cold start
-(`docs/notes/phase4-matrix.md`). On the v0.1.0 release candidate the Docker,
+Uprobes bind to the file inode. When containers share the same underlying
+provider file and are within the capture scope, one attachment can observe
+their calls after the probes are installed, including calls from later pods.
+Separate overlay instances and copy-up need additional identity handling;
+they do not inherit that guarantee. A process retaining a pre-copy-up mapping
+can currently be attributed to the new file and have calls missed without a
+runtime marker, on both identity backends. See the
+[copy-up limitation and restart workaround](docs/known-limitations.md#overlay-xinocopy-up-identity-divergences-d-c7-2d-c7-3).
+
+The v0.5.0 Knative warm capture observed 1,200/1,200 calls. Its cold first
+request started before attachment and only 84/1,200 calls were observed,
+despite zero kernel event loss. This is a disclosed coverage limit, not
+complete cold-start capture. Historical `overlay2` checks are in
+`docs/notes/phase4-matrix.md`: on the v0.1.0 release candidate the Docker,
 shared-layer, kind-pod, fork-scope and Knative lanes all passed with exact
 counts (host kernel 7.0; see the
 [v0.1.0 notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)).

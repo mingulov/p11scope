@@ -399,13 +399,17 @@ outside this release's completeness guarantee. The kernel keys each accepted
 uprobe to the pinned inode and offset, and the BPF scope guard runs before any
 argument read.
 
-The optional helper always drops supplementary groups, UID/GID, and active, permitted,
-inheritable, and ambient capabilities before loading provider code, even when
-invoked from an elevated observer. The module and output directory must
-therefore be readable/writable by the invoking unprivileged identity (or the
-`nobody` fallback for a direct root invocation). After an ID change, the helper
-restores Linux dumpability only to perform bounded reads through
-`/proc/self/mem`; it does not restore groups, IDs, or capabilities.
+Before loading provider code, the optional helper clears capabilities, uses
+an unprivileged UID/GID and sets `no_new_privs`. An elevated invocation clears
+supplementary groups when dropping to that identity (the invoking user, or
+the `nobody` fallback for direct root); an ordinary non-root invocation can
+retain its existing non-root groups. The module and output directory must be
+accessible to that resulting identity. The helper preopens its own
+`/proc/self/mem` for bounded reads and keeps Linux dumpability disabled while
+provider code runs; it does not restore dumpability after changing IDs.
+This is not a seccomp or Landlock sandbox. Library constructors and discovery
+exports execute with that user's access, so use the helper only with code
+you trust to run as that user. The observer never launches it automatically.
 
 Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
 `--system`; `--module` and `--manifest` are repeatable optional discovery

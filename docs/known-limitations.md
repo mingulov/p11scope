@@ -1298,9 +1298,11 @@ Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 ### Helper runs vendor code unsandboxed (DR-64)
 
 - What the user sees: `p11scope-discover` executes provider code in its own
-  unprivileged process (drops groups/IDs/capabilities, restores dumpability
-  only for bounded `/proc/self/mem` reads) but without a seccomp/Landlock
-  jail.
+  unprivileged process with capabilities cleared and `no_new_privs` set.
+  Elevated invocations clear supplementary groups when changing identity;
+  ordinary non-root invocations may retain their non-root groups. It reads
+  through a preopened `/proc/self/mem` descriptor and keeps dumpability
+  disabled while provider code runs. This is not a seccomp/Landlock jail.
 - Kernels/conditions: all helper runs.
 - Disclosure: usage attested-capture workflow; helper must match the
   provider ABI/libc and never carries capabilities or set-id.

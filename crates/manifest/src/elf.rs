@@ -328,14 +328,122 @@ impl ElfSnapshot {
     }
 }
 
+// Sorted disjoint intervals keep section/segment clipping linear after one
+// indexed collection; untrusted ELF tables never cause an S x P walk.
+fn merge_raw_metadata_ranges(ranges: &mut Vec<(u64, u64)>, work: &mut u64) {
+    let count = ranges.len() as u64;
+    *work = work.saturating_add(count.saturating_mul(u64::from(count.max(1).ilog2()) + 2));
+    ranges.sort_unstable();
+    let mut kept = 0usize;
+    for index in 0..ranges.len() {
+        let (start, end) = ranges[index];
+        if kept > 0 && start <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(end);
+        } else {
+            ranges[kept] = (start, end);
+            kept += 1;
+        }
+    }
+    ranges.truncate(kept);
+}
+
+fn intersect_raw_metadata_ranges(
+    left: &[(u64, u64)],
+    right: &[(u64, u64)],
+    out: &mut Vec<(u64, u64)>,
+    work: &mut u64,
+) {
+    let (mut a, mut b) = (0, 0);
+    while a < left.len() && b < right.len() {
+        *work = work.saturating_add(1);
+        let start = left[a].0.max(right[b].0);
+        let end = left[a].1.min(right[b].1);
+        if start < end {
+            out.push((start, end));
+        }
+        if left[a].1 <= right[b].1 {
+            a += 1;
+        } else {
+            b += 1;
+        }
+    }
+}
+
+fn subtract_raw_zero_fill_projections(
+    ranges: Vec<(u64, u64)>,
+    zero_fill: &[(u64, u64)],
+    work: &mut u64,
+) -> Vec<(u64, u64)> {
+    let mut retained = Vec::new();
+    let mut at = 0;
+    for (mut start, end) in ranges {
+        *work = work.saturating_add(1);
+        while at < zero_fill.len() && zero_fill[at].1 <= start {
+            *work = work.saturating_add(1);
+            at += 1;
+        }
+        while at < zero_fill.len() && zero_fill[at].0 < end {
+            *work = work.saturating_add(1);
+            if start < zero_fill[at].0 {
+                retained.push((start, zero_fill[at].0));
+            }
+            start = start.max(zero_fill[at].1);
+            if start >= end {
+                break;
+            }
+            at += 1;
+        }
+        if start < end {
+            retained.push((start, end));
+        }
+    }
+    retained
+}
+
 fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfFacts, String> {
     let (object, abi, _) = classified_validated_object(data)?;
     let mut ranges = Vec::new();
+    let mut work_units = 0u64;
     macro_rules! collect {
         ($elf:expr) => {{
             let elf = $elf;
             let endian = elf.endian();
             let sections = elf.elf_section_table();
+            let programs = elf.elf_program_headers();
+            work_units = work_units.saturating_add((sections.len() + programs.len()) as u64);
+            let mut by_bias = std::collections::BTreeMap::new();
+            let mut loaded_file = Vec::new();
+            let mut zero_fill = Vec::new();
+            for segment in programs {
+                if segment.p_type(endian) != elf::PT_LOAD {
+                    continue;
+                }
+                let (offset, size) = segment.file_range(endian);
+                let address: u64 = segment.p_vaddr(endian).into();
+                let memory_size: u64 = segment.p_memsz(endian).into();
+                // classified_validated_object already checked every LOAD's
+                // file/virtual arithmetic and actual file extent.
+                let end = offset + size;
+                if offset < end {
+                    let bias = i128::from(address) - i128::from(offset);
+                    let (loads, _) = by_bias
+                        .entry(bias)
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+                    loads.push((offset, end));
+                    loaded_file.push((offset, end));
+                }
+                if memory_size > size {
+                    // A file-named VMA can include the loader-zeroed tail.
+                    // Its projected offsets cannot prove metadata ownership,
+                    // even if another LOAD really contains metadata there.
+                    // memsz removes authority only; it never extends filesz.
+                    zero_fill.push((end, offset.saturating_add(memory_size)));
+                }
+            }
+            let index_work = u64::from((by_bias.len() as u64).max(1).ilog2()) + 1;
+            work_units = work_units
+                .saturating_add((sections.len() as u64).saturating_mul(index_work))
+                .saturating_add((programs.len() as u64).saturating_mul(index_work));
             // The existing parser handles ELF32/64 and extended indexes.
             // Only exact GOT names need strings, and each check examines
             // at most nine bytes rather than searching an unbounded name.
@@ -347,6 +455,10 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
                 .and_then(|section| section.data(endian, elf.data()).ok())
                 .unwrap_or(&[]);
             for section in sections.iter() {
+                let flags: u64 = section.sh_flags(endian).into();
+                if flags & u64::from(elf::SHF_ALLOC) == 0 {
+                    continue;
+                }
                 let kind = section.sh_type(endian);
                 let got = kind == elf::SHT_PROGBITS
                     && names
@@ -378,37 +490,56 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
                 if !metadata && !got {
                     continue;
                 }
-                // Exclude only proven file ranges. A malformed unrelated
-                // section must not suppress usable provider observations.
+                let address: u64 = section.sh_addr(endian).into();
+                // File ranges alone are insufficient: section and LOAD must
+                // agree on their virtual/file translation at every retained
+                // byte, and only actual p_filesz bytes can be structural.
                 if let Some((start, len)) = section.file_range(endian)
                     && let Some(end) = start.checked_add(len)
+                    && address.checked_add(len).is_some()
                     && start < end
                     && end <= data.len() as u64
+                    && let Some((_, metadata)) =
+                        by_bias.get_mut(&(i128::from(address) - i128::from(start)))
                 {
-                    ranges.push((start, end));
+                    metadata.push((start, end));
                 }
             }
-            (names.len() as u64, sections.len() as u64)
+            for (loads, metadata) in by_bias.values_mut() {
+                merge_raw_metadata_ranges(loads, &mut work_units);
+                merge_raw_metadata_ranges(metadata, &mut work_units);
+                intersect_raw_metadata_ranges(metadata, loads, &mut ranges, &mut work_units);
+            }
+            merge_raw_metadata_ranges(&mut loaded_file, &mut work_units);
+            // Headers remain structural even without a section table, but
+            // only their actually loaded bytes exclude a raw observation.
+            let mut headers = vec![(0, std::mem::size_of_val(elf.elf_header()) as u64)];
+            let phoff: u64 = elf.elf_header().e_phoff(endian).into();
+            let phbytes = std::mem::size_of_val(programs) as u64;
+            if let Some(end) = phoff.checked_add(phbytes)
+                && phoff < end
+                && end <= data.len() as u64
+            {
+                headers.push((phoff, end));
+            }
+            merge_raw_metadata_ranges(&mut headers, &mut work_units);
+            intersect_raw_metadata_ranges(&headers, &loaded_file, &mut ranges, &mut work_units);
+            merge_raw_metadata_ranges(&mut ranges, &mut work_units);
+            merge_raw_metadata_ranges(&mut zero_fill, &mut work_units);
+            ranges = subtract_raw_zero_fill_projections(ranges, &zero_fill, &mut work_units);
+            names.len() as u64
         }};
     }
-    let (names_bytes, work_units) = match &object {
+    let names_bytes = match &object {
         object::File::Elf32(elf) => collect!(elf),
         object::File::Elf64(elf) => collect!(elf),
         _ => unreachable!("classified ELF"),
     };
-    ranges.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in ranges {
-        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
     Ok(RawScanElfFacts {
         abi,
         exports: exports_matching_in_object(&object, wanted),
-        excluded_anchor_ranges: merged,
+        excluded_anchor_ranges: ranges,
+        // export_table_bytes already includes the ELF/program headers.
         structural_bytes: export_table_bytes(&object, data.len() as u64)
             .saturating_add(names_bytes)
             .min(data.len() as u64),

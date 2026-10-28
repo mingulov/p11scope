@@ -924,8 +924,177 @@ fn export_facts_refuse_an_empty_file_exactly_like_snapshot() {
 }
 
 #[test]
+fn raw_scan_metadata_clips_loaded_headers_at_the_exact_file_extent() {
+    let dir = tmp("elf-raw-metadata-loaded-headers");
+    let path = cc_so(
+        &dir,
+        "headers",
+        "unsigned long C_GetFunctionList(void **out) { *out = 0; return 0; }",
+    );
+    let original = std::fs::read(&path).unwrap();
+    let phoff = le_u64(&original, 32) as usize;
+    let phsize = usize::from(le_u16(&original, 54));
+    let phnum = usize::from(le_u16(&original, 56));
+    let first_load = (0..phnum)
+        .map(|index| phoff + index * phsize)
+        .find(|at| original[*at..*at + 4] == 1u32.to_le_bytes() && le_u64(&original, *at + 8) == 0)
+        .unwrap();
+    assert!(le_u64(&original, first_load + 32) >= (phoff + phsize * phnum) as u64);
+    let loaded = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&path).unwrap())
+        .unwrap()
+        .raw_scan_facts(&[])
+        .unwrap();
+    assert!(
+        loaded
+            .excluded_anchor_ranges
+            .iter()
+            .any(|(start, end)| { *start == 0 && *end >= (phoff + phsize * phnum) as u64 })
+    );
+
+    // Below/exactly at/above the ELF-header boundary: clipping includes
+    // the actual last byte, never a byte of the loader's zero-filled tail.
+    for filesz in [63u64, 64, 65] {
+        let mut bytes = original.clone();
+        bytes[first_load + 32..first_load + 40].copy_from_slice(&filesz.to_le_bytes());
+        let clipped = dir.join(format!("headers-{filesz}.so"));
+        std::fs::write(&clipped, bytes).unwrap();
+        let facts = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&clipped).unwrap())
+            .unwrap()
+            .raw_scan_facts(&[])
+            .unwrap();
+        assert_eq!(facts.excluded_anchor_ranges[0], (0, filesz));
+        assert!(
+            facts
+                .excluded_anchor_ranges
+                .iter()
+                .all(|(start, end)| filesz < *start || *end <= filesz)
+        );
+    }
+}
+
+#[test]
+fn raw_scan_metadata_does_not_exclude_the_loader_zero_fill_tail() {
+    use object::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
+
+    let dir = tmp("elf-raw-metadata-zero-fill");
+    let path = dir.join("provider.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&path)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../discover/tests/fixture/version_matrix.c"
+            ))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let table = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("t240"))
+        .unwrap()
+        .address();
+    let load = object
+        .segments()
+        .find(|segment| {
+            let (_, filesz) = segment.file_range();
+            segment.address() + filesz <= table
+                && table + 69 * 8 <= segment.address() + segment.size()
+                && table + 69 * 8 <= (segment.address() + filesz).next_multiple_of(4096)
+        })
+        .expect("actual PT_LOAD must contain this table in its last file page's zero-fill");
+    let (offset, filesz) = load.file_range();
+    let projection = offset + table - load.address();
+    assert!(projection >= offset + filesz);
+    let symtab = object.section_by_name(".symtab").unwrap();
+    let (symtab_start, symtab_len) = symtab.file_range().unwrap();
+    assert!(symtab_start <= projection && projection + 8 <= symtab_start + symtab_len);
+    assert_eq!(
+        symtab.address(),
+        0,
+        "symbol metadata is not runtime storage"
+    );
+    let file = p11scope_manifest::identity::open_object(&path).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&["C_GetFunctionList"])
+        .unwrap();
+    assert_eq!(
+        facts.exports.len(),
+        1,
+        "real own-export witness remains available"
+    );
+    assert!(
+        facts
+            .excluded_anchor_ranges
+            .iter()
+            .all(|(start, end)| projection + 8 <= *start || *end <= projection),
+        "unloaded metadata cannot suppress runtime BSS: {facts:?}"
+    );
+
+    // A second valid LOAD can really map those same file offsets as
+    // metadata at another VA. Global offset exclusions still cannot prove
+    // which interpretation a file-named BSS VMA's projection represents.
+    let mut aliased = bytes.clone();
+    let phoff = le_u64(&bytes, 32) as usize;
+    let phsize = usize::from(le_u16(&bytes, 54));
+    let phnum = usize::from(le_u16(&bytes, 56));
+    let spare = (0..phnum)
+        .map(|index| phoff + index * phsize)
+        .find(|at| bytes[*at..*at + 4] == elf::PT_GNU_STACK.to_le_bytes())
+        .unwrap();
+    let metadata_va = 0x20_0000 + (symtab_start & 4095);
+    aliased[spare..spare + 4].copy_from_slice(&elf::PT_LOAD.to_le_bytes());
+    aliased[spare + 4..spare + 8].copy_from_slice(&elf::PF_R.to_le_bytes());
+    for (field, value) in [
+        (8, symtab_start),
+        (16, metadata_va),
+        (24, metadata_va),
+        (32, symtab_len),
+        (40, symtab_len),
+        (48, 4096),
+    ] {
+        aliased[spare + field..spare + field + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let shoff = le_u64(&bytes, 40) as usize;
+    let shsize = usize::from(le_u16(&bytes, 58));
+    let symtab_header = shoff + symtab.index().0 * shsize;
+    aliased[symtab_header + 8..symtab_header + 16]
+        .copy_from_slice(&u64::from(elf::SHF_ALLOC).to_le_bytes());
+    aliased[symtab_header + 16..symtab_header + 24].copy_from_slice(&metadata_va.to_le_bytes());
+    let alias_object = object::File::parse(aliased.as_slice()).unwrap();
+    assert!(alias_object.segments().any(|segment| {
+        segment.address() == metadata_va && segment.file_range() == (symtab_start, symtab_len)
+    }));
+    let alias_path = dir.join("metadata-alias.so");
+    std::fs::write(&alias_path, &aliased).unwrap();
+    let alias = ElfSnapshot::read(&p11scope_manifest::identity::open_object(&alias_path).unwrap())
+        .unwrap()
+        .raw_scan_facts(&["C_GetFunctionList"])
+        .unwrap();
+    assert_eq!(alias.exports, facts.exports);
+    assert!(
+        alias
+            .excluded_anchor_ranges
+            .iter()
+            .all(|(start, end)| projection + 8 <= *start || *end <= projection),
+        "BSS/metadata alias is not suppression authority: {alias:?}"
+    );
+    assert!(
+        alias
+            .excluded_anchor_ranges
+            .iter()
+            .any(|(start, end)| *start == 0 && *end >= 64),
+        "unambiguous loaded headers remain structural"
+    );
+}
+
+#[test]
 fn raw_scan_metadata_ranges_preserve_data_tables_for_both_abis() {
-    use object::{Object as _, ObjectSection as _};
+    use object::{Object as _, ObjectSection as _, ObjectSegment as _};
     use p11scope_manifest::elf::read_raw_scan_facts_bounded;
 
     let dir = tmp("elf-raw-anchor-sections");
@@ -964,7 +1133,10 @@ int main(void) { return puts("metadata fixture"); }
             read_raw_scan_facts_bounded(&file, &["C_GetFunctionList"], bytes.len() as u64).unwrap();
         assert_eq!(facts.excluded_anchor_ranges, mapped.excluded_anchor_ranges);
         assert_eq!(facts.exports, mapped.exports);
-        assert_eq!(facts.work_units, object.sections().count() as u64 + 1);
+        assert!(
+            facts.work_units >= (object.sections().count() + 1 + object.segments().count()) as u64,
+            "section, LOAD indexing and clipping work must be charged"
+        );
         assert!(facts.structural_bytes <= bytes.len() as u64);
         assert!(read_raw_scan_facts_bounded(&file, &[], bytes.len() as u64 - 1).is_err());
         let overlaps = |start: u64, len: u64| {
@@ -1021,6 +1193,13 @@ int main(void) { return puts("metadata fixture"); }
         );
 
         // No section headers is uncertainty, not a blanket raw-source ban.
+        // Only the actually loaded ELF/program headers remain structural.
+        let headers_end = if bits == 64 {
+            le_u64(&bytes, 32) + u64::from(le_u16(&bytes, 54)) * u64::from(le_u16(&bytes, 56))
+        } else {
+            u64::from(u32::from_le_bytes(bytes[28..32].try_into().unwrap()))
+                + u64::from(le_u16(&bytes, 42)) * u64::from(le_u16(&bytes, 44))
+        };
         let mut no_sections = bytes;
         let fields = if bits == 64 {
             [(40, 8), (60, 2), (62, 2)]
@@ -1035,11 +1214,9 @@ int main(void) { return puts("metadata fixture"); }
         let bare =
             ElfSnapshot::read(&p11scope_manifest::identity::open_object(&bare_path).unwrap())
                 .unwrap();
-        assert!(
-            bare.raw_scan_facts(&[])
-                .unwrap()
-                .excluded_anchor_ranges
-                .is_empty()
+        assert_eq!(
+            bare.raw_scan_facts(&[]).unwrap().excluded_anchor_ranges,
+            vec![(0, headers_end)]
         );
     }
 }

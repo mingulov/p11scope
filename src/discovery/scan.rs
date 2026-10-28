@@ -7101,6 +7101,117 @@ mod tests {
     }
 
     #[test]
+    fn raw_metadata_preserves_a_real_elf_zero_fill_table_in_the_last_file_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&path)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/crates/discover/tests/fixture/version_matrix.c"
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let file = open_object(&path).unwrap();
+        let elf = ElfSnapshot::read(&file).unwrap();
+        let facts = elf.raw_scan_facts(&["C_GetFunctionList"]).unwrap();
+        let table_va = elf
+            .defined_symbol_virtual_address("t240", 69 * 8)
+            .unwrap()
+            .unwrap();
+        let getter_va = elf
+            .defined_symbol_virtual_address("C_GetFunctionList", 1)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let u16_at = |at| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        assert_eq!(&bytes[..5], b"\x7fELF\x02");
+        let phoff = u64_at(32) as usize;
+        let phsize = usize::from(u16_at(54));
+        assert_eq!(phsize, 56);
+        let metadata = file.metadata().unwrap();
+        let device = Device {
+            major: u64::from(libc::major(metadata.dev())),
+            minor: u64::from(libc::minor(metadata.dev())),
+        };
+        let object = ObjectKey {
+            device,
+            inode: metadata.ino(),
+        };
+        let bias = 0x100_0000u64;
+        let mut maps_text = String::new();
+        let mut zero_fill_last_page = false;
+        // Derive the mapping geometry from this ELF's actual PT_LOADs. A
+        // file-named last page contains loader-zeroed bytes after p_filesz;
+        // their VMA offset projection does not identify file content.
+        for i in 0..usize::from(u16_at(56)) {
+            let at = phoff + i * phsize;
+            if u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) != 1 {
+                continue;
+            }
+            let flags = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+            let offset = u64_at(at + 8);
+            let va = u64_at(at + 16);
+            let filesz = u64_at(at + 32);
+            let memsz = u64_at(at + 40);
+            let start = va & !4095;
+            let end = (va + filesz + 4095) & !4095;
+            if va + filesz <= table_va && table_va + 69 * 8 <= end {
+                assert!(table_va + 69 * 8 <= va + memsz);
+                zero_fill_last_page = true;
+            }
+            maps_text.push_str(&format!(
+                "{:x}-{:x} r{}{}p {:08x} {:x}:{:x} {} {}\n",
+                bias + start,
+                bias + end,
+                if flags & 2 != 0 { 'w' } else { '-' },
+                if flags & 1 != 0 { 'x' } else { '-' },
+                offset & !4095,
+                device.major,
+                device.minor,
+                object.inode,
+                path.display(),
+            ));
+        }
+        assert!(
+            zero_fill_last_page,
+            "fixture must exercise the real BSS tail"
+        );
+        let maps = parse_maps(maps_text.as_bytes()).unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 69 * 8];
+        snapshot[4 * 8..5 * 8].copy_from_slice(&(bias + getter_va).to_le_bytes());
+        let exports = ObjectExports {
+            object,
+            symbols: &facts.exports,
+        };
+        for (header, walk) in [(0x2802u64, "full"), (0xa5a5_0000_0000_e707, "known_prefix")] {
+            snapshot[..8].copy_from_slice(&header.to_le_bytes());
+            let (tables, skipped) = detect_tables_with_clock(
+                LinuxLayout::Lp64,
+                &snapshot,
+                bias + table_va,
+                &index,
+                &mut CaptureWorkBudget::default(),
+                Some(&exports),
+                &facts.excluded_anchor_ranges,
+                || Some(0),
+            );
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(tables.len(), 1, "zero-fill table is useful: {tables:?}");
+            assert_eq!(tables[0].walk, walk);
+            assert_eq!(tables[0].entries.len(), 1);
+            assert_eq!(tables[0].entries[0].name, "C_GetFunctionList");
+            assert_eq!(tables[0].null_entries.len(), 67);
+        }
+    }
+
+    #[test]
     fn strict_raw_metadata_header_does_not_admit_gnu_property_padding_and_arrays() {
         let maps = mislabelled_fixture_maps();
         let index = MapIndex::new(&maps).unwrap();

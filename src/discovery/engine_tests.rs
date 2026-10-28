@@ -37811,8 +37811,11 @@ fn probationary_constructor_refusal_does_not_run_a_deep_scan() {
     let children = e06_spawn_sleeps(1);
     let pid = children[0].pid();
     let executable = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let hint = directory.path().join("unmapped-provider.so");
+    std::fs::copy(executable, &hint).unwrap();
     let mut stopped = Engine::empty();
-    stopped.module_hints = vec![executable.clone()];
+    stopped.module_hints = vec![hint.clone()];
     stopped.budget.set_deadline(Some(0));
     let (proven_free, skipped) = stopped.probe_newcomer_provider_free(pid);
     eprintln!(
@@ -37833,7 +37836,7 @@ fn probationary_constructor_refusal_does_not_run_a_deep_scan() {
     // A separate fresh capture exercises the healthy side; the stopped
     // capture above never renews its sticky allowance.
     let mut healthy = Engine::empty();
-    healthy.module_hints = vec![executable];
+    healthy.module_hints = vec![hint];
     let (proven_free, skipped) = healthy.probe_newcomer_provider_free(pid);
     eprintln!(
         "R56 direct healthy probe: proven_free={proven_free}, scans={}, io={}, stop={:?}, skips={}",

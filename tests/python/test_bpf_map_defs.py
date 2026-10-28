@@ -877,6 +877,20 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             func(*args)
         return errors.getvalue()
 
+    def test_release_detailed_marker_absence_accepts(self):
+        maps = {name: value for name, value in checker.SAFE_MAPS.items()
+                if name != "JOURNAL_MARKER_CTL"}
+        self.quiet(checker.validate_inventory, "default", maps,
+                   checker.SAFE_PROGRAMS,
+                   self.detailed_symbols(missing=checker.REQUIRED_GLOBAL_MARKER_HELPERS))
+
+    def test_release_detailed_stale_marker_inventory_refused(self):
+        maps = dict(checker.SAFE_MAPS)
+        maps["JOURNAL_MARKER_CTL"] = checker.map_def(2, 4, 16, 1)
+        reason = self.refused(checker.validate_inventory, "default", maps,
+                              checker.SAFE_PROGRAMS, self.detailed_symbols())
+        self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
+
     def test_detailed_freeze_accepts_marker(self):
         """Healthy twin: the frozen Detailed inventory validates."""
         self.quiet(

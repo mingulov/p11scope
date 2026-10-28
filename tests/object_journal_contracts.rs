@@ -1433,6 +1433,21 @@ fn object_journal_object_ring_loss_gap_requires_settled_guard() {
 /// build produced them; every class present checks a nonzero
 /// object count, so the test cannot pass with an empty selection.
 #[test]
+fn object_journal_release_has_no_birth_marker_paths() {
+    let object = aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse release Detailed object");
+    assert!(
+        !object.maps.contains_key("JOURNAL_MARKER_CTL"),
+        "the release must not allocate the deferred birth-marker control map"
+    );
+    for name in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
+        assert!(
+            !object.functions.values().any(|function| function.name == name),
+            "the release must not retain a marker body, including a no-op stub: {name}"
+        );
+    }
+}
+
+#[test]
 fn object_journal_marker_wired_detailed_only() {
     const MARKER_MAP: &str = "JOURNAL_MARKER_CTL";
     const MARKER_GLOBALS: [&str; 2] = ["p11_instance_exec_birth", "p11_instance_scope_gap"];

@@ -2503,6 +2503,21 @@ mod tests {
     }
 
     #[test]
+    fn marker_control_release_off_absent_accepts() {
+        super::marker_control_verdict(false, super::StaticRoots::Detailed, None)
+            .expect("a release compiled without birth markers accepts their absence");
+    }
+
+    #[test]
+    fn marker_control_release_off_stale_present_refuses() {
+        let control = p11scope_ebpf_common::JournalAdmissionControl::default();
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control)).is_err(),
+            "an old marker-enabled object must not satisfy the marker-off release policy"
+        );
+    }
+
+    #[test]
     fn lto_config_predicate_matches_only_enabled_selections() {
         for enabled in [
             "CONFIG_LTO_CLANG=y\n",

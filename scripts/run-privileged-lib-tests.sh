@@ -380,6 +380,7 @@ attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
 attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins
 attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn
 discovery::engine::tests::lifecycle_manifest_helper_entrypoint
+discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance
 discovery::identity::tests::map_files_name_timing_per_thousand
 discovery::scan::tests::maps_reuse_timing_per_thousand_reads
 discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path
@@ -478,6 +479,7 @@ SKIP_REASONS=(
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"
 "needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand"
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
+"private count-manifest cache helper invoked only by count_manifest_full_and_tail_share_the_scan_inspection_cache with P11SCOPE_COUNT_MANIFEST_FULL/P11SCOPE_COUNT_MANIFEST_TAIL; the ordinary parent builds and validates its inputs, not an independent live cell"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"

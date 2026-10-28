@@ -1238,7 +1238,12 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
 fn object_journal_marker_drop_arms_call_the_gap() {
     const GAP: &str = "p11_instance_scope_gap();";
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
-    let lines: Vec<&str> = source.lines().collect();
+    // The release selector is checked independently for every marker call.
+    // Keep the original local-arm bound after omitting only that selector.
+    let lines: Vec<&str> = source
+        .lines()
+        .filter(|line| line.trim() != "#[cfg(p11scope_birth_marker)]")
+        .collect();
     let entry_at = lines
         .iter()
         .position(|line| line.starts_with("fn p11_entry_impl"))

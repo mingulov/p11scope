@@ -298,6 +298,29 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("privileged, feature-owner and integration "
                       "curation verified", result.stdout)
 
+    def test_count_manifest_cache_helper_is_only_run_by_its_parent(self):
+        name = ("discovery::identity::tests::"
+                "count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance")
+        parent = "count_manifest_full_and_tail_share_the_scan_inspection_cache"
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        self.assertIn(name, lists["SKIP_TESTS"])
+        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS"):
+            self.assertNotIn(name, lists[group])
+        names = runner_array_lines(RUNNER, "SKIP_TESTS")
+        reason = runner_array_lines(RUNNER, "SKIP_REASONS")[names.index(name)]
+        self.assertIn(parent, reason)
+        for variable in ("P11SCOPE_COUNT_MANIFEST_FULL", "P11SCOPE_COUNT_MANIFEST_TAIL"):
+            self.assertIn(variable, reason)
+        entries = json.loads(INVENTORY.read_text())["sites"]
+        entry = next(entry for entry in entries if entry["path"] == name)
+        self.assertEqual(entry["cell"], "helper")
+        self.assertIn(parent, entry["reason"])
+        source = (ROOT / "src/discovery/inventory_coordinator.rs").read_text()
+        self.assertIn("fn " + parent + "()", source)
+        self.assertIn('.args(["' + name + '", "--exact", "--ignored", "--nocapture"])', source)
+        for variable in ("P11SCOPE_COUNT_MANIFEST_FULL", "P11SCOPE_COUNT_MANIFEST_TAIL"):
+            self.assertIn('.env("' + variable + '",', source)
+
     def test_an_extra_ignored_test_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -623,7 +646,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "DEFAULT_TESTS=112",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "SKIP_TESTS=76",
+            "SKIP_TESTS=77",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

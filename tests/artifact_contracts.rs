@@ -10250,6 +10250,81 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             &["scripts/run-flake-quarantine.sh"],
         ),
     ];
+    fn manual_job_reference_admitted(
+        job: &str,
+        line: &str,
+        script: &str,
+        lanes: &[&str],
+        dependency_helpers: &[&str],
+    ) -> bool {
+        // Schema validation reads these two pinned assignments; it does not
+        // execute the Knative lane or add it to the job's runnable lane set.
+        let read_only_pin = job == "release-preview"
+            && script == "scripts/knative-e2e.sh"
+            && matches!(
+                line,
+                "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)"
+                    | "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)"
+            );
+        dependency_helpers.contains(&script) || lanes.contains(&script) || read_only_pin
+    }
+    let preview_lanes = manual_jobs
+        .iter()
+        .find(|(job, _, _)| *job == "release-preview")
+        .unwrap()
+        .2;
+    for line in [
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)",
+    ] {
+        assert!(manual_job_reference_admitted(
+            "release-preview",
+            line,
+            "scripts/knative-e2e.sh",
+            preview_lanes,
+            &dependency_helpers,
+        ));
+        for job in ["checks", "privileged-e2e", "quarantine"] {
+            assert!(
+                !manual_job_reference_admitted(
+                    job,
+                    line,
+                    "scripts/knative-e2e.sh",
+                    preview_lanes,
+                    &dependency_helpers,
+                ),
+                "read-only pin extraction is not admitted in {job}"
+            );
+        }
+    }
+    for line in [
+        "scripts/knative-e2e.sh",
+        "run: scripts/knative-e2e.sh",
+        "bash scripts/knative-e2e.sh",
+        "source scripts/knative-e2e.sh",
+        ". scripts/knative-e2e.sh",
+        "version=$(scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh) && true",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh); scripts/knative-e2e.sh",
+        "digest=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh); bash scripts/knative-e2e.sh",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' ./scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/other.sh)",
+        "version=$(sed -n 's/^CRDS_SHA256=//p' scripts/knative-e2e.sh)",
+        "digest=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/KNATIVE_VERSION=//p' scripts/knative-e2e.sh)",
+        "version=$(sed -n 's/^KNATIVE_VERSION=//p' scripts/knative-e2e.sh --run)",
+    ] {
+        assert!(
+            !manual_job_reference_admitted(
+                "release-preview",
+                line,
+                "scripts/knative-e2e.sh",
+                preview_lanes,
+                &dependency_helpers,
+            ),
+            "unreviewed Knative reference {line:?}"
+        );
+    }
     let mut outside = ci.replacen(checks, "", 1);
     for (job, gate, lanes) in manual_jobs {
         let block = block_under(&ci, &format!("  {job}:"));
@@ -10266,9 +10341,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 continue;
             }
             for script in named_scripts(line) {
-                let dependency_only = dependency_helpers.contains(&script.as_str());
                 assert!(
-                    dependency_only || lanes.contains(&script.as_str()),
+                    manual_job_reference_admitted(job, line, &script, lanes, &dependency_helpers),
                     "{job} names {script}, outside its documented lane set {lanes:?}: teach the \
                      table about it first",
                 );

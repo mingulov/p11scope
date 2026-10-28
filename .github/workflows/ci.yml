@@ -123,7 +123,7 @@ jobs:
           done
   # Static gates: formatting, compilation (gnu plus the shipped musl and
   # P0 configurations), both clippy profiles, the diagnostic-object
-  # inventory test and script lints.
+  # inventory test, feature host-admission regressions and script lints.
   lint:
     needs: dedupe
     if: needs.dedupe.outputs.run == 'true'
@@ -209,6 +209,55 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
+      - name: Run feature host-admission regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          mkdir -m 700 "$RUNNER_TEMP/feature-regression-tmp"
+          export TMPDIR="$RUNNER_TEMP/feature-regression-tmp"
+          selectors=(
+            run::tests::refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery
+            run::tests::refused_multi_host_precedes_owned_workload_and_output
+            run::tests::counter_capture_and_run_require_host_after_build_policy_validation
+            inventory::tests::refused_multi_host_precedes_inventory_sinks_and_auto_fallback
+            inventory::tests::typed_multi_host_refusal_never_becomes_native_auto_scan_success
+            attach::tests::empty_live_session_requires_host_admission_for_every_backend
+            doctor::tests::object_capture_check_matches_build
+            doctor::tests::object_capture_check_fails_on_flavor_mismatch
+            doctor::tests::object_capture_check_fails_on_unsafe_flavor_mismatch
+          )
+          feature_regression_status=0
+          for features in stub-object-attributes unsafe-unvalidated-metadata stub-object-attributes,unsafe-unvalidated-metadata; do
+            config_status=0
+            log="$RUNNER_TEMP/feature-host-${features//,/+}.log"
+            if cargo +"$(cat .release-rust-version)" test --locked --offline -p p11scope --lib \
+              --no-default-features --features "$features" -- \
+              --exact --test-threads=1 --color never "${selectors[@]}" 2>&1 | tee "$log"; then
+              :
+            else
+              config_status=1
+            fi
+            # Check the final outer summary and every unique named positive:
+            # zero matches, ignored tests or a nested summary cannot pass.
+            summary=$(grep '^test result:' "$log" | tail -n 1 || true)
+            if [[ "$summary" != "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; "* ]]; then
+              printf 'feature regressions %s: expected 9 passed, 0 failed, 0 ignored; got %s\n' "$features" "$summary" >&2
+              config_status=1
+            fi
+            for selector in "${selectors[@]}"; do
+              count=$(grep -Fxc -- "test $selector ... ok" "$log" || true)
+              if [[ "$count" != 1 ]]; then
+                printf 'feature regressions %s: expected one passing %s, got %s\n' "$features" "$selector" "$count" >&2
+                config_status=1
+              fi
+            done
+            printf 'feature regressions %s: status=%s\n' "$features" "$config_status"
+            if [[ "$config_status" != 0 ]]; then
+              feature_regression_status=1
+            fi
+          done
+          exit "$feature_regression_status"
       - run: pipx install ruff==0.16.8
       # SYSPLAN residual gates. None names a lane body: the lint step
       # addresses directories through a shell variable, never a scripts/

@@ -9,12 +9,18 @@ ring-reader/map-relocation patches ran untested in CI. These tests pin
 the three-way agreement — recipe revision, `[patch.crates-io]`, and
 every standalone fetch/test manifest path in ci.yml — plus the
 retained root-workspace compilation and recipe-hash verification.
+The lint job's focused feature tests also prove actual, nonzero host-admission
+selection in P0 and unsafe builds, with every configuration's failure retained.
 
 Run: python3 -I tests/python/test_ci_dependency_selection.py -v
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,11 +51,10 @@ def patch_paths():
     )
 
 
-def checks_job_steps():
-    """The tests job's steps (the standalone vendored-dependency fetch and
-    test steps run there), each as its list of raw lines."""
+def checks_job_steps(job="tests"):
+    """One job's steps, each as its list of raw lines."""
     lines = CI_YML.read_text(encoding="utf-8").splitlines()
-    start = lines.index("  tests:") + 1
+    start = lines.index(f"  {job}:") + 1
     steps = []
     for line in lines[start:]:
         if line.strip() and not line.startswith("    ") \
@@ -157,6 +162,129 @@ class DependencySelectionTests(unittest.TestCase):
             ci,
         )
         self.assertIn("scripts/check-prepared-dependencies.py", ci)
+
+
+class FeatureRegressionExecutionTests(unittest.TestCase):
+    FEATURES = (
+        "stub-object-attributes",
+        "unsafe-unvalidated-metadata",
+        "stub-object-attributes,unsafe-unvalidated-metadata",
+    )
+    SELECTORS = (
+        "run::tests::refused_multi_host_precedes_capture_sinks_and_empty_provider_discovery",
+        "run::tests::refused_multi_host_precedes_owned_workload_and_output",
+        "run::tests::counter_capture_and_run_require_host_after_build_policy_validation",
+        "inventory::tests::refused_multi_host_precedes_inventory_sinks_and_auto_fallback",
+        "inventory::tests::typed_multi_host_refusal_never_becomes_native_auto_scan_success",
+        "attach::tests::empty_live_session_requires_host_admission_for_every_backend",
+        "doctor::tests::object_capture_check_matches_build",
+        "doctor::tests::object_capture_check_fails_on_flavor_mismatch",
+        "doctor::tests::object_capture_check_fails_on_unsafe_flavor_mismatch",
+    )
+
+    def run_gate(self, scenario="healthy", failing_features=None):
+        steps = [
+            step for step in checks_job_steps("lint")
+            if step[0] == "      - name: Run feature host-admission regressions"
+        ]
+        self.assertEqual(len(steps), 1, "the lint job must execute feature tests")
+        step = steps[0]
+        self.assertIn("        shell: bash", step)
+        body_at = step.index("        run: |") + 1
+        body = "\n".join(line[10:] for line in step[body_at:])
+        with tempfile.TemporaryDirectory(prefix="ci-feature-", dir="/var/tmp") as raw:
+            work = Path(raw)
+            fake_bin = work / "bin"
+            fake_bin.mkdir()
+            cargo = fake_bin / "cargo"
+            cargo.write_text(f"#!{sys.executable}\n" + '''\
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+features = args[args.index("--features") + 1]
+with open(os.environ["FAKE_CARGO_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+selectors = json.loads(os.environ["FAKE_SELECTORS"])
+scenario = os.environ["FAKE_SCENARIO"] if features == os.environ["FAKE_FEATURES"] else "healthy"
+if scenario == "zero":
+    selectors = []
+elif scenario == "ignored":
+    selectors = selectors[:-1]
+elif scenario == "wrong-name":
+    selectors[0] = "unrelated::test"
+elif scenario == "missing-name":
+    selectors = selectors[:-1]
+elif scenario == "duplicate-name":
+    selectors.append(selectors[0])
+for selector in selectors:
+    print(f"test {selector} ... ok")
+if scenario == "zero":
+    print("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s")
+elif scenario == "ignored":
+    print("test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s")
+else:
+    print("test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 6000 filtered out; finished in 0.01s")
+    if scenario == "nested-zero":
+        print("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s")
+    elif scenario == "nested-failure":
+        print("test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
+sys.exit(101 if scenario == "cargo-failure" else 0)
+''', encoding="utf-8")
+            cargo.chmod(0o700)
+            log = work / "cargo.jsonl"
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "RUNNER_TEMP": str(work),
+                "FAKE_CARGO_LOG": str(log),
+                "FAKE_SELECTORS": json.dumps(self.SELECTORS),
+                "FAKE_SCENARIO": scenario,
+                "FAKE_FEATURES": failing_features or self.FEATURES[0],
+            })
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", body],
+                cwd=ROOT, env=env, text=True, capture_output=True, check=False,
+            )
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(calls), 3, result.stdout + result.stderr)
+        for args, features in zip(calls, self.FEATURES, strict=True):
+            self.assertEqual(args, [
+                f"+{(ROOT / '.release-rust-version').read_text().strip()}",
+                "test", "--locked", "--offline", "-p", "p11scope", "--lib",
+                "--no-default-features", "--features", features, "--",
+                "--exact", "--test-threads=1", "--color", "never", *self.SELECTORS,
+            ])
+        return result
+
+    def test_all_three_feature_configurations_run_the_exact_nine_tests(self):
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_any_cargo_failure_survives_tee_and_later_successes(self):
+        for features in self.FEATURES:
+            with self.subTest(features=features):
+                result = self.run_gate("cargo-failure", features)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_zero_or_ignored_selection_fails_without_hiding_other_configurations(self):
+        for scenario in ("zero", "ignored"):
+            with self.subTest(scenario=scenario):
+                result = self.run_gate(scenario)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_count_cannot_replace_the_nine_unique_named_positives(self):
+        for scenario in ("wrong-name", "missing-name", "duplicate-name"):
+            with self.subTest(scenario=scenario):
+                result = self.run_gate(scenario)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_nested_success_cannot_hide_the_outer_zero_or_failed_summary(self):
+        for scenario in ("nested-zero", "nested-failure"):
+            with self.subTest(scenario=scenario):
+                result = self.run_gate(scenario)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

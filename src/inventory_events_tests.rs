@@ -360,6 +360,254 @@ fn cumulative_eviction_totals_count_each_deleted_line_once() {
     }
 }
 
+fn assert_final_stream_accounting(writer: &EventWriter, dir: &Path) -> serde_json::Value {
+    let records = read_stream(dir, "events.jsonl");
+    let emitted = records
+        .iter()
+        .map(|(_, row)| row["seq"].as_u64().unwrap())
+        .max()
+        .unwrap()
+        + 1;
+    let (covered_events, covered_bytes) = records
+        .iter()
+        .filter(|(_, row)| row["kind"] == "retention_evicted")
+        .fold((0, 0), |(events, bytes), (_, row)| {
+            let event = &row["event"];
+            (
+                events
+                    + event["evicted_events"].as_u64().unwrap()
+                    + event["covered_events"].as_u64().unwrap(),
+                bytes
+                    + event["evicted_bytes"].as_u64().unwrap()
+                    + event["covered_bytes"].as_u64().unwrap(),
+            )
+        });
+    assert_eq!(records.len() as u64 + covered_events, emitted);
+    assert_eq!(writer.evicted_events(), covered_events);
+    assert_eq!(writer.evicted_bytes(), covered_bytes);
+    let ended: Vec<_> = records
+        .iter()
+        .filter(|(_, row)| row["kind"] == "ended")
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].1["event"]["stream"],
+        serde_json::json!({
+            "rotations": writer.rotations(),
+            "evicted_events": covered_events,
+            "evicted_bytes": covered_bytes,
+        }),
+        "ended.stream must include the rotation and deletion caused by ended itself"
+    );
+    let live = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(live.lines().last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "ended");
+    ended[0].1["event"].clone()
+}
+
+#[test]
+fn ended_stream_accounts_for_its_own_rotation_and_retention() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    for max_files in [1, 2, 3] {
+        for (max_bytes, final_rotation) in [(1024, true), (8192, false), (8192, true)] {
+            let dir = private_tempdir();
+            let path = dir.path().join("events.jsonl");
+            let mut writer = EventWriter::create(&path, max_bytes, max_files).unwrap();
+            for i in 0..512 {
+                if writer.rotations() == 9 {
+                    break;
+                }
+                writer
+                    .append(
+                        "tick",
+                        serde_json::json!({"i": i, "pad": "p".repeat(500)}),
+                        1,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                writer.rotations(),
+                9,
+                "the final rotation crosses a digit boundary"
+            );
+            let payload = ended_payload(&presentation, 2, &writer);
+            if final_rotation {
+                for i in 0..256 {
+                    if writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes {
+                        break;
+                    }
+                    writer
+                        .append("padding", serde_json::json!({"i": i}), 1)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes,
+                final_rotation
+            );
+            assert_eq!(
+                writer.rotations(),
+                9,
+                "padding did not cause a separate rotation"
+            );
+            writer.finish(payload, 2).unwrap();
+            assert_eq!(
+                writer.rotations(),
+                9 + u64::from(final_rotation),
+                "an oversized footer still causes at most one append rotation"
+            );
+            assert_final_stream_accounting(&writer, dir.path());
+            assert!(std::fs::read_dir(dir.path()).unwrap().count() <= max_files);
+        }
+    }
+}
+
+#[test]
+fn ended_stream_on_an_empty_file_does_not_rotate_even_when_oversized() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let mut writer = EventWriter::create(&dir.path().join("events.jsonl"), 1, 1).unwrap();
+    writer
+        .finish(ended_payload(&presentation, 2, &writer), 2)
+        .unwrap();
+    assert_eq!(writer.rotations(), 0);
+    assert_final_stream_accounting(&writer, dir.path());
+}
+
+#[test]
+fn ended_normalizes_stream_totals_before_deciding_whether_to_rotate() {
+    let harness = refused_harness();
+    let (presentation, _) = presentation_for(&harness);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let max_bytes = 8192;
+    let mut writer = EventWriter::create(&path, max_bytes, 1).unwrap();
+    writer.append("tick", serde_json::json!({}), 1).unwrap();
+    let mut payload = ended_payload(&presentation, 2, &writer);
+    payload["padding"] = "".into();
+    let padding = max_bytes - writer.live_bytes() - writer.line_len("ended", &payload, 2);
+    payload["padding"] = "p".repeat(padding as usize).into();
+    assert_eq!(
+        writer.live_bytes() + writer.line_len("ended", &payload, 2),
+        max_bytes
+    );
+    payload["stream"] = serde_json::json!({
+        "rotations": u64::MAX,
+        "evicted_events": u64::MAX,
+        "evicted_bytes": u64::MAX,
+    });
+    assert!(writer.live_bytes() + writer.line_len("ended", &payload, 2) > max_bytes);
+    writer.finish(payload, 2).unwrap();
+    assert_eq!(
+        writer.rotations(),
+        0,
+        "stale footer totals must not force a rotation"
+    );
+    assert_final_stream_accounting(&writer, dir.path());
+}
+
+#[test]
+fn ended_settlements_include_stream_digit_growth_in_the_written_payload() {
+    let mut harness = limited(4);
+    harness.commit();
+    let (presentation, _) = presentation_for(&harness);
+    assert!(presentation.edges.is_empty());
+    for combined in [false, true] {
+        for next_seq in [9, 99] {
+            let dir = private_tempdir();
+            let path = dir.path().join("events.jsonl");
+            let max_bytes = 32 * 1024;
+            let mut writer = EventWriter::create(&path, max_bytes, 1).unwrap();
+            for i in 0..next_seq {
+                writer
+                    .append("tick", serde_json::json!({"i": i}), 1)
+                    .unwrap();
+            }
+            assert_eq!(writer.next_seq, next_seq);
+            assert_eq!(writer.rotations(), 0);
+            let mut base = ended_payload(&presentation, 2, &writer);
+            for key in [
+                "edges_unretained",
+                "instances_unretained",
+                "semantic_edges_unretained",
+                "key_operations_unretained",
+            ] {
+                base[key] = 0.into();
+            }
+            base["padding"] = "".into();
+            let unpadded = writer.line_len("ended", &base, 2);
+            let padding = max_bytes - writer.live_bytes() - unpadded + 1;
+            base["padding"] = "e".repeat(padding as usize).into();
+            assert_eq!(
+                writer.live_bytes() + writer.line_len("ended", &base, 2),
+                max_bytes + 1
+            );
+            let build = |counts: (usize, usize, usize, usize)| {
+                let mut payload = base.clone();
+                payload["edges_unretained"] = counts.0.into();
+                payload["instances_unretained"] = counts.1.into();
+                payload["semantic_edges_unretained"] = counts.2.into();
+                payload["key_operations_unretained"] = counts.3.into();
+                payload
+            };
+            let edges = EdgeEmitter::new();
+            let payload = if combined {
+                let (counts, payload) = settle_ended_combined(
+                    &edges,
+                    &InstanceEmitter::new(),
+                    &KeyOperationEmitter::new(),
+                    &writer,
+                    &presentation,
+                    &presentation.object_observations,
+                    (usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+                    2,
+                    build,
+                );
+                assert_eq!(counts, (0, 0, 0, 0));
+                payload
+            } else {
+                let (count, payload) = edges
+                    .settle_ended(&writer, &[], usize::MAX, 2, |count| build((count, 0, 0, 0)));
+                assert_eq!(count, 0);
+                payload
+            };
+            let settled_len = writer.line_len("ended", &payload, 2);
+            writer.finish(payload.clone(), 2).unwrap();
+            assert_eq!(writer.rotations(), 1);
+            assert_eq!(writer.evicted_events(), next_seq);
+            let actual = assert_final_stream_accounting(&writer, dir.path());
+            assert_eq!(
+                payload, actual,
+                "finish must write the exact settled payload"
+            );
+            let live = std::fs::read_to_string(path).unwrap();
+            let last = live.lines().last().unwrap();
+            assert_eq!(last.len() as u64 + 1, settled_len);
+            let ended: serde_json::Value = serde_json::from_str(last).unwrap();
+            assert_eq!(
+                ended["seq"], next_seq,
+                "existing triggering-line sequence is preserved"
+            );
+        }
+    }
+}
+
+#[test]
+fn synthetic_ended_payload_without_stream_keeps_its_shape() {
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1024, 1).unwrap();
+    writer.append("tick", serde_json::json!({}), 1).unwrap();
+    let payload = serde_json::json!({"edges_unretained": 1, "pad": "x".repeat(2048)});
+    writer.finish(payload.clone(), 2).unwrap();
+    assert_eq!(writer.rotations(), 1);
+    let live = std::fs::read_to_string(path).unwrap();
+    let ended: serde_json::Value = serde_json::from_str(live.lines().last().unwrap()).unwrap();
+    assert_eq!(ended["event"], payload);
+}
+
 #[test]
 fn stream_privacy_bounds_match_snapshots_exactly() {
     let harness = refused_harness();

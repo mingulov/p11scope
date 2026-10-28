@@ -279,6 +279,7 @@ impl EventWriter {
 
     /// Write the terminal `ended` event, flush, and sync the live file.
     pub(crate) fn finish(&mut self, payload: serde_json::Value, at_ns: u64) -> Result<(), String> {
+        let payload = self.project_ended_payload(payload, at_ns);
         self.append("ended", payload, at_ns)?;
         #[cfg(test)]
         if let Some(fault) = &self.fault
@@ -292,6 +293,55 @@ impl EventWriter {
                 self.path.display()
             )
         })
+    }
+
+    /// Account for the one rotation an `ended` append can cause, without
+    /// changing writer state. Start from current totals so an already
+    /// projected payload cannot force a rotation that its real totals avoid.
+    /// Synthetic terminal payloads without a stream object retain their shape.
+    fn project_ended_payload(
+        &self,
+        mut payload: serde_json::Value,
+        at_ns: u64,
+    ) -> serde_json::Value {
+        if !payload
+            .get("stream")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            return payload;
+        }
+        let mut rotations = self.rotations;
+        let mut evicted_events = self.evicted_events;
+        let mut evicted_bytes = self.evicted_bytes;
+        for (field, value) in [
+            ("rotations", rotations),
+            ("evicted_events", evicted_events),
+            ("evicted_bytes", evicted_bytes),
+        ] {
+            payload["stream"][field] = value.into();
+        }
+        let incoming = self.line_len("ended", &payload, at_ns);
+        if self.events_in_file > 0 && self.current_bytes.saturating_add(incoming) > self.max_bytes {
+            rotations = rotations.saturating_add(1);
+            if self.retained.len().saturating_add(1) >= self.max_files {
+                let (events, bytes) = self
+                    .retained
+                    .front()
+                    .map_or((self.events_in_file, self.current_bytes), |oldest| {
+                        (oldest.events, oldest.bytes)
+                    });
+                evicted_events = evicted_events.saturating_add(events);
+                evicted_bytes = evicted_bytes.saturating_add(bytes);
+            }
+            for (field, value) in [
+                ("rotations", rotations),
+                ("evicted_events", evicted_events),
+                ("evicted_bytes", evicted_bytes),
+            ] {
+                payload["stream"][field] = value.into();
+            }
+        }
+        payload
     }
 
     /// Rotation + retention state for tests and the `ended` payload.
@@ -1296,7 +1346,7 @@ impl EdgeEmitter {
     ) -> (usize, serde_json::Value) {
         let mut count = estimate;
         for _ in 0..=edges.len() + 1 {
-            let payload = ended(count);
+            let payload = writer.project_ended_payload(ended(count), at_ns);
             let exact =
                 self.unretained_after(writer, edges, writer.line_len("ended", &payload, at_ns));
             if exact == count {
@@ -2217,7 +2267,7 @@ pub(crate) fn settle_ended_combined(
         .saturating_add(key_rows)
         .saturating_add(1);
     for _ in 0..=bound {
-        let payload = ended(counts);
+        let payload = writer.project_ended_payload(ended(counts), at_ns);
         let incoming = writer.line_len("ended", &payload, at_ns);
         let exact = (
             edges.unretained_after(writer, &presentation.edges, incoming),

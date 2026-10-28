@@ -50,7 +50,8 @@ def hook_contract(main, identity):
              '    if cleanup == 1 {\n'
              '        unsafe { p11_object_fault() };\n'
              '    }')
-    gap = ('#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
+    gap = ('#[cfg(p11scope_birth_marker)]\n'
+           '    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
            '    if cleanup == OWNER_CLEANUP_ABANDONED_START {\n'
            '        unsafe {\n'
            '            p11_instance_scope_gap();\n'
@@ -135,7 +136,8 @@ class RootAffiliationTests(unittest.TestCase):
         root_end = exit_body.index('};', root_start) + 2
         root_block = exit_body[root_start:root_end]
         owner = "unsafe { p11_owner_cleanup() };"
-        gap_block = ('#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
+        gap_block = ('#[cfg(p11scope_birth_marker)]\n'
+                     '    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n'
                      '    if cleanup == OWNER_CLEANUP_ABANDONED_START {\n'
                      '        unsafe {\n'
                      '            p11_instance_scope_gap();\n'
@@ -160,6 +162,11 @@ class RootAffiliationTests(unittest.TestCase):
             leader_hoisted,
             exit_body.replace(gap_block, gap_block + "\n    return 0;", 1),
             exit_body.replace(gap_block, gap_block.split("\n", 1)[1], 1),
+            exit_body.replace(gap_block, gap_block.replace(
+                '    #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]\n',
+                '', 1), 1),
+            exit_body.replace(gap_block, gap_block.replace(
+                '#[cfg(p11scope_birth_marker)]', '#[cfg(any())]', 1), 1),
             exit_body.replace(root_block, "if false { " + root_block + " }"),
             exit_body.replace(owner, "if false { " + owner, 1)
                      .replace(root_block, root_block + " }", 1),
@@ -199,6 +206,7 @@ class RootAffiliationTests(unittest.TestCase):
                  "        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);\n"
                  "        // H8-D birth marker: an identity-mismatched return loses the\n"
                  "        // completion, so it gaps here in place at depth 3.\n"
+                 "        #[cfg(p11scope_birth_marker)]\n"
                  "        #[cfg(not(feature = \"counter-broad\"))]\n"
                  "        unsafe {\n"
                  "            p11_instance_scope_gap();\n"

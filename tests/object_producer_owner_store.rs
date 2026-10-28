@@ -552,7 +552,7 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
             let fault_open = "#[cfg(not(feature = \"inventory-only\"))]\n    if cleanup == 1 {";
             let fault_at = read_end + text[read_end..].find(fault_open)?;
             let fault_end = fault_at + text[fault_at..].find("\n    }\n")? + "\n    }".len();
-            let gap_open = "#[cfg(not(any(feature = \"inventory-only\", feature = \"counter-broad\")))]\n    if cleanup == OWNER_CLEANUP_ABANDONED_START {";
+            let gap_open = "#[cfg(p11scope_birth_marker)]\n    #[cfg(not(any(feature = \"inventory-only\", feature = \"counter-broad\")))]\n    if cleanup == OWNER_CLEANUP_ABANDONED_START {";
             let gap_at = fault_end + text[fault_end..].find(gap_open)?;
             let gap_end = gap_at + text[gap_at..].find("\n    }\n")? + "\n    }".len();
             let inventory_block =
@@ -607,6 +607,14 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
             contiguous(&holed).is_none(),
             "early-return mutant must be caught by the contiguity rule"
         );
+        for replacement in ["", "#[cfg(any())]"] {
+            let altered = body.replacen("#[cfg(p11scope_birth_marker)]", replacement, 1);
+            assert_ne!(altered, body, "marker selector mutant must change the body");
+            assert!(
+                contiguous(&altered).is_none(),
+                "the exact marker selector must remain part of the contiguous gap arm"
+            );
+        }
     }
 }
 

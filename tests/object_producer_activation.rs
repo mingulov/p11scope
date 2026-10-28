@@ -2700,6 +2700,8 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// Re-baselined for getter-ABI acquisition bounds, verifier-visible index
 /// guards without panic subprograms, and ordinary-base preservation on a
 /// refused object join: 123958 B, measured with the unchanged lexer.
+/// Re-baselined for the shared birth-marker compile selector and forbidden
+/// counter/inventory combination: 124730 B, measured with that same lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2709,8 +2711,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            123958,
-            "53f8218b0827374f5178d89d5547e0c993654ad43ce939c96cb042f07e2e23a9"
+            124730,
+            "014e51a833f5d651a836a252c9bda9a940f14ebede3f01335aa944630a8e74c3"
         ),
         "stripped BPF dump must stay byte-identical"
     );

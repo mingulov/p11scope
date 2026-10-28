@@ -1522,6 +1522,7 @@ impl RootSeed {
 /// use p11scope::attach::OwnedPauseGeneration;
 /// ```
 pub struct Session {
+    return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     /// Mmap of the STOP_GATE cell. Declared first so the mapping unmaps
     /// before the map FDs owned by `ebpf` close.
     stop_gate: StopGate,
@@ -5960,6 +5961,11 @@ fn read_pid_health_with(
 }
 
 impl Session {
+    fn require_return_probe_admission(&mut self) -> Result<()> {
+        crate::uretprobe_hazard::ensure_admission(&mut self.return_probe_admission)
+            .map_err(crate::uretprobe_hazard::refusal_error)
+    }
+
     #[cfg(feature = "h6-reexec-diagnostic")]
     pub(crate) fn reexec_diagnostic(&self) -> Option<reexec_diagnostic::Diagnostic> {
         self.reexec_diagnostic.clone()
@@ -6077,13 +6083,13 @@ impl Session {
             None,
             None,
             require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
         )
     }
 
-    /// Counter capture start: the Engine's route for
-    /// `CapturePolicy::Counter`. Identical to `start` except for the
-    /// counter spec, so the FD raise and backend selection cover counter
-    /// sessions with no parallel constructor.
+    /// Direct counter start with default return-probe admission. The Engine
+    /// shares `start_for_capture` so it can retain its CLI admission.
+    #[allow(dead_code)] // Retain the direct constructor; Engine uses start_for_capture.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_counter(
         plan: &AttachPlan,
@@ -6108,6 +6114,41 @@ impl Session {
             None,
             Some(counter),
             require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
+        )
+    }
+
+    /// The Engine passes only the authority already warned and recorded by
+    /// its CLI preflight. Other factories continue to request default safety.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_for_capture(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        counter: Option<&counter_banks::CounterSpec>,
+        admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
+    ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+            counter,
+            require_multi_capable_host(),
+            || match admission {
+                Some(admission) => Ok(admission),
+                None => crate::uretprobe_hazard::admit(None, false),
+            },
         )
     }
 
@@ -6124,9 +6165,14 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
         host: MultiHostVerdict,
+        admission: impl FnOnce() -> std::result::Result<
+            crate::uretprobe_hazard::ReturnProbeAdmission,
+            crate::uretprobe_hazard::Action,
+        >,
     ) -> Result<Self> {
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let _host = host?;
+        let admission = admission().map_err(crate::uretprobe_hazard::refusal_error)?;
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
@@ -6148,6 +6194,7 @@ impl Session {
             backend,
             selected,
             counter,
+            &admission,
         ) {
             Ok(session) => Ok((session, fallback)),
             Err(error)
@@ -6177,6 +6224,7 @@ impl Session {
                     AttachBackend::Singles,
                     selected,
                     counter,
+                    &admission,
                 )
                 .map(|session| (session, Some(reason)))
             }
@@ -6283,6 +6331,7 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        admission: &crate::uretprobe_hazard::ReturnProbeAdmission,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -6306,6 +6355,7 @@ impl Session {
                 unsupported_environment_context(error)
             }
         })?;
+        session.return_probe_admission = Some(admission.clone());
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
             crate::first_use_probe::DiscoveryStage::LifecycleActive,
@@ -6728,6 +6778,7 @@ impl Session {
 
         Ok((
             Self {
+                return_probe_admission: None,
                 stop_gate: stop_gate.expect("preparation established the stop gate"),
                 native_selection,
                 image_coverage,
@@ -7266,6 +7317,7 @@ impl Session {
         abi: HookAbi,
         objects: &PinnedObjects,
     ) -> Result<(bool, Option<u64>)> {
+        self.require_return_probe_admission()?;
         let (object, file_offset) = target;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned export object changed before dynamic attach");
@@ -7446,6 +7498,9 @@ impl Session {
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<TargetAttachResult> {
+        if !targets.is_empty() {
+            self.require_return_probe_admission()?;
+        }
         if self.native_retirement.collected_blocking() && targets.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -8282,6 +8337,9 @@ impl Session {
         // Regroup and resolve program fds before the first link mutation:
         // a failure here leaves every old link untouched.
         let regrouped: Vec<Slot> = survivors.iter().map(|target| target.slot.clone()).collect();
+        if !regrouped.is_empty() {
+            self.require_return_probe_admission()?;
+        }
         #[cfg(test)]
         if !regrouped.is_empty() {
             crate::first_use_probe::unsupported_rebuild();
@@ -9843,6 +9901,109 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn return_admission_guards_cover_real_link_mutations_and_preserve_entry_only_paths() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }")
+                .unwrap()
+                .0
+        }
+        fn contract(source: &str) -> bool {
+            let guard = "self.require_return_probe_admission()?;";
+            for (signature, mutation) in [
+                (
+                    "    pub(crate) fn attach_targets(",
+                    "self.native_retirement.collected_blocking()",
+                ),
+                (
+                    "    pub(crate) fn attach_dynamic_export(",
+                    "let (object, file_offset) = target;",
+                ),
+                ("    fn rebuild_affected_groups(", "multi_prog_fd("),
+            ] {
+                let text = body(source, signature);
+                if text.matches(guard).count() != 1 || text.find(guard) >= text.find(mutation) {
+                    return false;
+                }
+            }
+            body(source, "    pub(crate) fn attach_targets(").contains(
+                "if !targets.is_empty() {\n            self.require_return_probe_admission()?;\n        }"
+            ) && body(source, "    fn rebuild_affected_groups(").contains(
+                "if !regrouped.is_empty() {\n            self.require_return_probe_admission()?;\n        }"
+            ) && !body(source, "    pub(crate) fn attach_diagnostic_probe(").contains(guard)
+                && !body(source, "    pub(crate) fn attach_dynamic_loader(").contains(guard)
+        }
+        let source = include_str!("attach.rs");
+        assert!(contract(source));
+        for signature in [
+            "    pub(crate) fn attach_targets(",
+            "    pub(crate) fn attach_dynamic_export(",
+            "    fn rebuild_affected_groups(",
+        ] {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(
+                "self.require_return_probe_admission()?;",
+                "Ok::<(), anyhow::Error>(())?;",
+                1,
+            );
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {signature}"
+            );
+        }
+        let inventory = include_str!("attach/inventory/activation.rs");
+        assert!(!inventory.contains("require_return_probe_admission"));
+        assert!(inventory.contains("let program = match entry.abi {"));
+        assert!(inventory.contains("ElfAbi::Lp64 => \"p11_usage_entry_lp64\""));
+        assert!(inventory.contains("ElfAbi::Ilp32 => \"p11_usage_entry_ia32\""));
+    }
+
+    #[test]
+    fn admission_refusals_precede_the_actual_session_factory_for_every_backend() {
+        use super::{BackendSelection, CapturePolicy, Scope, Session};
+        use crate::uretprobe_hazard::Action;
+        let plan = crate::plan::build_from_reconciled_modules(&[]);
+        let objects = crate::discovery::identity::PinnedObjects::empty();
+        for backend in [
+            BackendSelection::Auto,
+            BackendSelection::Multi,
+            BackendSelection::Singles,
+        ] {
+            for refusal in [
+                Action::Refuse("unsafe kernel".into()),
+                Action::NotPermitted("denied".into()),
+                Action::FlavorMismatch("stale".into()),
+            ] {
+                let expected = match &refusal {
+                    Action::Refuse(_) => "unsafe kernel",
+                    Action::NotPermitted(_) => "denied",
+                    _ => "stale",
+                };
+                let error = Session::start_with_selected(
+                    &plan,
+                    &Scope::System,
+                    &objects,
+                    CapturePolicy::Allowlisted,
+                    None,
+                    None,
+                    None,
+                    backend,
+                    None,
+                    None,
+                    Ok(super::multi_host::MultiCapableHost::for_test()),
+                    || Err(refusal),
+                )
+                .err()
+                .expect("refusal precedes backend selection and any BPF preparation");
+                assert!(format!("{error:#}").contains(expected));
+            }
+        }
+    }
+
+    #[test]
     fn empty_live_session_requires_host_admission_for_every_backend() {
         use super::{
             BackendSelection, CapturePolicy, MultiHostRefusal, MultiHostStage, Scope, Session,
@@ -9869,6 +10030,7 @@ mod tests {
                     None,
                     None,
                     Err(refusal),
+                    || panic!("host refusal must precede the return-probe assessment"),
                 )
                 .err()
                 .expect("even an empty live plan requires a Multi-capable host");

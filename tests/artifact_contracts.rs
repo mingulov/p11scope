@@ -1149,24 +1149,20 @@ fn assert_live_discovery_host_contract(
         require_contract_marker(scope, marker, contract)?;
     }
 
-    // Counter captures start through the Engine's sibling `Session::start_counter`
-    // constructor, selected inside the same Engine-owned closure as the single
-    // `Session::start` call. Both funnel into `start_with_selected` with the
-    // same owned-child capability, so the Engine still owns exactly one start
-    // route per Session kind and one owned-child capability caller. Any
-    // additional route of either spelling, in any file, fails this contract.
+    // Both Detailed and counters use one Engine-owned start route. It passes
+    // the same owned-child capability, exact optional counter spec and the
+    // capture's retained return-probe admission into the shared Session factory.
     if main.contains("Session::start(")
         || main.contains("Session::start_counter(")
+        || main.contains("Session::start_for_capture(")
         || run.contains("Session::start(")
         || run.contains("Session::start_counter(")
-        || engine.matches("Session::start(").count() != 1
-        || engine.matches("Session::start_counter(").count() != 1
+        || run.contains("Session::start_for_capture(")
+        || engine.contains("Session::start(")
+        || engine.contains("Session::start_counter(")
+        || engine.matches("Session::start_for_capture(").count() != 1
         || engine
-            .matches("Session::start(\n                        plan,\n                        scope,\n                        pinned,\n                        policy,\n                        pause_generation.take(),\n                        ring_bytes,\n                        owned_child,\n                        backend,\n                    )")
-            .count()
-            != 1
-        || engine
-            .matches("Session::start_counter(\n                        plan,\n                        scope,\n                        pinned,\n                        policy,\n                        pause_generation.take(),\n                        ring_bytes,\n                        owned_child,\n                        backend,\n                        spec,\n                    )")
+            .matches("Session::start_for_capture(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                    counter.as_ref(),\n                    admission.clone(),\n                )")
             .count()
             != 1
         || engine
@@ -6631,8 +6627,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "policy-map metadata must be validated before publication"
     );
     let second_start_route = engine.replacen(
-        "                    Session::start(\n",
-        "                    Session::start(\n                    Session::start(\n",
+        "                Session::start_for_capture(\n",
+        "                Session::start_for_capture(\n                Session::start_for_capture(\n",
         1,
     );
     assert_ne!(

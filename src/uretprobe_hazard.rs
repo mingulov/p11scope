@@ -91,12 +91,161 @@ pub(crate) enum Action {
     FlavorMismatch(String),
 }
 
+/// Observer credentials are per-thread. A missing proc fact never makes two
+/// assessments reusable merely because both reads failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssessmentContext {
+    process: u32,
+    euid: u32,
+    egid: u32,
+    capabilities: Option<u64>,
+    user_namespace: Option<u64>,
+    seccomp: Option<SeccompMode>,
+    filters: Option<u64>,
+}
+
+impl AssessmentContext {
+    fn current() -> Self {
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok();
+        Self {
+            process: std::process::id(),
+            // SAFETY: credential queries have no preconditions.
+            euid: unsafe { libc::geteuid() },
+            // SAFETY: getegid has no preconditions and cannot fail.
+            egid: unsafe { libc::getegid() },
+            capabilities: status.as_deref().and_then(parse_cap_eff),
+            user_namespace: std::fs::read_link("/proc/thread-self/ns/user")
+                .ok()
+                .and_then(|path| parse_user_ns_link(&path.to_string_lossy())),
+            seccomp: status.as_deref().and_then(parse_seccomp_mode),
+            filters: status.as_deref().and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Seccomp_filters:")?.trim().parse().ok())
+            }),
+        }
+    }
+
+    fn reusable(&self) -> bool {
+        self.capabilities.is_some()
+            && self.user_namespace.is_some()
+            && self.seccomp.is_some()
+            && (self.seccomp != Some(SeccompMode::Filter) || self.filters.is_some())
+    }
+}
+
+#[derive(Default)]
+struct AssessmentCache(std::sync::Mutex<Option<AssessmentContext>>);
+
+impl AssessmentCache {
+    fn assess(
+        &self,
+        context: &AssessmentContext,
+        probe: impl FnOnce() -> KernelVerdict,
+    ) -> KernelVerdict {
+        let mut clean = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if context.reusable() && clean.as_ref() == Some(context) {
+            return KernelVerdict::Clean;
+        }
+        *clean = None;
+        let verdict = probe();
+        if verdict == KernelVerdict::Clean && context.reusable() {
+            *clean = Some(context.clone());
+        }
+        verdict
+    }
+}
+
+/// Authority for this capture's return links. An explicit risk acceptance is
+/// retained as such; it can never populate the positive kernel cache.
+#[derive(Debug, Clone)]
+pub(crate) struct ReturnProbeAdmission {
+    context: AssessmentContext,
+    override_reason: Option<String>,
+}
+
+impl ReturnProbeAdmission {
+    pub(crate) fn override_reason(&self) -> Option<&str> {
+        self.override_reason.as_deref()
+    }
+}
+
+pub(crate) fn admit(
+    target: Option<u32>,
+    overridden: bool,
+) -> std::result::Result<ReturnProbeAdmission, Action> {
+    let context = AssessmentContext::current();
+    let action = evaluate(target, overridden);
+    if context != AssessmentContext::current() {
+        return Err(Action::Refuse(
+            "observer credentials changed during return-probe safety assessment".into(),
+        ));
+    }
+    match action {
+        Action::Proceed => Ok(ReturnProbeAdmission {
+            context,
+            override_reason: None,
+        }),
+        Action::ProceedUnderOverride(reason) => Ok(ReturnProbeAdmission {
+            context,
+            override_reason: Some(reason),
+        }),
+        refusal => Err(refusal),
+    }
+}
+
+/// A shared Session backstop, checked once per link mutation, not per endpoint.
+/// A credential change needs a fresh assessment under the same explicit risk
+/// acceptance, if any; default Sessions never inherit another capture's override.
+pub(crate) fn ensure_admission(
+    retained: &mut Option<ReturnProbeAdmission>,
+) -> std::result::Result<(), Action> {
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return Err(Action::FlavorMismatch(format!("{error:#}")));
+    }
+    let context = AssessmentContext::current();
+    ensure_admission_with(retained, context, |overridden| admit(None, overridden))
+}
+
+fn ensure_admission_with(
+    retained: &mut Option<ReturnProbeAdmission>,
+    context: AssessmentContext,
+    assess: impl FnOnce(bool) -> std::result::Result<ReturnProbeAdmission, Action>,
+) -> std::result::Result<(), Action> {
+    if retained
+        .as_ref()
+        .is_some_and(|admission| context.reusable() && admission.context == context)
+    {
+        return Ok(());
+    }
+    let overridden = retained
+        .as_ref()
+        .is_some_and(|admission| admission.override_reason.is_some());
+    *retained = Some(assess(overridden)?);
+    Ok(())
+}
+
+pub(crate) fn refusal_error(action: Action) -> anyhow::Error {
+    match action {
+        Action::Refuse(reason) => anyhow!(
+            "refusing to attach: {reason}. Capture on a kernel that exempts the trampoline \
+             (`p11scope doctor` shows this kernel's `uretprobe vs seccomp` verdict). \
+             The --allow-uretprobe-on-confined-target risk override is supported only by \
+             profile, trace and run"
+        ),
+        Action::NotPermitted(why) => {
+            anyhow!(not_permitted_message(&why, PrivilegeFacts::current()))
+        }
+        Action::FlavorMismatch(why) => anyhow!("{why}"),
+        _ => anyhow!("return-probe admission did not provide a refusal"),
+    }
+}
+
 /// The whole policy, in one pure function so it is testable without a kernel.
 ///
-/// Two facts decide it: whether this kernel filters the trampoline's syscall,
-/// and whether the target confines syscalls at all. Both must be true for the
-/// hazard to exist, so an ordinary unconfined target — the common case — is
-/// never refused however bad the kernel is.
+/// Admission depends on positive kernel evidence, not a seccomp snapshot.
+/// A sibling may already be filtered, or the target may install a filter
+/// after this check. The snapshot only explains an existing confinement.
 pub(crate) fn decide(
     kernel: &KernelVerdict,
     target: Option<SeccompMode>,
@@ -110,34 +259,30 @@ pub(crate) fn decide(
         (KernelVerdict::FlavorMismatch(why), _) => return Action::FlavorMismatch(why.clone()),
         // Nothing to fear: the kernel exempts the trampoline.
         (KernelVerdict::Clean, _) => return Action::Proceed,
-        // The target cannot refuse a syscall, so the trampoline cannot kill it.
-        (_, Some(mode)) if !mode.confines_syscalls() => return Action::Proceed,
         // Not a hazard verdict at all: this process may not load BPF, so the
         // override (which only accepts a hazard) must not be offered or taken.
         (KernelVerdict::NotPermitted(why), _) => return Action::NotPermitted(why.clone()),
-        (KernelVerdict::Affected(how), Some(_)) => format!(
+        (KernelVerdict::Affected(how), Some(mode)) if mode.confines_syscalls() => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
              {how}) and the target confines syscalls, so attaching a uretprobe would kill it on \
              the first return and capture nothing"
         ),
-        (KernelVerdict::Affected(how), None) => format!(
+        (KernelVerdict::Affected(how), _) => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
-             {how}) and the target cannot be shown unconfined (its seccomp mode could not be \
-             read, the scope's targets cannot be enumerated, or an owned run child may confine \
-             itself after attach), so attaching a uretprobe might kill it"
+             {how}) and a sibling thread may be confined or the target may install a filter \
+             after attach, so attaching a uretprobe might kill it"
         ),
-        (KernelVerdict::Unknown(why), Some(_)) => format!(
+        (KernelVerdict::Unknown(why), Some(mode)) if mode.confines_syscalls() => format!(
             "the target confines syscalls and this kernel could not be shown to exempt the \
              uretprobe trampoline's syscall ({why}), so attaching a uretprobe might kill it"
         ),
         // F-01: fail closed. An unproven kernel with a target that cannot be
         // shown unconfined is the widest blast radius under the weakest
         // protection; it used to proceed.
-        (KernelVerdict::Unknown(why), None) => format!(
+        (KernelVerdict::Unknown(why), _) => format!(
             "this kernel could not be shown to exempt the uretprobe trampoline's syscall \
-             ({why}) and the target cannot be shown unconfined (its seccomp mode could not \
-             be read, the scope's targets cannot be enumerated, or an owned run child may \
-             confine itself after attach), so attaching a uretprobe might kill it"
+             ({why}); a sibling thread may be confined or the target may install a \
+             filter after attach, so attaching a uretprobe might kill it"
         ),
     };
     if overridden {
@@ -204,17 +349,6 @@ pub(crate) extern "C" fn probe_point(seed: u64) -> u64 {
     std::hint::black_box(seed).wrapping_add(1)
 }
 
-/// Whether the expensive self-probe is worth running for this target.
-///
-/// A target that cannot refuse a syscall cannot be killed by the trampoline,
-/// so the common case — an ordinary unconfined process — never pays for the
-/// fork. `None` (a cgroup scope, or a target we could not read) does probe:
-/// there the blast radius is every process mapping the object, which is
-/// exactly when a wrong guess is worst.
-fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
-    !matches!(mode, Some(mode) if !mode.confines_syscalls())
-}
-
 /// The hazard for one capture, cheapest check first.
 ///
 /// `target` is the single pid a `--pid` capture probes. `None` means the scope
@@ -223,8 +357,13 @@ fn needs_kernel_probe(mode: Option<SeccompMode>) -> bool {
 /// enumerated and must be treated as possibly confined — or an owned `run`
 /// child, which may confine itself after attach.
 pub(crate) fn evaluate(target: Option<u32>, overridden: bool) -> Action {
+    if let Err(error) = crate::attach::checked_embedded_flavor() {
+        return Action::FlavorMismatch(format!("{error:#}"));
+    }
     let mode = target.and_then(target_seccomp_mode);
-    evaluate_mode(mode, overridden, probe_kernel)
+    static CLEAN: AssessmentCache = AssessmentCache(std::sync::Mutex::new(None));
+    let context = AssessmentContext::current();
+    evaluate_mode(mode, overridden, || CLEAN.assess(&context, probe_kernel))
 }
 
 /// The policy half of [`evaluate`], with the kernel verdict injected so the
@@ -236,9 +375,6 @@ fn evaluate_mode(
     overridden: bool,
     probe: impl FnOnce() -> KernelVerdict,
 ) -> Action {
-    if !needs_kernel_probe(mode) {
-        return Action::Proceed;
-    }
     decide(&probe(), mode, overridden)
 }
 
@@ -805,6 +941,184 @@ pub(crate) fn describe_owned_child_death(exit_code: i32, attached_probes: usize)
 mod tests {
     use super::*;
 
+    fn assessment_context() -> AssessmentContext {
+        AssessmentContext {
+            process: 7,
+            euid: 1000,
+            egid: 1000,
+            capabilities: Some(0),
+            user_namespace: Some(42),
+            seccomp: Some(SeccompMode::Disabled),
+            filters: Some(0),
+        }
+    }
+
+    #[test]
+    fn only_clean_assessments_are_reused_in_the_same_credential_context() {
+        let cache = AssessmentCache::default();
+        let context = assessment_context();
+        let calls = std::cell::Cell::new(0);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            KernelVerdict::Clean
+        };
+        assert_eq!(cache.assess(&context, probe), KernelVerdict::Clean);
+        assert_eq!(
+            cache.assess(&context, || panic!("one positive probe")),
+            KernelVerdict::Clean
+        );
+        assert_eq!(calls.get(), 1);
+        for field in 0..7 {
+            let mut changed = context.clone();
+            match field {
+                0 => changed.process += 1,
+                1 => changed.euid += 1,
+                2 => changed.egid += 1,
+                3 => changed.capabilities = Some(1),
+                4 => changed.user_namespace = Some(43),
+                5 => changed.seccomp = Some(SeccompMode::Filter),
+                _ => changed.filters = Some(1),
+            }
+            assert!(matches!(
+                cache.assess(&changed, || KernelVerdict::Unknown("changed".into())),
+                KernelVerdict::Unknown(_)
+            ));
+            assert_eq!(cache.assess(&context, probe), KernelVerdict::Clean);
+        }
+        assert_eq!(calls.get(), 8);
+    }
+
+    #[test]
+    fn failed_or_unreadable_assessments_never_become_a_cached_positive() {
+        for verdict in [
+            KernelVerdict::Affected("filtered"),
+            KernelVerdict::Unknown("unreadable".into()),
+            KernelVerdict::NotPermitted("denied".into()),
+            KernelVerdict::FlavorMismatch("stale".into()),
+        ] {
+            let cache = AssessmentCache::default();
+            let context = assessment_context();
+            for _ in 0..2 {
+                assert_eq!(cache.assess(&context, || verdict.clone()), verdict);
+            }
+            assert!(cache.0.lock().unwrap().is_none());
+        }
+        for field in 0..3 {
+            let cache = AssessmentCache::default();
+            let mut context = assessment_context();
+            match field {
+                0 => context.capabilities = None,
+                1 => context.user_namespace = None,
+                _ => {
+                    context.seccomp = Some(SeccompMode::Filter);
+                    context.filters = None;
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.assess(&context, || KernelVerdict::Clean),
+                    KernelVerdict::Clean
+                );
+                assert!(cache.0.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_admission_rechecks_context_and_never_inherits_an_override() {
+        let context = assessment_context();
+        for reason in [None, Some("explicitly accepted risk".to_string())] {
+            let mut admission = Some(ReturnProbeAdmission {
+                context: context.clone(),
+                override_reason: reason.clone(),
+            });
+            ensure_admission_with(&mut admission, context.clone(), |_| panic!("retained fact"))
+                .unwrap();
+            let mut changed = context.clone();
+            changed.capabilities = Some(1);
+            let calls = std::cell::Cell::new(0);
+            let result = ensure_admission_with(&mut admission, changed, |overridden| {
+                calls.set(calls.get() + 1);
+                assert_eq!(overridden, reason.is_some());
+                Err(Action::NotPermitted("changed privilege".into()))
+            });
+            assert!(matches!(result, Err(Action::NotPermitted(_))));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(admission.unwrap().override_reason, reason);
+        }
+        let mut absent = None;
+        assert!(
+            ensure_admission_with(&mut absent, context, |overridden| {
+                assert!(
+                    !overridden,
+                    "another capture's override is not kernel evidence"
+                );
+                Err(Action::Refuse("unsafe".into()))
+            })
+            .is_err()
+        );
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn override_guidance_names_only_commands_that_accept_the_existing_flag() {
+        let message = refusal_error(Action::Refuse("unproven kernel".into())).to_string();
+        assert!(message.contains("supported only by profile, trace and run"));
+        assert!(message.contains("p11scope doctor"));
+        assert!(message.contains("--allow-uretprobe-on-confined-target"));
+    }
+
+    #[test]
+    fn a_disabled_snapshot_still_requires_the_kernel_assessment() {
+        for kernel in [
+            KernelVerdict::Affected("filtered return"),
+            KernelVerdict::Unknown("probe unavailable".into()),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let action = evaluate_mode(Some(SeccompMode::Disabled), false, || {
+                calls.set(calls.get() + 1);
+                kernel.clone()
+            });
+            assert_eq!(calls.get(), 1, "leader status cannot bypass the probe");
+            assert!(matches!(action, Action::Refuse(_)), "{action:?}");
+            assert!(matches!(
+                decide(&kernel, Some(SeccompMode::Disabled), false),
+                Action::Refuse(_)
+            ));
+            assert!(matches!(
+                decide(&kernel, Some(SeccompMode::Disabled), true),
+                Action::ProceedUnderOverride(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn every_snapshot_keeps_assessment_failures_non_overridable() {
+        for mode in [
+            Some(SeccompMode::Disabled),
+            Some(SeccompMode::Strict),
+            Some(SeccompMode::Filter),
+            None,
+        ] {
+            for overridden in [false, true] {
+                for kernel in [
+                    KernelVerdict::NotPermitted("denied".into()),
+                    KernelVerdict::FlavorMismatch("stale object".into()),
+                ] {
+                    let action = evaluate_mode(mode, overridden, || kernel.clone());
+                    assert!(
+                        matches!(
+                            (kernel, action),
+                            (KernelVerdict::NotPermitted(_), Action::NotPermitted(_))
+                                | (KernelVerdict::FlavorMismatch(_), Action::FlavorMismatch(_))
+                        ),
+                        "{mode:?}, override={overridden}"
+                    );
+                }
+            }
+        }
+    }
+
     fn io_chain(errno: libc::c_int, context: &str) -> anyhow::Error {
         anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
             .context("map error: failed to create map `STATS`")
@@ -1173,7 +1487,7 @@ mod tests {
         }
         assert_eq!(
             decide(&refused, Some(SeccompMode::Disabled), false),
-            Action::Proceed
+            Action::NotPermitted("Operation not permitted".to_string())
         );
     }
 
@@ -1390,14 +1704,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfined_target_is_never_refused_however_bad_the_kernel_is() {
+    fn an_unconfined_snapshot_does_not_make_a_bad_kernel_safe() {
         for kernel in [
             KernelVerdict::Affected("test"),
             KernelVerdict::Unknown("test".to_string()),
         ] {
-            assert_eq!(
-                decide(&kernel, Some(SeccompMode::Disabled), false),
-                Action::Proceed,
+            assert!(
+                matches!(
+                    decide(&kernel, Some(SeccompMode::Disabled), false),
+                    Action::Refuse(_)
+                ),
                 "{kernel:?}"
             );
         }
@@ -1431,12 +1747,10 @@ mod tests {
         ));
     }
 
-    /// An unknown verdict is not a clean one: it refuses a confined target
-    /// and anything that cannot be shown unconfined. Only a positively
-    /// unconfined target escapes it, so a failed self-probe cannot break
-    /// ordinary captures but can never silently authorize a risky one.
+    /// No current target snapshot can establish future thread/filter state.
+    /// An unknown kernel therefore refuses every snapshot by default.
     #[test]
-    fn an_unprovable_kernel_refuses_everything_but_an_unconfined_target() {
+    fn an_unprovable_kernel_refuses_every_target_snapshot() {
         let unknown = KernelVerdict::Unknown("fork failed".to_string());
         for target in [Some(SeccompMode::Strict), Some(SeccompMode::Filter), None] {
             assert!(
@@ -1444,10 +1758,10 @@ mod tests {
                 "{target:?} must be refused"
             );
         }
-        assert_eq!(
+        assert!(matches!(
             decide(&unknown, Some(SeccompMode::Disabled), false),
-            Action::Proceed
-        );
+            Action::Refuse(_)
+        ));
     }
 
     /// F-01: an Unknown kernel with an unspecified target (`--cgroup` /
@@ -1481,11 +1795,11 @@ mod tests {
             (&KernelVerdict::Clean, Some(SeccompMode::Strict), false),
             (&KernelVerdict::Clean, Some(SeccompMode::Filter), false),
             (&KernelVerdict::Clean, None, false),
-            (&affected, Some(SeccompMode::Disabled), false),
+            (&affected, Some(SeccompMode::Disabled), true),
             (&affected, Some(SeccompMode::Strict), true),
             (&affected, Some(SeccompMode::Filter), true),
             (&affected, None, true),
-            (&unknown, Some(SeccompMode::Disabled), false),
+            (&unknown, Some(SeccompMode::Disabled), true),
             (&unknown, Some(SeccompMode::Strict), true),
             (&unknown, Some(SeccompMode::Filter), true),
             (&unknown, None, true),
@@ -1533,18 +1847,6 @@ mod tests {
         );
     }
 
-    /// The ordering promise: an ordinary target never pays for the fork.
-    #[test]
-    fn only_a_confined_or_unknown_target_is_worth_probing_the_kernel_for() {
-        assert!(!needs_kernel_probe(Some(SeccompMode::Disabled)));
-        assert!(needs_kernel_probe(Some(SeccompMode::Filter)));
-        assert!(needs_kernel_probe(Some(SeccompMode::Strict)));
-        assert!(
-            needs_kernel_probe(None),
-            "a scope whose targets cannot be enumerated must still be probed"
-        );
-    }
-
     /// A pid with no readable status is not unconfined: it feeds the
     /// fail-closed `None` arm, never a guessed mode.
     #[test]
@@ -1584,18 +1886,6 @@ mod tests {
             panic!("the override must convert the refusal");
         };
         assert_eq!(refused, warned, "the override must not soften the reason");
-    }
-
-    /// The probe is only consulted when the target side needs it: an
-    /// unconfined target proceeds without forking anything.
-    #[test]
-    fn an_unconfined_target_never_pays_for_the_fork() {
-        assert_eq!(
-            evaluate_mode(Some(SeccompMode::Disabled), false, || panic!(
-                "an unconfined target must not probe the kernel"
-            )),
-            Action::Proceed
-        );
     }
 
     #[test]

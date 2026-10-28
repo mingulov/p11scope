@@ -344,6 +344,7 @@ enum TracePhase {
 }
 
 pub struct Engine {
+    return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
     discovery: render::DiscoveryEvidence,
@@ -9365,6 +9366,7 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
 impl Engine {
     fn empty() -> Self {
         Self {
+            return_probe_admission: None,
             plan: plan::build_from_reconciled_modules(&[]),
             pinned: PinnedObjects::empty(),
             discovery: render::DiscoveryEvidence::default(),
@@ -27344,6 +27346,13 @@ impl Engine {
         self.counters.noise.clear();
     }
 
+    pub(crate) fn retain_return_probe_admission(
+        &mut self,
+        admission: crate::uretprobe_hazard::ReturnProbeAdmission,
+    ) {
+        self.return_probe_admission = Some(admission);
+    }
+
     pub fn start_session(
         &mut self,
         policy: CapturePolicy,
@@ -27720,32 +27729,21 @@ impl Engine {
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
+        let admission = self.return_probe_admission.clone();
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
-                if let Some(spec) = counter.as_ref() {
-                    Session::start_counter(
-                        plan,
-                        scope,
-                        pinned,
-                        policy,
-                        pause_generation.take(),
-                        ring_bytes,
-                        owned_child,
-                        backend,
-                        spec,
-                    )
-                } else {
-                    Session::start(
-                        plan,
-                        scope,
-                        pinned,
-                        policy,
-                        pause_generation.take(),
-                        ring_bytes,
-                        owned_child,
-                        backend,
-                    )
-                }
+                Session::start_for_capture(
+                    plan,
+                    scope,
+                    pinned,
+                    policy,
+                    pause_generation.take(),
+                    ring_bytes,
+                    owned_child,
+                    backend,
+                    counter.as_ref(),
+                    admission.clone(),
+                )
             }) {
                 Ok(session) => session,
                 Err(error) => {

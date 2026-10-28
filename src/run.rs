@@ -2218,13 +2218,14 @@ fn capture_with_host(
         _ => {}
     }
     warn_unsafe_policy(policy);
-    let accepted = preflight_uretprobe_hazard(
+    let return_admission = preflight_uretprobe_hazard(
         match &a.scope {
             ScopeArg::Pid(pid) => Some(*pid),
             ScopeArg::Cgroup(_) | ScopeArg::System => None,
         },
         a.allow_confined_uretprobe,
     )?;
+    let accepted = return_admission.override_reason().map(str::to_owned);
     let accepted_uretprobe_risk = accepted.is_some();
     // Durable, not just stderr (SYSPLAN residual F-01): the override flag +
     // hazard reason travel with the evidence this capture renders.
@@ -2249,6 +2250,7 @@ fn capture_with_host(
     let discovered = Engine::discover(a, &scope, named_view);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
+    engine.retain_return_probe_admission(return_admission);
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
@@ -2273,17 +2275,14 @@ fn capture_with_host(
         uretprobe_override,
         resource_start,
     )?;
-    // `--pid` cannot read a non-child's exit status, so the honest report is
-    // the pairing of two facts we do have: the target went away, and this
-    // capture knowingly attached uretprobes a measured-affected kernel kills
-    // confined targets for. Saying nothing here would leave the operator with
-    // a capture whose calls are all in flight and no reason given.
+    // A non-child's exit and explicit risk acceptance are observable facts.
+    // Neither establishes its seccomp state, an affected kernel, or causation.
     if accepted_uretprobe_risk && engine.expected_target_exit() {
         emit_capture_diagnostic(
-            "p11scope: WARNING: the target exited during this capture, which attached uretprobes \
-             to a syscall-confined target on a kernel measured to kill one for exactly that. \
-             p11scope cannot read a non-child's exit status, so this is not proof — but calls \
-             left in flight with no returns are that death's fingerprint",
+            "p11scope: WARNING: the target exited during this capture after return-probe \
+             risk was explicitly accepted. A non-child's exit status is unavailable; this \
+             does not establish whether return probes caused the exit. See the recorded \
+             override reason for the assessed risk",
         );
     }
     Ok(())
@@ -3193,13 +3192,14 @@ fn run_owned_inner_with_host(
     // attach, so no startup /proc reading can qualify it — only a kernel
     // proven to exempt the trampoline proceeds by default (F-01). An
     // initial unconfined status cannot qualify that future state.
+    let return_admission = preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?;
     let uretprobe_override =
-        preflight_uretprobe_hazard(None, args.allow_confined_uretprobe)?.map(|reason| {
-            render::UretprobeOverride {
+        return_admission
+            .override_reason()
+            .map(|reason| render::UretprobeOverride {
                 flag: "--allow-uretprobe-on-confined-target",
-                reason,
-            }
-        });
+                reason: reason.to_owned(),
+            });
 
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
@@ -3231,6 +3231,7 @@ fn run_owned_inner_with_host(
     let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    engine.retain_return_probe_admission(return_admission);
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
     // signalled `always` failure can be named an interruption, not a refusal.
     // Before the attach, and before the child crosses its barrier: a bad `-o`
@@ -3403,32 +3404,19 @@ fn run_owned_inner_with_host(
 /// filter after exec, which is after attach, so there is nothing to read
 /// yet and only a proven-clean kernel proceeds. The death report stays as
 /// the second layer for override runs.
-fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<Option<String>> {
-    match uretprobe_hazard::evaluate(target, overridden) {
-        uretprobe_hazard::Action::Proceed => Ok(None),
-        uretprobe_hazard::Action::ProceedUnderOverride(reason) => {
-            emit_capture_diagnostic(&format!(
-                "p11scope: WARNING: {reason}. Continuing because \
-                 --allow-uretprobe-on-confined-target was given"
-            ));
-            Ok(Some(reason.to_string()))
-        }
-        uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
-            "refusing to attach: {reason}. Re-run with \
-             --allow-uretprobe-on-confined-target to accept that risk, or capture on a kernel \
-             that exempts the trampoline (`p11scope doctor` shows this kernel's `uretprobe vs \
-             seccomp` verdict)"
-        )),
-        // HIGH-1: missing privilege is not a hazard; the override is not offered.
-        uretprobe_hazard::Action::NotPermitted(why) => {
-            Err(anyhow!(uretprobe_hazard::not_permitted_message(
-                &why,
-                uretprobe_hazard::PrivilegeFacts::current()
-            )))
-        }
-        // A broken observer build is not a hazard; the override is not offered.
-        uretprobe_hazard::Action::FlavorMismatch(why) => Err(anyhow!("{why}")),
+fn preflight_uretprobe_hazard(
+    target: Option<u32>,
+    overridden: bool,
+) -> Result<uretprobe_hazard::ReturnProbeAdmission> {
+    let admission =
+        uretprobe_hazard::admit(target, overridden).map_err(uretprobe_hazard::refusal_error)?;
+    if let Some(reason) = admission.override_reason() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: WARNING: {reason}. Continuing because \
+             --allow-uretprobe-on-confined-target was given"
+        ));
     }
+    Ok(admission)
 }
 
 /// DR-K8S-1: a PID scope is refused unless `/proc` PIDs are proven to be the
@@ -17633,6 +17621,23 @@ mod tests {
             assert!(message.contains("stale or mismatched"), "{message}");
             assert!(!message.contains("allow-uretprobe"), "{message}");
         }
+    }
+
+    #[test]
+    fn an_override_exit_warning_does_not_invent_target_or_kernel_facts() {
+        let source = include_str!("run.rs");
+        let warning = source
+            .split_once("    if accepted_uretprobe_risk && engine.expected_target_exit() {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(warning.contains("risk was explicitly accepted"));
+        assert!(warning.contains("does not establish whether"));
+        assert!(!warning.contains("syscall-confined"));
+        assert!(!warning.contains("kernel measured to kill"));
+        assert!(!warning.contains("death's fingerprint"));
     }
 
     #[test]

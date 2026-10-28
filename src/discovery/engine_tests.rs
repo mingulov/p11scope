@@ -16184,16 +16184,102 @@ fn wait_for_child_exec(pid: u32) {
     panic!("sleep child {pid} never execed; last evidence: {evidence}");
 }
 
-/// Two provider modules over two distinct executable objects the live
-/// child really mapped. Generous deadline plus a final snapshot attempt
-/// after the last sleep (P2-6).
+// Self-contained fixture control: exercise this actual code without compiling
+// the observer when checking loader phases and the existing wait budget.
+mod provider_pair_readiness {
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn indices(paths: &[PathBuf], exe: &Path) -> Option<(usize, usize)> {
+        let image = paths.iter().position(|path| path == exe)?;
+        // Keep the existing facts consumer's libc classification; readiness
+        // must wait for that same object, rather than accepting the loader.
+        let libc = paths
+            .iter()
+            .position(|path| path != exe && path.to_string_lossy().contains("libc.so"))?;
+        Some((image, libc))
+    }
+
+    pub(super) fn poll<T>(
+        mut attempt: impl FnMut() -> Option<T>,
+        mut pause: impl FnMut(),
+        polls: usize,
+    ) -> Option<T> {
+        for _ in 0..polls {
+            if let Some(pair) = attempt() {
+                return Some(pair);
+            }
+            pause();
+        }
+        attempt()
+    }
+
+    #[test]
+    fn executable_and_loader_do_not_prove_libc_ready() {
+        let exe = Path::new("/fixture/sleep");
+        let paths = vec![exe.to_path_buf(), PathBuf::from("/fixture/ld-linux.so.2")];
+        assert_eq!(indices(&paths, exe), None);
+    }
+
+    #[test]
+    fn ready_pair_selects_exact_executable_and_libc() {
+        let exe = Path::new("/fixture/sleep");
+        let paths = vec![
+            PathBuf::from("/fixture/other-program"),
+            PathBuf::from("/fixture/ld-linux.so.2"),
+            PathBuf::from("/fixture/libc.so.6"),
+            exe.to_path_buf(),
+        ];
+        assert_eq!(indices(&paths, exe), Some((3, 2)));
+    }
+
+    #[test]
+    fn delayed_libc_is_checked_on_the_final_existing_attempt() {
+        let exe = Path::new("/fixture/sleep");
+        let phase = std::cell::Cell::new(0);
+        let result = poll(
+            || {
+                let mut paths = vec![exe.to_path_buf(), PathBuf::from("/fixture/ld-linux.so.2")];
+                if phase.get() == 2 {
+                    paths.push(PathBuf::from("/fixture/libc.so.6"));
+                }
+                indices(&paths, exe)
+            },
+            || phase.set(phase.get() + 1),
+            2,
+        );
+        assert_eq!(result, Some((0, 2)));
+        assert_eq!(phase.get(), 2);
+    }
+
+    #[test]
+    fn missing_libc_exhausts_the_existing_attempt_budget() {
+        let exe = Path::new("/fixture/sleep");
+        let paths = vec![exe.to_path_buf(), PathBuf::from("/fixture/ld-linux.so.2")];
+        let attempts = std::cell::Cell::new(0);
+        let pauses = std::cell::Cell::new(0);
+        let result = poll(
+            || {
+                attempts.set(attempts.get() + 1);
+                indices(&paths, exe)
+            },
+            || pauses.set(pauses.get() + 1),
+            3,
+        );
+        assert_eq!(result, None);
+        assert_eq!((attempts.get(), pauses.get()), (4, 3));
+    }
+}
+
+/// Two provider modules over distinct executable objects the live child
+/// really mapped. Keep the existing bounded wait and final snapshot attempt.
 fn snapshot_two_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
     let attempt = || {
         let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
         let maps = parse_maps(&bytes).unwrap();
         let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
+        let exe = std::fs::read_link(format!("/proc/{}/exe", view.pid())).unwrap();
         let mut keys = BTreeSet::new();
-        let mut modules = Vec::new();
+        let mut objects = Vec::new();
         for mapping in maps
             .iter()
             .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
@@ -16208,23 +16294,21 @@ fn snapshot_two_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
             if !keys.insert(ObjectKey::of(mapping)) {
                 continue;
             }
-            modules.push(provider_module(view, mapping, &path, 0x1000));
-            if modules.len() == 2 {
-                return Some(modules);
-            }
+            objects.push((mapping, path));
         }
-        None
+        let paths: Vec<_> = objects.iter().map(|(_, path)| path.clone()).collect();
+        let (exe, libc) = provider_pair_readiness::indices(&paths, &exe)?;
+        Some(vec![
+            provider_module(view, objects[exe].0, &objects[exe].1, 0x1000),
+            provider_module(view, objects[libc].0, &objects[libc].1, 0x1000),
+        ])
     };
-    for _ in 0..3000 {
-        if let Some(modules) = attempt() {
-            return modules;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if let Some(modules) = attempt() {
-        return modules;
-    }
-    panic!("the live child never mapped two distinct file-backed objects");
+    provider_pair_readiness::poll(
+        attempt,
+        || std::thread::sleep(std::time::Duration::from_millis(10)),
+        3000,
+    )
+    .expect("the live child never mapped its executable and libc provider pair")
 }
 
 fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
@@ -51268,45 +51352,10 @@ fn collected_graph_installed_facts_stay_charged_while_canonical() {
     );
 }
 
-/// T5 helper: the deterministic (exe, libc) provider pair for one
-/// view. Index-picked peers race the child's exec; path-picked ones do
-/// not, and twin engines must agree on the peer below.
+/// T5 helper: reuse the same settled (exe, libc) pair as the accepted-provider
+/// factory, rather than racing a fresh unguarded libc snapshot.
 fn facts_provider_pair(view: &ProcessView) -> Vec<ScannedModule> {
-    let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
-    let maps = parse_maps(&bytes).unwrap();
-    let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
-    let mut keys = BTreeSet::new();
-    let mut found: BTreeMap<String, ScannedModule> = BTreeMap::new();
-    for mapping in maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-    {
-        let Resolved::File {
-            path: MappedPath::Usable(path),
-            ..
-        } = map_index.resolve(mapping.start)
-        else {
-            continue;
-        };
-        if !keys.insert(ObjectKey::of(mapping)) {
-            continue;
-        }
-        let path_string = path.to_string_lossy().into_owned();
-        if path_string.contains("libc.so") || !path_string.contains(".so") {
-            found.insert(path_string, provider_module(view, mapping, &path, 0x1000));
-        }
-    }
-    let exe = found
-        .iter()
-        .find(|(path, _)| !path.contains(".so"))
-        .map(|(_, module)| module.clone())
-        .unwrap();
-    let libc = found
-        .iter()
-        .find(|(path, _)| path.contains("libc.so"))
-        .map(|(_, module)| module.clone())
-        .unwrap();
-    vec![exe, libc]
+    snapshot_two_provider_modules(view)
 }
 
 /// T5 helper: two accepted providers on one live view (slots 0 and 1).

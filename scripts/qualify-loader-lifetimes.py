@@ -359,8 +359,9 @@ def validate_ledger(rows, cell, expected_lifetimes):
     _require(type(header.get("calls_per_lifetime")) is int
              and header.get("calls_per_lifetime") == CALLS_PER_LIFETIME,
              "ledger call denominator mismatch")
-    _require(_integer(header.get("max_live"), 1) and header["max_live"] <= 4,
-             "workload live bound exceeds 4")
+    live_bound = G16_MAX_LIVE if cell == "g16" else G17_MAX_LIVE
+    _require(_integer(header.get("max_live"), 1) and header["max_live"] <= live_bound,
+             f"workload live bound exceeds {live_bound}")
     _require(set(header) == {"seq", "kind", "version", "cell", "expected_lifetimes",
                              "calls_per_lifetime", "max_live", "provider"},
              "unexpected header fields")
@@ -738,7 +739,10 @@ def parse_trace(text):
 
 
 def check_trace_output(text, *, expected):
-    """Check delivered trace rows and terminal evidence; raise FAIL."""
+    """Check delivered trace rows and terminal evidence; raise FAIL.
+
+    Returns the terminal evidence record so the caller can gate L4
+    receipts on it."""
     rows, _counts, evidence_list, errors = parse_trace(text)
     if errors:
         _fail("; ".join(errors[:3]))
@@ -775,6 +779,104 @@ def check_trace_output(text, *, expected):
         _fail("trace total delivery differs from independent ledger")
     if expected > 1 and len({row["pid"] for row in rows}) < 2:
         _fail("trace shows a single PID, not sequential leaders")
+    return evidence
+
+
+# --- Provisional L4 loader/image transition receipts. D2/T-L4b owns the
+# final public field names; when they land, ONLY the map below changes:
+# every L4 read goes through _l4_receipt. ---
+
+L4_RECEIPT_FIELD_MAP = {
+    # Logical receipt name -> path of components under the capture
+    # evidence object (profile `evidence`, or the trace terminal EVIDENCE
+    # record, which carries the same aggregate receipts).
+    "loader_arms": ("loader_transitions", "arms"),
+    "loader_reclaims": ("loader_transitions", "reclaims"),
+    "loader_retained_peak": ("loader_transitions", "retained_peak"),
+    "loader_refusals": ("loader_transitions", "refusals"),
+    "image_tickets_issued": ("image_transitions", "tickets_issued"),
+    "image_bank_cuts": ("image_transitions", "bank_cuts"),
+    "image_bank_refusals": ("image_transitions", "bank_refusals"),
+    "invocation": ("invocation_receipt",),
+}
+
+_MISSING = object()
+
+
+def _l4_receipt(evidence, name):
+    """Read one provisional L4 receipt; _MISSING when a hop is absent.
+
+    A present-but-unwalkable container is a contradiction (FAIL), never a
+    missing seam: the producer emitted receipts that do not decode.
+    """
+    value = evidence
+    for hop in L4_RECEIPT_FIELD_MAP[name]:
+        if type(value) is not dict:
+            _fail("malformed L4 receipt container: " + name)
+        if hop not in value:
+            return _MISSING
+        value = value[hop]
+    return value
+
+
+def _l4_counter(evidence, name):
+    """Read one provisional L4 counter; _MISSING when absent, FAIL unless
+    a finite uint."""
+    value = _l4_receipt(evidence, name)
+    if value is _MISSING:
+        return _MISSING
+    if type(value) is not int or not 0 <= value < 2**64:
+        _fail("invalid L4 counter: " + name)
+    return value
+
+
+def check_g16_l4_receipts(evidence, expected):
+    """Gate G16 on owned loader-transition receipts; BLOCKED when absent."""
+    arms = _l4_counter(evidence, "loader_arms")
+    reclaims = _l4_counter(evidence, "loader_reclaims")
+    peak = _l4_counter(evidence, "loader_retained_peak")
+    refusals = _l4_counter(evidence, "loader_refusals")
+    if any(value is _MISSING
+           for value in (arms, reclaims, peak, refusals)):
+        _blocked("missing native seam: per-lifetime loader arming/admission "
+                 "and peak retained occupancy are not observable in current "
+                 "public output (needs the approved bounded aggregate loader "
+                 "transition counters, L4); retained controlled contexts "
+                 "(at most 8), held-return cutoff and delayed-record ack "
+                 "(LoaderRetirementFence) likewise have no public proof")
+    if arms != expected:
+        _fail("L4 loader arms differ from independent ledger")
+    if peak > G16_MAX_RETAINED:
+        _fail("L4 retained peak exceeds 8")
+    if refusals != 0:
+        _fail("L4 loader refusals are unexplained loss")
+    if not arms - peak <= reclaims <= arms:
+        _fail("L4 loader reclaims disagree with arms and retained peak")
+
+
+def check_g17_l4_receipts(evidence, expected):
+    """Gate G17 on ticket-issuance, cut and invocation receipts."""
+    issued = _l4_counter(evidence, "image_tickets_issued")
+    cuts = _l4_counter(evidence, "image_bank_cuts")
+    refusals = _l4_counter(evidence, "image_bank_refusals")
+    invocation = _l4_receipt(evidence, "invocation")
+    if any(value is _MISSING
+           for value in (issued, cuts, refusals, invocation)):
+        _blocked("missing native seam: successful ticket issuance across 16,384 "
+                 "has no public producer receipt (kernel_control shows refusals "
+                 "only); distinct (pid,starttime) leaders are not provable from "
+                 "aggregated profile or starttime-less trace rows; single-capture "
+                 "guarantee against hidden session restart needs an observer "
+                 "invocation receipt")
+    if issued < expected:
+        _fail("L4 ticket issuance never crossed 16,384")
+    if cuts != 1:
+        _fail("L4 bank cuts are not exactly one")
+    if refusals != 0:
+        _fail("L4 bank refusals are unexplained loss")
+    if (type(invocation) is not dict or type(invocation.get("id")) is not str
+            or not invocation["id"]):
+        _fail("L4 invocation receipt is malformed")
 
 
 def judge(cell, ledger_rows, *, report_text=None, trace_text=None):
@@ -802,21 +904,16 @@ def judge(cell, ledger_rows, *, report_text=None, trace_text=None):
     if report_text is not None:
         report = parse_bounded_json(report_text, "profile report")
         check_profile_report(report, pin=pin, expected=expected, cell=cell)
+        evidence = report["evidence"]
     else:
-        check_trace_output(trace_text, expected=expected)
+        evidence = check_trace_output(trace_text, expected=expected)
     if cell == "g16":
-        _blocked("missing native seam: per-lifetime loader arming/admission "
-                 "and peak retained occupancy are not observable in current "
-                 "public output (needs the approved bounded aggregate loader "
-                 "transition counters, L4); retained controlled contexts "
-                 "(at most 8), held-return cutoff and delayed-record ack "
-                 "(LoaderRetirementFence) likewise have no public proof")
-    _blocked("missing native seam: successful ticket issuance across 16,384 "
-             "has no public producer receipt (kernel_control shows refusals "
-             "only); distinct (pid,starttime) leaders are not provable from "
-             "aggregated profile or starttime-less trace rows; single-capture "
-             "guarantee against hidden session restart needs an observer "
-             "invocation receipt")
+        check_g16_l4_receipts(evidence, expected)
+        return (f"installed positive: {expected} owned loader arms with "
+                "peak retained <= 8 and zero refusals")
+    check_g17_l4_receipts(evidence, expected)
+    return ("installed positive: ticket issuance crossed 16,384 with "
+            "exactly one bank cut, zero refusals, one invocation")
 
 
 def _redacted_error():

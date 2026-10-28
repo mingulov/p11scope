@@ -81,7 +81,7 @@ def valid_ledger(cell, count):
     return rows
 
 
-def valid_report(expected, pin=None):
+def valid_report(expected, pin=None, l4=None):
     owned = dict((pin or PIN), path="/owned.so", tables=[{}])
     module = {"dev": list((pin or PIN)["dev"]), "ino": (pin or PIN)["ino"],
               "sha256": (pin or PIN)["sha256"]}
@@ -97,7 +97,7 @@ def valid_report(expected, pin=None):
                      "ordinals": [{"table_file_offset": 0, "ordinal": 2 + index * 2}],
                      "latency_ns": {"total": 0, "max": 0},
                      "rv_counts": {"0000000000000000": expected}})
-    return {"schema": "p11scope/observed-profile/v3", "lane": "profile",
+    report = {"schema": "p11scope/observed-profile/v3", "lane": "profile",
             "capture": {"scope": "system", "mode": "profile",
                         "modules": [dict(module, path="/owned.so",
                                          build_id=None)]},
@@ -120,9 +120,12 @@ def valid_report(expected, pin=None):
                     "root_affiliation_failures": []},
                 "discovery": [owned],
                 "in_flight_at_end": 0, "event_loss": 0}}
+    if l4 is not None:
+        report["evidence"].update(copy.deepcopy(l4))
+    return report
 
 
-def valid_trace(expected):
+def valid_trace(expected, l4=None):
     lines = ["Trace — completed call events in arrival order",
              "CAPTURE privacy=allowlisted"]
     pid = 2000
@@ -140,9 +143,21 @@ def valid_trace(expected):
                     "owner_admission_failures": 0, "identity_unavailable": 0,
                     "identity_budget_exhausted": False,
                     "root_affiliation_failures": []}}
+    if l4 is not None:
+        evidence.update(copy.deepcopy(l4))
     lines.append("COUNT_EVIDENCE " + json.dumps({"calls": expected * 2}))
     lines.append("EVIDENCE " + json.dumps(evidence))
     return "\n".join(lines) + "\n"
+
+
+def valid_l4_transitions(cell, expected):
+    """Provisional L4 receipts proving the full population for one cell."""
+    if cell == "g16":
+        return {"loader_transitions": {"arms": expected, "reclaims": expected,
+                                       "retained_peak": 1, "refusals": 0}}
+    return {"image_transitions": {"tickets_issued": expected, "bank_cuts": 1,
+                                  "bank_refusals": 0},
+            "invocation_receipt": {"id": "invocation-1"}}
 
 
 class LedgerValidationTests(unittest.TestCase):
@@ -297,6 +312,23 @@ class LedgerValidationTests(unittest.TestCase):
                 mutate(rows)
                 self.assert_refused(rows, "g16", 3)
 
+    def test_live_bound_message_names_the_configured_bound(self):
+        rows = valid_ledger("g16", 3)
+        rows[0]["max_live"] = 5
+        with self.assertRaises(ORACLE.LedgerError) as raised:
+            ORACLE.validate_ledger(rows, "g16", 3)
+        self.assertIn("exceeds 4", str(raised.exception))
+        # The message must track the bound, not a hardcoded number.
+        previous = ORACLE.G16_MAX_LIVE
+        ORACLE.G16_MAX_LIVE = 3
+        try:
+            rows[0]["max_live"] = 4
+            with self.assertRaises(ORACLE.LedgerError) as raised:
+                ORACLE.validate_ledger(rows, "g16", 3)
+            self.assertIn("exceeds 3", str(raised.exception))
+        finally:
+            ORACLE.G16_MAX_LIVE = previous
+
     def test_parser_rejects_malformed_and_unbounded_input(self):
         for content in ('{"seq":1,"seq":1}\n', '[]\n', '\n', '{"seq":NaN}\n',
                         '{"x":"' + 'x' * 4096 + '"}\n'):
@@ -372,27 +404,29 @@ class InstalledJudgeTests(unittest.TestCase):
             command += ["--trace", trace]
         return subprocess.run(command, capture_output=True, text=True, timeout=30)
 
-    def test_g16_valid_public_output_is_blocked_not_pass(self):
+    def test_g16_valid_public_output_is_pass(self):
         rows = valid_ledger("g16", 300)
-        report = json.dumps(valid_report(300))
-        with self.assertRaises(ORACLE.Blocked) as raised:
-            ORACLE.judge("g16", rows, report_text=report)
-        self.assertIn("arming", str(raised.exception))
+        report = json.dumps(valid_report(
+            300, l4=valid_l4_transitions("g16", 300)))
+        detail = ORACLE.judge("g16", rows, report_text=report)
+        self.assertIn("installed positive", detail)
 
-    def test_g17_valid_profile_is_blocked_not_pass(self):
+    def test_g17_valid_profile_is_pass(self):
         rows = valid_ledger("g17", 16385)
-        report = json.dumps(valid_report(16385))
-        with self.assertRaises(ORACLE.Blocked) as raised:
-            ORACLE.judge("g17", rows, report_text=report)
-        self.assertIn("ticket", str(raised.exception))
+        report = json.dumps(valid_report(
+            16385, l4=valid_l4_transitions("g17", 16385)))
+        detail = ORACLE.judge("g17", rows, report_text=report)
+        self.assertIn("installed positive", detail)
 
-    def test_g17_valid_trace_is_blocked_not_pass(self):
+    def test_g17_valid_trace_is_pass(self):
         # Full 32,770-row trace (~5 MB); well within the 256 MiB bound.
-        with self.assertRaises(ORACLE.Blocked):
-            ORACLE.judge("g17", valid_ledger("g17", 16385),
-                         trace_text=valid_trace(16385))
+        detail = ORACLE.judge(
+            "g17", valid_ledger("g17", 16385),
+            trace_text=valid_trace(
+                16385, l4=valid_l4_transitions("g17", 16385)))
+        self.assertIn("installed positive", detail)
         # Short-trace sanity: exact per-function delivery is checked before
-        # the seam blocks.
+        # the receipts are consulted.
         with self.assertRaises(ORACLE.JudgeFail):
             ORACLE.judge("g16", valid_ledger("g16", 3), trace_text=valid_trace(2))
 
@@ -532,6 +566,141 @@ class InstalledJudgeTests(unittest.TestCase):
             verdict = json.loads(result.stdout)
             self.assertEqual(
                 (verdict["pass"], verdict["qualification"]), (False, "failed"))
+
+
+class L4ReceiptTests(unittest.TestCase):
+    """Provisional L4 loader/image receipts: contradictions fail, missing
+    receipts block on the exact seam, valid receipts pass. Receipt paths
+    stay behind the oracle's L4_RECEIPT_FIELD_MAP so T-L4b changes one
+    place."""
+
+    def judge_report(self, cell, count, l4):
+        rows = valid_ledger(cell, count)
+        report = json.dumps(valid_report(count, l4=l4))
+        return ORACLE.judge(cell, rows, report_text=report)
+
+    def with_receipt(self, cell, count, dotted, value):
+        l4 = valid_l4_transitions(cell, count)
+        node = l4
+        hops = dotted.split(".")
+        for hop in hops[:-1]:
+            node = node[hop]
+        node[hops[-1]] = value
+        return l4
+
+    def test_l4_loader_arms_short_is_fail(self):
+        l4 = self.with_receipt("g16", 300, "loader_transitions.arms", 299)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g16", 300, l4)
+        self.assertIn("arms", str(raised.exception))
+
+    def test_l4_retained_peak_over_bound_is_fail(self):
+        l4 = self.with_receipt(
+            "g16", 300, "loader_transitions.retained_peak", 9)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g16", 300, l4)
+        self.assertIn("retained", str(raised.exception))
+
+    def test_l4_final_retained_above_peak_is_fail(self):
+        # Peak 1 with 8 contexts still retained at the end contradicts
+        # itself: the final occupancy arms - reclaims never exceeds the peak.
+        l4 = self.with_receipt("g16", 300, "loader_transitions.reclaims", 292)
+        self.assertEqual(l4["loader_transitions"]["retained_peak"], 1)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g16", 300, l4)
+        self.assertIn("reclaims", str(raised.exception))
+
+    def test_l4_tickets_never_crossed_is_fail(self):
+        l4 = self.with_receipt(
+            "g17", 16385, "image_transitions.tickets_issued", 16384)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g17", 16385, l4)
+        self.assertIn("16,384", str(raised.exception))
+
+    def test_l4_second_bank_cut_is_fail(self):
+        l4 = self.with_receipt(
+            "g17", 16385, "image_transitions.bank_cuts", 2)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g17", 16385, l4)
+        self.assertIn("cut", str(raised.exception))
+
+    def test_l4_receipt_boundaries_and_contradictions(self):
+        g16_failures = {
+            "reclaims_above_arms": ("loader_transitions.reclaims", 301),
+            "reclaims_below_arms_minus_peak": ("loader_transitions.reclaims",
+                                               291),
+            "loader_refusals_nonzero": ("loader_transitions.refusals", 1),
+            "arms_wrong_type": ("loader_transitions.arms", "300"),
+            "peak_is_bool": ("loader_transitions.retained_peak", True),
+        }
+        for name, (dotted, value) in g16_failures.items():
+            with self.subTest(name=name):
+                l4 = self.with_receipt("g16", 300, dotted, value)
+                with self.assertRaises(ORACLE.JudgeFail):
+                    self.judge_report("g16", 300, l4)
+        g17_failures = {
+            "bank_refusals_nonzero": ("image_transitions.bank_refusals", 1),
+            "issued_negative": ("image_transitions.tickets_issued", -1),
+            "cuts_wrong_type": ("image_transitions.bank_cuts", "1"),
+            "invocation_is_list": ("invocation_receipt", []),
+            "invocation_missing_id": ("invocation_receipt", {}),
+            "invocation_empty_id": ("invocation_receipt.id", ""),
+        }
+        for name, (dotted, value) in g17_failures.items():
+            with self.subTest(name=name):
+                l4 = self.with_receipt("g17", 16385, dotted, value)
+                with self.assertRaises(ORACLE.JudgeFail):
+                    self.judge_report("g17", 16385, l4)
+        # Exact boundaries pass: peak 8, reclaims at arms-peak, and surplus
+        # issuance (crossing, not exact: ambient births may burn tickets).
+        for name, peak, reclaims in (
+                ("peak_at_bound", 8, 299),
+                ("reclaims_at_arms_minus_peak_8", 8, 292),
+                ("reclaims_at_arms_minus_peak_1", 1, 299)):
+            with self.subTest(name=name):
+                l4 = self.with_receipt(
+                    "g16", 300, "loader_transitions.retained_peak", peak)
+                l4["loader_transitions"]["reclaims"] = reclaims
+                self.assertIn("installed positive",
+                              self.judge_report("g16", 300, l4))
+        surplus = self.with_receipt(
+            "g17", 16385, "image_transitions.tickets_issued", 16386)
+        self.assertIn("installed positive",
+                      self.judge_report("g17", 16385, surplus))
+
+    def test_g16_valid_trace_with_l4_receipts_is_pass(self):
+        detail = ORACLE.judge(
+            "g16", valid_ledger("g16", 300),
+            trace_text=valid_trace(
+                300, l4=valid_l4_transitions("g16", 300)))
+        self.assertIn("installed positive", detail)
+
+    def test_g16_missing_loader_receipts_is_blocked(self):
+        rows = valid_ledger("g16", 300)
+        report = json.dumps(valid_report(300))
+        with self.assertRaises(ORACLE.Blocked) as raised:
+            ORACLE.judge("g16", rows, report_text=report)
+        self.assertIn("arming", str(raised.exception))
+
+    def test_g17_missing_image_receipts_is_blocked(self):
+        rows = valid_ledger("g17", 16385)
+        report = json.dumps(valid_report(16385))
+        with self.assertRaises(ORACLE.Blocked) as raised:
+            ORACLE.judge("g17", rows, report_text=report)
+        self.assertIn("ticket", str(raised.exception))
+
+    def test_g17_missing_invocation_receipt_is_blocked(self):
+        l4 = valid_l4_transitions("g17", 16385)
+        del l4["invocation_receipt"]
+        with self.assertRaises(ORACLE.Blocked) as raised:
+            self.judge_report("g17", 16385, l4)
+        self.assertIn("invocation", str(raised.exception))
+
+    def test_g17_trace_missing_receipts_is_blocked(self):
+        with self.assertRaises(ORACLE.Blocked) as raised:
+            ORACLE.judge("g17", valid_ledger("g17", 16385),
+                         trace_text=valid_trace(16385))
+        self.assertIn("ticket", str(raised.exception))
 
 
 class BoundedTextTests(unittest.TestCase):

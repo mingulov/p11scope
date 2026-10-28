@@ -365,6 +365,21 @@ discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_i
 
 # Static skips: external prerequisites or explicitly deferred build cells.
 SKIP_TESTS=(
+# Private image-bank cells require a separately enabled FULL proof build.
+attach::image_bank_proof::tests::privileged_image_bank_verifier_stats
+attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota
+attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b
+attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once
+attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut
+attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused
+attach::image_bank_proof::tests::privileged_image_bank_failure_modes_refuse_and_balance
+attach::image_bank_proof::tests::privileged_image_bank_fork_burn_sentinel
+attach::image_bank_proof::tests::privileged_image_bank_second_rollover
+attach::image_bank_proof::tests::privileged_image_bank_omitted_route_refuses
+attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut
+attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher
+attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once
+attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead
 # R52: preserve the marker assertions for the 0.6.0 marker-enabled build.
 attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
 attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
@@ -465,6 +480,20 @@ metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
 )
 SKIP_REASONS=(
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
+"needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; prior E3 acceptance, a quiet exclusive host and matched production cost inputs P11_BANK_N5_PRODUCTION_NS_1/P11_BANK_N5_PRODUCTION_NS_4 required; run this --exact selector --ignored as root in an authorized BPF lane (E4/N5)"
 "R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
 "R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
 "R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
@@ -652,14 +681,40 @@ check_skip_alignment() {
 
 # Compare curation against the binary. Prints drift details to stderr and
 # returns 1 on any mismatch, so new tests cannot be silently dropped.
+# Exactly these private cells are cfg'd out together in an ordinary libtest.
+# This is not a generic prefix exemption: unknown or partial proof lists fail.
+private_image_proof_name() {
+    local prefix=attach::image_bank_proof::tests::privileged_image_bank_
+    case $1 in "$prefix"*) ;; *) return 1 ;; esac
+    case ${1#"$prefix"} in
+        verifier_stats|exhaustion_16384_then_quota|cut_16385th_leader_in_b|\
+        concurrent_cut_counts_once|held_return_across_cut|late_incarnation_refused|\
+        failure_modes_refuse_and_balance|fork_burn_sentinel|second_rollover|\
+        omitted_route_refuses|exec_query_span_cut|attach_cookie_through_dispatcher|\
+        inflight_cut_counts_once|per_call_overhead) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 check_curation() {
     check_skip_alignment || return 1
-    local bin=$1 workdir bin_list cur_list missing_bin missing_cur
+    local bin=$1 workdir bin_list cur_list missing_bin missing_cur proof_present=0 name
+    local -A proof_curated=()
+    for name in "${SKIP_TESTS[@]}"; do
+        if private_image_proof_name "$name"; then proof_curated["$name"]=1; fi
+    done
     workdir=$(mktemp -d) || { echo "$PROG: cannot create temp dir" >&2; return 1; }
     bin_list=$workdir/bin.txt
     cur_list=$workdir/cur.txt
     if ! binary_ignored_list "$bin" >"$bin_list"; then
         echo "$PROG: cannot list ignored tests in $bin" >&2
+        rm -rf "$workdir"
+        return 1
+    fi
+    if grep -q '^attach::image_bank_proof::tests::privileged_image_bank_' "$bin_list"; then
+        proof_present=1
+    elif [ "$?" -ne 1 ]; then
+        echo "$PROG: cannot inspect private proof membership in $bin" >&2
         rm -rf "$workdir"
         return 1
     fi
@@ -682,6 +737,11 @@ check_curation() {
         done
         while IFS= read -r aname; do
             [ -z "$aname" ] && continue
+            # Only the exact curated private group may be entirely absent.
+            # One present member disables this exception for all fourteen.
+            if [ "$proof_present" -eq 0 ] && [ -n "${proof_curated[$aname]+present}" ]; then
+                continue
+            fi
             local is_alt=0 alt
             for alt in "${ALTERNATIVE_TESTS[@]}"; do
                 [ "$aname" = "$alt" ] && is_alt=1
@@ -709,6 +769,13 @@ $aname"; fi
             }
         } >&2
         return 1
+    fi
+    if [ "${#proof_curated[@]}" -ne 14 ]; then
+        echo "$PROG: all 14 private image-proof names must remain static SKIPs" >&2
+        return 1
+    fi
+    if [ "$proof_present" -eq 0 ]; then
+        echo "$PROG: private image-bank proof group not built (0/14 present; no proof positive)"
     fi
     return 0
 }
@@ -796,7 +863,9 @@ list_mode() {
         echo "${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}"
     done
     if check_curation "$bin"; then
-        echo "verify: curation matches the binary ($(( ${#default_all[@]} + ${#LONG_TESTS[@]} + ${#SKIP_TESTS[@]} )) tests)"
+        local actual_count
+        actual_count=$(binary_ignored_list "$bin" | wc -l) || return 1
+        echo "verify: curation matches the binary ($actual_count tests)"
         return 0
     fi
     return 1

@@ -12,6 +12,7 @@ Run: python3 -I tests/python/test_residual_gates.py -v
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,12 +30,197 @@ def ci_text():
     return CI_YML.read_text(encoding="utf-8")
 
 
+def hosted_job():
+    return ci_text().split("\n  privileged-e2e:\n", 1)[1].split("\n  release-preview:\n", 1)[0]
+
+
+def hosted_step(name):
+    marker = f"      - name: {name}\n"
+    block = hosted_job()
+    if marker not in block:
+        raise AssertionError(f"hosted capture step missing: {name}")
+    step = block.split(marker, 1)[1].split("\n      - ", 1)[0]
+    if "        run: |\n" not in step:
+        raise AssertionError(f"hosted capture step has no shell body: {name}")
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+
+def hosted_python(name):
+    return hosted_step(name).split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+
 class ResidualGates(unittest.TestCase):
     def test_privileged_e2e_job_exists(self):
         """F-04: one privileged CI E2E job running the gated capture cells."""
         text = ci_text()
         self.assertIn("privileged-e2e", text)
         self.assertIn("system-scope-measure", text)
+        block = hosted_job()
+        self.assertIn("runs-on: ubuntu-26.04", block)
+        self.assertNotIn("self-hosted", block)
+        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", block)
+        self.assertIsNotNone(timeout, "hosted capture needs a finite job deadline")
+        self.assertGreater(int(timeout[1]), 0)
+        self.assertLessEqual(int(timeout[1]), 60)
+        self.assertLess(block.index("Build observer and discovery helper"),
+                        block.index("Run four gated system-scope cells"))
+        self.assertIn("--release -p p11scope -p p11scope-discover", block)
+
+    def test_hosted_system_cell_validator_refuses_missing_or_unproven(self):
+        program = hosted_python("Validate four required capture records")
+        expected = ("pid/metrics", "pid/profile", "system/metrics", "system/profile")
+        records = {}
+        for key in expected:
+            scope, mode = key.split("/")
+            records[key] = {
+                "condition": {"scope": scope, "mode": mode, "n_calls": 20000},
+                "truth_vs_observed": {"counts_match": True, "truth": {"C_GenerateRandom": 20000}},
+                "window": {"window_valid": True},
+                "harness": {"observer_exit": 0, "observer_timed_out": False, "observer_signal": None},
+                "evidence": {"counters": {"event_loss": 0, "semantic_capture_failures": 0},
+                             "in_flight_at_end": 0},
+            }
+        good = {"schema": "p11scope/system-scope-matrix/v1", "records": records}
+        with tempfile.TemporaryDirectory() as temporary:
+            matrix = Path(temporary) / "matrix.json"
+            for key, row in records.items():
+                report = Path(temporary) / (key.replace("/", "-") + ".json")
+                row["artifacts"] = {"report": str(report)}
+            cases = [("complete", good, True)]
+            missing = json.loads(json.dumps(good))
+            del missing["records"]["system/profile"]
+            cases.append(("missing cell", missing, False))
+            for field, bad in (("counts_match", False), ("counts_match", "true"),
+                               ("window_valid", False), ("observer_exit", 1),
+                               ("observer_timed_out", True), ("observer_signal", 2),
+                               ("n_calls", 0), ("C_GenerateRandom", 0), ("scope", "pid"),
+                               ("event_loss", 1), ("semantic_capture_failures", 1),
+                               ("in_flight_at_end", 1), ("event_loss", False)):
+                changed = json.loads(json.dumps(good))
+                row = changed["records"]["system/profile"]
+                section = ({"counts_match": "truth_vs_observed", "window_valid": "window",
+                            "observer_exit": "harness", "observer_timed_out": "harness",
+                            "observer_signal": "harness", "n_calls": "condition", "scope": "condition",
+                            "in_flight_at_end": "evidence"})
+                if field == "C_GenerateRandom":
+                    row["truth_vs_observed"]["truth"][field] = bad
+                elif field in ("event_loss", "semantic_capture_failures"):
+                    row["evidence"]["counters"][field] = bad
+                else:
+                    row[section[field]][field] = bad
+                cases.append((field, changed, False))
+            cases.extend((control, good, False) for control in ("drain unproven", "drain missing"))
+            for control, document, passes in cases:
+                with self.subTest(control=control):
+                    for row in records.values():
+                        evidence = {"drain_proven": True}
+                        if control == "drain unproven":
+                            evidence["drain_proven"] = False
+                        elif control == "drain missing":
+                            evidence = {}
+                        Path(row["artifacts"]["report"]).write_text(json.dumps({"evidence": evidence}))
+                    matrix.write_text(json.dumps(document))
+                    result = subprocess.run([sys.executable, "-I", "-", str(matrix)],
+                                            input=program, text=True, capture_output=True)
+                    self.assertEqual(result.returncode == 0, passes, result.stderr)
+                    if passes:
+                        self.assertEqual(result.stdout.count("PASS "), 4)
+
+    def test_hosted_capture_step_uses_prebuilt_pair_and_propagates_failure(self):
+        program = hosted_step("Run four gated system-scope cells")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "bin"
+            tools.mkdir()
+            release = root / "target/release"
+            release.mkdir(parents=True)
+            for name in ("p11scope", "p11scope-discover"):
+                executable = release / name
+                executable.write_text(textwrap.dedent("""\
+                    #!/bin/sh
+                    mode=${STUB_DOCTOR_MODE:-clean}
+                    printf 'uprobe-multi attach (own libc) ... ok\\n'
+                    if [ "$mode" != missing ]; then
+                        word=ok
+                        [ "$mode" != bad ] || word=fail
+                        printf 'uretprobe vs seccomp ... %s\\n' "$word"
+                    fi
+                    if [ "$mode" = duplicate ]; then printf 'uretprobe vs seccomp ... ok\\n'; fi
+                    exit "${STUB_DOCTOR_RC:-0}"
+                    """))
+                executable.chmod(0o755)
+            sudo = tools / "sudo"
+            sudo.write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+            sudo.chmod(0o755)
+            pgrep = tools / "pgrep"
+            pgrep.write_text('#!/bin/sh\nexit "${STUB_PGREP_RC:-1}"\n')
+            pgrep.chmod(0o755)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            harness = scripts / "system-scope-measure.sh"
+            harness.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@" > "$TMPDIR/argv.txt"\nexit "${CAPTURE_EXIT:-0}"\n')
+            harness.chmod(0o755)
+            environment = os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                        "TMPDIR": str(root)}
+            result = subprocess.run(["bash", "-c", program], cwd=root, env=environment,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = (root / "argv.txt").read_text().splitlines()
+            self.assertEqual(args[args.index("--binary") + 1], str(release / "p11scope"))
+            self.assertIn("--no-build", args)
+            self.assertNotIn("--discover", args, "helper must use the harness's real sibling interface")
+            self.assertEqual(args[args.index("--scope") + 1], "both")
+            self.assertEqual(args[args.index("--mode") + 1], "both")
+            result = subprocess.run(["bash", "-c", program], cwd=root,
+                                    env=environment | {"CAPTURE_EXIT": "9"}, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 9, "a failed real capture must fail the job")
+            doctor_cases = [(1, "clean", True), (2, "clean", False), (127, "clean", False)]
+            doctor_cases.extend((status, mode, False) for status in (0, 1)
+                                for mode in ("bad", "missing", "duplicate"))
+            for status, mode, passes in doctor_cases:
+                with self.subTest(doctor_status=status, rows=mode):
+                    result = subprocess.run(["bash", "-c", program], cwd=root,
+                                            env=environment | {"STUB_DOCTOR_RC": str(status),
+                                                               "STUB_DOCTOR_MODE": mode},
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode == 0, passes, result.stderr)
+                    if passes:
+                        self.assertEqual((root / "hosted-doctor-status.txt").read_text(), "1\n")
+            for status in (0, 2, 3, 127):
+                with self.subTest(pgrep_status=status):
+                    result = subprocess.run(["bash", "-c", program], cwd=root,
+                                            env=environment | {"STUB_PGREP_RC": str(status)},
+                                            text=True, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0, "busy or failed process inspection must prevent capture")
+
+    def test_hosted_failure_context_is_bounded_and_owned(self):
+        program = hosted_python("Collect bounded capture context")
+        for failed in (False, True):
+            with (self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary,
+                  tempfile.TemporaryDirectory() as foreign_directory):
+                root = Path(temporary)
+                (root / "hosted-doctor.txt").write_bytes(b"d" * 20000)
+                (root / "hosted-doctor-status.txt").write_text("1\n")
+                cells = root / "hosted-system-e2e"
+                cell = cells / "pid-metrics"
+                cell.mkdir(parents=True)
+                (cell / "stderr.txt").write_bytes(b"e" * 30000)
+                (cell / "workload.log").write_bytes(b"w" * 30000)
+                (cell / "foreign.log").write_text("PRIVATE_UNSELECTED_CONTENT")
+                foreign = Path(foreign_directory)
+                (foreign / "stderr.txt").write_text("PRIVATE_UNSELECTED_CONTENT")
+                (foreign / "workload.log").write_text("PRIVATE_UNSELECTED_CONTENT")
+                (cells / "pid-profile").symlink_to(foreign, target_is_directory=True)
+                result = subprocess.run([sys.executable, "-I", "-", str(root)], input=program,
+                                        env=os.environ | {"CAPTURE_FAILED": str(failed).lower()},
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outputs = list((root / "hosted-context").iterdir())
+                self.assertEqual(len(outputs), 4 if failed else 2)
+                for output in outputs:
+                    self.assertLessEqual(output.stat().st_size, 16384)
+                    self.assertNotIn(b"PRIVATE_UNSELECTED_CONTENT", output.read_bytes())
 
     def test_release_preview_job_exists(self):
         """F-28: release-preview CI job (musl/docker/SBOM/build-release)."""

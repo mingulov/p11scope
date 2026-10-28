@@ -11,7 +11,7 @@ on:
         type: boolean
         default: true
       privileged_e2e:
-        description: Run privileged-e2e (waits for a [self-hosted, bpf] runner)
+        description: Run four gated capture cells on a hosted Ubuntu 26.04 runner
         type: boolean
         default: false
 permissions:
@@ -824,30 +824,187 @@ jobs:
           retention-days: 90
   # SYSPLAN residual F-04: one privileged CI E2E job running the gated
   # system-scope cells (pid/system x metrics/profile) with their
-  # expected-count oracles. Required-but-manual: it runs only on manual
-  # dispatch, on a self-hosted BPF-capable runner. On push/PR it skips
-  # without implying anything ran; while no runner carries these labels
-  # the job waits rather than going green. Real and runnable: dispatch it
-  # from the Actions tab once a [self-hosted, bpf] runner exists.
+  # expected-count oracles. Manual on an ordinary hosted runner; push/PR
+  # skips do not qualify these cells. A missing capability, incomplete
+  # matrix or failed count/window oracle fails rather than becoming a skip.
+  # Endpoint/WIDE/population scale and long soaks are separate qualifications.
   privileged-e2e:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.privileged_e2e }}
-    runs-on: [self-hosted, bpf]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Prepare owned hosted test storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          work=/var/tmp/p11scope-ws-tmp
+          if [[ ! -e "$work" ]]; then mkdir -m 700 "$work"; fi
+          test -d "$work" && test ! -L "$work" && test -O "$work"
+          test "$(stat -c %a "$work")" = 700
+          case "$(stat -f -c %T "$work")" in
+            tmpfs|ramfs) echo "capture TMPDIR must be disk-backed" >&2; exit 1 ;;
+          esac
+          echo "TMPDIR=$work" >>"$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=2" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      - run: sudo -n apt-get update && sudo -n apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm procps python3 softhsm2 util-linux
+      - name: Check hosted capture prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n true
+          test "$(id -u)" -ne 0
+          test -r /sys/kernel/btf/vmlinux
+          command -v flock
+          command -v pgrep
+          {
+            uname -a
+            id
+            clang-18 --version
+            free -h
+            df -h "$TMPDIR"
+            ulimit -a
+            cat /proc/sys/kernel/perf_event_paranoid
+            cat /proc/sys/kernel/yama/ptrace_scope
+          } >"$TMPDIR/hosted-capabilities.txt"
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Build observer and discovery helper
+        run: cargo +"$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
       # The four gated cells in one lane invocation: --scope both runs
       # pid+system, --mode both runs metrics+profile, and the lane's own
       # oracle joins observer report + traces + workload TRUTH per cell.
-      - run: scripts/system-scope-measure.sh --scope both --mode both
+      - name: Run four gated system-scope cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          ulimit -n 65536
+          test -x "$PWD/target/release/p11scope"
+          test -x "$PWD/target/release/p11scope-discover"
+          if pgrep -x 'cargo|rustc' >/dev/null; then
+            echo "compiler still active before capture" >&2
+            exit 1
+          else
+            status=$?
+            if [[ "$status" -ne 1 ]]; then
+              echo "cannot verify a quiet capture host" >&2
+              exit 1
+            fi
+          fi
+          flock -n "$TMPDIR/hosted-system.lock" bash -c '
+            set -euo pipefail
+            binary="$PWD/target/release/p11scope"
+            doctor_status=0
+            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
+            printf "%s\n" "$doctor_status" >"$TMPDIR/hosted-doctor-status.txt"
+            python3 -I - "$TMPDIR/hosted-doctor.txt" "$doctor_status" << "PY"
+          import re
+          import sys
+          from pathlib import Path
+
+          if int(sys.argv[2]) not in (0, 1):
+              raise RuntimeError("doctor did not finish with a supported verdict")
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          PY
+            exec scripts/system-scope-measure.sh --scope both --mode both \
+              --duration 8 --n-calls 20000 --binary "$binary" --no-build \
+              --work "$TMPDIR/hosted-system-e2e"
+          '
+      - name: Validate four required capture records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - "$TMPDIR/hosted-system-e2e/matrix.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def require(ok, reason):
+              if not ok:
+                  raise RuntimeError(reason)
+
+          matrix = json.loads(Path(sys.argv[1]).read_text())
+          require(matrix.get("schema") == "p11scope/system-scope-matrix/v1", "matrix schema")
+          expected = {"pid/metrics", "pid/profile", "system/metrics", "system/profile"}
+          records = matrix["records"]
+          require(set(records) == expected, "four distinct capture records required")
+          for key in sorted(expected):
+              row = records[key]
+              condition = row["condition"]
+              require(key == condition["scope"] + "/" + condition["mode"], "cell identity")
+              require(condition["n_calls"] == 20000, "expected workload size")
+              truth = row["truth_vs_observed"]
+              require(truth["truth"]["C_GenerateRandom"] == 20000, "nonzero workload truth")
+              require(truth["counts_match"] is True, "expected-count oracle failed")
+              require(row["window"]["window_valid"] is True, "capture window oracle failed")
+              harness = row["harness"]
+              require(harness["observer_exit"] == 0, "observer exit")
+              require(harness["observer_timed_out"] is False, "observer timeout")
+              require(harness["observer_signal"] is None, "observer signal")
+              evidence = row["evidence"]
+              for name in ("event_loss", "semantic_capture_failures"):
+                  value = evidence["counters"][name]
+                  require(type(value) is int and value == 0, "capture loss counter: " + name)
+              pending = evidence["in_flight_at_end"]
+              require(type(pending) is int and pending == 0, "calls remain in flight")
+              report = json.loads(Path(row["artifacts"]["report"]).read_text())
+              require(report["evidence"]["drain_proven"] is True, "final drain unproven")
+              print("PASS " + key + " expected_random_calls=20000")
+          PY
+      - name: Collect bounded capture context
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CAPTURE_FAILED: ${{ failure() }}
+        run: |
+          set -euo pipefail
+          python3 -I - "$TMPDIR" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve()
+          output = root / "hosted-context"
+          output.mkdir(mode=0o700)
+          sources = [("doctor.txt", root / "hosted-doctor.txt"),
+                     ("doctor-status.txt", root / "hosted-doctor-status.txt")]
+          if os.environ["CAPTURE_FAILED"] == "true":
+              for cell in ("pid-metrics", "pid-profile", "system-metrics", "system-profile"):
+                  for name in ("stderr.txt", "workload.log"):
+                      sources.append((cell + "-" + name, root / "hosted-system-e2e" / cell / name))
+          for label, source in sources:
+              if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(root):
+                  continue
+              with source.open("rb") as stream:
+                  stream.seek(0, os.SEEK_END)
+                  stream.seek(max(0, stream.tell() - 16384))
+                  (output / label).write_bytes(stream.read(16384))
+          PY
+      - name: Retain bounded hosted capture results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-system-cells
+          path: |
+            /var/tmp/p11scope-ws-tmp/hosted-capabilities.txt
+            /var/tmp/p11scope-ws-tmp/hosted-context/
+            /var/tmp/p11scope-ws-tmp/hosted-system-e2e/matrix.json
+            /var/tmp/p11scope-ws-tmp/hosted-system-e2e/*/summary.txt
+          if-no-files-found: warn
+          retention-days: 7
   # SYSPLAN residual F-28: release preview (musl FULL and P0 builds,
   # docker build/lint, kubeconform, SBOM, build-release.sh wired for both
   # capture modes). Manual like the privileged lane: dispatch it on demand;

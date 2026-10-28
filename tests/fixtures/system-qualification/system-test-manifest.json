@@ -84,7 +84,7 @@
         "bounded-release"
       ],
       "expected_behavior": "regression",
-      "limitation": "source-fixed: no hosted E2E in CI. Existing check: `ci.yml` privileged-e2e job. Final execution not recorded.",
+      "limitation": "source-fixed: manual Ubuntu 26.04 hosted E2E configured. Existing check: `ci.yml` privileged-e2e four-cell count/window job. Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},

@@ -10,7 +10,8 @@ claim. Base `fabbb0a4`; re-verify on the converged candidate.
   `tests`, `bpf-noninterference`, `contracts-N` shards, `scripts`,
   `archive-log`, `coverage` + `coverage-report`, `quarantine` (only on
   failure), dispatch-only `release-preview`, gated `privileged-e2e`
-  (needs a `[self-hosted, bpf]` runner; do not dispatch blindly).
+  (ordinary hosted Ubuntu 26.04; capability checks and four required
+  PID/system metrics/profile count/window positives, not scale or soak).
 - Every job of the push run must pass on the exact candidate SHA. Record
   the URL of the run that EXECUTED the matrix, not a deduplicated one.
   A manual dispatch always reruns the full matrix (release-preview is not

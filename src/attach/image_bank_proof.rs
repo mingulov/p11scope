@@ -7021,6 +7021,20 @@ mod tests {
     }
 
     #[test]
+    fn n5_absolute_only_does_not_qualify_full_cell() {
+        // Missing production cost leaves the 15% gate unmeasured even
+        // when the independent absolute budget is met, including its
+        // inclusive boundary. This must not green the full N5 cell.
+        for added in [200.0, 250.0] {
+            let verdict = super::n5_verdict_ns_only(&[added; 5]);
+            assert!(
+                !verdict.pass,
+                "absolute-only {added} ns cannot qualify the missing percentage gate"
+            );
+        }
+    }
+
+    #[test]
     fn n5_verdict_ns_only_covers_the_added_gate() {
         let pass = super::n5_verdict_ns_only(&[200.0; 5]);
         assert!(pass.pass, "within the added budget passes");

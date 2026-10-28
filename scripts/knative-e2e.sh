@@ -21,8 +21,9 @@
 # spanning one woken request: wake with GET /, wait the attach window, run
 # the ledger on the same pod, exact LEDGER total, event_loss == 0), scale
 # back to zero, run the reported-only boundary (`profile --system` spanning
-# one cold-first request: a BOUNDARY line, never gated except on a partial
-# total) and the failure twin (inventory after scale-to-zero: the dead
+# one cold-first request: a record-only BOUNDARY line disclosing the measured
+# tail; malformed, excess, ambiguous or lossy measurements fail) and the
+# failure twin (inventory after scale-to-zero: the dead
 # serving PID is absent with no stale edge).
 #
 # The CONTROLLER runs every docker/kind/kubectl/curl command below. Workers
@@ -100,7 +101,8 @@ Environment:
 Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 UNRUN (cell not run, see SUMMARY reason).
 Every run prints a single SUMMARY line: SUMMARY cell=K3 verdict=... reason="...".
 A passing run also prints one BOUNDARY k3-cold-start counted=<n> of <N> ... line
-for the reported-only cold-first-request measurement (a partial total fails named).
+for the reported-only cold-first-request measurement. A bounded partial tail
+is a disclosed limitation; malformed, excess, ambiguous or lossy data fails.
 
 CONTROLLER (from the repo root; needs docker, kind, kubectl, curl):
   sh scripts/knative-e2e.sh --token <TOKEN>
@@ -476,48 +478,143 @@ PY
 
 # Reported-only cold-start measurement: the /ledger request as the pod's
 # first request. Prints the BOUNDARY line plus a record-only JSON line (never
-# "ok": true, so the gated count stays exact). Exit 0 when the six named
-# rows total exactly N or exactly 0; exit 2 on a partial total (the driver
-# fails that named); exit 1 when the document is unreadable.
+# "ok": true, so the gated count stays exact). Every bounded observed tail
+# from 0 through 6xN is a limitation report, not a complete-capture claim.
+# Exit 2 for a shaped but invalid measurement (loss, errors, excess counts or
+# ambiguous attribution); exit 1 for unreadable or malformed required data.
 boundary_report() {
     python3 -I - "$1" "$2" <<'PY'
-import json, sys
-path, iters = sys.argv[1], int(sys.argv[2])
-total = 6 * iters
-document = json.load(open(path, encoding="utf-8"))
-evidence = document["evidence"]
-want = {"C_GenerateRandom", "C_DigestInit", "C_Digest",
-        "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"}
-named = [f for f in document["functions"]
-         if len(f.get("names") or []) == 1 and f["names"][0] in want]
-counted = sum(f.get("calls") or 0 for f in named)
-extra = [f for f in document["functions"]
-         if (f.get("calls") or 0)
-         and not (len(f.get("names") or []) == 1 and f["names"][0] in want)]
-extra_calls = sum(f.get("calls") or 0 for f in extra)
-row_errors = sum(f.get("errors") or 0 for f in document["functions"])
-causes = ",".join(sorted(evidence["gap_classes"]["observation"]["causes"])) or "none"
-newcomer = evidence["scheduling"]["newcomer_queue"]
-dlopen_unproven = evidence["loader_discovery"]["dlopen_timing"]["unproven"]
+import json, re, sys
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+def count(value):
+    require(type(value) is int and value >= 0, "count must be a nonnegative integer")
+    return value
+
+def optional_count(value):
+    return None if value is None else count(value)
+
+def unique_object(items):
+    result = {}
+    for key, value in items:
+        require(key not in result, "duplicate JSON field")
+        result[key] = value
+    return result
+
 def field(value):
     return "null" if value is None else str(value)
-print(f"BOUNDARY k3-cold-start counted={counted} of {total} "
-      f"event_loss={evidence['event_loss']} "
-      f"attached_probes={evidence['attached_probes']} "
-      f"completeness={evidence['completeness']} causes={causes} "
-      f"pid_descendant_gaps={evidence['pid_descendant_gaps']} "
-      f"dlopen_unproven={dlopen_unproven} "
-      f"newcomer_admitted={newcomer['admitted']} "
-      f"newcomer_max_age_ms={field(newcomer['max_admitted_age_ms'])} "
-      f"attach_gap_ms={field(evidence['attach_gap_ms'])} "
-      f"discovery_ring_loss={evidence['discovery_ring_loss']} "
-      f"unprotected_windows={evidence['unprotected_live_windows']} "
-      f"in_flight={evidence['in_flight_at_end']} "
-      f"extra_rows={len(extra)} extra_calls={extra_calls} row_errors={row_errors}")
-print(json.dumps({"check": "boundary-k3-cold-start", "record_only": True,
-      "counted": counted, "of": total, "extra_rows": len(extra)}))
-sys.exit(0 if counted in (0, total) else 2)
+
+try:
+    path, iterations = sys.argv[1:]
+    require(re.fullmatch(r"[1-9][0-9]*", iterations), "invalid iteration count")
+    iters = int(iterations)
+    require(iters <= 1000000, "invalid iteration count")
+    total = 6 * iters
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source, object_pairs_hook=unique_object,
+                             parse_constant=lambda _: require(False, "invalid JSON constant"))
+    require(isinstance(document, dict)
+            and document.get("schema") == "p11scope/observed-profile/v3"
+            and document.get("lane") == "profile"
+            and document["capture"]["scope"] == "system", "not a system profile document")
+    evidence = document["evidence"]
+    for name in ("event_loss", "attached_probes", "pid_descendant_gaps", "discovery_ring_loss",
+                 "unprotected_live_windows", "in_flight_at_end"):
+        count(evidence[name])
+    require(evidence["completeness"] in ("COMPLETE", "PARTIAL"), "invalid capture completeness")
+    cause_list = evidence["gap_classes"]["observation"]["causes"]
+    require(isinstance(cause_list, list) and all(isinstance(cause, str) and cause
+            and not any(ord(char) < 32 for char in cause) for cause in cause_list), "invalid gap causes")
+    causes = ",".join(sorted(cause_list)) or "none"
+    newcomer = evidence["scheduling"]["newcomer_queue"]
+    count(newcomer["admitted"])
+    optional_count(newcomer["max_admitted_age_ms"])
+    optional_count(evidence["attach_gap_ms"])
+    dlopen_unproven = count(evidence["loader_discovery"]["dlopen_timing"]["unproven"])
+    rows = document["functions"]
+    require(isinstance(rows, list), "functions must be an array")
+    want = {"C_GenerateRandom", "C_DigestInit", "C_Digest",
+            "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"}
+    by_name = dict.fromkeys(want, 0)
+    extra = []
+    ambiguous = []
+    row_errors = 0
+    for row in rows:
+        names = row["names"]
+        require(isinstance(names, list) and names
+                and all(isinstance(name, str) and name for name in names), "invalid function names")
+        calls = count(row["calls"])
+        row_errors += count(row["errors"])
+        if len(names) == 1 and names[0] in want:
+            # Distinct providers and retired/re-attached cells may repeat a
+            # name or target; bound the aggregate, never require six rows.
+            by_name[names[0]] += calls
+        elif calls:
+            extra.append(row)
+            if want.intersection(names):
+                ambiguous.append(row)
+    counted = sum(by_name.values())
+    extra_calls = sum(row["calls"] for row in extra)
+    failures = []
+    if any(calls > iters for calls in by_name.values()) or counted > total:
+        failures.append("target-count-excess")
+    if ambiguous:
+        failures.append("ambiguous-target-alias")
+    if evidence["event_loss"]:
+        failures.append("event-loss")
+    if evidence["discovery_ring_loss"]:
+        failures.append("discovery-loss")
+    if row_errors:
+        failures.append("row-errors")
+    classification = "none" if counted == 0 else "full" if counted == total else "partial"
+    print(f"BOUNDARY k3-cold-start counted={counted} of {total} "
+          f"event_loss={evidence['event_loss']} "
+          f"attached_probes={evidence['attached_probes']} "
+          f"completeness={evidence['completeness']} causes={causes} "
+          f"pid_descendant_gaps={evidence['pid_descendant_gaps']} "
+          f"dlopen_unproven={dlopen_unproven} "
+          f"newcomer_admitted={newcomer['admitted']} "
+          f"newcomer_max_age_ms={field(newcomer['max_admitted_age_ms'])} "
+          f"attach_gap_ms={field(evidence['attach_gap_ms'])} "
+          f"discovery_ring_loss={evidence['discovery_ring_loss']} "
+          f"unprotected_windows={evidence['unprotected_live_windows']} "
+          f"in_flight={evidence['in_flight_at_end']} "
+          f"extra_rows={len(extra)} extra_calls={extra_calls} row_errors={row_errors} "
+          f"classification={classification} ambiguous_rows={len(ambiguous)} "
+          f"measurement_valid={str(not failures).lower()}")
+    print(json.dumps({"check": "boundary-k3-cold-start", "record_only": True,
+          "counted": counted, "of": total, "extra_rows": len(extra),
+          "classification": classification, "limitation": "cold-first-request-observed-tail",
+          "measurement_valid": not failures, "measurement_failures": failures}))
+    sys.exit(2 if failures else 0)
+except (OSError, ValueError, KeyError, TypeError) as error:
+    print(f"cold boundary report invalid: {error}", file=sys.stderr)
+    sys.exit(1)
 PY
+}
+
+# Record the cold observation without adding a gated check. A failed shaped
+# measurement retains the same BOUNDARY diagnostics before the cell refuses.
+record_boundary_report() {
+    BND_STATUS=0
+    BND_OUT=$(boundary_report "$1" "$2") || BND_STATUS=$?
+    BND_LINE=$(printf '%s\n' "$BND_OUT" | sed -n '1p')
+    BND_JSON=$(printf '%s\n' "$BND_OUT" | sed -n '2p')
+    case $BND_STATUS in
+        0|2) : ;;
+        *) fail_cell "boundary report failed" ;;
+    esac
+    case $BND_LINE in
+        "BOUNDARY k3-cold-start "*) : ;;
+        *) fail_cell "boundary report printed no BOUNDARY line" ;;
+    esac
+    say "$BND_LINE"
+    fact "$BND_LINE"
+    record "$BND_JSON"
+    [ "$BND_STATUS" -eq 0 ] || fail_cell "boundary k3-cold-start measurement failed"
 }
 
 # Failure twin: after scale-to-zero the dead serving PID is absent from
@@ -1163,27 +1260,29 @@ EOF
 
 k3_boundary_self_test() {
     stub=$1
-    # Reported-only cold-start measurement: full (6xN) and empty (0) both
-    # report with exit 0; a partial total exits 2; an unreadable document
-    # exits 1. Every outcome prints a BOUNDARY line carrying the disclosure
-    # fields plus a record-only JSON line that never counts as a gated check.
+    # R45: every well-formed bounded cold total reports a measured tail.
+    # Missing rows are unobserved; repeated physical cells sum by name.
+    # Loss, errors, excess counts and positive aliases refuse measurement
+    # while retaining diagnostics. Malformed/unreadable data exits 1.
     python3 - "$stub/boundary-full.json" <<'PY'
 import json, sys
 names = ["C_GenerateRandom", "C_DigestInit", "C_Digest", "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"]
 json.dump({
+  "schema": "p11scope/observed-profile/v3", "lane": "profile", "capture": {"scope": "system"},
   "evidence": {"attached_probes": 136, "event_loss": 0, "in_flight_at_end": 0,
     "completeness": "PARTIAL", "pid_descendant_gaps": 262, "attach_gap_ms": None,
     "discovery_ring_loss": 0, "unprotected_live_windows": 0,
     "gap_classes": {"observation": {"causes": ["skipped", "pid_namespace", "pid_descendant_gaps"], "status": "lossy"}},
     "loader_discovery": {"dlopen_timing": {"unproven": 1}},
     "scheduling": {"newcomer_queue": {"admitted": 6, "max_admitted_age_ms": 25}}},
-  "functions": [{"calls": 200, "errors": 0, "names": [n]} for n in names],
+  "functions": [{"calls": 200, "errors": 0, "names": [n],
+                 "target": {"object": None, "file_offset": i * 8}} for i, n in enumerate(names)],
 }, open(sys.argv[1], "w"))
 PY
     boundary_report "$stub/boundary-full.json" 200 > "$stub/bnd-full.txt" \
         || { echo "full boundary refused" >&2; exit 1; }
     k3_boundary_line_is "$stub/bnd-full.txt" "counted=1200 of 1200" \
-        "newcomer_admitted=6" "attach_gap_ms=null"
+        "newcomer_admitted=6" "attach_gap_ms=null" "classification=full" "measurement_valid=true"
     python3 - "$stub/boundary-full.json" "$stub" <<'PY'
 import copy, json, sys
 src, stub = sys.argv[1], sys.argv[2]
@@ -1193,38 +1292,131 @@ def save(name, mutate):
     mutate(bad)
     json.dump(bad, open(f"{stub}/boundary-{name}.json", "w"))
 save("empty", lambda d: [r.update(calls=0) for r in d["functions"]])
+save("absent", lambda d: d.update(functions=[]))
+save("tail", lambda d: [r.update(calls=14) for r in d["functions"]])
+save("sparse", lambda d: d.update(functions=[{**d["functions"][0], "calls": 84}]))
 save("short", lambda d: d["functions"][0].update(calls=100))
 save("over", lambda d: d["functions"][0].update(calls=201))
 save("extra", lambda d: d["functions"].append({"calls": 5, "errors": 0, "names": ["C_Login"]}))
+save("ambient-alias", lambda d: d["functions"].append({"calls": 5, "errors": 0, "names": ["C_Login", "C_Logout"]}))
+save("split", lambda d: (d["functions"][0].update(calls=100), d["functions"].append(copy.deepcopy(d["functions"][0]))))
+save("aggregate-over", lambda d: d.update(functions=[{**d["functions"][0], "calls": 150},
+                                                      {**d["functions"][0], "calls": 51}]))
+save("alias", lambda d: d["functions"][0].update(names=["C_GenerateRandom", "C_Login"]))
+save("zero-alias", lambda d: d["functions"][0].update(calls=0, names=["C_GenerateRandom", "C_Login"]))
+save("gap-tail", lambda d: ([r.update(calls=14) for r in d["functions"]],
+                            d["evidence"].update(in_flight_at_end=2, unprotected_live_windows=5, attach_gap_ms=11)))
+save("event-loss", lambda d: ([r.update(calls=14) for r in d["functions"]], d["evidence"].update(event_loss=1)))
+save("discovery-loss", lambda d: ([r.update(calls=14) for r in d["functions"]], d["evidence"].update(discovery_ring_loss=1)))
+save("row-errors", lambda d: ([r.update(calls=14) for r in d["functions"]], d["functions"][0].update(errors=1)))
+save("ambient-error", lambda d: d["functions"].append({"calls": 5, "errors": 1, "names": ["C_Login"]}))
+for field in ("calls", "errors"):
+    for label, value in (("negative", -1), ("string", "0"), ("boolean", True), ("float", 0.0), ("null", None)):
+        save(f"{field}-{label}", lambda d, field=field, value=value: d["functions"][0].update({field: value}))
+    save(f"missing-{field}", lambda d, field=field: d["functions"][0].pop(field))
+for label, value in (("empty", []), ("string", "C_GenerateRandom"), ("null", None), ("number", [1])):
+    save(f"names-{label}", lambda d, value=value: d["functions"][0].update(names=value))
+save("missing-names", lambda d: d["functions"][0].pop("names"))
+save("missing-functions", lambda d: d.pop("functions"))
+save("functions-object", lambda d: d.update(functions={}))
+save("functions-null", lambda d: d.update(functions=None))
+save("wrong-schema", lambda d: d.update(schema="p11scope/observed-profile/v2"))
+save("wrong-lane", lambda d: d.update(lane="metrics"))
+save("wrong-scope", lambda d: d["capture"].update(scope="cgroup"))
+save("missing-scheduling", lambda d: d["evidence"].pop("scheduling"))
+save("bad-causes", lambda d: d["evidence"]["gap_classes"]["observation"].update(causes="pid_namespace"))
+save("negative-loss", lambda d: d["evidence"].update(event_loss=-1))
+save("bad-gap", lambda d: d["evidence"].update(attach_gap_ms=-1))
+save("bad-age", lambda d: d["evidence"]["scheduling"]["newcomer_queue"].update(max_admitted_age_ms=False))
+save("nan", lambda d: d.update(unused=float("nan")))
+with open(f"{stub}/boundary-duplicate-field.json", "w") as output:
+    output.write(json.dumps(good).replace('"calls": 200', '"calls": 100, "calls": 200', 1))
 PY
     boundary_report "$stub/boundary-empty.json" 200 > "$stub/bnd-empty.txt" \
         || { echo "empty boundary refused" >&2; exit 1; }
     k3_boundary_line_is "$stub/bnd-empty.txt" "counted=0 of 1200" \
-        "causes=pid_descendant_gaps,pid_namespace,skipped" "dlopen_unproven=1"
+        "causes=pid_descendant_gaps,pid_namespace,skipped" "dlopen_unproven=1" "classification=none"
+    boundary_report "$stub/boundary-tail.json" 200 > "$stub/bnd-tail.txt" \
+        || { echo "approved cold tail 84/1200 refused" >&2; exit 1; }
+    k3_boundary_line_is "$stub/bnd-tail.txt" "counted=84 of 1200" "classification=partial" "measurement_valid=true"
     boundary_report "$stub/boundary-extra.json" 200 > "$stub/bnd-extra.txt" \
         || { echo "boundary with ambient rows refused" >&2; exit 1; }
     k3_boundary_line_is "$stub/bnd-extra.txt" "counted=1200 of 1200" \
         "extra_rows=1 extra_calls=5"
-    for bad in short over; do
+    for good in absent sparse short ambient-alias split zero-alias gap-tail; do
+        boundary_report "$stub/boundary-$good.json" 200 > "$stub/bnd-$good.txt" \
+            || { echo "valid cold observation refused: $good" >&2; exit 1; }
+        k3_boundary_line_is "$stub/bnd-$good.txt" "measurement_valid=true"
+    done
+    k3_boundary_line_is "$stub/bnd-absent.txt" "counted=0 of 1200" "classification=none"
+    k3_boundary_line_is "$stub/bnd-sparse.txt" "counted=84 of 1200" "classification=partial"
+    k3_boundary_line_is "$stub/bnd-short.txt" "counted=1100 of 1200" "classification=partial"
+    k3_boundary_line_is "$stub/bnd-split.txt" "counted=1200 of 1200" "classification=full"
+    k3_boundary_line_is "$stub/bnd-zero-alias.txt" "counted=1000 of 1200" "classification=partial"
+    k3_boundary_line_is "$stub/bnd-gap-tail.txt" "in_flight=2" "unprotected_windows=5" "attach_gap_ms=11"
+    for bad in over aggregate-over alias event-loss discovery-loss row-errors ambient-error; do
         status=0
         boundary_report "$stub/boundary-$bad.json" 200 > "$stub/bnd-$bad.txt" 2>/dev/null \
             || status=$?
         [ "$status" -eq 2 ] || {
-            echo "partial boundary exited $status (want 2): $bad" >&2
+            echo "invalid measurement exited $status (want 2): $bad" >&2
             exit 1
         }
-        # A partial total still prints its BOUNDARY line: the driver reports
-        # it before failing the cell named.
-        head -n 1 "$stub/bnd-$bad.txt" | grep -Fq "BOUNDARY k3-cold-start counted=" \
-            || { echo "partial boundary printed no BOUNDARY line: $bad" >&2; exit 1; }
+        k3_boundary_line_is "$stub/bnd-$bad.txt" "measurement_valid=false"
+    done
+    k3_boundary_line_is "$stub/bnd-event-loss.txt" "event_loss=1"
+    k3_boundary_line_is "$stub/bnd-discovery-loss.txt" "discovery_ring_loss=1"
+    k3_boundary_line_is "$stub/bnd-row-errors.txt" "row_errors=1"
+    k3_boundary_line_is "$stub/bnd-alias.txt" "ambiguous_rows=1" "extra_rows=1 extra_calls=200"
+    for bad in event-loss discovery-loss row-errors; do
+        k3_boundary_line_is "$stub/bnd-$bad.txt" "counted=84 of 1200" "classification=partial"
     done
     printf '{"no": "evidence"}\n' > "$stub/boundary-broken.json"
-    status=0
-    boundary_report "$stub/boundary-broken.json" 200 >/dev/null 2>&1 || status=$?
-    [ "$status" -eq 1 ] || {
-        echo "broken boundary exited $status (want 1)" >&2
-        exit 1
-    }
+    for bad in broken absent-file calls-negative calls-string calls-boolean calls-float calls-null \
+        errors-negative errors-string errors-boolean errors-float errors-null missing-calls missing-errors \
+        names-empty names-string names-null names-number missing-names missing-functions functions-object \
+        functions-null wrong-schema wrong-lane wrong-scope missing-scheduling bad-causes negative-loss \
+        bad-gap bad-age nan duplicate-field; do
+        status=0
+        boundary_report "$stub/boundary-$bad.json" 200 > "$stub/bnd-$bad.txt" 2> "$stub/bnd-$bad.err" \
+            || status=$?
+        [ "$status" -eq 1 ] && [ ! -s "$stub/bnd-$bad.txt" ] && [ -s "$stub/bnd-$bad.err" ] || {
+            echo "malformed boundary exited $status or lost its refusal diagnostic: $bad" >&2
+            exit 1
+        }
+    done
+    # Exercise the same recording/failure seam used after the real capture.
+    # The three seeded gated results must remain three on every cold report.
+    for case in full empty absent tail sparse extra split zero-alias gap-tail over aggregate-over alias \
+        event-loss discovery-loss row-errors ambient-error broken absent-file; do
+        status=0
+        (
+            FACTS=$stub/driver-$case.facts
+            SUMMARY_JSONL=$stub/driver-$case.jsonl
+            : > "$FACTS"
+            printf '%s\n' '{"check": "primary", "ok": true}' \
+                '{"check": "warm", "ok": true}' '{"check": "twin", "ok": true}' > "$SUMMARY_JSONL"
+            record_boundary_report "$stub/boundary-$case.json" 200
+        ) > "$stub/driver-$case.out" 2> "$stub/driver-$case.err" || status=$?
+        case $case in
+            over|aggregate-over|alias|event-loss|discovery-loss|row-errors|ambient-error)
+                [ "$status" -eq 1 ] || { echo "driver accepted invalid measurement: $case" >&2; exit 1; }
+                head -n 2 "$stub/driver-$case.out" > "$stub/driver-$case.boundary"
+                k3_boundary_line_is "$stub/driver-$case.boundary" "measurement_valid=false"
+                grep -Fq 'verdict=FAIL' "$stub/driver-$case.facts" \
+                    || { echo "driver lost its measurement failure: $case" >&2; exit 1; }
+                ;;
+            broken|absent-file)
+                [ "$status" -eq 1 ] || { echo "driver accepted missing shape: $case" >&2; exit 1; }
+                ;;
+            *)
+                [ "$status" -eq 0 ] || { echo "driver refused measured cold tail: $case" >&2; exit 1; }
+                k3_boundary_line_is "$stub/driver-$case.out" "measurement_valid=true"
+                ;;
+        esac
+        [ "$(grep -c '"ok": true' "$stub/driver-$case.jsonl")" -eq 3 ] \
+            || { echo "cold report changed the three gated checks: $case" >&2; exit 1; }
+    done
 }
 
 # The boundary output shape: line 1 is the BOUNDARY line carrying each named
@@ -1248,6 +1440,14 @@ k3_boundary_line_is() {
     case $bl_json in
         *'"ok": true'*) echo "boundary JSON counts as a gated check" >&2; exit 1 ;;
     esac
+    python3 -I - "$bl_json" <<'PY'
+import json, sys
+report = json.loads(sys.argv[1])
+assert report["record_only"] is True and "ok" not in report
+assert report["classification"] in ("full", "none", "partial")
+assert report["limitation"] == "cold-first-request-observed-tail"
+assert report["measurement_valid"] is (not report["measurement_failures"])
+PY
 }
 
 k3_sequencing_self_test() {
@@ -1773,27 +1973,7 @@ wait "$BND_PID" || fail_cell "boundary profile failed"
 kc -n "$OBS_NS" cp "$OBS:/tmp/k3-boundary.json" "$WORK/k3-boundary.json" >/dev/null \
     || fail_cell "cannot fetch the boundary profile"
 unlock_step
-BND_STATUS=0
-BND_OUT=$(boundary_report "$WORK/k3-boundary.json" "$ITERS") || BND_STATUS=$?
-BND_LINE=$(printf '%s\n' "$BND_OUT" | sed -n '1p')
-BND_JSON=$(printf '%s\n' "$BND_OUT" | sed -n '2p')
-case $BND_STATUS in
-    0) : ;;
-    2)
-        say "$BND_LINE"
-        fact "$BND_LINE"
-        record "$BND_JSON"
-        fail_cell "boundary k3-cold-start counted a partial total"
-        ;;
-    *) fail_cell "boundary report failed" ;;
-esac
-case $BND_LINE in
-    "BOUNDARY k3-cold-start "*) : ;;
-    *) fail_cell "boundary report printed no BOUNDARY line" ;;
-esac
-say "$BND_LINE"
-fact "$BND_LINE"
-record "$BND_JSON"
+record_boundary_report "$WORK/k3-boundary.json" "$ITERS"
 
 say "=== scale back to zero ==="
 wait_scale_zero "$KSVC" "$KNS" 180 || fail_cell "service never scaled to zero after the boundary"

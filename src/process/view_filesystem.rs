@@ -973,7 +973,8 @@ mod tests {
         let anchor_fd = anchor.as_raw_fd();
         drop(anchor);
         assert_closed(anchor_fd);
-        println!("{COMPLETED}");
+        // libtest's nocapture label may still occupy the current stdout line.
+        println!("\n{COMPLETED}");
     }
 
     #[test]

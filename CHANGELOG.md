@@ -96,6 +96,9 @@ or a product startup SLA.
 
 ### Fixed
 
+- An ordinary native-retirement refusal during a `--manifest` capture writes
+  the incomplete report and returns nonzero on the first stop. Original
+  ownership remains quarantined and replacement admission remains blocked.
 - Provider discovery retains usable function entries independently of version
   labels, including 68-entry legacy tables labelled 3.2, sparse tables and
   acquired all-NULL tables. Unavailable words and unusable targets remain
@@ -144,12 +147,10 @@ Known issues in this release:
   gaps; their calls through attached providers still count.
 - This version reports no key operations (planned for 0.5.1);
   mechanisms and API results are reported as before.
-- If probes failed to detach cleanly during a `--manifest` capture,
-  stopping needs a second Ctrl-C to write the report.
 - A process whose main thread had already exited when first met is not
   admitted, and its calls are not counted.
-- A library loaded just before a process exits counts one
-  `discovery_truncated` gap; call counts stay exact.
+- Loader inspection still pending when process custody ends can remain
+  unavailable and produce a `discovery_truncated` gap; call counts are independent.
 - A post-exec instance whose semantics cannot be proven appears as a
   named gap, not a joined instance.
 - Historical 5.15 per-copy attribution and non-leader exec results remain

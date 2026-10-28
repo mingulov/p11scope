@@ -52,10 +52,9 @@ Short-lived processes missed at system scale are counted only as gaps
 count. A process whose main thread had already exited when the capture
 first met it is not admitted, and its calls are not counted.
 
-A library loaded just before a process exits (glibc loads `libgcc_s`
-at a thread's first `pthread_exit`) cannot be checked against the dead
-process: the report counts one `discovery_truncated` gap with the
-loader skipped as `discovery unavailable`, and call counts stay exact.
+If a process exits while loader inspection is still pending, the report may
+include a `discovery_truncated` gap. Unread metadata remains unavailable;
+call coverage is evaluated separately.
 A post-exec instance whose semantics cannot be proven appears as a
 named gap (`gap [instance semantics refused] instance_unproven`), not
 a joined instance. If a multi-threaded program unloads and reloads a
@@ -66,10 +65,10 @@ is also one instance.
 
 This version reports no key operations, so the `key operations:`
 line always reads `not reported by this version (planned for 0.5.1)`;
-mechanisms and API results are reported as before. If probes failed to detach cleanly
-during a `--manifest` capture, stopping needs a second Ctrl-C: the
-first begins the stop and the second interrupts the wait so the report
-is written.
+mechanisms and API results are reported as before. An ordinary native-retirement
+refusal during a `--manifest` capture ends the first stop with an incomplete
+report and a nonzero exit. Uncertain native ownership stays retained and
+replacement admission stays blocked; the refusal is not proof of clean detach.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

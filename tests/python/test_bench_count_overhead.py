@@ -293,6 +293,32 @@ class TracedCostOracle(unittest.TestCase):
             self.assertEqual(37.5 * 100.0 / production_ns, 15.0)
             self.assertGreater(37.5001 * 100.0 / production_ns, 15.0)
 
+    def test_traced_cost_machine_denominator_round_trips_at_budget_boundary(self):
+        cell = "relevant-call-t4"
+        for wall_ns, added_ns, expected_pass in (
+                (1249960, 37.5, False), (1250040, 37.501, True)):
+            log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+            for rnd in range(1, 6):
+                arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                    "unobserved", "on", "on", "unobserved")
+                for arm in arms:
+                    if arm == "on":
+                        log += sample(cell, arm, rnd, 4, 1000, wall_ns,
+                                      **counted(4, 1000), **bpf())
+                    else:
+                        log += sample(cell, arm, rnd, 4, 1000, 1000000,
+                                      lane="none")
+            rows, problems = den_analyze_text(log, cells=(cell,))
+            self.assertEqual(problems, [])
+            self.assertEqual(len(rows), 1)
+            raw = rows[0]["median_ns"]
+            line, = ANALYZE["traced_cost_lines"](rows)
+            fields = dict(token.split("=", 1) for token in line.split()[1:])
+            exported = float(fields["median_ns"])
+            self.assertEqual(exported, raw, "machine denominator must round-trip")
+            self.assertEqual(added_ns * 100.0 / raw <= 15.0, expected_pass)
+            self.assertEqual(added_ns * 100.0 / exported <= 15.0, expected_pass)
+
     def test_traced_cost_accepts_exact_denominator_campaign(self):
         rows, problems = den_analyze_text(dencampaign_log())
         self.assertEqual(problems, [])

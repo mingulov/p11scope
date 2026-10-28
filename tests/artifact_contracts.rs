@@ -6076,11 +6076,11 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
     // OBJECT_ZERO) with no new programs. Selected detailed adds the
     // three SELECTED_* maps and the bootstrap/cgroup-migrate programs.
-    // The birth marker adds JOURNAL_MARKER_CTL and no program.
+    // R52 omits the deferred birth-marker map without removing a core program.
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (45, 25)
+        (44, 25)
     } else {
-        (43, 20)
+        (42, 20)
     };
     let report = run_ok(
         "python3",

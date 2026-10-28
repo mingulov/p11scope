@@ -2964,7 +2964,7 @@ fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
 /// after the mint publishes READY with the minted generation and one
 /// admission, and the next call carries the same exec ID.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3049,7 +3049,7 @@ fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> 
 /// (the neighbor detachment gate pins that bound), so this cell reads the
 /// row, never events.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3102,7 +3102,7 @@ fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<
 /// re-execing from a thread. Reads the row after the exec, never events.
 /// The private cgroup is removed at the end.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3193,7 +3193,7 @@ fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Res
 /// keeps no row (task storage dies with the task), every marker write
 /// charges first, and the parent's row is untouched.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3253,7 +3253,7 @@ fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
 /// stops creating (no row), stops charging once (spent moves), or faults.
 /// The in-scope twin joins clean. The private cgroup is removed at the end.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<()> {
     let PairSetup {
         _directory,
@@ -3347,7 +3347,7 @@ fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<
 /// (No vfork child runs here, so the CLONE_VM-sharer exception is out of
 /// scope for this cell.)
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
     let PairSetup {
         _directory,
@@ -3408,7 +3408,7 @@ fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
 /// and one call stick DIRTY across the move back, another call, and a
 /// later in-scope exec. The private cgroup is removed at the end.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3490,7 +3490,7 @@ fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Resu
 /// provider while the process leaves the cgroup dirties on return, with no
 /// other call in between. The same held call released in scope leaves READY.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
     let CmdSetup {
         _directory,
@@ -3588,7 +3588,7 @@ fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
 /// READY. The process keeps running throughout; the private cgroup is
 /// removed at the end.
 #[test]
-#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+#[ignore = "R52 deferred to 0.5.1: requires a marker-enabled BPF build"]
 fn privileged_journal_marker_abandoned_call_at_thread_exit_dirties() -> Result<()> {
     let CmdSetup {
         _directory,

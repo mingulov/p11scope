@@ -177,17 +177,17 @@ fn native_bpf_map_decoder_contracts() {
     assert!(report.contains("\nOK\n"), "skipped decoder proof: {report}");
 }
 
-/// H8-D birth marker twins: the freeze and call-site checks run here so
-/// CI pins all twenty-one without a live object.
+/// Release marker-OFF inventory and future native marker call-site twins.
 #[test]
 fn embedded_birth_marker_twins_are_driven() {
     let cases = [
-        "JournalMarkerInventoryTests.test_detailed_freeze_accepts_marker",
-        "JournalMarkerInventoryTests.test_detailed_without_marker_map_refused",
+        "JournalMarkerInventoryTests.test_release_detailed_marker_absence_accepts",
+        "JournalMarkerInventoryTests.test_release_detailed_stale_marker_inventory_refused",
+        "JournalMarkerInventoryTests.test_release_half_linked_marker_globals_refused",
         "JournalMarkerInventoryTests.test_inventory_with_marker_map_refused",
         "JournalMarkerInventoryTests.test_inventory_with_marker_symbols_refused",
-        "JournalMarkerInventoryTests.test_marker_value_size_8_refused",
-        "JournalMarkerInventoryTests.test_missing_marker_global_refused",
+        "JournalMarkerInventoryTests.test_release_stale_marker_wrong_abi_refused",
+        "JournalMarkerInventoryTests.test_core_instance_helper_missing_still_refused",
         "JournalMarkerInventoryTests.test_marker_helper_boundary",
         "JournalMarkerInventoryTests.test_marker_helper_boundary_refuses_user_read",
         "JournalMarkerInventoryTests.test_marker_single_global_refused",
@@ -216,6 +216,6 @@ fn embedded_birth_marker_twins_are_driven() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.status.success(), "birth marker twins: {report}");
-    assert!(report.contains("Ran 21 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 22 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped marker proof: {report}");
 }

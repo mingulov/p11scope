@@ -8,6 +8,12 @@
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
 
+#[cfg(all(
+    p11scope_birth_marker,
+    any(feature = "inventory-only", feature = "counter-broad")
+))]
+compile_error!("birth markers require a Detailed non-bank object");
+
 #[cfg(all(feature = "inventory-only", feature = "unsafe-unvalidated-metadata"))]
 compile_error!("inventory-only cannot be combined with unsafe-unvalidated-metadata");
 
@@ -1957,6 +1963,7 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
         // H8-D birth marker: an in-scope exec after closure publishes
         // READY for key-operation birth. Scope-gated: an exec outside
         // the scope can never be born, so it is never charged.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
         unsafe {
             p11_instance_exec_birth();
@@ -1987,6 +1994,7 @@ pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
 /// Cleanup outcome for a healthy settle that abandoned at least one live
 /// START (mirrors `P11_OWNER_CLEANUP_ABANDONED_START` in task_owner.h;
 /// pinned by test). Only 1 is failure.
+#[cfg(p11scope_birth_marker)]
 #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
 const OWNER_CLEANUP_ABANDONED_START: u32 = 2;
 
@@ -2005,6 +2013,7 @@ fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
     // H8-D birth marker: a call that entered in scope but never returned,
     // reclaimed here at thread exit, is an uncaptured call, so it dirties
     // the leader row.
+    #[cfg(p11scope_birth_marker)]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     if cleanup == OWNER_CLEANUP_ABANDONED_START {
         unsafe {
@@ -2848,6 +2857,7 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
         // H8-D birth marker: a watched call outside the scope dirties
         // the leader row, so a later exec cannot claim an uncaptured
         // prefix as born.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -2905,8 +2915,10 @@ unsafe extern "C" {
     /// only): the exec half publishes READY on the leader row after
     /// closure; the gap half dirties it on an out-of-scope or refused
     /// call. Both own their frames; failures latch the control row.
+    #[cfg(p11scope_birth_marker)]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_exec_birth() -> u32;
+    #[cfg(p11scope_birth_marker)]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_scope_gap() -> u32;
     fn p11_owner_healthy() -> u32;
@@ -3444,6 +3456,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         // H8-D birth marker: a watched call outside the scope dirties
         // the leader row, so a later exec cannot claim an uncaptured
         // prefix as born.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3457,6 +3470,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     };
     let Some(actual_layout) = probe_layout(&ctx) else {
         // H8-D birth marker: a refused ABI is an uncaptured call.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3468,6 +3482,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     let layout = if ENTRY_ABI == ENTRY_ABI_LP64 {
         if !matches!(actual_layout, LinuxLayout::Lp64) {
             // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(p11scope_birth_marker)]
             #[cfg(not(feature = "counter-broad"))]
             unsafe {
                 p11_instance_scope_gap();
@@ -3480,6 +3495,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     } else if ENTRY_ABI == ENTRY_ABI_ILP32 {
         if !matches!(actual_layout, LinuxLayout::Ilp32) {
             // H8-D birth marker: a refused ABI is an uncaptured call.
+            #[cfg(p11scope_birth_marker)]
             #[cfg(not(feature = "counter-broad"))]
             unsafe {
                 p11_instance_scope_gap();
@@ -3511,6 +3527,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if unsafe { p11_link_current_identity(&mut seed.image) } != 1 || seed.image.task_cookie == 0 {
         // H8-D birth marker: a call lost to identity failure is an
         // uncaptured call, so it dirties the leader row.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3541,6 +3558,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if start_pointer.is_null() {
         // H8-D birth marker: a call lost to START refusal is an
         // uncaptured call, so it dirties the leader row.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3833,6 +3851,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         };
         // H8-D birth marker: a return that lost its scope loses the
         // completion, so it dirties the leader row.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3858,6 +3877,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let Some(layout) = ret_probe_layout(&ctx) else {
         // H8-D birth marker: a return with a refused ABI loses the
         // completion, so it dirties the leader row.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -3873,6 +3893,7 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         // H8-D birth marker: a return without START loses the
         // completion. Absence and owner-custody refusal share this NULL,
         // so both dirty the leader row.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -4057,6 +4078,7 @@ fn ordinary_return(
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         // H8-D birth marker: an identity-mismatched return loses the
         // completion, so it gaps here in place at depth 3.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         unsafe {
             p11_instance_scope_gap();
@@ -4083,6 +4105,7 @@ fn ordinary_return(
             bump_evidence(EVIDENCE_RING_LOSS);
             // H8-D birth marker: a ring-loss return loses the
             // completion. The gap runs here in place.
+            #[cfg(p11scope_birth_marker)]
             #[cfg(not(feature = "counter-broad"))]
             unsafe {
                 p11_instance_scope_gap();
@@ -4175,6 +4198,7 @@ fn object_return(
         bump_evidence(EVIDENCE_RING_LOSS);
         // H8-D birth marker: a ring-loss return whose START removal
         // settled loses the completion, so it gaps here in place.
+        #[cfg(p11scope_birth_marker)]
         #[cfg(not(feature = "counter-broad"))]
         if !failed {
             unsafe {

@@ -1137,7 +1137,7 @@ fn object_journal_cleanup_abandoned_code_matches_native() {
 fn object_journal_marker_build_uses_one_gate() {
     let build = std::fs::read_to_string("build.rs").expect("read build script");
     let lines: Vec<&str> = build.lines().collect();
-    let binding = "let journal_marker = ";
+    let binding = "let journal_marker =";
     let predicates: Vec<&&str> = lines
         .iter()
         .filter(|line| line.trim_start().starts_with(binding))
@@ -1147,15 +1147,26 @@ fn object_journal_marker_build_uses_one_gate() {
         1,
         "the marker build must share one predicate"
     );
+    assert!(build.contains("const BIRTH_MARKER_ENABLED: bool = false;"));
+    let predicate = build
+        .split_once(binding)
+        .expect("single marker predicate")
+        .1
+        .split(';')
+        .next()
+        .expect("terminated marker predicate");
     assert!(
-        predicates[0].contains("BpfFlavor::Detailed") && predicates[0].contains("!bank_proof"),
+        predicate.contains("BIRTH_MARKER_ENABLED")
+            && predicate.contains("BpfFlavor::Detailed")
+            && predicate.contains("!bank_proof"),
         "the shared gate must select Detailed non-bank builds: {}",
-        predicates[0]
+        predicate
     );
     for anchor in [
         "selected_native_units.push(\"journal_marker\")",
         "\"-DP11SCOPE_JOURNAL_MARKER\"",
         "\"link-arg=--export=p11_instance_scope_gap\"",
+        "\"--cfg=p11scope_birth_marker\"",
     ] {
         let at = lines
             .iter()
@@ -1171,6 +1182,46 @@ fn object_journal_marker_build_uses_one_gate() {
             "marker build site must use the shared gate: {anchor} under {guard}"
         );
     }
+    let host = build
+        .split("cargo:rustc-cfg=p11scope_birth_marker")
+        .next()
+        .expect("host cfg site");
+    assert!(build.contains("cargo:rustc-cfg=p11scope_birth_marker"));
+    assert!(
+        host.lines()
+            .rev()
+            .take(2)
+            .any(|line| line.contains("if BIRTH_MARKER_ENABLED"))
+    );
+}
+
+#[test]
+fn object_journal_marker_calls_and_declarations_share_the_gate() {
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let lines: Vec<_> = source.lines().collect();
+    let mut calls = 0;
+    let mut declarations = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        let call = matches!(
+            line,
+            "p11_instance_exec_birth();" | "p11_instance_scope_gap();"
+        );
+        let declaration = line.starts_with("fn p11_instance_exec_birth(")
+            || line.starts_with("fn p11_instance_scope_gap(");
+        if call || declaration {
+            assert!(
+                lines[index.saturating_sub(6)..index]
+                    .iter()
+                    .any(|line| line.trim() == "#[cfg(p11scope_birth_marker)]"),
+                "marker site must have the same compile-time gate: {line}"
+            );
+            calls += usize::from(call);
+            declarations += usize::from(declaration);
+        }
+    }
+    assert_eq!(calls, 15);
+    assert_eq!(declarations, 2);
 }
 
 /// H8-D marker drop arms: every silent in-scope drop arm calls the scope
@@ -1434,14 +1485,18 @@ fn object_journal_object_ring_loss_gap_requires_settled_guard() {
 /// object count, so the test cannot pass with an empty selection.
 #[test]
 fn object_journal_release_has_no_birth_marker_paths() {
-    let object = aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse release Detailed object");
+    let object =
+        aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse release Detailed object");
     assert!(
         !object.maps.contains_key("JOURNAL_MARKER_CTL"),
         "the release must not allocate the deferred birth-marker control map"
     );
     for name in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
         assert!(
-            !object.functions.values().any(|function| function.name == name),
+            !object
+                .functions
+                .values()
+                .any(|function| function.name == name),
             "the release must not retain a marker body, including a no-op stub: {name}"
         );
     }
@@ -1514,7 +1569,7 @@ fn object_journal_marker_wired_detailed_only() {
         "the counter class checks every built counter object"
     );
     for (class, objects, wired) in [
-        ("detailed", detailed.as_slice(), true),
+        ("detailed", detailed.as_slice(), cfg!(p11scope_birth_marker)),
         ("inventory", inventory.as_slice(), false),
         ("counter", counter.as_slice(), false),
     ] {

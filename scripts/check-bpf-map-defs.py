@@ -2022,9 +2022,6 @@ SAFE_MAPS = {
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
-        # H8-D post-attach birth marker: Detailed-only admission control
-        # row {spent, failed}, frozen before links attach.
-        "JOURNAL_MARKER_CTL": (2, 4, 16, 1),
     }.items()
 }
 UNSAFE_MAPS = SAFE_MAPS | {
@@ -2165,6 +2162,10 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
+    if not inventory:
+        markers = symbols & (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"})
+        if markers:
+            raise RuntimeError(f"release object contains forbidden birth marker symbols: {sorted(markers)}")
     if inventory:
         allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity",
                    "INV_BASELINE_RQ", "INV_BASELINE_CT",
@@ -2176,8 +2177,7 @@ def validate_inventory(variant, maps, programs, symbols):
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
-                        | REQUIRED_GLOBAL_MARKER_HELPERS)
+                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
     required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
     if callers:
         required_helpers |= {"p11_link_current_identity"}
@@ -2220,7 +2220,7 @@ def self_test():
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
-    assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1)
+    assert "JOURNAL_MARKER_CTL" not in SAFE_MAPS
     assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
     assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
     assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)

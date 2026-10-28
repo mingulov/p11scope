@@ -127,17 +127,6 @@ attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
 attach::instance_tests::privileged_object_continuity_refusal_preserves_s1_base
-# Birth marker cells: live exec/fork/scope-gap marker words and admission
-# counts through the session's instance maps.
-attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
-attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
-attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
-attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready
-attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
-attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
-attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
-attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
-attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 # H6 observer mapping interactions: owned idle target and genuine external
 # mutation control; distinguish ordinary scans from System identity anchors.
 attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance
@@ -374,8 +363,18 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_p
 discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_identity_refusals
 )
 
-# Static skips: external fixture/driver/env the script cannot provide.
+# Static skips: external prerequisites or explicitly deferred build cells.
 SKIP_TESTS=(
+# R52: preserve the marker assertions for the 0.5.1 marker-enabled build.
+attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
+attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
+attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
+attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready
+attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
+attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
+attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
+attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
+attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 attach::instance_tests::privileged_instance_cross_process_punch_hole_renews
 attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
 attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins
@@ -465,6 +464,15 @@ metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
 )
 SKIP_REASONS=(
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
+"R52: deferred to 0.5.1; requires a marker-enabled future build, with original assertions preserved"
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"

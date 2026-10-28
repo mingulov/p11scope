@@ -33,6 +33,10 @@ mod clang_resolve;
 #[path = "build_support/semantic_rustc.rs"]
 mod semantic_rustc;
 
+// R52: the unused birth-marker paths move to 0.5.1. One trusted source
+// decision controls host expectations and every native/Rust BPF build site.
+const BIRTH_MARKER_ENABLED: bool = false;
+
 #[derive(Clone, Copy)]
 enum BpfFlavor {
     Detailed,
@@ -124,6 +128,14 @@ fn main() {
     // Refuse malformed requests before any compiler or native build work.
     let counter_artifacts = counter_artifacts_requested();
     let counter_objects_request = counter_objects_requested();
+    println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
+    if BIRTH_MARKER_ENABLED {
+        println!("cargo:rustc-cfg=p11scope_birth_marker");
+    }
+    println!(
+        "cargo:rustc-env=P11SCOPE_BIRTH_MARKER_ENABLED={}",
+        u8::from(BIRTH_MARKER_ENABLED)
+    );
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
@@ -392,7 +404,8 @@ fn build_variant_with_proof(
     // control row; counter and inventory flavors keep no marker state.
     // One gate for the unit, the define and the exports below, so a
     // future Detailed bank object cannot half-link the marker.
-    let journal_marker = matches!(flavor, BpfFlavor::Detailed) && !bank_proof;
+    let journal_marker =
+        BIRTH_MARKER_ENABLED && matches!(flavor, BpfFlavor::Detailed) && !bank_proof;
     if journal_marker {
         selected_native_units.push("journal_marker");
     }
@@ -589,6 +602,10 @@ fn build_variant_with_proof(
         }
         flags.push_str(flag);
     };
+    append_flag("--check-cfg=cfg(p11scope_birth_marker)");
+    if journal_marker {
+        append_flag("--cfg=p11scope_birth_marker");
+    }
     // Native task storage and typed tracepoint require BTF/CO-RE in every build.
     for flag in [
         "-C",

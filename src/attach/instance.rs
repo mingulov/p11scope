@@ -1237,18 +1237,19 @@ fn marker_row_or_refuse(
 
 /// Detailed-only birth marker control (`JOURNAL_MARKER_CTL[0]`):
 /// exact metadata, zero readback, then freeze before any link. A
-/// Detailed object without the map is a stale build; a counter
+/// Detailed object must match this compilation's marker selection; a counter
 /// bank object with the map is refused without touching it.
 /// UNRUN: live map access stays out of tests; the verdict below is
 /// pinned over pure values.
 pub(super) fn prepare_marker_control(ebpf: &aya::Ebpf, roots: StaticRoots) -> Result<()> {
     const NAME: &str = "JOURNAL_MARKER_CTL";
+    let expected = cfg!(p11scope_birth_marker);
     let map = ebpf.map(NAME);
-    if roots == StaticRoots::CounterBanks {
-        return marker_control_verdict(map.is_some(), roots, None);
+    if roots == StaticRoots::CounterBanks || !expected {
+        return marker_control_verdict(map.is_some(), roots, expected, None);
     }
     let Some(map) = map else {
-        return marker_control_verdict(false, roots, None);
+        return marker_control_verdict(false, roots, expected, None);
     };
     let data = super::policy_map_data(NAME, map)?;
     super::validate_map_metadata(NAME, data, super::map_metadata(MapType::Array, 4, 16, 1, 0))?;
@@ -1256,28 +1257,32 @@ pub(super) fn prepare_marker_control(ebpf: &aya::Ebpf, roots: StaticRoots) -> Re
     let readback = control
         .get(&0, 0)
         .with_context(|| format!("reading {NAME} control row"))?;
-    marker_control_verdict(true, roots, Some(readback))?;
+    marker_control_verdict(true, roots, expected, Some(readback))?;
     super::freeze_map(NAME, map)
 }
 
 /// Pure control-row verdict behind [`prepare_marker_control`]: a
-/// Detailed session needs the map with a zero readback (a missing
-/// map is a stale build; a nonzero row moved before the freeze),
-/// while counter banks must not carry the map at all.
+/// Detailed session requires the map exactly when this build enabled it. An
+/// enabled map needs zero readback before freezing; counter banks forbid it
+/// independently of the Detailed build selection.
 fn marker_control_verdict(
     present: bool,
     roots: StaticRoots,
+    expected: bool,
     readback: Option<JournalAdmissionControl>,
 ) -> Result<()> {
-    match (roots, present) {
-        (StaticRoots::CounterBanks, true) => {
+    match (roots, expected, present) {
+        (StaticRoots::CounterBanks, _, true) => {
             bail!("JOURNAL_MARKER_CTL present in a counter bank object")
         }
-        (StaticRoots::CounterBanks, false) => Ok(()),
-        (StaticRoots::Detailed, false) => {
+        (StaticRoots::CounterBanks, _, false) | (StaticRoots::Detailed, false, false) => Ok(()),
+        (StaticRoots::Detailed, false, true) => {
+            bail!("JOURNAL_MARKER_CTL present in a marker-off Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, false) => {
             bail!("JOURNAL_MARKER_CTL missing from the Detailed object (stale build)")
         }
-        (StaticRoots::Detailed, true) => match readback {
+        (StaticRoots::Detailed, true, true) => match readback {
             Some(control) if control.spent == 0 && control.failed == 0 => Ok(()),
             Some(control) => bail!(
                 "JOURNAL_MARKER_CTL moved before links: spent={} failed={}",
@@ -2448,7 +2453,7 @@ mod tests {
             spent: 0,
             failed: 0,
         };
-        super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+        super::marker_control_verdict(true, super::StaticRoots::Detailed, true, Some(control))
             .expect("zero readback accepts");
     }
 
@@ -2461,7 +2466,7 @@ mod tests {
             failed: 0,
         };
         assert!(
-            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, true, Some(control))
                 .is_err()
         );
     }
@@ -2474,7 +2479,7 @@ mod tests {
             failed: 1,
         };
         assert!(
-            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control))
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, true, Some(control))
                 .is_err()
         );
     }
@@ -2483,7 +2488,9 @@ mod tests {
     fn marker_control_detailed_absent_map_refuses() {
         // H8-D: a Detailed object without the map is a stale
         // build; the session refuses instead of running blind.
-        assert!(super::marker_control_verdict(false, super::StaticRoots::Detailed, None).is_err());
+        assert!(
+            super::marker_control_verdict(false, super::StaticRoots::Detailed, true, None).is_err()
+        );
     }
 
     #[test]
@@ -2491,20 +2498,21 @@ mod tests {
         // H8-D: counter bank objects must not carry the marker
         // map; a session over one refuses.
         assert!(
-            super::marker_control_verdict(true, super::StaticRoots::CounterBanks, None).is_err()
+            super::marker_control_verdict(true, super::StaticRoots::CounterBanks, false, None)
+                .is_err()
         );
     }
 
     #[test]
     fn marker_control_counter_absent_accepts() {
         // H8-D: the healthy counter twin of the refusal above.
-        super::marker_control_verdict(false, super::StaticRoots::CounterBanks, None)
+        super::marker_control_verdict(false, super::StaticRoots::CounterBanks, false, None)
             .expect("counter banks without the map accept");
     }
 
     #[test]
     fn marker_control_release_off_absent_accepts() {
-        super::marker_control_verdict(false, super::StaticRoots::Detailed, None)
+        super::marker_control_verdict(false, super::StaticRoots::Detailed, false, None)
             .expect("a release compiled without birth markers accepts their absence");
     }
 
@@ -2512,9 +2520,27 @@ mod tests {
     fn marker_control_release_off_stale_present_refuses() {
         let control = p11scope_ebpf_common::JournalAdmissionControl::default();
         assert!(
-            super::marker_control_verdict(true, super::StaticRoots::Detailed, Some(control)).is_err(),
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, false, Some(control))
+                .is_err(),
             "an old marker-enabled object must not satisfy the marker-off release policy"
         );
+    }
+
+    #[test]
+    fn marker_control_enabled_missing_readback_refuses() {
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::Detailed, true, None).is_err()
+        );
+    }
+
+    #[test]
+    fn marker_control_counter_forbids_map_when_detailed_enabled() {
+        assert!(
+            super::marker_control_verdict(true, super::StaticRoots::CounterBanks, true, None)
+                .is_err()
+        );
+        super::marker_control_verdict(false, super::StaticRoots::CounterBanks, true, None)
+            .expect("the Detailed selection cannot require a counter marker map");
     }
 
     #[test]

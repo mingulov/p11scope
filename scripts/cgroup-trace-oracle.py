@@ -71,6 +71,64 @@ def parse_trace(text):
     return rows, counts, evidence, errors
 
 
+def unreadable_proven(receipt, images, generations, calls, start, ready, stop):
+    try:
+        fact = receipt['unreadable']
+        target_id = fact['image']
+        if len(images) != 2 or target_id not in images:
+            return False
+        anchor_id, = set(images) - {target_id}
+        target, anchor = images[target_id], images[anchor_id]
+        if (generations[target_id]['named'] or not generations[target_id]['unknown']
+                or not generations[anchor_id]['named']):
+            return False
+        controller = fact['controller']
+        expected = dict(uid=0, gid=0, groups=[])
+        if controller['uid'] != 0 or controller['gid'] != 0 or controller['pid'] <= 0:
+            return False
+        for field in ('effective', 'permitted', 'bounding'):
+            mask = controller[field]
+            if type(mask) is not int or not 0 <= mask < 1 << 64:
+                return False
+            expected[field] = mask & ~(1 << 19)
+        if not controller['effective'] & (1 << 19):
+            return False
+        if (fact['observer_credentials'] != expected
+                or fact['final_observer_credentials'] != expected):
+            return False
+        dump = fact['dumpability']
+        if (dump['kind'] != 'dumpability' or dump['image'] != target_id
+                or dump['pid'] != target['pid'] or dump['tid'] != target['pid']
+                or dump['uid'] != 0 or dump['dumpable'] != 0):
+            return False
+        before, after = fact['before'], fact['after']
+        if (not start <= before['started_ns'] <= before['finished_ns'] <= ready
+                or not dump['t'] < before['started_ns']
+                or not calls or not max(call['t1'] for call in calls) <= after['started_ns']
+                or not after['started_ns'] <= after['finished_ns'] <= stop):
+            return False
+        for proof in (before, after):
+            if proof['credentials'] != expected:
+                return False
+            for role, image in (('anchor', anchor), ('target', target)):
+                row = proof[role]
+                if (row['pid'] != image['pid'] or row['start_time'] != image['start_time']
+                        or row['ppid'] != controller['pid'] or row['credentials'] != expected
+                        or set(row['metadata_readable']) != {'maps', 'stat', 'cgroup'}
+                        or any(value is not True for value in row['metadata_readable'].values())):
+                    return False
+            if (proof['anchor']['exe'] != {field: anchor[field] for field in ('path', 'dev', 'ino', 'mtime_ns')}
+                    or type(proof['anchor']['mount_namespace']) is not int
+                    or proof['anchor']['mount_namespace'] <= 0
+                    or set(proof['target']['exe_errors']) != {'stat', 'readlink'}
+                    or any(type(value) is not int or value not in (1, 13)
+                           for value in (*proof['target']['exe_errors'].values(), proof['target']['namespace_errno']))):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _evaluate(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = parse_trace(trace)
     if file_trace is not None:
@@ -255,6 +313,40 @@ def _evaluate(trace, ledger, receipt, file_trace):
     for image_id in receipt.get('require_named_images', []):
         if not generations[image_id]['named']:
             errors.append('required image contains no independently correct named event')
+    if receipt['cell'] == 'mapped-only':
+        mapped = receipt['mapped_only']
+        image_id = mapped['image']
+        before_map, after_map = mapped['before'], mapped['after']
+        target = targets.get((image_id, 'C_GetFunctionList'))
+        if (len(images) != 2 or image_id not in images or before_map != after_map
+                or set(before_map) != {'dev', 'ino', 'file_offset', 'permissions'}
+                or before_map['dev'] != before['dev'] or before_map['ino'] != before['ino']
+                or before_map['permissions'][2:3] != 'x' or not target
+                or target['file_offset'] != before_map['file_offset']
+                or not images[image_id]['t'] <= mapped['before_ns'] < start
+                or not stop <= mapped['after_ns']
+                or any(call['image'] == image_id for call in calls)
+                or any(row['pid'] == images[image_id]['pid'] for row in rows)
+                or not any(pop['named'] for image, pop in generations.items() if image != image_id)):
+            errors.append('mapped-only cell lacks the held uncalled mapping and named anchor')
+    if receipt['cell'] == 'duplicate-basename':
+        paths = [image['path'] for image in images.values()]
+        files = {(image['dev'], image['ino']) for image in images.values()}
+        if (len(paths) != 2 or len(set(paths)) != 2 or len(files) != 2
+                or len({Path(path).name for path in paths}) != 1
+                or any(not pop['named'] for pop in generations.values())):
+            errors.append('duplicate-basename cell needs distinct files and both correctly named paths')
+    if receipt['cell'] == 'unreadable' and not unreadable_proven(
+            receipt, images, generations, selected_interval, start, ready, stop):
+        errors.append('unreadable cell lacks actual same-credential denial and the named-anchor/Unknown-target split')
+    if receipt['cell'] == 'slow-reader':
+        pause = receipt['reader_pause']
+        paused, resumed, hold = (pause[field] for field in ('paused_ns', 'resumed_ns', 'hold_ns'))
+        if (any(type(value) is not int for value in (paused, resumed, hold))
+                or hold != 250_000_000 or not start <= paused <= ready < resumed <= stop
+                or not any(paused <= call['t0'] <= call['t1'] and call['t1'] + hold <= resumed
+                           for call in selected_interval)):
+            errors.append('slow reader lacks an acknowledged pause across a real call and bounded hold')
     for image_id in receipt.get('first_unknown_images', []):
         image_calls = [call for call in selected_interval if call['image'] == image_id]
         new_child = (receipt['cell'] == 'short' and receipt['short_lifetime']['image'] == image_id
@@ -277,12 +369,14 @@ def _evaluate(trace, ledger, receipt, file_trace):
         ev = evidence[0]
         if ev.get('privacy_mode') != 'allowlisted' or ev.get('trace_truncated') is not False:
             errors.append('capture privacy policy/truncation differs from the requested policy')
+        if type(ev.get('event_loss')) is not int or ev['event_loss'] != 0:
+            errors.append('capture lacks its mandatory integer zero event-loss proof')
         if any(ev.get(field, 0) != 0 for field in
-               ('event_loss', 'start_insert_failures', 'unmatched_returns', 'rv_update_failures',
+               ('start_insert_failures', 'unmatched_returns', 'rv_update_failures',
                 'cgroup_scope_failures', 'process_tracking_failures', 'process_tracking_evictions')):
             errors.append('capture reports event/identity loss in this no-loss cell')
-        if ev.get('final_drain') is False and ev.get('completeness') == 'COMPLETE':
-            errors.append('capture claims complete without its final drain proof')
+        if ev.get('final_drain') is not True:
+            errors.append('capture lacks its mandatory proven final drain')
     # A fresh session with just one authentic provider CALL has no upper
     # witness. This is independent setup proof, not a timing assumption.
     first_proved = (receipt['cell'] != 'run' and receipt.get('fresh_observer') is True

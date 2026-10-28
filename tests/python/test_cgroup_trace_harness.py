@@ -2,6 +2,7 @@
 """Ownership checks must fail before any signal or cgroup mutation."""
 
 from collections import Counter
+import hashlib
 import os
 import json
 import io
@@ -19,6 +20,30 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
+
+
+class DelayedReaderTests(unittest.TestCase):
+    def test_acknowledged_reader_pause_retains_real_pipe_bytes_until_resume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            read_fd, write_fd = os.pipe()
+            with os.fdopen(read_fd, 'r') as stream:
+                reader = None
+                try:
+                    reader = HARNESS['Reader'](stream, Path(temporary) / 'trace', paused=True)
+                    paused = reader.wait_paused()
+                    os.write(write_fd, b'N3LEDGER {"kind":"ready","image":0}\n')
+                    self.assertEqual(select.select([stream], [], [], 0)[0], [stream])
+                    self.assertFalse(reader.lines, 'another consumer drained the paused trace pipe')
+                    self.assertEqual((Path(temporary) / 'trace').read_bytes(), b'')
+                    resumed = reader.resume()
+                    self.assertGreaterEqual(resumed, paused)
+                    self.assertEqual(reader.record('ready')['image'], 0)
+                finally:
+                    if reader:
+                        reader.resume()
+                    os.close(write_fd)
+                    if reader:
+                        reader.finish()
 
 
 class ManifestInputTests(unittest.TestCase):
@@ -597,6 +622,83 @@ class NativeMatrixFixtureTests(unittest.TestCase):
             target = targets[call['image'], call['fn']]
             self.assertEqual((target['dev'], target['ino']), (pin['dev'], pin['ino']))
             self.assertEqual(call['rv'], 0)
+
+    def test_real_map_only_mode_holds_provider_without_pkcs11_setup_or_teardown(self):
+        owner, reader = self.start(('--map-only', '1'))
+        reader.record('ready')
+        self.image(reader, owner, self.executable, 0)
+        target = reader.wait(lambda r: next((row for row in r.records
+                             if row['kind'] == 'target' and row['fn'] == 'C_GetFunctionList'), None))
+        pin = HARNESS['FilePin'](self.provider)
+        self.pins.append(pin)
+        before = HARNESS['provider_mapping'](owner, pin, target)
+        self.assertFalse(any(row['kind'] == 'call' for row in reader.records))
+        self.assertEqual(HARNESS['provider_mapping'](owner, pin, target), before)
+        self.stop(owner, reader, 0)
+        self.assertFalse(any(row['kind'] == 'call' for row in reader.records))
+
+    def test_map_only_mode_refuses_a_pkcs11_call_command_without_calling_it(self):
+        owner, reader = self.start(('--map-only', '1'))
+        reader.record('ready')
+        owner.popen.stdin.write('calls C_GenerateRandom 1 0 refused selected\n')
+        owner.popen.stdin.flush()
+        self.assertEqual(owner.popen.wait(timeout=1), 2)
+        reader.finish()
+        self.assertFalse(any(row['kind'] == 'call' for row in reader.records))
+
+    def test_real_undumpable_handshake_changes_only_the_owned_caller(self):
+        owner, reader = self.start()
+        reader.record('ready')
+        setup = sum(row['kind'] == 'call' for row in reader.records)
+        owner.popen.stdin.write('undumpable\n')
+        owner.popen.stdin.flush()
+        proof = reader.wait(lambda r: next((row for row in r.records if row['kind'] == 'dumpability'), None))
+        self.assertEqual((proof['pid'], proof['tid'], proof['uid'], proof['dumpable']),
+                         (owner.pid, owner.pid, os.geteuid(), 0))
+        reader.record('ack', 0, 'undumpable')
+        self.assertEqual(sum(row['kind'] == 'call' for row in reader.records), setup)
+        # No protected /proc read or signal is needed to finish this direct
+        # child's existing stdin protocol and reap it after the handshake.
+        self.stop(owner, reader, 0)
+
+    def test_actual_provider_mapping_rejects_a_changed_target_or_file_identity(self):
+        owner, reader = self.start()
+        reader.record('ready')
+        target = reader.wait(lambda r: next((row for row in r.records
+                             if row['kind'] == 'target' and row['fn'] == 'C_GetFunctionList'), None))
+        pin = HARNESS['FilePin'](self.provider)
+        self.pins.append(pin)
+        HARNESS['provider_mapping'](owner, pin, target)
+        for field, value in (('file_offset', target['file_offset'] + 1),
+                             ('ino', target['ino'] + 1), ('vaddr', 0), ('vaddr', True)):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                HARNESS['provider_mapping'](owner, pin, dict(target, **{field: value}))
+        self.stop(owner, reader, 0)
+
+    def test_duplicate_basename_copies_are_distinct_regular_executables(self):
+        pins = HARNESS['duplicate_callers'](self.executable, self.directory / 'duplicates')
+        self.pins.extend(pins)
+        self.assertEqual(len(pins), 2)
+        self.assertEqual(pins[0].path.name, pins[1].path.name)
+        self.assertNotEqual(pins[0].path, pins[1].path)
+        self.assertNotEqual(pins[0].initial.st_ino, pins[1].initial.st_ino)
+        for index, pin in enumerate(pins):
+            self.assertFalse(pin.path.is_symlink())
+            self.assertEqual(pin.digest, hashlib.sha256(self.executable.read_bytes()).hexdigest())
+            owner = HARNESS['spawn_owned'](self.owners,
+                [str(pin.path), str(self.provider), str(index), 'selected'], os.getuid(),
+                env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            reader = HARNESS['Reader'](owner.popen.stdout, self.directory / f'ledger-{index}')
+            errors = HARNESS['Reader'](owner.popen.stderr, self.directory / f'stderr-{index}')
+            self.readers.extend((reader, errors))
+            reader.record('ready', index)
+            image = pin.image_receipt(reader.record('image', index), owner)
+            self.assertEqual(image['path'], str(pin.path))
+            HARNESS['command'](owner, reader, 'C_GenerateRandom', 3, 0, 'main', 'selected', index)
+            self.stop(owner, reader, index)
+            self.assertEqual(sum(row['kind'] == 'call' and row['phase'] == 'main'
+                                 for row in reader.records), 3)
 
     def test_real_spaced_calls_complete_and_record_actual_gaps(self):
         owner, reader = self.start()

@@ -9,6 +9,7 @@ Resource samples on the shared build host are exploratory, not performance gates
 import argparse
 from contextlib import contextmanager, nullcontext
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -32,7 +33,8 @@ INITIAL_CELLS = ('stable', 'onecall', 'burst', 'migrate', 'exec', 'run')
 SPARSE = {'sparse1': (5, 1000), 'sparse10': (4, 10000),
           'sparse59': (3, 59000), 'sparse61': (3, 61000)}
 MATRIX_CELLS = (*SPARSE, 'short', 'reexec', 'nonleader')
-CELLS = (*INITIAL_CELLS, *MATRIX_CELLS)
+U6_CELLS = ('mapped-only', 'unreadable', 'duplicate-basename', 'slow-reader')
+CELLS = (*INITIAL_CELLS, *MATRIX_CELLS, *U6_CELLS)
 CANARIES = ('N3_PRIVATE_BUFFER_91b947', 'N3_PRIVATE_ENV_a279d2', 'N3_PRIVATE_ARG_248abc')
 REMAINING = ('actual fixed registration/sample deadline and equality proof',
              'unchanged leave while the allowed identity sample actually runs, then reenter',
@@ -428,6 +430,159 @@ def verify_input_path(pin):
         raise ValueError('held manifest/provider/helper pathname was replaced')
 
 
+def duplicate_callers(source, directory):
+    """Two actual executable files; the basename alone cannot distinguish them."""
+    directory.mkdir(mode=0o755)
+    pins = []
+    try:
+        for name in ('a', 'b'):
+            parent = directory / name
+            parent.mkdir(mode=0o755)
+            path = parent / 'trace-caller'
+            shutil.copyfile(source, path)
+            path.chmod(0o755)
+            pins.append(FilePin(path))
+        return pins
+    except BaseException:
+        for pin in pins:
+            pin.close()
+        raise
+
+
+def provider_mapping(owner, provider, target):
+    """Independently bind the caller's actual code mapping to the held provider."""
+    owner.verify()
+    provider.verify()
+    mapping = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))
+    pin = mapping['pin_fd'](provider.fd)
+    expected = pin['dev']
+    if target.get('dev') != expected or target.get('ino') != pin['ino']:
+        raise ValueError('caller target does not belong to the held provider')
+    address = target.get('vaddr')
+    if type(address) is not int or address <= 0:
+        raise ValueError('missing actual caller target address')
+    with (Path('/proc') / str(owner.pid) / 'maps').open() as stream:
+        text = stream.read(16 * 1024 * 1024 + 1)
+    if len(text) > 16 * 1024 * 1024:
+        raise ValueError('owned caller maps exceed the bounded fixture input')
+    pattern = mapping['MAPS_LINE']
+    matches = []
+    for line in text.splitlines():
+        row = pattern.fullmatch(line)
+        if row is None:
+            raise ValueError('malformed owned caller mapping')
+        low, high = int(row[1], 16), int(row[2], 16)
+        if low <= address < high:
+            if (row[3][2] != 'x' or [int(row[5], 16), int(row[6], 16)] != expected
+                    or int(row[7]) != pin['ino']
+                    or int(row[4], 16) + address - low != target.get('file_offset')):
+                raise ValueError('actual caller mapping differs from the held provider target')
+            matches.append(dict(dev=expected, ino=pin['ino'],
+                                file_offset=target['file_offset'], permissions=row[3]))
+    if len(matches) != 1:
+        raise ValueError('missing or duplicate actual provider mapping')
+    owner.verify()
+    return matches[0]
+
+
+def capability_snapshot(pid):
+    with (Path('/proc') / str(pid) / 'status').open() as stream:
+        status = stream.read(65537)
+    if len(status) > 65536:
+        raise ValueError('owned capability status exceeds the fixture bound')
+    rows = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+    uids = [int(value) for value in rows['Uid'].split()]
+    gids = [int(value) for value in rows['Gid'].split()]
+    if len(uids) != 4 or len(set(uids)) != 1 or len(gids) != 4 or len(set(gids)) != 1:
+        raise ValueError('owned process has unexpected mixed UIDs/GIDs')
+    return dict(uid=uids[0], gid=gids[0], groups=sorted(int(value) for value in rows['Groups'].split()),
+                effective=int(rows['CapEff'], 16),
+                permitted=int(rows['CapPrm'], 16), bounding=int(rows['CapBnd'], 16))
+
+
+def without_ptrace(argv):
+    # This restriction is private to the one controlled unreadable test cell.
+    # Never change the controller, the host or another cell's credentials.
+    tool = Path('/usr/bin/setpriv')
+    info = tool.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('setpriv is not the trusted installed executable')
+    return [str(tool), '--bounding-set=-sys_ptrace', '--inh-caps=-sys_ptrace',
+            '--ambient-caps=-sys_ptrace', '--', *argv]
+
+
+def write_unreadable_probe(inputs):
+    """Run under the exact restricted observer credentials, then optionally exec."""
+    started = time.monotonic_ns()
+    credentials = capability_snapshot(os.getpid())
+    if credentials['uid'] != 0 or any(credentials[field] & (1 << 19)
+                                    for field in ('effective', 'permitted', 'bounding')):
+        raise ValueError('unreadable probe did not inherit the required cell-only credentials')
+    observed = {}
+    for role in ('anchor', 'target'):
+        expected = inputs[role]
+        proc = Path('/proc') / str(expected['pid'])
+        with (proc / 'stat').open() as stream:
+            text = stream.read(4097)
+        if len(text) > 4096:
+            raise ValueError('owned process stat exceeds the fixture bound')
+        fields = text[text.rindex(')') + 2:].split()
+        identity = dict(pid=expected['pid'], ppid=int(fields[1]), start_time=int(fields[19]))
+        if any(identity[field] != expected[field] for field in identity):
+            raise ValueError('access probe no longer names the original owned process')
+        caps = capability_snapshot(expected['pid'])
+        if caps != credentials:
+            raise ValueError('unreadable probe and owned callers do not have matching credentials')
+        metadata = {}
+        for name in ('maps', 'cgroup'):
+            with (proc / name).open() as stream:
+                if not stream.read(1):
+                    raise ValueError('owned metadata unexpectedly disappeared')
+            metadata[name] = True
+        metadata['stat'] = True
+        item = dict(identity, credentials=caps, metadata_readable=metadata)
+        if role == 'anchor':
+            info = (proc / 'exe').stat()
+            item['exe'] = dict(path=os.readlink(proc / 'exe'), dev=info.st_dev,
+                               ino=info.st_ino, mtime_ns=info.st_mtime_ns)
+            item['mount_namespace'] = (proc / 'ns/mnt').stat().st_ino
+        else:
+            errors = {}
+            for name, operation in (('stat', lambda: (proc / 'exe').stat()),
+                                    ('readlink', lambda: os.readlink(proc / 'exe'))):
+                try:
+                    operation()
+                except OSError as error:
+                    errors[name] = error.errno
+                else:
+                    raise ValueError('owned target executable was readable in the restricted observer context')
+                if errors[name] not in (errno.EACCES, errno.EPERM):
+                    raise ValueError('owned target failed for a cause other than the actual access denial')
+            item['exe_errors'] = errors
+            try:
+                (proc / 'ns/mnt').stat()
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EPERM):
+                    raise ValueError('owned namespace failed without an actual access denial') from error
+                item['namespace_errno'] = error.errno
+            else:
+                raise ValueError('owned target namespace remained readable')
+        observed[role] = item
+    observed.update(credentials=credentials, started_ns=started, finished_ns=time.monotonic_ns())
+    fd = os.open(inputs['path'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(observed, stream)
+
+
+def unreadable_probe_argv(anchor, target, path, executable=()):
+    inputs = dict(anchor=anchor.identity, target=target.identity, path=str(path))
+    code = ("import json,os,runpy,sys\n"
+            "runpy.run_path(sys.argv[1])['write_unreadable_probe'](json.loads(sys.argv[2]))\n"
+            "if len(sys.argv)>3: os.execv(sys.argv[3],sys.argv[3:])\n")
+    return without_ptrace([sys.executable, '-I', '-c', code, str(Path(__file__).resolve()),
+                           json.dumps(inputs), *executable])
+
+
 def manifest_arguments(manifests, provider, helper, helper_revision):
     if not manifests:
         if helper is not None or helper_revision is not None:
@@ -473,10 +628,14 @@ def run_trace_argv(binary, provider, caller, trace_path, gate, manifest_argv):
 
 
 class Reader:
-    def __init__(self, stream, path):
+    def __init__(self, stream, path, *, paused=False):
         self.stream, self.path = stream, path
         self.lines, self.records, self.errors = [], [], []
         self.updates = queue.Queue()
+        self.read_gate, self.pause_ack = threading.Event(), threading.Event()
+        self.paused_ns = self.resumed_ns = None
+        if not paused:
+            self.read_gate.set()
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
 
@@ -484,6 +643,10 @@ class Reader:
         total = 0
         with self.path.open('w', encoding='utf-8') as output:
             try:
+                if not self.read_gate.is_set():
+                    self.paused_ns = time.monotonic_ns()
+                    self.pause_ack.set()
+                    self.read_gate.wait()
                 for line in self.stream:
                     total += len(line.encode())
                     if total > 8 * 1024 * 1024 or len(line) > 65536:
@@ -500,6 +663,17 @@ class Reader:
                 self.errors.append(str(error))
             finally:
                 self.updates.put(None)
+
+    def wait_paused(self):
+        if not self.pause_ack.wait(timeout=1):
+            raise TimeoutError('actual trace reader did not acknowledge its initial pause')
+        return self.paused_ns
+
+    def resume(self):
+        if not self.read_gate.is_set():
+            self.resumed_ns = time.monotonic_ns()
+            self.read_gate.set()
+        return self.resumed_ns
 
     def wait(self, predicate, seconds=10):
         deadline = time.monotonic() + seconds
@@ -523,6 +697,7 @@ class Reader:
             and (phase is None or row.get('phase') == phase)), None), seconds)
 
     def finish(self):
+        self.resume()
         self.thread.join(timeout=3)
         if self.thread.is_alive() or self.errors:
             raise ValueError('owned output did not finish cleanly: ' + '; '.join(self.errors))
@@ -702,15 +877,16 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
              manifests=(), manifest_helper=None, helper_revision=None):
     selected, outside = cgroups
     owners, readers, images, sampler = [], [], [], None
-    observer = caller = None
+    observer = caller = auxiliary = auxiliary_stdout = mapping_target = None
     budget = cell_timing(name)
+    workload_uid, workload_gid = (0, 0) if name == 'unreadable' else (args.uid, args.gid)
     manifest_argv = manifest_arguments(manifests, provider, manifest_helper, helper_revision)
     mode = dict(mode='explicit_trusted_manifest' if manifests else 'default_discovery',
                 manifests=[pin.metadata() for pin in manifests],
                 helper=manifest_helper.metadata() if manifest_helper else None,
                 helper_source_revision=helper_revision)
     receipt = dict(cell=name, discovery_input=mode, require_named=name in ('stable', 'migrate', 'exec', 'run',
-                                                   'sparse1', 'sparse10', 'reexec', 'nonleader'),
+                                                   'sparse1', 'sparse10', 'reexec', 'nonleader', *U6_CELLS),
                    fresh_observer=True, scope_created_ns=scope_created_ns,
                    pid_namespace=process_identity(os.getpid())['pid_namespace'],
                    time_namespace=process_identity(os.getpid())['time_namespace'],
@@ -720,6 +896,8 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         receipt['require_named_images'] = [0]
     elif name in ('exec', 'reexec', 'nonleader'):
         receipt['require_named_images'] = [0, 1]
+    if name in U6_CELLS:
+        receipt['require_named_images'] = [0, 1] if name == 'duplicate-basename' else [0]
     if name in ('reexec', 'nonleader', 'short'):
         receipt['first_unknown_images'] = [1]
     ledger_readers = []
@@ -734,10 +912,12 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
     try:
         trace_path = directory / 'trace.file.txt'
         if name != 'run':
-            caller = spawn_owned(owners, [str(callers[0].path), str(provider.path), '0', 'selected',
-                                     '--canary', CANARIES[2]], stdin=subprocess.PIPE,
+            caller_argv = [str(callers[0].path), str(provider.path), '0', 'selected', '--canary', CANARIES[2]]
+            if name == 'unreadable':
+                caller_argv = without_ptrace(caller_argv)
+            caller = spawn_owned(owners, caller_argv, stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    env=env, uid=args.uid, user=args.uid, group=args.gid,
+                                    env=env, uid=workload_uid, user=workload_uid, group=workload_gid,
                                     extra_groups=[], start_new_session=True)
             proc = caller.popen
             stdout = Reader(proc.stdout, directory / 'caller.ledger.jsonl')
@@ -747,24 +927,73 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             image = stdout.record('image')
             images.append(callers[0].image_receipt(image, caller))
             selected.move(caller)
+            expected_pids = [caller.pid]
+            if name in ('mapped-only', 'duplicate-basename', 'unreadable'):
+                extra = ['--map-only', '1'] if name == 'mapped-only' else []
+                auxiliary_argv = [str(callers[1].path), str(provider.path), '1', 'selected',
+                                  *extra, '--canary', CANARIES[2]]
+                if name == 'unreadable':
+                    auxiliary_argv = without_ptrace(auxiliary_argv)
+                auxiliary = spawn_owned(owners, auxiliary_argv,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, env=env, uid=workload_uid, user=workload_uid, group=workload_gid,
+                                        extra_groups=[], start_new_session=True)
+                auxiliary_stdout = Reader(auxiliary.popen.stdout, directory / 'auxiliary.ledger.jsonl')
+                auxiliary_errors = Reader(auxiliary.popen.stderr, directory / 'auxiliary.stderr.txt')
+                readers.extend((auxiliary_stdout, auxiliary_errors))
+                ledger_readers.append(auxiliary_stdout)
+                auxiliary_stdout.record('ready', 1)
+                images.append(callers[1].image_receipt(auxiliary_stdout.record('image', 1), auxiliary))
+                selected.move(auxiliary)
+                expected_pids.append(auxiliary.pid)
+                if name == 'mapped-only':
+                    mapping_target = auxiliary_stdout.wait(lambda r: next((row for row in r.records
+                        if row['kind'] == 'target' and row['fn'] == 'C_GetFunctionList'), None))
+                    receipt['mapped_only'] = dict(image=1,
+                        before=provider_mapping(auxiliary, provider, mapping_target), before_ns=time.monotonic_ns())
+                elif name == 'unreadable':
+                    auxiliary.popen.stdin.write('undumpable\n')
+                    auxiliary.popen.stdin.flush()
+                    dumpability = auxiliary_stdout.wait(lambda r: next((row for row in r.records
+                                                        if row['kind'] == 'dumpability'), None))
+                    auxiliary_stdout.record('ack', 1, 'undumpable')
+                    # The full-root controller retains the unchanged ownership
+                    # checks after the target has actually become unreadable.
+                    caller.verify()
+                    auxiliary.verify()
+                    receipt['unreadable'] = dict(image=1, dumpability=dumpability,
+                        controller=dict(capability_snapshot(os.getpid()), pid=os.getpid()))
             receipt['selected_initial_pids'] = selected.members()
-            if receipt['selected_initial_pids'] != [caller.pid]:
-                raise ValueError('selected cgroup contains a process other than the owned caller')
+            if sorted(receipt['selected_initial_pids']) != sorted(expected_pids):
+                raise ValueError('selected cgroup contains a process other than the owned callers')
             argv = trace_capture_argv(binary, provider, selected.path, trace_path, budget, manifest_argv)
+            if name == 'unreadable':
+                access_before = directory / 'unreadable-access-before.json'
+                argv = unreadable_probe_argv(caller, auxiliary, access_before, argv)
         else:
             gate = directory / 'run-gate'
             argv = run_trace_argv(binary, provider, callers[0], trace_path, gate, manifest_argv)
         receipt['observer_started_ns'] = time.monotonic_ns()
+        observer_credentials = dict(user=0, group=0, extra_groups=[]) if name == 'unreadable' else {}
         observer = spawn_owned(owners, argv, uid=0, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env=env, start_new_session=True)
+                               text=True, env=env, start_new_session=True, **observer_credentials)
         proc = observer.popen
-        binary.image_receipt(dict(image=0), observer)
-        capture = Reader(proc.stdout, directory / 'trace.stdout.txt')
+        if name != 'unreadable':
+            binary.image_receipt(dict(image=0), observer)
+        capture = Reader(proc.stdout, directory / 'trace.stdout.txt', paused=name == 'slow-reader')
         errors = Reader(proc.stderr, directory / 'observer.stderr.txt')
         readers.extend((capture, errors))
         sampler = Resources(observer)
+        if name == 'slow-reader':
+            receipt['reader_pause'] = dict(paused_ns=capture.wait_paused(), hold_ns=250_000_000)
         wait_capture_started(errors, allow_empty=name == 'run')
+        if name == 'unreadable':
+            # setpriv/Python have execed the actual observer by its readiness
+            # banner. Preserve the exact executable check after that handoff.
+            binary.image_receipt(dict(image=0), observer)
+            receipt['unreadable'].update(before=json.loads(access_before.read_text()),
+                                         observer_credentials=capability_snapshot(observer.pid))
         receipt['observer_ready_ns'] = time.monotonic_ns()
         if name == 'run':
             capture.record('ready')
@@ -787,8 +1016,32 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             receipt['caller_rc'] = receipt['observer_rc']
             ledger_readers = [capture]
         else:
-            if name == 'stable':
+            if name in ('stable', 'mapped-only'):
                 workload('C_GenerateRandom', 20, 200, 'main', 'selected')
+            elif name == 'duplicate-basename':
+                workload('C_GenerateRandom', 20, 200, 'main', 'selected')
+                command(auxiliary, auxiliary_stdout, 'C_GenerateRandom', 20, 200, 'main', 'selected',
+                        1, group=selected, phases=phases)
+            elif name == 'unreadable':
+                workload('C_GenerateRandom', 20, 200, 'main', 'selected')
+                command(auxiliary, auxiliary_stdout, 'C_GenerateRandom', 20, 200, 'main', 'selected',
+                        1, group=selected, phases=phases)
+                caller.verify()
+                auxiliary.verify()
+                access_after = directory / 'unreadable-access-after.json'
+                probe = spawn_owned(owners, unreadable_probe_argv(caller, auxiliary, access_after), uid=0,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, env=env, user=0, group=0, extra_groups=[], start_new_session=True)
+                _out, probe_error = probe.popen.communicate(timeout=5)
+                if probe.popen.returncode != 0:
+                    raise ValueError('same-credential final executable access proof failed: ' + probe_error[-512:])
+                receipt['unreadable'].update(after=json.loads(access_after.read_text()),
+                                             final_observer_credentials=capability_snapshot(observer.pid))
+            elif name == 'slow-reader':
+                workload('C_GenerateRandom', 1, 0, 'held-reader', 'selected')
+                time.sleep(0.25)
+                receipt['reader_pause']['resumed_ns'] = capture.resume()
+                workload('C_GenerateRandom', 19, 200, 'main', 'selected')
             elif name == 'onecall':
                 workload('C_GenerateRandom', 1, 0, 'main', 'selected')
             elif name == 'burst':
@@ -834,6 +1087,17 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             observer.send(signal.SIGINT)
             receipt['observer_rc'] = proc.wait(timeout=5)
             receipt['observer_stopped_ns'] = time.monotonic_ns()
+            if name == 'mapped-only':
+                receipt['mapped_only'].update(after=provider_mapping(auxiliary, provider, mapping_target),
+                                              after_ns=time.monotonic_ns())
+            if auxiliary:
+                outside.move(auxiliary)
+                auxiliary.popen.stdin.write('stop\n')
+                auxiliary.popen.stdin.flush()
+                auxiliary_stdout.record('ack', 1, 'done')
+                receipt['auxiliary_rc'] = auxiliary.popen.wait(timeout=3)
+                if receipt['auxiliary_rc'] != 0:
+                    raise ValueError('owned auxiliary caller failed')
             outside.move(caller)
             caller.popen.stdin.write('stop\n')
             caller.popen.stdin.flush()
@@ -866,6 +1130,8 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         return result
     finally:
         with cleanup_section():
+            for reader in readers:
+                reader.resume()
             if sampler:
                 sampler.finish()
             try:
@@ -951,7 +1217,11 @@ def _main():
         for name in names:
             directory = args.out / name
             directory.mkdir(mode=0o755)
-            result = run_cell(args, name, directory, env, provider, binary, callers, cgroups, created,
+            cell_callers = callers
+            if name == 'duplicate-basename':
+                cell_callers = duplicate_callers(args.caller, directory / 'callers')
+                pins.extend(cell_callers)
+            result = run_cell(args, name, directory, env, provider, binary, cell_callers, cgroups, created,
                               manifests, manifest_helper, args.helper_source_revision)
             results.append(result)
             print(json.dumps({key: result.get(key) for key in
@@ -964,7 +1234,7 @@ def _main():
                            helper_source_revision=args.helper_source_revision),
                        abi='Linux x86-64 LP64', kernel=os.uname().release,
                        cells=results, remaining=list(REMAINING) +
-                       [f'unexecuted prepared cell: {name}' for name in MATRIX_CELLS if name not in names],
+                       [f'unexecuted prepared cell: {name}' for name in (*MATRIX_CELLS, *U6_CELLS) if name not in names],
                        resource_qualification='exploratory shared loaded build host')
         (args.out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         return 0 if all(result['pass'] for result in results) else 1

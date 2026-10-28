@@ -2,6 +2,7 @@
 """The trace oracle must reject false names and unknown-only positive cells."""
 
 import copy
+import json
 import runpy
 import unittest
 from pathlib import Path
@@ -80,7 +81,173 @@ def short_setup_inputs():
     return ''.join(rows) + '\n'.join(trace.splitlines()[3:]).replace(':3', ':7') + '\n', ledger, receipt
 
 
+def u6_inputs(cell):
+    trace, ledger, receipt = inputs()
+    receipt['cell'] = cell
+    if cell == 'slow-reader':
+        for row in ledger:
+            for field in ('t', 't0', 't1'):
+                if field in row:
+                    row[field] *= 10_000_000
+        for field in ('scope_created_ns', 'observer_started_ns', 'observer_ready_ns', 'observer_stopped_ns'):
+            receipt[field] *= 10_000_000
+        receipt['reader_pause'] = dict(paused_ns=1_000_000_000, resumed_ns=1_400_000_000,
+                                      hold_ns=250_000_000)
+        return trace, ledger, receipt
+    first = ledger[0]
+    second = dict(first, image=1, pid=124, start_time=78, path='/owned/b/trace-a', ino=4)
+    receipt['images'].append(copy.deepcopy(second))
+    receipt['selected_initial_pids'] = [123, 124]
+    ledger.extend((second, dict(ledger[1], image=1)))
+    if cell == 'mapped-only':
+        ledger[-1]['fn'] = 'C_GetFunctionList'
+        mapping = dict(dev=[8, 1], ino=9, file_offset=100, permissions='r-xp')
+        receipt['mapped_only'] = dict(image=1, before=mapping, after=copy.deepcopy(mapping),
+                                      before_ns=80, after_ns=201)
+        return trace, ledger, receipt
+    first['path'] = '/owned/a/trace-a'
+    receipt['images'][0]['path'] = first['path']
+    calls = [dict(row, image=1, pid=124, tid=124)
+             for row in ledger if row['kind'] == 'call']
+    ledger.extend(calls)
+    rows = trace.splitlines()
+    events = [line.replace('/owned/trace-a', first['path']) for line in rows[:3]]
+    events += [line.replace('PID 123, TID 123', 'PID 124, TID 124')
+                   .replace('/owned/trace-a', second['path']) for line in rows[:3]]
+    counts = json.loads(rows[3].split(' ', 1)[1])
+    counts = {field: 6 for field in counts}
+    if cell == 'unreadable':
+        events[3:] = [line.replace('"trace-a"', 'Unknown executable')
+                           .replace(' exe="/owned/b/trace-a"', '') for line in events[3:]]
+        full = (1 << 41) - 1
+        caps = dict(uid=0, gid=0, groups=[], effective=full & ~(1 << 19), permitted=full & ~(1 << 19),
+                    bounding=full & ~(1 << 19))
+        controller = dict(uid=0, gid=0, groups=[0], pid=111, effective=full, permitted=full, bounding=full)
+        def probe(started, finished):
+            return dict(credentials=copy.deepcopy(caps), started_ns=started, finished_ns=finished,
+                anchor=dict(pid=123, ppid=111, start_time=77, credentials=copy.deepcopy(caps),
+                    exe={field: first[field] for field in ('path', 'dev', 'ino', 'mtime_ns')},
+                    mount_namespace=99, metadata_readable=dict(stat=True, maps=True, cgroup=True)),
+                target=dict(pid=124, ppid=111, start_time=78, credentials=copy.deepcopy(caps),
+                    exe_errors=dict(stat=13, readlink=13), namespace_errno=13,
+                    metadata_readable=dict(stat=True, maps=True, cgroup=True)))
+        receipt['unreadable'] = dict(image=1, controller=controller,
+            dumpability=dict(kind='dumpability', image=1, pid=124, tid=124, uid=0, dumpable=0, t=80),
+            before=probe(92, 95), after=probe(150, 160), observer_credentials=copy.deepcopy(caps),
+            final_observer_credentials=copy.deepcopy(caps))
+    return '\n'.join(events + ['COUNT_EVIDENCE ' + json.dumps(counts), rows[4]]) + '\n', ledger, receipt
+
+
 class OracleTests(unittest.TestCase):
+    def test_event_loss_and_final_drain_are_required_literal_proofs_with_partial_names(self):
+        trace, ledger, receipt = inputs()
+        lines = trace.splitlines()
+        original = json.loads(lines[-1].split(' ', 1)[1])
+        original['completeness'] = 'PARTIAL'
+        healthy = '\n'.join(lines[:-1] + ['EVIDENCE ' + json.dumps(original)]) + '\n'
+        self.assertTrue(ORACLE['evaluate'](healthy, ledger, receipt, healthy)['pass'])
+        for field, values in (('event_loss', ('missing', False, None, '0', 1)),
+                              ('final_drain', ('missing', False, None, 0, 1, 'true'))):
+            for value in values:
+                evidence = copy.deepcopy(original)
+                if value == 'missing':
+                    del evidence[field]
+                else:
+                    evidence[field] = value
+                poisoned = '\n'.join(lines[:-1] + ['EVIDENCE ' + json.dumps(evidence)]) + '\n'
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(ORACLE['evaluate'](poisoned, ledger, receipt, poisoned)['pass'])
+
+    def test_unreadable_requires_real_matching_credentials_and_both_access_denials(self):
+        trace, ledger, receipt = u6_inputs('unreadable')
+        self.assertTrue(ORACLE['evaluate'](trace, ledger, receipt, trace)['pass'])
+        for change in ('missing', 'wrong-errno', 'missing-proof', 'ptrace-restored', 'other-cap-lost',
+                       'wrong-birth', 'wrong-parent', 'early-final-proof', 'wrong-dumpability', 'ordinary-uid',
+                       'gid-mismatch', 'groups-mismatch', 'namespace-readable', 'maps-unavailable'):
+            bad = copy.deepcopy(receipt)
+            proof = bad['unreadable']
+            if change == 'missing':
+                del bad['unreadable']
+            elif change == 'wrong-errno':
+                proof['after']['target']['exe_errors']['stat'] = 2
+            elif change == 'missing-proof':
+                del proof['before']['target']['exe_errors']['readlink']
+            elif change == 'ptrace-restored':
+                proof['final_observer_credentials']['effective'] |= 1 << 19
+            elif change == 'other-cap-lost':
+                proof['before']['credentials']['effective'] &= ~(1 << 21)
+            elif change == 'wrong-birth':
+                proof['after']['target']['start_time'] += 1
+            elif change == 'wrong-parent':
+                proof['before']['target']['ppid'] += 1
+            elif change == 'early-final-proof':
+                proof['after']['started_ns'] = 100
+            elif change == 'wrong-dumpability':
+                proof['dumpability']['dumpable'] = 1
+            elif change == 'gid-mismatch':
+                proof['after']['target']['credentials']['gid'] = 1000
+            elif change == 'groups-mismatch':
+                proof['after']['target']['credentials']['groups'] = [0]
+            elif change == 'namespace-readable':
+                proof['before']['target']['namespace_errno'] = 0
+            elif change == 'maps-unavailable':
+                proof['after']['target']['metadata_readable']['maps'] = False
+            else:
+                proof['controller']['uid'] = 1000
+            with self.subTest(change=change):
+                self.assertFalse(ORACLE['evaluate'](trace, ledger, bad, trace)['pass'])
+
+    def test_unreadable_target_cannot_gain_a_name_or_hide_a_missing_call(self):
+        trace, ledger, receipt = u6_inputs('unreadable')
+        invented = trace.replace('Unknown executable (PID 124, TID 124)',
+                                 '"trace-a" (PID 124, TID 124) exe="/owned/b/trace-a"')
+        self.assertFalse(ORACLE['evaluate'](invented, ledger, receipt, invented)['pass'])
+        missing = '\n'.join(trace.splitlines()[1:]) + '\n'
+        self.assertFalse(ORACLE['evaluate'](missing, ledger, receipt, missing)['pass'])
+
+    def test_mapped_only_requires_a_real_mapping_held_across_the_capture(self):
+        trace, ledger, receipt = u6_inputs('mapped-only')
+        self.assertTrue(ORACLE['evaluate'](trace, ledger, receipt)['pass'])
+        for change in ('missing', 'changed', 'late', 'early'):
+            bad = copy.deepcopy(receipt)
+            if change == 'missing':
+                del bad['mapped_only']
+            elif change == 'changed':
+                bad['mapped_only']['after']['ino'] += 1
+            elif change == 'late':
+                bad['mapped_only']['before_ns'] = bad['observer_started_ns'] + 1
+            else:
+                bad['mapped_only']['after_ns'] = bad['observer_stopped_ns'] - 1
+            with self.subTest(change=change):
+                self.assertFalse(ORACLE['evaluate'](trace, ledger, bad)['pass'])
+
+    def test_duplicate_basename_requires_two_distinct_files_and_two_named_populations(self):
+        trace, ledger, receipt = u6_inputs('duplicate-basename')
+        self.assertTrue(ORACLE['evaluate'](trace, ledger, receipt)['pass'])
+        unknown = trace.replace('"trace-a" (PID 124, TID 124) exe="/owned/b/trace-a"',
+                                'Unknown executable (PID 124, TID 124)')
+        self.assertFalse(ORACLE['evaluate'](unknown, ledger, receipt)['pass'])
+        for population in (ledger, receipt['images']):
+            next(row for row in population if row.get('kind') == 'image' and row['image'] == 1)['ino'] = 3
+        self.assertFalse(ORACLE['evaluate'](trace, ledger, receipt)['pass'])
+
+    def test_slow_reader_requires_an_acknowledged_pause_over_a_real_call(self):
+        trace, ledger, receipt = u6_inputs('slow-reader')
+        self.assertTrue(ORACLE['evaluate'](trace, ledger, receipt, trace)['pass'])
+        for change in ('missing', 'short', 'after-calls', 'late'):
+            bad = copy.deepcopy(receipt)
+            if change == 'missing':
+                del bad['reader_pause']
+            elif change == 'short':
+                bad['reader_pause']['resumed_ns'] = 1_110_000_001
+            elif change == 'after-calls':
+                bad['reader_pause']['paused_ns'] = 1_500_000_000
+                bad['reader_pause']['resumed_ns'] = 1_800_000_000
+            else:
+                bad['reader_pause']['resumed_ns'] = bad['observer_stopped_ns'] + 1
+            with self.subTest(change=change):
+                self.assertFalse(ORACLE['evaluate'](trace, ledger, bad, trace)['pass'])
+
     def test_short_actual_first_setup_call_unknown_passes_with_sink_parity(self):
         trace, ledger, receipt = short_setup_inputs()
         result = ORACLE['evaluate'](trace, ledger, receipt, trace)

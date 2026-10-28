@@ -542,13 +542,15 @@ def rotation_verdict(doc, files, ledger_text, window=None):
         event = record.get("event")
         return event if isinstance(event, dict) else {}
 
+    evicted = [record for record in records if record.get("kind") == "retention_evicted"]
     accounted = sum(event_of(record).get("evicted_events", 0)
-                    + event_of(record).get("covered_events", 0)
-                    for record in records if record.get("kind") == "retention_evicted")
+                    + event_of(record).get("covered_events", 0) for record in evicted)
     rotated = [record for record in records if record.get("kind") == "rotated"]
     ended = [record for record in records if record.get("kind") == "ended"]
     if len(files) < 2 or not rotated:
         errors.append("rotation was not exercised (need 2+ files and a rotated marker)")
+    if not evicted or accounted <= 0:
+        errors.append("retention eviction was not exercised")
     if len(ended) != 1:
         errors.append(f"expected exactly one ended marker, saw {len(ended)}")
     elif event_of(ended[0]).get("edges_unretained"):
@@ -990,8 +992,10 @@ def capture_ledger_cells(args, resolved, out, record):
     argv = [str(resolved), "inventory", "--pid", str(config["pid"])]
     for module in config["modules"]:
         argv += ["--module", module]
+    # Retain the real edge and terminal accounting record; 1K leaves no
+    # guaranteed refresh capacity after the writer's control allowance.
     argv += ["--capture", "native", "--duration", "20s", "--json", "-o", str(document),
-            "--event-log", str(stream), "--event-rotate-bytes", "1K", "--event-max-files", "3"]
+            "--event-log", str(stream), "--event-rotate-bytes", "8K", "--event-max-files", "3"]
     code, _stdout, stderr = run(argv, timeout=120)
     record("rotation-capture", code == 0,
            {"exit": code, "stderr": stderr[:512].decode("utf-8", "replace")})

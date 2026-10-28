@@ -295,7 +295,7 @@ class ReleaseRecipientTests(unittest.TestCase):
                 self.assertEqual(command[1:5], ['inventory', '--pid', '501', '--module'])
                 self.assertEqual(command[command.index('--module') + 1], str(module))
                 self.assertEqual(command[command.index('--duration') + 1], '20s')
-                self.assertEqual(command[-4:], ['--event-rotate-bytes', '1K', '--event-max-files', '3'])
+                self.assertEqual(command[-4:], ['--event-rotate-bytes', '8K', '--event-max-files', '3'])
                 if failure == 'rotation-capture':
                     return 23, b'', b'capture failed'
                 doc, _files, text = DRIVER.rotation_fixture(
@@ -391,6 +391,54 @@ class ReleaseRecipientTests(unittest.TestCase):
             self.compose_ledger('ledger-component', failure='receipt-sink', c8_base=False)
         self.assertFalse((self.last_ledger_out / 'receipt.json').is_file())
         self.assertEqual(len(self.last_ledger_commands), 2)
+
+    def test_rotation_requires_real_eviction_even_when_other_proofs_balance(self):
+        for mutation in ('missing-marker', 'zero-accounted'):
+            directory = Path(tempfile.mkdtemp(dir=self.root, prefix='rotation-'))
+            doc, files, ledger = DRIVER.rotation_fixture(directory)
+            records = {path: [json.loads(line) for line in path.read_text().splitlines()]
+                       for path in files}
+            for path, rows in records.items():
+                if mutation == 'missing-marker':
+                    records[path] = [row for row in rows if row['kind'] != 'retention_evicted']
+                else:
+                    for row in rows:
+                        if row['kind'] == 'retention_evicted':
+                            row['event'].update(evicted_events=0, covered_events=0)
+            # Keep every other proof valid: unique contiguous sequence,
+            # multiple files/rotation, both exact ledgered uses and ended0.
+            ordered = sorted([row for rows in records.values() for row in rows],
+                             key=lambda row: row['seq'])
+            for seq, row in enumerate(ordered):
+                row['seq'] = seq
+            for path, rows in records.items():
+                path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            with self.subTest(mutation=mutation):
+                ok, detail = DRIVER.rotation_verdict(doc, files, ledger)
+                self.assertEqual(detail['retained'] + detail['accounted'], detail['emitted'])
+                self.assertEqual(detail['accounted'], 0)
+                self.assertFalse(ok, detail)
+                self.assertEqual(detail['errors'], ['retention eviction was not exercised'])
+
+    def test_rotation_balanced_counts_never_waive_the_retained_population(self):
+        for mutation in ('unretained', 'missing-use'):
+            directory = Path(tempfile.mkdtemp(dir=self.root, prefix='rotation-'))
+            doc, files, ledger = DRIVER.rotation_fixture(directory, missing_use=mutation == 'missing-use')
+            if mutation == 'unretained':
+                for path in files:
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    for row in rows:
+                        if row['kind'] == 'ended':
+                            row['event']['edges_unretained'] = 1
+                    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            with self.subTest(mutation=mutation):
+                ok, detail = DRIVER.rotation_verdict(doc, files, ledger)
+                self.assertEqual(detail['retained'] + detail['accounted'], detail['emitted'])
+                self.assertGreater(detail['accounted'], 0)
+                self.assertFalse(ok, detail)
+                self.assertTrue(any(('edges_unretained' if mutation == 'unretained'
+                                     else 'ledgered use has no retained record') in error
+                                    for error in detail['errors']), detail)
 
     def compact_verdict(self, doc, transcript, ledger):
         path = self.root / 'compact.ledger'

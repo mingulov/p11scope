@@ -12297,8 +12297,8 @@ mod tests {
             "no latch means no finite stop"
         );
 
-        // A synchronous outcome keeps today's reads even with a
-        // joint first error: the fold is the retained consumer's.
+        // A synchronous first stop of an unfinished Joint lane also
+        // returns its abandoned Finish error through the consumer.
         {
             let mut coordinator2 = coordinator();
             let headless = headless_display();
@@ -12315,15 +12315,22 @@ mod tests {
                 "no pending publication means no retention"
             );
             assert!(!driver.suspended, "a synchronous run never suspends");
-            assert!(
-                driver.joint_first_error.is_some(),
-                "the stop hook kept its first error"
-            );
+            assert_eq!(driver.joint_finish, JointFinishDriver::Abandoned);
+            let first_error = driver
+                .joint_first_error
+                .clone()
+                .expect("the stop hook kept its first error");
             let stop = std::cell::Cell::new(false);
             let stop_now = || stop.get();
             let clock = consume_clock(&stop_now);
             let (_, error, zero_pass) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
-            assert!(error.is_none(), "today's reads keep no error");
+            let error = error.expect("the abandoned Finish returns its original error");
+            assert_eq!(error.to_string(), first_error);
+            assert_eq!(crate::run::failure_exit_code(&error), 1);
+            assert!(
+                driver.joint_first_error.is_none(),
+                "the consumer transferred the original error into the outcome"
+            );
             assert!(
                 zero_pass.is_some(),
                 "today's reads keep the zero-pass report"

@@ -18,7 +18,8 @@ per-mechanism calls / errors, with function and return-code set
 equality over the hot loop; the driver's ledgered teardown calls are
 conserved in the exact totals but claim no mechanism row); zero event
 loss (ring_loss == 0, unrouted S1 returns == 0, a proven full drain, no
-loss gap or lossy coverage, a complete event stream); and the
+loss gap, clean physical coverage and only clean or exact terminal R59
+semantic coverage, a complete event stream); and the
 S1-active gate (object_observations unavailable with reason
 journal_unavailable, the semantic lane past disabled). S1 publish
 latency (coarse per-call edge-count publication delay) is recorded as
@@ -27,15 +28,24 @@ p50/p99 with its sample count, never gated.
 Healthy and mutation twins run unignored; the driver tests build the
 tracked gen-calls.c fixture with gcc and drive a test-only in-suite
 stub provider (real PKCS#11 entry signatures, counting-free immediate
-OK returns), so they need no SoftHSM install.
+OK returns, with optional test-only call tracing), so they need no
+SoftHSM install. The optional FINISH phase preserves the original
+process/provider after closed ledgers; its signal-interruptible wait has
+no internal timeout, so the controller's absolute 30 s lifetime bound
+must include GO, work, DONE and FINISH. This active-target rate mode does
+not qualify immediate-exit coverage. Actual Multi, identity-bound
+Detailed EVENTS loss == 0, and exact collected/joined/shed stop receipts
+remain mandatory independent live-wrapper proofs.
 """
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
+import os
+import select
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -82,7 +92,7 @@ FN_INIT = "C_DigestInit"
 FN_DO = "C_Digest"
 FNS = (FN_INIT, FN_DO)
 MECH_SHA256 = 0x250
-MECH_NAME = "CKM_SHA_256"
+MECH_NAME = "CKM_SHA256"
 FULL_RATE = 10000
 
 
@@ -154,9 +164,9 @@ def mechanism_row(calls, errors=0, fns=FNS, rvs=(0,)):
                 "truncated": False}}
 
 
-def driver_edge(count, errors=0, fns=FNS, rvs=(0,), caller="c0", module="m0",
-                coverage_state="counted", lossy=False, operations_calls=None,
-                mechanisms=True):
+def driver_edge(count, caller="c0", module="m0",
+                coverage_state="counted", lossy=False):
+    # Physical edges deliberately withhold per-instance semantic summaries.
     return {
         "caller": caller, "module": module,
         "mapping": {"state": "mapped", "evidence": "deep_scan",
@@ -169,11 +179,23 @@ def driver_edge(count, errors=0, fns=FNS, rvs=(0,), caller="c0", module="m0",
                                  "until_ns": None, "first_ns": None,
                                  "lossy": lossy if coverage_state == "counted" else None,
                                  "reason": None, "detail": None}},
-        "semantics": "observed",
-        "mechanisms": ([mechanism_row(count, errors, fns, rvs)]
-                       if mechanisms else None),
-        "operations": {"calls": count if operations_calls is None else operations_calls,
-                       "started": count // 2, "completed": count // 2,
+        "semantics": "unknown (per-edge summary withheld; see semantic children)",
+        "mechanisms": None,
+        "operations": None,
+    }
+
+
+def semantic_row(edge, api_count, lossy=False):
+    return {"caller": edge["caller"], "module": edge["module"],
+            "instance": "i0",
+            "entries": {"unit": "api_entries", "count": None,
+                        "observation": "unavailable"},
+            "api_returns": {"unit": "api_returns", "count": api_count,
+                            "saturated": False, "historical_only_returns": 0},
+            "semantics": "observed",
+            "mechanisms": [mechanism_row(api_count)],
+            "operations": {"calls": api_count,
+                       "started": (api_count + 1) // 2, "completed": api_count // 2,
                        "cancelled": 0, "failed": 0, "unknown": 0, "orphans": 0,
                        "dropped": 0, "last_seen_ns": R0 + 2_000_000_000,
                        "active": [],
@@ -186,20 +208,8 @@ def driver_edge(count, errors=0, fns=FNS, rvs=(0,), caller="c0", module="m0",
                                     "async_duplicates": 0,
                                     "async_evictions": 0,
                                     "unmatched_closes": 0}},
-    }
-
-
-def semantic_row(edge, api_count, lossy=False):
-    return {"caller": edge["caller"], "module": edge["module"],
-            "instance": "i0",
-            "entries": {"unit": "api_entries", "count": None,
-                        "observation": "unavailable"},
-            "api_returns": {"unit": "api_returns", "count": api_count,
-                            "saturated": False, "historical_only_returns": 0},
-            "semantics": edge["semantics"],
-            "mechanisms": edge["mechanisms"],
-            "operations": edge["operations"],
-            "coverage": {"lossy": lossy, "reasons": []}}
+            "coverage": {"lossy": lossy, "reasons": (
+                ["capture_stopped", "semantic_loss"] if lossy else [])}}
 
 
 def inventory_doc(edge, sem_rows, pid=PID, ring_loss=0, unrouted=0,
@@ -207,10 +217,15 @@ def inventory_doc(edge, sem_rows, pid=PID, ring_loss=0, unrouted=0,
                   obs_status="unavailable", obs_reason="journal_unavailable",
                   gaps=(), suppressed=0):
     return {
-        "callers": [{"id": "c0", "pid": pid}],
-        "modules": [{"id": "m0"}],
+        "schema": "p11scope/inventory/v1", "scope": f"pid:{pid}",
+        "callers": [{"id": "c0", "pid": pid, "start_time": 12345,
+                     "retired": False}],
+        "modules": [{"id": "m0", "lifecycle": "mapped", "unloaded_observed": False,
+                     "admission": {"state": "admitted", "class": "operator",
+                                   "endpoints": 68, "reasons": []}}],
         "edges": [edge],
-        "instances": [{"id": "i0", "caller": "c0", "module": "m0"}],
+        "instances": [{"id": "i0", "caller": "c0", "module": "m0",
+                       "state": "observed", "reason": None}],
         "semantic_edges": list(sem_rows),
         "object_observations": {
             "version": 1, "revision": 0, "status": obs_status,
@@ -236,6 +251,7 @@ def inventory_doc(edge, sem_rows, pid=PID, ring_loss=0, unrouted=0,
         "gaps": [{"caller": None, "module": None, "pid": None,
                   "subject": subject, "reason": reason, "budget": None,
                   "repeats": 1} for subject, reason in gaps],
+        "gaps_suppressed": 0,
         "budgets": {"retained_history": {"limit": 1024, "retained": 0,
                                          "suppressed": suppressed}},
     }
@@ -510,8 +526,9 @@ class ConservationGate(unittest.TestCase):
                 inventory = json.load(stream)
             mutate(inventory)
             write_json(inventory_path, inventory)
-            if inventory["edges"]:
-                rewrite_events_for_edge(workdir, inventory["edges"][0],
+            edges = inventory.get("edges")
+            if type(edges) is list and edges:
+                rewrite_events_for_edge(workdir, edges[0],
                                         ledger_last_t1(ledger_path))
             return s1.compare([str(ledger_path)], [str(events_path)],
                               str(inventory_path), 10)
@@ -519,7 +536,6 @@ class ConservationGate(unittest.TestCase):
     def test_one_call_missing_for_a_function_fails(self):
         def mutate(inventory):
             inventory["edges"][0]["entries"]["count"] = 24
-            inventory["edges"][0]["mechanisms"][0]["calls"] = 24
             inventory["semantic_edges"][0]["mechanisms"][0]["calls"] = 24
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
@@ -527,7 +543,6 @@ class ConservationGate(unittest.TestCase):
 
     def test_wrong_return_code_count_fails(self):
         def mutate(inventory):
-            inventory["edges"][0]["mechanisms"][0]["errors"] = 1
             inventory["semantic_edges"][0]["mechanisms"][0]["errors"] = 1
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
@@ -535,7 +550,7 @@ class ConservationGate(unittest.TestCase):
 
     def test_operations_calls_short_fails(self):
         def mutate(inventory):
-            inventory["edges"][0]["operations"]["calls"] = 24
+            inventory["semantic_edges"][0]["operations"]["calls"] = 24
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
         self.assertIn("operations.calls 24 != issued 25", str(ctx.exception))
@@ -549,7 +564,7 @@ class ConservationGate(unittest.TestCase):
 
     def test_phantom_function_fails(self):
         def mutate(inventory):
-            row = inventory["edges"][0]["mechanisms"][0]
+            row = inventory["semantic_edges"][0]["mechanisms"][0]
             row["evidence"]["functions"].append("C_Phantom")
             row["evidence"]["functions"].sort()
         with self.assertRaises(ValueError) as ctx:
@@ -558,7 +573,7 @@ class ConservationGate(unittest.TestCase):
 
     def test_unobserved_function_fails(self):
         def mutate(inventory):
-            row = inventory["edges"][0]["mechanisms"][0]
+            row = inventory["semantic_edges"][0]["mechanisms"][0]
             row["evidence"]["functions"] = [FN_INIT]
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
@@ -566,7 +581,7 @@ class ConservationGate(unittest.TestCase):
 
     def test_phantom_return_code_fails(self):
         def mutate(inventory):
-            row = inventory["edges"][0]["mechanisms"][0]
+            row = inventory["semantic_edges"][0]["mechanisms"][0]
             row["evidence"]["returns"].append(
                 {"rv": 1, "rv_hex": "0x1", "name": None})
         with self.assertRaises(ValueError) as ctx:
@@ -575,7 +590,7 @@ class ConservationGate(unittest.TestCase):
 
     def test_missing_mechanism_row_fails(self):
         def mutate(inventory):
-            inventory["edges"][0]["mechanisms"] = None
+            inventory["semantic_edges"][0]["mechanisms"] = None
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
         self.assertIn("mechanism", str(ctx.exception))
@@ -585,7 +600,67 @@ class ConservationGate(unittest.TestCase):
             inventory["edges"] = []
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate)
-        self.assertIn("0 edges", str(ctx.exception))
+        self.assertIn("edges", str(ctx.exception))
+
+    def test_current_topology_rejects_duplicates_missing_or_foreign_rows(self):
+        cases = []
+        for key in ("callers", "modules", "edges", "instances", "semantic_edges"):
+            cases.extend(((key + " duplicate", lambda d, k=key: d[k].append(copy.deepcopy(d[k][0]))),
+                          (key + " absent", lambda d, k=key: d.pop(k)),
+                          (key + " null", lambda d, k=key: d.__setitem__(k, None))))
+        for key in ("edges", "instances", "semantic_edges"):
+            for ref in ("caller", "module"):
+                cases.append((key + " wrong " + ref,
+                              lambda d, k=key, r=ref: d[k][0].__setitem__(r, "foreign")))
+        cases.extend((
+            ("wrong PID", lambda d: d["callers"][0].__setitem__("pid", PID + 1)),
+            ("wrong scope", lambda d: d.__setitem__("scope", "system")),
+            ("missing start", lambda d: d["callers"][0].pop("start_time")),
+            ("retired caller", lambda d: d["callers"][0].__setitem__("retired", True)),
+            ("wrong instance", lambda d: d["semantic_edges"][0].__setitem__("instance", "i9")),
+            ("unloaded module", lambda d: d["modules"][0].__setitem__("lifecycle", "unloaded")),
+            ("unload observed", lambda d: d["modules"][0].__setitem__("unloaded_observed", True)),
+            ("manifest refused", lambda d: d["modules"][0]["admission"].__setitem__("state", "refused")),
+            ("manifest unproven", lambda d: d["modules"][0]["admission"].__setitem__("class", "heuristic")),
+            ("interrupted mapping", lambda d: d["edges"][0]["mapping"].__setitem__("interruptions", 1)),
+            ("unknown parent only", lambda d: d["semantic_edges"][0].__setitem__("semantics", "unknown")),
+            ("parent promotion", lambda d: d["edges"][0].__setitem__("operations", d["semantic_edges"][0]["operations"])),
+        ))
+        for name, mutate in cases:
+            with self.subTest(name=name), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate)
+
+    def test_current_count_authority_flags_are_required(self):
+        for section, key, value in (
+                ("physical", "saturated", True), ("physical", "in_flight", True),
+                ("physical", "observation", "unknown"),
+                ("returns", "unit", "api_entries"), ("returns", "saturated", True),
+                ("returns", "historical_only_returns", 1), ("returns", "count", True),
+                ("entries", "count", 25), ("entries", "observation", "observed")):
+            def mutate(doc, s=section, k=key, v=value):
+                row = (doc["edges"][0]["entries"] if s == "physical" else
+                       doc["semantic_edges"][0]["api_returns" if s == "returns" else "entries"])
+                row[k] = v
+            with self.subTest(section=section, key=key), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate)
+
+    def test_duplicate_or_truncated_mechanism_evidence_fails(self):
+        for mutate in (
+                lambda d: d["semantic_edges"][0]["mechanisms"].append(
+                    copy.deepcopy(d["semantic_edges"][0]["mechanisms"][0])),
+                lambda d: d["semantic_edges"][0]["mechanisms"][0]["evidence"].__setitem__("truncated", True),
+                lambda d: d["semantic_edges"][0]["mechanisms"][0]["evidence"]["functions"].append(FN_DO)):
+            with self.subTest(mutate=mutate), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate)
+
+    def test_mechanism_identity_and_duplicate_return_evidence_are_hard(self):
+        for mutate_row in (
+                lambda r: r.__setitem__("mechanism", 0x251),
+                lambda r: r.__setitem__("name", "CKM_SHA_256"),
+                lambda r: r.__setitem__("operations", ["sign"]),
+                lambda r: r["evidence"]["returns"].append(copy.deepcopy(r["evidence"]["returns"][0]))):
+            with self.subTest(mutate=mutate_row), self.assertRaises(S1.S1Error):
+                self.run_mutation(lambda d: mutate_row(d["semantic_edges"][0]["mechanisms"][0]))
 
     def test_no_semantic_rows_fails(self):
         def mutate(inventory):
@@ -619,7 +694,7 @@ class ConservationGate(unittest.TestCase):
                            str(inventory_path), 10)
             self.assertIn("divergence", str(ctx.exception))
 
-    def run_teardown_triple(self, teardown_rv=0, row_calls=25):
+    def run_teardown_triple(self, teardown_rv=0, row_calls=25, stopped=False):
         """Ledger with teardown vs observer totals that include it.
 
         The mechanism row keeps the hot-loop calls only: teardown claims
@@ -638,11 +713,14 @@ class ConservationGate(unittest.TestCase):
                 inventory = json.load(stream)
             edge = inventory["edges"][0]
             edge["entries"]["count"] = 27
-            edge["operations"]["calls"] = 27
-            edge["mechanisms"][0]["calls"] = row_calls
+            inventory["semantic_edges"][0]["operations"]["calls"] = 27
             inventory["semantic_edges"][0]["mechanisms"][0]["calls"] = \
                 row_calls
             inventory["semantic_edges"][0]["api_returns"]["count"] = 27
+            if stopped:
+                inventory["instances"][0].update(state="uncertain", reason="semantic_loss")
+                inventory["semantic_edges"][0]["coverage"] = {
+                    "lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}
             write_json(inventory_path, inventory)
             rewrite_events_for_edge(workdir, edge, last_t1)
             return s1.compare([str(ledger_path)], [str(events_path)],
@@ -654,6 +732,13 @@ class ConservationGate(unittest.TestCase):
         self.assertEqual(result["issued"], 27)
         self.assertEqual(result["conservation"]["teardown"]["calls"], 2)
         self.assertEqual(result["conservation"]["teardown"]["errors"], 0)
+
+    def test_R59_stopped_child_still_requires_every_hot_and_teardown_call(self):
+        result = self.run_teardown_triple(stopped=True)
+        self.assertEqual(result["issued"], 27)
+        for name in ("entries", "api_returns", "operations"):
+            self.assertEqual(result["conservation"][name], 27)
+        self.assertEqual(result["conservation"]["mechanisms"][0]["calls"], 25)
 
     def test_teardown_inside_a_mechanism_row_fails(self):
         with self.assertRaises(ValueError) as ctx:
@@ -791,6 +876,103 @@ class LossGate(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate_inventory=mutate)
         self.assertIn("loss-free", str(ctx.exception))
+
+    def test_exact_R59_terminal_disclosure_preserves_all_call_denominators(self):
+        def mutate(doc):
+            doc["instances"][0].update(state="uncertain", reason="semantic_loss")
+            doc["semantic_edges"][0]["coverage"] = {
+                "lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}
+        result = self.run_mutation(mutate_inventory=mutate)
+        self.assertEqual(result["conservation"]["entries"], 25)
+        self.assertEqual(result["conservation"]["operations"], 25)
+        self.assertEqual(result["conservation"]["api_returns"], 25)
+
+    def test_R59_does_not_waive_retirement_history_or_real_loss(self):
+        cases = [
+            lambda d: d["instances"][0].update(state="retired", reason="task_retired"),
+            lambda d: d["semantic_edges"][0]["coverage"]["reasons"].append("task_retired"),
+            lambda d: d["semantic_edges"][0]["coverage"]["reasons"].append("instance_retired"),
+            lambda d: d["semantic_edges"][0]["coverage"]["reasons"].append("semantic_loss"),
+            lambda d: d["semantic_edges"][0]["coverage"].__setitem__("reasons", ["capture_stopped"]),
+            lambda d: d["semantic_edges"][0]["api_returns"].__setitem__("historical_only_returns", 1),
+            lambda d: d["observation"]["semantic_capture"].__setitem__("status", "active"),
+            lambda d: d["observation"]["semantic_capture"].__setitem__("final_drain", False),
+            lambda d: d["observation"]["semantic_capture"].__setitem__("stop_quiescence", "unproven"),
+        ]
+        for key in ("continuity_cuts", "refused_endpoints", "unrouted_returns"):
+            cases.append(lambda d, k=key: d["observation"]["semantic_capture"].__setitem__(k, 1))
+        for key in ("malformed", "failed_quanta"):
+            cases.append(lambda d, k=key: d["observation"]["lifecycle"].__setitem__(k, 1))
+        for mutate in cases:
+            def stopped_mutation(doc):
+                doc["instances"][0].update(state="uncertain", reason="semantic_loss")
+                doc["semantic_edges"][0]["coverage"] = {
+                    "lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}
+                mutate(doc)
+            with self.subTest(mutate=mutate), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate_inventory=stopped_mutation)
+
+    def test_published_loss_and_suppression_never_hide_behind_R50(self):
+        for subject in ("semantic capture loss", "native capture retirement unsettled",
+                        "native capture scope custody unproven", "native capture refused an extend",
+                        "rejected demoted count", "semantic admission refused", "semantic calls unrouted"):
+            def mutate(doc):
+                doc["gaps"].append({"caller": None, "module": None, "pid": None,
+                                    "subject": subject, "reason": "joint_journal_unavailable",
+                                    "repeats": 1})
+            with self.subTest(subject=subject), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate_inventory=mutate)
+        for value in (1, None, True):
+            with self.subTest(suppressed=value), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate_inventory=lambda d: d.__setitem__("gaps_suppressed", value))
+
+    def test_gap_rows_are_scoped_readable_and_never_echo_untrusted_labels(self):
+        base = {"caller": None, "module": None, "pid": None,
+                "subject": "disclosure", "reason": "before_semantic_boundary", "repeats": 1}
+        for key, value in (("caller", "c8"), ("module", "m8"), ("pid", PID + 1),
+                           ("repeats", 0), ("repeats", True), ("reason", None), ("subject", "")):
+            def mutate(d, k=key, v=value):
+                gap = dict(base)
+                gap[k] = v
+                d["gaps"].append(gap)
+            with self.subTest(key=key, value=value), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate_inventory=mutate)
+        secret = "untrusted-private-label"
+        def mutate(d):
+            d["gaps"].append(dict(base, subject="semantic capture loss", reason=secret))
+        with self.assertRaises(S1.S1Error) as failure:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertNotIn(secret, str(failure.exception))
+
+    def test_missing_duplicate_or_unaccounted_rotations_refuse(self):
+        mutations = (
+            lambda e: e.pop(1),
+            lambda e: e.insert(1, copy.deepcopy(e[1])),
+            lambda e: e[-1]["event"]["stream"].__setitem__("rotations", 1),
+            lambda e: e[-1]["event"]["stream"].__setitem__("evicted_events", 1),
+            lambda e: e[-1]["event"]["stream"].__setitem__("evicted_bytes", 1),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), self.assertRaises(S1.S1Error):
+                self.run_mutation(mutate_events=mutate)
+
+    def test_retained_rotation_files_are_merged_without_losing_a_row(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-rotation-") as tmp:
+            workdir = Path(tmp)
+            ledger, events_path, inventory = healthy_triple(workdir, count=25, per_s=21)
+            rows = [json.loads(line) for line in events_path.read_text().splitlines()]
+            prior = workdir / "events.jsonl.1"
+            write_jsonl(prior, rows[:2])
+            marker = event_envelope(2, R0 + 1_000_000, "rotated", {
+                "prior_file": prior.name, "prior_events": 2,
+                "prior_bytes": prior.stat().st_size, "rotation_seq": 1})
+            tail = [marker, *rows[2:]]
+            for seq, row in enumerate(tail, start=2):
+                row["seq"] = seq
+            tail[-1]["event"]["stream"]["rotations"] = 1
+            write_jsonl(events_path, tail)
+            result = S1.compare([ledger], [events_path, prior], inventory, 10)
+            self.assertEqual(result["verdict"], "pass")
 
     def test_unretained_edges_fail(self):
         def mutate(events):
@@ -961,6 +1143,15 @@ class MalformedLedgerCLI(unittest.TestCase):
 
 
 STUB_PROVIDER = r"""/* Test-only stub provider: immediate OK returns, real entry shapes. */
+#include <stdio.h>
+#include <stdlib.h>
+static void record(const char *function) {
+    const char *path = getenv("S1TP_STUB_CALLS");
+    if (path == NULL) return;
+    FILE *stream = fopen(path, "a");
+    if (stream == NULL) abort();
+    if (fprintf(stream, "%s\n", function) < 0 || fclose(stream) != 0) abort();
+}
 typedef unsigned long CK_RV;
 typedef unsigned long CK_ULONG;
 typedef unsigned long CK_SLOT_ID;
@@ -971,9 +1162,10 @@ typedef void (*CK_NOTIFY)(void);
 #define CKR_OK 0
 typedef struct { unsigned long mechanism; void *pParameter; unsigned long ulParameterLen; } CK_MECHANISM;
 static unsigned long next_session = 100;
-CK_RV C_Initialize(void *init_args) { (void)init_args; return CKR_OK; }
-CK_RV C_Finalize(void *reserved) { (void)reserved; return CKR_OK; }
+CK_RV C_Initialize(void *init_args) { (void)init_args; record("C_Initialize"); return CKR_OK; }
+CK_RV C_Finalize(void *reserved) { (void)reserved; record("C_Finalize"); return CKR_OK; }
 CK_RV C_GetSlotList(unsigned char token_present, CK_SLOT_ID *slot_list, CK_ULONG *count) {
+    record("C_GetSlotList");
     (void)token_present;
     if (count == 0) return 1;
     if (slot_list == 0) { *count = 1; return CKR_OK; }
@@ -983,24 +1175,27 @@ CK_RV C_GetSlotList(unsigned char token_present, CK_SLOT_ID *slot_list, CK_ULONG
     return CKR_OK;
 }
 CK_RV C_OpenSession(CK_SLOT_ID slot, CK_FLAGS flags, void *application, CK_NOTIFY notify, CK_SESSION_HANDLE *session) {
+    record("C_OpenSession");
     (void)slot; (void)flags; (void)application; (void)notify;
     if (session == 0) return 1;
     *session = next_session++;
     return CKR_OK;
 }
-CK_RV C_CloseSession(CK_SESSION_HANDLE session) { (void)session; return CKR_OK; }
+CK_RV C_CloseSession(CK_SESSION_HANDLE session) { (void)session; record("C_CloseSession"); return CKR_OK; }
 CK_RV C_DigestInit(CK_SESSION_HANDLE session, CK_MECHANISM *mechanism) {
+    record("C_DigestInit");
     (void)session; (void)mechanism;
     return CKR_OK;
 }
 CK_RV C_Digest(CK_SESSION_HANDLE session, CK_BYTE *data, CK_ULONG data_len, CK_BYTE *digest, CK_ULONG *digest_len) {
+    record("C_Digest");
     (void)session; (void)data; (void)data_len;
     if (digest_len == 0) return 1;
     if (digest != 0 && *digest_len >= 4) {
         digest[0] = 1; digest[1] = 2; digest[2] = 3; digest[3] = 4;
     }
     *digest_len = 4;
-    return CKR_OK;
+    return getenv("S1TP_STUB_FAIL_DIGEST") == NULL ? CKR_OK : 5;
 }
 """
 
@@ -1018,19 +1213,187 @@ def build_c(test, sources, output, extra=()):
 
 @unittest.skipUnless(shutil.which("gcc"), "gcc unavailable")
 class DriverFixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build_root = tempfile.TemporaryDirectory(prefix="s1tp-compiled-")
+        cls.addClassCleanup(cls.build_root.cleanup)
+        cls.compiled = Path(cls.build_root.name)
+
     def build_driver(self, workdir):
         self.assertTrue(DRIVER_SRC.exists(),
                         f"driver missing: {DRIVER_SRC}")
-        driver = workdir / "gen-calls"
-        build_c(self, [DRIVER_SRC], driver, extra=["-ldl", "-pthread"])
+        driver = self.compiled / "gen-calls"
+        if not driver.exists():
+            build_c(self, [DRIVER_SRC], driver, extra=["-ldl", "-pthread"])
         return driver
 
     def build_stub(self, workdir):
-        stub_src = workdir / "stub.c"
-        stub_src.write_text(STUB_PROVIDER, encoding="utf-8")
-        stub = workdir / "stub.so"
-        build_c(self, [stub_src], stub, extra=["-shared", "-fPIC"])
+        stub_src = self.compiled / "stub.c"
+        stub = self.compiled / "stub.so"
+        if not stub.exists():
+            stub_src.write_text(STUB_PROVIDER, encoding="utf-8")
+            build_c(self, [stub_src], stub, extra=["-shared", "-fPIC"])
         return stub
+
+    def finish_process(self, workdir, ledger=None, finish=None, fail_digest=False):
+        driver = self.build_driver(workdir)
+        stub = self.build_stub(workdir)
+        go = workdir / "go"
+        finish = finish or workdir / "finish"
+        ledger = ledger or workdir / "ledger.jsonl"
+        calls = workdir / "provider-calls"
+        env = dict(os.environ, S1TP_STUB_CALLS=str(calls))
+        if fail_digest:
+            env["S1TP_STUB_FAIL_DIGEST"] = "1"
+        # One absolute supervisor deadline starts before Popen, covering GO,
+        # hot work, DONE and FINISH. It is never renewed at a phase boundary.
+        deadline = time.monotonic() + 30
+        proc = subprocess.Popen(
+            [str(driver), str(stub), "single", "1k", "1", str(ledger),
+             str(go), str(finish)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env)
+        return proc, go, finish, ledger, calls, deadline
+
+    def read_phase(self, proc, prefix, deadline):
+        line = bytearray()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [],
+                                         max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            part = os.read(proc.stdout.fileno(), 1)
+            if not part:
+                break
+            line.extend(part)
+            if part == b"\n":
+                break
+        self.assertEqual(line.decode(), f"{prefix} pid={proc.pid}\n")
+
+    def reap(self, proc):
+        if proc.poll() is None:
+            proc.terminate()
+        proc.communicate(timeout=5)
+
+    def test_finish_keeps_original_pid_mapping_and_closed_ledgers_without_calls(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-") as tmp:
+            workdir = Path(tmp)
+            proc, go, finish, ledger, calls, deadline = self.finish_process(workdir)
+            try:
+                self.read_phase(proc, "READY", deadline)
+                start = Path(f"/proc/{proc.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+                go.touch()
+                self.read_phase(proc, "DONE", deadline)
+                self.assertIsNone(proc.poll())
+                self.assertIn(str(self.compiled / "stub.so"), Path(f"/proc/{proc.pid}/maps").read_text())
+                self.assertEqual(start, Path(f"/proc/{proc.pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+                teardown = workdir / "ledger-teardown.jsonl"
+                before = (ledger.read_bytes(), teardown.read_bytes(), calls.read_bytes())
+                self.assertEqual(S1.load_ledgers([ledger, teardown])["issued"], 1002)
+                recorded = calls.read_text().splitlines()
+                self.assertEqual(recorded.count("C_DigestInit"), 500)
+                self.assertEqual(recorded.count("C_Digest"), 500)
+                self.assertEqual(recorded.count("C_CloseSession"), 1)
+                self.assertEqual(recorded.count("C_Finalize"), 1)
+                time.sleep(0.08)
+                self.assertEqual(before, (ledger.read_bytes(), teardown.read_bytes(), calls.read_bytes()))
+                finish.touch()
+                out, err = proc.communicate(timeout=max(0.01, deadline - time.monotonic()))
+                self.assertEqual(proc.returncode, 0, err)
+                self.assertEqual(out, "")
+                self.assertEqual(before, (ledger.read_bytes(), teardown.read_bytes(), calls.read_bytes()))
+            finally:
+                self.reap(proc)
+
+    def test_missing_finish_supervisor_terminates_and_reaps_without_double_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-missing-") as tmp:
+            short_deadline = time.monotonic() + 3
+            proc, go, _, _, calls, deadline = self.finish_process(Path(tmp))
+            # A shortened test supervisor exercises the same absolute bound;
+            # the actual qualification supervisor uses the existing 30 s.
+            deadline = min(deadline, short_deadline)
+            try:
+                self.read_phase(proc, "READY", deadline)
+                go.touch()
+                self.read_phase(proc, "DONE", deadline)
+                before = calls.read_bytes()
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+                proc.terminate()
+                out, err = proc.communicate(timeout=5)
+                self.assertNotEqual(proc.returncode, 0, (out, err))
+                self.assertIn("finish", err)
+                self.assertEqual(calls.read_bytes(), before)
+            finally:
+                self.reap(proc)
+
+    def test_preexisting_or_bad_finish_never_enters_healthy_hold(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-bad-") as tmp:
+            workdir = Path(tmp)
+            for label in ("preexisting", "inaccessible"):
+                with self.subTest(label=label):
+                    cell = workdir / label
+                    cell.mkdir()
+                    barrier = cell / "barrier"
+                    barrier.touch()
+                    finish = barrier if label == "preexisting" else barrier / "finish"
+                    proc, _, _, _, calls, deadline = self.finish_process(cell, finish=finish)
+                    try:
+                        out, err = proc.communicate(timeout=max(0.01, deadline - time.monotonic()))
+                        self.assertEqual(proc.returncode, 2, err)
+                        self.assertNotIn("DONE", out)
+                        self.assertFalse(calls.exists())
+                    finally:
+                        self.reap(proc)
+
+    def test_early_finish_cannot_claim_a_held_phase(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-early-") as tmp:
+            proc, go, finish, _, calls, deadline = self.finish_process(Path(tmp))
+            try:
+                self.read_phase(proc, "READY", deadline)
+                finish.touch()
+                go.touch()
+                out, err = proc.communicate(timeout=max(0.01, deadline - time.monotonic()))
+                self.assertEqual(proc.returncode, 2, err)
+                self.assertNotIn("DONE", out)
+                self.assertEqual(calls.read_text().splitlines().count("C_Finalize"), 1)
+            finally:
+                self.reap(proc)
+
+    def test_unhealthy_or_unwritten_ledger_cannot_emit_healthy_done(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-unhealthy-") as tmp:
+            for unhealthy in (True, False):
+                with self.subTest(unhealthy=unhealthy):
+                    cell = Path(tmp) / str(unhealthy)
+                    cell.mkdir()
+                    ledger = cell / "ledger.jsonl" if unhealthy else cell / "missing" / "ledger.jsonl"
+                    proc, go, _, _, calls, deadline = self.finish_process(
+                        cell, ledger=ledger, fail_digest=unhealthy)
+                    try:
+                        self.read_phase(proc, "READY", deadline)
+                        go.touch()
+                        out, err = proc.communicate(timeout=max(0.01, deadline - time.monotonic()))
+                        self.assertEqual(proc.returncode, 1 if unhealthy else 2, err)
+                        self.assertNotIn("DONE", out)
+                        recorded = calls.read_text().splitlines()
+                        self.assertEqual(recorded.count("C_CloseSession"), 1)
+                        self.assertEqual(recorded.count("C_Finalize"), 1)
+                    finally:
+                        self.reap(proc)
+
+    def test_done_flush_failure_never_becomes_a_successful_hold(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-finish-pipe-") as tmp:
+            proc, go, _, _, calls, deadline = self.finish_process(Path(tmp))
+            try:
+                self.read_phase(proc, "READY", deadline)
+                proc.stdout.close()
+                go.touch()
+                proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+                self.assertNotEqual(proc.returncode, 0)
+                recorded = calls.read_text().splitlines()
+                self.assertEqual(recorded.count("C_CloseSession"), 1)
+                self.assertEqual(recorded.count("C_Finalize"), 1)
+            finally:
+                self.reap(proc)
 
     def test_driver_builds_clean(self):
         with tempfile.TemporaryDirectory(prefix="s1tp-gcc-") as tmp:
@@ -1073,6 +1436,9 @@ class DriverFixture(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(">= 2", proc.stdout)
             self.assertIn("smoke only", proc.stdout)
+            self.assertIn("FINISH_FILE", proc.stdout)
+            self.assertIn("absolute 30 s", proc.stdout)
+            self.assertIn("No internal deadline", proc.stdout)
 
     def test_driver_dry_run_names_the_teardown_ledger(self):
         with tempfile.TemporaryDirectory(prefix="s1tp-tddry-") as tmp:
@@ -1103,6 +1469,7 @@ class DriverFixture(unittest.TestCase):
             self.assertEqual(proc.returncode, 0,
                              f"rc={proc.returncode}: {proc.stderr[-2000:]}")
             self.assertIn("READY pid=", proc.stdout)
+            self.assertNotIn("DONE", proc.stdout)
             with open(ledger, encoding="utf-8") as stream:
                 rows = t0.read_ledger(stream)
             summary = t0.validate_ledger(rows)
@@ -1122,32 +1489,23 @@ class DriverFixture(unittest.TestCase):
             stub = self.build_stub(workdir)
             ledger = workdir / "ledger.jsonl"
             gate = workdir / "go"
+            deadline = time.monotonic() + 30
             proc = subprocess.Popen(
                 [str(driver), str(stub), "single", "1k", "1", str(ledger),
                  str(gate)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True)
             try:
-                ready = ""
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    chunk = proc.stdout.read(1)
-                    if not chunk:
-                        break
-                    ready += chunk
-                    if "\n" in ready:
-                        break
-                self.assertIn("READY pid=", ready)
+                self.read_phase(proc, "READY", deadline)
                 time.sleep(0.5)
                 self.assertIsNone(proc.poll())
                 self.assertFalse(ledger.exists())
                 gate.touch()
-                rc = proc.wait(timeout=30)
-                self.assertEqual(rc, 0)
+                out, err = proc.communicate(timeout=max(0.01, deadline - time.monotonic()))
+                self.assertEqual(proc.returncode, 0, err)
+                self.assertNotIn("DONE", out)
                 self.assertTrue(ledger.exists())
             finally:
-                if proc.poll() is None:
-                    proc.send_signal(signal.SIGTERM)
-                    proc.wait(timeout=10)
+                self.reap(proc)
 
     def test_driver_churn_run_emits_one_ledger_per_thread(self):
         t0 = require_t0(self)

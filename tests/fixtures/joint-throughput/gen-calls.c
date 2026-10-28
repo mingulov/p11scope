@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* S1 throughput driver: paced SoftHSM digest calls with per-call ledgers.
  *
- * Usage: gen-calls PROVIDER MODE RATE DURATION_S LEDGER [GO_FILE]
+ * Usage: gen-calls PROVIDER MODE RATE DURATION_S LEDGER [GO_FILE [FINISH_FILE]]
  *   PROVIDER    SoftHSM library path to dlopen and drive
  *   MODE        single (one worker) or churn (waves of short-lived threads)
  *   RATE        1k, 10k or 100k (paced PKCS#11 calls per second)
@@ -11,6 +11,11 @@
  *               Teardown is ledgered beside the hot ledgers (2 calls
  *               single, 9 churn); pass every emitted file to --ledger.
  *   GO_FILE     optional gate path: print READY, wait for the path, run
+ *   FINISH_FILE optional active-target gate, initially absent. After all
+ *               healthy hot/teardown ledgers close, print/flush DONE and
+ *               wait before dlclose/exit, with no further PKCS#11 calls.
+ *               The controller must prove the original PID/mapping stays
+ *               held through observer drain, then create this path.
  *
  * Also: gen-calls --help (usage, exit 0) and gen-calls --dry-run with the
  * same arguments (print the call/thread/ledger plan, exit 0). Both need
@@ -34,6 +39,13 @@
  * on absolute deadlines, so a 1 s run ends near 0.95 s with no full 1 s
  * window, and the comparison refuses it. Use 1 s runs as --min-rate 0
  * smoke only.
+ *
+ * GO/FINISH waits poll every 10 ms and are signal-interruptible; neither
+ * has an internal timeout. Qualification requires the controller's one
+ * absolute 30 s supervisor deadline from before process launch (never
+ * renewed at DONE), with timeout -> TERM and reap. FINISH mode qualifies
+ * active throughput, not exit coverage; the default immediate exit stays
+ * available for the separate lifecycle/count regression.
  *
  * Pacing aims 5% above nominal on absolute CLOCK_MONOTONIC deadlines,
  * so scheduling jitter and churn wave boundaries cannot push a full 1 s
@@ -143,6 +155,15 @@ static int wait_for_go(const char *path) {
     return stop ? 1 : 0;
 }
 
+/* A gate released before DONE cannot establish a held active target. */
+static int finish_is_absent(const char *path) {
+    if (path[0] != '\0' && access(path, F_OK) != 0 && errno == ENOENT) {
+        return 1;
+    }
+    fprintf(stderr, "gen-calls: finish gate must be absent before DONE\n");
+    return 0;
+}
+
 static int parse_duration(const char *text, unsigned long *out) {
     if (text[0] == '\0') {
         return -1;
@@ -179,7 +200,7 @@ static int parse_rate(const char *text, unsigned long *out) {
 }
 
 static void usage(const char *name) {
-    printf("usage: %s PROVIDER MODE RATE DURATION_S LEDGER [GO_FILE]\n"
+    printf("usage: %s PROVIDER MODE RATE DURATION_S LEDGER [GO_FILE [FINISH_FILE]]\n"
            "  PROVIDER    SoftHSM library path to dlopen and drive\n"
            "  MODE        single (one worker) or churn (thread waves)\n"
            "  RATE        1k, 10k or 100k paced calls per second\n"
@@ -190,8 +211,12 @@ static void usage(const char *name) {
            "              Teardown (closes + finalize) is ledgered beside\n"
            "              the hot ledgers: 2 calls single, 9 churn.\n"
            "  GO_FILE     optional gate: print READY, wait for it, run\n"
+           "  FINISH_FILE optional initially absent gate: healthy closed ledgers,\n"
+           "              flush DONE, wait before dlclose/exit; no further calls.\n"
+           "              No internal deadline: requires one absolute 30 s\n"
+           "              process supervisor from launch, then TERM/reap.\n"
            "  %s --help | --dry-run PROVIDER MODE RATE DURATION_S LEDGER "
-           "[GO_FILE]\n",
+           "[GO_FILE [FINISH_FILE]]\n",
            name, name);
 }
 
@@ -566,7 +591,7 @@ int main(int argc, char **argv) {
         first = 2;
     }
     int rest = argc - first;
-    if (rest != 5 && rest != 6) {
+    if (rest != 5 && rest != 6 && rest != 7) {
         usage(name);
         return 2;
     }
@@ -590,7 +615,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *ledger_arg = argv[first + 4];
-    const char *gate = rest == 6 ? argv[first + 5] : NULL;
+    const char *gate = rest >= 6 ? argv[first + 5] : NULL;
+    const char *finish = rest == 7 ? argv[first + 6] : NULL;
     struct plan plan;
     if (make_plan(churn, rate, duration, &plan) != 0) {
         return 2;
@@ -616,6 +642,9 @@ int main(int argc, char **argv) {
                    teardown);
         }
         return 0;
+    }
+    if (finish != NULL && !finish_is_absent(finish)) {
+        return 2;
     }
 
     signal(SIGTERM, on_signal);
@@ -791,6 +820,19 @@ int main(int argc, char **argv) {
         rc = 2;
     } else if (teardown_unhealthy != 0 && rc == 0) {
         rc = 1;
+    }
+    if (finish != NULL && rc == 0) {
+        if (stop || !finish_is_absent(finish)) {
+            rc = 2;
+        } else if (printf("DONE pid=%d\n", (int)getpid()) < 0 || fflush(stdout) != 0) {
+            fprintf(stderr, "gen-calls: cannot flush DONE\n");
+            rc = 2;
+        } else if (wait_for_go(finish) != 0) {
+            fprintf(stderr, "gen-calls: interrupted or cannot wait for finish gate\n");
+            rc = 2;
+        }
+        /* write_teardown_ledger already closed/finalized the provider.
+         * Finish success, interruption and failure make no PKCS#11 calls. */
     }
     free(sessions);
     dlclose(provider.handle);

@@ -18,8 +18,8 @@ Gates, in order; the first failure refuses with its own reason:
    diagnostic runs only.
 2. Conservation: issued == observed exactly, at the finest granularity
    the v0.5.0 S1 contract publishes (docs/schema/inventory-v1.md):
-   exact call and error totals per mechanism - the driver edge
-   entries.count, operations.calls and the summed api_returns counts
+   exact call and error totals per mechanism - the physical edge's
+   entries.count and its owned semantic child's operations.calls and api_returns
    each equal issued, and every mechanism row's calls / errors equal
    the ledgered totals of its evidence functions - with the observed
    function-name and return-code sets equal to the ledger's hot-loop
@@ -28,18 +28,28 @@ Gates, in order; the first failure refuses with its own reason:
    mechanism row, so they are exempt from the evidence-set checks.
    Within one mechanism row, function swaps are invisible in v1 output
    and are a documented blind spot, not a proof.
-3. Zero event loss: observation.lifecycle.ring_loss == 0, the S1
+3. No published capture loss: observation.lifecycle.ring_loss == 0, the S1
    event-loss account observation.semantic_capture.unrouted_returns ==
    0 (reported as events_lost), a proven full drain (final_drain true,
    stop_quiescence quiesced), no known-loss gap, loss-free counted
-   coverage on the driver edge and its semantic rows, and a complete
+   coverage on the physical edge, a current semantic child (clean or only
+   the exact terminal R59 capture_stopped/semantic_loss pair), and a complete
    event stream (ended present, edges_unretained == 0,
    gaps_suppressed == 0, no retention eviction). The v0.5.0
    joint_journal_unavailable lane disclosure is tolerated, never gated.
 4. S1-active proof: object_observations reads unavailable with reason
    journal_unavailable (the v0.5.0 marker: no key-operation feed was
    installed, so the S1 path carried every call), and the semantic
-   lane left disabled behind.
+   lane finished stopped.
+
+This oracle checks the current PID/module/instance graph, not a parent
+semantic rollup. The live controller must separately prove actual Multi,
+PID generation/provider identity, lifetime Detailed EVENTS loss == 0 via
+the identity-bound held map, and collected == joined == issued with shed
+and refused == 0 at stop. Inventory lifecycle.ring_loss covers DISCOVERY;
+the retained totals and R59 disclosure alone do not prove lifetime EVENTS.
+An optional active-target FINISH hold qualifies rate while the original
+PID/mapping lives through drain; it does not qualify exit coverage.
 
 Recorded, never gated: S1 publish latency. Each ledgered END t1 maps
 to the first edge_observed record whose cumulative entries.count
@@ -51,6 +61,7 @@ tests/python/test_s1_throughput_compare.py.
 import argparse
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -81,6 +92,11 @@ LOSS_GAP_SUBJECTS = frozenset({
     "native capture lifecycle evidence lost",
     "native capture retirement unsettled",
     "joint machine unavailable",
+    "native capture scope custody unproven",
+    "native capture refused an extend",
+    "rejected demoted count",
+    "semantic admission refused",
+    "semantic calls unrouted",
 })
 # Gap reasons that name a lost feed (the plan-named text above).
 LOSS_GAP_REASONS = frozenset({
@@ -90,13 +106,6 @@ LOSS_GAP_REASONS = frozenset({
 # entries/operations/api_returns, but lifecycle-only calls claim no
 # mechanism row, so they are exempt from the evidence-set checks.
 TEARDOWN_FUNCTIONS = frozenset({"C_CloseSession", "C_Finalize"})
-# The v0.5.0 per-lane S1 disclosure: expected on every --manifest run,
-# tolerated by the loss gate, never required and never a failure.
-TOLERATED_GAP_REASONS = frozenset({
-    "joint_journal_unavailable",
-})
-# Semantic-lane states past "no lane": the S1 path carried the run.
-S1_ACTIVE_STATUSES = frozenset({"active", "partial", "stopped"})
 # Derived presentation keys on edge_observed records, stripped before
 # the record is compared with its snapshot edge.
 DERIVED_EDGE_KEYS = frozenset(
@@ -289,28 +298,70 @@ def check_scope_and_clock(events, pid):
              f"{clock.get('unit')!r} disagrees with CLOCK_MONOTONIC/ns")
 
 
+def _singleton(doc, key):
+    rows = doc.get(key)
+    _require(type(rows) is list and len(rows) == 1 and type(rows[0]) is dict,
+             f"current throughput topology needs exactly one {key} row")
+    return rows[0]
+
+
 def select_driver(doc, pid):
-    """Find the driver's single edge and its semantic rows."""
-    callers = doc.get("callers")
-    _require(type(callers) is list, "inventory callers must be a list")
-    caller_ids = {caller["id"] for caller in callers
-                  if type(caller) is dict and caller.get("pid") == pid
-                  and type(caller.get("id")) is str}
-    _require(caller_ids, f"no caller with driver pid {pid} in inventory")
-    edges = doc.get("edges")
-    _require(type(edges) is list, "inventory edges must be a list")
-    driver_edges = [edge for edge in edges
-                    if type(edge) is dict and edge.get("caller") in caller_ids]
-    _require(len(driver_edges) == 1,
-             f"driver edge: {len(driver_edges)} edges for pid {pid}, "
-             "need exactly 1 for an exact comparison")
-    edge = driver_edges[0]
-    sem_rows = [row for row in doc.get("semantic_edges", [])
-                if type(row) is dict and row.get("caller") == edge.get("caller")
-                and row.get("module") == edge.get("module")]
-    _require(sem_rows,
-             f"no semantic_edges rows for driver edge "
-             f"({edge.get('caller')}, {edge.get('module')})")
+    """Resolve one current owned graph without promoting its withheld parent.
+
+    The live wrapper binds start_time and the mapped provider to its actual
+    process; this checks consistent report references, never reads a path
+    from the report, and refuses missing, duplicate or unrelated rows.
+    """
+    _require(doc.get("schema") == "p11scope/inventory/v1",
+             "current inventory schema is required")
+    caller = _singleton(doc, "callers")
+    module = _singleton(doc, "modules")
+    edge = _singleton(doc, "edges")
+    instance = _singleton(doc, "instances")
+    child = _singleton(doc, "semantic_edges")
+    for row, prefix in ((caller, "c"), (module, "m"), (instance, "i")):
+        _require(type(row.get("id")) is str
+                 and re.fullmatch(prefix + r"[0-9]+", row["id"]) is not None,
+                 "invalid current throughput identity")
+    _require(_u64(caller.get("pid")) and caller["pid"] == pid
+             and 0 < pid < 2 ** 32 and doc.get("scope") == f"pid:{pid}"
+             and _u64(caller.get("start_time")) and caller["start_time"] > 0
+             and caller.get("retired") is False,
+             "throughput caller is not the retained driver PID scope")
+    pair = (caller["id"], module["id"])
+    _require(all((row.get("caller"), row.get("module")) == pair
+                 for row in (edge, instance, child))
+             and child.get("instance") == instance["id"],
+             "throughput child does not resolve to the owned caller/module/instance")
+    admission = module.get("admission")
+    _require(type(admission) is dict and admission.get("state") == "admitted"
+             and admission.get("class") == "operator" and admission.get("reasons") == []
+             and _u64(admission.get("endpoints")) and admission["endpoints"] > 0,
+             "throughput module lacks validated manifest admission")
+    _require(module.get("lifecycle") == "mapped" and module.get("unloaded_observed") is False,
+             "throughput module is not the held mapped provider")
+    mapping = edge.get("mapping")
+    _require(type(mapping) is dict and mapping.get("state") == "mapped"
+             and _u64(mapping.get("interruptions")) and mapping["interruptions"] == 0,
+             "throughput physical mapping is retired or interrupted")
+    entries = edge.get("entries")
+    _require(type(entries) is dict and entries.get("observation") == "observed"
+             and entries.get("in_flight") is False and entries.get("saturated") is False,
+             "physical entries are not complete observed counts")
+    _require(edge.get("semantics") == "unknown (per-edge summary withheld; see semantic children)"
+             and "operations" in edge and edge["operations"] is None
+             and "mechanisms" in edge and edge["mechanisms"] is None,
+             "current parent is not the exact withheld semantic summary")
+    _require(child.get("semantics") == "observed"
+             and child.get("entries") == {"unit": "api_entries", "count": None,
+                                          "observation": "unavailable"},
+             "child lacks observed semantics or invents physical entries")
+    returns = child.get("api_returns")
+    _require(type(returns) is dict and returns.get("unit") == "api_returns"
+             and returns.get("saturated") is False
+             and _u64(returns.get("historical_only_returns"))
+             and returns["historical_only_returns"] == 0,
+             "child API returns are not current unsaturated observations")
     observation = doc.get("observation")
     _require(type(observation) is dict, "inventory observation must be an object")
     _require(observation.get("lane") == "native",
@@ -320,8 +371,8 @@ def select_driver(doc, pid):
              "native observation without a lifecycle account")
     _require(type(observation.get("semantic_capture")) is dict,
              "native observation without a semantic_capture summary")
-    return {"caller_ids": sorted(caller_ids), "edge": edge,
-            "sem_rows": sem_rows, "observation": observation}
+    return {"caller_ids": [caller["id"]], "pid": pid, "edge": edge,
+            "instance": instance, "sem_rows": [child], "observation": observation}
 
 
 def driver_series(events, edge):
@@ -392,13 +443,13 @@ def check_conservation(view, selected):
     edge = selected["edge"]
     entries = edge.get("entries")
     _require(type(entries) is dict, "driver edge without entries")
-    _require(entries.get("count") == issued,
+    _require(_u64(entries.get("count")) and entries["count"] == issued,
              f"entries.count {entries.get('count')} != issued {issued}")
-    operations = edge.get("operations")
+    child = selected["sem_rows"][0]
+    operations = child.get("operations")
     _require(type(operations) is dict,
-             f"no S1 operations on the driver edge "
-             f"(semantics {edge.get('semantics')!r})")
-    _require(operations.get("calls") == issued,
+             "no S1 operations on the owned semantic child")
+    _require(_u64(operations.get("calls")) and operations["calls"] == issued,
              f"operations.calls {operations.get('calls')} != issued {issued}")
     api_total = 0
     for row in selected["sem_rows"]:
@@ -410,25 +461,40 @@ def check_conservation(view, selected):
         api_total += count
     _require(api_total == issued,
              f"api_returns {api_total} != issued {issued}")
-    mechanisms = edge.get("mechanisms")
+    mechanisms = child.get("mechanisms")
     _require(type(mechanisms) is list and mechanisms,
-             f"no S1 mechanism rows on the driver edge "
+             f"no S1 mechanism rows on the owned semantic child "
              f"with {issued} issued calls")
     observed_fns = set()
     observed_rvs = set()
+    ids = set()
     for row in mechanisms:
         _require(type(row) is dict, "mechanism row must be an object")
+        mechanism = row.get("mechanism")
+        _require(_u64(mechanism) and mechanism not in ids,
+                 "duplicate or invalid mechanism identity")
+        ids.add(mechanism)
+        _require(mechanism == 0x250 and row.get("name") == "CKM_SHA256"
+                 and row.get("operations") == ["digest"],
+                 "mechanism does not match the driver's SHA256 digest workload")
         evidence = row.get("evidence")
         _require(type(evidence) is dict, "mechanism without evidence")
+        _require(evidence.get("truncated") is False, "truncated mechanism evidence")
         functions = evidence.get("functions")
         _require(type(functions) is list
                  and all(type(fn) is str for fn in functions),
                  "mechanism evidence functions must be a string list")
+        _require(functions and len(set(functions)) == len(functions)
+                 and not (observed_fns & set(functions)),
+                 "duplicate or empty mechanism function evidence")
         returns = evidence.get("returns")
         _require(type(returns) is list, "mechanism evidence returns must be a list")
+        row_rvs = set()
         for entry in returns:
             _require(type(entry) is dict and _u64(entry.get("rv")),
                      "observed return code out of range")
+            _require(entry["rv"] not in row_rvs, "duplicate mechanism return evidence")
+            row_rvs.add(entry["rv"])
             observed_rvs.add(entry["rv"])
         observed_fns.update(functions)
     hot_calls = [row for row in view["calls"]
@@ -439,14 +505,14 @@ def check_conservation(view, selected):
     if missing:
         raise S1Error(
             f"ledger function {missing[0]} missing from observed evidence")
-    extra = sorted(observed_fns - view["fn_set"])
+    extra = sorted(observed_fns - hot_fns)
     if extra:
         raise S1Error(f"observed function {extra[0]} absent from ledger")
     missing_rv = sorted(hot_rvs - observed_rvs)
     if missing_rv:
         raise S1Error(
             f"ledger rv {missing_rv[0]} missing from observed returns")
-    extra_rv = sorted(observed_rvs - view["rv_set"])
+    extra_rv = sorted(observed_rvs - hot_rvs)
     if extra_rv:
         raise S1Error(f"observed rv {extra_rv[0]} absent from ledger")
     checked = []
@@ -455,10 +521,10 @@ def check_conservation(view, selected):
         want_calls = sum(view["fn_table"][fn]["total"] for fn in functions)
         want_errors = sum(view["fn_table"][fn]["errors"] for fn in functions)
         label = row.get("mechanism")
-        _require(row.get("calls") == want_calls,
+        _require(_u64(row.get("calls")) and row["calls"] == want_calls,
                  f"mechanism {label} calls {row.get('calls')} != "
                  f"ledger {want_calls} for functions {sorted(functions)}")
-        _require(row.get("errors") == want_errors,
+        _require(_u64(row.get("errors")) and row["errors"] == want_errors,
                  f"mechanism {label} errors {row.get('errors')} != "
                  f"ledger {want_errors} for functions {sorted(functions)}")
         checked.append({"mechanism": label, "calls": row["calls"],
@@ -475,20 +541,28 @@ def check_conservation(view, selected):
 
 
 def _gap_loss_reason(subject, reason):
-    if reason in TOLERATED_GAP_REASONS:
-        return None
     if subject in LOSS_GAP_SUBJECTS or reason in LOSS_GAP_REASONS:
-        return f"loss gap: subject {subject!r} reason {reason!r}"
+        return "loss gap: published capture loss or retirement"
+    if subject == "semantic input refused" and reason != "slot":
+        return "loss gap: semantic input refused beyond count-only setup"
     return None
 
 
 def check_loss(selected, doc, events):
-    """Zero event loss across counters, drain proof, gaps and coverage."""
+    """Check published loss and the exact terminal R59 child disclosure.
+
+    The held Detailed EVENTS counter and exact stop collected/joined/shed
+    account remain mandatory independent live-wrapper checks.
+    """
     observation = selected["observation"]
     ring_loss = observation["lifecycle"].get("ring_loss")
     _require(_u64(ring_loss), "lifecycle ring_loss out of range")
     _require(ring_loss == 0,
              f"ring_loss {ring_loss} (observation.lifecycle.ring_loss)")
+    for name in ("malformed", "failed_quanta"):
+        value = observation["lifecycle"].get(name)
+        _require(_u64(value) and value == 0,
+                 f"lifecycle {name} is unknown or nonzero")
     capture = observation["semantic_capture"]
     unrouted = capture.get("unrouted_returns")
     _require(_u64(unrouted), "semantic_capture unrouted_returns out of range")
@@ -500,14 +574,27 @@ def check_loss(selected, doc, events):
     _require(drain is True and quiescence == "quiesced",
              f"stop did not prove a full drain (final_drain={drain}, "
              f"stop_quiescence={quiescence})")
+    _require(_u64(capture.get("admitted_endpoints")) and capture["admitted_endpoints"] > 0,
+             "no admitted semantic endpoints")
+    for name in ("refused_endpoints", "continuity_cuts"):
+        _require(_u64(capture.get(name)) and capture[name] == 0,
+                 f"semantic_capture {name} is unknown or nonzero")
+    _require(_u64(doc.get("gaps_suppressed")) and doc["gaps_suppressed"] == 0,
+             "snapshot gaps_suppressed is unknown or nonzero")
     gaps = doc.get("gaps")
     _require(type(gaps) is list, "inventory gaps must be a list")
     for gap in gaps:
         _require(type(gap) is dict, "gap entry must be an object")
         subject = gap.get("subject")
         reason = gap.get("reason")
-        _require(type(subject) is str and type(reason) is str,
+        _require(type(subject) is str and subject and type(reason) is str and reason,
                  "gap entry without subject/reason")
+        _require(_u64(gap.get("repeats")) and gap["repeats"] > 0,
+                 "gap entry without a positive repeat count")
+        _require(gap.get("caller") in (None, selected["edge"]["caller"])
+                 and gap.get("module") in (None, selected["edge"]["module"])
+                 and (gap.get("pid") is None or (_u64(gap["pid"]) and gap["pid"] == selected["pid"])),
+                 "gap references another caller/module/PID")
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)
     for row in events:
@@ -516,7 +603,7 @@ def check_loss(selected, doc, events):
         payload = row["event"]
         subject = payload.get("subject")
         reason = payload.get("reason")
-        _require(type(subject) is str and type(reason) is str,
+        _require(type(subject) is str and subject and type(reason) is str and reason,
                  "gap_recorded without subject/reason")
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)
@@ -530,21 +617,36 @@ def check_loss(selected, doc, events):
     for row in selected["sem_rows"]:
         row_coverage = row.get("coverage")
         _require(type(row_coverage) is dict, "semantic row without coverage")
-        _require(row_coverage.get("lossy") is False,
-                 "semantic coverage not loss-free for instance "
-                 f"{row.get('instance')!r}")
+        instance = selected["instance"]
+        if row_coverage.get("lossy") is False and row_coverage.get("reasons") == []:
+            _require(instance.get("state") == "observed" and instance.get("reason") is None,
+                     "semantic coverage has unproven instance authority")
+        else:
+            _require(row_coverage.get("lossy") is True
+                     and row_coverage.get("reasons") == ["capture_stopped", "semantic_loss"]
+                     and instance.get("state") == "uncertain" and instance.get("reason") == "semantic_loss",
+                     "semantic coverage is not the exact R59 stopped disclosure")
+        # Gap repeats mix call and admission pushes, and are never a call
+        # denominator or evidence that a shed return is harmless.
     ended = next((row["event"] for row in events if row["kind"] == "ended"),
                  None)
     _require(ended is not None, "event stream incomplete: no ended marker")
     unretained = ended.get("edges_unretained")
-    _require(unretained == 0,
+    _require(_u64(unretained) and unretained == 0,
              f"event stream incomplete: edges_unretained {unretained}")
     suppressed = ended.get("gaps_suppressed")
-    _require(suppressed == 0,
+    _require(_u64(suppressed) and suppressed == 0,
              f"event stream incomplete: gaps_suppressed {suppressed}")
     evicted = [row for row in events if row["kind"] == "retention_evicted"]
     _require(not evicted,
              f"event stream incomplete: retention evicted {len(evicted)} files")
+    stream = ended.get("stream")
+    _require(type(stream) is dict
+             and all(_u64(stream.get(name)) and stream[name] == 0
+                     for name in ("evicted_events", "evicted_bytes"))
+             and _u64(stream.get("rotations"))
+             and stream["rotations"] == sum(row["kind"] == "rotated" for row in events),
+             "event stream incomplete: rotation/retention account differs")
     budgets = doc.get("budgets")
     _require(budgets is None or type(budgets) is dict,
              "inventory budgets must be an object")
@@ -569,8 +671,8 @@ def check_s1_active(doc, selected):
              f"object_observations status {status} reason {reason}, not "
              "the S1 marker unavailable/journal_unavailable")
     lane = selected["observation"]["semantic_capture"].get("status")
-    _require(lane in S1_ACTIVE_STATUSES,
-             f"semantic lane never active: status {lane}")
+    _require(lane == "stopped",
+             f"semantic lane has not finished stopped: status {lane}")
     return {"status": status, "reason": reason, "lane": lane}
 
 
@@ -586,6 +688,14 @@ def compare(ledger_paths, event_paths, inventory_path,
         except (OSError, UnicodeError) as error:
             raise S1Error(f"unreadable events {path}") from error
     events.sort(key=lambda row: row["seq"])
+    _require(events and all(row["seq"] == seq for seq, row in enumerate(events)),
+             "event stream incomplete: missing or duplicate sequence")
+    _require(events[0]["kind"] == "started"
+             and sum(row["kind"] == "started" for row in events) == 1,
+             "event stream incomplete: started marker is not unique and first")
+    _require(events[-1]["kind"] == "ended"
+             and sum(row["kind"] == "ended" for row in events) == 1,
+             "event stream incomplete: ended marker is not unique and last")
     try:
         doc = read_inventory_file(inventory_path)
     except OSError as error:

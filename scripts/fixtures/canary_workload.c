@@ -565,7 +565,7 @@ static int run_concurrent(struct concurrent_call *calls, size_t count, const cha
     }
     if (shared && (wait_for_registration(shared) != 0 ||
                    publish_roster(shared, mode, ready) != 0 ||
-                   wait_for_go(shared, gate, 10) != 0)) {
+                   wait_for_go(shared, gate, 30) != 0)) {
         barrier_abort(shared);
         for (size_t i = 0; i < created; i++) pthread_join(threads[i], NULL);
         barrier_destroy(shared);

@@ -34,7 +34,9 @@ Denominator reuse (--traced-cost, the R-47 N5 production cost):
 each round runs on/unobserved ABBA (odd) or BAAB (even) with no base
 arm, and the tool prints one TRACED_COST line per cell (median and
 p10/p90 spread of the per-pair observed-minus-unobserved ns per
-call). Every per-sample gate above still applies; the --rel-pct and
+completed call: wall_ns / total completed calls, without M2's thread
+factor). Each line names the unit, thread count and both arms' total
+completed calls. Every per-sample gate above still applies; the --rel-pct and
 --ci-pct bars belong to the M2 report only.
 
 Usage:
@@ -215,7 +217,10 @@ def paired_traced_deltas(cell_samples):
             return [], (f"round {rnd}: on={len(on)} unobserved={len(bare)} "
                         "samples do not pair")
         for a, b in zip(on, bare):
-            deltas.append(unit_ns(a) - unit_ns(b))
+            # N5 divides elapsed time by total completed calls, so its
+            # production denominator must use that same unit. M2's
+            # per-thread normalization in unit_ns remains separate.
+            deltas.append(a["wall_ns"] / a["ops"] - b["wall_ns"] / b["ops"])
     return deltas, ""
 
 
@@ -449,7 +454,8 @@ def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
 
     Returns (rows, problems). Each row holds one cell's median and
     spread (p10/p90) of the per-pair observed-minus-unobserved ns per
-    call plus the pair count. Every M2 per-sample gate is kept: the
+    completed call, without a thread factor, plus the pair count and
+    total-call/thread provenance. Every M2 per-sample gate is kept: the
     log must hold exactly the required cells, each under its exact
     workload, each with contiguous rounds 1..R (R >= required) in
     strict on/unobserved ABBA (odd) or BAAB (even) order, each on-arm
@@ -490,6 +496,10 @@ def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
                 problems.append(f"cell {cell}: mixed modes {sorted(modes)}")
                 continue
             mode = cell_samples[0]["mode"]
+        thread_counts = {s["threads"] for s in cell_samples}
+        if len(thread_counts) != 1:
+            problems.append(f"cell {cell}: mixed thread counts {sorted(thread_counts)}")
+            continue
         present = sorted({s["round"] for s in cell_samples})
         if present != list(range(1, len(present) + 1)):
             problems.append(f"cell {cell}: rounds {present} are not contiguous from 1")
@@ -576,6 +586,11 @@ def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
                 "p10_ns": traced_percentile(ordered, 10),
                 "p90_ns": traced_percentile(ordered, 90),
                 "samples": len(ordered),
+                "unit": "ns/completed_call" if mode == "call" else "ns/op",
+                "threads": next(iter(thread_counts)),
+                "on_total_ops": sum(s["ops"] for s in on),
+                "unobserved_total_ops": sum(s["ops"] for s in cell_samples
+                                            if s["arm"] == "unobserved"),
             }
         )
     return rows, problems
@@ -583,12 +598,17 @@ def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
 
 def traced_cost_lines(rows):
     """One parseable TRACED_COST line per denominator row."""
-    return [
-        f"TRACED_COST cell={row['cell']} median_ns={row['median_ns']:.1f} "
-        f"p10_ns={row['p10_ns']:.1f} p90_ns={row['p90_ns']:.1f} "
-        f"samples={row['samples']}"
-        for row in rows
-    ]
+    lines = []
+    for row in rows:
+        count_kind = "calls" if row["unit"] == "ns/completed_call" else "ops"
+        lines.append(
+            f"TRACED_COST cell={row['cell']} median_ns={row['median_ns']:.1f} "
+            f"p10_ns={row['p10_ns']:.1f} p90_ns={row['p90_ns']:.1f} "
+            f"samples={row['samples']} unit={row['unit']} threads={row['threads']} "
+            f"on_total_{count_kind}={row['on_total_ops']} "
+            f"unobserved_total_{count_kind}={row['unobserved_total_ops']}"
+        )
+    return lines
 
 
 def report(headers, rows, rel_bar, ci_bar, required_cells=M2_CELLS,
@@ -979,12 +999,14 @@ def self_test():
         assert t1row["samples"] == 10, t1row
         t4row = next(r for r in den_rows if r["cell"] == "relevant-call-t4")
         assert (t4row["median_ns"], t4row["p10_ns"], t4row["p90_ns"],
-                t4row["samples"]) == (300.0, 300.0, 300.0, 10), t4row
+                t4row["samples"]) == (75.0, 75.0, 75.0, 10), t4row
         assert traced_cost_lines(den_rows) == [
             "TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
-            "p10_ns=109.0 p90_ns=181.0 samples=10",
-            "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
-            "p10_ns=300.0 p90_ns=300.0 samples=10",
+            "p10_ns=109.0 p90_ns=181.0 samples=10 unit=ns/completed_call threads=1 "
+            "on_total_calls=10000 unobserved_total_calls=10000",
+            "TRACED_COST cell=relevant-call-t4 median_ns=75.0 "
+            "p10_ns=75.0 p90_ns=75.0 samples=10 unit=ns/completed_call threads=4 "
+            "on_total_calls=10000 unobserved_total_calls=10000",
         ], traced_cost_lines(den_rows)
         # Every denominator failure mode fails loudly.
         den_off = den_log.replace("cell=relevant-call-t1 arm=on round=1",

@@ -209,7 +209,8 @@ def dencampaign_log(cells=DEN_CELLS, rounds=5):
 
     Odd rounds run on/unobserved/unobserved/on, even rounds the
     mirror. t1 diffs run 100..190 over alternating bare walls (the
-    subtraction is per pair, not against a median); t4 is flat 300.
+    subtraction is per pair, not against a median); t4 is flat 75 ns
+    per total completed call (300 under M2's per-thread normalization).
     """
     log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
     log += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
@@ -277,6 +278,11 @@ class TracedCostOracle(unittest.TestCase):
         self.assertEqual(problems, [])
         for line in ANALYZE["traced_cost_lines"](rows):
             fields = dict(token.split("=", 1) for token in line.split()[1:])
+            self.assertEqual(fields["unit"], "ns/completed_call")
+            self.assertEqual(int(fields["threads"]),
+                             1 if fields["cell"] == "relevant-call-t1" else 4)
+            self.assertEqual(int(fields["on_total_calls"]), 10000)
+            self.assertEqual(int(fields["unobserved_total_calls"]), 10000)
             production_ns = float(fields["median_ns"])
             self.assertEqual(production_ns, 250.0, fields["cell"])
             # An 80 ns/call dispatcher addition is 32%, above the
@@ -300,13 +306,15 @@ class TracedCostOracle(unittest.TestCase):
         t4 = next(row for row in rows if row["cell"] == "relevant-call-t4")
         self.assertEqual(
             (t4["median_ns"], t4["p10_ns"], t4["p90_ns"], t4["samples"]),
-            (300.0, 300.0, 300.0, 10))
+            (75.0, 75.0, 75.0, 10))
         self.assertEqual(
             ANALYZE["traced_cost_lines"](rows),
             ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
-             "p10_ns=109.0 p90_ns=181.0 samples=10",
-             "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
-             "p10_ns=300.0 p90_ns=300.0 samples=10"])
+             "p10_ns=109.0 p90_ns=181.0 samples=10 unit=ns/completed_call threads=1 "
+             "on_total_calls=10000 unobserved_total_calls=10000",
+             "TRACED_COST cell=relevant-call-t4 median_ns=75.0 "
+             "p10_ns=75.0 p90_ns=75.0 samples=10 unit=ns/completed_call threads=4 "
+             "on_total_calls=10000 unobserved_total_calls=10000"])
 
     def test_traced_cost_subtracts_the_unobserved_baseline(self):
         # The pinned median is the per-pair observed-minus-unobserved
@@ -341,9 +349,11 @@ class TracedCostOracle(unittest.TestCase):
         self.assertEqual(
             buffer.getvalue().splitlines(),
             ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
-             "p10_ns=109.0 p90_ns=181.0 samples=10",
-             "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
-             "p10_ns=300.0 p90_ns=300.0 samples=10"])
+             "p10_ns=109.0 p90_ns=181.0 samples=10 unit=ns/completed_call threads=1 "
+             "on_total_calls=10000 unobserved_total_calls=10000",
+             "TRACED_COST cell=relevant-call-t4 median_ns=75.0 "
+             "p10_ns=75.0 p90_ns=75.0 samples=10 unit=ns/completed_call threads=4 "
+             "on_total_calls=10000 unobserved_total_calls=10000"])
 
     def test_traced_cost_rejects_bad_shapes(self):
         log = dencampaign_log()

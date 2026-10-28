@@ -83,7 +83,11 @@
 # refuses); ARMS=on-unobserved runs on/unobserved ABBA rounds with
 # no base binary, and the campaign analysis prints one TRACED_COST
 # line per cell (median and spread of observed-minus-unobserved
-# ns/call). PREBUILT_COMMIT names the exported commit when no VCS
+# wall ns per total completed call, with thread count and both arms'
+# completed-call totals). The relevant-call-t1/t4 median_ns values feed
+# P11_BANK_N5_PRODUCTION_NS_1/4 in that same ns/completed_call unit;
+# apply no further thread factor. PREBUILT_COMMIT names the exported
+# commit when no VCS
 # tree is staged (provenance is the staged-input shas instead of
 # the clean-tree check). Defaults are unchanged: PREBUILT=0 with
 # ARMS=default runs the exact M2 method.

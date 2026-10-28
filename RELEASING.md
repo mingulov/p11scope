@@ -174,6 +174,30 @@ private archive. The full hosted receipt remains on the runner only during
 verification. Actions logs contain a small status, source identity, tree and
 digest-checker summary; record their run URL and result.
 
+For package-only work after a successful ordinary and coverage run, dispatch
+`package-preview` on the **same commit**, with `accepted_ci_run_id` set to that
+actual `ci.yml` run ID. `capture_mode` selects `full`, `p0` or `both` (default
+`both`); `jobs` selects a canonical integer from 1 through 16 (default `2`).
+The workflow requires the selected run to have completed successfully in this
+repository, on the checkout's exact SHA and tree, with every current ordinary
+job, all eight contracts shards, all seven coverage partitions and the merged
+coverage report successful in that run's current attempt. Missing, skipped,
+duplicate, stale or partial gates, API errors and deduped runs refuse; there
+is no automatic search for a different run. The complete `ci` workflow remains
+the ordinary and coverage entry point.
+
+Each selected package mode gets its own ordinary `ubuntu-26.04` runner,
+official `build-release.sh --capture-mode MODE --jobs N`, successful receipt,
+source export, notices and package validation before its own public upload.
+All final-binary canaries, helper, static and hostile-target checks stay in the
+official builder. FULL and P0 upload independently as
+`release-preview-public-assets` and `release-preview-public-assets-p0` in this
+separate run; a P0 failure does not withhold successful FULL assets. Both
+required mode results still need to pass for a release. No private receipts,
+capture or logs are uploaded. This new producer is **not yet accepted by the
+Docker runtime artifact downloader**; that consumer needs explicit integration
+and acceptance before using these run IDs.
+
 The preview workflow passes a version-neutral `source.tar.gz` from the exporter
 to the packager. The packager validates the archive's recorded revision and
 derives the public source filename from the manifests. Inspect the actual output

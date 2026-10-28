@@ -1513,6 +1513,53 @@ impl SemanticCapture {
         self.service_live_discovery_with(|| session.discovery_dequeue());
     }
 
+    /// Bounded service for the running, unlinked-journal machine. Transport
+    /// faults stay sticky and refuse even when an audited original needs no
+    /// further H0 tick. This creates no empty-prefix or publication evidence.
+    pub(crate) fn service_live_discovery_until(
+        &mut self,
+        session: &mut Session,
+        work: usize,
+        deadline: Instant,
+    ) -> anyhow::Result<usize> {
+        if session.native_domain() != Some(self.router.domain()) {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+            anyhow::bail!("foreign semantic DISCOVERY Session");
+        }
+        self.service_live_discovery_until_with(work, deadline, || session.discovery_dequeue())
+    }
+
+    fn service_live_discovery_until_with(
+        &mut self,
+        work: usize,
+        deadline: Instant,
+        mut dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,
+    ) -> anyhow::Result<usize> {
+        if self.stopped {
+            self.pending_discovery_status = CollectionStatus::ReadError;
+        }
+        anyhow::ensure!(
+            !self.stopped && work <= crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            "semantic DISCOVERY service unavailable"
+        );
+        let mut records = 0;
+        let status = service_discovery_quantum(work, || {
+            // Ending this service quantum is not an observed-empty proof.
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let item = dequeue()?;
+            records += usize::from(item.is_some());
+            Ok(item)
+        });
+        self.pending_discovery_status = self.pending_discovery_status.combine(status);
+        anyhow::ensure!(
+            self.pending_discovery_status == CollectionStatus::Complete,
+            "semantic DISCOVERY transport failed"
+        );
+        Ok(records)
+    }
+
     fn service_live_discovery_with(
         &mut self,
         dequeue: impl FnMut() -> anyhow::Result<Option<DiscoveryItem>>,

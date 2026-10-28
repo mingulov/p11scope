@@ -3,6 +3,7 @@
 
 use super::audit_handoff::{acquire, attachment, claim_and_finish};
 use super::*;
+use crate::events::BoundedRecordSource;
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
 use crate::semantics_objects::journal::{
@@ -218,6 +219,7 @@ struct HeldMachineIo<'a> {
     attached: &'a crate::attach::AttachedSemanticSet,
     native: &'a mut MachineNativeRows,
     finish: Option<&'a mut FinishMachineFixture>,
+    live_discovery: Option<&'a mut LiveMachineDiscovery>,
 }
 
 /// Original terminal I/O only. The machine owns Q, the final Raw, reports,
@@ -270,6 +272,27 @@ impl HeldMachineIo<'_> {
 impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn producers(&self) -> &SessionDrainProducers {
         self.producers
+    }
+
+    fn service_unlinked_discovery(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        work: usize,
+        deadline: Instant,
+    ) -> Result<usize, SemanticRefusal> {
+        let Some(discovery) = self.live_discovery.as_mut() else {
+            return Ok(0);
+        };
+        discovery.calls += 1;
+        self.h0
+            .0
+            .borrow_mut()
+            .capture
+            .service_live_discovery_until_with(work, deadline, || {
+                anyhow::ensure!(!discovery.fail_read, "owned fixture DISCOVERY read failed");
+                Ok(discovery.drain.dequeue())
+            })
+            .map_err(|_| SemanticRefusal::Unavailable)
     }
 
     fn request_finish_stop(
@@ -896,6 +919,47 @@ struct MachineScene {
     machine: crate::inventory_semantics::LiveJointMachine,
     native: MachineNativeRows,
     finish: Option<FinishMachineFixture>,
+    live_discovery: Option<LiveMachineDiscovery>,
+}
+
+struct LiveMachineDiscovery {
+    drain: crate::events::DiscoveryDrain<ScriptedRecords>,
+    fail_read: bool,
+    calls: usize,
+}
+
+impl LiveMachineDiscovery {
+    fn records(count: usize) -> Self {
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        record.pid_tgid = (7u64 << 32) | 7;
+        record.hook_ts_ns = 1;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of_val(&record),
+            )
+        }
+        .to_vec();
+        Self::bytes(vec![bytes; count])
+    }
+
+    fn bytes(records: Vec<Vec<u8>>) -> Self {
+        let count = records.len();
+        Self {
+            drain: crate::events::DiscoveryDrain::over(ScriptedRecords::records(records, count)),
+            fail_read: false,
+            calls: 0,
+        }
+    }
+
+    fn consumer(&self) -> usize {
+        self.drain.source().consumer()
+    }
+
+    fn remaining(&self) -> usize {
+        self.drain.source().remaining()
+    }
 }
 
 impl MachineScene {
@@ -1039,6 +1103,30 @@ impl MachineScene {
         Self::with_initial_files(providers, &(0..providers as u32).collect::<Vec<_>>(), false)
     }
 
+    fn unlinked(providers: usize) -> Self {
+        let mut fixture = Self::new(providers);
+        let events = fixture
+            .scene
+            .drain
+            .consumption_cut()
+            .unwrap()
+            .events()
+            .clone();
+        fixture.scene.producers =
+            SessionDrainProducers::test_pair_unlinked(fixture.scene.real.lane.domain(), events);
+        let reserve = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
+        fixture.machine =
+            crate::inventory_semantics::LiveJointMachine::new(&fixture.scene.producers, &reserve)
+                .unwrap();
+        fixture
+    }
+
     fn with_initial_files(providers: usize, mapped: &[u32], quiet: bool) -> Self {
         let (held, attached) = HeldProviders::with_attachment(
             providers,
@@ -1122,6 +1210,7 @@ impl MachineScene {
             scene,
             machine,
             finish: None,
+            live_discovery: None,
             native: MachineNativeRows {
                 publisher: NativePublisher::build(),
                 rows: std::collections::BTreeMap::new(),
@@ -1141,15 +1230,24 @@ impl MachineScene {
         &mut self,
         work: usize,
     ) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
+        self.service_until(work, Instant::now() + Duration::from_secs(10))
+    }
+
+    fn service_until(
+        &mut self,
+        work: usize,
+        deadline: Instant,
+    ) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: work,
-            deadline: Instant::now() + Duration::from_secs(10),
+            deadline,
         };
         let Self {
             scene,
             machine,
             native,
             finish,
+            live_discovery,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -1158,6 +1256,7 @@ impl MachineScene {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         machine.service_with_io(
             &mut scene.real.lane,
@@ -1182,6 +1281,7 @@ impl MachineScene {
             machine,
             native,
             finish,
+            live_discovery,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -1190,6 +1290,7 @@ impl MachineScene {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         machine.poll_commit_with_io(
             &mut scene.real.lane,
@@ -1214,6 +1315,7 @@ impl MachineScene {
             machine,
             native,
             finish,
+            live_discovery,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -1222,6 +1324,7 @@ impl MachineScene {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         machine.resolve_pending_h0_at_q_with_io(
             &mut scene.real.lane,
@@ -1255,6 +1358,7 @@ impl MachineScene {
             machine,
             native,
             finish,
+            live_discovery,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -1263,6 +1367,7 @@ impl MachineScene {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         machine.begin_finish_with_io(
             &mut scene.real.lane,
@@ -1281,6 +1386,7 @@ impl MachineScene {
             machine,
             native,
             finish,
+            live_discovery,
         } = self;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -1289,6 +1395,7 @@ impl MachineScene {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: work,
@@ -2569,6 +2676,261 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
                 "the healthy commit discloses no wedge gap"
             );
         }
+    }
+}
+
+/// The real command installs the machine even when the journal is unlinked.
+/// Its retained publication must not stop servicing that Session's DISCOVERY.
+#[test]
+fn joint_machine_unlinked_discovery_progresses_with_retained_audit() {
+    for positive in [false, true] {
+        let mut fixture = MachineScene::unlinked(1);
+        if positive {
+            fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+        } else {
+            fixture.machine.begin_commit(false).unwrap();
+        }
+        fixture.machine.pose_no_progress_poll_for_test(true);
+        fixture.reach_phase("Audited");
+        let original = fixture.machine.retained_original_for_test().unwrap();
+        let events = fixture.scene.drain.consumption_cut().unwrap();
+        let revision = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        let storage = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .charged_bytes;
+        fixture.live_discovery = Some(LiveMachineDiscovery::records(300));
+        // ScriptedRecords advances its cursor by eight bytes per row.
+        for (want_bytes, want_remaining) in [(2048, 44), (2400, 0)] {
+            assert_eq!(
+                fixture.service(1024).unwrap(),
+                crate::inventory_semantics::JointServiceProgress::Pending
+            );
+            let discovery = fixture.live_discovery.as_ref().unwrap();
+            assert_eq!(discovery.consumer(), want_bytes);
+            assert_eq!(discovery.remaining(), want_remaining);
+            assert!(fixture.machine.retained_original_for_test().unwrap() == original);
+            assert!(events.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+            assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Audited");
+            let registry = fixture.scene.real.scene.coordinator.registry();
+            assert_eq!(registry.published_revision(), revision);
+            assert_eq!(registry.semantic_resource_snapshot().charged_bytes, storage);
+            assert_eq!(registry.joint_feeds(), 0);
+        }
+        fixture.machine.pose_no_progress_poll_for_test(false);
+        fixture.published();
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            revision + 1
+        );
+    }
+}
+
+#[test]
+fn joint_machine_unlinked_discovery_fault_preserves_retained_original() {
+    for read_error in [false, true] {
+        let mut fixture = MachineScene::unlinked(1);
+        fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+        fixture.machine.pose_no_progress_poll_for_test(true);
+        fixture.reach_phase("Audited");
+        let original = fixture.machine.retained_original_for_test().unwrap();
+        let events = fixture.scene.drain.consumption_cut().unwrap();
+        let revision = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        let mut discovery = LiveMachineDiscovery::bytes(vec![vec![0; 17]]);
+        discovery.fail_read = read_error;
+        fixture.live_discovery = Some(discovery);
+        assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
+        assert_eq!(
+            fixture.machine.disposition_reason(),
+            Some(SemanticRefusal::Unavailable)
+        );
+        assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 1);
+        assert!(fixture.machine.retained_original_for_test().unwrap() == original);
+        assert!(events.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
+        assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 1);
+        fixture.enable_finish_fixture(Vec::new());
+        assert_eq!(fixture.begin_finish(), Err(SemanticRefusal::Unavailable));
+        assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 1);
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            revision
+        );
+    }
+}
+
+#[test]
+fn joint_machine_unlinked_discovery_preserves_pending_raw() {
+    let mut fixture = MachineScene::unlinked(1);
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    fixture.reach_phase("AwaitH0");
+    let original = fixture
+        .machine
+        .retained_raw_for_test()
+        .unwrap()
+        .h0_identity();
+    let events = fixture.scene.drain.consumption_cut().unwrap();
+    fixture.live_discovery = Some(LiveMachineDiscovery::records(300));
+    for (want_bytes, want_remaining) in [(2048, 44), (2400, 0)] {
+        assert_eq!(
+            fixture.service(1024).unwrap(),
+            crate::inventory_semantics::JointServiceProgress::Pending
+        );
+        let discovery = fixture.live_discovery.as_ref().unwrap();
+        assert_eq!(discovery.consumer(), want_bytes);
+        assert_eq!(discovery.remaining(), want_remaining);
+        assert!(
+            fixture
+                .machine
+                .retained_raw_for_test()
+                .unwrap()
+                .h0_identity()
+                == original
+        );
+        assert!(events.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+        assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+    }
+}
+
+#[test]
+fn joint_machine_unlinked_discovery_respects_work_and_phase_fairness() {
+    let mut fixture = MachineScene::unlinked(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    fixture.live_discovery = Some(LiveMachineDiscovery::records(3));
+    let events = fixture.scene.drain.consumption_cut().unwrap();
+    assert_eq!(
+        fixture.service(0).unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(
+        fixture
+            .service_until(1024, Instant::now() - Duration::from_secs(1))
+            .unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 0);
+    assert!(events.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    fixture.service(1).unwrap();
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 0);
+    assert_eq!(fixture.scene.drain.source().remaining(), 1);
+    assert!(fixture.machine.retained_raw_for_test().is_some());
+    let prefix = fixture.scene.drain.consumption_cut().unwrap();
+    fixture.service(2).unwrap();
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().consumer(), 8);
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().remaining(), 2);
+    assert_eq!(fixture.scene.drain.source().remaining(), 0);
+    assert!(!prefix.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+}
+
+#[test]
+fn joint_machine_discovery_leaf_deadline_does_not_poll() {
+    let fixture = MachineScene::unlinked(1);
+    let mut held = fixture.scene.real.h0.0.borrow_mut();
+    assert_eq!(
+        held.capture
+            .service_live_discovery_until_with(
+                256,
+                Instant::now() - Duration::from_secs(1),
+                || panic!("an expired quantum cannot read the cursor"),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(held.capture.pending_discovery_status == CollectionStatus::Complete);
+}
+
+#[test]
+fn joint_machine_live_discovery_preserves_linked_and_terminal_owners() {
+    for state in [
+        "linked",
+        "gated",
+        "finished",
+        "exit-retained",
+        "finish",
+        "foreign",
+    ] {
+        let mut fixture = if state == "linked" {
+            MachineScene::new(1)
+        } else {
+            MachineScene::unlinked(1)
+        };
+        fixture.live_discovery = Some(LiveMachineDiscovery::records(1));
+        match state {
+            "linked" => {}
+            "gated" => fixture.scene.real.lane.request_semantic_stop(),
+            "finished" => assert!(fixture.scene.real.lane.finish_semantic_stop().is_some()),
+            "exit-retained" => {
+                fixture
+                    .scene
+                    .real
+                    .lane
+                    .note_joint_finish_failure(SemanticRefusal::Unavailable);
+                fixture
+                    .scene
+                    .real
+                    .lane
+                    .abandon_finish_for_exit(
+                        &mut fixture.scene.real.scene.coordinator,
+                        "owned fixture disposition",
+                    )
+                    .unwrap();
+            }
+            "finish" => {
+                fixture.enable_finish_fixture(Vec::new());
+                fixture.begin_finish().unwrap();
+            }
+            "foreign" => {
+                let events = fixture
+                    .scene
+                    .drain
+                    .consumption_cut()
+                    .unwrap()
+                    .events()
+                    .clone();
+                fixture.scene.producers =
+                    SessionDrainProducers::test_pair_unlinked(NativeDomainId::mint(), events);
+            }
+            _ => unreachable!(),
+        }
+        let result = fixture.service(1024);
+        if state == "linked" {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result, Err(SemanticRefusal::Unavailable), "{state}");
+        }
+        let discovery = fixture.live_discovery.as_ref().unwrap();
+        assert_eq!(discovery.calls, 0, "{state}");
+        assert_eq!(discovery.consumer(), 0, "{state}");
     }
 }
 
@@ -5978,6 +6340,7 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
             machine,
             native,
             finish,
+            live_discovery,
         } = &mut finishing;
         let mut io = HeldMachineIo {
             drain: &mut scene.drain,
@@ -5986,6 +6349,7 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
             attached: scene.attached.as_ref().unwrap(),
             native,
             finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
         };
         let mut work = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1,
@@ -6817,6 +7181,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 machine,
                 native,
                 finish,
+                live_discovery,
             } = &mut fixture;
             let mut io = HeldMachineIo {
                 drain: &mut scene.drain,
@@ -6825,6 +7190,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 attached: scene.attached.as_ref().unwrap(),
                 native,
                 finish: finish.as_mut(),
+                live_discovery: live_discovery.as_mut(),
             };
             let mut budget = crate::inventory_semantics::JointWorkBudget {
                 remaining_actions: 0,

@@ -210,6 +210,7 @@ fn poll_finish_expired(scene: &mut MachineScene) -> Result<JointCommitProgress, 
         machine,
         native,
         finish,
+        live_discovery,
     } = scene;
     let mut io = HeldMachineIo {
         drain: &mut scene.drain,
@@ -218,6 +219,7 @@ fn poll_finish_expired(scene: &mut MachineScene) -> Result<JointCommitProgress, 
         attached: scene.attached.as_ref().unwrap(),
         native,
         finish: finish.as_mut(),
+        live_discovery: live_discovery.as_mut(),
     };
     machine.poll_finish_with_io(
         &mut scene.real.lane,

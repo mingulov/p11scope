@@ -119,6 +119,16 @@ pub(crate) enum JointCommitRefusal {
 /// seal, receipt or publication-completion word.
 pub(crate) trait JointMachineIo {
     fn producers(&self) -> &SessionDrainProducers;
+    /// Running S1-only service uses the same retained Session cursor. Linked
+    /// Joint keeps its publication-bearing DISCOVERY for its existing owner.
+    fn service_unlinked_discovery(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _work: usize,
+        _deadline: Instant,
+    ) -> Result<usize, SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
     /// The Session override admits the live Finish request against the
     /// owning lane; the default refuses. A test may forward only the
     /// existing immediate admission gate.
@@ -1792,11 +1802,33 @@ impl LiveJointMachine {
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
         self.validate_owner(lane, coordinator, io)?;
-        if self.finish.is_some() {
+        if self.finish.is_some()
+            || lane.exit_retained
+            || lane.live.as_ref().is_some_and(|live| live.gated)
+        {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        #[cfg(test)]
+        if lane.test_gated {
             return Err(SemanticRefusal::Unavailable);
         }
         if let RunState::DispositionRequired(reason) = self.state {
             return Err(reason);
+        }
+        // Production v0.5.0 installs this machine with no journal producer.
+        // Service its own DISCOVERY even while a raw/audited original waits,
+        // leaving linked Joint's records and every Finish-Q bound untouched.
+        // Reserve one action so one-credit calls still advance their phase.
+        if !self.producers.journal_linked() && budget.available() && budget.remaining_actions > 1 {
+            let work = (budget.remaining_actions - 1)
+                .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
+            match io.service_unlinked_discovery(lane, work, budget.deadline) {
+                Ok(records) if records <= work => budget.spend(records),
+                _ => {
+                    self.state = RunState::DispositionRequired(SemanticRefusal::Unavailable);
+                    return Err(SemanticRefusal::Unavailable);
+                }
+            }
         }
         while budget.available() {
             let phase = self.phase.take().expect("one original machine phase");
@@ -1953,6 +1985,22 @@ impl LiveJointMachine {
             } => Some(&value.raw),
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_original_for_test(&self) -> Option<RawQuantumIdentity> {
+        self.retained_raw_for_test()
+            .map(RawJointQuantum::h0_identity)
+            .or_else(|| match self.phase.as_ref()? {
+                Phase::Claiming { identity, .. }
+                | Phase::InstallingClosure { identity, .. }
+                | Phase::Births { identity, .. }
+                | Phase::Staging { identity, .. }
+                | Phase::Auditing { identity, .. }
+                | Phase::Negative { identity, .. }
+                | Phase::Audited { identity, .. } => Some(*identity),
+                _ => None,
+            })
     }
 
     #[cfg(test)]
@@ -3331,6 +3379,18 @@ impl SessionMachineIo {
 impl JointMachineIo for SessionMachineIo {
     fn producers(&self) -> &SessionDrainProducers {
         &self.producers
+    }
+
+    fn service_unlinked_discovery(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        work: usize,
+        deadline: Instant,
+    ) -> Result<usize, SemanticRefusal> {
+        let live = self.live(lane)?;
+        live.capture
+            .service_live_discovery_until(&mut live.session, work, deadline)
+            .map_err(|_| SemanticRefusal::Unavailable)
     }
 
     fn request_finish_stop(

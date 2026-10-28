@@ -964,10 +964,10 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
     return -1;
 }
 
-#if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
-/* Helper 181 verifies the callback body once instead of exploring an 8192-slot
- * loop frontier in each lifecycle root. This is a private feasibility profile;
- * both actual exec/exit roots still require a separate kernel load proof. */
+#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* Helper 181 verifies the callback body once instead of exploring the wide
+ * or private bank-profile loop frontier in each lifecycle root. Both actual
+ * exec/exit roots still require a separate kernel load proof. */
 static long (*owner_loop)(u32, long (*)(u32, void *), void *, u64) = (void *)181;
 
 struct owner_cleanup_context {
@@ -1067,7 +1067,7 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
      * Mismatched counts still fail (1) at the checks below. */
     u32 live_starts = owner->start_count;
 #ifndef P11SCOPE_INVENTORY_ONLY
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#if defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U
     struct owner_cleanup_context context = {
         .ctl = ctl,
         .owner = owner,

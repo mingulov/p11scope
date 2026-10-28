@@ -355,6 +355,24 @@ static void ring_discard(void *record, u64 flags)
 }
 #endif
 
+#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+static unsigned owner_loop_calls;
+/* Replace only kernel helper 181; execute the production cleanup callbacks. */
+static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
+                                  void *context, u64 flags)
+{
+    assert(count == P11SCOPE_OWNER_SLOT_BOUND && flags == 0);
+    owner_loop_calls++;
+    for (u32 slot = 0; slot < count; slot++) {
+        long stop = callback(slot, context);
+        assert(stop == 0 || stop == 1);
+        if (stop)
+            return slot + 1;
+    }
+    return count;
+}
+#endif
+
 static void reset(void)
 {
     unsigned i;
@@ -377,6 +395,10 @@ static void reset(void)
     owner_storage_delete = storage_delete;
     owner_current_task = current_task;
     owner_pid_tgid = pid_tgid;
+#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+    owner_loop_calls = 0;
+    owner_loop = controlled_owner_loop;
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     memset(&journal_ctl, 0, sizeof(journal_ctl));
     fail_reserve = 0;
@@ -587,6 +609,9 @@ static void cleanup_preserves_words(void)
     EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
            "exec/exit cleanup settles abandoning live START");
     EXPECT(ctl.abandoned_start == 1, "cleanup abandoned one live START");
+#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+    EXPECT(owner_loop_calls == 2, "both production callback sweeps completed");
+#endif
     EXPECT(owner_map_lookup(&START, &key) == NULL, "cleanup removed the START row");
     EXPECT(owners[0].flags == 0 && owners[0].start_count == 0, "lease released by cleanup");
     EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,

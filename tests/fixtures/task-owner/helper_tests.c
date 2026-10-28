@@ -2,6 +2,9 @@
  * Only kernel helper operations and atomic interference are injected; there is
  * no second owner-accounting algorithm. */
 #include "task_owner.h"
+#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#define P11SCOPE_HOST_OWNER_LOOP 1
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
 /* Host-only weak declaration makes a missing constructor fail at runtime. */
 extern void *p11_owner_start_begin(const struct owner_start_key *,
@@ -15,7 +18,7 @@ _Static_assert(OWNER_CONTROL_BOUND == OWNER_LIMIT + OWNER_TRANSIENT_CLAIMS,
 static u64 *cas_interference_cell;
 static unsigned cas_failures_remaining, cas_attempts;
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
 static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
                                   void *context, u64 flags);
 #endif
@@ -82,7 +85,7 @@ struct row { int used; void *map; unsigned char key[24]; unsigned char value[432
 #define FIXTURE_ROW_BOUND (2U * P11SCOPE_OWNER_SLOT_BOUND + 128U)
 #endif
 static struct row rows[FIXTURE_ROW_BOUND];
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
 static unsigned bank_loop_calls, bank_loop_error_on, bank_loop_short_on;
 static int bank_hide_start_slot;
 #endif
@@ -114,13 +117,13 @@ static u64 instance_gen[INST_GEN_CELLS];
 static struct instance_counters instance_counters_live;
 #endif
 
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
 /* Only helper 181 is replaced. The callback remains the real native cleanup
  * body, including its owner checks, removals, scrub, counters and faults. */
 static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
                                   void *context, u64 flags)
 {
-    assert(count == 8192 && flags == 0);
+    assert(count == P11SCOPE_OWNER_SLOT_BOUND && flags == 0);
     bank_loop_calls++;
     if (bank_loop_error_on == bank_loop_calls)
         return -22;
@@ -213,7 +216,7 @@ static void *lookup(void *map, const void *key)
         return disposition < 2 ? &bank_health_cells[disposition] : NULL;
     }
 #endif
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
     if (map == &START && bank_hide_start_slot >= 0 &&
         ((const struct owner_start_key *)key)->slot == (u32)bank_hide_start_slot)
         return NULL;
@@ -391,7 +394,7 @@ static void reset(void)
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
     bank_loop_calls = bank_loop_error_on = bank_loop_short_on = 0;
     bank_hide_start_slot = -1;
     owner_loop = controlled_owner_loop;
@@ -2361,12 +2364,12 @@ static void object_producer_cleanup_idle_returns_zero(void)
     puts("object custody idle cleanup passed");
 }
 #endif
-#if defined(P11SCOPE_COUNTER_BANK_PROOF) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifdef P11SCOPE_HOST_OWNER_LOOP
 static void counter_bank_owner_high_slot(void)
 {
     reset(); object_setup();
-    struct owner_start_key high = start_key(8191);
-    struct owner_start_key outside = start_key(8192);
+    struct owner_start_key high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
+    struct owner_start_key outside = start_key(P11SCOPE_OWNER_SLOT_BOUND);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     assert(p11_owner_start_get(&high, 1));
     struct thread_owner before = owners[0];
@@ -2386,11 +2389,11 @@ static void counter_bank_owner_high_slot(void)
 static void counter_bank_owner_start_failures(void)
 {
     struct owner_start_key high;
-    reset(); object_setup(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     fail_start_delete = -16;
     assert(p11_owner_cleanup() == 1);
-    /* The failure occurs at the last callback: helper count 8192 alone
+    /* The failure occurs at the last callback: a full helper count alone
      * cannot distinguish successful completion from explicit callback failure. */
     assert(bank_loop_calls == 1 && row(&START, &high));
     assert(owners[0].start_count == 1 && ctl.outstanding == 1 && ctl.poison);
@@ -2400,15 +2403,15 @@ static void counter_bank_owner_start_failures(void)
     assert(!row(&START, &high) && !ctl.outstanding && idle(0));
     assert(ctl.abandoned_start == 1 && ctl.poison);
 
-    reset(); object_setup(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
-    bank_hide_start_slot = 8191;
+    bank_hide_start_slot = P11SCOPE_OWNER_SLOT_BOUND - 1;
     assert(p11_owner_cleanup() == 1);
     assert(bank_loop_calls == 1 && row(&START, &high));
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
     assert(!ctl.abandoned_start);
 
-    reset(); object_setup(); high = start_key(8191);
+    reset(); object_setup(); high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     owners[0].start_count = 2;
     assert(p11_owner_cleanup() == 1);
@@ -2419,7 +2422,7 @@ static void counter_bank_owner_start_failures(void)
 static struct owner_start_key counter_bank_owner_orphan(void)
 {
     reset(); object_setup();
-    struct owner_start_key high = start_key(8191);
+    struct owner_start_key high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(p11_owner_start_aggregate(&high, 17) == 1);
     assert(!pair_delete(&START, &high));
     owners[0].start_count--;
@@ -2466,7 +2469,7 @@ static void counter_bank_owner_incomplete_loops(void)
         for (unsigned short_result = 0; short_result <= 1; short_result++) {
             struct owner_start_key high;
             if (phase == 1) {
-                reset(); object_setup(); high = start_key(8191);
+                reset(); object_setup(); high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
                 assert(p11_owner_start_aggregate(&high, 17) == 1);
             } else {
                 high = counter_bank_owner_orphan();
@@ -2493,7 +2496,7 @@ static void counter_bank_owner_incomplete_loops(void)
      * or release its physical-task lease before the second sweep. */
     reset(); object_setup();
     struct owner_start_key low = start_key(0);
-    struct owner_start_key high = start_key(8191);
+    struct owner_start_key high = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     unsigned char side[432];
     memset(side, 0xA5, sizeof(side));
     assert(p11_owner_start_aggregate(&low, 17) == 1);
@@ -2507,7 +2510,50 @@ static void counter_bank_owner_incomplete_loops(void)
     assert(row(&OBJECT_START, &high));
     for (unsigned i = 0; i < 432; i++)
         assert(row(&OBJECT_START, &high)->value[i] == 0xA5);
+
+    /* A short orphan sweep can remove every observed row and still fail to
+     * prove the full bound. Retain the lease until a later complete sweep. */
+    reset(); object_setup();
+    low = start_key(0);
+    assert(p11_owner_start_aggregate(&low, 17) == 1);
+    assert(!pair_delete(&START, &low));
+    owners[0].start_count--;
+    assert(!update(&OBJECT_START, &low, side, 1));
+    require_scrubbed_side_delete = 1;
+    bank_loop_short_on = 2;
+    assert(p11_owner_cleanup() == 1);
+    assert(bank_loop_calls == 2 && !row(&OBJECT_START, &low));
+    assert(!owners[0].start_count && owners[0].flags && !idle(0));
+    assert(ctl.outstanding == 1 && ctl.poison && ctl.abandoned_start == 1);
+    bank_loop_short_on = 0;
+    assert(p11_owner_cleanup() == 1);
+    assert(!ctl.outstanding && idle(0) && ctl.abandoned_start == 1);
+    assert(p11_owner_cleanup() == 1 && ctl.abandoned_start == 1);
 }
+
+#if P11SCOPE_OWNER_SLOT_BOUND == 2112U
+static void wide_owner_full_bound(void)
+{
+    reset(); object_setup();
+    memset(value, 0, sizeof(value));
+    object_write_start(value, 24);
+    for (u32 slot = 0; slot < 2112; slot++) {
+        struct owner_start_key key = start_key(slot);
+        assert(!p11_owner_start_insert(&key, value));
+    }
+    assert(owners[0].start_count == 2112 && ctl.outstanding == 1);
+    require_scrubbed_side_delete = 1;
+    /* A de-threaded exec still retires keys under the retained original ID. */
+    current_number[0]++;
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+    assert(bank_loop_calls == 2 && checked_side_deletes == 2112);
+    assert(ctl.abandoned_start == 2112 && !ctl.poison && !ctl.outstanding && idle(0));
+    for (u32 slot = 0; slot < 2112; slot++) {
+        struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = slot };
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    }
+}
+#endif
 
 #ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Publishes one live route for `slot` under `transaction`, with its commit
@@ -2776,11 +2822,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_aggregate_start_construction")) object_aggregate_start_construction();
         else if (!strcmp(argv[1], "object_seeded_start_failures")) object_seeded_start_failures();
         else if (!strcmp(argv[1], "object_producer_cleanup_idle_returns_zero")) object_producer_cleanup_idle_returns_zero();
-#ifdef P11SCOPE_COUNTER_BANK_PROOF
+#ifdef P11SCOPE_HOST_OWNER_LOOP
         else if (!strcmp(argv[1], "counter_bank_owner_high_slot")) counter_bank_owner_high_slot();
         else if (!strcmp(argv[1], "counter_bank_owner_start_failures")) counter_bank_owner_start_failures();
         else if (!strcmp(argv[1], "counter_bank_owner_orphan_failures")) counter_bank_owner_orphan_failures();
         else if (!strcmp(argv[1], "counter_bank_owner_incomplete_loops")) counter_bank_owner_incomplete_loops();
+#if P11SCOPE_OWNER_SLOT_BOUND == 2112U
+        else if (!strcmp(argv[1], "wide_owner_full_bound")) wide_owner_full_bound();
+#endif
 #endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
         else if (!strcmp(argv[1], "bank_timing_add_saturates")) bank_timing_add_saturates();

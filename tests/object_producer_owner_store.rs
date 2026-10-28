@@ -765,7 +765,12 @@ fn object_producer_scrub_preserves_whole_side_and_neighbors() {
     );
     let directory = tempfile::tempdir().expect("complete emitted side scrub");
     let object = embedded_object(directory.path());
-    println!("{}", run_object_checker(&object, "scrubs"));
+    let mode = if cfg!(feature = "wide-detailed-2112") {
+        "scrubs-wide"
+    } else {
+        "scrubs"
+    };
+    println!("{}", run_object_checker(&object, mode));
 }
 
 /// Actual emitted-object custody checks: exact owned-map allocation,
@@ -1116,7 +1121,7 @@ def check_exec_exit_fault(data, report):
     report.append('cleanup nests no fault call')
 
 
-def scrub_flow(instructions, map_loads):
+def scrub_flow(instructions, map_loads, callback=False):
     graph = {}
     pc = 0
     while pc < len(instructions):
@@ -1137,7 +1142,10 @@ def scrub_flow(instructions, map_loads):
         graph[pc] = targets
         pc += size
     assert all(target in graph for targets in graph.values() for target in targets)
-    states = {0: (None,) * 10 + (('stack', 0),)}
+    initial = [None] * 10 + [('stack', 0)]
+    if callback:
+        initial[2] = ('context', 0)
+    states = {0: tuple(initial)}
     pending = [0]
     while pending:
         pc = pending.pop()
@@ -1170,8 +1178,8 @@ def scrub_flow(instructions, map_loads):
             elif op == 0x07 and offset == 0:
                 if isinstance(before[dst], int):
                     value = (before[dst] + immediate) & ((1 << 64) - 1)
-                elif before[dst] and before[dst][0] == 'stack':
-                    value = ('stack', before[dst][1] + immediate)
+                elif before[dst] and before[dst][0] in ('stack', 'context'):
+                    value = (before[dst][0], before[dst][1] + immediate)
             values[dst] = value
         after = tuple(values)
         for target in graph[pc]:
@@ -1189,9 +1197,10 @@ def scrub_flow(instructions, map_loads):
     return states, predecessors
 
 
-def complete_side_scrubs(data):
+def complete_side_scrubs(data, name='p11_owner_cleanup'):
     elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
-    key = only(bodies, 'p11_owner_cleanup')
+    callback = name != 'p11_owner_cleanup'
+    key = only(bodies, name)
     body = body_of(raws, bodies, key)
     instructions = [struct.unpack_from('<BBhi', body, at)
                     for at in range(0, len(body), 8)]
@@ -1208,7 +1217,7 @@ def complete_side_scrubs(data):
             name = maps.get((target[3], target[4] + immediate))
             assert op == 0x18 and name, 'scrub map relocation must name an exact map'
             map_loads[pc] = ('map', name)
-    states, predecessors = scrub_flow(instructions, map_loads)
+    states, predecessors = scrub_flow(instructions, map_loads, callback)
     old_loops = [pc for pc, (op, _, offset, immediate) in enumerate(instructions)
                  if op & 7 in (5, 6) and offset < 0 and immediate == 432]
     assert not old_loops, f'side scrub retains 54-word backedge(s): {old_loops}'
@@ -1223,7 +1232,9 @@ def complete_side_scrubs(data):
             continue
         side_deletes.append(deleted)
         delete_key = states[deleted][2]
-        assert delete_key and delete_key[0] == 'stack', 'side deletion needs its actual stack key'
+        assert (delete_key == ('context', 16) if callback
+                else delete_key and delete_key[0] == 'stack'), \
+            'side deletion needs its actual stack or callback-context key'
         pending = [(pc, None, 424, (), frozenset({deleted}))
                    for pc in predecessors[deleted]]
         proved = 0
@@ -1240,15 +1251,16 @@ def complete_side_scrubs(data):
                 assert wanted == -8 and pointer == (0, 0), \
                     'side deletion requires all 54 ordered zero stores to its lookup result'
                 assert states[pc][2] == delete_key, 'scrub and deletion must use the same key'
-                assert not any(at < delete_key[1] + 16 and delete_key[1] < at + width
-                               for at, width in stack_writes), 'side key changed after lookup'
+                assert not any(origin == delete_key[0] and at < delete_key[1] + 16
+                               and delete_key[1] < at + width
+                               for origin, at, width in stack_writes), 'side key changed after lookup'
                 proved += 1
                 continue
             if op & 7 in (2, 3):
                 base = states[pc][dst]
                 width = {0: 4, 8: 2, 16: 1, 24: 8}[op & 0x18]
-                if base and base[0] == 'stack':
-                    stack_writes += ((base[1] + offset, width),)
+                if base and base[0] in ('stack', 'context'):
+                    stack_writes += ((base[0], base[1] + offset, width),)
                 else:
                     assert op in (0x7a, 0x7b), 'side scrub requires full-width ordinary stores'
                     if pointer is None:
@@ -1274,8 +1286,8 @@ def complete_side_scrubs(data):
     return key, offsets, instructions, stores, side_deletes
 
 
-def check_scrubs(data, report):
-    key, offsets, instructions, stores, deletes = complete_side_scrubs(data)
+def check_scrub_body(data, report, name):
+    key, offsets, instructions, stores, deletes = complete_side_scrubs(data, name)
     ordered = sorted(stores)
     first = ordered[0]
     op, reg, offset, immediate = instructions[first]
@@ -1294,7 +1306,7 @@ def check_scrubs(data, report):
         struct.pack_into('<BBhi', bad, file_offset(offsets, key, first, 0), *replacement)
         assert bytes(bad) != data, f'{label} must change actual instructions'
         try:
-            complete_side_scrubs(bytes(bad))
+            complete_side_scrubs(bytes(bad), name)
         except AssertionError:
             pass
         else:
@@ -1304,13 +1316,41 @@ def check_scrubs(data, report):
     left, right = (file_offset(offsets, key, pc, 0) for pc in (first, second))
     bad[left:left + 8], bad[right:right + 8] = bad[right:right + 8], bad[left:left + 8]
     try:
-        complete_side_scrubs(bytes(bad))
+        complete_side_scrubs(bytes(bad), name)
     except AssertionError:
         pass
     else:
         raise AssertionError('reordered scrub mutation accepted')
-    report.append(f'cleanup: {len(deletes)} actual side deletion(s), {len(stores)} '
+    report.append(f'{name}: {len(deletes)} actual side deletion(s), {len(stores)} '
                   'complete ordered zero stores; eight actual mutations refused')
+
+
+def check_scrubs(data, report, wide=False):
+    names = ['p11_owner_cleanup']
+    if wide:
+        # Pin the actual helper-bound callback references, not nearby symbols.
+        _, raws, _, bodies, relocations = bodies_and_relocations(data)
+        root = only(bodies, 'p11_owner_cleanup')
+        body = body_of(raws, bodies, root)
+        instructions = [struct.unpack_from('<BBhi', body, at)
+                        for at in range(0, len(body), 8)]
+        calls = [pc for pc, insn in enumerate(instructions)
+                 if insn == (0x85, 0, 0, 181)]
+        names = ['owner_cleanup_start_callback', 'owner_cleanup_orphan_callback']
+        assert len(calls) == 2, 'wide cleanup needs both real bounded helper calls'
+        for pc, name in zip(calls, names):
+            assert instructions[pc - 4] == (0xb7, 1, 0, 2112), \
+                'wide cleanup helper must cover every slot'
+            assert instructions[pc - 1] == (0xb7, 4, 0, 0), 'loop flags must be zero'
+            op, reg, offset, immediate = instructions[pc - 3]
+            assert (op, reg, offset) == (0x18, 2, 0), 'helper callback must be argument two'
+            relocation = relocations.get((root[0], root[1] + (pc - 3) * 8))
+            assert relocation and relocation[0] == 1, 'callback needs its actual relocation'
+            target = relocation[1]
+            assert (target[3], target[4] + immediate) == only(bodies, name), \
+                'wide helper must call the corresponding cleanup callback'
+    for name in names:
+        check_scrub_body(data, report, name)
 
 
 def main():
@@ -1330,8 +1370,8 @@ def main():
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':
         check_exec_exit_fault(data, report)
-    elif mode == 'scrubs':
-        check_scrubs(data, report)
+    elif mode in ('scrubs', 'scrubs-wide'):
+        check_scrubs(data, report, wide=mode == 'scrubs-wide')
     else:
         raise AssertionError(f'unknown checker mode {mode}')
     print('\n'.join(report))

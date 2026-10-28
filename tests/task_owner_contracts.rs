@@ -89,6 +89,58 @@ fn production_counter_bank_owner_full_bound_cleanup_is_fail_closed() {
     }
 }
 
+/// Executes the actual 2112-slot cleanup, including its helper failure paths.
+/// Kernel loading and verifier acceptance are separate qualification cells.
+#[test]
+fn production_wide_owner_full_bound_cleanup_is_fail_closed() {
+    let temporary = tempfile::tempdir().expect("wide owner test directory");
+    let binary = temporary.path().join("wide-owner");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-DP11SCOPE_OWNER_SLOT_BOUND=2112U",
+            "-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual wide native owner");
+    assert!(
+        output.status.success(),
+        "native wide owner compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // All existing lifecycle, poison, readback, side-map and accounting twins
+    // also execute against the wide production path.
+    for selector in [
+        None,
+        Some("counter_bank_owner_high_slot"),
+        Some("counter_bank_owner_start_failures"),
+        Some("counter_bank_owner_orphan_failures"),
+        Some("counter_bank_owner_incomplete_loops"),
+        Some("wide_owner_full_bound"),
+    ] {
+        let mut command = Command::new(&binary);
+        if let Some(selector) = selector {
+            command.arg(selector);
+        }
+        let output = command.output().expect("execute actual wide owner");
+        assert!(
+            output.status.success(),
+            "native wide owner {selector:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Timing-bank producer units over the actual C helpers: saturating add,
 /// exact maximum, ts-before-remove ordering and entry-write fences.
 /// Host-only; no BPF load, no attach.

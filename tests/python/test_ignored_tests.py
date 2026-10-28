@@ -261,6 +261,112 @@ def runner_array_lines(path, name):
 
 
 class IgnoredTestsTests(unittest.TestCase):
+    def test_private_image_proof_cells_require_the_explicit_full_build(self):
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        entries = json.loads(INVENTORY.read_text())["sites"]
+        proof = {entry["path"] for entry in entries if entry["path"].startswith(prefix)}
+        self.assertEqual(len(proof), 14)
+        self.assertEqual(sum(entry["cell"] == "privileged" for entry in entries
+                             if entry["path"] in proof), 13)
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        self.assertTrue(proof <= lists["SKIP_TESTS"])
+        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS"):
+            self.assertFalse(proof & lists[group])
+        reasons = dict(zip(runner_array_lines(RUNNER, "SKIP_TESTS"),
+                           runner_array_lines(RUNNER, "SKIP_REASONS")))
+        for name in proof:
+            for prerequisite in ("FULL", "P11SCOPE_IMAGE_BANK_PROOF=1", "--exact",
+                                 "--ignored", "root", "BPF lane"):
+                self.assertIn(prerequisite, reasons[name], name)
+        overhead = reasons[prefix + "per_call_overhead"]
+        for prerequisite in ("quiet exclusive host", "prior E3 acceptance",
+                             "P11_BANK_N5_PRODUCTION_NS_1", "P11_BANK_N5_PRODUCTION_NS_4"):
+            self.assertIn(prerequisite, overhead)
+
+    def test_private_image_proof_list_covers_all_fourteen_without_execution(self):
+        # Real runner + fake libtest boundary: the old 13/14 curation failed
+        # --list only on N5. Never execute a proof or performance cell here.
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {entry["path"] for entry in json.loads(INVENTORY.read_text())["sites"]
+                 if entry["path"].startswith(prefix)}
+        self.assertEqual(len(proof), 14)
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS"))) | proof
+        with tempfile.TemporaryDirectory() as raw:
+            binary = Path(raw) / "libtest-proof"
+            # A run-shaped invocation fails; only the literal list request
+            # may print the fixture's actual fourteen proof paths.
+            write_fake_binary(binary, sorted(full))
+            binary.write_text(binary.read_text().replace(
+                "#!/bin/sh\n", "#!/bin/sh\n[ \"$*\" = '--list --ignored --format terse' ] || exit 97\n", 1))
+            result = run_runner("--list", str(binary))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name in proof:
+                self.assertIn(name + " :: ", result.stdout)
+            self.assertIn("verify: curation matches the binary", result.stdout)
+            # Retain the old failing shape as a causal negative. Drop N5 and
+            # its matching reason together so this tests membership, not a
+            # generic reason-array length mismatch.
+            text = RUNNER.read_text()
+            names = runner_array_lines(RUNNER, "SKIP_TESTS")
+            reasons = runner_array_lines(RUNNER, "SKIP_REASONS")
+            overhead = prefix + "per_call_overhead"
+            reason = reasons[names.index(overhead)]
+            old = text.replace(overhead + "\n", "", 1).replace(reason + "\n", "", 1)
+            runner = Path(raw) / "runner-thirteen.sh"
+            runner.write_text(old)
+            runner.chmod(0o755)
+            negative = subprocess.run([str(runner), "--list", str(binary)], cwd=ROOT,
+                                      capture_output=True, text=True)
+        self.assertEqual(negative.returncode, 1, negative.stdout + negative.stderr)
+        self.assertIn("ignored in the binary but not curated", negative.stderr)
+        self.assertIn(overhead, negative.stderr)
+
+    def test_private_image_proof_list_keeps_ordinary_builds_usable(self):
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {entry["path"] for entry in json.loads(INVENTORY.read_text())["sites"]
+                 if entry["path"].startswith(prefix)}
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS")))
+        ordinary = full - proof
+        with tempfile.TemporaryDirectory() as raw:
+            binary = Path(raw) / "libtest-ordinary"
+            write_fake_binary(binary, sorted(ordinary))
+            result = run_runner("--list", str(binary))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("private image-bank proof group not built (0/14 present; no proof positive)",
+                          result.stdout)
+            self.assertIn(f"verify: curation matches the binary ({len(ordinary)} tests)", result.stdout)
+            # A partially compiled proof never inherits the ordinary-build
+            # exception: N5 is missing from this 13/14 binary listing.
+            write_fake_binary(binary, sorted(full - {prefix + "per_call_overhead"}))
+            partial = run_runner("--list", str(binary))
+        self.assertEqual(partial.returncode, 1, partial.stderr)
+        self.assertIn("curated but absent from the binary", partial.stderr)
+        self.assertIn(prefix + "per_call_overhead", partial.stderr)
+
+    def test_private_image_proof_list_refuses_renamed_or_unknown_members(self):
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS")))
+        unknown = prefix + "unknown_cell"
+        renamed = prefix + "verifier_stats_renamed"
+        with tempfile.TemporaryDirectory() as raw:
+            binary = Path(raw) / "libtest-proof-drift"
+            for names, unexpected in ((full | {unknown}, unknown),
+                                      ((full - {prefix + "verifier_stats"}) | {renamed}, renamed)):
+                with self.subTest(unexpected=unexpected):
+                    write_fake_binary(binary, sorted(names))
+                    result = run_runner("--list", str(binary))
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("ignored in the binary but not curated", result.stderr)
+                    self.assertIn(unexpected, result.stderr)
+                    self.assertNotIn("verify: curation matches", result.stdout)
+                    self.assertNotIn("proof group not built", result.stdout)
+
     def test_r52_defers_only_marker_cells_and_keeps_core_instance_cells(self):
         prefix = "attach::instance_tests::privileged_journal_marker_"
         deferred = {prefix + name for name in (
@@ -646,7 +752,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "DEFAULT_TESTS=112",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "SKIP_TESTS=77",
+            "SKIP_TESTS=91",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

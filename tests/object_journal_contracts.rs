@@ -1250,7 +1250,7 @@ fn object_journal_marker_build_uses_one_gate() {
     assert!(
         predicate.contains("BIRTH_MARKER_ENABLED")
             && predicate.contains("BpfFlavor::Detailed")
-            && predicate.contains("!bank_proof"),
+            && predicate.contains("!counter_bank_proof"),
         "the shared gate must select Detailed non-bank builds: {}",
         predicate
     );

@@ -4363,3 +4363,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 mod counter_bank_proof;
 #[cfg(any(feature = "counts-bank-proof", feature = "timestamps-bank-proof", feature = "latency-bank-proof"))]
 use counter_bank_proof::RV_COUNTS;
+// Appended so disabled proof preparation does not move ordinary BPF lines.
+#[cfg(feature = "image-bank-proof")]
+mod image_bank_proof;

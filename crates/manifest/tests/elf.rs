@@ -1094,7 +1094,7 @@ fn raw_scan_metadata_does_not_exclude_the_loader_zero_fill_tail() {
 
 #[test]
 fn raw_scan_metadata_ranges_preserve_data_tables_for_both_abis() {
-    use object::{Object as _, ObjectSection as _, ObjectSegment as _};
+    use object::{Object as _, ObjectSection as _};
     use p11scope_manifest::elf::read_raw_scan_facts_bounded;
 
     let dir = tmp("elf-raw-anchor-sections");

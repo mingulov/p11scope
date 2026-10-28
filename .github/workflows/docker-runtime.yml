@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Docker runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      preview_run_id:
+        description: Successful CI release-preview run ID for this exact source SHA (FULL public assets)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  docker-runtime:
+    runs-on: ubuntu-26.04
+    # Initial scheduling budget; runtime on this runner remains unmeasured.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare owned disk storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REPOSITORY" == mingulov/p11scope ]]
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
+          base=/var/tmp/p11scope-ws-tmp
+          if [[ ! -e "$base" ]]; then mkdir -m 700 "$base"; fi
+          test -d "$base" && test ! -L "$base" && test -O "$base"
+          test "$(stat -c %a "$base")" = 700
+          case "$(stat -f -c %T "$base")" in
+            tmpfs|ramfs) echo "runtime work must be disk-backed" >&2; exit 1 ;;
+          esac
+          work=$(mktemp -d "$base/docker-runtime.XXXXXX")
+          mkdir -m 700 "$work/logs" "$work/tmp"
+          {
+            echo "DOCKER_RUNTIME_WORK=$work"
+            echo "TMPDIR=$work/tmp"
+            echo "P11SCOPE_MATRIX_TMPDIR=$work/tmp"
+            echo "P11SCOPE_PRIVILEGED_LOCK=$base/privileged.lock"
+          } >>"$GITHUB_ENV"
+      - name: Download and validate exact FULL preview observer
+        id: observer
+        shell: bash
+        env:
+          PREVIEW_RUN_ID: ${{ inputs.preview_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 022
+          binary=$(python3 -I scripts/download-runtime-observer.py \
+            --repository "$GITHUB_REPOSITORY" --run-id "$PREVIEW_RUN_ID" \
+            --sha "$GITHUB_SHA" --output "$DOCKER_RUNTIME_WORK/observer")
+          test -x "$binary"
+          echo "P11SCOPE_BIN=$binary" >>"$GITHUB_ENV"
+      - name: Prepare host tools without a Rust build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n apt-get update
+          sudo -n apt-get install -y gcc python3 python3-yaml coreutils bpftool
+          command -v cargo
+          command -v docker
+          # The unchanged harness checks cargo's presence even with P11SCOPE_BIN.
+          # Its GNU timeout selector handles Ubuntu's uutils default separately.
+      - name: Run minimum Docker capture in one owned lane
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          ulimit -n 65536
+          : "${P11SCOPE_BIN:?matching prebuilt observer required}"
+          case "$P11SCOPE_BIN" in /*) ;; *) echo "absolute prebuilt observer required" >&2; exit 1 ;; esac
+          test -f "$P11SCOPE_BIN" && test -x "$P11SCOPE_BIN"
+          test -d "$DOCKER_RUNTIME_WORK/logs"
+          test -d "$P11SCOPE_MATRIX_TMPDIR"
+          [[ -z "${DOCKER_HOST-}" && -z "${DOCKER_CONTEXT-}" && -z "${DOCKER_TLS_VERIFY-}" ]]
+          # A local host daemon is required; no external context or DinD service.
+          exec 9>"$P11SCOPE_PRIVILEGED_LOCK"
+          flock -n 9
+          sudo -n true
+          test "$(uname -m)" = x86_64
+          uname -a
+          test -s /sys/kernel/btf/vmlinux
+          test -f /sys/fs/cgroup/cgroup.controllers
+          endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
+          case "$endpoint" in unix:///var/run/docker.sock|unix:///run/docker.sock) ;; *) echo "local Docker daemon required" >&2; exit 1 ;; esac
+          docker info --format '{{json .}}' >"$DOCKER_RUNTIME_WORK/logs/docker-info.json"
+          python3 -I - "$DOCKER_RUNTIME_WORK" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import resource
+          import sys
+
+          work = Path(sys.argv[1])
+          info = json.loads((work / 'logs/docker-info.json').read_text())
+          assert info['OSType'] == 'linux' and info['Architecture'] == 'x86_64', 'Docker host architecture'
+          assert info['CgroupVersion'] == '2', 'Docker cgroup v2 required'
+          assert isinstance(info['Driver'], str) and info['Driver'], 'Docker storage driver missing'
+          # MemAvailable includes reclaimable cache; free pages alone do not.
+          with Path('/proc/meminfo').open('rb') as stream:
+              memory_facts = stream.read(65537)
+          assert len(memory_facts) <= 65536, 'meminfo exceeds bound'
+          rows = [row for row in memory_facts.splitlines() if row.startswith(b'MemAvailable:')]
+          assert len(rows) == 1, 'one MemAvailable field required'
+          match = re.fullmatch(rb'MemAvailable:[ \t]+([0-9]{1,20})[ \t]+kB', rows[0])
+          assert match, 'malformed MemAvailable KiB field'
+          memory = int(match[1]) * 1024
+          for path in (work, Path(info['DockerRootDir'])):
+              fs = os.statvfs(path)
+              assert fs.f_bavail * fs.f_frsize >= 2 * 1024**3, 'insufficient runtime disk'
+          assert memory >= 1024**3, 'insufficient available runtime memory'
+          assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] >= 65536, 'nofile too low'
+          processes = resource.getrlimit(resource.RLIMIT_NPROC)
+          assert processes[0] == resource.RLIM_INFINITY or processes[0] >= 1024, 'process limit too low'
+          print('host resources:', {'available_memory': memory, 'cpus': os.cpu_count(),
+                                    'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'nproc': processes})
+          print('Docker storage/cgroup:', info['Driver'], info['CgroupVersion'], info['DockerRootDir'])
+          PY
+          if pgrep -x 'cargo|rustc|p11scope' >/dev/null; then
+            echo "compiler or observer active before capture" >&2; exit 1
+          else
+            test "$?" -eq 1
+          fi
+          # No pre-existing matrix resources may be mistaken for this run's.
+          docker ps -a --filter 'name=^/p11scope-matrix-docker-' --format '{{.ID}}' >"$DOCKER_RUNTIME_WORK/logs/containers-before.txt"
+          docker image ls --filter 'reference=p11scope-matrix-docker:*' --format '{{.ID}}' >"$DOCKER_RUNTIME_WORK/logs/images-before.txt"
+          test ! -s "$DOCKER_RUNTIME_WORK/logs/containers-before.txt"
+          test ! -s "$DOCKER_RUNTIME_WORK/logs/images-before.txt"
+          # Redirect into caller-owned diagnostics, outside sudo deliberately.
+          for object in link prog map; do
+            # shellcheck disable=SC2024
+            sudo -n bpftool -j "$object" show >"$DOCKER_RUNTIME_WORK/logs/bpf-$object-before.json"
+          done
+          check_cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+            clean=1
+            docker ps -a --filter 'name=^/p11scope-matrix-docker-' --format '{{.ID}}' >"$DOCKER_RUNTIME_WORK/logs/containers-after.txt" || clean=0
+            docker image ls --filter 'reference=p11scope-matrix-docker:*' --format '{{.ID}}' >"$DOCKER_RUNTIME_WORK/logs/images-after.txt" || clean=0
+            test ! -s "$DOCKER_RUNTIME_WORK/logs/containers-after.txt" || clean=0
+            test ! -s "$DOCKER_RUNTIME_WORK/logs/images-after.txt" || clean=0
+            pgrep -x p11scope >/dev/null
+            test "$?" -eq 1 || clean=0
+            for object in link prog map; do
+              # shellcheck disable=SC2024
+              sudo -n bpftool -j "$object" show >"$DOCKER_RUNTIME_WORK/logs/bpf-$object-after.json" || clean=0
+            done
+            python3 -I - "$DOCKER_RUNTIME_WORK/logs" <<'PY' || clean=0
+          import json
+          from pathlib import Path
+          import sys
+          logs = Path(sys.argv[1])
+          for object in ('link', 'prog', 'map'):
+              before = json.loads((logs / f'bpf-{object}-before.json').read_text())
+              after = json.loads((logs / f'bpf-{object}-after.json').read_text())
+              assert {row['id'] for row in before} == {row['id'] for row in after}, f'BPF {object} cleanup differs'
+          PY
+            if [[ "$clean" -ne 1 ]]; then
+              echo "Docker runtime cleanup verification failed" >&2
+              status=1
+            fi
+            exit "$status"
+          }
+          trap check_cleanup EXIT
+          doctor_status=0
+          # shellcheck disable=SC2024
+          sudo -n env TMPDIR="$TMPDIR" "$P11SCOPE_BIN" doctor >"$DOCKER_RUNTIME_WORK/logs/doctor.txt" 2>&1 || doctor_status=$?
+          cat "$DOCKER_RUNTIME_WORK/logs/doctor.txt"
+          python3 -I - "$DOCKER_RUNTIME_WORK/logs/doctor.txt" "$doctor_status" <<'PY'
+          from pathlib import Path
+          import re
+          import runpy
+          import sys
+
+          assert int(sys.argv[2]) in (0, 1), 'doctor did not finish normally'
+          text = Path(sys.argv[1]).read_text()
+          admission = runpy.run_path('scripts/qualify-return-probe-admission.py')
+          admission['require_clean_doctor'](text)
+          rows = [row for row in text.splitlines() if row.startswith('object-attribute capture ')]
+          assert len(rows) == 1 and re.fullmatch(r'object-attribute capture \.+ ok +enabled(?:[ (].*)?', rows[0]), 'embedded FULL capture required'
+          PY
+          # The actual observer context still performs its own safety admission.
+          # The fixture is nine workload functions/226 calls, plus its existing
+          # C_GetFunctionList bootstrap. No safety override or build fallback.
+          scripts/matrix/verify-docker.sh 2>&1 | tee "$DOCKER_RUNTIME_WORK/logs/docker.log"
+          grep -Fx '=== docker: ALL OK ===' "$DOCKER_RUNTIME_WORK/logs/docker.log"
+          capture=$(python3 -I - "$P11SCOPE_MATRIX_TMPDIR" <<'PY'
+          from pathlib import Path
+          import sys
+          captures = list(Path(sys.argv[1]).glob('p11scope-docker-*'))
+          assert len(captures) == 1 and captures[0].is_dir(), 'one required capture record'
+          print(captures[0] / 'observed.json')
+          PY
+          )
+          # Reuse the original oracles on the actual required record; zero,
+          # missing/UNRUN, lost and incomplete outputs cannot count as success.
+          python3 -I scripts/check-capture-evidence.py clean-metrics "$capture" spike/expected.txt
+          python3 -I scripts/matrix/check-count-multiset.py "$capture" spike/expected.txt
+          cp "$capture" "$DOCKER_RUNTIME_WORK/logs/observed.json"
+      - name: Retain bounded runtime diagnostics
+        if: ${{ always() && env.DOCKER_RUNTIME_WORK != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-runtime-diagnostics
+          path: |
+            ${{ env.DOCKER_RUNTIME_WORK }}/logs/
+            ${{ env.DOCKER_RUNTIME_WORK }}/tmp/p11scope-docker-*/profile.log
+            ${{ env.DOCKER_RUNTIME_WORK }}/tmp/p11scope-docker-*/workload.log
+            ${{ env.DOCKER_RUNTIME_WORK }}/tmp/p11scope-docker-*/observed.json
+          if-no-files-found: warn
+          retention-days: 7

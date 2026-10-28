@@ -86,6 +86,34 @@ and working backports. One combined stock pre-Multi refusal guest verifies
 command availability; it supplies no positive load or headroom evidence.
 Historical 5.15/6.1 results retain their original outcomes.
 
+## Manual Docker runtime workflow
+
+[Docker runtime](../.github/workflows/docker-runtime.yml) runs the existing
+minimum container capture directly on an `ubuntu-26.04` hosted VM, using its
+local Docker daemon. Supply `preview_run_id` from a completed, successful
+same-repository CI release-preview run at the exact SHA selected for dispatch.
+The workflow fails if that input is absent, expired, mismatched or P0. It
+validates the existing FULL public package, source/tree, compiler pins,
+checksums and static x86-64 observer before executing it. It neither starts
+a preview nor builds a replacement observer. This public package consumer
+does not provide default/WIDE libtest fanout artifacts.
+
+The job holds one owned privileged lane, uses private disk work directories,
+and checks actual Docker/cgroup/storage, BTF, resources, functional Multi,
+return-probe safety and embedded FULL capture before the unchanged
+`scripts/matrix/verify-docker.sh` body runs. Its original nine-function,
+226-call workload, bootstrap call, count multiset, clean metrics, provider
+identity and unprivileged diagnostics remain required. Missing records,
+UNRUN/nonzero status, loss and resource cleanup failures fail the job. The
+25-minute outer timeout is an initial scheduling budget, not a measurement.
+
+Source and stub checks do not establish runtime qualification. The ordinary
+scripts job still reports this live body UNRUN in that job; only an actual
+successful manual Docker runtime run supplies this minimum positive. D1
+shared-layer/copy-up, Kubernetes, Knative and performance qualification remain
+separate. The manual job retains its diagnostics for seven days, checks owned
+container/image/process and BPF link/program/map cleanup, and never prunes the daemon.
+
 ## Pinned Git dependency
 
 The only Git dependency is

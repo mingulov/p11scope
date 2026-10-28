@@ -250,6 +250,43 @@ def den_analyze_text(log, cells=DEN_CELLS, rounds=5):
 
 
 class TracedCostOracle(unittest.TestCase):
+    def test_traced_cost_four_thread_units_are_completed_calls(self):
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        t4 = next(row for row in rows if row["cell"] == "relevant-call-t4")
+        # Each four-thread on arm takes 75,000 ns more for 1,000
+        # total completed calls: 75 ns/call, without multiplying by four.
+        self.assertEqual(t4["median_ns"], 75.0)
+
+    def test_traced_cost_relative_budget_uses_completed_call_units(self):
+        log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+        for cell, threads in (("relevant-call-t1", 1), ("relevant-call-t4", 4)):
+            for rnd in range(1, 6):
+                arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                    "unobserved", "on", "on", "unobserved")
+                for arm in arms:
+                    if arm == "on":
+                        log += sample(cell, arm, rnd, threads, 1000, 1250000,
+                                      **counted(threads, 1000), **bpf())
+                    else:
+                        log += sample(cell, arm, rnd, threads, 1000, 1000000,
+                                      lane="none")
+        rows, problems = den_analyze_text(log)
+        self.assertEqual(problems, [])
+        for line in ANALYZE["traced_cost_lines"](rows):
+            fields = dict(token.split("=", 1) for token in line.split()[1:])
+            production_ns = float(fields["median_ns"])
+            self.assertEqual(production_ns, 250.0, fields["cell"])
+            # An 80 ns/call dispatcher addition is 32%, above the
+            # 15% gate, even though it meets the independent 250 ns gate.
+            self.assertEqual(80.0 * 100.0 / production_ns, 32.0)
+            self.assertGreater(80.0 * 100.0 / production_ns, 15.0)
+            # The inclusive relative boundary remains healthy.
+            self.assertEqual(37.5 * 100.0 / production_ns, 15.0)
+            self.assertGreater(37.5001 * 100.0 / production_ns, 15.0)
+
     def test_traced_cost_accepts_exact_denominator_campaign(self):
         rows, problems = den_analyze_text(dencampaign_log())
         self.assertEqual(problems, [])

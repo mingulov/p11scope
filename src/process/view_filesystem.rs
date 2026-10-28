@@ -624,6 +624,358 @@ mod tests {
     use super::*;
     use crate::process::cold_view_tests::ColdLeaderSubject;
 
+    fn assert_real_census_boundary(workers: u32) {
+        let mut group = ColdLeaderSubject::spawn(workers);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let original = pin.open_proc_dir().unwrap();
+        let mut expected = group.tids.clone();
+        expected.sort_unstable();
+        assert_eq!(expected.len(), workers as usize);
+        let mut work = CaptureWorkBudget::default();
+        let deadline = cold_filesystem_deadline(&work);
+        let started = Instant::now();
+        let census = task_ids(&original, &mut work, deadline);
+        match workers {
+            128 => assert_eq!(census.unwrap(), expected, "every real member is retained"),
+            129 => {
+                let error = census.unwrap_err();
+                assert!(error.contains("member capacity 128 exhausted"), "{error}");
+                assert!(error.contains("namespace remains unproven"), "{error}");
+            }
+            _ => panic!("this fixture checks exactly the 128/129 boundary"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "census must finish in its real cutoff"
+        );
+        assert!(
+            work.stopped_reason().is_none(),
+            "capacity is a local refusal"
+        );
+        assert_eq!(pin.original_exited(), Ok(false));
+        eprintln!(
+            "R56 census: actual_nonleaders={workers}, elapsed={:?}",
+            started.elapsed()
+        );
+        group.call_three();
+        drop(group);
+        assert_eq!(
+            pin.original_exited(),
+            Ok(true),
+            "the owned subject is reaped"
+        );
+    }
+
+    #[test]
+    fn cold_census_accepts_all_128_live_nonleaders() {
+        assert_real_census_boundary(128);
+    }
+
+    #[test]
+    fn cold_census_refuses_129_live_nonleaders_without_truncation() {
+        assert_real_census_boundary(129);
+    }
+
+    #[test]
+    fn cold_fd_pressure_refuses_recovers_and_releases_owned_descriptors() {
+        use std::collections::BTreeSet;
+        const CHILD: &str = "P11SCOPE_COLD_FD_RESOURCE_CHILD";
+        const COMPLETED: &str = "R56_FD_RESOURCE_COMPLETED";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::view_filesystem::tests::cold_fd_pressure_refuses_recovers_and_releases_owned_descriptors",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, std::process::id().to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated FD child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "the exact child must execute every resource assertion"
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let parent: u32 = std::env::var(CHILD).unwrap().parse().unwrap();
+        // SAFETY: getppid reads the current process's parent; no ownership changes.
+        assert_eq!(unsafe { libc::getppid() } as u32, parent);
+        assert!(std::env::args().any(|arg| arg == "--test-threads=1"));
+
+        struct LoweredFdLimit {
+            saved: libc::rlimit,
+            restored: bool,
+        }
+        impl LoweredFdLimit {
+            fn new(highest_owned_fd: i32) -> Self {
+                let mut saved = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: owned output struct; only this isolated child's soft limit changes.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                    0
+                );
+                let soft = saved.rlim_cur.min(256);
+                assert!(soft > highest_owned_fd as libc::rlim_t + 16);
+                let lowered = libc::rlimit {
+                    rlim_cur: soft,
+                    rlim_max: saved.rlim_max,
+                };
+                // SAFETY: lower only the isolated child's soft ceiling.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+                Self {
+                    saved,
+                    restored: false,
+                }
+            }
+            fn restore(&mut self) {
+                // SAFETY: restore the exact saved limit; the hard ceiling was never changed.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
+                    0
+                );
+                self.restored = true;
+            }
+        }
+        impl Drop for LoweredFdLimit {
+            fn drop(&mut self) {
+                if !self.restored {
+                    // SAFETY: same restoration on an assertion's unwind.
+                    let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+                }
+            }
+        }
+        fn identity(fd: i32) -> (u64, u64, u32) {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat writes one valid stat on success and never takes FD ownership.
+            assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+            // SAFETY: the successful fstat above initialized every stat field.
+            let stat = unsafe { stat.assume_init() };
+            (stat.st_dev, stat.st_ino, stat.st_mode)
+        }
+        fn assert_closed(fd: i32) {
+            // SAFETY: query only; no descriptor is opened or closed by fcntl.
+            let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let error = io::Error::last_os_error();
+            assert_eq!(result, -1, "owned FD {fd} must have closed");
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        }
+        fn exhausted(anchor: &std::fs::File) {
+            assert_eq!(
+                anchor.try_clone().unwrap_err().raw_os_error(),
+                Some(libc::EMFILE)
+            );
+        }
+
+        let mut group = ColdLeaderSubject::spawn(1);
+        let mut warm = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let original_pidfd = pin.pidfd.as_ref().unwrap().as_raw_fd();
+        let mut work = CaptureWorkBudget::default();
+        let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+        proof.validate(&mut work).unwrap();
+        let maps = proof.open_maps().unwrap();
+        let namespace = proof.namespace();
+        let held_fds = {
+            let cold = proof.cold.as_ref().unwrap();
+            assert_eq!(cold.members.len(), 1);
+            vec![
+                cold.original.directory.as_raw_fd(),
+                cold.members[0].directory.as_raw_fd(),
+                cold.filesystem._namespace.as_raw_fd(),
+                cold.filesystem.root.as_raw_fd(),
+                maps.as_raw_fd(),
+            ]
+        };
+        let held_set: BTreeSet<_> = held_fds.iter().copied().collect();
+        assert_eq!(held_set.len(), 5);
+        let held_references: Vec<_> = held_fds
+            .iter()
+            .map(|fd| {
+                (
+                    *fd,
+                    identity(*fd),
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap(),
+                )
+            })
+            .collect();
+        let anchor = tempfile::tempfile().unwrap();
+        let anchor_identity = identity(anchor.as_raw_fd());
+        let highest_owned_fd = held_fds
+            .iter()
+            .copied()
+            .chain([anchor.as_raw_fd()])
+            .max()
+            .unwrap();
+        let mut limit = LoweredFdLimit::new(highest_owned_fd);
+        let mut fillers = Vec::new();
+        loop {
+            match anchor.try_clone() {
+                Ok(file) => {
+                    assert!(fillers.len() < 256);
+                    fillers.push(file);
+                }
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let filler_fds: BTreeSet<_> = fillers.iter().map(AsRawFd::as_raw_fd).collect();
+        assert!(filler_fds.len() >= 2);
+        assert!(
+            Instant::now() < proof.cold.as_ref().unwrap().deadline,
+            "FD acquisition is tested inside the unchanged proof cutoff"
+        );
+        assert_eq!(
+            proof.open_maps().unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        for (fd, expected, _) in &held_references {
+            assert_eq!(identity(*fd), *expected);
+        }
+
+        // Exactly two owned slots permit a partial cold acquisition, then
+        // force its next descriptor open to refuse. No /proc FD census runs.
+        let released: BTreeSet<_> = fillers
+            .iter()
+            .rev()
+            .take(2)
+            .map(AsRawFd::as_raw_fd)
+            .collect();
+        drop(fillers.pop().unwrap());
+        drop(fillers.pop().unwrap());
+        let mut retry_work = CaptureWorkBudget::default();
+        let refusal = ViewFilesystem::open(&pin, &mut retry_work)
+            .err()
+            .expect("FD pressure must refuse acquisition");
+        assert!(
+            refusal.contains(&io::Error::from_raw_os_error(libc::EMFILE).to_string()),
+            "{refusal}"
+        );
+        assert!(
+            retry_work.stopped_reason().is_none(),
+            "FD refusal must not fake a budget stop"
+        );
+        assert!(
+            retry_work.attempted_io_bytes() > 0,
+            "the failed constructor must reach partial metadata acquisition"
+        );
+        assert_eq!(
+            pin.original_exited(),
+            Ok(false),
+            "resource pressure does not end the group"
+        );
+        for fd in &released {
+            assert_closed(*fd);
+        }
+        let returned: Vec<_> = (0..2).map(|_| anchor.try_clone().unwrap()).collect();
+        assert_eq!(
+            returned
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<BTreeSet<_>>(),
+            released
+        );
+        exhausted(&anchor);
+        for (fd, expected, _) in &held_references {
+            assert_eq!(identity(*fd), *expected, "refusal preserves the held proof");
+        }
+
+        drop(maps);
+        drop(proof);
+        for fd in &held_fds {
+            assert_closed(*fd);
+        }
+        let reclaimed: Vec<_> = (0..5).map(|_| anchor.try_clone().unwrap()).collect();
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<BTreeSet<_>>(),
+            held_set
+        );
+        exhausted(&anchor);
+        for file in fillers.iter().chain(&returned).chain(&reclaimed) {
+            assert_eq!(
+                identity(file.as_raw_fd()),
+                anchor_identity,
+                "reused slots still hold only the owned anchor"
+            );
+        }
+        eprintln!(
+            "R56 FD pressure: retained={held_references:?}, owned_fillers={}, partial_slots_returned=2, retained_slots_returned=5",
+            filler_fds.len()
+        );
+        drop(reclaimed);
+        drop(returned);
+        drop(fillers);
+        limit.restore();
+        for fd in filler_fds.union(&held_set) {
+            assert_closed(*fd);
+        }
+
+        // Reuse the actual allowance after the resource refusal; no reset
+        // refunds the partial acquisition's reads or work.
+        {
+            let fresh = ViewFilesystem::open(&pin, &mut retry_work).unwrap();
+            assert_eq!(fresh.namespace(), namespace);
+            fresh.validate(&mut retry_work).unwrap();
+            let maps = crate::discovery::scan::read_maps_or_refuse(
+                fresh.open_maps().unwrap(),
+                &mut retry_work,
+                crate::attach::monotonic_ns,
+            )
+            .unwrap();
+            assert!(!maps.is_empty());
+            fresh.validate(&mut retry_work).unwrap();
+        }
+        let warm_view =
+            ProcessView::open_with_budget(ProcessViewId(310), warm.pid(), &mut retry_work).unwrap();
+        warm_view
+            .with_filesystem(&mut retry_work, |filesystem, budget| {
+                assert!(!filesystem.is_cold());
+                let maps = crate::discovery::scan::read_maps_or_refuse(
+                    filesystem.open_maps().unwrap(),
+                    budget,
+                    crate::attach::monotonic_ns,
+                )?;
+                assert!(!maps.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        let warm_pidfd = warm_view.pin.pidfd.as_ref().unwrap().as_raw_fd();
+        group.call_three();
+        warm.leave_leader();
+        warm.call_three();
+        drop(group);
+        drop(warm);
+        assert_eq!(pin.original_exited(), Ok(true));
+        assert_eq!(warm_view.original_exited(), Ok(true));
+        drop(warm_view);
+        drop(pin);
+        assert_closed(warm_pidfd);
+        assert_closed(original_pidfd);
+        let anchor_fd = anchor.as_raw_fd();
+        drop(anchor);
+        assert_closed(anchor_fd);
+        println!("{COMPLETED}");
+    }
+
     #[test]
     fn exiting_or_dead_task_metadata_never_proves_a_live_member() {
         let mut task = Task {

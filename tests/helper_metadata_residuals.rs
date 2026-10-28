@@ -15,6 +15,7 @@ fn provider(name: &str, defines: &[&str]) -> PathBuf {
     assert!(
         Command::new("gcc")
             .arg(format!("-m{}", usize::BITS))
+            .arg("-DMETA_RECLAIM_GUARDS=1")
             .args(["-shared", "-fPIC", "-o"])
             .arg(&path)
             .arg(

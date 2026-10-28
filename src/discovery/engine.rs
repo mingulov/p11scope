@@ -18,8 +18,6 @@ use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
-#[cfg(test)]
-use crate::discovery::identity::open_view_object;
 use crate::discovery::identity::{
     ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
     KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
@@ -6195,22 +6193,52 @@ pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -
         &|pid| std::fs::File::open(format!("/proc/{pid}/maps")),
         &crate::attach::monotonic_ns,
     );
-    // Keep the sharded common path untouched. Only unavailable snapshots
-    // of a Z leader get one serial, globally charged cold proof; every
-    // row shares this stage deadline, and refusals remain unavailable.
+    // Keep the sharded common path untouched. An empty leader read may be
+    // a Z boundary too. Every such row starts unknown before the serial,
+    // globally charged classification/proof; stop never leaves empty success.
     let deadline = process::cold_filesystem_deadline(budget);
     for (pid, snapshot) in &mut sweep.snapshots {
-        if budget.stopped_now().is_some() || std::time::Instant::now() >= deadline {
-            break;
+        if matches!(snapshot, MapsSnapshot::Read(maps) if !maps.is_empty()) {
+            continue;
         }
-        if matches!(snapshot, MapsSnapshot::Unavailable)
-            && process::process_is_zombie(*pid)
-            && let Ok(maps) = read_cold_maps_snapshot(*pid, budget, deadline)
-        {
+        let initial = match std::mem::replace(snapshot, MapsSnapshot::Unavailable) {
+            MapsSnapshot::Read(maps) => Ok(maps),
+            MapsSnapshot::Unavailable => Err("initial process maps unavailable".into()),
+        };
+        if let Ok(maps) = complete_maps_snapshot(*pid, initial, budget, deadline) {
             *snapshot = MapsSnapshot::Read(maps);
         }
     }
     sweep
+}
+
+/// Shared initial/reconcile completion. Generic successful empty snapshots
+/// stay valid for a noncold leader, but a Z leader needs actual survivor maps.
+/// Stopped or unclassifiable rows remain unknown, without uncharged metadata.
+fn complete_maps_snapshot(
+    pid: u32,
+    initial: Result<Vec<MapEntry>, String>,
+    budget: &mut CaptureWorkBudget,
+    deadline: std::time::Instant,
+) -> Result<Vec<MapEntry>, String> {
+    if matches!(&initial, Ok(maps) if !maps.is_empty()) {
+        return initial;
+    }
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("cold maps snapshot stage deadline exhausted".into());
+    }
+    if !process::snapshot_leader_is_zombie(pid, budget, deadline)? {
+        return initial;
+    }
+    // No path below can recover the original empty snapshot on refusal.
+    let maps = read_cold_maps_snapshot(pid, budget, deadline)?;
+    if maps.is_empty() {
+        return Err("cold member maps remain unavailable or empty".into());
+    }
+    Ok(maps)
 }
 
 fn read_cold_maps_snapshot(
@@ -21242,7 +21270,7 @@ impl Engine {
             {
                 revalidated = revalidated.saturating_add(1);
             }
-            let mut result = std::fs::File::open(format!("/proc/{pid}/maps"))
+            let result = std::fs::File::open(format!("/proc/{pid}/maps"))
                 .map_err(|error| error.to_string())
                 .and_then(|maps| {
                     read_maps_or_refuse_with_buffers(
@@ -21252,10 +21280,10 @@ impl Engine {
                         &mut bufs,
                     )
                 });
-            if result.is_err() && process::process_is_zombie(pid) {
-                result = read_cold_maps_snapshot(pid, &mut self.budget, cold_deadline);
-            }
-            slice.record(pid, result);
+            slice.record(
+                pid,
+                complete_maps_snapshot(pid, result, &mut self.budget, cold_deadline),
+            );
             self.scheduler.advance_cursor(pid);
         }
         let attempted = slice.attempted();

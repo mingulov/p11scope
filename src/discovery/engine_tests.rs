@@ -37750,7 +37750,7 @@ fn probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity() {
 }
 
 /// Lane-A P3, cancellation twin: a refused scan proves nothing. With an
-/// expired budget the probationary probe runs, refuses, and the pending
+/// expired budget the probationary constructor refuses, and the pending
 /// provider-free newcomer stays queued for relief. Fail-closed under
 /// cancellation: only a complete scan completes viewlessly.
 #[test]
@@ -37782,6 +37782,7 @@ fn probationary_probe_refuses_without_a_complete_scan() {
     engine.budget.set_deadline(Some(0));
     assert!(engine.request_refresh_consumed(head_pid, Some(1_200)));
     let scans_before = engine.deep_scans;
+    let io_before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     eprintln!(
         "R56 probationary refusal: scans_before={scans_before}, scans_after={}, io={}, stop={:?}, request_retained={}, completions={}",
@@ -37795,10 +37796,12 @@ fn probationary_probe_refuses_without_a_complete_scan() {
         engine.refresh_requested.contains_key(&head_pid),
         "a refused probe retains the request"
     );
-    assert!(
-        engine.deep_scans > scans_before,
-        "the probe ran and refused"
+    assert_eq!(
+        engine.deep_scans, scans_before,
+        "constructor refusal never reaches the actual deep scan"
     );
+    assert_eq!(engine.budget.attempted_io_bytes(), io_before);
+    assert_eq!(engine.budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
     assert_eq!(
         engine.probationary_completions, 0,
         "refusal never completes viewlessly"

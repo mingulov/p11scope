@@ -26,6 +26,29 @@ pub(crate) fn cold_filesystem_deadline(work: &CaptureWorkBudget) -> Instant {
     }
 }
 
+/// Classify only an advisory snapshot's empty/unavailable leader row. This
+/// does not grant process authority; any cold read still acquires its own
+/// original pin and complete live-member proof under the same allowance.
+pub(crate) fn snapshot_leader_is_zombie(
+    pid: u32,
+    work: &mut CaptureWorkBudget,
+    deadline: Instant,
+) -> Result<bool, String> {
+    let deadline = deadline.min(cold_filesystem_deadline(work));
+    spend(work, deadline, 1)?;
+    let file = std::fs::File::open(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("maps snapshot leader metadata unavailable: {error}"))?;
+    let stat = read_bounded(file, STAT_LIMIT, work, deadline)?;
+    let end = stat
+        .rfind(')')
+        .ok_or("maps snapshot leader stat is malformed")?;
+    let state = stat[end + 1..]
+        .split_whitespace()
+        .next()
+        .ok_or("maps snapshot leader state is unavailable")?;
+    Ok(state == "Z")
+}
+
 /// Advisory snapshots may hold fresh process custody, but return no view,
 /// admission or member capability that could renew an older owner.
 pub(crate) fn with_cold_snapshot_filesystem<T>(

@@ -510,7 +510,14 @@ static void mech_generation(long iters, int gated) {
     if (c8_gated()) {
         for (int m = 0; m < split; m++) load_module(m);
         c8_wait("go");
-        for (int m = 0; m < split; m++) { bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+        for (int m = 0; m < split; m++) {
+            bind_module(m, PH_SETUP);
+            if (gen == 2 && !strcmp(opt.mode, "exec-chain")) {
+                flush_ledger();
+                c8_wait("semantic");
+            }
+            s[m] = setup(m, PH_SETUP);
+        }
     } else {
         for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
     }

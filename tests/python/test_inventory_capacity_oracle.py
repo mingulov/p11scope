@@ -1075,35 +1075,44 @@ class C8GatePredicateTests(unittest.TestCase):
         if inherited:
             edge['entries']['coverage'].update(state='unknown', reason='use_before_admission', since_ns=None)
         self.add('edge_observed', edge, 270)
+        self.add('pass_committed', {'pass': 5}, 272)
+        pre = self.select()
+        self.want.update(pre=pre, getter_entry_ns=280, semantic_ns=285, count=1, last_entry_ns=280)
+        edge = self.edge(counted=True, count=1)
+        edge['entries'].update(first_seen_ns=281, last_seen_ns=281)
+        edge['entries']['coverage']['since_ns'] = 281
+        self.add('edge_observed', edge, 290)
         instance = {'id': 'i2', 'caller': 'c2', 'module': 'm0', 'state': 'observed',
-                    'reason': None, 'first_seen_ns': 271, 'last_seen_ns': 271}
+                    'reason': None, 'first_seen_ns': 281, 'last_seen_ns': 281}
         child = {'caller': 'c2', 'module': 'm0', 'instance': 'i2',
             'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
             'api_returns': {'count': None, 'historical_only_returns': 0, 'saturated': False, 'unit': 'api_returns'},
             'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
             'coverage': {'lossy': False, 'reasons': ['no_calls']}}
         if registered:
-            self.add('instance_observed', instance, 275)
-            self.add('semantic_edge_observed', child, 276)
-        self.add('pass_committed', {'pass': 5}, 280)
+            self.add('instance_observed', instance, 295)
+            self.add('semantic_edge_observed', child, 296)
+        self.add('pass_committed', {'pass': 6}, 300)
         return instance, child
 
     def test_gen2_requires_both_quiet_registrations_and_their_following_commit(self):
         instance, child = self.gen2_quiet(registered=False)
-        self.assertIsNone(self.select())  # A physical watch and pass are insufficient.
-        self.add('instance_observed', instance, 290)
-        self.add('pass_committed', {'pass': 6}, 300)
-        self.assertIsNone(self.select())
-        self.add('semantic_edge_observed', child, 310)
-        self.assertIsNone(self.select())
+        self.assertIsNone(self.select('semantic'))  # Physical count1 and a pass are insufficient.
+        self.add('instance_observed', instance, 310)
         self.add('pass_committed', {'pass': 7}, 320)
-        proof = self.select()
+        self.assertIsNone(self.select('semantic'))
+        self.add('semantic_edge_observed', child, 330)
+        self.assertIsNone(self.select('semantic'))
+        self.add('pass_committed', {'pass': 8}, 340)
+        proof = self.select('semantic')
         self.assertEqual((proof['proof'], proof['instance']), ('quiet_ready', 'i2'))
 
     def test_gen2_preserves_inherited_zero_coverage_without_inventing_a_watch(self):
         self.gen2_quiet(inherited=True)
-        proof = self.select()
+        proof = self.want['pre']
         self.assertIsNotNone(proof)
+        self.assertEqual(proof['proof'], 'mapped_ready')
+        self.assertNotIn('instance', proof)
         self.assertEqual((proof['coverage_state'], proof['coverage_reason']), ('unknown', 'use_before_admission'))
         self.assertEqual(proof['count'], 0)
 
@@ -1126,13 +1135,13 @@ class C8GatePredicateTests(unittest.TestCase):
                 target = {'instance': instance, 'child': child, 'entries': child['entries'],
                           'returns': child['api_returns'], 'coverage': child['coverage']}[area]
                 target[key] = value
-                self.assertIsNone(self.select())
+                self.assertIsNone(self.select('semantic'))
         self.rows = baseline
         extra = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
         extra['id'] = 'i3'
-        self.add('instance_observed', extra, 290)
-        self.add('pass_committed', {'pass': 6}, 300)
-        self.assertIsNone(self.select())
+        self.add('instance_observed', extra, 310)
+        self.add('pass_committed', {'pass': 7}, 320)
+        self.assertIsNone(self.select('semantic'))
 
     def test_gen2_latest_retirement_child_update_and_final_pass_invalidate_quiet_proof(self):
         self.gen2_quiet()
@@ -1140,36 +1149,62 @@ class C8GatePredicateTests(unittest.TestCase):
         for change in ('instance', 'child', 'caller', 'final'):
             with self.subTest(change=change):
                 self.rows = copy.deepcopy(baseline)
-                self.assertIsNotNone(self.select())
+                self.assertIsNotNone(self.select('semantic'))
                 if change == 'instance':
                     item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'instance_observed'))
                     item.update(state='retired', reason='task_retired')
-                    self.add('instance_observed', item, 290)
+                    self.add('instance_observed', item, 310)
                 elif change == 'child':
                     item = copy.deepcopy(next(r['event'] for r in self.rows if r['kind'] == 'semantic_edge_observed'))
                     item['api_returns']['historical_only_returns'] = 1
-                    self.add('semantic_edge_observed', item, 290)
+                    self.add('semantic_edge_observed', item, 310)
                 elif change == 'caller':
-                    self.add('caller_event', {'event': 'retired', 'caller': 'c2'}, 290)
-                self.add('pass_committed', {'pass': 6, 'final': change == 'final'}, 300)
-                self.assertIsNone(self.select())
+                    self.add('caller_event', {'event': 'retired', 'caller': 'c2'}, 310)
+                self.add('pass_committed', {'pass': 7, 'final': change == 'final'}, 320)
+                self.assertIsNone(self.select('semantic'))
 
     def test_gen2_other_unknowns_positive_entries_and_original_deadline_still_refuse(self):
         self.gen2_quiet(inherited=True)
         baseline = copy.deepcopy(self.rows)
-        for field, value in [('count', 1), ('first_seen_ns', 270), ('last_seen_ns', 270),
+        for field, value in [('count', 0), ('count', 2), ('first_seen_ns', 270), ('last_seen_ns', 291),
                              ('in_flight', True), ('saturated', True), ('reason', 'pending_first_use')]:
             with self.subTest(field=field):
                 self.rows = copy.deepcopy(baseline)
                 entries = next(r['event']['entries'] for r in reversed(self.rows) if r['kind'] == 'edge_observed')
                 (entries['coverage'] if field == 'reason' else entries)[field] = value
-                self.assertIsNone(self.select())
+                self.assertIsNone(self.select('semantic'))
         self.rows = baseline
         for times in ((1000,), (999, 1000)):
             clock = iter(times)
             self.gate['monotonic_ns'] = lambda: next(clock)
             with self.assertRaisesRegex(ValueError, 'deadline'):
-                self.select()
+                self.select('semantic')
+
+    def test_completed_getter_prefix_requires_one_successful_original_call_and_actual_hold(self):
+        getter = {'fn': 'C_GetFunctionList', 'module': '/owned/A.so', 'phase': 'setup',
+                  'n': '1', 'bad': '0', 't0': '210', 't1': '210'}
+        hold = {'phase': 'semantic', 't': '230', 'deadline': '1000'}
+        native = [('LEDGER', getter), ('WATCH_READY', hold)]
+        prefix = self.gate['completed_getter'](native, '/owned/A.so', 1000)
+        self.assertEqual(prefix, {'getter_entry_ns': 210, 'semantic_ns': 230, 'count': 1, 'last_entry_ns': 210})
+        self.assertIsNone(self.gate['completed_getter'](native[:1], '/owned/A.so', 1000))
+        for field, value in [('fn', 'C_Initialize'), ('module', '/owned/B.so'), ('n', '2'), ('bad', '1'),
+                             ('phase', 'main'), ('t1', '211')]:
+            with self.subTest(field=field):
+                bad = copy.deepcopy(native)
+                bad[0][1][field] = value
+                with self.assertRaises(ValueError): self.gate['completed_getter'](bad, '/owned/A.so', 1000)
+        with self.assertRaises(ValueError): self.gate['completed_getter'](native + native[:1], '/owned/A.so', 1000)
+        hold['t'] = '209'
+        with self.assertRaises(ValueError): self.gate['completed_getter'](native, '/owned/A.so', 1000)
+
+    def test_semantic_gate_accepts_physical_poll_time_after_getter_completion(self):
+        self.gen2_quiet()
+        edge = next(row['event'] for row in reversed(self.rows) if row['kind'] == 'edge_observed')
+        edge['entries']['last_seen_ns'] = 289  # Read after hold285, before publication290.
+        proof = self.select('semantic')
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['count'], 1)
 
 
 class C8GateFixtureTests(unittest.TestCase):
@@ -1295,6 +1330,13 @@ class C8GateFixtureTests(unittest.TestCase):
             text = self.wait(child, ledger, "WATCH_READY", gen=gen, phase="go")
             self.assertFalse(any(line.startswith("LEDGER ") and f" gen={gen} " in line for line in text.splitlines()))
             Path(str(prefix) + f".{gen}.go").touch()
+            if gen == 2:
+                text = self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='semantic')
+                prefix_calls = [parse_native_row(line) for line in text.splitlines()
+                                if line.startswith('LEDGER ') and ' gen=2 ' in line]
+                self.assertEqual(len(prefix_calls), 1)
+                self.assertEqual(prefix_calls[0]['fn'], 'C_GetFunctionList')
+                Path(str(prefix) + '.2.semantic').touch()
             self.wait(child, ledger, "WATCH_READY", gen=gen, phase="next")
             rows = [parse_native_row(line) for line in ledger.read_text().splitlines()
                     if line.startswith("LEDGER ") and f" gen={gen} " in line]
@@ -1311,6 +1353,25 @@ class C8GateFixtureTests(unittest.TestCase):
         self.assertEqual(len({(x["pid"], x["start"]) for x in idents}), 1)
         self.assertEqual([x["exe"] for x in idents], [str(self.driver), str(self.driver), str(self.other), str(self.driver)])
         self.assertFalse(any(line.startswith("WATCH_READY ") and " gen=3 " in line for line in text.splitlines()))
+
+    def test_semantic_hold_stop_and_original_deadline_keep_the_remaining_calls_unrun(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                child, prefix, ledger = self.start(chain=True, seconds=1)
+                for gen in (0, 1):
+                    self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='go')
+                    Path(str(prefix) + f'.{gen}.go').touch()
+                    self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='next')
+                    Path(str(prefix) + f'.{gen}.next').touch()
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='go')
+                Path(str(prefix) + '.2.go').touch()
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='semantic')
+                if stopped: child.terminate()
+                self.assertNotEqual(child.wait(timeout=3), 0)
+                calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                         if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                self.assertEqual([x['fn'] for x in calls], ['C_GetFunctionList'])
+                self.assertEqual((calls[0]['n'], calls[0]['bad']), ('1', '0'))
 
     def test_stale_gate_is_refused_without_calls(self):
         child, _prefix, ledger = self.start(stale=True)
@@ -1455,10 +1516,15 @@ class C8GateFixtureTests(unittest.TestCase):
         self.assertEqual(proof['proof'], 'publication_progress')
         self.assertNotIn('count', proof)
         physical_seen, instance_seen = threading.Event(), threading.Event()
+        # The publisher owns the original held identity. The negative mapping
+        # control below mutates the controller's separate serialized input.
+        gen2_exe = json.loads((ledger.parent / 'pins.json').read_text())['pins']['L2']['exe']
         original_select = ns['select_gate']
         def observe_gen2(rows, want, phase):
+            if errors:
+                raise AssertionError(f'controlled publisher failed: {errors!r}') from errors[0]
             result = original_select(rows, want, phase)
-            if want['gen'] == 2 and any(r['kind'] == 'edge_observed'
+            if want['gen'] == 2 and phase == 'semantic' and any(r['kind'] == 'edge_observed'
                     and r['event'].get('caller') == 'c2' for r in rows):
                 registered = any(r['kind'] == 'instance_observed' for r in rows)
                 child = any(r['kind'] == 'semantic_edge_observed' for r in rows)
@@ -1474,7 +1540,7 @@ class C8GateFixtureTests(unittest.TestCase):
                 old = copy.deepcopy(edge['identity_context']['caller'])
                 old['lifecycle'] = 'exec_retired'
                 current = copy.deepcopy(old)
-                exe = json.loads((ledger.parent / 'pins.json').read_text())['pins']['L2']['exe']
+                exe = gen2_exe
                 current.update(id='c2', incarnation=2, lifecycle='mapped')
                 current['executable'].update(path=exe['path'], ino=exe['ino'], dev=exe['dev'],
                     mtime_secs=exe['mtime_ns'] // 1_000_000_000, mtime_nanos=exe['mtime_ns'] % 1_000_000_000)
@@ -1484,13 +1550,29 @@ class C8GateFixtureTests(unittest.TestCase):
                 edge['identity_context']['caller'] = current
                 append('edge_observed', edge)
                 append('pass_committed', {'pass': 4})
+                # Detailed registration is unavailable until the real original
+                # getter entry. The native semantic hold must finish that one
+                # call and prevent Initialize or any of the remaining37 calls.
+                self.wait(child, ledger, 'WATCH_READY', gen=2, phase='semantic')
+                prefix_calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
+                                if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                if len(prefix_calls) != 1 or prefix_calls[0]['fn'] != 'C_GetFunctionList':
+                    raise AssertionError('semantic hold did not preserve the one-getter prefix')
+                if prefix_calls[0]['n'] != '1' or prefix_calls[0]['bad'] != '0':
+                    raise AssertionError('original getter did not complete successfully once')
+                stamp = int(prefix_calls[0]['t0']) + 1
+                edge['entries'].update(count=1, first_seen_ns=stamp, last_seen_ns=time.monotonic_ns())
+                edge['entries']['coverage'].update(state='counted', since_ns=stamp, reason=None, lossy=False)
+                append('edge_observed', edge)
+                append('pass_committed', {'pass': 5})
                 for observed in (physical_seen, instance_seen):
                     if not observed.wait(2):
                         if stopped.is_set(): return
                         raise AssertionError('controller did not inspect incomplete gen2 registration')
                     if stopped.is_set(): return
-                    if any(x.startswith('LEDGER ') and ' gen=2 ' in x for x in ledger.read_text().splitlines()):
-                        raise AssertionError('gen2 APIs ran before quiet S1 readiness')
+                    calls = [x for x in ledger.read_text().splitlines() if x.startswith('LEDGER ') and ' gen=2 ' in x]
+                    if len(calls) != 1:
+                        raise AssertionError('remaining gen2 APIs ran before quiet S1 readiness')
                     now = time.monotonic_ns()
                     if observed is physical_seen:
                         append('instance_observed', {'id': 'i2', 'caller': 'c2', 'module': 'm0',
@@ -1502,10 +1584,18 @@ class C8GateFixtureTests(unittest.TestCase):
                                             'saturated': False, 'unit': 'api_returns'},
                             'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
                             'coverage': {'lossy': False, 'reasons': ['no_calls']}})
-                    append('pass_committed', {'pass': 5 if observed is physical_seen else 6})
+                    append('pass_committed', {'pass': 6 if observed is physical_seen else 7})
             except BaseException as error:
                 errors.append(error)
         quiet_publisher = threading.Thread(target=publish_quiet_gen2)
+        original_read = Path.read_text
+        def publisher_read_guard(path, *args, **kwargs):
+            if path == ledger.parent / 'pins.json' and threading.current_thread() is quiet_publisher:
+                raise AssertionError('publisher consulted concurrently mutable controller pins')
+            return original_read(path, *args, **kwargs)
+        read_guard = mock.patch.object(Path, 'read_text', publisher_read_guard)
+        read_guard.start()
+        self.addCleanup(read_guard.stop)
         quiet_publisher.start()
         self.addCleanup(quiet_publisher.join, 5)
         self.addCleanup(stopped.set)
@@ -1531,7 +1621,12 @@ class C8GateFixtureTests(unittest.TestCase):
             pins.write_text(saved)
             gate('pre', 2)
         proof = json.loads(Path(str(prefix) + '.2.pre.json').read_text())
+        self.assertEqual(proof['proof'], 'mapped_ready')
+        self.assertNotIn('instance', proof)
+        gate('semantic', 2)
+        proof = json.loads(Path(str(prefix) + '.2.semantic.json').read_text())
         self.assertEqual(proof['proof'], 'quiet_ready')
+        self.assertEqual(proof['count'], 1)
         self.assertEqual(proof['instance'], 'i2')
         quiet_publisher.join(2)
         self.assertFalse(quiet_publisher.is_alive())
@@ -1540,6 +1635,16 @@ class C8GateFixtureTests(unittest.TestCase):
         calls = [parse_native_row(x) for x in ledger.read_text().splitlines()
                  if x.startswith('LEDGER ') and ' gen=2 ' in x]
         self.assertEqual(len(calls), 38)
+        edge['entries'].update(count=38, last_seen_ns=time.monotonic_ns())
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 8})
+        gate('post', 2)
+        proof = json.loads(Path(str(prefix) + '.2.post.json').read_text())
+        self.assertEqual((proof['proof'], proof['count']), ('bound_exact', 38))
+        self.assertEqual(child.wait(timeout=5), 0)
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        self.assertEqual([sum(x['gen'] == str(gen) and x['fn'] != 'C_GetFunctionList' for x in calls)
+                          for gen in range(4)], [17, 27, 37, 47])
 
     def test_actual_embedded_controller_releases_only_after_current_watch_and_full_count(self):
         child, _observer, prefix, ledger, _ns, edge, append, gate = self.controller_inputs()

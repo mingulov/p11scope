@@ -126,7 +126,7 @@ def select_gate(records, want, phase):
     return result
 
 
-def quiet_registration(instances, children, invalid, cid, mid, previous, commit):
+def quiet_registration(instances, children, invalid, cid, mid, after_seq, first_ns, commit):
     current = [(iid, event, row) for iid, (event, row) in instances.items()
                if event.get('caller') == cid and event.get('module') == mid and event.get('state') == 'observed']
     if len(current) != 1:
@@ -136,10 +136,10 @@ def quiet_registration(instances, children, invalid, cid, mid, previous, commit)
     returns, coverage = child.get('api_returns') or {}, child.get('coverage') or {}
     if (iid in invalid or instance.get('reason') is not None
             or not integer(instance.get('first_seen_ns')) or not integer(instance.get('last_seen_ns'))
-            or not previous['done_ns'] < instance['first_seen_ns'] <= instance['last_seen_ns'] <= publication['at_ns']
+            or not first_ns <= instance['first_seen_ns'] <= instance['last_seen_ns'] <= publication['at_ns']
             or child.get('caller') != cid or child.get('module') != mid
-            or not previous['seq'] < publication['seq'] < commit['seq']
-            or not previous['seq'] < child_row.get('seq', -1) < commit['seq']):
+            or not after_seq < publication['seq'] < commit['seq']
+            or not after_seq < child_row.get('seq', -1) < commit['seq']):
         return None
     if (child.get('entries') != {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'}
             or not integer(returns.get('historical_only_returns')) or returns['historical_only_returns'] != 0
@@ -153,6 +153,25 @@ def quiet_registration(instances, children, invalid, cid, mid, previous, commit)
     return {'instance': iid, 'instance_seq': publication['seq'], 'semantic_edge_seq': child_row['seq']}
 
 
+def completed_getter(native, provider, deadline):
+    calls = [row for kind, row in native if kind == 'LEDGER']
+    ready = [row for kind, row in native if kind == 'WATCH_READY' and row.get('phase') == 'semantic']
+    if len(calls) > 1 or len(ready) > 1:
+        raise ValueError('C8 semantic prefix contains extra calls or holds')
+    if calls:
+        call = calls[0]
+        if (call.get('fn') != 'C_GetFunctionList' or call.get('module') != provider
+                or call.get('phase') != 'setup' or call.get('n') != '1' or call.get('bad') != '0'
+                or call.get('t0') != call.get('t1') or int(call['t0']) <= 0):
+            raise ValueError('C8 semantic prefix is not the one successful original getter')
+    if not ready:
+        return None
+    if not calls or int(ready[0]['deadline']) != deadline or int(ready[0]['t']) <= int(calls[0]['t0']):
+        raise ValueError('C8 getter has no valid completed semantic hold')
+    return {'getter_entry_ns': int(calls[0]['t0']), 'semantic_ns': int(ready[0]['t']),
+            'count': 1, 'last_entry_ns': int(calls[0]['t0'])}
+
+
 def select_publication(records, want, phase, observed_ns):
     dead, candidates, edges, inconsistent = set(), {}, {}, set()
     gaps, witnesses = set(), []
@@ -162,7 +181,7 @@ def select_publication(records, want, phase, observed_ns):
     pre = want.get('pre')
     native_pre = pre and pre.get('proof') == 'native_ready'
     expected_module = (pre or {}).get('module', (previous or {}).get('module'))
-    floor = (pre if phase == 'post' and not native_pre else previous or {}).get('seq', -1)
+    floor = (pre if phase in ('post', 'semantic') and not native_pre else previous or {}).get('seq', -1)
     watermark = max(want.get('unbound_watermark', -1), (previous or {}).get('unbound_watermark', -1))
     origin = None
     for index, row in enumerate(records):
@@ -261,11 +280,11 @@ def select_publication(records, want, phase, observed_ns):
         return {'proof': 'native_ready', 'module': previous['module'], 'seq': commit['seq'],
             'origin': origin, 'deadline': want['deadline'], 'pid': want['pid'], 'start': want['start'],
             'gen': want['gen'], 'exe': want['exe']}
-    if phase == 'post' and pre and not native_pre:
+    if phase in ('post', 'semantic') and pre and not native_pre:
         candidates = {pre['caller']: ({'incarnation': pre['incarnation']}, pre['seq'])}
     for cid, (caller, admitted_seq) in sorted(candidates.items(), key=lambda item: item[1][1], reverse=True):
         pairs = [pair for key, pair in edges.items() if key[0] == cid and pair is not None
-                 and key not in inconsistent and (phase != 'post' or key[1] == expected_module)]
+                 and key not in inconsistent and (phase not in ('post', 'semantic') or key[1] == expected_module)]
         if cid in dead or len(pairs) != 1 or commit is None:
             continue
         edge, publication = pairs[0]
@@ -309,11 +328,21 @@ def select_publication(records, want, phase, observed_ns):
                     or entries.get('last_seen_ns') is not None):
                 continue
             if want['gen'] == 2:
-                quiet = quiet_registration(instances, children, invalid_instances, cid, edge['module'], previous, commit)
-                if quiet is None:
-                    continue
-                return dict(base, proof='quiet_ready', count=0, coverage_state=coverage['state'],
-                            coverage_reason=coverage.get('reason'), **quiet)
+                return dict(base, proof='mapped_ready', count=0, coverage_state=coverage['state'],
+                            coverage_reason=coverage.get('reason'))
+        elif phase == 'semantic':
+            if (coverage.get('state') != 'counted' or coverage.get('lossy') is not False
+                    or entries['count'] != 1 or publication['seq'] <= floor
+                    or publication['at_ns'] < want['getter_entry_ns'] or commit['at_ns'] < want['semantic_ns']
+                    or not integer(entries.get('first_seen_ns')) or not integer(entries.get('last_seen_ns'))
+                    or not want['getter_entry_ns'] <= entries['first_seen_ns'] <= want['semantic_ns']
+                    or not entries['first_seen_ns'] <= entries['last_seen_ns'] <= publication['at_ns']):
+                continue
+            quiet = quiet_registration(instances, children, invalid_instances, cid, edge['module'],
+                                       pre['seq'], want['getter_entry_ns'], commit)
+            if quiet is None:
+                continue
+            return dict(base, proof='quiet_ready', count=1, semantic_ns=want['semantic_ns'], **quiet)
         elif (coverage.get('state') != 'counted' or coverage.get('lossy') is not False
                 or entries['count'] != want['count'] or publication['seq'] <= floor
                 or publication['at_ns'] < want['last_entry_ns']
@@ -386,10 +415,12 @@ def main():
         path.write_text(json.dumps(state) + '\n')
         print(deadline)
         return
-    if operation not in ('pre', 'post'):
+    if operation not in ('pre', 'semantic', 'post'):
         raise ValueError('unknown C8 gate operation')
     cell, number, generation, exe_role, provider_role, ledger_path, prefix, parent, uid = args
     pid, gen = int(number), int(generation)
+    if operation == 'semantic' and (gen != 2 or cell != 'P5'):
+        raise ValueError('C8 semantic gate is only the required generation2 prefix')
     ledger_path, prefix = Path(ledger_path), Path(prefix)
     deadline = state['deadline']
     exe, provider = state['pins'][exe_role], state['pins'][provider_role]
@@ -427,8 +458,9 @@ def main():
             check_deadline(deadline)
         previous = (json.loads(Path(str(prefix) + f'.{gen-1}.post.json').read_text())
                     if gen else None)
-        pre = (json.loads(Path(str(prefix) + f'.{gen}.pre.json').read_text())
-               if operation == 'post' else None)
+        prior_phase = 'semantic' if operation == 'post' and gen == 2 else 'pre'
+        pre = (json.loads(Path(str(prefix) + f'.{gen}.{prior_phase}.json').read_text())
+               if operation in ('semantic', 'post') else None)
         if previous and (previous['pid'] != pid or previous['gen'] != gen - 1):
             raise ValueError('C8 prior completed generation differs')
         stream = state['stream']
@@ -463,7 +495,8 @@ def main():
                                 or row.get('exe') != exe['path']):
                             raise ValueError('native C8 image differs from original held birth/file')
                         native.append((parts[0], row))
-            ready = [r for k, r in native if k == 'WATCH_READY' and r.get('phase') == ('go' if operation == 'pre' else 'next')]
+            native_phase = {'pre': 'go', 'semantic': 'semantic', 'post': 'next'}[operation]
+            ready = [r for k, r in native if k == 'WATCH_READY' and r.get('phase') == native_phase]
             mapped = [r for k, r in native if k == 'MAPPED' and r.get('module') == provider['path']
                       and r.get('ino') == str(provider['identity'][1])]
             identified = [r for k, r in native if k == 'IDENT']
@@ -480,6 +513,11 @@ def main():
             if ready: verify(require_image=True)
             complete = operation == 'pre'
             if operation == 'pre' and calls: raise ValueError('C8 calls preceded their native gate')
+            if operation == 'semantic':
+                prefix_proof = completed_getter(native, provider['path'], deadline)
+                if prefix_proof:
+                    want.update(prefix_proof)
+                    complete = True
             if operation == 'post':
                 done = [r for k, r in native if k == 'DONE' and r.get('status') == 'ok']
                 expected = 18 + gen * 10
@@ -499,7 +537,8 @@ def main():
                     continue  # An append may invalidate the previously read state.
                 proof.update(stream_bytes=len(payload), stream_sha256=hashlib.sha256(payload).hexdigest())
                 receipt = Path(str(prefix) + f'.{gen}.{operation}.json')
-                gate = Path(str(prefix) + f'.{gen}.' + ('go' if operation == 'pre' else 'next'))
+                gate_phase = {'pre': 'go', 'semantic': 'semantic', 'post': 'next'}[operation]
+                gate = Path(str(prefix) + f'.{gen}.{gate_phase}')
                 if gate.exists(): raise ValueError('C8 gate already exists')
                 write_new(receipt, proof)
                 verify(require_image=True)
@@ -922,6 +961,11 @@ if [ "$LANE" = native ]; then
             c8_gate pre "$C8_PINS" P5 "$C8_P5_PID" "$c8_gen" "$c8_exe" A \
                 "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
                 > "$OBS/c8-P5-$c8_gen-pre.log" || die "P5 image$c8_gen native image/provider readiness unproved"
+        fi
+        if [ "$c8_gen" = 2 ]; then
+            c8_gate semantic "$C8_PINS" P5 "$C8_P5_PID" 2 "$c8_exe" A \
+                "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
+                > "$OBS/c8-P5-2-semantic.log" || die "P5 getter completion/quiet registration unproved"
         fi
         c8_gate post "$C8_PINS" P5 "$C8_P5_PID" "$c8_gen" "$c8_exe" A \
             "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \

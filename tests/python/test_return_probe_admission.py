@@ -20,8 +20,11 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/qualify-return-probe-admission.py"
 SOURCE = ROOT / "tests/fixtures/return-probe-admission.c"
 CLEAN = ("uretprobe vs seccomp .............. ok    "
-         "the trampoline's syscall is exempt from seccomp; confined targets are safe\n")
-PUBLIC_LOSS_COUNTERS = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))["COUNTERS"]
+         "the trampoline's syscall is exempt from seccomp; confined targets are safe\n"
+         "uprobe-multi attach (own libc) .... ok    scratch program loaded; "
+         "self-link attached and detached (delivery unmeasured)\n")
+PUBLIC_CONTRACT = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+PUBLIC_LOSS_COUNTERS = PUBLIC_CONTRACT["COUNTERS"]
 
 
 def subject():
@@ -32,37 +35,29 @@ def subject():
 
 
 def report(provider, pid, count):
+    # Reuse the current public profile factory: scope is a KIND, never pid:N.
     st = provider.stat()
     module = {"dev": [os.major(st.st_dev), os.minor(st.st_dev)], "ino": st.st_ino,
               "sha256": hashlib.sha256(provider.read_bytes()).hexdigest()}
-    return {
-        "schema": "p11scope/observed-profile/v3", "lane": "profile",
-        "capture": {"mode": "profile", "scope": f"pid:{pid}",
-                    "privacy_mode": "allowlisted", "modules": [{"path": str(provider), **module}]},
-        "evidence": {
-            **{key: 0 for key in PUBLIC_LOSS_COUNTERS},
-            "completeness": "COMPLETE", "drain_proven": True, "verdict_detail": "clean_proven",
-            "stop_quiescence": {"state": "proven", "post_q_events": False,
-                                "post_q_discovery": False},
-            "uretprobe_override": None, "in_flight_at_end": 0,
-            "attach_backend": {"selection": "multi", "fallback": None,
-                               "scope_filter": "kernel-pid+bpf"},
-            "attach_mechanisms": ["uprobe-multi"], "attach_failures": [],
-            "event_loss": 0, "start_insert_failures": 0, "unmatched_returns": 0,
-            "rv_update_failures": 0, "abi_refusals": 0, "malformed_records": 0,
-            "discovery_ring_loss": 0, "discovery_read_failures": 0,
-            "discovery_state_failures": 0, "discovery_truncated": 0,
-            "task_uprobe_link_losses": 0,
-            "kernel_control": {"capture_halted": False, "owner_poison": [],
-                               "owner_admission_failures": 0, "identity_unavailable": 0,
-                               "identity_budget_exhausted": False,
-                               "root_affiliation_failures": []},
-        },
-        "functions": [{"names": ["C_GetInfo"], "module": module,
-                       "module_ambiguous": False, "module_unresolved": False,
-                       "calls": count, "errors": 0, "in_flight": 0, "pending_returns": 0,
-                       "rv_counts": {"0x0000000000000000": count}}],
-    }
+    evidence = PUBLIC_CONTRACT["evidence_fixture"]({("full", 68): 1})
+    evidence.update(
+        slots=2, active_slots=2, attached_probes=4, table_entries=68,
+        semantic_unverified_slots=2, drain_proven=True,
+        stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False},
+        attach_backend={"selection": "auto", "fallback": None, "scope_filter": "kernel-pid+bpf"},
+        attach_mechanisms=["per-offset", "uprobe-multi"],
+    )
+    for discovered in evidence["discovery"]:
+        discovered.update(module, path=str(provider))
+        for obj in discovered["objects"]:
+            obj.update(module, path=str(provider))
+    document = PUBLIC_CONTRACT["document_fixture"](evidence)
+    document["functions"] = PUBLIC_CONTRACT["function_items"](
+        [(["C_GetInfo"], count), (["C_GetFunctionList"], 0)], module)
+    for row in document["functions"]:
+        row.update(errors=0, pending_returns=0, in_flight=0,
+                   rv_counts={"0x0000000000000000": row["calls"]} if row["calls"] else {})
+    return document
 
 
 class DisclosureControls(unittest.TestCase):
@@ -91,9 +86,50 @@ class DisclosureControls(unittest.TestCase):
         self.mod.validate_report(report(self.provider, 123, 16), self.provider, 123, 16,
                                  mapping_dev=self.device)
 
+    def test_current_fixture_obeys_the_existing_public_profile_schema(self):
+        data = report(self.provider, 123, 16)
+        PUBLIC_CONTRACT["exact_profile_v3_selection"](data)
+        PUBLIC_CONTRACT["exact_capture_modules"](data)
+        self.assertEqual(data["capture"]["scope"], "pid")
+        self.assertEqual(data["evidence"]["completeness"], "PARTIAL")
+        self.assertEqual(data["evidence"]["gap_classes"]["attribution"]["causes"],
+                         ["semantic_unverified_slots"])
+
+    def test_clean_without_functional_multi_host_row_cannot_launch_fixture(self):
+        with self.assertRaises(self.mod.Refused):
+            self.mod.require_clean_doctor(CLEAN.splitlines()[0] + "\n")
+
+    def test_only_published_scan_only_attribution_is_accepted_not_other_partial(self):
+        base = report(self.provider, 123, 16)
+        for key, value in (("observation", {"status": "lossy", "causes": ["event_loss"]}),
+                           ("attribution", {"status": "withheld", "causes": ["module_unresolved_slots"]}),
+                           ("semantics", {"status": "degraded", "causes": ["semantic_capture_failures"]}),
+                           ("settlement", "unproven")):
+            data = copy.deepcopy(base)
+            data["evidence"]["gap_classes"][key] = value
+            with self.subTest(key=key), self.assertRaises(self.mod.Refused):
+                self.mod.validate_report(data, self.provider, 123, 16, mapping_dev=self.device)
+
+    def test_eligible_scoped_singles_and_mixed_links_keep_truthful_disclosure(self):
+        for mechanisms, backend in (
+            (["per-offset", "uprobe-multi"], {"selection": "multi", "fallback": None,
+                                             "scope_filter": "kernel-pid+bpf"}),
+            (["per-offset"], {"selection": "auto", "fallback": "PID Multi filter proof unavailable",
+                              "scope_filter": "perf-task+bpf"}),
+        ):
+            data = report(self.provider, 123, 16)
+            data["evidence"].update(attach_backend=backend, attach_mechanisms=mechanisms)
+            result = self.mod.validate_report(data, self.provider, 123, 16, mapping_dev=self.device)
+            self.assertEqual(result["attach_backend"], backend)
+            self.assertEqual(result["attach_mechanisms"], mechanisms)
+
     def test_maps_device_is_authority_for_report_not_filesystem_stat_device(self):
         data = report(self.provider, 123, 16)
-        for module in (data["capture"]["modules"][0], data["functions"][0]["module"]):
+        modules = [*data["capture"]["modules"], *data["evidence"]["discovery"]]
+        modules += [obj for discovered in data["evidence"]["discovery"] for obj in discovered["objects"]]
+        modules += [row["module"] for row in data["functions"]]
+        modules += [row["target"]["object"] for row in data["functions"]]
+        for module in modules:
             module["dev"] = [231, 17]
         self.mod.validate_report(data, self.provider, 123, 16, mapping_dev=(231, 17))
         with self.assertRaises(self.mod.Refused):
@@ -122,9 +158,7 @@ class DisclosureControls(unittest.TestCase):
 
     def test_zero_call_row_cannot_hide_positive_return_counters(self):
         data = report(self.provider, 123, 16)
-        zero = copy.deepcopy(data["functions"][0])
-        zero.update(names=["C_GetFunctionList"], calls=0, rv_counts={})
-        data["functions"].append(zero)
+        zero = data["functions"][1]
         self.mod.validate_report(data, self.provider, 123, 16, mapping_dev=self.device)
         zero["rv_counts"] = {"0x0000000000000000": 1}
         with self.assertRaises(self.mod.Refused):
@@ -140,14 +174,14 @@ class DisclosureControls(unittest.TestCase):
             ("functions.0.rv_counts", {"0x0000000000000005": 16}),
             ("capture.scope", "pid:124"), ("capture.modules.0.ino", 9),
             ("capture.privacy_mode", "unsafe-unvalidated-metadata"),
-            ("evidence.completeness", "PARTIAL"), ("evidence.drain_proven", False),
+            ("evidence.completeness", "COMPLETE"), ("evidence.drain_proven", False),
             ("evidence.stop_quiescence.post_q_events", True),
             ("evidence.stop_quiescence.post_q_discovery", True),
             ("evidence.uretprobe_override", {"reason": "accepted risk"}),
             ("evidence.event_loss", 1), ("evidence.unmatched_returns", 1),
             ("evidence.abi_refusals", 1), ("evidence.discovery_ring_loss", 1),
             ("evidence.kernel_control.capture_halted", True),
-            ("evidence.attach_backend.scope_filter", "perf-task+bpf"),
+            ("evidence.attach_backend.scope_filter", None),
         ]
         for path, value in poisons:
             with self.subTest(path=path):
@@ -298,9 +332,13 @@ class OwnedFixtureControls(unittest.TestCase):
             " dev=next(row.split()[3] for row in maps if str(provider) in row and 'r-x' in row)\n" +
             " module={'dev':[int(x,16) for x in dev.split(':')],'ino':st.st_ino," +
             "'sha256':hashlib.sha256(provider.read_bytes()).hexdigest()}\n" +
-            " doc['capture']['modules']=[{'path':str(provider),**module}]\n" +
-            " doc['functions'][0]['module']=module\n" +
-            (" doc['evidence']['completeness']='PARTIAL'\n" if behavior == "partial" else "") +
+            " doc['capture']['modules'][0].update(module,path=str(provider))\n" +
+            " for discovered in doc['evidence']['discovery']:\n" +
+            "  discovered.update(module,path=str(provider))\n" +
+            "  for obj in discovered['objects']:obj.update(module,path=str(provider))\n" +
+            " for row in doc['functions']:\n" +
+            "  row['module']=module;row['target']['object']=dict(module)\n" +
+            (" doc['evidence']['verdict_detail']='concrete_gap'\n" if behavior == "partial" else "") +
             " out.write_text(json.dumps(doc))\n" +
             " sys.exit(0)\n" +
             "signal.signal(signal.SIGINT,stop)\n" +
@@ -347,7 +385,7 @@ class OwnedFixtureControls(unittest.TestCase):
         pid = json.loads((cell / "caller.stdout").read_text().splitlines()[0])["pid"]
         self.assertFalse(Path(f"/proc/{pid}").exists())
 
-    def test_partial_final_report_fails_and_cleans_held_fixture(self):
+    def test_concrete_gap_final_report_fails_and_cleans_held_fixture(self):
         fake = self.fake_observer("partial")
         work = self.work / "qualification"
         with self.assertRaises(self.mod.Refused):

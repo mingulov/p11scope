@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODES = ("worker-pre-filter", "worker-late-filter")
 MAX_BYTES = 8 * 1024 * 1024
 CLEAN_DETAIL = "the trampoline's syscall is exempt from seccomp; confined targets are safe"
+MULTI_DETAIL = "scratch program loaded; self-link attached and detached (delivery unmeasured)"
 READY = re.compile(r"p11scope: capturing: ([1-9][0-9]*) probe\(s\) attached; stop with Ctrl-C")
 DOCTOR_SECONDS = 60
 READINESS_SECONDS = 60
@@ -38,7 +39,8 @@ CALL_SECONDS = 10
 CALLER_SECONDS = 120
 # Reuse the public profile's finite loss vocabulary, including semantic and
 # process-tracking loss. COMPLETE alone cannot excuse a contradictory counter.
-LOSS_COUNTERS = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))["COUNTERS"]
+CAPTURE_CONTRACT = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+LOSS_COUNTERS = CAPTURE_CONTRACT["COUNTERS"]
 
 
 class Refused(Exception):
@@ -55,11 +57,16 @@ def uint(value):
 
 
 def require_clean_doctor(text):
-    rows = [row for row in text.splitlines() if row.startswith("uretprobe vs seccomp ")]
-    require(len(rows) == 1, "functional return-probe assessment missing or duplicated")
-    match = re.fullmatch(r"uretprobe vs seccomp \.+ ok +(.+)", rows[0])
-    require(match is not None and match[1] == CLEAN_DETAIL,
-            "functional return-probe assessment is not Clean; no filtered target launched")
+    for name, detail, reason in (
+        ("uretprobe vs seccomp", CLEAN_DETAIL,
+         "functional return-probe assessment is not Clean; no filtered target launched"),
+        ("uprobe-multi attach (own libc)", MULTI_DETAIL,
+         "functional Multi host eligibility is unproven; no filtered target launched"),
+    ):
+        rows = [row for row in text.splitlines() if row.startswith(name + " ")]
+        require(len(rows) == 1, reason)
+        match = re.fullmatch(re.escape(name) + r" \.+ ok +(.+)", rows[0])
+        require(match is not None and match[1] == detail, reason)
 
 
 class OwnedProcess:
@@ -274,10 +281,14 @@ def validate_ledger(rows, pid, tid, count):
 def validate_report(document, provider, pid, count, *, mapping_dev):
     """Narrow exact-return/drain oracle over the current public profile fields."""
     try:
+        # Reuse the existing current-profile contract and its recomputed gap
+        # classes. In particular, capture.scope is a kind, not an Inventory PID.
+        CAPTURE_CONTRACT["exact_profile_v3_selection"](document)
+        CAPTURE_CONTRACT["exact_capture_modules"](document)
         require(document["schema"] == "p11scope/observed-profile/v3" and
                 document["lane"] == "profile", "observer profile schema disagrees")
         capture, ev = document["capture"], document["evidence"]
-        require(capture["mode"] == "profile" and capture["scope"] == f"pid:{pid}" and
+        require(uint(pid) and pid > 0 and capture["mode"] == "profile" and capture["scope"] == "pid" and
                 capture["privacy_mode"] == "allowlisted", "observer scope or privacy disagrees")
         st = provider.stat()
         require(len(mapping_dev) == 2 and all(uint(value) for value in mapping_dev),
@@ -287,17 +298,27 @@ def validate_report(document, provider, pid, count, *, mapping_dev):
         require(len(capture["modules"]) == 1 and
                 all(capture["modules"][0][key] == value for key, value in identity.items()),
                 "observer provider identity disagrees")
-        require(ev["completeness"] == "COMPLETE" and ev["verdict_detail"] == "clean_proven" and
+        require(ev["completeness"] == "PARTIAL" and ev["verdict_detail"] == "attribution_only" and
                 ev["drain_proven"] is True and ev["uretprobe_override"] is None,
-                "observer is partial, undrained or used a risk override")
+                "observer has an unsupported verdict, unproven drain or risk override")
+        # Scan-only slots preserve count authority and explicitly withhold
+        # semantics (render::Evidence::semantic_unverified_slots / OD33).
+        # This finite actual disclosure is not permission to accept other loss.
+        require(ev["slots"] == ev["active_slots"] == ev["semantic_unverified_slots"] == 2 and
+                ev["authority"] == "hash-pinned" and len(ev["discovery"]) == 1 and
+                ev["discovery"][0]["sources"] == ["scan"] and
+                ev["gap_classes"] == {
+                    "observation": {"status": "exact", "causes": []},
+                    "attribution": {"status": "withheld", "causes": ["semantic_unverified_slots"]},
+                    "semantics": {"status": "not_applicable", "causes": []},
+                    "open_calls": 0, "settlement": "proven", "stdout_data_sink": False,
+                }, "observer has more than the published scan-only attribution limitation")
         require(ev["stop_quiescence"] == {"state": "proven", "post_q_events": False,
                                          "post_q_discovery": False} and
                 all(ev["stop_quiescence"][key] is False for key in ("post_q_events", "post_q_discovery")),
                 "observer final drain is unproven")
-        require(ev["attach_backend"] == {"selection": "multi", "fallback": None,
-                                        "scope_filter": "kernel-pid+bpf"} and
-                ev["attach_mechanisms"] == ["uprobe-multi"] and ev["attach_failures"] == [],
-                "actual PID Multi attachment is not proven")
+        require(ev["attach_mechanisms"] and ev["attach_failures"] == [],
+                "actual scoped attachment is not proven")
         for key in (*LOSS_COUNTERS, "in_flight_at_end"):
             require(type(ev[key]) is int and ev[key] == 0, "observer loss or incomplete returns")
         control = ev["kernel_control"]
@@ -330,7 +351,10 @@ def validate_report(document, provider, pid, count, *, mapping_dev):
                 row["rv_counts"] == {"0x0000000000000000": count} and
                 type(row["rv_counts"]["0x0000000000000000"]) is int,
                 "observer exact C_GetInfo returns or provider identity disagree")
-    except (KeyError, TypeError, IndexError, AttributeError) as error:
+        return {"completeness": ev["completeness"], "verdict_detail": ev["verdict_detail"],
+                "attribution_causes": ev["gap_classes"]["attribution"]["causes"],
+                "attach_backend": ev["attach_backend"], "attach_mechanisms": ev["attach_mechanisms"]}
+    except (AssertionError, KeyError, TypeError, IndexError, AttributeError) as error:
         raise Refused("observer required profile facts are missing or malformed") from error
 
 
@@ -355,7 +379,7 @@ def qualify_cell(observer, app, provider, work, mode, calls, duration):
         require(ready.get("calls") == 0 and ledger.read_bytes() == b"", "calls preceded attachment")
         output = work / "profile.json"
         argv = [str(observer), "profile", "--pid", str(child.pid), "--module", str(provider),
-                "--attach-backend", "multi", "--duration", f"{duration}s", "-o", str(output)]
+                "--attach-backend", "auto", "--duration", f"{duration}s", "-o", str(output)]
         with OwnedProcess(argv, work / "observer", child.remaining()) as capture:
             readiness_deadline = capture.started + READINESS_SECONDS
             while True:
@@ -388,13 +412,15 @@ def qualify_cell(observer, app, provider, work, mode, calls, duration):
             require(capture.wait(deadline=draining + DRAIN_SECONDS) == 0, "observer did not stop successfully")
             drained = time.monotonic()
             verify_facts(child, done, provider, original, armed=True)
-            validate_report(read_json(output), provider, child.pid, calls, mapping_dev=original["mapping_dev"])
+            reporting = validate_report(read_json(output), provider, child.pid, calls,
+                                        mapping_dev=original["mapping_dev"])
             require(ledger.read_bytes() == data, "call ledger changed during final drain")
         child.send("R")
         require(child.wait(deadline=time.monotonic() + CALL_SECONDS) == 0,
                 "owned caller did not exit successfully after release")
         return {"mode": mode, "pid": child.pid, "tid": original["tid"], "calls": calls,
                 "leader_seccomp": 0, "worker_seccomp": 2, "owned_cleanup": True,
+                **reporting,
                 "attach_seconds": attached - capture.started, "calls_seconds": draining - attached,
                 "drain_seconds": drained - draining, "total_seconds": time.monotonic() - child.started}
 

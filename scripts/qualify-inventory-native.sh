@@ -327,7 +327,7 @@ def select_publication(records, want, phase, observed_ns):
                     or entries['count'] != 0 or entries.get('first_seen_ns') is not None
                     or entries.get('last_seen_ns') is not None):
                 continue
-            if want['gen'] == 2:
+            if want['gen'] == 2 or want.get('warm_initial'):
                 return dict(base, proof='mapped_ready', count=0, coverage_state=coverage['state'],
                             coverage_reason=coverage.get('reason'))
         elif phase == 'semantic':
@@ -417,10 +417,18 @@ def main():
         return
     if operation not in ('pre', 'semantic', 'post'):
         raise ValueError('unknown C8 gate operation')
-    cell, number, generation, exe_role, provider_role, ledger_path, prefix, parent, uid = args
+    cell, number, generation, exe_role, provider_role, ledger_path, prefix, parent, uid, *warm_plan = args
     pid, gen = int(number), int(generation)
-    if operation == 'semantic' and (gen != 2 or cell != 'P5'):
-        raise ValueError('C8 semantic gate is only the required generation2 prefix')
+    if len(warm_plan) > 1:
+        raise ValueError('C8 warm role has more than one original population')
+    warm_initial = bool(warm_plan)
+    expected_total = int(warm_plan[0]) if warm_initial else 18 + gen * 10
+    if warm_initial and (gen != 0 or cell not in ('P1', 'P5', 'P7') or expected_total <= 0
+                         or (cell == 'P5' and expected_total != 18)):
+        raise ValueError('C8 warm role differs from the original initial population')
+    semantic_required = warm_initial or (gen == 2 and cell == 'P5')
+    if operation == 'semantic' and not semantic_required:
+        raise ValueError('C8 semantic gate is not part of this original role')
     ledger_path, prefix = Path(ledger_path), Path(prefix)
     deadline = state['deadline']
     exe, provider = state['pins'][exe_role], state['pins'][provider_role]
@@ -458,7 +466,7 @@ def main():
             check_deadline(deadline)
         previous = (json.loads(Path(str(prefix) + f'.{gen-1}.post.json').read_text())
                     if gen else None)
-        prior_phase = 'semantic' if operation == 'post' and gen == 2 else 'pre'
+        prior_phase = 'semantic' if operation == 'post' and semantic_required else 'pre'
         pre = (json.loads(Path(str(prefix) + f'.{gen}.{prior_phase}.json').read_text())
                if operation in ('semantic', 'post') else None)
         if previous and (previous['pid'] != pid or previous['gen'] != gen - 1):
@@ -503,7 +511,7 @@ def main():
             calls = [r for k, r in native if k == 'LEDGER']
             want = {'pid': pid, 'start': owner.identity['start_time'], 'gen': gen, 'exe': exe['exe'],
                     'provider': provider['provider'], 'origin': state['origin'], 'deadline': deadline,
-                    'previous': previous, 'pre': pre}
+                    'previous': previous, 'pre': pre, 'warm_initial': warm_initial}
             if previous and previous['start'] != want['start']: raise ValueError('C8 birth changed across exec')
             if ready and int(ready[0]['deadline']) != deadline: raise ValueError('native C8 deadline renewed')
             if ready and (len(ready) != 1 or len(mapped) != 1 or len(identified) != 1):
@@ -520,7 +528,7 @@ def main():
                     complete = True
             if operation == 'post':
                 done = [r for k, r in native if k == 'DONE' and r.get('status') == 'ok']
-                expected = 18 + gen * 10
+                expected = expected_total
                 if done and calls:
                     if (len(calls) != expected or any(r['n'] != '1' or r['bad'] != '0'
                             or r['t0'] != r['t1'] or r['module'] != provider['path'] for r in calls)):
@@ -903,7 +911,7 @@ if [ "$probe_manifest" = 1 ]; then
 fi
 echo "probe: capture_args=${CAPTURE_ARGS[*]:-none} manifest=${MANIFEST_ARGS[*]:-none}"
 
-C8_P2=() C8_P5=()
+C8_P1=() C8_P2=() C8_P5=() C8_P7=()
 if [ "$LANE" = native ]; then
     exec {C8_LFD}<"$L"
     exec {C8_L2FD}<"$WL/bin/ledger2"
@@ -926,13 +934,18 @@ if [ "$LANE" = native ]; then
     C8_DEADLINE=$(c8_gate start "$C8_PINS" "$OBS/system.jsonl" "$C8_STREAM_FD" "$DURATION" "$SYS" "$$") \
         || die "C8 original work deadline unavailable"
     C8_P2=(--ledger-singletons --c8-gate-prefix "$WL/gates/P2" --c8-gated-images 1 --c8-deadline "$C8_DEADLINE")
-    C8_P5=(--ledger-singletons --c8-gate-prefix "$WL/gates/P5" --c8-gated-images 3 --c8-deadline "$C8_DEADLINE")
+    C8_P1=(--ledger-singletons --c8-gate-prefix "$WL/gates/P1" --c8-gated-images 1 --c8-deadline "$C8_DEADLINE" --c8-warm-initial)
+    C8_P5=(--ledger-singletons --c8-gate-prefix "$WL/gates/P5" --c8-gated-images 3 --c8-deadline "$C8_DEADLINE" --c8-warm-initial)
+    C8_P7=(--ledger-singletons --c8-gate-prefix "$WL/gates/P7" --c8-gated-images 1 --c8-deadline "$C8_DEADLINE" --c8-warm-initial)
+    C8_WARM_TOTAL=$((8 + ITERS * 10))
 fi
-launch P1 mech --cell P1 --module "$A" --iters "$ITERS" --gate "$GATE" --hold
+launch P1 mech --cell P1 --module "$A" --iters "$ITERS" --gate "$GATE" --hold "${C8_P1[@]}"
+C8_P1_PID=${WORKLOADS[-1]}
 launch P2 mech --cell P2 --module "$B" --iters "$ITERS" --gate "$GATE" --hold "${C8_P2[@]}"
 C8_P2_PID=${WORKLOADS[-1]}
 launch P3 map --cell P3 --module "$A" --module "$C" --gate "$GATE" --hold
-launch P7 mech --late --cell P7 --module "$A" --iters "$ITERS" --gate "$GATE" --delay-ms "$LATE_MS" --hold
+launch P7 mech --late --cell P7 --module "$A" --iters "$ITERS" --gate "$GATE" --delay-ms "$LATE_MS" --hold "${C8_P7[@]}"
+C8_P7_PID=${WORKLOADS[-1]}
 launch LX leader-exit --cell LX --module "$A" --iters "$ITERS" --gate "$GATE"
 launch P5 exec-chain --cell P5 --module "$A" --iters 1 --gate "$GATE" --delay-ms 300 \
     --chain "leader:$L,leader:$WL/bin/ledger2,thread:$L" "${C8_P5[@]}"
@@ -940,8 +953,18 @@ C8_P5_PID=${WORKLOADS[-1]}
 if [ "$LANE" = native ]; then
     c8_gate pre "$C8_PINS" P2 "$C8_P2_PID" 0 L B "$OBS/ledgers/P2.out" "$WL/gates/P2" "$$" "$RUNUID" \
         > "$OBS/c8-P2-pre.log" || die "P2 current provider watch unproved"
-    c8_gate pre "$C8_PINS" P5 "$C8_P5_PID" 0 L A "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
-        > "$OBS/c8-P5-0-pre.log" || die "P5 initial provider watch unproved"
+    for c8_cell in P1 P5; do
+        c8_pid=$C8_P1_PID c8_total=$C8_WARM_TOTAL
+        [ "$c8_cell" = P5 ] && c8_pid=$C8_P5_PID && c8_total=18
+        c8_gate pre "$C8_PINS" "$c8_cell" "$c8_pid" 0 L A "$OBS/ledgers/$c8_cell.out" "$WL/gates/$c8_cell" "$$" "$RUNUID" "$c8_total" \
+            > "$OBS/c8-$c8_cell-0-pre.log" || die "$c8_cell initial provider mapping unproved"
+    done
+    for c8_cell in P1 P5; do
+        c8_pid=$C8_P1_PID c8_total=$C8_WARM_TOTAL
+        [ "$c8_cell" = P5 ] && c8_pid=$C8_P5_PID && c8_total=18
+        c8_gate semantic "$C8_PINS" "$c8_cell" "$c8_pid" 0 L A "$OBS/ledgers/$c8_cell.out" "$WL/gates/$c8_cell" "$$" "$RUNUID" "$c8_total" \
+            > "$OBS/c8-$c8_cell-0-semantic.log" || die "$c8_cell original getter/quiet registration unproved"
+    done
 fi
 for c in P1 P2 P3 P7 LX P5; do waitfor "$OBS/ledgers/$c.out" '^READY ' 30 || die "$c never became ready"; done
 # Two more passes: the native lane admits and attaches the new mappings first.
@@ -954,6 +977,10 @@ for i in 1 2 3; do  # P4: ~100 ms CLIs, ungated, while capture runs
     sleep 1
 done
 if [ "$LANE" = native ]; then
+    c8_gate pre "$C8_PINS" P7 "$C8_P7_PID" 0 L A "$OBS/ledgers/P7.out" "$WL/gates/P7" "$$" "$RUNUID" "$C8_WARM_TOTAL" \
+        > "$OBS/c8-P7-0-pre.log" || die "P7 late provider mapping unproved"
+    c8_gate semantic "$C8_PINS" P7 "$C8_P7_PID" 0 L A "$OBS/ledgers/P7.out" "$WL/gates/P7" "$$" "$RUNUID" "$C8_WARM_TOTAL" \
+        > "$OBS/c8-P7-0-semantic.log" || die "P7 original getter/quiet registration unproved"
     for c8_gen in 0 1 2; do  # The final thread-reached image remains optional.
         c8_exe=L
         [ "$c8_gen" = 2 ] && c8_exe=L2
@@ -967,8 +994,10 @@ if [ "$LANE" = native ]; then
                 "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
                 > "$OBS/c8-P5-2-semantic.log" || die "P5 getter completion/quiet registration unproved"
         fi
+        c8_plan=()
+        [ "$c8_gen" = 0 ] && c8_plan=(18)
         c8_gate post "$C8_PINS" P5 "$C8_P5_PID" "$c8_gen" "$c8_exe" A \
-            "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" \
+            "$OBS/ledgers/P5.out" "$WL/gates/P5" "$$" "$RUNUID" "${c8_plan[@]}" \
             > "$OBS/c8-P5-$c8_gen-post.log" || die "P5 image$c8_gen count/publication progress unproved"
     done
 fi

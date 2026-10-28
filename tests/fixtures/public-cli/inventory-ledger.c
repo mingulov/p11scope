@@ -455,7 +455,7 @@ static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
 struct options {
     const char *mode, *gate, *gate2, *chain;
     long iters, delay_ms, sleep_us;
-    int hold, late_from, single_call, h6_control;
+    int hold, late_from, single_call, h6_control, c8_warm_initial;
     unsigned long h6_deadline, h6_leg_deadline;
 };
 static struct options opt = {.gate = "-", .iters = 4, .late_from = -1, .single_call = -1};
@@ -507,12 +507,13 @@ static void mech_generation(long iters, int gated) {
     CK_SESSION_HANDLE s[MAX_MODULES];
     int split = opt.late_from < 0 ? module_count : opt.late_from;
     if (split > module_count) split = module_count;
-    if (c8_gated()) {
+    int warm_late = c8_gated() && opt.c8_warm_initial && gen == 0 && opt.late_from == 0;
+    if (c8_gated() && !warm_late) {
         for (int m = 0; m < split; m++) load_module(m);
         c8_wait("go");
         for (int m = 0; m < split; m++) {
             bind_module(m, PH_SETUP);
-            if (gen == 2 && !strcmp(opt.mode, "exec-chain")) {
+            if ((opt.c8_warm_initial && gen == 0) || (gen == 2 && !strcmp(opt.mode, "exec-chain"))) {
                 flush_ledger();
                 c8_wait("semantic");
             }
@@ -546,7 +547,12 @@ static void mech_generation(long iters, int gated) {
         for (int m = split; m < module_count; m++) load_module(m);
         if (opt.single_call < 0) {
             sleep_ms(opt.delay_ms);
-            for (int m = split; m < module_count; m++) { bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+            if (warm_late) c8_wait("go");
+            for (int m = split; m < module_count; m++) {
+                bind_module(m, PH_SETUP);
+                if (warm_late) { flush_ledger(); c8_wait("semantic"); }
+                s[m] = setup(m, PH_SETUP);
+            }
         } else {
             /* Bind before the quarantine: the dlsym acquisition is
              * pre-attach (uncounted) while C_Initialize lands post-attach. */
@@ -790,6 +796,7 @@ int main(int argc, char **argv) {
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--h6-control")) { opt.h6_control = 1; continue; }
         if (!strcmp(a, "--ledger-singletons")) { ledger_singletons = 1; continue; }
+        if (!strcmp(a, "--c8-warm-initial")) { opt.c8_warm_initial = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
@@ -831,9 +838,10 @@ int main(int argc, char **argv) {
     printf("IDENT " HEAD "\n", HEAD_ARGS);
     fflush(stdout);
 
-    if (c8_gate_prefix || c8_gated_images || c8_deadline) {
+    if (c8_gate_prefix || c8_gated_images || c8_deadline || opt.c8_warm_initial) {
+        int warm_late = opt.c8_warm_initial && gen == 0 && !strcmp(opt.mode, "mech") && opt.late_from == 0;
         if (!c8_gate_prefix || !c8_gated_images || !c8_deadline || !ledger_singletons ||
-            opt.h6_control || opt.late_from >= 0 || opt.gate2 || opt.single_call >= 0 ||
+            opt.h6_control || (opt.late_from >= 0 && !warm_late) || opt.gate2 || opt.single_call >= 0 ||
             module_count != 1 || has_space(c8_gate_prefix) ||
             (strcmp(opt.mode, "mech") && strcmp(opt.mode, "exec-chain")) ||
             (!strcmp(opt.mode, "mech") && c8_gated_images != 1))

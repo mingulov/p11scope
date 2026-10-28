@@ -1232,14 +1232,15 @@ class C8GateFixtureTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def start(self, *, chain=False, seconds=10, stale=False, delay_ms=0):
+    def start(self, *, chain=False, seconds=10, stale=False, delay_ms=0,
+              cell=None, warm=False, late=False, shared_open=True):
         root = Path(tempfile.mkdtemp(dir=self.base, prefix="case-"))
         prefix, ledger = root / "gate", root / "ledger.out"
         if stale: Path(str(prefix) + ".0.go").touch()
         shared = root / "shared"
-        shared.touch()
+        if shared_open: shared.touch()
         output, errors = ledger.open("w"), (root / "ledger.err").open("w")
-        args = [str(self.driver), "exec-chain" if chain else "mech", "--cell", "P5" if chain else "P2",
+        args = [str(self.driver), "exec-chain" if chain else "mech", "--cell", cell or ("P5" if chain else "P2"),
             "--module", "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so", "--iters", "1" if chain else "4",
             "--gate", str(shared), "--ledger-singletons", "--c8-gate-prefix", str(prefix),
             "--c8-gated-images", "3" if chain else "1", "--c8-deadline",
@@ -1247,6 +1248,8 @@ class C8GateFixtureTests(unittest.TestCase):
         if chain: args += ["--chain", f"leader:{self.driver},leader:{self.other},thread:{self.driver}",
                            "--delay-ms", str(delay_ms)]
         else: args += ["--hold"]
+        if warm: args += ['--c8-warm-initial']
+        if late: args += ['--late', '--delay-ms', str(delay_ms)]
         child = subprocess.Popen(args, stdout=output, stderr=errors,
             env={**os.environ, "SOFTHSM2_CONF": str(self.conf)})
         self.addCleanup(output.close)
@@ -1269,6 +1272,51 @@ class C8GateFixtureTests(unittest.TestCase):
                           f"{ledger.with_name('ledger.err').read_text()} {text}")
             time.sleep(.005)
         self.fail(f"native fixture did not reach {prefix}/{gen}/{phase}")
+
+    def test_warm_initial_roles_hold_one_getter_before_setup_ready(self):
+        for cell, chain, total in (('P1', False, 48), ('P5', True, 18)):
+            with self.subTest(cell=cell):
+                child, prefix, ledger = self.start(cell=cell, chain=chain, warm=True, shared_open=False)
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='go')
+                self.assertNotIn('LEDGER ', text)
+                self.assertNotIn('READY ', '\n'.join(x for x in text.splitlines() if not x.startswith('WATCH_READY ')))
+                Path(str(prefix) + '.0.go').touch()
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+                calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ')]
+                self.assertEqual([x['fn'] for x in calls], ['C_GetFunctionList'])
+                self.assertEqual((calls[0]['n'], calls[0]['bad']), ('1', '0'))
+                self.assertFalse(any(x.startswith('READY ') for x in text.splitlines()))
+                Path(str(prefix) + '.0.semantic').touch()
+                text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+                self.assertFalse(any(x.startswith('LEDGER ') and ' phase=main ' in x for x in text.splitlines()))
+                (ledger.parent / 'shared').touch()
+                text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+                self.assertEqual(len([x for x in text.splitlines() if x.startswith('LEDGER ') and ' gen=0 ' in x]), total)
+
+    def test_warm_late_ready_stays_unmapped_until_the_original_global_gate(self):
+        child, prefix, ledger = self.start(cell='P7', warm=True, late=True, shared_open=False, delay_ms=20)
+        text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+        self.assertNotIn('MAPPED ', text)
+        self.assertNotIn('LEDGER ', text)
+        provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
+        inode = str(provider.stat().st_ino)
+        self.assertFalse(any(x.split()[4] == inode for x in Path(f'/proc/{child.pid}/maps').read_text().splitlines()))
+        opened = time.monotonic_ns()
+        (ledger.parent / 'shared').touch()
+        text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='go')
+        self.assertIn('MAPPED ', text)
+        self.assertNotIn('LEDGER ', text)
+        ready = next(parse_native_row(x) for x in text.splitlines() if x.startswith('WATCH_READY '))
+        self.assertGreaterEqual(int(ready['t']) - opened, 20_000_000)
+        Path(str(prefix) + '.0.go').touch()
+        text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+        self.assertEqual([parse_native_row(x)['fn'] for x in text.splitlines() if x.startswith('LEDGER ')],
+                         ['C_GetFunctionList'])
+        Path(str(prefix) + '.0.semantic').touch()
+        text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+        self.assertEqual(len([x for x in text.splitlines() if x.startswith('LEDGER ')]), 48)
+        child.terminate()
+        self.assertEqual(child.wait(timeout=5), 0)
 
     def test_real_mech_holds_before_getter_and_keeps_singleton_plan(self):
         child, prefix, ledger = self.start()
@@ -1325,18 +1373,24 @@ class C8GateFixtureTests(unittest.TestCase):
         self.assertEqual(set(json.loads(target.read_text())['pins']), {'L', 'L2', 'A', 'B'})
 
     def test_real_chain_holds_required_images_and_leaves_thread_image_optional(self):
-        child, prefix, ledger = self.start(chain=True)
+        self.assert_real_chain(warm=False)
+
+    def test_warm_initial_gate_does_not_add_semantic_holds_to_later_images(self):
+        self.assert_real_chain(warm=True)
+
+    def assert_real_chain(self, *, warm):
+        child, prefix, ledger = self.start(chain=True, warm=warm)
         for gen, wanted in enumerate((18, 28, 38)):
             text = self.wait(child, ledger, "WATCH_READY", gen=gen, phase="go")
             self.assertFalse(any(line.startswith("LEDGER ") and f" gen={gen} " in line for line in text.splitlines()))
             Path(str(prefix) + f".{gen}.go").touch()
-            if gen == 2:
+            if (warm and gen == 0) or gen == 2:
                 text = self.wait(child, ledger, 'WATCH_READY', gen=gen, phase='semantic')
                 prefix_calls = [parse_native_row(line) for line in text.splitlines()
-                                if line.startswith('LEDGER ') and ' gen=2 ' in line]
+                                if line.startswith('LEDGER ') and f' gen={gen} ' in line]
                 self.assertEqual(len(prefix_calls), 1)
                 self.assertEqual(prefix_calls[0]['fn'], 'C_GetFunctionList')
-                Path(str(prefix) + '.2.semantic').touch()
+                Path(str(prefix) + f'.{gen}.semantic').touch()
             self.wait(child, ledger, "WATCH_READY", gen=gen, phase="next")
             rows = [parse_native_row(line) for line in ledger.read_text().splitlines()
                     if line.startswith("LEDGER ") and f" gen={gen} " in line]
@@ -1352,6 +1406,9 @@ class C8GateFixtureTests(unittest.TestCase):
         idents = [parse_native_row(line) for line in text.splitlines() if line.startswith("IDENT ")]
         self.assertEqual(len({(x["pid"], x["start"]) for x in idents}), 1)
         self.assertEqual([x["exe"] for x in idents], [str(self.driver), str(self.driver), str(self.other), str(self.driver)])
+        self.assertEqual([int(parse_native_row(line)['gen']) for line in text.splitlines()
+                          if line.startswith('WATCH_READY ') and ' phase=semantic ' in line],
+                         [0, 2] if warm else [2])
         self.assertFalse(any(line.startswith("WATCH_READY ") and " gen=3 " in line for line in text.splitlines()))
 
     def test_semantic_hold_stop_and_original_deadline_keep_the_remaining_calls_unrun(self):
@@ -1387,9 +1444,14 @@ class C8GateFixtureTests(unittest.TestCase):
                 self.assertNotEqual(child.wait(timeout=3), 0)
                 self.assertNotIn("LEDGER ", ledger.read_text())
 
-    def controller_inputs(self, *, delay_ms=0):
+    def controller_inputs(self, *, delay_ms=0, cell='P5', warm=False, late=False):
         """Real owned processes/FDs; JSONL is explicitly controlled unit input."""
-        child, prefix, ledger = self.start(chain=True, delay_ms=delay_ms)
+        child, prefix, ledger = self.start(chain=cell == 'P5', delay_ms=delay_ms,
+            cell=cell, warm=warm, late=late, shared_open=not warm)
+        if late:
+            text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+            self.assertNotIn('MAPPED ', text)
+            (ledger.parent / 'shared').touch()
         self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
         ready = next(parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith("WATCH_READY "))
         root = ledger.parent
@@ -1440,9 +1502,84 @@ class C8GateFixtureTests(unittest.TestCase):
         self.addCleanup(os.close, fd)
         invoke('start', stream, fd, 10, observer.pid, os.getpid())
         def gate(phase, gen=0):
-            return invoke(phase, 'P5', child.pid, gen, 'L2' if gen == 2 else 'L',
-                          'A', ledger, prefix, os.getpid(), os.getuid())
+            total = [18 if cell == 'P5' else 48] if warm and gen == 0 else []
+            return invoke(phase, cell, child.pid, gen, 'L2' if gen == 2 else 'L',
+                          'A', ledger, prefix, os.getpid(), os.getuid(), *total)
         return child, observer, prefix, ledger, ns, edge, append, gate
+
+    def warm_controller_case(self, cell, *, late=False):
+        child, _observer, prefix, ledger, ns, edge, append, gate = self.controller_inputs(
+            cell=cell, warm=True, late=late, delay_ms=20 if late else 0)
+        stopped, errors = threading.Event(), []
+        original_select = ns['select_gate']
+        def checked_select(*args):
+            if errors: raise AssertionError(f'warm publisher failed: {errors!r}') from errors[0]
+            return original_select(*args)
+        ns['select_gate'] = checked_select
+        def publish_after_getter():
+            try:
+                text = self.wait(child, ledger, 'WATCH_READY', gen=0, phase='semantic')
+                if stopped.is_set(): return
+                calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ')]
+                if [x['fn'] for x in calls] != ['C_GetFunctionList']:
+                    raise AssertionError('warm role ran remaining calls before quiet registration')
+                stamp, now = int(calls[0]['t0']) + 1, time.monotonic_ns()
+                edge['entries'].update(count=1, first_seen_ns=stamp, last_seen_ns=now)
+                edge['entries']['coverage'].update(state='counted', lossy=False, since_ns=stamp)
+                append('edge_observed', edge)
+                append('instance_observed', {'id': 'i0', 'caller': 'c0', 'module': 'm0', 'state': 'observed',
+                    'reason': None, 'first_seen_ns': now, 'last_seen_ns': now})
+                append('semantic_edge_observed', {'caller': 'c0', 'module': 'm0', 'instance': 'i0',
+                    'entries': {'count': None, 'observation': 'unavailable', 'unit': 'api_entries'},
+                    'api_returns': {'count': None, 'historical_only_returns': 0, 'saturated': False, 'unit': 'api_returns'},
+                    'semantics': 'unknown (no calls observed)', 'mechanisms': None, 'operations': None,
+                    'coverage': {'lossy': False, 'reasons': ['no_calls']}})
+                append('pass_committed', {'pass': 1})
+            except BaseException as error:
+                errors.append(error)
+        publisher = threading.Thread(target=publish_after_getter)
+        publisher.start()
+        self.addCleanup(publisher.join, 5)
+        self.addCleanup(stopped.set)
+        gate('pre')
+        gate('semantic')
+        proof = json.loads(Path(str(prefix) + '.0.semantic.json').read_text())
+        self.assertEqual((proof['proof'], proof['count'], proof['instance']), ('quiet_ready', 1, 'i0'))
+        publisher.join(2)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(errors, [])
+        if not late:
+            text = self.wait(child, ledger, 'READY', gen=0, phase=None)
+            self.assertFalse(any(x.startswith('LEDGER ') and ' phase=main ' in x for x in text.splitlines()))
+            (ledger.parent / 'shared').touch()
+        text = self.wait(child, ledger, 'DONE', gen=0, phase=None)
+        calls = [parse_native_row(x) for x in text.splitlines() if x.startswith('LEDGER ') and ' gen=0 ' in x]
+        self.assertEqual(len(calls), 18 if cell == 'P5' else 48)
+        if cell == 'P5':
+            edge['entries'].update(count=18, last_seen_ns=time.monotonic_ns())
+            append('edge_observed', edge)
+            append('pass_committed', {'pass': 2})
+            receipt = Path(str(prefix) + '.0.semantic.json')
+            saved = receipt.read_bytes()
+            receipt.unlink()
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    gate('post')
+                self.assertFalse(Path(str(prefix) + '.0.next').exists())
+            finally:
+                receipt.write_bytes(saved)
+            gate('post')
+            self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        else:
+            child.terminate()
+            self.assertEqual(child.wait(timeout=5), 0)
+
+    def test_warm_initial_controller_waits_for_actual_getter_before_semantic_publication(self):
+        for cell in ('P1', 'P5'):
+            with self.subTest(cell=cell): self.warm_controller_case(cell)
+
+    def test_warm_late_controller_uses_the_existing_unmapped_global_gate(self):
+        self.warm_controller_case('P7', late=True)
 
     def test_successor_publisher_waits_for_real_native_use_instead_of_deadlocking_pre(self):
         self.successor_controller_case()

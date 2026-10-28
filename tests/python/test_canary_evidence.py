@@ -3358,6 +3358,94 @@ class RingLayoutTests(unittest.TestCase):
 
 
 class VersionCanaryPrefixTests(unittest.TestCase):
+    def recovered_profile(self):
+        subject, document = self.profile(32)
+        evidence = document['evidence']
+        module = evidence['discovery'][0]
+        raw = [table for table in module['tables'] if table['source'] == 'scan']
+        # Actual retained FULL32 geometry: eight420-byte Table objects,
+        # aligned448 bytes apart in the terminal file-backed page.
+        for table, offset in zip(raw, (21024, 21472, 21920, 22368, 22816, 23264)):
+            table['file_offset'] = offset
+        for version, count, offset, anchors in (
+                ([3, 2], 68, 24160, 1), ([4, 0], 68, 23712, 1), ([4, 0], 92, 23712, 3)):
+            module['tables'].append(dict(source='scan', version=version, entries=count,
+                file_offset=offset, linkage='heuristic', exports_agreeing=anchors))
+            evidence['surfaces'].append(dict(source=module['path'] + f' table {version[0]}.{version[1]}',
+                acquisition='ok', walk='known_prefix', functions=count))
+        return subject, document
+
+    def test_ia32_actual_export_recovery_preserves_both_same_base_prefix_views(self):
+        subject, document = self.recovered_profile()
+        subject.validate_canary('default-safe-profile', document, 32)
+        self.assertEqual(document['evidence']['table_entries'], 1056)
+        self.assertEqual(len(document['evidence']['discovery'][0]['tables']), 22)
+        self.assertEqual(document['evidence']['attached_probes'], 208)
+
+    def test_lp64_independent_extension_keeps_its_complete_word_page_boundary(self):
+        page = os.sysconf('SC_PAGE_SIZE')
+        for count in (70, 83, 92):
+            offset = 8 * page - 8 * (count + 1 if count < 92 else 60)
+            with self.subTest(count=count):
+                subject, document = self.profile(boundary=(offset, count, 'known_prefix'))
+                evidence = document['evidence']
+                module = evidence['discovery'][0]
+                module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
+                module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+                    file_offset=offset, linkage='heuristic', exports_agreeing=1))
+                evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
+                    acquisition='ok', walk='known_prefix', functions=68))
+                subject.validate_canary('default-safe-profile', document, 64)
+                evidence['surfaces'][-2]['walk'] = 'full'
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary('default-safe-profile', document, 64)
+
+    def test_paired_three_export_witness_cannot_claim_an_unread_ordinal69(self):
+        page = os.sysconf('SC_PAGE_SIZE')
+        offset = 8 * page - 8 * 70
+        subject, document = self.profile(boundary=(offset, 69, 'known_prefix'))
+        evidence = document['evidence']
+        module = evidence['discovery'][0]
+        module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
+        module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+            file_offset=offset, linkage='heuristic', exports_agreeing=1))
+        evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
+            acquisition='ok', walk='known_prefix', functions=68))
+        with self.assertRaises(AssertionError):
+            subject.validate_canary('default-safe-profile', document, 64)
+
+    def test_recovered_views_refuse_duplicate_unrelated_or_unproven_overlaps(self):
+        subject, healthy = self.recovered_profile()
+        subject.validate_canary('default-safe-profile', healthy, 32)
+        mutations = [
+            lambda d: d['evidence']['discovery'][0]['tables'].append(
+                dict(d['evidence']['discovery'][0]['tables'][-1])),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=23716),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=7 * 4096),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(entries=104),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(version=[3, 0]),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(source='manifest'),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=1),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=True),
+            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(linkage='exports'),
+            lambda d: d['evidence']['discovery'][0]['tables'][-2].update(file_offset=23713),
+            lambda d: d['evidence']['discovery'][0]['tables'][-3].update(file_offset=23712),
+            lambda d: d['evidence']['discovery'][0]['tables'].pop(-2),
+            lambda d: d['evidence']['surfaces'][-1].update(walk='full'),
+            lambda d: d['evidence']['surfaces'][-1].update(source='unrelated table 4.0'),
+            lambda d: d['evidence'].update(table_entries=1812),
+            lambda d: d['evidence'].update(slots=105),
+            lambda d: d['evidence'].update(attached_probes=210),
+            lambda d: d['evidence'].update(event_loss=1),
+            lambda d: d['evidence'].update(drain_proven=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                document = copy.deepcopy(healthy)
+                mutate(document)
+                with self.assertRaises(AssertionError):
+                    subject.validate_canary('default-safe-profile', document, 32)
+
     def profile(self, bits=64, boundary=None):
         subject = load_capture_checker()
         manifest = [

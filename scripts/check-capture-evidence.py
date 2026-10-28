@@ -320,6 +320,9 @@ VERSION_SURFACES = Counter(
 # three baseline LP64 surfaces (13 -> 16) or six ILP32 surfaces (13 -> 19).
 # A terminal LP64 3.1 table can additionally contribute a complete or
 # page-bounded partial observation; validate its own extent below.
+# Independent exported callbacks can retain a larger same-base prefix beside
+# the common68 view. ILP32 can also expose tbad's68 and tunknown's68/92 views;
+# these are bounded recovery observations, not additional manifest demand.
 # `table_entries` counts exact target occurrences across sources, so neither
 # scan subset changes the 1056-entry union.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
@@ -1787,11 +1790,11 @@ def table_signature(evidence):
 
 
 def version_canary_scan_shape(evidence, target_bits):
-    """Keep the fixed matrix union exact and bound its terminal raw row.
+    """Keep the fixed matrix union exact and validate recovered raw prefixes.
 
-    Only this controlled LP64 fixture's final 3.1 observation varies with
-    the file/BSS boundary. A partial row must end at that page boundary;
-    a complete row may cross pages because no VMA-end witness is published.
+    The controlled fixture's file/BSS boundary varies by ABI/linker layout.
+    Same-base views require their independent export witnesses; other raw
+    tables cannot overlap. Partial LP64 tails must end at the page boundary.
     """
     require(len(evidence["discovery"]) == 1, "version fixture needs one provider")
     module = evidence["discovery"][0]
@@ -1809,45 +1812,76 @@ def version_canary_scan_shape(evidence, target_bits):
     actual = table_signature(evidence)
     require(not base_tables - actual, "version fixture lost a required table")
     extra = actual - base_tables
-    require(not extra or (target_bits == 64 and sum(extra.values()) == 1),
-            "unrelated or duplicate version fixture table")
+    for (source, version, count), multiplicity in extra.items():
+        allowed = (version == (3, 1) and 0 < count <= 92 if target_bits == 64
+                   else (version, count) in {((3, 2), 68), ((4, 0), 68), ((4, 0), 92)})
+        require(source == "scan" and multiplicity == 1 and allowed,
+                "unrelated or duplicate version fixture table")
+    if target_bits == 64:
+        counts = sorted(count for (_, _, count) in extra)
+        require(len(counts) <= 1 or (len(counts) == 2 and counts[0] == 68 and counts[1] >= 70),
+                "unrelated terminal fixture prefixes")
 
     word = target_bits // 8
-    spans = []
+    groups = {}
     raw = [table for table in tables if table["source"] == "scan"]
     for table in raw:
         offset, count = table.get("file_offset"), table["entries"]
         require(u64(offset) and offset % word == 0, "invalid raw table offset")
         end = offset + word * (count + 1)
         require(u64(end), "raw table extent overflows")
-        spans.append((offset, end))
-    ordered = sorted(spans)
+        groups.setdefault(offset, []).append(table)
+
+    def anchored(table, wanted):
+        require(table.get("linkage") == "heuristic"
+                and type(table.get("exports_agreeing")) is int
+                and table["exports_agreeing"] == wanted,
+                "recovered fixture prefix lacks its independent export witness")
+
+    for views in groups.values():
+        if len(views) == 1:
+            continue
+        ordered_views = sorted(views, key=lambda table: table["entries"])
+        version = [3, 1] if target_bits == 64 else [4, 0]
+        # The three fixture exports occupy ordinals3,68,69: a69-word
+        # observation cannot witness the third export at ordinal69.
+        require(len(ordered_views) == 2 and all(table["version"] == version for table in views)
+                and ordered_views[0]["entries"] == 68 and 70 <= ordered_views[1]["entries"] <= 92,
+                "duplicate or conflicting same-base fixture views")
+        anchored(ordered_views[0], 1)
+        anchored(ordered_views[1], 3)
+    ordered = sorted((offset, max(offset + word * (table["entries"] + 1) for table in views))
+                     for offset, views in groups.items())
     require(all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:])),
             "duplicate or overlapping raw fixture tables")
     if not extra:
         return base_surfaces, base_tables
 
-    ((source, version, count), multiplicity), = extra.items()
-    require(source == "scan" and version == (3, 1) and multiplicity == 1
-            and 0 < count <= 92, "unrelated terminal fixture prefix")
-    prefix, = [table for table in raw if table["version"] == [3, 1]]
-    offset = prefix["file_offset"]
-    require(offset == max(span[0] for span in spans),
-            "fixture prefix is not the terminal raw table")
-    walk = "full" if count == 92 else "known_prefix"
-    if count < 92:
-        page = os.sysconf("SC_PAGE_SIZE")
-        require(word * (count + 1) == page - offset % page,
-                "partial fixture prefix does not end at its page boundary")
-    # This is structural classification of a full row, not proof of a
-    # mapping end. In particular, a full row is allowed to cross a page.
-    require(sum(surface == {"source": module["path"] + " table 3.1",
-                            "acquisition": "ok", "walk": walk,
-                            "functions": count}
-                for surface in evidence["surfaces"]) == 1,
-            "terminal fixture prefix lacks its exact source surface")
-    return (base_surfaces + Counter({(walk, count): 1}),
-            base_tables + Counter({("scan", (3, 1), count): 1}))
+    added_surfaces = Counter()
+    for prefix in raw:
+        version, count = tuple(prefix["version"]), prefix["entries"]
+        if ("scan", version, count) not in extra:
+            continue
+        offset = prefix["file_offset"]
+        paired = len(groups[offset]) == 2
+        walk = "known_prefix" if target_bits == 32 or paired or count < 92 else "full"
+        if target_bits == 64:
+            require(offset == ordered[-1][0], "fixture prefix is not the terminal raw table")
+            if count < 92 and not (paired and count == 68):
+                page = os.sysconf("SC_PAGE_SIZE")
+                require(word * (count + 1) == page - offset % page,
+                        "partial fixture prefix does not end at its page boundary")
+        else:
+            anchored(prefix, 3 if count == 92 else 1)
+            if count == 92:
+                require(paired, "recovered extension lacks its same-base common prefix")
+        # A complete92 row may cross pages: no VMA-end witness is published.
+        require(sum(surface == {"source": module["path"] + f" table {version[0]}.{version[1]}",
+                                "acquisition": "ok", "walk": walk, "functions": count}
+                    for surface in evidence["surfaces"]) == 1,
+                "recovered fixture prefix lacks its exact source surface")
+        added_surfaces[walk, count] += 1
+    return base_surfaces + added_surfaces, base_tables + extra
 
 
 def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interface_list):

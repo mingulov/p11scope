@@ -136,6 +136,9 @@ mod instance_tests;
 
 #[cfg(test)]
 mod continuation_guard_tests;
+/// Private image-bank feasibility driver, present only in opt-in lib tests.
+#[cfg(all(test, p11scope_image_bank_proof))]
+mod image_bank_proof;
 #[cfg(test)]
 #[path = "attach/joint_cells_native_tests.rs"]
 mod joint_cells;

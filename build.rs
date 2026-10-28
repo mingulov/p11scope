@@ -47,6 +47,15 @@ enum BpfFlavor {
     CounterLatency,
 }
 
+/// Private proof kind beside the ordinary object flavor. Counter geometry
+/// remains selected by its current counts/timestamps/latency flavor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BankProof {
+    None,
+    Counter,
+    Image,
+}
+
 impl BpfFlavor {
     fn counters(self) -> bool {
         matches!(
@@ -77,6 +86,14 @@ fn counter_objects_requested() -> CounterObjectsRequest {
         Ok("1") => CounterObjectsRequest::Enabled,
         Ok("0") => CounterObjectsRequest::Disabled,
         _ => panic!("P11SCOPE_COUNTER_OBJECTS must be unset, 0 or 1"),
+    }
+}
+
+fn image_bank_proof_requested() -> bool {
+    match env::var("P11SCOPE_IMAGE_BANK_PROOF").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_IMAGE_BANK_PROOF must be unset, 0 or 1"),
     }
 }
 
@@ -128,6 +145,7 @@ fn main() {
     // Refuse malformed requests before any compiler or native build work.
     let counter_artifacts = counter_artifacts_requested();
     let counter_objects_request = counter_objects_requested();
+    let image_bank_proof = image_bank_proof_requested();
     println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
     if BIRTH_MARKER_ENABLED {
         println!("cargo:rustc-cfg=p11scope_birth_marker");
@@ -177,6 +195,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_ARTIFACTS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_OBJECTS");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_IMAGE_BANK_PROOF");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
@@ -186,6 +205,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
+    println!("cargo:rustc-check-cfg=cfg(p11scope_image_bank_proof)");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -203,6 +223,9 @@ fn main() {
     if small_discovery_ring {
         println!("cargo:rustc-cfg=p11scope_small_discovery_ring");
     }
+    if image_bank_proof {
+        println!("cargo:rustc-cfg=p11scope_image_bank_proof");
+    }
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
     let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
     let small_build = small_ring || small_state_maps || small_discovery_ring;
@@ -213,6 +236,18 @@ fn main() {
                 || stub_object_attributes
                 || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
         "private counter artifacts currently require default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !image_bank_proof
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private image bank proof requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !(image_bank_proof && counter_artifacts),
+        "private image bank proof and counter artifacts require separate build configurations"
     );
     // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
     // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
@@ -267,9 +302,41 @@ fn main() {
             BpfFlavor::CounterTimestamps,
             BpfFlavor::CounterLatency,
         ] {
-            build_variant_with_proof(flavor, false, false, false, false, false, true);
+            build_variant_with_proof(
+                flavor,
+                false,
+                false,
+                false,
+                false,
+                false,
+                BankProof::Counter,
+            );
         }
     }
+    if image_bank_proof {
+        println!("cargo:rerun-if-changed=crates/ebpf/native/image_bank_proof.c");
+        build_variant_with_proof(
+            BpfFlavor::Detailed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BankProof::Image,
+        );
+    }
+    println!(
+        "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_ENABLED={}",
+        u8::from(image_bank_proof)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_OUTPUTS={}",
+        if image_bank_proof {
+            "image-bank-proof-v1"
+        } else {
+            ""
+        }
+    );
     // Selection is an emitted contract, never an inference from stale files.
     println!(
         "cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_ENABLED={}",
@@ -330,7 +397,7 @@ fn build_variant(
         small_discovery_ring,
         wide_detailed,
         stub_object_attributes,
-        false,
+        BankProof::None,
     );
 }
 
@@ -341,8 +408,10 @@ fn build_variant_with_proof(
     small_discovery_ring: bool,
     wide_detailed: bool,
     stub_object_attributes: bool,
-    bank_proof: bool,
+    bank_proof: BankProof,
 ) {
+    let counter_bank_proof = matches!(bank_proof, BankProof::Counter);
+    let image_bank_proof = matches!(bank_proof, BankProof::Image);
     let inventory = matches!(
         flavor,
         BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
@@ -350,9 +419,13 @@ fn build_variant_with_proof(
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let mut out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
-    if bank_proof {
-        out_dir.push("counter-bank-growth-v2");
-        std::fs::create_dir_all(&out_dir).expect("creating private counter bank proof output");
+    if counter_bank_proof || image_bank_proof {
+        out_dir.push(if image_bank_proof {
+            "image-bank-proof-v1"
+        } else {
+            "counter-bank-growth-v2"
+        });
+        std::fs::create_dir_all(&out_dir).expect("creating private bank proof output");
     } else if flavor.counters() {
         out_dir.push("counter-artifacts");
         std::fs::create_dir_all(&out_dir).expect("creating private counter artifact output");
@@ -391,10 +464,11 @@ fn build_variant_with_proof(
         ],
     };
     let mut selected_native_units = native_units.to_vec();
-    if bank_proof {
-        // Exactly one bank unit per flavor: the checker requires exactly the
-        // untimed pair for counts and exactly the timed pair for timing.
+    if counter_bank_proof || image_bank_proof {
+        // Each proof flavor links one bank core. Counter checkers require
+        // exactly the untimed counts pair or the timed timestamps/latency pair.
         selected_native_units.push(match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "image_bank_proof",
             BpfFlavor::CounterCounts => "counter_bank_proof",
             BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => "counter_bank_timing",
             _ => unreachable!("bank proof builds only counter flavors"),
@@ -402,17 +476,18 @@ fn build_variant_with_proof(
     }
     // H8-D birth marker: the Detailed object alone links the admission
     // control row; counter and inventory flavors keep no marker state.
-    // One gate for the unit, the define and the exports below, so a
-    // future Detailed bank object cannot half-link the marker.
+    // One gate for the unit, define and exports below: Image is Detailed
+    // and retains the canonical marker dependencies; Counter excludes them.
     let journal_marker =
-        BIRTH_MARKER_ENABLED && matches!(flavor, BpfFlavor::Detailed) && !bank_proof;
+        BIRTH_MARKER_ENABLED && matches!(flavor, BpfFlavor::Detailed) && !counter_bank_proof;
     if journal_marker {
         selected_native_units.push("journal_marker");
     }
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
-        let suffix = if bank_proof {
+        let suffix = if counter_bank_proof || image_bank_proof {
             match flavor {
+                BpfFlavor::Detailed if image_bank_proof => "image-bank-proof-v1",
                 BpfFlavor::CounterCounts => "counts-bank-growth-v2",
                 BpfFlavor::CounterTimestamps => "timestamps-bank-growth-v2",
                 BpfFlavor::CounterLatency => "latency-bank-growth-v2",
@@ -470,7 +545,7 @@ fn build_variant_with_proof(
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
         if flavor.counters() && *unit == "task_owner" {
-            if bank_proof {
+            if counter_bank_proof {
                 compile.args([
                     "-DP11SCOPE_COUNTER_BANK_PROOF",
                     "-DP11SCOPE_OWNER_SLOT_BOUND=8192U",
@@ -482,7 +557,7 @@ fn build_variant_with_proof(
         if !inventory && wide_detailed && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");
         }
-        if bank_proof && *unit == "instance_epoch" {
+        if counter_bank_proof && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=8192U");
         }
         // H8-D wires the exec-birth and scope-gap globals into the
@@ -490,7 +565,7 @@ fn build_variant_with_proof(
         if journal_marker && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_JOURNAL_MARKER");
         }
-        if bank_proof && *unit == "counter_bank_timing" {
+        if counter_bank_proof && *unit == "counter_bank_timing" {
             compile.arg("-DP11SCOPE_COUNTER_BANK_PROOF");
             compile.arg(match flavor {
                 BpfFlavor::CounterTimestamps => "-DP11SCOPE_BANK_MODE_TIMESTAMPS",
@@ -519,8 +594,9 @@ fn build_variant_with_proof(
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let target_dir = out_dir.join(if bank_proof {
+    let target_dir = out_dir.join(if counter_bank_proof || image_bank_proof {
         match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "ebpf-image-bank-proof-v1-target",
             BpfFlavor::CounterCounts => "ebpf-counts-bank-growth-v2-target",
             BpfFlavor::CounterTimestamps => "ebpf-timestamps-bank-growth-v2-target",
             BpfFlavor::CounterLatency => "ebpf-latency-bank-growth-v2-target",
@@ -557,19 +633,20 @@ fn build_variant_with_proof(
         BpfFlavor::CounterCounts => features.push("counter-counts"),
         // Bank objects share the counts Rust shape so the ordinary maps
         // stay identical; only the fixed-512 artifacts take their flavor.
-        BpfFlavor::CounterTimestamps => features.push(if bank_proof {
+        BpfFlavor::CounterTimestamps => features.push(if counter_bank_proof {
             "counter-counts"
         } else {
             "counter-timestamps"
         }),
-        BpfFlavor::CounterLatency => features.push(if bank_proof {
+        BpfFlavor::CounterLatency => features.push(if counter_bank_proof {
             "counter-counts"
         } else {
             "counter-latency"
         }),
     }
-    if bank_proof {
+    if counter_bank_proof || image_bank_proof {
         features.push(match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "image-bank-proof",
             BpfFlavor::CounterCounts => "counts-bank-proof",
             BpfFlavor::CounterTimestamps => "timestamps-bank-proof",
             BpfFlavor::CounterLatency => "latency-bank-proof",
@@ -627,8 +704,16 @@ fn build_variant_with_proof(
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
     }
-    if bank_proof {
+    if counter_bank_proof || image_bank_proof {
         let bank_exports: &[&str] = match flavor {
+            BpfFlavor::Detailed if image_bank_proof => &[
+                "p11_bank_select",
+                "p11_bank_gate_release",
+                "p11_bank_enter_a",
+                "p11_bank_enter_b",
+                "p11_bank_complete",
+                "p11_bank_ref",
+            ],
             BpfFlavor::CounterCounts => &["p11_bank_enter", "p11_bank_complete"],
             BpfFlavor::CounterTimestamps | BpfFlavor::CounterLatency => {
                 &["p11_bank_enter_timed", "p11_bank_complete_timed"]
@@ -755,18 +840,19 @@ fn build_variant_with_proof(
     println!(
         "cargo:rustc-env={}={flags}",
         match flavor {
+            BpfFlavor::Detailed if image_bank_proof => "P11SCOPE_BPF_RUSTFLAGS_IMAGE_BANK_PROOF",
             BpfFlavor::Detailed => "P11SCOPE_BPF_RUSTFLAGS_DETAILED",
             BpfFlavor::InventoryGlobal => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY",
             BpfFlavor::InventoryCallers => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY_CALLERS",
-            BpfFlavor::CounterCounts if bank_proof => {
+            BpfFlavor::CounterCounts if counter_bank_proof => {
                 "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS_PROOF"
             }
             BpfFlavor::CounterCounts => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS",
-            BpfFlavor::CounterTimestamps if bank_proof => {
+            BpfFlavor::CounterTimestamps if counter_bank_proof => {
                 "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS_PROOF"
             }
             BpfFlavor::CounterTimestamps => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS",
-            BpfFlavor::CounterLatency if bank_proof => {
+            BpfFlavor::CounterLatency if counter_bank_proof => {
                 "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY_PROOF"
             }
             BpfFlavor::CounterLatency => "P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY",
@@ -804,8 +890,9 @@ fn build_variant_with_proof(
     let built = target_dir.join(target).join("release/p11scope-ebpf");
     std::fs::copy(
         &built,
-        out_dir.join(if bank_proof {
+        out_dir.join(if counter_bank_proof || image_bank_proof {
             match flavor {
+                BpfFlavor::Detailed if image_bank_proof => "p11scope-ebpf-image-bank-proof-v1",
                 BpfFlavor::CounterCounts => "p11scope-ebpf-counts-bank-growth-v2",
                 BpfFlavor::CounterTimestamps => "p11scope-ebpf-timestamps-bank-growth-v2",
                 BpfFlavor::CounterLatency => "p11scope-ebpf-latency-bank-growth-v2",

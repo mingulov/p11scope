@@ -1279,6 +1279,90 @@
       "path": "second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
       "reason": "privileged: loads BPF; run as root with --ignored --test-threads=1",
       "cell": "live-kernel"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_verifier_stats",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N1-N4 verifier/object cells"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 concurrent cut counting cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N9 held-return-across-cut cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N10 late-incarnation refusal cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_failure_modes_refuse_and_balance",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 failure-modes cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_fork_burn_sentinel",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N12 fork-burn and N4 memlock cells"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_second_rollover",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 second-rollover cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_omitted_route_refuses",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N13 omitted-route cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N14 exec/query-span cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N15 attach-cookie cell"
+    },
+    {
+      "cell": "privileged",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 in-flight cut counting cell (flip while calling)"
+    },
+    {
+      "cell": "performance",
+      "file": "src/attach/image_bank_proof.rs",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead",
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane on a quiet host (E4); N5 per-call overhead cell"
     }
   ]
 }

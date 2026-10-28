@@ -20,6 +20,8 @@ counts-bank-proof = ["counter-counts"]
 # roots and the bank geometry.
 timestamps-bank-proof = ["counter-counts"]
 latency-bank-proof = ["counter-counts"]
+# Private image-bank feasibility roots; default capture never selects them.
+image-bank-proof = []
 inventory-only = []
 inventory-callers = ["inventory-only"]
 small-ring = ["p11scope-ebpf-common/small-ring"]

@@ -50798,13 +50798,20 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
     insert_sizing_selection_rows(&mut engine, VIEWS);
     engine.next_view_id = VIEWS;
     let mut session = ScriptedSession::default();
-    // Infallible closer: this test models the deferral, not the
-    // channel-paced handoff, so no entered/returned receiver can drop
-    // and fail a return close.
+    // Hold the actual return close so even a worker which has not been
+    // scheduled to finish cannot be mistaken for a stalled graph.
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
     let retirement = crate::attach::RetirementFixture::new_collected(
         &engine.plan.slots,
         &engine.pinned,
-        Box::new(|owned, _| {
+        Box::new(move |owned, producer| {
+            if producer == crate::attach::ProducerProgram::UProbe("p11_return") {
+                entered_sender.send(()).map_err(|error| error.to_string())?;
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+            }
             drop(owned);
             Ok(())
         }),
@@ -50853,19 +50860,47 @@ fn collected_finish_partial_multi_keeps_surviving_sibling() {
     engine
         .pending_retirements
         .extend((0..VIEWS - 1).map(ProcessViewId));
-    let mut outcome = engine
-        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
-        .unwrap();
+    let original_plan = engine.plan.clone();
+    let original_pins = engine.pinned.revision();
+    drive_graph_until(&mut engine, &mut session, |engine, _, _| {
+        engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll)
+    });
+    entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the actual return closer reaches the owned gate");
+    // Exhaust the former drain-loop allowance while completion is held.
+    // Poll count does not witness worker progress or authorize Install.
     for _ in 0..4096 {
-        if !outcome.pending {
-            break;
-        }
-        outcome = engine
+        let outcome = engine
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
             .unwrap();
+        assert!(outcome.pending && !outcome.progressed && !outcome.changed);
     }
-    assert!(!outcome.pending, "the partial graph drains");
+    assert_eq!(
+        engine.collected_graph.as_ref().map(|graph| graph.phase),
+        Some(GraphPhase::NativePoll)
+    );
+    assert_eq!(
+        engine.plan, original_plan,
+        "Install waits for native closure"
+    );
+    assert_eq!(engine.pinned.revision(), original_pins);
+    {
+        let leaf = session.global_retirement.as_ref().unwrap().borrow();
+        assert_eq!(leaf.released(), 1, "only the entry close completed");
+        assert!(leaf.has_slot_link(survivor) && leaf.has_slot_link(retired[2]));
+    }
+    release.send(()).expect("release the owned return closer");
+    drive_graph_until(&mut engine, &mut session, |_, _, outcome| !outcome.pending);
     let leaf = session.global_retirement.as_ref().unwrap().borrow();
+    assert_eq!(
+        leaf.released(),
+        2,
+        "both whole-group links closed exactly once"
+    );
     assert_eq!(leaf.begins, 1, "begins counts whole groups only");
     assert_eq!(
         leaf.deferred_slots(),

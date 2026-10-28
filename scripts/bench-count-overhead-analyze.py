@@ -597,12 +597,16 @@ def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
 
 
 def traced_cost_lines(rows):
-    """One parseable TRACED_COST line per denominator row."""
+    """One TRACED_COST line with a round-trip machine denominator.
+
+    N5 consumes median_ns without display rounding at its 15% boundary;
+    the informational spread retains the ordinary one-decimal display.
+    """
     lines = []
     for row in rows:
         count_kind = "calls" if row["unit"] == "ns/completed_call" else "ops"
         lines.append(
-            f"TRACED_COST cell={row['cell']} median_ns={row['median_ns']:.1f} "
+            f"TRACED_COST cell={row['cell']} median_ns={row['median_ns']!r} "
             f"p10_ns={row['p10_ns']:.1f} p90_ns={row['p90_ns']:.1f} "
             f"samples={row['samples']} unit={row['unit']} threads={row['threads']} "
             f"on_total_{count_kind}={row['on_total_ops']} "

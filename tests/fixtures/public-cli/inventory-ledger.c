@@ -30,6 +30,11 @@
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
  *   --chain SPEC     (exec-chain) comma list of HOW:EXE steps, HOW = leader|thread
  *   --gen K          (internal) exec generation, set by the chain itself
+ *   --ledger-singletons opt-in: flush each returned call as a singleton entry
+ *   --c8-gate-prefix P --c8-gated-images N --c8-deadline NS
+ *                    C8 only: images0..N-1 wait before all API calls on
+ *                    P.GEN.go; exec-chain also waits after DONE on P.GEN.next.
+ *                    All waits retain the same absolute monotonic deadline.
  *   --h6-control     opt-in mech/exec-chain stdin controller; every image maps
  *                    providers without API calls before READY, then waits.
  *                    Commands: W/M/T/X/F GEN SEQ LOWER DEADLINE
@@ -164,6 +169,9 @@ static char self_exe[PATH_MAX];
 static unsigned long self_start;
 static int gen;
 static volatile sig_atomic_t stop;
+static int ledger_singletons, c8_gated_images;
+static const char *c8_gate_prefix;
+static unsigned long c8_deadline;
 static void on_signal(int s) { (void)s; stop = 1; }
 
 static unsigned long now_ns(void) {
@@ -173,6 +181,7 @@ static unsigned long now_ns(void) {
 }
 
 static void flush_ledger_try(void);
+static void flush_ledger(void);
 static _Noreturn void die(const char *what) {
     flush_ledger_try();
     fprintf(stdout, "DONE cell=%s pid=%d start=%lu gen=%d exe=%s status=fail\n", cell, getpid(),
@@ -224,6 +233,8 @@ enum { PH_SETUP, PH_MAIN, PH_TEARDOWN, PH_HELD, PH_H6_SETUP,
        PH_H6_MEASURED, PH_H6_FAILED, PH_H6_TEARDOWN, PH_H6_WARM };
 static unsigned long h6_work_deadline;
 static void check_h6_work(void) {
+    if (c8_deadline && (stop || now_ns() >= c8_deadline))
+        die("C8 original work deadline expired");
     if (h6_work_deadline && (stop || now_ns() >= h6_work_deadline))
         die("H6 work deadline expired");
 }
@@ -260,10 +271,12 @@ static void enter(int module, int fn, unsigned long mech, int phase) {
 }
 
 static void returned(int module, int fn, unsigned long mech, int phase, CK_RV rv) {
-    if (rv == 0) return;
-    pthread_mutex_lock(&ledger_lock);
-    slot(module, fn, mech, phase)->bad++;
-    pthread_mutex_unlock(&ledger_lock);
+    if (rv != 0) {
+        pthread_mutex_lock(&ledger_lock);
+        slot(module, fn, mech, phase)->bad++;
+        pthread_mutex_unlock(&ledger_lock);
+    }
+    if (ledger_singletons) flush_ledger();
 }
 
 static void flush_ledger(void) {
@@ -318,6 +331,7 @@ static void load_module(int m) {
 }
 
 static void bind_module(int m, int phase) {
+    check_h6_work();
     struct module *mod = &modules[m];
     CK_RV (*gfl)(void **) = (CK_RV (*)(void **))dlsym(mod->handle, "C_GetFunctionList");
     if (!gfl) die("no C_GetFunctionList");
@@ -333,10 +347,12 @@ static void wait_gate(const char *gate) {
     if (!gate || !strcmp(gate, "-")) return;
     unsigned long deadline = now_ns() + 600UL * 1000000000UL;
     while (access(gate, F_OK) != 0) {
+        check_h6_work();
         if (stop) die("stopped before the gate opened");
         if (now_ns() > deadline) die("gate never opened");
         usleep(10000);
     }
+    check_h6_work();
 }
 
 static void sleep_ms(long ms) {
@@ -461,8 +477,29 @@ static void hold_if_asked(void) {
 }
 
 static void done_ok(void) {
-    printf("DONE " HEAD " status=ok\n", HEAD_ARGS);
+    printf("DONE " HEAD " status=ok", HEAD_ARGS);
+    if (c8_gate_prefix) printf(" t=%lu", now_ns());
+    putchar('\n');
     fflush(stdout);
+}
+
+static int c8_gated(void) { return c8_gate_prefix && gen < c8_gated_images; }
+
+static void c8_wait(const char *phase) {
+    if (!c8_gated()) return;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s.%d.%s", c8_gate_prefix, gen, phase) >= (int)sizeof path)
+        die("C8 gate path too long");
+    if (access(path, F_OK) == 0) die("stale C8 gate already exists");
+    check_h6_work();
+    printf("WATCH_READY " HEAD " phase=%s t=%lu deadline=%lu\n",
+           HEAD_ARGS, phase, now_ns(), c8_deadline);
+    fflush(stdout);
+    while (access(path, F_OK) != 0) {
+        check_h6_work();
+        usleep(10000);
+    }
+    check_h6_work();
 }
 
 /* The mech generation over every module: setup all, gate, main, teardown. */
@@ -470,7 +507,13 @@ static void mech_generation(long iters, int gated) {
     CK_SESSION_HANDLE s[MAX_MODULES];
     int split = opt.late_from < 0 ? module_count : opt.late_from;
     if (split > module_count) split = module_count;
-    for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+    if (c8_gated()) {
+        for (int m = 0; m < split; m++) load_module(m);
+        c8_wait("go");
+        for (int m = 0; m < split; m++) { bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+    } else {
+        for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
+    }
     flush_ledger();
     if (gated) {
         printf("READY " HEAD "\n", HEAD_ARGS);
@@ -739,6 +782,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--h6-control")) { opt.h6_control = 1; continue; }
+        if (!strcmp(a, "--ledger-singletons")) { ledger_singletons = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
@@ -762,6 +806,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--gen")) gen = atoi(v);
         else if (!strcmp(a, "--h6-deadline")) opt.h6_deadline = absolute_bound(v);
         else if (!strcmp(a, "--h6-leg-deadline")) opt.h6_leg_deadline = absolute_bound(v);
+        else if (!strcmp(a, "--c8-gate-prefix")) c8_gate_prefix = v;
+        else if (!strcmp(a, "--c8-gated-images")) {
+            unsigned long count = absolute_bound(v);
+            if (count > 3) die("C8 gates cover at most three required images");
+            c8_gated_images = (int)count;
+        }
+        else if (!strcmp(a, "--c8-deadline")) c8_deadline = absolute_bound(v);
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (has_space(cell)) { fprintf(stderr, "--cell must not contain whitespace or '='\n"); return 2; }
@@ -772,6 +823,16 @@ int main(int argc, char **argv) {
     read_identity();
     printf("IDENT " HEAD "\n", HEAD_ARGS);
     fflush(stdout);
+
+    if (c8_gate_prefix || c8_gated_images || c8_deadline) {
+        if (!c8_gate_prefix || !c8_gated_images || !c8_deadline || !ledger_singletons ||
+            opt.h6_control || opt.late_from >= 0 || opt.gate2 || opt.single_call >= 0 ||
+            module_count != 1 || has_space(c8_gate_prefix) ||
+            (strcmp(opt.mode, "mech") && strcmp(opt.mode, "exec-chain")) ||
+            (!strcmp(opt.mode, "mech") && c8_gated_images != 1))
+            die("C8 gate options require a precise single-provider mech/exec plan");
+        check_h6_work();
+    }
 
     if (opt.h6_control) {
         if ((!strcmp(opt.mode, "exec-chain") && module_count == 1) ||
@@ -809,10 +870,12 @@ int main(int argc, char **argv) {
         /* Generation k runs ITERS*(k+1) iterations, so every image's count is distinct. */
         mech_generation(opt.iters * (gen + 1), gen == 0);
         done_ok();
+        c8_wait("next");
         if (opt.chain && *opt.chain) {
             /* A quiet gap on both sides of every exec, so a witness timestamp
              * can only fall inside one image's call window. */
             sleep_ms(opt.delay_ms);
+            check_h6_work();
             exec_next();
         }
         hold_if_asked();

@@ -2,6 +2,8 @@
 """Capacity oracle controls use independent target ledgers, never observer totals."""
 
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -764,14 +766,14 @@ class C8GatePredicateTests(unittest.TestCase):
                           "at_ns": at, "kind": kind, "event": copy.deepcopy(event)})
 
     def edge(self, *, counted=False, count=0):
-        return {"caller": self.context["id"], "module": "m0", "presence": "mapped",
+        return copy.deepcopy({"caller": self.context["id"], "module": "m0", "presence": "mapped",
             "capture": "counted" if counted else "armed", "mapping": {"state": "mapped"},
             "identity_context": {"version": 1, "caller": self.context, "module": self.module},
             "entries": {"count": count, "saturated": False, "in_flight": False,
                 "first_seen_ns": 140 if counted else None, "last_seen_ns": 150 if counted else None,
                 "coverage": {"state": "counted" if counted else "watched_no_use",
                     "since_ns": 140 if counted else 115, "until_ns": None,
-                    "lossy": False if counted else None, "reason": None, "detail": None}}}
+                    "lossy": False if counted else None, "reason": None, "detail": None}}})
 
     def select(self, phase="pre", **extra):
         return self.gate["select_gate"](self.rows, {**self.want, **extra}, phase)
@@ -814,6 +816,7 @@ class C8GatePredicateTests(unittest.TestCase):
     def test_wrong_owned_birth_executable_and_provider_are_refused(self):
         for area, field, value in (("caller", "pid", 102), ("caller", "start_time", 78),
                 ("caller", "id", "c9"), ("module", "id", "m9"),
+                ("caller", "incarnation", 1), ("module", "device_major", False),
                 ("module", "inode", 202), ("module", "device_minor", 36),
                 ("module", "path", "/owned/B.so"), ("caller", "lifecycle", "exited")):
             with self.subTest(area=area, field=field):
@@ -857,6 +860,40 @@ class C8GatePredicateTests(unittest.TestCase):
         self.add("edge_observed", edge, 140)
         self.assertIsNone(self.select())
 
+    def test_unrelated_provider_does_not_poison_wanted_watch_or_count(self):
+        for counted in (False, True):
+            with self.subTest(counted=counted):
+                original_rows, original_want = copy.deepcopy(self.rows), copy.deepcopy(self.want)
+                try:
+                    if counted: self.post()
+                    unrelated = self.edge(counted=counted, count=18 if counted else 0)
+                    unrelated['module'] = 'm9'
+                    unrelated['identity_context']['module'].update(id='m9', path='/owned/B.so', inode=202)
+                    self.add('edge_observed', unrelated, 180)
+                    self.add('pass_committed', {'pass': 2}, 190)
+                    proof = self.select('post' if counted else 'pre')
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['module'], 'm0')
+                finally:
+                    self.rows, self.want = original_rows, original_want
+
+    def test_same_pair_identity_change_cannot_restore_old_authority(self):
+        wrong = self.edge()
+        wrong['identity_context']['module']['inode'] = 202
+        self.add('edge_observed', wrong, 140)
+        self.add('edge_observed', self.edge(), 150)
+        self.add('pass_committed', {'pass': 1}, 160)
+        self.assertIsNone(self.select())
+
+    def test_unready_evidence_can_be_replaced_by_a_fresh_clean_watch(self):
+        unready = self.edge()
+        unready['entries']['coverage'].update(state='unknown', reason='not_attached')
+        unready['identity_context']['module']['status'] = 'unavailable'
+        self.add('edge_observed', unready, 140)
+        self.add('edge_observed', self.edge(), 150)
+        self.add('pass_committed', {'pass': 1}, 160)
+        self.assertIsNotNone(self.select())
+
     def test_full_count_before_done_is_sealed_by_later_commit(self):
         self.post()
         self.assertEqual(self.select("post")["count"], 18)
@@ -884,6 +921,16 @@ class C8GatePredicateTests(unittest.TestCase):
         self.gate["monotonic_ns"] = lambda: next(times)
         with self.assertRaisesRegex(ValueError, "deadline"):
             self.select()
+
+    def test_future_publication_and_incomplete_jsonl_are_not_ready(self):
+        original = self.rows[-1]['at_ns']
+        for stamp in (900, 1001):
+            self.rows[-1]['at_ns'] = stamp
+            self.assertIsNone(self.select())
+        self.rows[-1]['at_ns'] = original
+        data = ''.join(json.dumps(row) + '\n' for row in self.rows).encode()
+        self.assertIsNone(self.gate['records_from'](data[:-1]))
+        self.assertEqual(self.gate['records_from'](data), self.rows)
 
 
 class C8GateFixtureTests(unittest.TestCase):
@@ -960,6 +1007,47 @@ class C8GateFixtureTests(unittest.TestCase):
         entries = [parse_native_row(line) for line in ledger.read_text().splitlines() if line.startswith("LEDGER ")]
         self.assertEqual(len(entries), 48)
         self.assertTrue(all(x["n"] == "1" and x["t0"] == x["t1"] and x["bad"] == "0" for x in entries))
+        oracle = runpy.run_path(str(ORACLE))
+        errors = []
+        image = next(iter(oracle['parse_ledger'](ledger.read_text(), errors).values()))
+        self.assertEqual(errors, [])
+        first, last = min(int(x['t0']) for x in entries), max(int(x['t1']) for x in entries)
+        window = (first - 1000, last + 1000)
+        use = oracle['use_in'](image, entries[0]['module'], window)
+        verdict, count, _detail = oracle['exact_window_count'](
+            use, first + 1, window, None, first - 100, first - 100, 68)
+        self.assertEqual((verdict, count), ('exact', 48), 'unchanged oracle must count the armed getter')
+
+    def test_singleton_error_preserves_actual_bad_return(self):
+        root = Path(tempfile.mkdtemp(dir=self.base, prefix='bad-pin-'))
+        (root / 'tokens').mkdir()
+        conf = root / 'softhsm2.conf'
+        conf.write_text(f'directories.tokendir = {root}/tokens\nobjectstore.backend = file\nlog.level = ERROR\n')
+        env = {**os.environ, 'SOFTHSM2_CONF': str(conf)}
+        subprocess.run(['softhsm2-util', '--init-token', '--free', '--label', 'c8-error',
+            '--so-pin', '5678', '--pin', '9999'], env=env, check=True,
+            stdout=subprocess.DEVNULL, timeout=10)
+        result = subprocess.run([str(self.driver), 'mech', '--cell', 'P2', '--module',
+            '/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so', '--ledger-singletons'],
+            env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        rows = [parse_native_row(x) for x in result.stdout.splitlines() if x.startswith('LEDGER ')]
+        login = [r for r in rows if r['fn'] == 'C_Login']
+        self.assertEqual(len(login), 1)
+        self.assertEqual((login[0]['n'], login[0]['bad']), ('1', '1'))
+
+    def test_parent_shell_pin_fds_survive_command_substitution(self):
+        text = SHELL.read_text()
+        function = text.split('c8_gate() {', 1)[1].split('\n}\n\nmono_ns', 1)[0]
+        target = self.base / 'shell-pins.json'
+        script = ('REPO=$1\nc8_gate() {' + function + '\n}\n'
+            'exec {one}<"$2"\nexec {two}<"$3"\nexec {three}<"$4"\nexec {four}<"$4"\n'
+            'result=$(c8_gate prepare "$5" "$one" "$two" "$three" "$four")\n')
+        result = subprocess.run(['bash', '-eu', '-c', script, 'c8-pins', str(ROOT),
+            str(self.driver), str(self.other), '/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so',
+            str(target)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(target.read_text())['pins']), {'L', 'L2', 'A', 'B'})
 
     def test_real_chain_holds_required_images_and_leaves_thread_image_optional(self):
         child, prefix, ledger = self.start(chain=True)
@@ -997,6 +1085,105 @@ class C8GateFixtureTests(unittest.TestCase):
                 if stopped: child.terminate()
                 self.assertNotEqual(child.wait(timeout=3), 0)
                 self.assertNotIn("LEDGER ", ledger.read_text())
+
+    def controller_inputs(self):
+        """Real owned processes/FDs; JSONL is explicitly controlled unit input."""
+        child, prefix, ledger = self.start(chain=True)
+        self.wait(child, ledger, "WATCH_READY", gen=0, phase="go")
+        ready = next(parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith("WATCH_READY "))
+        root = ledger.parent
+        provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
+        descriptors = [os.open(x, os.O_RDONLY) for x in (self.driver, self.other, provider, provider)]
+        for fd in descriptors: self.addCleanup(os.close, fd)
+        observer = subprocess.Popen([sys.executable, '-I', '-c', 'import time;time.sleep(30)'])
+        def stop_observer():
+            if observer.poll() is None: observer.kill()
+            observer.wait(timeout=5)
+        self.addCleanup(stop_observer)
+        ns, pins, stream = c8_gate_namespace(), root / 'pins.json', root / 'events.jsonl'
+
+        def invoke(operation, *arguments):
+            argv = [str(SHELL), str(ROOT), operation, str(pins), *map(str, arguments)]
+            with mock.patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+                ns['main']()
+
+        invoke('prepare', *descriptors)
+        state = json.loads(pins.read_text())
+        exe, mapped = state['pins']['L']['exe'], state['pins']['A']['provider']
+        context = {'id': 'c0', 'pid': child.pid, 'start_time': int(ready['start']), 'incarnation': 0,
+            'authority': 'scan_pinned', 'status': 'observed', 'lifecycle': 'mapped',
+            'executable': {'path': exe['path'], 'dev': exe['dev'], 'ino': exe['ino'],
+                'mtime_secs': exe['mtime_ns'] // 1_000_000_000, 'mtime_nanos': exe['mtime_ns'] % 1_000_000_000}}
+        module = {'id': 'm0', 'path': mapped['path'], 'device_major': mapped['dev'][0],
+                  'device_minor': mapped['dev'][1], 'inode': mapped['ino'], 'status': 'observed'}
+        edge = {'caller': 'c0', 'module': 'm0', 'mapping': {'state': 'mapped'},
+            'identity_context': {'version': 1, 'caller': context, 'module': module},
+            'entries': {'count': 0, 'saturated': False, 'in_flight': False,
+                'first_seen_ns': None, 'last_seen_ns': None,
+                'coverage': {'state': 'watched_no_use', 'since_ns': int(ready['t']),
+                             'until_ns': None, 'reason': None, 'detail': None, 'lossy': None}}}
+        rows = []
+        def append(kind, event, at=None):
+            rows.append({'schema': 'p11scope/inventory-events/v1', 'seq': len(rows),
+                         'at_ns': time.monotonic_ns() if at is None else at,
+                         'kind': kind, 'event': copy.deepcopy(event)})
+            stream.write_text(''.join(json.dumps(x) + '\n' for x in rows))
+        origin = int(ready['deadline']) - 10_000_000_000
+        append('started', {'started_ns': origin, 'clock': {'basis': 'CLOCK_MONOTONIC', 'unit': 'ns'}}, origin)
+        append('caller_event', {'event': 'admitted', 'caller': 'c0',
+                                'identity_context': {'version': 1, 'caller': context}})
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 0})
+        fd = os.open(stream, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        invoke('start', stream, fd, 10, observer.pid, os.getpid())
+        def gate(phase):
+            return invoke(phase, 'P5', child.pid, 0, 'L', 'A', ledger, prefix, os.getpid(), os.getuid())
+        return child, observer, prefix, ledger, ns, edge, append, gate
+
+    def test_actual_embedded_controller_releases_only_after_current_watch_and_full_count(self):
+        child, _observer, prefix, ledger, _ns, edge, append, gate = self.controller_inputs()
+        gate('pre')
+        self.assertTrue(Path(str(prefix) + '.0.go').is_file())
+        self.wait(child, ledger, 'WATCH_READY', gen=0, phase='next')
+        self.assertNotIn(' gen=1 ', ledger.read_text())
+        calls = [parse_native_row(x) for x in ledger.read_text().splitlines() if x.startswith('LEDGER ')]
+        edge['entries'].update(count=18, first_seen_ns=int(calls[0]['t0']) + 1,
+                               last_seen_ns=int(calls[-1]['t1']) + 1)
+        edge['entries']['coverage'].update(state='counted', lossy=False,
+                                            since_ns=int(calls[0]['t0']) + 1)
+        append('edge_observed', edge)
+        append('pass_committed', {'pass': 1})
+        gate('post')
+        self.assertTrue(Path(str(prefix) + '.0.next').is_file())
+        self.wait(child, ledger, 'WATCH_READY', gen=1, phase='go')
+        proof = json.loads(Path(str(prefix) + '.0.post.json').read_text())
+        self.assertEqual(proof['count'], 18)
+
+    def test_dead_publisher_cannot_release_a_buffered_watch(self):
+        _child, observer, prefix, ledger, _ns, _edge, _append, gate = self.controller_inputs()
+        observer.kill()
+        os.waitid(os.P_PID, observer.pid, os.WEXITED | os.WNOWAIT)
+        opened = len(os.listdir('/proc/self/fd'))
+        with self.assertRaises((ValueError, OSError)):
+            gate('pre')
+        self.assertEqual(len(os.listdir('/proc/self/fd')), opened, 'failed gate acquisition closes all its own FDs')
+        self.assertFalse(Path(str(prefix) + '.0.go').exists())
+        self.assertNotIn('LEDGER ', ledger.read_text())
+
+    def test_dead_actor_and_late_buffered_watch_cannot_create_gate(self):
+        for dead in (False, True):
+            with self.subTest(dead=dead):
+                child, _observer, prefix, ledger, ns, _edge, _append, gate = self.controller_inputs()
+                if dead:
+                    child.kill()
+                    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                else:
+                    ns['monotonic_ns'] = lambda: 2 ** 63
+                with self.assertRaises((ValueError, OSError)):
+                    gate('pre')
+                self.assertFalse(Path(str(prefix) + '.0.go').exists())
+                self.assertNotIn('LEDGER ', ledger.read_text())
 
 
 def parse_native_row(line):

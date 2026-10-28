@@ -883,7 +883,7 @@ def ready_bound_case(pid, directory, spec):
     release, never_ready = {'pass_515': ('5.15.221-ready-bound-test', False),
                             'fail_66': ('6.6.157-ready-bound-test', True),
                             'fail_515': ('5.15.221-ready-bound-test', True)}[spec]
-    expected = {'pass_515': 30, 'fail_66': 8, 'fail_515': 30}[spec]
+    expected = {'pass_515': 30, 'fail_66': 20, 'fail_515': 30}[spec]
     config = config_for(pid, directory)
     if never_ready:
         # Never signal readiness: the observer must outlive the longest
@@ -911,9 +911,10 @@ def ready_bound_case(pid, directory, spec):
     line = f'CANARY_READY_BOUND_DECLARED kernel={release} seconds={expected}'
     assert line in output.getvalue().splitlines(), output.getvalue()
     if never_ready:
-        lower, upper = (8, 15) if spec == 'fail_66' else (30, 44)
+        lower, upper = (20, 27) if spec == 'fail_66' else (30, 44)
         assert lower <= elapsed < upper, (spec, elapsed)
         assert not (Path(directory) / f'mapdump_manifest_{config.lane}.json').exists()
+        assert not config.go.exists()
     else:
         assert manifest.is_file()
 
@@ -2152,12 +2153,44 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                 stream.write('p11scope \u2014 test \u2014 privacy=allowlisted\n'.encode())
             self.assertTrue(coordinator.final_privacy_present(time.monotonic() + 1))
 
-    def test_ready_bound_declares_8s_for_modern_kernels(self):
-        self.assertEqual(capture.READY_SECONDS, 8)
+    def test_ready_bound_declares_20s_for_modern_observer_startup(self):
+        self.assertEqual(capture.READY_SECONDS, 20)
         for release in ('6.6.157-ready-bound-test', '6.6.0', '6.12.10-generic',
                         '7.0.0-38-generic', '7.2.9'):
             with self.subTest(release=release):
-                self.assertEqual(capture.ready_bound_seconds(release), 8)
+                self.assertEqual(capture.ready_bound_seconds(release), 20)
+
+    def test_ready_bound_preserves_preliminary_workload_roster_allowance(self):
+        for release in ('6.6.157-ready-bound-test', '7.0.0-38-generic'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release, workload_roster=True), 8)
+        for release in ('5.15.221-ready-bound-test', '6.1.188-ready-bound-test'):
+            with self.subTest(release=release):
+                self.assertEqual(capture.ready_bound_seconds(release, workload_roster=True), 30)
+
+    def test_ready_bound_run_keeps_preliminary_roster_deadline_separate(self):
+        for release, expected in (('6.6.157-ready-bound-test', 8),
+                                  ('7.0.0-38-generic', 8),
+                                  ('5.15.221-ready-bound-test', 30),
+                                  ('6.1.188-ready-bound-test', 30)):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                config = config_for(os.getpid(), directory)
+                deadlines = []
+
+                def roster(_config, deadline):
+                    deadlines.append(deadline - time.monotonic())
+                    raise capture.CaptureError('stop-at-preliminary-roster')
+
+                with kernel_release(release), virtual_monotonic(), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        patch.object(capture, 'ready_roster', side_effect=roster), \
+                        patch.object(c.Custody, 'launch') as launched:
+                    with self.assertRaises(capture.CaptureError):
+                        capture.capture(config, FakeMaps(config))
+                    launched.assert_not_called()
+                self.assertEqual(deadlines, [expected])
+                self.assertFalse(config.observer_log.exists())
+                self.assertFalse(config.go.exists())
 
     def test_ready_bound_declares_30s_for_legacy_kernels(self):
         self.assertEqual(capture.READY_SECONDS_LEGACY_KERNEL, 30)
@@ -2176,9 +2209,11 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
 
     def test_ready_bound_ignores_environment_override(self):
         bogus = {'CANARY_READY_SECONDS': '999', 'CANARY_READY_BOUND_SECONDS': '999',
-                 'READY_SECONDS': '999', 'P11SCOPE_READY_SECONDS': '999'}
+                 'READY_SECONDS': '999', 'P11SCOPE_READY_SECONDS': '999',
+                 'WORKLOAD_ROSTER_SECONDS': '999'}
         with patch.dict(os.environ, bogus):
-            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test'), 8)
+            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test'), 20)
+            self.assertEqual(capture.ready_bound_seconds('6.6.157-ready-bound-test', workload_roster=True), 8)
             self.assertEqual(capture.ready_bound_seconds('5.15.221-ready-bound-test'), 30)
             with self.assertRaises(capture.CaptureError):
                 capture.ready_bound_seconds('5.4.0')
@@ -2186,7 +2221,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_ready_bound_accepts_str_subclasses(self):
         class Release(str):
             pass
-        for release, expected in ((Release('6.6.157-ready-bound-test'), 8),
+        for release, expected in ((Release('6.6.157-ready-bound-test'), 20),
                                   (Release('5.15.221-ready-bound-test'), 30)):
             with self.subTest(release=str(release)):
                 self.assertEqual(capture.ready_bound_seconds(release), expected)
@@ -2225,7 +2260,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         hits = [line for line in output.getvalue().splitlines()
                 if 'CANARY_READY_BOUND_DECLARED' in line]
         self.assertEqual(len(hits), 1, output.getvalue())
-        self.assertIn('seconds=8', hits[0], output.getvalue())
+        self.assertIn('seconds=20', hits[0], output.getvalue())
         self.assertEqual(len(hits[0].split()), 3, output.getvalue())
 
     def test_ready_bound_unknown_kernel_run_refuses_before_launch(self):
@@ -2319,7 +2354,66 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_ready_bound_515_run_within_30s_passes(self):
         self.probe('ready_bound:pass_515')
 
-    def test_ready_bound_66_run_over_8s_still_fails(self):
+    def observer_readiness_boundary(self, ready_after):
+        """Publish the actual ready line on the existing virtual clock."""
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'observer.log'
+            log.write_bytes(b'')
+            config = SimpleNamespace(mode='profile', privacy='allowlisted', observer_log=log)
+            coordinator = capture.Coordinator(config, None)
+            with virtual_monotonic() as clock:
+                started = clock[0]
+                deadline = started + capture.ready_bound_seconds('6.6.157-ready-bound-test')
+
+                def check_alive(bound):
+                    self.assertEqual(bound, deadline, 'readiness deadline was renewed')
+                    capture.remaining(bound)
+                    if ready_after is not None and clock[0] - started >= ready_after:
+                        log.write_bytes(b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+
+                observer = SimpleNamespace(group=SimpleNamespace(check_alive=check_alive))
+                error = None
+                try:
+                    coordinator.readiness(observer, deadline)
+                except capture.CaptureError as caught:
+                    error = caught
+                return error, clock[0] - started, log.read_bytes()
+
+    def test_ready_bound_modern_accepts_actual_ready_line_before_20s(self):
+        for ready_after in (0, 17.217, 19.99):
+            with self.subTest(ready_after=ready_after):
+                error, elapsed, payload = self.observer_readiness_boundary(ready_after)
+                self.assertIsNone(error)
+                self.assertGreaterEqual(elapsed, ready_after)
+                self.assertLess(elapsed, 20)
+                self.assertIn(b'p11scope: capturing: ', payload)
+
+    def test_ready_bound_modern_refuses_at_deadline_late_and_never_ready(self):
+        for ready_after in (20, 20.01, None):
+            with self.subTest(ready_after=ready_after):
+                error, elapsed, payload = self.observer_readiness_boundary(ready_after)
+                self.assertIsInstance(error, capture.CaptureError)
+                self.assertIn('phase deadline expired', str(error))
+                self.assertGreaterEqual(elapsed, 20)
+                self.assertLess(elapsed, 20.1)
+                self.assertEqual(payload, b'')
+
+    def test_ready_bound_expired_clock_refuses_cached_actual_ready_line(self):
+        for overdue in (0, .01):
+            with self.subTest(overdue=overdue), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / 'observer.log'
+                log.write_bytes(b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+                config = SimpleNamespace(mode='profile', privacy='allowlisted', observer_log=log)
+                coordinator = capture.Coordinator(config, None)
+                observer = SimpleNamespace(group=SimpleNamespace(check_alive=lambda _deadline: None))
+                with virtual_monotonic() as clock:
+                    deadline = clock[0] + capture.ready_bound_seconds('6.6.157-ready-bound-test')
+                    clock[0] = deadline + overdue
+                    with self.assertRaisesRegex(capture.CaptureError, 'phase deadline expired'):
+                        coordinator.readiness(observer, deadline)
+                self.assertIn(b'p11scope: capturing: ', log.read_bytes())
+
+    def test_ready_bound_66_run_over_20s_still_fails(self):
         self.ready_bound_probe('fail_66', 16)
 
     def test_ready_bound_515_run_over_30s_fails(self):

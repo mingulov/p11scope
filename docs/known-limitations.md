@@ -396,30 +396,44 @@ The old bounds are measurements, not a product startup SLA.
 - Planned: classic system/cgroup Multi on 6.6–6.8 is probe-gated but not
   yet qualified on those kernels (DR-CLASSIC-F4-66-68, v0.3.0).
 
-### Startup takes ~15–22 s on 5.15/6.1 (sequential BPF verifier), ~4–7 s on 6.6+
+### Startup includes sequential BPF program loading
 
 Historical measurements below predate v0.5 host admission. Stock non-Multi
 hosts are outside current live support; these failures remain historical failures.
 The old bounds are measurements, not a product startup SLA.
 
-- What the user sees: the observer loads its BPF programs one at a time
-  and the kernel verifies each load, so startup (discovery to the
-  `capturing:` line) takes ~15–22 s on 5.15/6.1 but only ~4–7 s on
-  6.6+. Measured FULL default, 208 probes, 4 vCPUs: 6.6.157 4.5–4.9 s,
+- Historical measurements cover discovery to the `capturing:` line,
+  rather than complete observer startup. FULL default, 208 probes,
+  4 vCPUs: 6.6.157 4.5–4.9 s,
   host 7.0 6.25–6.6 s, 6.1.188 16.7–17.4 s, 5.15.221 17.0–20.2 s;
   0-probe runs take the same time (5.15 14.8–21.5 s under host load),
-  showing verifier load dominates, not attach or probe count.
-- Kernels/conditions: 5.15 and 6.1 take the slow path; 6.6 and later
-  take the fast path. Capture after readiness is unaffected: slow
-  startup delays, but never degrades, the evidence.
-- Disclosure: this entry, plus the canary harness's declared
+  showing that these historical runs spent most startup time loading
+  programs, rather than attaching probes.
+- Current FULL32 setup-only samples on the supported development host
+  took 7.512, 13.133 and 17.217 s from observer launch to readiness.
+  The 7.512 s attempt had no usable syscall attribution. A separate
+  complete 13.133 s measurement attributed 96.5% of its post-discovery
+  interval to `BPF_PROG_LOAD`; it did not distinguish verifier, JIT or
+  other work inside that syscall. No GO was released in these diagnostics.
+- **Inactive proposal, requiring owner approval:** use a 20 s observer
+  readiness bound for the harness's existing modern-kernel timer class,
+  preserving the preliminary borrowed-workload allowance at 8 s. Both
+  legacy timer allowances stay 30 s; that is historical test policy,
+  not permission to run capture on an ineligible non-Multi host.
+  The original 8 s FULL32 failure and three unrun cells remain unchanged.
+  These setup samples do not qualify calls, privacy, counts or zero loss.
+- In the FULL32 object cell, the 6 s capture, native fixture's 30 s GO
+  deadline and 30 s stop bound remain unchanged. The native GO clock
+  starts before observer startup;
+  a 20 s observer allowance does not guarantee the remaining setup and
+  stop-to-GO work fits. Missing either real readiness or GO still fails.
+- Disclosure: this entry and the canary harness's declared
   per-kernel readiness bound, printed up front in every run as
-  `CANARY_READY_BOUND_DECLARED kernel=... seconds=...` (8 s on 6.6+,
-  30 s on 5.15/6.1 with margin over the measured maxima under load;
-  any other kernel is refused rather than guessed).
+  `CANARY_READY_BOUND_DECLARED kernel=... seconds=...`. No environment
+  variable can replace the declared timer.
 - Workaround: keep the workload alive past attach (as in
   [usage](usage.md#discovery-timing-and-optional-offline-discovery)),
-  or capture on 6.6+ for faster startup.
+  while respecting the current Multi capability requirement.
 - Planned: parallel program loading stays an optional later speedup,
   not a correctness fix.
 

@@ -4,7 +4,7 @@
  * (call rows carry the session handle, or 0 where no session exists; target
  * rows carry the observed vaddr alongside the file offset).
  * Interactive: calls|spaced FUNCTION COUNT DELAY_MS PHASE SCOPE;
- * exec|thread-exec PATH; stop. Auto: --start-gate PATH --auto-gate PATH
+ * exec|thread-exec PATH; undumpable; stop. Auto: --start-gate PATH --auto-gate PATH
  * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE].
  * --map-only 1 maps the provider without calling PKCS#11; only stop is accepted. */
 #define _GNU_SOURCE
@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -140,6 +141,17 @@ static int mapped_only(void) {
   char line[8192];
   if (!fgets(line, sizeof line, stdin) || strcmp(line, "stop\n")) return 2;
   ack("done");
+  return 0;
+}
+static int become_undumpable(void) {
+  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)) return 1;
+  int dumpable = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+  if (dumpable != 0) return 1;
+  header("dumpability");
+  printf(",\"pid\":%d,\"tid\":%ld,\"uid\":%u,\"dumpable\":%d,\"t\":%llu}\n",
+         getpid(), syscall(SYS_gettid), (unsigned int)geteuid(), dumpable, now_ns());
+  fflush(stdout);
+  ack("undumpable");
   return 0;
 }
 static void teardown(void) {
@@ -271,6 +283,10 @@ int main(int argc, char **argv) {
   unsigned long n, ms;
   while (fgets(line, sizeof line, stdin)) {
     if (!strcmp(line, "stop\n")) { teardown(); ack("done"); return 0; }
+    if (!strcmp(line, "undumpable\n")) {
+      if (become_undumpable()) return 1;
+      continue;
+    }
     if (sscanf(line, "calls %63s %lu %lu %63s %63s", fn, &n, &ms, phase, next_scope) == 5) {
       scope = next_scope; calls(fn, n, ms, phase, 0); continue;
     }

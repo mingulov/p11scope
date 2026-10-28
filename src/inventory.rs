@@ -5263,6 +5263,29 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     /// (begin once per publication, then poll); a legacy lane keeps
     /// today's sync commit plus Published.
     fn poll_commit(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
+        // Stop already gated this lane and transferred its publication to
+        // Finish. Keep that original terminal owner: a running poll rejects
+        // the gated Session before Finish can publish or detach can join.
+        if matches!(
+            self.joint_finish,
+            JointFinishDriver::Polling | JointFinishDriver::Published
+        ) && self.semantic.as_ref().is_some_and(Self::is_joint_lane)
+        {
+            if self.second_signal.is_some_and(|signal| signal()) {
+                self.escalate_joint_finish("second stop during joint finish");
+            } else {
+                let outcome = self.step_final_joint_finish_once();
+                if matches!(outcome, JointStepOutcome::WoundDown) {
+                    self.complete_final_joint_lane();
+                }
+            }
+            // Published can still own a pending detach even though
+            // publication_pending() is false. Only the joined handoff or
+            // explicit abandonment admits the ordinary final commit below.
+            if self.semantic.is_some() {
+                return Ok(PassCommitProgress::Pending);
+            }
+        }
         if self
             .semantic
             .as_ref()
@@ -17227,6 +17250,220 @@ mod promotion_driver_tests {
             2,
             "both polls ran through the lane"
         );
+    }
+
+    fn retained_at_lane_stopped(
+        driver: &mut ClassicDriver<'_>,
+    ) -> crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane> {
+        use crate::inventory_capture::{RetainedPass, RetainedTerminalPhase, ZeroPassCause};
+        let mut outcome =
+            super::tests::retain_with_cause(driver, ZeroPassCause::OperatorStop, None);
+        outcome
+            .retained
+            .as_mut()
+            .expect("Finish keeps the run")
+            .pass = RetainedPass::Terminal {
+            phase: RetainedTerminalPhase::LaneStopped,
+        };
+        outcome
+    }
+
+    fn poll_one_retained_action(
+        driver: &mut ClassicDriver<'_>,
+        outcome: crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane>,
+    ) -> crate::inventory_capture::ClassicOutcome<crate::inventory_capture::FacadeLane> {
+        let (run, error) = super::tests::retained_run_of(outcome);
+        let stop = || false;
+        let clock = super::tests::consume_clock(&stop);
+        let mut budget = RetainedWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        poll_retained_classic(driver, run, error, &clock, &mut budget, &mut |_, _| Ok(()))
+    }
+
+    #[test]
+    fn retained_final_commit_keeps_polling_original_finish() {
+        // The native stop has completed, but Detailed Finish needs more
+        // than the one poll allowed by on_lane_stopped. The real retained
+        // pump must keep the same terminal owner instead of polling Running
+        // on a Session which stop has already gated.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        let drops = Rc::new(Cell::new(0));
+        io.drop_spy = Some(Rc::clone(&drops));
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        // A real machine with Finish owns an outstanding request. Leave
+        // poll_joint_commit unscripted: a wrong running poll really refuses
+        // at its Session boundary, rather than receiving a fabricated Err.
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest,
+        )));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        assert_eq!(driver.joint_finish, JointFinishDriver::Polling);
+        let outcome = retained_at_lane_stopped(&mut driver);
+        let outcome = poll_one_retained_action(&mut driver, outcome);
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .unwrap()
+                .finish_poll_calls_for_test(),
+            1,
+            "LaneStopped spends one bounded Finish poll"
+        );
+        let mut outcome = poll_one_retained_action(&mut driver, outcome);
+        assert_eq!(
+            driver.joint_commit_polls, 0,
+            "FinalCommit never polls Running"
+        );
+        assert_eq!(driver.joint_finish, JointFinishDriver::Polling);
+        assert_eq!(driver.commit_calls, 0, "no broad commit overtakes Finish");
+        assert!(outcome.retained.is_some(), "the original run stays owned");
+        for _ in 0..3 {
+            outcome = poll_one_retained_action(&mut driver, outcome);
+        }
+        assert!(
+            driver
+                .semantic
+                .as_ref()
+                .unwrap()
+                .finish_poll_calls_for_test()
+                > 1,
+            "the same lane receives subsequent Finish polls"
+        );
+        assert_eq!(driver.joint_commit_polls, 0);
+        assert_eq!(driver.commit_calls, 0);
+        assert_eq!(drops.get(), 0, "pending Finish retains the original I/O");
+        assert!(driver.joint_first_error.is_none());
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|gap| gap.0 != "semantic lane stopped"),
+            "normal terminal waiting must not become a running-lane failure"
+        );
+    }
+
+    #[test]
+    fn retained_final_commit_waits_for_published_detach_handoff() {
+        // Published is not publication_pending(), yet its actual detach
+        // still owns the Session. FinalCommit must wait for that join too.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let (mut io, gate) = WindDownIo::gated();
+        let polls = Rc::clone(&io.polls);
+        let drops = Rc::new(Cell::new(0));
+        io.drop_spy = Some(Rc::clone(&drops));
+        let mut lane = joint_lane(io, true);
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest,
+        )));
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.on_stop_requested();
+        let outcome = retained_at_lane_stopped(&mut driver);
+        let outcome = poll_one_retained_action(&mut driver, outcome);
+        assert_eq!(driver.joint_finish, JointFinishDriver::Published);
+        assert!(
+            !driver.publication_pending(),
+            "publication alone is complete"
+        );
+        let mut outcome = poll_one_retained_action(&mut driver, outcome);
+        assert_eq!(
+            driver.joint_commit_polls, 0,
+            "a published Finish never polls Running"
+        );
+        for _ in 0..3 {
+            outcome = poll_one_retained_action(&mut driver, outcome);
+        }
+        assert!(polls.get() > 0, "the actual detach remains pending");
+        assert_eq!(driver.commit_calls, 0, "no commit overtakes the detach");
+        assert_eq!(drops.get(), 0);
+        assert!(driver.semantic.is_some());
+        assert!(outcome.retained.is_some());
+
+        release_gate(&gate);
+        driver
+            .semantic
+            .as_mut()
+            .unwrap()
+            .set_test_joint_frame(false);
+        for _ in 0..12 {
+            if outcome.retained.is_none() {
+                break;
+            }
+            outcome = poll_one_retained_action(&mut driver, outcome);
+        }
+        assert!(
+            outcome.retained.is_none(),
+            "joined handoff completes the run"
+        );
+        assert!(outcome.error.is_none());
+        assert!(
+            driver.semantic.is_none(),
+            "only the joined take releases the lane"
+        );
+        assert_eq!(drops.get(), 1, "the original I/O releases once");
+        assert_eq!(driver.joint_commit_polls, 0);
+        assert_eq!(
+            driver.commit_calls, 1,
+            "the final broad commit follows handoff"
+        );
+        assert!(driver.joint_first_error.is_none());
+    }
+
+    #[test]
+    fn retained_final_commit_second_signal_preserves_first_error() {
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        let polls = Rc::clone(&io.polls);
+        let drops = Rc::new(Cell::new(0));
+        io.drop_spy = Some(Rc::clone(&drops));
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_finish_begin_for_test(Some(Ok(())));
+        lane.set_scripted_finish_poll_for_test(Some(Ok(JointCommitProgress::Pending)));
+        lane.set_scripted_joint_begin_for_test(Some(Err(
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest,
+        )));
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        let outcome = retained_at_lane_stopped(&mut driver);
+        let outcome = poll_one_retained_action(&mut driver, outcome);
+        driver.joint_first_error = Some("the earlier terminal failure".into());
+        driver.second_signal = Some(&|| true);
+        let outcome = poll_one_retained_action(&mut driver, outcome);
+        assert_eq!(
+            driver.joint_commit_polls, 0,
+            "second stop never polls Running"
+        );
+        assert_eq!(driver.joint_finish, JointFinishDriver::Abandoned);
+        assert!(
+            driver.semantic.is_none(),
+            "second stop holds the original lane"
+        );
+        assert_eq!(polls.get(), 0, "the held Session never joins");
+        assert_eq!(drops.get(), 0, "the held Session never drops");
+        let stop = || false;
+        let clock = super::tests::consume_clock(&stop);
+        let (_, error, _) = driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(
+            error
+                .unwrap()
+                .to_string()
+                .contains("the earlier terminal failure"),
+            "terminal completion keeps the first failure nonzero"
+        );
+        assert!(gaps(&mut driver).iter().any(|gap| {
+            gap.0 == "joint finish held for exit" && gap.1 == "second stop during joint finish"
+        }));
     }
 
     #[test]

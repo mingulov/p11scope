@@ -602,6 +602,50 @@ mod tests {
     use crate::process::cold_view_tests::ColdLeaderSubject;
 
     #[test]
+    fn exiting_or_dead_task_metadata_never_proves_a_live_member() {
+        let mut task = Task {
+            birth: 7,
+            state: b'S',
+            flags: 0,
+        };
+        assert!(task.live(), "a sleeping nonexiting member remains useful");
+        task.flags = 4; // Linux PF_EXITING, independently fixed by the task ABI.
+        assert!(!task.live(), "a live-looking state cannot waive PF_EXITING");
+        task.flags = 0;
+        task.state = b'Z';
+        assert!(!task.live(), "a zombie cannot serve the live filesystem");
+    }
+
+    #[test]
+    fn a_live_foreign_tgid_cannot_replace_a_retained_member_directory() {
+        let mut group = ColdLeaderSubject::spawn(2);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let mut proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+        let cold = proof.cold.as_mut().unwrap();
+        // Keep the original census and supply an actual live proc directory.
+        // Matching its birth reaches the independent Tgid check, rather than
+        // succeeding only because the generation check refused first.
+        let foreign = std::fs::File::open("/proc/self").unwrap().into();
+        let member = &mut cold.members[1];
+        let original_directory = std::mem::replace(&mut member.directory, foreign);
+        let original_birth = std::mem::replace(
+            &mut member.birth,
+            process_start_time(std::process::id()).unwrap(),
+        );
+        let error = cold.validate(&mut work).unwrap_err();
+        assert!(error.contains("group membership"), "{error}");
+
+        let member = &mut cold.members[1];
+        member.directory = original_directory;
+        member.birth = original_birth;
+        cold.validate(&mut work)
+            .expect("the original healthy member still proves the same group");
+        group.call_three();
+    }
+
+    #[test]
     fn rooted_fifo_is_rejected_without_readable_open_side_effects() {
         for cold in [false, true] {
             let mut group = ColdLeaderSubject::spawn(1);

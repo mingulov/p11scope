@@ -339,6 +339,21 @@ class LedgerValidationTests(unittest.TestCase):
 
 
 class InstalledJudgeTests(unittest.TestCase):
+    def test_cli_complete_g16_l4_receipts_can_qualify(self):
+        # Complete controlled input exercises the future oracle path;
+        # current captures have no L4 producer and still block below.
+        report = valid_report(300)
+        report["evidence"]["loader_transitions"] = {
+            "arms": 300, "reclaims": 299, "retained_peak": 1, "refusals": 0}
+        with tempfile.TemporaryDirectory(prefix="p11scope-l4-cli-") as raw:
+            ledger = self.write(raw, "ledger.jsonl", self.ledger_text("g16", 300))
+            output = self.write(raw, "report.json", json.dumps(report))
+            result = self.judge_cli("g16", ledger, report=output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual((verdict["pass"], verdict["qualification"]),
+                         (True, "installed-positive"))
+
     def ledger_text(self, cell, count):
         return "".join(json.dumps(r) + "\n" for r in valid_ledger(cell, count))
 

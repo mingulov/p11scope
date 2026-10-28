@@ -1798,6 +1798,107 @@ mod tests {
     }
 
     #[test]
+    fn loader_lifetime_cancel_prepared_preserves_short_guard_until_release() {
+        let (domain, mut registry) = fresh_registry();
+        let token = registry.prepare_new(domain).unwrap();
+        registry.acquire_short(domain, token).unwrap();
+
+        assert_eq!(
+            registry.cancel_prepared(domain, token),
+            Err(LifetimeError::ProducersActive { short: 1, long: 0 })
+        );
+        assert_eq!(registry.phase_of(token), Some(SlotPhase::Prepared));
+        assert_eq!(registry.charged_contexts(), 1);
+        registry.release_short(domain, token).unwrap();
+        registry.cancel_prepared(domain, token).unwrap();
+        assert_eq!(registry.charged_contexts(), 0);
+        let successor = registry.prepare_new(domain).unwrap();
+        assert_eq!(successor.slot(), token.slot());
+        assert_eq!(successor.generation(), 2);
+    }
+
+    #[test]
+    fn loader_lifetime_cancel_prepared_preserves_long_lease_until_delete() {
+        let (domain, mut registry) = fresh_registry();
+        let token = registry.prepare_new(domain).unwrap();
+        registry.acquire_short(domain, token).unwrap();
+        registry.insert_state(domain, token).unwrap();
+        registry.release_short(domain, token).unwrap();
+
+        assert_eq!(
+            registry.cancel_prepared(domain, token),
+            Err(LifetimeError::ProducersActive { short: 0, long: 1 })
+        );
+        assert_eq!(registry.phase_of(token), Some(SlotPhase::Prepared));
+        assert_eq!(registry.charged_contexts(), 1);
+        registry.remove_state(domain, token, true).unwrap();
+        registry.cancel_prepared(domain, token).unwrap();
+        assert_eq!(registry.charged_contexts(), 0);
+        let successor = registry.prepare_new(domain).unwrap();
+        assert_eq!(successor.slot(), token.slot());
+        assert_eq!(successor.generation(), 2);
+    }
+
+    #[test]
+    fn loader_lifetime_cancel_prepared_preserves_queued_debt_until_disposition() {
+        for queue in QueueKind::ALL {
+            let (domain, mut registry) = fresh_registry();
+            let token = registry.prepare_new(domain).unwrap();
+            registry.collect_record(domain, token, queue).unwrap();
+
+            assert_eq!(
+                registry.cancel_prepared(domain, token),
+                Err(LifetimeError::RecordsPending { queue, count: 1 })
+            );
+            assert_eq!(registry.phase_of(token), Some(SlotPhase::Prepared));
+            assert_eq!(registry.charged_contexts(), 1);
+            registry.dispose_record(domain, token, queue).unwrap();
+            registry.cancel_prepared(domain, token).unwrap();
+            assert_eq!(registry.charged_contexts(), 0);
+            let successor = registry.prepare_new(domain).unwrap();
+            assert_eq!(successor.slot(), token.slot());
+            assert_eq!(successor.generation(), 2);
+        }
+    }
+
+    #[test]
+    fn loader_lifetime_cancel_prepared_preserves_scan_debt_until_settlement() {
+        let (domain, mut registry) = fresh_registry();
+        let token = registry.prepare_new(domain).unwrap();
+        registry.register_scan(domain, token).unwrap();
+
+        assert_eq!(
+            registry.cancel_prepared(domain, token),
+            Err(LifetimeError::ScansPending(1))
+        );
+        assert_eq!(registry.phase_of(token), Some(SlotPhase::Prepared));
+        assert_eq!(registry.charged_contexts(), 1);
+        registry.settle_scan(domain, token).unwrap();
+        registry.cancel_prepared(domain, token).unwrap();
+        assert_eq!(registry.charged_contexts(), 0);
+        let successor = registry.prepare_new(domain).unwrap();
+        assert_eq!(successor.slot(), token.slot());
+        assert_eq!(successor.generation(), 2);
+    }
+
+    #[test]
+    fn loader_lifetime_cancel_prepared_releases_staged_binding_without_debt() {
+        let (domain, mut registry) = fresh_registry();
+        let token = registry.prepare_new(domain).unwrap();
+        // Binding metadata may be staged before attachment; it does not
+        // itself admit a callback, discovery state, record or scan.
+        registry.bind_export(domain, token, binding(21)).unwrap();
+        assert_eq!(registry.charged_descriptors(), 1);
+
+        registry.cancel_prepared(domain, token).unwrap();
+        assert_eq!(registry.charged_contexts(), 0);
+        assert_eq!(registry.charged_descriptors(), 0);
+        let successor = registry.prepare_new(domain).unwrap();
+        assert_eq!(successor.slot(), token.slot());
+        assert_eq!(successor.generation(), 2);
+    }
+
+    #[test]
     fn loader_lifetime_export_links_close_before_settlement() {
         let (domain, mut registry) = fresh_registry();
         let token = registry.prepare_new(domain).unwrap();

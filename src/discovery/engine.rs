@@ -76,6 +76,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd as _;

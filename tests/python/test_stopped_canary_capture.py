@@ -2169,26 +2169,29 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                 self.assertEqual(capture.ready_bound_seconds(release, workload_roster=True), 30)
 
     def test_ready_bound_run_keeps_preliminary_roster_deadline_separate(self):
-        for release, expected in (('6.6.157-ready-bound-test', 8),
-                                  ('7.0.0-38-generic', 8),
-                                  ('5.15.221-ready-bound-test', 30),
-                                  ('6.1.188-ready-bound-test', 30)):
-            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+        # Subtracting these origins after adding 30 rounds in opposite directions.
+        for release, expected, origin in (('6.6.157-ready-bound-test', 8, 2.2),
+                                          ('7.0.0-38-generic', 8, 2.3),
+                                          ('5.15.221-ready-bound-test', 30, 2.2),
+                                          ('6.1.188-ready-bound-test', 30, 2.3)):
+            with self.subTest(release=release, origin=origin), tempfile.TemporaryDirectory() as directory:
                 config = config_for(os.getpid(), directory)
                 deadlines = []
 
                 def roster(_config, deadline):
-                    deadlines.append(deadline - time.monotonic())
+                    deadlines.append(deadline)
                     raise capture.CaptureError('stop-at-preliminary-roster')
 
-                with kernel_release(release), virtual_monotonic(), \
+                with kernel_release(release), virtual_monotonic() as clock, \
                         contextlib.redirect_stdout(io.StringIO()), \
                         patch.object(capture, 'ready_roster', side_effect=roster), \
                         patch.object(c.Custody, 'launch') as launched:
+                    clock[0] = origin
+                    started = clock[0]
                     with self.assertRaises(capture.CaptureError):
                         capture.capture(config, FakeMaps(config))
                     launched.assert_not_called()
-                self.assertEqual(deadlines, [expected])
+                self.assertEqual(deadlines, [started + expected])
                 self.assertFalse(config.observer_log.exists())
                 self.assertFalse(config.go.exists())
 

@@ -17,6 +17,11 @@ pub mod inventory_workload;
 #[allow(dead_code)]
 pub(crate) mod kernel_identity;
 pub(crate) mod loader;
+// L1 staged loader-lifetime token/generation model (G16). Production
+// allocation stays on loader.rs's refusal path until L2/L3 land atomically;
+// L3's Engine acknowledgement wires the retirement/fence API.
+#[allow(dead_code)]
+pub(crate) mod loader_lifetime;
 pub(crate) mod native_binding;
 pub mod noise;
 pub(crate) mod pause;

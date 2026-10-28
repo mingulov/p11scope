@@ -6,9 +6,12 @@
 //!
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::discovery::scan::{
-    CaptureWorkBudget, ScanLimits, ScanOutcome, ScanRequest, scan_pid,
+    CaptureWorkBudget, ScanLimits, ScanOutcome, ScanRequest, ScannedTable, scan_pid,
 };
-use p11scope_manifest::manifest::{Resolution, SurfaceSource, Version, WalkOutcome};
+use p11scope_manifest::manifest::{
+    FunctionRecord, Manifest, Resolution, SurfaceRecord, SurfaceSource, Version, WalkOutcome,
+};
+use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::FileExt as _;
@@ -55,7 +58,7 @@ fn build_fixture(dir: &Path, name: &str, defines: &[&str]) -> PathBuf {
 
 /// dlopen + call C_GetFunctionList so the fixture's static tables are filled,
 /// exactly as a real application would before the observer scans it.
-fn load_and_populate(so: &Path) {
+fn load_and_populate(so: &Path) -> u64 {
     let c = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
     let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     assert!(!handle.is_null(), "dlopen {}", so.display());
@@ -70,6 +73,7 @@ fn load_and_populate(so: &Path) {
         0,
         "fixture C_GetFunctionList must succeed"
     );
+    table as usize as u64
 }
 
 fn scan_self(hints: &[PathBuf]) -> ScanOutcome {
@@ -100,6 +104,226 @@ fn helper_offsets(so: &Path) -> BTreeMap<String, u64> {
         }
     }
     out
+}
+
+/// This fixture's helper objects must belong to its acquired executable
+/// closure. The IDs below are lookup values, not reconstructed table identity.
+fn helper_object_ids(manifest: &Manifest) -> BTreeMap<ObjectKey, u32> {
+    let mut ids = BTreeMap::new();
+    for object in &manifest.objects {
+        let proof = manifest
+            .provenance_objects
+            .iter()
+            .find(|proof| proof.path == object.path)
+            .expect("resolved helper object belongs to its executable closure");
+        assert_eq!(proof.identity, object.identity);
+        assert!(
+            ids.insert(
+                ObjectKey {
+                    device: Device {
+                        major: proof.device_major,
+                        minor: proof.device_minor
+                    },
+                    inode: proof.inode,
+                },
+                object.id
+            )
+            .is_none(),
+            "fixture object IDs must be unambiguous"
+        );
+    }
+    ids
+}
+
+/// Independently read exactly the scan's claimed words inside its original
+/// file-named VMA. In particular, neither a helper's longer walk nor an adjacent
+/// anonymous BSS mapping authorizes adding NULL or absent slots to this read.
+fn scanned_word_oracle(
+    table: &ScannedTable,
+    maps: &[MapEntry],
+    object_ids: &BTreeMap<ObjectKey, u32>,
+    owner: ObjectKey,
+    exports: &BTreeMap<String, u64>,
+) -> (Vec<FunctionRecord>, usize, usize) {
+    let mapping = maps
+        .iter()
+        .find(|map| map.start <= table.address && table.address < map.end)
+        .expect("scanned header is still mapped");
+    assert_eq!(ObjectKey::of(mapping), owner);
+    assert_eq!(mapping.permissions[0], b'r');
+    assert_ne!(mapping.permissions[2], b'x');
+    let width = std::mem::size_of::<usize>();
+    let first_word = table.address.checked_add(width as u64).unwrap();
+    assert!(
+        first_word <= mapping.end,
+        "the complete header must be readable"
+    );
+    let available = usize::try_from((mapping.end - first_word) / width as u64).unwrap();
+    let count = table.entries.len() + table.null_entries.len() + table.unpinned.len();
+    assert!(
+        count > 0 && count <= available,
+        "scan cannot claim an unread word"
+    );
+    assert!(
+        table.unpinned.is_empty(),
+        "fixture targets are all executable files"
+    );
+    let mut claimed = BTreeMap::new();
+    for entry in &table.entries {
+        assert!(
+            claimed
+                .insert(
+                    entry.name,
+                    Resolution::Resolved {
+                        object: *object_ids
+                            .get(&entry.object)
+                            .expect("target is in helper closure"),
+                        file_offset: entry.file_offset,
+                    }
+                )
+                .is_none(),
+            "duplicate observed ordinal"
+        );
+    }
+    for name in &table.null_entries {
+        assert!(
+            claimed.insert(*name, Resolution::NullPointer).is_none(),
+            "NULL cannot duplicate or replace a target ordinal"
+        );
+    }
+    let mut bytes = vec![0u8; count * width];
+    std::fs::File::open("/proc/self/mem")
+        .unwrap()
+        .read_exact_at(&mut bytes, first_word)
+        .unwrap();
+    let mut observed = Vec::new();
+    let mut anchor_limit = 0;
+    for ordinal in 0..count {
+        let name = pkcs11_module::function_name(ordinal).expect("canonical observed ordinal");
+        let mut word = [0u8; 8];
+        word[..width].copy_from_slice(&bytes[ordinal * width..(ordinal + 1) * width]);
+        let word = u64::from_le_bytes(word);
+        let resolution = if word == 0 {
+            Resolution::NullPointer
+        } else {
+            let target = maps
+                .iter()
+                .find(|map| map.start <= word && word < map.end)
+                .expect("fixture function is mapped");
+            assert_ne!(target.inode, 0);
+            assert_eq!(target.permissions[2], b'x');
+            let key = ObjectKey::of(target);
+            let offset = target.file_offset + (word - target.start);
+            if key == owner && exports.get(name) == Some(&offset) {
+                anchor_limit = anchor_limit.max(if ordinal < 68 {
+                    68
+                } else if ordinal < 92 {
+                    92
+                } else {
+                    104
+                });
+            }
+            Resolution::Resolved {
+                object: *object_ids
+                    .get(&key)
+                    .expect("actual target is in helper closure"),
+                file_offset: offset,
+            }
+        };
+        assert_eq!(
+            claimed.remove(name),
+            Some(resolution.clone()),
+            "raw word at ordinal {ordinal} must agree on identity, offset and NULL"
+        );
+        observed.push(FunctionRecord {
+            name: name.to_owned(),
+            resolution,
+        });
+    }
+    assert!(
+        claimed.is_empty(),
+        "no foreign/noncanonical ordinal may be hidden"
+    );
+    (observed, available, anchor_limit)
+}
+
+/// C_GetFunctionList supplies a common acquisition extent, independently
+/// of the stored version label. Keep the canonical raw full/prefix count
+/// assertions at the call site; compare only the words this typed route read.
+fn assert_legacy_shared_words(so: &Path, table: &ScannedTable, owner: ObjectKey) {
+    let manifest = p11scope_discover::discover::discover(so).unwrap();
+    let typed = manifest
+        .surfaces
+        .iter()
+        .find(|surface| matches!(&surface.source, SurfaceSource::LegacyFunctionList))
+        .unwrap();
+    assert_eq!(
+        typed.version,
+        Some(Version {
+            major: table.version.0,
+            minor: table.version.1
+        })
+    );
+    assert!(matches!(
+        &typed.walk,
+        WalkOutcome::Full | WalkOutcome::KnownPrefix
+    ));
+    assert!(!typed.functions.is_empty());
+    let maps =
+        p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let hooks = HookRegistry::builtin();
+    let exports = p11scope_manifest::elf::exports_matching(
+        &p11scope_manifest::identity::open_object(so).unwrap(),
+        &hooks.names(),
+    )
+    .unwrap()
+    .into_iter()
+    .collect();
+    let (observed, _, _) =
+        scanned_word_oracle(table, &maps, &helper_object_ids(&manifest), owner, &exports);
+    for (raw, acquired) in observed.iter().zip(&typed.functions) {
+        assert_eq!(raw, acquired, "shared legacy ordinal must agree exactly");
+    }
+    // Extra observed positions remain in their original route. In particular
+    // the typed common 68 never truncates independently verified raw 92/104,
+    // and a raw 67 layout never invents the typed route's ordinal 67 as NULL.
+}
+
+/// Compare only positions both routes actually observed. Extra positions are
+/// checked by scanned_word_oracle, never inferred NULL in the shorter route.
+fn observed_prefix_agrees(
+    observed: &[FunctionRecord],
+    version: (u8, u8),
+    walk: &str,
+    helper: &SurfaceRecord,
+    available: usize,
+    anchor_limit: usize,
+) -> bool {
+    if helper.version
+        != Some(Version {
+            major: version.0,
+            minor: version.1,
+        })
+        || !matches!(&helper.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+        || observed.is_empty()
+        || helper.functions.is_empty()
+        || observed.len() > available
+        || observed.iter().enumerate().any(|(ordinal, function)| {
+            pkcs11_module::function_name(ordinal) != Some(function.name.as_str())
+        })
+        || observed
+            .iter()
+            .zip(&helper.functions)
+            .any(|(raw, typed)| raw != typed)
+    {
+        return false;
+    }
+    match walk {
+        "full" => helper.walk == WalkOutcome::Full && observed.len() == helper.functions.len(),
+        "known_prefix" if observed.len() == helper.functions.len() => true,
+        "known_prefix" => anchor_limit > 0 && observed.len() == available.min(anchor_limit),
+        _ => false,
+    }
 }
 
 #[test]
@@ -156,7 +380,7 @@ fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
                 "-DMATRIX_INTERFACES=0",
             ],
         );
-        load_and_populate(&so);
+        let legacy_address = load_and_populate(&so);
         let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&so)) else {
             panic!("scan must be available");
         };
@@ -167,23 +391,25 @@ fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
         let table = module
             .tables
             .iter()
-            .find(|t| t.version == (major, minor))
+            .find(|t| t.address == legacy_address && t.version == (major, minor))
             .unwrap_or_else(|| panic!("{major}.{minor} table not found"));
+        assert_eq!(table.walk, "full", "canonical complete layout stays full");
         assert_eq!(
             table.entries.len() + table.null_entries.len(),
             expected,
             "{major}.{minor} must decode {expected} slots"
         );
+        assert_legacy_shared_words(&so, table, module.key);
     }
 }
 
-/// Owner-approved 2026-09-27: future-minor legacy tables decode as known
-/// prefixes — [2,41] as the 68-slot layout, [3,9] as the 104-slot 3.2
-/// layout — with no version skip; [4,0] stays refused and silent.
+/// OD35: preserve useful future-minor and independently export-anchored
+/// unknown-major observations. Version metadata neither proves allocation
+/// nor discards a bounded prefix; the actual ordinal/offsets remain exact.
 #[test]
 fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
     let _guard = serial_guard();
-    for (major, minor, expected) in [(2u8, 41u8, 68usize), (3, 9, 104)] {
+    for (major, minor, expected) in [(2u8, 41u8, 68usize), (3, 9, 104), (4, 0, 68)] {
         let dir = tmp(&format!("scan-future-{major}-{minor}"));
         let so = build_fixture(
             &dir,
@@ -194,7 +420,7 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
                 "-DMATRIX_INTERFACES=0",
             ],
         );
-        load_and_populate(&so);
+        let legacy_address = load_and_populate(&so);
         let ScanOutcome::Scanned {
             modules, skipped, ..
         } = scan_self(std::slice::from_ref(&so))
@@ -208,7 +434,7 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
         let table = module
             .tables
             .iter()
-            .find(|t| t.version == (major, minor))
+            .find(|t| t.address == legacy_address && t.version == (major, minor))
             .unwrap_or_else(|| panic!("{major}.{minor} table not found"));
         assert_eq!(table.walk, "known_prefix");
         assert_eq!(
@@ -216,6 +442,9 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
             expected,
             "{major}.{minor} must decode {expected} slots"
         );
+        assert_legacy_shared_words(&so, table, module.key);
+        assert!(table.null_entries.is_empty());
+        assert!(table.unpinned.is_empty());
         assert!(
             skipped
                 .iter()
@@ -223,62 +452,104 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
             "no version skip: {skipped:?}"
         );
     }
-    // A new major stays refused, and the refusal is silent.
-    let dir = tmp("scan-refused-major");
-    let so = build_fixture(
-        &dir,
-        "refused",
-        &[
-            "-DLEGACY_MAJOR=4",
-            "-DLEGACY_MINOR=0",
-            "-DMATRIX_INTERFACES=0",
-        ],
-    );
-    load_and_populate(&so);
-    let ScanOutcome::Scanned {
-        modules, skipped, ..
-    } = scan_self(std::slice::from_ref(&so))
-    else {
-        panic!("scan must be available");
-    };
-    let module = modules
-        .iter()
-        .find(|m| m.path.ends_with("refused.so"))
-        .unwrap();
-    assert!(
-        !module.tables.iter().any(|t| t.version == (4, 0)),
-        "the [4,0] table stays refused"
-    );
-    assert!(
-        skipped
-            .iter()
-            .all(|skip| !skip.reason.contains("unsupported function-table")),
-        "no version skip: {skipped:?}"
-    );
 }
 
-/// Owner-approved 2026-09-27 (consistency check): for the version-matrix
-/// fixture built as verify-canaries.sh builds matrix-provider.so (legacy
-/// 2.40 plus the 13 interface tables), every table the scan decodes is a
-/// (version, slots, walk) triple the helper manifest also walks, no
-/// version skip is emitted. OD35 treats [4,0] as metadata too: an acquired
-/// interface retains its bounded common68 catalogue. Every raw-scan table
-/// must still agree with an actually acquired helper extent.
+#[test]
+fn sparse_words_keep_null_ordinals_but_unknown_raw_headers_still_need_an_anchor() {
+    let _guard = serial_guard();
+    for major in [2, 4] {
+        let minor = if major == 2 { 40 } else { 0 };
+        let dir = tmp(&format!("scan-sparse-major-{major}"));
+        let so = build_fixture(
+            &dir,
+            "sparse",
+            &[
+                &format!("-DLEGACY_MAJOR={major}"),
+                &format!("-DLEGACY_MINOR={minor}"),
+                "-DMATRIX_INTERFACES=0",
+                "-DSPARSE_LEGACY=3",
+            ],
+        );
+        let address = load_and_populate(&so);
+        let manifest = p11scope_discover::discover::discover(&so).unwrap();
+        let typed = manifest
+            .surfaces
+            .iter()
+            .find(|surface| matches!(&surface.source, SurfaceSource::LegacyFunctionList))
+            .unwrap();
+        assert_eq!(typed.version, Some(Version { major, minor }));
+        assert_eq!(typed.functions.len(), 68);
+        assert_eq!(
+            typed.walk,
+            if major == 2 {
+                WalkOutcome::Full
+            } else {
+                WalkOutcome::KnownPrefix
+            }
+        );
+        for (ordinal, function) in typed.functions.iter().enumerate() {
+            assert_eq!(
+                Some(function.name.as_str()),
+                pkcs11_module::function_name(ordinal)
+            );
+            if ordinal == 3 {
+                assert!(matches!(function.resolution, Resolution::Resolved { .. }));
+            } else {
+                assert_eq!(function.resolution, Resolution::NullPointer);
+            }
+        }
+        let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&so)) else {
+            panic!("self scan must be available")
+        };
+        let module = modules
+            .iter()
+            .find(|module| module.path.ends_with("sparse.so"))
+            .unwrap();
+        if major == 4 {
+            // SPARSE_LEGACY writes private s03, not the exported getter, at
+            // ordinal 3. Typed acquisition stays useful; an unknown raw
+            // header alone still cannot invent a table at that address.
+            assert!(!module.tables.iter().any(|table| table.address == address));
+        } else {
+            let table = module
+                .tables
+                .iter()
+                .find(|table| table.address == address)
+                .unwrap();
+            assert_eq!(table.walk, "full");
+            assert_eq!(table.entries.len(), 1);
+            assert_eq!(table.null_entries.len(), 67);
+            let maps =
+                p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap())
+                    .unwrap();
+            let (observed, available, anchor) = scanned_word_oracle(
+                table,
+                &maps,
+                &helper_object_ids(&manifest),
+                module.key,
+                &BTreeMap::new(),
+            );
+            assert!(observed_prefix_agrees(
+                &observed,
+                table.version,
+                table.walk,
+                typed,
+                available,
+                anchor
+            ));
+        }
+    }
+}
+
+/// Cross-route consistency for this fixed matrix: compare shared observed
+/// ordinals, not equality of separately acquired extents. The raw scan cannot
+/// cross its file-named VMA into anonymous BSS; typed helper reads can. An own
+/// export can also anchor more canonical raw positions than the helper's
+/// unknown-version common prefix. Unread positions in either route are not NULL.
 ///
-/// Reachability note: the scan covers only file-backed mappings
-/// (`candidate_groups` keeps inode-bearing mappings; snapshots are
-/// per-mapping), while the fixture's later statics live past the
-/// file-backed page tail in anonymous .bss — measured on this host's
-/// toolchain, the RW LOAD's file data ends at file offset 0x53c0 with a
-/// 3136-byte .bss tail in the last file-backed page, so the LP64 scan
-/// sees the first statics (legacy, t240, t30) but t31's window already
-/// crosses into the anonymous mapping. The [3,9] static is therefore
-/// outside the LP64 scan's reach in that measured layout (not by version gate),
-/// and the [3,9] scan-decode path itself is covered by
-/// `future_minor_legacy_tables_are_scanned_as_known_prefix` (the legacy
-/// static is first in .bss, always in the tail) and the `scan.rs` unit
-/// tests. On ILP32 the smaller tables put more statics in the tail; the
-/// live canary suite covers that lane.
+/// The manifest has no table address. This fixture uses version groups only
+/// after proving their duplicate helper surfaces agree at every shared position;
+/// that is a fixture-specific value oracle, not general table identity.
 #[test]
 fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
     let _guard = serial_guard();
@@ -328,25 +599,112 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
         .find(|m| m.path.ends_with("matrix.so"))
         .expect("the fixture must be discovered");
     assert!(!module.tables.is_empty(), "the scan must decode tables");
-    // The legacy static is first in .bss, so it is always in the
-    // file-backed tail; later statics depend on toolchain layout and are
-    // covered only by the membership check below.
+    let object_ids = helper_object_ids(&manifest);
+    let maps =
+        p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let hooks = HookRegistry::builtin();
+    let exports = p11scope_manifest::elf::exports_matching(
+        &p11scope_manifest::identity::open_object(&so).unwrap(),
+        &hooks.names(),
+    )
+    .unwrap()
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let walked = manifest
+        .surfaces
+        .iter()
+        .filter(|surface| matches!(&surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix))
+        .collect::<Vec<_>>();
+    for (index, left) in walked.iter().enumerate() {
+        for right in &walked[index + 1..] {
+            if left.version == right.version {
+                assert!(
+                    left.functions
+                        .iter()
+                        .zip(&right.functions)
+                        .all(|(a, b)| a == b),
+                    "same-version fixture surfaces must not hide ambiguous table values"
+                );
+            }
+        }
+    }
     assert!(
         module
             .tables
             .iter()
-            .any(|t| t.version == (2, 40) && t.walk == "full"),
-        "the scan must decode the legacy table"
+            .any(|table| table.version == (2, 40) && table.walk == "full")
     );
+    let mut canonical = None;
     for table in &module.tables {
-        let slots = table.entries.len() + table.null_entries.len() + table.unpinned.len();
-        assert!(
-            helper.contains(&(table.version, slots, table.walk)),
-            "{:?}: the scan decoded ({slots}, {}), which the helper does not walk: {helper:?}",
-            table.version,
-            table.walk,
-        );
+        let (observed, available, anchor_limit) =
+            scanned_word_oracle(table, &maps, &object_ids, module.key, &exports);
+        let matching = walked.iter().copied().find(|surface| {
+            observed_prefix_agrees(&observed, table.version, table.walk, surface, available, anchor_limit)
+        }).unwrap_or_else(|| {
+            panic!("{:?}: {} observed slots/{} disagree with shared helper positions; VMA words={available}, anchor={anchor_limit}, helper={helper:?}", table.version, observed.len(), table.walk)
+        });
+        if table.version == (3, 0) && table.walk == "full" {
+            canonical = Some((observed, matching, anchor_limit));
+        }
     }
+    let (complete, typed, anchor_limit) = canonical.expect("matrix has a complete 3.0 oracle twin");
+    assert_eq!(complete.len(), 92);
+    assert_eq!(typed.functions.len(), 92);
+    // Comparator controls use an explicitly shortened observation; they are
+    // not another production scan. Real file-tail observations above retain
+    // their actual addresses and read bounds (63 on the failing CI host).
+    let prefix = &complete[..63];
+    let agrees = |words: &[FunctionRecord], walk, available| {
+        observed_prefix_agrees(words, (3, 0), walk, typed, available, anchor_limit)
+    };
+    assert!(agrees(prefix, "known_prefix", 63));
+    assert!(!agrees(prefix, "full", 63));
+    assert!(
+        !agrees(prefix, "known_prefix", 64),
+        "an arbitrary subset is not a VMA/anchor boundary"
+    );
+    let mut bad_offset = prefix.to_vec();
+    if let Resolution::Resolved { file_offset, .. } = &mut bad_offset[0].resolution {
+        *file_offset += 1;
+    }
+    let mut bad_ordinal = prefix.to_vec();
+    bad_ordinal[0].name = bad_ordinal[1].name.clone();
+    let mut bad_null = prefix.to_vec();
+    bad_null[0].resolution = Resolution::NullPointer;
+    for changed in [bad_offset, bad_ordinal, bad_null] {
+        assert!(!agrees(&changed, "known_prefix", 63));
+    }
+    let mut invented_null = prefix.to_vec();
+    invented_null.push(FunctionRecord {
+        name: pkcs11_module::function_name(63).unwrap().to_owned(),
+        resolution: Resolution::NullPointer,
+    });
+    assert!(
+        !agrees(&invented_null, "known_prefix", 63),
+        "unread ordinal 63 cannot become NULL"
+    );
+    // Reverse extent twin: this matrix's 4.0 helper observes only its common
+    // 68, while the independently verified 3.0 raw vector supplies 92 actual
+    // words and the ordinal 68/69 exports. Varying only the metadata label for
+    // this comparator control must not erase the extra observed raw words.
+    let common = walked
+        .iter()
+        .copied()
+        .find(|surface| surface.version == Some(Version { major: 4, minor: 0 }))
+        .unwrap();
+    assert_eq!(common.functions.len(), 68);
+    assert!(observed_prefix_agrees(
+        &complete,
+        (4, 0),
+        "known_prefix",
+        common,
+        92,
+        anchor_limit
+    ));
+    assert!(
+        !observed_prefix_agrees(&complete, (4, 0), "known_prefix", common, 92, 68),
+        "extra raw extent needs its own extension anchor"
+    );
 }
 
 /// A provider-owned, statically initialised `CK_FUNCTION_LIST` plus the

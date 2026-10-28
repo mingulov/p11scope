@@ -240,7 +240,57 @@ def dencampaign_log(cells=DEN_CELLS, rounds=5):
     return log
 
 
+def den_analyze_text(log, cells=DEN_CELLS, rounds=5):
+    with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+        path = Path(work) / "campaign.log"
+        path.write_text(log)
+        _, samples, errors = ANALYZE["parse_log"](str(path))
+        assert not errors, errors
+        return ANALYZE["analyze_traced"](samples, cells, rounds)
+
+
 class TracedCostOracle(unittest.TestCase):
+    def test_traced_cost_accepts_exact_denominator_campaign(self):
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        self.assertEqual(len(rows), 2)
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        # Interpolated percentiles are float-exact to 1e-9 only.
+        self.assertAlmostEqual(t1["p10_ns"], 109.0, places=9)
+        self.assertAlmostEqual(t1["p90_ns"], 181.0, places=9)
+        self.assertEqual(t1["samples"], 10)
+        t4 = next(row for row in rows if row["cell"] == "relevant-call-t4")
+        self.assertEqual(
+            (t4["median_ns"], t4["p10_ns"], t4["p90_ns"], t4["samples"]),
+            (300.0, 300.0, 300.0, 10))
+        self.assertEqual(
+            ANALYZE["traced_cost_lines"](rows),
+            ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
+             "p10_ns=109.0 p90_ns=181.0 samples=10",
+             "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
+             "p10_ns=300.0 p90_ns=300.0 samples=10"])
+
+    def test_traced_cost_subtracts_the_unobserved_baseline(self):
+        # The pinned median is the per-pair observed-minus-unobserved
+        # cost (145.0), not the raw observed on-arm median (1150.0):
+        # dropping the subtraction fails this test.
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(dencampaign_log())
+            _, samples, _ = ANALYZE["parse_log"](str(path))
+        on_units = sorted(
+            ANALYZE["unit_ns"](s) for s in samples
+            if s["cell"] == "relevant-call-t1" and s["arm"] == "on")
+        self.assertEqual(len(on_units), 10)
+        on_median = (on_units[4] + on_units[5]) / 2
+        self.assertEqual(on_median, 1150.0)
+        self.assertNotEqual(t1["median_ns"], on_median)
+
     def test_traced_cost_reports_parseable_lines_end_to_end(self):
         with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
             path = Path(work) / "campaign.log"
@@ -257,6 +307,58 @@ class TracedCostOracle(unittest.TestCase):
              "p10_ns=109.0 p90_ns=181.0 samples=10",
              "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
              "p10_ns=300.0 p90_ns=300.0 samples=10"])
+
+    def test_traced_cost_rejects_bad_shapes(self):
+        log = dencampaign_log()
+        # An off arm or a scrambled order breaks the round shape.
+        bad_off = log.replace("cell=relevant-call-t1 arm=on round=1",
+                              "cell=relevant-call-t1 arm=off round=1", 1)
+        _, problems = den_analyze_text(bad_off)
+        self.assertTrue(any("order" in problem for problem in problems), problems)
+        bad_order = log.replace("cell=relevant-call-t1 arm=on round=2",
+                                "cell=relevant-call-t1 arm=unobserved round=2", 1)
+        _, problems = den_analyze_text(bad_order)
+        self.assertTrue(any("order" in problem for problem in problems), problems)
+        # Missing on-arm BPF corroboration or an evidenced baseline.
+        bad_bpf = log.replace("bpf_ns=200000 bpf_cnt=1000",
+                              "bpf_ns=none bpf_cnt=none", 1)
+        _, problems = den_analyze_text(bad_bpf)
+        self.assertTrue(any("BPF" in problem for problem in problems), problems)
+        bad_bare = log.replace("lane=none", "lane=multi", 1)
+        _, problems = den_analyze_text(bad_bare)
+        self.assertTrue(any("unobserved" in problem for problem in problems),
+                        problems)
+        # The on-arm count re-verifies against the workload denominator.
+        bad_count = log.replace("edge_count=1003", "edge_count=1002", 1)
+        _, problems = den_analyze_text(bad_count)
+        self.assertTrue(any("denominator" in problem for problem in problems),
+                        problems)
+        # Missing or extra cells, short rounds, mixed lanes, rebinding.
+        _, problems = den_analyze_text(dencampaign_log(cells=DEN_CELLS[:1]))
+        self.assertTrue(any("relevant-call-t4" in problem for problem in problems),
+                        problems)
+        extra = log + sample("rogue", "on", 1, 1, 100, 100000,
+                             **counted(1, 100), **bpf())
+        _, problems = den_analyze_text(extra)
+        self.assertTrue(any("rogue" in problem for problem in problems), problems)
+        _, problems = den_analyze_text(dencampaign_log(rounds=2))
+        self.assertTrue(any("rounds" in problem for problem in problems), problems)
+        bad_lane = log.replace("lane=multi", "lane=singles", 1)
+        _, problems = den_analyze_text(bad_lane)
+        self.assertTrue(any("mixed lane" in problem for problem in problems),
+                        problems)
+        bad_threads = log.replace("threads=4", "threads=1", 1)
+        _, problems = den_analyze_text(bad_threads)
+        self.assertTrue(any("workload" in problem for problem in problems),
+                        problems)
+        # The modes do not leak into each other.
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(log)
+            _, samples, _ = ANALYZE["parse_log"](str(path))
+        _, problems = ANALYZE["analyze"](samples, 5.0, 10.0, DEN_CELLS, 5)
+        self.assertTrue(problems, "an on/unobserved log is not an M2 campaign")
+
 
 if __name__ == "__main__":
     unittest.main()

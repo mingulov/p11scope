@@ -30,9 +30,16 @@ evidence at all. A reduced or reshaped log renders no verdict.
 --cells/--rounds override the required shape for explicitly non-M2 reuse;
 the report then names the custom shape instead of the M2 gate.
 
+Denominator reuse (--traced-cost, the R-47 N5 production cost):
+each round runs on/unobserved ABBA (odd) or BAAB (even) with no base
+arm, and the tool prints one TRACED_COST line per cell (median and
+p10/p90 spread of the per-pair observed-minus-unobserved ns per
+call). Every per-sample gate above still applies; the --rel-pct and
+--ci-pct bars belong to the M2 report only.
+
 Usage:
   scripts/bench-count-overhead-analyze.py LOG [--rel-pct 5.0] [--ci-pct 10.0]
-      [--cells a,b] [--rounds N]
+      [--cells a,b] [--rounds N] [--traced-cost]
   scripts/bench-count-overhead-analyze.py --self-test
 
 Exit 0 prints the table and verdict. Exit 1 when the shape is not the
@@ -162,6 +169,17 @@ def summarize(values):
     }
 
 
+def traced_percentile(ordered, pct):
+    """Linear-interpolation percentile of a sorted non-empty list."""
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * pct / 100.0
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    frac = rank - low
+    return ordered[low] + (ordered[high] - ordered[low]) * frac
+
+
 def paired_deltas(cell_samples):
     """Per-round i-th-on minus i-th-off deltas in log order.
 
@@ -176,6 +194,27 @@ def paired_deltas(cell_samples):
         if len(on) != len(off) or not on:
             return [], f"round {rnd}: on={len(on)} off={len(off)} samples do not pair"
         for a, b in zip(on, off):
+            deltas.append(unit_ns(a) - unit_ns(b))
+    return deltas, ""
+
+
+def paired_traced_deltas(cell_samples):
+    """Per-round i-th-on minus i-th-unobserved deltas in log order.
+
+    Returns (deltas, problem): deltas is the flat pair list, problem names
+    a round whose arms do not pair (fail closed).
+    """
+    deltas = []
+    rounds = sorted({s["round"] for s in cell_samples
+                     if s["arm"] in ("on", "unobserved")})
+    for rnd in rounds:
+        on = [s for s in cell_samples if s["round"] == rnd and s["arm"] == "on"]
+        bare = [s for s in cell_samples if s["round"] == rnd
+                and s["arm"] == "unobserved"]
+        if len(on) != len(bare) or not on:
+            return [], (f"round {rnd}: on={len(on)} unobserved={len(bare)} "
+                        "samples do not pair")
+        for a, b in zip(on, bare):
             deltas.append(unit_ns(a) - unit_ns(b))
     return deltas, ""
 
@@ -405,6 +444,153 @@ def analyze(samples, rel_bar, ci_bar, required_cells=M2_CELLS, required_rounds=M
     return rows, problems
 
 
+def analyze_traced(samples, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
+    """Per-cell production traced cost (the R-47 N5 15% denominator).
+
+    Returns (rows, problems). Each row holds one cell's median and
+    spread (p10/p90) of the per-pair observed-minus-unobserved ns per
+    call plus the pair count. Every M2 per-sample gate is kept: the
+    log must hold exactly the required cells, each under its exact
+    workload, each with contiguous rounds 1..R (R >= required) in
+    strict on/unobserved ABBA (odd) or BAAB (even) order, each on-arm
+    sample count-exact against the recomputed workload denominator
+    with independent BPF corroboration, and each unobserved baseline
+    carrying no observed evidence. Anything less renders no numbers.
+    """
+    rows = []
+    problems = []
+    cells = sorted({sample["cell"] for sample in samples})
+    missing = [name for name in required_cells if name not in cells]
+    extra = [name for name in cells if name not in required_cells]
+    if missing or extra:
+        problems.append(f"expected cells {list(required_cells)}: missing {missing}, "
+                        f"unexpected {extra}")
+        return rows, problems
+    for cell in cells:
+        cell_samples = [s for s in samples if s["cell"] == cell]
+        workload = M2_WORKLOADS.get(cell)
+        if workload is not None:
+            reshaped = [s for s in cell_samples
+                        if s["mode"] != workload["mode"]
+                        or s["threads"] != workload["threads"]
+                        or s["pad"] != workload["pad"]]
+            if reshaped:
+                first = reshaped[0]
+                problems.append(
+                    f"cell {cell}: line {first['lineno']}: workload "
+                    f"mode={first['mode']} threads={first['threads']} "
+                    f"pad={first['pad']}, want mode={workload['mode']} "
+                    f"threads={workload['threads']} pad={workload['pad']}"
+                )
+                continue
+            mode = workload["mode"]
+        else:
+            modes = {s["mode"] for s in cell_samples}
+            if len(modes) != 1:
+                problems.append(f"cell {cell}: mixed modes {sorted(modes)}")
+                continue
+            mode = cell_samples[0]["mode"]
+        present = sorted({s["round"] for s in cell_samples})
+        if present != list(range(1, len(present) + 1)):
+            problems.append(f"cell {cell}: rounds {present} are not contiguous from 1")
+            continue
+        if len(present) < required_rounds:
+            problems.append(f"cell {cell}: {len(present)} rounds, need >= {required_rounds}")
+            continue
+        shaped = True
+        for rnd in present:
+            order = [s["arm"] for s in cell_samples if s["round"] == rnd]
+            want = (["on", "unobserved", "unobserved", "on"] if rnd % 2
+                    else ["unobserved", "on", "on", "unobserved"])
+            if order != want:
+                problems.append(f"cell {cell}: round {rnd} order {order} is not "
+                                "the on/unobserved ABBA/BAAB round order")
+                shaped = False
+        if not shaped:
+            continue
+        on = [s for s in cell_samples if s["arm"] == "on"]
+        if not on:
+            problems.append(f"cell {cell}: no on-arm samples")
+            continue
+        lanes = {s["lane"] for s in on}
+        if len(lanes) != 1 or lanes == {"none"}:
+            problems.append(f"cell {cell}: mixed lane mechanisms {sorted(lanes)}")
+            continue
+        for s in cell_samples:
+            if s["arm"] == "unobserved":
+                if not (s["edge_state"] == "none" and s["edge_count"] is None
+                        and s["edge_expected"] is None and s["lane"] == "none"
+                        and s["bpf_ns"] is None and s["bpf_cnt"] is None):
+                    problems.append(
+                        f"cell {cell}: line {s['lineno']}: unobserved sample carries "
+                        "observed evidence"
+                    )
+                continue
+            if mode == "call":
+                want = s["ops"] + 2 * s["threads"] + 1
+                if not (s["edge_state"] == "counted"
+                        and s["edge_count"] == want
+                        and s["edge_expected"] == want):
+                    problems.append(
+                        f"cell {cell}: line {s['lineno']}: on-arm count "
+                        f"{s['edge_count']} / expected {s['edge_expected']} != "
+                        f"workload denominator {want} (ops={s['ops']} "
+                        f"threads={s['threads']} {s['edge_state']})"
+                    )
+            elif not (s["edge_state"] == "none" and s["edge_count"] is None
+                      and s["edge_expected"] is None):
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: map-cell edge "
+                    f"{s['edge_count']}/{s['edge_expected']} {s['edge_state']}, want none"
+                )
+            ns, cnt = s["bpf_ns"], s["bpf_cnt"]
+            if ns is None or cnt is None:
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: on-arm BPF "
+                    "corroboration missing"
+                )
+            elif mode == "call" and not (ns > 0 and cnt > 0):
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: on-arm BPF run-time "
+                    f"vacuous (ns={ns} cnt={cnt})"
+                )
+            elif mode == "mmap" and not (ns >= 0 and cnt >= 0):
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: on-arm BPF run-time "
+                    f"invalid (ns={ns} cnt={cnt})"
+                )
+        if problems and problems[-1].startswith(f"cell {cell}: line"):
+            continue
+        deltas, pairing = paired_traced_deltas(cell_samples)
+        if pairing:
+            problems.append(f"cell {cell}: {pairing}")
+            continue
+        if len(deltas) < 2:
+            problems.append(f"cell {cell}: only {len(deltas)} pair(s), need >= 2")
+            continue
+        ordered = sorted(deltas)
+        rows.append(
+            {
+                "cell": cell,
+                "median_ns": statistics.median(ordered),
+                "p10_ns": traced_percentile(ordered, 10),
+                "p90_ns": traced_percentile(ordered, 90),
+                "samples": len(ordered),
+            }
+        )
+    return rows, problems
+
+
+def traced_cost_lines(rows):
+    """One parseable TRACED_COST line per denominator row."""
+    return [
+        f"TRACED_COST cell={row['cell']} median_ns={row['median_ns']:.1f} "
+        f"p10_ns={row['p10_ns']:.1f} p90_ns={row['p90_ns']:.1f} "
+        f"samples={row['samples']}"
+        for row in rows
+    ]
+
+
 def report(headers, rows, rel_bar, ci_bar, required_cells=M2_CELLS,
            required_rounds=M2_ROUNDS):
     """Render the comparison table plus the verdict; returns the verdict."""
@@ -490,6 +676,7 @@ def main(argv):
         return 0
     rel_bar, ci_bar, positional = 5.0, 10.0, []
     required_cells, required_rounds = M2_CELLS, M2_ROUNDS
+    traced = False
     index = 0
     while index < len(args):
         if args[index] == "--rel-pct" and index + 1 < len(args):
@@ -498,6 +685,9 @@ def main(argv):
         elif args[index] == "--ci-pct" and index + 1 < len(args):
             ci_bar = float(args[index + 1])
             index += 2
+        elif args[index] == "--traced-cost":
+            traced = True
+            index += 1
         elif args[index] == "--cells" and index + 1 < len(args):
             required_cells = tuple(name for name in args[index + 1].split(",") if name)
             if not required_cells or len(set(required_cells)) != len(required_cells):
@@ -523,7 +713,8 @@ def main(argv):
     if len(positional) != 1:
         print(
             "usage: bench-count-overhead-analyze.py LOG "
-            "[--rel-pct PCT] [--ci-pct PCT] [--cells a,b] [--rounds N]",
+            "[--rel-pct PCT] [--ci-pct PCT] [--cells a,b] [--rounds N] "
+            "[--traced-cost]",
             file=sys.stderr,
         )
         return 2
@@ -535,6 +726,14 @@ def main(argv):
     if not samples:
         print("no samples in the log", file=sys.stderr)
         return 1
+    if traced:
+        rows, problems = analyze_traced(samples, required_cells, required_rounds)
+        if problems:
+            for problem in problems:
+                print(f"cannot compare: {problem}", file=sys.stderr)
+            return 1
+        sys.stdout.write("\n".join(traced_cost_lines(rows)) + "\n")
+        return 0
     rows, problems = analyze(samples, rel_bar, ci_bar, required_cells, required_rounds)
     if problems:
         for problem in problems:
@@ -723,6 +922,112 @@ def self_test():
         assert bad, "a bad arm must be reported"
         _, empty, _ = load("MACHINE nothing here\n")
         assert not empty
+        # Denominator mode (the R-47 N5 production cost): on/unobserved
+        # ABBA per round, traced cost per pair, TRACED_COST lines. t1
+        # diffs run 100..190 over alternating bare walls (the
+        # subtraction is per pair, not against a median); t4 is flat.
+        den_cells = ("relevant-call-t1", "relevant-call-t4")
+
+        def dencampaign(cells, rounds):
+            text = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+            text += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
+            for cell in cells:
+                workload = M2_WORKLOADS[cell]
+                threads = workload["threads"]
+                pad = workload["pad"]
+                pair = 0
+                for rnd in range(1, rounds + 1):
+                    arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                        "unobserved", "on", "on", "unobserved")
+                    on_queue, bare_queue = [], []
+                    for _ in range(2):
+                        if cell == "relevant-call-t1":
+                            bare = 1000000 + (pair % 2) * 10000
+                            diff = 100 + 10 * pair
+                        else:
+                            bare = 1000000
+                            diff = 300
+                        on_queue.append(bare + diff * 1000 // threads)
+                        bare_queue.append(bare)
+                        pair += 1
+                    for arm in arms:
+                        if arm == "on":
+                            exact = 1000 + 2 * threads + 1
+                            text += sample(cell, arm, rnd, threads, 1000,
+                                           on_queue.pop(0), pad=pad,
+                                           edge_count=exact, edge_expected=exact,
+                                           edge_state="counted",
+                                           bpf_ns=200000, bpf_cnt=1000)
+                        else:
+                            text += sample(cell, arm, rnd, threads, 1000,
+                                           bare_queue.pop(0), pad=pad, lane="none")
+            return text
+
+        den_log = dencampaign(den_cells, 5)
+        _, den_samples, den_errors = load(den_log)
+        assert not den_errors, den_errors
+        assert len(den_samples) == 2 * 5 * 4, len(den_samples)
+        den_rows, den_problems = analyze_traced(den_samples, den_cells, 5)
+        assert not den_problems, den_problems
+        assert len(den_rows) == 2, den_rows
+        t1row = next(r for r in den_rows if r["cell"] == "relevant-call-t1")
+        assert t1row["median_ns"] == 145.0, t1row
+        # Interpolated percentiles: float-exact only to 1e-9 (0.9 is
+        # not exact in binary); the printed line rounds to 1 decimal.
+        assert abs(t1row["p10_ns"] - 109.0) < 1e-9, t1row
+        assert abs(t1row["p90_ns"] - 181.0) < 1e-9, t1row
+        assert t1row["samples"] == 10, t1row
+        t4row = next(r for r in den_rows if r["cell"] == "relevant-call-t4")
+        assert (t4row["median_ns"], t4row["p10_ns"], t4row["p90_ns"],
+                t4row["samples"]) == (300.0, 300.0, 300.0, 10), t4row
+        assert traced_cost_lines(den_rows) == [
+            "TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
+            "p10_ns=109.0 p90_ns=181.0 samples=10",
+            "TRACED_COST cell=relevant-call-t4 median_ns=300.0 "
+            "p10_ns=300.0 p90_ns=300.0 samples=10",
+        ], traced_cost_lines(den_rows)
+        # Every denominator failure mode fails loudly.
+        den_off = den_log.replace("cell=relevant-call-t1 arm=on round=1",
+                                  "cell=relevant-call-t1 arm=off round=1", 1)
+        _, problems = analyze_traced(load(den_off)[1], den_cells, 5)
+        assert any("order" in p for p in problems), problems
+        den_scrambled = den_log.replace("cell=relevant-call-t1 arm=on round=2",
+                                        "cell=relevant-call-t1 arm=unobserved round=2", 1)
+        _, problems = analyze_traced(load(den_scrambled)[1], den_cells, 5)
+        assert any("order" in p for p in problems), problems
+        den_no_bpf = load(den_log.replace("bpf_ns=200000 bpf_cnt=1000",
+                                          "bpf_ns=none bpf_cnt=none", 1))
+        _, problems = analyze_traced(den_no_bpf[1], den_cells, 5)
+        assert any("BPF" in p for p in problems), problems
+        den_evidenced = load(den_log.replace("lane=none", "lane=multi", 1))
+        _, problems = analyze_traced(den_evidenced[1], den_cells, 5)
+        assert any("unobserved" in p for p in problems), problems
+        den_bad_count = load(den_log.replace("edge_count=1003", "edge_count=1002", 1))
+        _, problems = analyze_traced(den_bad_count[1], den_cells, 5)
+        assert any("denominator" in p for p in problems), problems
+        _, problems = analyze_traced(load(dencampaign(den_cells[:1], 5))[1],
+                                     den_cells, 5)
+        assert any("relevant-call-t4" in p for p in problems), problems
+        den_extra = den_log + sample("rogue", "on", 1, 1, 100, 100000,
+                                     edge_count=103, edge_expected=103,
+                                     edge_state="counted", bpf_ns=1, bpf_cnt=1)
+        _, problems = analyze_traced(load(den_extra)[1], den_cells, 5)
+        assert any("rogue" in p for p in problems), problems
+        _, problems = analyze_traced(load(dencampaign(den_cells, 2))[1],
+                                     den_cells, 5)
+        assert any("rounds" in p for p in problems), problems
+        den_lane = load(den_log.replace("lane=multi", "lane=singles", 1))
+        _, problems = analyze_traced(den_lane[1], den_cells, 5)
+        assert any("mixed lane" in p for p in problems), problems
+        den_threads = load(den_log.replace("threads=4", "threads=1", 1))
+        _, problems = analyze_traced(den_threads[1], den_cells, 5)
+        assert any("workload" in p for p in problems), problems
+        # The modes do not leak into each other.
+        _, problems = analyze(den_samples, 5.0, 10.0, den_cells, 5)
+        assert problems, "an on/unobserved log is not an M2 campaign"
+        _, m2_samples, _ = load(campaign(("relevant-call-t1",), 5))
+        _, problems = analyze_traced(m2_samples, ("relevant-call-t1",), 5)
+        assert problems, "an on/off log is not a denominator campaign"
     print("bench-count-overhead-analyze self-test: OK")
 
 

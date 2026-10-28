@@ -74,6 +74,19 @@
 # BASE_BIN (default /var/tmp/p11scope-ws-tmp/m2-base/target/release/p11scope),
 # OBS_CPUS (default 10,11), WCPUS_T1/T4/T12, LOCK, TMPDIR (must be a disk
 # filesystem; the campaign keeps per-sample evidence under its work dir).
+#
+# Prebuilt + denominator reuse (the R-47 N5 production cost on a
+# no-build host): PREBUILT=1 skips every build (no cargo, no gcc)
+# and stages caller-provided binaries (CAND_BIN plus MT_COUNT_BIN,
+# and MAP_CHURN_BIN/GATED_BIN when unrelated-mmap is selected;
+# each recorded by sha256, a missing or non-executable input
+# refuses); ARMS=on-unobserved runs on/unobserved ABBA rounds with
+# no base binary, and the campaign analysis prints one TRACED_COST
+# line per cell (median and spread of observed-minus-unobserved
+# ns/call). PREBUILT_COMMIT names the exported commit when no VCS
+# tree is staged (provenance is the staged-input shas instead of
+# the clean-tree check). Defaults are unchanged: PREBUILT=0 with
+# ARMS=default runs the exact M2 method.
 set -eu
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -97,6 +110,12 @@ OBS_CPUS=${OBS_CPUS:-10,11}
 WCPUS_T1=${WCPUS_T1:-2}
 WCPUS_T4=${WCPUS_T4:-2-5}
 WCPUS_T12=${WCPUS_T12:-0-9}
+PREBUILT=${PREBUILT:-0}
+ARMS=${ARMS:-default}
+PREBUILT_COMMIT=${PREBUILT_COMMIT:-}
+MT_COUNT_BIN=${MT_COUNT_BIN:-}
+MAP_CHURN_BIN=${MAP_CHURN_BIN:-}
+GATED_BIN=${GATED_BIN:-}
 LANE_MARKER="p11scope: native usage lane active"
 KIND=p11scope-control-plane
 WORK=
@@ -190,6 +209,71 @@ if coverage.get("lossy") is not None:
     sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want null")
 print("none witnessed")
 EOF
+}
+
+# round_arms MODE ROUND: the observed arm order for one round on
+# stdout (ABBA on odd rounds, BAAB on even). Default pairs on/off;
+# on-unobserved pairs on/unobserved for the R-47 denominator (no
+# base binary). Fails on an unknown mode.
+round_arms() {
+    case $1 in
+        default|on-unobserved) : ;;
+        *) return 1 ;;
+    esac
+    if [ $(( $2 % 2 )) -eq 1 ]; then
+        if [ "$1" = on-unobserved ]; then echo "on unobserved unobserved on";
+        else echo "on off off on"; fi
+    else
+        if [ "$1" = on-unobserved ]; then echo "unobserved on on unobserved";
+        else echo "off on on off"; fi
+    fi
+}
+
+# validate_arms MODE / validate_prebuilt_env PREBUILT
+# PREBUILT_COMMIT: mode-knob validation (0 valid, 1 usage error).
+# A commit override only makes sense with staged prebuilt inputs.
+validate_arms() {
+    case $1 in default|on-unobserved) return 0 ;; *) return 1 ;; esac
+}
+
+validate_prebuilt_env() {
+    case $1 in 0|1) : ;; *) return 1 ;; esac
+    if [ -n "$2" ] && [ "$1" != 1 ]; then return 1; fi
+    return 0
+}
+
+# stage_prebuilt_inputs DEST: PREBUILT=1 input staging. No cargo, no
+# gcc: check the caller-staged binaries, copy the fixtures into
+# DEST, and print one BINARY line per staged input with its
+# sha256. CAND_BIN and MT_COUNT_BIN are always required; the map
+# fixtures only when the selected cells use them (unrelated-mmap).
+# Any missing or non-executable input fails by name: never a
+# silent fallback to a build.
+stage_prebuilt_inputs() {
+    spi_dest=$1
+    test -x "$CAND_BIN" || { echo "bench-count-overhead: prebuilt CAND_BIN missing or not executable: $CAND_BIN" >&2; return 1; }
+    test -x "$MT_COUNT_BIN" || { echo "bench-count-overhead: prebuilt MT_COUNT_BIN missing or not executable: $MT_COUNT_BIN" >&2; return 1; }
+    spi_need_map=0
+    for spi_cell in $CELLS; do
+        if [ "$spi_cell" = unrelated-mmap ]; then spi_need_map=1; fi
+    done
+    if [ "$spi_need_map" = 1 ]; then
+        test -x "$MAP_CHURN_BIN" || { echo "bench-count-overhead: prebuilt MAP_CHURN_BIN missing or not executable: $MAP_CHURN_BIN" >&2; return 1; }
+        test -x "$GATED_BIN" || { echo "bench-count-overhead: prebuilt GATED_BIN missing or not executable: $GATED_BIN" >&2; return 1; }
+    fi
+    mkdir -p "$spi_dest" || return 1
+    chmod 0700 "$spi_dest" || return 1
+    cp "$MT_COUNT_BIN" "$spi_dest/mt_count" || return 1
+    chmod +x "$spi_dest/mt_count" || return 1
+    echo "BINARY role=mt_count path=$MT_COUNT_BIN sha256=$(sha256sum "$spi_dest/mt_count" | cut -d' ' -f1)"
+    if [ "$spi_need_map" = 1 ]; then
+        cp "$MAP_CHURN_BIN" "$spi_dest/map_churn" || return 1
+        chmod +x "$spi_dest/map_churn" || return 1
+        echo "BINARY role=map_churn path=$MAP_CHURN_BIN sha256=$(sha256sum "$spi_dest/map_churn" | cut -d' ' -f1)"
+        cp "$GATED_BIN" "$spi_dest/gated" || return 1
+        chmod +x "$spi_dest/gated" || return 1
+        echo "BINARY role=gated path=$GATED_BIN sha256=$(sha256sum "$spi_dest/gated" | cut -d' ' -f1)"
+    fi
 }
 
 # check_native_lane DIR: the unrelated-cell gate. The idle anchor makes no
@@ -322,6 +406,92 @@ EOF
     st_inventory anchor-lane unknown 0 null scan
     st_gate fail anchor-lane check_native_lane "$SELF_TEST_WORK/anchor-lane"
     [ "$ST_GATE_OK" -eq 14 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 14" >&2; exit 1; }
+    # Prebuilt + denominator-mode controls: per-round arm order in
+    # each mode, ARMS/PREBUILT validation, and prebuilt input
+    # staging (a missing or non-executable input refuses by name;
+    # the map fixtures are only required when unrelated-mmap is
+    # selected). Counter pinned exactly like ST_GATE_OK.
+    ST_MODE_OK=0
+    st_mode() {
+        # st_mode RC NAME PATTERN CMD... : CMD must exit RC and its
+        # combined output must match PATTERN ("-" skips the match).
+        st_want_rc=$1; st_name=$2; st_pattern=$3; shift 3
+        if "$@" >"$SELF_TEST_WORK/mode.out" 2>&1; then st_rc=0; else st_rc=$?; fi
+        st_match=0
+        if [ "$st_pattern" = "-" ] || grep -q "$st_pattern" "$SELF_TEST_WORK/mode.out" 2>/dev/null; then
+            st_match=1
+        fi
+        if [ "$st_rc" -eq "$st_want_rc" ] && [ "$st_match" -eq 1 ]; then
+            ST_MODE_OK=$((ST_MODE_OK + 1))
+        else
+            echo "self-test: mode $st_name: want rc=$st_want_rc match=$st_pattern, got rc=$st_rc:" >&2
+            cat "$SELF_TEST_WORK/mode.out" >&2; exit 1
+        fi
+    }
+    st_arms() {
+        # st_arms MODE ROUND WANT: exact arm order for one round.
+        st_got=$(round_arms "$1" "$2" 2>/dev/null) || st_got=
+        if [ "$st_got" = "$3" ]; then
+            ST_MODE_OK=$((ST_MODE_OK + 1))
+        else
+            echo "self-test: round_arms $1 round $2: have '$st_got', want '$3'" >&2
+            exit 1
+        fi
+    }
+    st_arms default 1 "on off off on"
+    st_arms default 2 "off on on off"
+    st_arms on-unobserved 1 "on unobserved unobserved on"
+    st_arms on-unobserved 2 "unobserved on on unobserved"
+    st_mode 1 round-arms-bogus "-" round_arms bogus 1
+    st_mode 0 validate-arms-default "-" validate_arms default
+    st_mode 0 validate-arms-denominator "-" validate_arms on-unobserved
+    st_mode 1 validate-arms-bogus "-" validate_arms bogus
+    st_mode 0 validate-prebuilt-plain "-" validate_prebuilt_env 0 ""
+    st_mode 0 validate-prebuilt-commit "-" validate_prebuilt_env 1 "abc123"
+    st_mode 1 validate-prebuilt-badflag "-" validate_prebuilt_env 2 ""
+    st_mode 1 validate-prebuilt-commit-without-prebuilt "-" validate_prebuilt_env 0 "abc123"
+    ST_PRE=$SELF_TEST_WORK/prebuilt-inputs
+    mkdir -p "$ST_PRE/in" "$ST_PRE/dest"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/cand"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/mt"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/map"
+    printf '#!/bin/sh\necho staged\n' > "$ST_PRE/in/gated"
+    printf 'not an executable\n' > "$ST_PRE/in/nonexec"
+    chmod +x "$ST_PRE/in/cand" "$ST_PRE/in/mt" "$ST_PRE/in/map" "$ST_PRE/in/gated"
+    ST_PRE_MT_SHA=$(sha256sum "$ST_PRE/in/mt" | cut -d' ' -f1)
+    ST_PRE_SAVED_CAND=$CAND_BIN
+    ST_PRE_SAVED_CELLS=$CELLS
+    CAND_BIN=$ST_PRE/in/cand
+    MT_COUNT_BIN=$ST_PRE/in/mt
+    MAP_CHURN_BIN=$ST_PRE/in/map
+    GATED_BIN=$ST_PRE/in/gated
+    CELLS="relevant-call-t1"
+    st_mode 0 stage-call-cells-ok "BINARY role=mt_count .* sha256=$ST_PRE_MT_SHA" stage_prebuilt_inputs "$ST_PRE/dest"
+    if [ -x "$ST_PRE/dest/mt_count" ]; then
+        ST_MODE_OK=$((ST_MODE_OK + 1))
+    else
+        echo "self-test: staged mt_count missing or not executable" >&2; exit 1
+    fi
+    MAP_CHURN_BIN=; GATED_BIN=
+    st_mode 0 stage-map-not-required "-" stage_prebuilt_inputs "$ST_PRE/dest"
+    CELLS="unrelated-mmap"
+    st_mode 1 stage-map-required "MAP_CHURN_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MAP_CHURN_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-map-missing "MAP_CHURN_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MAP_CHURN_BIN=$ST_PRE/in/map; GATED_BIN=$ST_PRE/in/gated
+    st_mode 0 stage-map-ok "BINARY role=map_churn" stage_prebuilt_inputs "$ST_PRE/dest"
+    CELLS="relevant-call-t1"
+    MT_COUNT_BIN=$ST_PRE/in/nonexec
+    st_mode 1 stage-mt-nonexec "MT_COUNT_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MT_COUNT_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-mt-missing "MT_COUNT_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    MT_COUNT_BIN=$ST_PRE/in/mt
+    CAND_BIN=$ST_PRE/in/does-not-exist
+    st_mode 1 stage-cand-missing "CAND_BIN" stage_prebuilt_inputs "$ST_PRE/dest"
+    CAND_BIN=$ST_PRE_SAVED_CAND
+    CELLS=$ST_PRE_SAVED_CELLS
+    MT_COUNT_BIN=; MAP_CHURN_BIN=; GATED_BIN=
+    [ "$ST_MODE_OK" -eq 21 ] || { echo "self-test: ran $ST_MODE_OK mode controls, want 21" >&2; exit 1; }
     python3 -I scripts/bench-count-overhead-analyze.py --self-test \
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     echo "bench-count-overhead self-test: OK"
@@ -339,6 +509,9 @@ for cell in $CELLS; do
         *) echo "usage: unknown cell $cell" >&2; exit 2 ;;
     esac
 done
+validate_arms "$ARMS" || { echo "usage: unknown ARMS $ARMS (want default or on-unobserved)" >&2; exit 2; }
+validate_prebuilt_env "$PREBUILT" "$PREBUILT_COMMIT" \
+    || { echo "usage: PREBUILT is 0 or 1 and PREBUILT_COMMIT needs PREBUILT=1" >&2; exit 2; }
 
 # The observer refuses an output directory below any group- or other-writable
 # ancestor, which a checkout under a 0775 home tree has, so the campaign works
@@ -367,7 +540,7 @@ cleanup() {
 }
 . scripts/cleanup-traps.sh
 
-command -v gcc >/dev/null || die "gcc required"
+if [ "$PREBUILT" != 1 ]; then command -v gcc >/dev/null || die "gcc required"; fi
 command -v softhsm2-util >/dev/null || die "softhsm2-util required"
 command -v python3 >/dev/null || die "python3 required"
 command -v bpftool >/dev/null || die "bpftool required"
@@ -376,7 +549,7 @@ command -v taskset >/dev/null || die "taskset required"
 test -f "$MODULE" || die "SoftHSM2 not installed at $MODULE"
 [ "$(id -u)" -ne 0 ] || die "run as a non-root user with passwordless sudo"
 sudo -n true 2>/dev/null || die "passwordless sudo required"
-test -x "$BASE_BIN" || die "prebuilt base binary missing: $BASE_BIN"
+if [ "$ARMS" = default ]; then test -x "$BASE_BIN" || die "prebuilt base binary missing: $BASE_BIN"; fi
 
 # An ancestor must hold the privileged lock: a concurrent privileged test or
 # capture would charge these samples. Run under `flock "$LOCK" $0`.
@@ -414,7 +587,12 @@ fi
 if sudo -n bpftool prog show 2>/dev/null | grep -q "p11_"; then
     refuse "p11_* BPF programs are already attached"
 fi
-[ -z "$(git status --porcelain -- . ':!target')" ] || refuse "the tree is not clean"
+# A prebuilt export carries no VCS tree; its provenance is the
+# staged-input shas, so the clean-tree check only applies without
+# a commit override.
+if [ -z "$PREBUILT_COMMIT" ]; then
+    [ -z "$(git status --porcelain -- . ':!target')" ] || refuse "the tree is not clean"
+fi
 
 build_processes() {
     cat /proc/[0-9]*/comm 2>/dev/null | grep -cxE 'cargo|rustc'
@@ -559,15 +737,21 @@ print(f"{ns} {cnt}")
 }
 
 echo "=== build ==="
-scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --bin p11scope
-test -x "$CAND_BIN" || die "candidate observer missing: $CAND_BIN"
-mkdir -m 0700 -p "$WORK/bin"
-gcc -O2 -Wall -Wextra -Werror -pthread -o "$WORK/bin/mt_count" "$FIX/mt_count.c" -ldl \
-    || die "mt_count does not compile"
-gcc -O2 -Wall -Wextra -Werror -o "$WORK/bin/map_churn" "$FIX/map_churn.c" \
-    || die "map_churn does not compile"
-gcc -O1 -Wall -Wextra -Werror -o "$WORK/bin/gated" tests/fixtures/public-cli/gated.c -ldl \
-    || die "gated does not compile"
+if [ "$PREBUILT" = 1 ]; then
+    stage_prebuilt_inputs "$WORK/bin" > "$WORK/prebuilt.inputs" \
+        || die "prebuilt inputs incomplete (see above)"
+    while IFS= read -r prebuilt_line; do say "$prebuilt_line"; done < "$WORK/prebuilt.inputs"
+else
+    scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --bin p11scope
+    test -x "$CAND_BIN" || die "candidate observer missing: $CAND_BIN"
+    mkdir -m 0700 -p "$WORK/bin"
+    gcc -O2 -Wall -Wextra -Werror -pthread -o "$WORK/bin/mt_count" "$FIX/mt_count.c" -ldl \
+        || die "mt_count does not compile"
+    gcc -O2 -Wall -Wextra -Werror -o "$WORK/bin/map_churn" "$FIX/map_churn.c" \
+        || die "map_churn does not compile"
+    gcc -O1 -Wall -Wextra -Werror -o "$WORK/bin/gated" tests/fixtures/public-cli/gated.c -ldl \
+        || die "gated does not compile"
+fi
 head -c 8192 /dev/zero > "$WORK/unrelated.bin" || die "cannot write the unrelated file"
 
 echo "=== private softhsm token ==="
@@ -589,20 +773,28 @@ echo "=== machine ==="
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
 VIRT=$(systemd-detect-virt 2>/dev/null || echo bare)
-COMMIT=$(git rev-parse HEAD)
+if [ -n "$PREBUILT_COMMIT" ]; then
+    COMMIT=$PREBUILT_COMMIT
+else
+    COMMIT=$(git rev-parse HEAD)
+fi
 CAND_SHA=$(sha256sum "$CAND_BIN" | cut -d' ' -f1)
-BASE_SHA=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)
+if [ "$ARMS" = default ]; then
+    BASE_SHA=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)
+fi
 echo "kernel: $KERNEL"
 echo "cpu: $CPU"
 echo "virt: $VIRT"
 echo "commit: $COMMIT"
 echo "candidate: $CAND_SHA"
-echo "base: $BASE_SHA"
+if [ "$ARMS" = default ]; then echo "base: $BASE_SHA"; fi
 echo "cells: $CELLS"
 echo "rounds: $ROUNDS secs: $SECS"
 say "MACHINE kernel=$KERNEL cpu=$CPU virt=$VIRT nproc=$(nproc) date=$(date -u +%FT%TZ) host=$(uname -n)"
 say "BINARY role=candidate path=$CAND_BIN sha256=$CAND_SHA commit=$COMMIT"
-say "BINARY role=base path=$BASE_BIN sha256=$BASE_SHA commit=c34b4d4605581bca8d89cb3a136cb7eb91f9e19e"
+if [ "$ARMS" = default ]; then
+    say "BINARY role=base path=$BASE_BIN sha256=$BASE_SHA commit=c34b4d4605581bca8d89cb3a136cb7eb91f9e19e"
+fi
 
 if command -v docker >/dev/null 2>&1 && docker inspect "$KIND" >/dev/null 2>&1; then
     if [ "$(docker inspect -f '{{.State.Status}}' "$KIND" 2>/dev/null)" = running ]; then
@@ -860,25 +1052,31 @@ for cell in $CELLS; do
     fi
     round=1
     while [ "$round" -le "$ROUNDS" ]; do
-        if [ $((round % 2)) -eq 1 ]; then
-            arms="on off off on"
-        else
-            arms="off on on off"
-        fi
+        arms=$(round_arms "$ARMS" "$round")
         for arm in $arms; do
             case $cell in
                 unrelated-mmap) run_map_sample "$cell" "$arm" "$round" || exit 1 ;;
                 *) run_call_sample "$cell" "$arm" "$round" || exit 1 ;;
             esac
         done
-        case $cell in
-            unrelated-mmap) run_map_sample "$cell" unobserved "$round" || exit 1 ;;
-            *) run_call_sample "$cell" unobserved "$round" || exit 1 ;;
-        esac
+        if [ "$ARMS" = default ]; then
+            case $cell in
+                unrelated-mmap) run_map_sample "$cell" unobserved "$round" || exit 1 ;;
+                *) run_call_sample "$cell" unobserved "$round" || exit 1 ;;
+            esac
+        fi
         round=$((round + 1))
     done
 done
 
 echo "=== results ==="
-python3 -I scripts/bench-count-overhead-analyze.py "$LOG" || exit 1
+if [ "$ARMS" = on-unobserved ]; then
+    # shellcheck disable=SC2086
+    traced_cells=$(printf '%s,' $CELLS)
+    python3 -I scripts/bench-count-overhead-analyze.py "$LOG" --traced-cost \
+        --cells "${traced_cells%,}" --rounds "$ROUNDS" > "$WORK/traced-cost.txt" || exit 1
+    while IFS= read -r traced_line; do say "$traced_line"; done < "$WORK/traced-cost.txt"
+else
+    python3 -I scripts/bench-count-overhead-analyze.py "$LOG" || exit 1
+fi
 echo "=== bench-count-overhead: DONE ($LOG) ==="

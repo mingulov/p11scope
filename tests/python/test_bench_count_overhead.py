@@ -8,9 +8,11 @@ campaign with integer-exact counts renders a verdict. Run as a script:
 
     python3 -I tests/python/test_bench_count_overhead.py -v
 """
+import io
 import runpy
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -197,6 +199,238 @@ class CountOverheadOracle(unittest.TestCase):
         _, problems = analyze_text(bad_count, required_cells=("relevant-call-t1",))
         self.assertTrue(any("workload denominator" in problem for problem in problems),
                         problems)
+
+
+DEN_CELLS = ("relevant-call-t1", "relevant-call-t4")
+
+
+def dencampaign_log(cells=DEN_CELLS, rounds=5):
+    """One exact denominator campaign: on/unobserved ABBA per round.
+
+    Odd rounds run on/unobserved/unobserved/on, even rounds the
+    mirror. t1 diffs run 100..190 over alternating bare walls (the
+    subtraction is per pair, not against a median); t4 is flat 75 ns
+    per total completed call (300 under M2's per-thread normalization).
+    """
+    log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+    log += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
+    for cell in cells:
+        threads, pad = WORKLOADS[cell]
+        pair = 0
+        for rnd in range(1, rounds + 1):
+            arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                "unobserved", "on", "on", "unobserved")
+            on_queue, bare_queue = [], []
+            for _ in range(2):
+                if cell == "relevant-call-t1":
+                    bare = 1000000 + (pair % 2) * 10000
+                    diff = 100 + 10 * pair
+                else:
+                    bare = 1000000
+                    diff = 300
+                on_queue.append(bare + diff * 1000 // threads)
+                bare_queue.append(bare)
+                pair += 1
+            for arm in arms:
+                if arm == "on":
+                    log += sample(cell, arm, rnd, threads, 1000, on_queue.pop(0),
+                                  pad=pad, **counted(threads, 1000), **bpf())
+                else:
+                    log += sample(cell, arm, rnd, threads, 1000, bare_queue.pop(0),
+                                  pad=pad, lane="none")
+    return log
+
+
+def den_analyze_text(log, cells=DEN_CELLS, rounds=5):
+    with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+        path = Path(work) / "campaign.log"
+        path.write_text(log)
+        _, samples, errors = ANALYZE["parse_log"](str(path))
+        assert not errors, errors
+        return ANALYZE["analyze_traced"](samples, cells, rounds)
+
+
+class TracedCostOracle(unittest.TestCase):
+    def test_traced_cost_four_thread_units_are_completed_calls(self):
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        t4 = next(row for row in rows if row["cell"] == "relevant-call-t4")
+        # Each four-thread on arm takes 75,000 ns more for 1,000
+        # total completed calls: 75 ns/call, without multiplying by four.
+        self.assertEqual(t4["median_ns"], 75.0)
+
+    def test_traced_cost_relative_budget_uses_completed_call_units(self):
+        log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+        for cell, threads in (("relevant-call-t1", 1), ("relevant-call-t4", 4)):
+            for rnd in range(1, 6):
+                arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                    "unobserved", "on", "on", "unobserved")
+                for arm in arms:
+                    if arm == "on":
+                        log += sample(cell, arm, rnd, threads, 1000, 1250000,
+                                      **counted(threads, 1000), **bpf())
+                    else:
+                        log += sample(cell, arm, rnd, threads, 1000, 1000000,
+                                      lane="none")
+        rows, problems = den_analyze_text(log)
+        self.assertEqual(problems, [])
+        for line in ANALYZE["traced_cost_lines"](rows):
+            fields = dict(token.split("=", 1) for token in line.split()[1:])
+            self.assertEqual(fields["unit"], "ns/completed_call")
+            self.assertEqual(int(fields["threads"]),
+                             1 if fields["cell"] == "relevant-call-t1" else 4)
+            self.assertEqual(int(fields["on_total_calls"]), 10000)
+            self.assertEqual(int(fields["unobserved_total_calls"]), 10000)
+            production_ns = float(fields["median_ns"])
+            self.assertEqual(production_ns, 250.0, fields["cell"])
+            # An 80 ns/call dispatcher addition is 32%, above the
+            # 15% gate, even though it meets the independent 250 ns gate.
+            self.assertEqual(80.0 * 100.0 / production_ns, 32.0)
+            self.assertGreater(80.0 * 100.0 / production_ns, 15.0)
+            # The inclusive relative boundary remains healthy.
+            self.assertEqual(37.5 * 100.0 / production_ns, 15.0)
+            self.assertGreater(37.5001 * 100.0 / production_ns, 15.0)
+
+    def test_traced_cost_machine_denominator_round_trips_at_budget_boundary(self):
+        cell = "relevant-call-t4"
+        for wall_ns, added_ns, expected_pass in (
+                (1249960, 37.5, False), (1250040, 37.501, True)):
+            log = "MACHINE kernel=7.2.9 test-cpu nproc=5\n"
+            for rnd in range(1, 6):
+                arms = ("on", "unobserved", "unobserved", "on") if rnd % 2 else (
+                    "unobserved", "on", "on", "unobserved")
+                for arm in arms:
+                    if arm == "on":
+                        log += sample(cell, arm, rnd, 4, 1000, wall_ns,
+                                      **counted(4, 1000), **bpf())
+                    else:
+                        log += sample(cell, arm, rnd, 4, 1000, 1000000,
+                                      lane="none")
+            rows, problems = den_analyze_text(log, cells=(cell,))
+            self.assertEqual(problems, [])
+            self.assertEqual(len(rows), 1)
+            raw = rows[0]["median_ns"]
+            line, = ANALYZE["traced_cost_lines"](rows)
+            fields = dict(token.split("=", 1) for token in line.split()[1:])
+            exported = float(fields["median_ns"])
+            self.assertEqual(exported, raw, "machine denominator must round-trip")
+            self.assertEqual(added_ns * 100.0 / raw <= 15.0, expected_pass)
+            self.assertEqual(added_ns * 100.0 / exported <= 15.0, expected_pass)
+
+    def test_traced_cost_accepts_exact_denominator_campaign(self):
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        self.assertEqual(len(rows), 2)
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        # Interpolated percentiles are float-exact to 1e-9 only.
+        self.assertAlmostEqual(t1["p10_ns"], 109.0, places=9)
+        self.assertAlmostEqual(t1["p90_ns"], 181.0, places=9)
+        self.assertEqual(t1["samples"], 10)
+        t4 = next(row for row in rows if row["cell"] == "relevant-call-t4")
+        self.assertEqual(
+            (t4["median_ns"], t4["p10_ns"], t4["p90_ns"], t4["samples"]),
+            (75.0, 75.0, 75.0, 10))
+        self.assertEqual(
+            ANALYZE["traced_cost_lines"](rows),
+            ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
+             "p10_ns=109.0 p90_ns=181.0 samples=10 unit=ns/completed_call threads=1 "
+             "on_total_calls=10000 unobserved_total_calls=10000",
+             "TRACED_COST cell=relevant-call-t4 median_ns=75.0 "
+             "p10_ns=75.0 p90_ns=75.0 samples=10 unit=ns/completed_call threads=4 "
+             "on_total_calls=10000 unobserved_total_calls=10000"])
+
+    def test_traced_cost_subtracts_the_unobserved_baseline(self):
+        # The pinned median is the per-pair observed-minus-unobserved
+        # cost (145.0), not the raw observed on-arm median (1150.0):
+        # dropping the subtraction fails this test.
+        rows, problems = den_analyze_text(dencampaign_log())
+        self.assertEqual(problems, [])
+        t1 = next(row for row in rows if row["cell"] == "relevant-call-t1")
+        self.assertEqual(t1["median_ns"], 145.0)
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(dencampaign_log())
+            _, samples, _ = ANALYZE["parse_log"](str(path))
+        on_units = sorted(
+            ANALYZE["unit_ns"](s) for s in samples
+            if s["cell"] == "relevant-call-t1" and s["arm"] == "on")
+        self.assertEqual(len(on_units), 10)
+        on_median = (on_units[4] + on_units[5]) / 2
+        self.assertEqual(on_median, 1150.0)
+        self.assertNotEqual(t1["median_ns"], on_median)
+
+    def test_traced_cost_reports_parseable_lines_end_to_end(self):
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(dencampaign_log())
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = ANALYZE["main"](["--traced-cost", "--cells",
+                                      "relevant-call-t1,relevant-call-t4",
+                                      "--rounds", "5", str(path)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            buffer.getvalue().splitlines(),
+            ["TRACED_COST cell=relevant-call-t1 median_ns=145.0 "
+             "p10_ns=109.0 p90_ns=181.0 samples=10 unit=ns/completed_call threads=1 "
+             "on_total_calls=10000 unobserved_total_calls=10000",
+             "TRACED_COST cell=relevant-call-t4 median_ns=75.0 "
+             "p10_ns=75.0 p90_ns=75.0 samples=10 unit=ns/completed_call threads=4 "
+             "on_total_calls=10000 unobserved_total_calls=10000"])
+
+    def test_traced_cost_rejects_bad_shapes(self):
+        log = dencampaign_log()
+        # An off arm or a scrambled order breaks the round shape.
+        bad_off = log.replace("cell=relevant-call-t1 arm=on round=1",
+                              "cell=relevant-call-t1 arm=off round=1", 1)
+        _, problems = den_analyze_text(bad_off)
+        self.assertTrue(any("order" in problem for problem in problems), problems)
+        bad_order = log.replace("cell=relevant-call-t1 arm=on round=2",
+                                "cell=relevant-call-t1 arm=unobserved round=2", 1)
+        _, problems = den_analyze_text(bad_order)
+        self.assertTrue(any("order" in problem for problem in problems), problems)
+        # Missing on-arm BPF corroboration or an evidenced baseline.
+        bad_bpf = log.replace("bpf_ns=200000 bpf_cnt=1000",
+                              "bpf_ns=none bpf_cnt=none", 1)
+        _, problems = den_analyze_text(bad_bpf)
+        self.assertTrue(any("BPF" in problem for problem in problems), problems)
+        bad_bare = log.replace("lane=none", "lane=multi", 1)
+        _, problems = den_analyze_text(bad_bare)
+        self.assertTrue(any("unobserved" in problem for problem in problems),
+                        problems)
+        # The on-arm count re-verifies against the workload denominator.
+        bad_count = log.replace("edge_count=1003", "edge_count=1002", 1)
+        _, problems = den_analyze_text(bad_count)
+        self.assertTrue(any("denominator" in problem for problem in problems),
+                        problems)
+        # Missing or extra cells, short rounds, mixed lanes, rebinding.
+        _, problems = den_analyze_text(dencampaign_log(cells=DEN_CELLS[:1]))
+        self.assertTrue(any("relevant-call-t4" in problem for problem in problems),
+                        problems)
+        extra = log + sample("rogue", "on", 1, 1, 100, 100000,
+                             **counted(1, 100), **bpf())
+        _, problems = den_analyze_text(extra)
+        self.assertTrue(any("rogue" in problem for problem in problems), problems)
+        _, problems = den_analyze_text(dencampaign_log(rounds=2))
+        self.assertTrue(any("rounds" in problem for problem in problems), problems)
+        bad_lane = log.replace("lane=multi", "lane=singles", 1)
+        _, problems = den_analyze_text(bad_lane)
+        self.assertTrue(any("mixed lane" in problem for problem in problems),
+                        problems)
+        bad_threads = log.replace("threads=4", "threads=1", 1)
+        _, problems = den_analyze_text(bad_threads)
+        self.assertTrue(any("workload" in problem for problem in problems),
+                        problems)
+        # The modes do not leak into each other.
+        with tempfile.TemporaryDirectory(prefix="count-denominator-") as work:
+            path = Path(work) / "campaign.log"
+            path.write_text(log)
+            _, samples, _ = ANALYZE["parse_log"](str(path))
+        _, problems = ANALYZE["analyze"](samples, 5.0, 10.0, DEN_CELLS, 5)
+        self.assertTrue(problems, "an on/unobserved log is not an M2 campaign")
 
 
 if __name__ == "__main__":

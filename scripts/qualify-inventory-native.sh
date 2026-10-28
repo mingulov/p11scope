@@ -69,7 +69,7 @@ ROTATE_BYTES=1024M  # far above any run: the oracle fails a rotated stream
 
 die() { echo "qualify-inventory-native: $*" >&2; exit 70; }
 
-# Closed C8 controller. Tests execute this exact embedded code; only P2 and
+# Closed C8 controller. Tests execute this exact embedded code; P1/P2/P7 and
 # required P5 images use its gates. Parent-held FDs survive every query/exec.
 c8_gate() {
 python3 -I - "$REPO" "$@" <<'C8_GATE_PY'

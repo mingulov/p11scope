@@ -15,6 +15,9 @@ and the association bound.
 
 Healthy and mutation twins run unignored; the live-emission tests build
 the fixtures with gcc and validate the real emitted ledgers.
+The provider-free forward-sparse-stub.c emitter covers forwarding sums
+and sparse per-feed seqs; a stripped inline provider (no
+C_GetFunctionList export) proves the sibling driver refuses it.
 """
 
 import importlib.util
@@ -33,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ORACLE_PATH = ROOT / "scripts" / "joint-two-provider-compare.py"
 SIBS_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "dlmopen-sibs.c"
 LATE_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "late-b.c"
+STUB_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "forward-sparse-stub.c"
 MK_PROVIDERS = ROOT / "tests" / "fixtures" / "two-providers" / "mk-providers.sh"
 
 SOFT_LIBS = (
@@ -265,6 +269,10 @@ unsigned long C_GetFunctionList(void **out) {
     *out = &plain_table;
     return 0;
 }
+"""
+
+STRIPPED_PROVIDER = """/* Test-only stripped provider: no C_GetFunctionList export at all. */
+int TwoProvidersStrippedPadding;
 """
 
 
@@ -1232,6 +1240,19 @@ class EmissionTests(unittest.TestCase):
         self.assertEqual(build.returncode, 0, build.stderr)
         return provider
 
+    def build_forward_stub(self, tmp):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        if not STUB_SRC.is_file():
+            self.fail(f"fixture missing: {STUB_SRC} (implementation not present)")
+        stub = Path(tmp) / "forward-sparse-stub"
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             str(STUB_SRC), "-o", str(stub)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return stub
+
     def test_fixture_emits_valid_ledger_both_orders(self):
         oracle = require_oracle(self)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1523,6 +1544,100 @@ class EmissionTests(unittest.TestCase):
             with open(ledger, encoding="utf-8") as stream:
                 summary = oracle.validate_ledger(oracle.read_ledger(stream))
             self.assertEqual(summary["issued"], 18)
+
+    def test_stub_emits_valid_forward_ledger(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "10", "--forward", "A:7,B:3"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 20)
+            self.assertEqual(summary["feeds"]["A"]["forwarded"], 7)
+            self.assertEqual(summary["feeds"]["B"]["forwarded"], 3)
+            snapshot = split_snapshot()
+            snapshot["key_rows"][0]["forwarded"] = 7
+            snapshot["key_rows"][1]["forwarded"] = 3
+            result = oracle.compare(summary, snapshot)
+            self.assertEqual(result["path"], "split")
+
+    def test_stub_merged_forward_sum_is_refused(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "10", "--forward", "A:7"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            snapshot = split_snapshot()
+            snapshot["key_rows"][0]["forwarded"] = 7
+            snapshot["key_rows"][0]["completed"] = 17
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        r"feed A completed 17 disagrees"):
+                oracle.compare(summary, snapshot)
+
+    def test_stub_sparse_holes_stay_exact(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "12", "--sparse", "3"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 16)
+            seqs = summary["feeds"]["B"]["seqs"]
+            self.assertEqual(len(seqs), 4)
+            self.assertGreater(max(seqs) - min(seqs) + 1, len(seqs))
+            result = oracle.compare(
+                summary, split_snapshot(calls_a=12, calls_b=4))
+            self.assertEqual(result["path"], "split")
+
+    def test_stub_refuses_bad_argv(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            cases = ([], ["10"], [str(Path(tmp) / "ledger.jsonl"), "0"],
+                     [str(Path(tmp) / "ledger.jsonl"), "abc"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--sparse", "1"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--sparse", "99"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "A:0"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "C:3"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "A:"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--bogus"])
+            for argv in cases:
+                with self.subTest(argv=argv):
+                    ledger = Path(tmp) / "ledger.jsonl"
+                    if ledger.exists():
+                        ledger.unlink()
+                    completed = subprocess.run(
+                        [str(stub)] + argv,
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(completed.returncode, 2, argv)
+                    self.assertFalse(ledger.exists())
+
+    def test_fixture_refuses_stripped_provider(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = self.build_sibs_driver(tmp)
+            provider = self.build_inline_provider(
+                tmp, "stripped", STRIPPED_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(driver), str(provider), "ab", "5", str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("C_GetFunctionList failed", completed.stderr)
+            self.assertFalse(ledger.exists())
 
 
 if __name__ == "__main__":

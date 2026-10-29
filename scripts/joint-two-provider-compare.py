@@ -4,8 +4,10 @@
 
 Ledger input: E17-pattern JSONL extended with feed labels and cut/handle
 marker rows, as emitted by tests/fixtures/two-providers/dlmopen-sibs.c
-(same-file dlmopen siblings, colliding handles) and late-b.c (late B
-arrival, physical cut, post-cut burst). The first row is ready; further
+(same-file dlmopen siblings, colliding handles), late-b.c (late B
+arrival, physical cut, post-cut burst) and forward-sparse-stub.c
+(provider-free forwarding and sparse emission). The first row is ready;
+further
 ready rows, call rows and cut/handle marker rows follow in arrival order;
 one ack row closes. Call seq is global and contiguous across feeds;
 issued counts call rows only, so markers are transparent to counts.

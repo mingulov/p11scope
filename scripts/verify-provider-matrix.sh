@@ -353,6 +353,8 @@ def self_test():
     version_changed["surfaces"][0]["version"]["minor"] = 40
     walk_changed = synthetic(nss)
     walk_changed["surfaces"][1]["walk"]["status"] = "partial"
+    stripped = synthetic(nss)
+    stripped["surfaces"] = []
     surfaces_reordered = synthetic(nss)
     surfaces_reordered["surfaces"][1], surfaces_reordered["surfaces"][2] = (
         surfaces_reordered["surfaces"][2],
@@ -381,6 +383,7 @@ def self_test():
         ("table version 2.20 -> 2.40", gnome, version_changed),
         ("walk.status full -> partial", nss, walk_changed),
         ("surfaces reordered", nss, surfaces_reordered),
+        ("stripped provider exports no surfaces", nss, stripped),
         (
             "fedora softhsm2 known_prefix 68 -> full 104 expectation",
             known_prefix_to_full,

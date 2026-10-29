@@ -2047,9 +2047,9 @@ fn joint_refused_exec_marker_row_stays_unready_and_stage1_continues() {
     // Every dumped row comes from the real marker leaves; only the argv
     // parameters are injected.
     for (args, what) in [
-        (vec!["0", "0", "0", "0", "1"], "unpublished"),
-        (vec!["0", "0", "1", "0", "1"], "DIRTY"),
-        (vec!["9", "0", "0", "9", "0"], "READY naming another exec"),
+        (["0", "0", "0", "0", "1"], "unpublished"),
+        (["0", "0", "1", "0", "1"], "DIRTY"),
+        (["9", "0", "0", "9", "0"], "READY naming another exec"),
     ] {
         let (row, control, _) = publisher.publish(&args);
         let mut rows = NativeBirthRows { row, control };

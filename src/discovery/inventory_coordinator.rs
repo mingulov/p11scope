@@ -13791,6 +13791,8 @@ exit 0
                     .retired,
                 "{setup}: the incarnation is not replaced"
             );
+            // Gaps stage at apply_exec_hook and materialize at commit.
+            native.scene.coordinator.commit_batch(false).unwrap();
             let retained: Vec<_> = native
                 .scene
                 .coordinator
@@ -13815,7 +13817,6 @@ exit 0
                 "{setup}: the gap names the ticket: {}",
                 gap.reason
             );
-            native.scene.coordinator.commit_batch(false).unwrap();
             assert_eq!(
                 native.scene.coordinator.adapter.live_id(7),
                 Some(caller),

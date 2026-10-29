@@ -70,6 +70,14 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(next(step for step in steps if step.get("id") == "cleanup")["if"],
                          "${{ always() && steps.workspace.outcome == 'success' }}")
 
+    def test_header_describes_integrated_shared_consumer(self):
+        steps = workflow()["jobs"]["runtime"]["steps"]
+        observer = next(step for step in steps if step.get("id") == "observer")
+        self.assertIn("scripts/download-runtime-observer.py", observer["run"])
+        header = "\n".join(line for line in WORKFLOW.read_text().splitlines()[:8]
+                           if line.startswith("#"))
+        self.assertNotIn("must be integrated", header)
+
 
 class OfflineWorkflowTests(unittest.TestCase):
     def setUp(self):

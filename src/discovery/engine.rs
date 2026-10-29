@@ -17,6 +17,7 @@ use crate::attach::{
 use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
+use crate::discovery::elf_needed;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
@@ -606,6 +607,10 @@ pub struct Engine {
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
     unmatched_leader_exit_events: BTreeSet<(u32, u64)>,
     cgroup_ingress_overflow: bool,
+    /// Extensive-mode executable dependency hints (6.14 Option B):
+    /// capture-local exe stash, scan-learned paths, and hint counts.
+    /// Disabled unless the operator armed `--track-short-lived`.
+    extensive: elf_needed::ExtensiveState,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -9741,6 +9746,7 @@ impl Engine {
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
+            extensive: elf_needed::ExtensiveState::new(),
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -10731,6 +10737,13 @@ impl Engine {
         }
     }
 
+    /// Extensive-mode static-hint split, present only when armed. Like
+    /// the gap counter it never moves calls or attribution; unlike it,
+    /// the split is `None` (key omitted) unless armed.
+    pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
+        self.extensive.enabled().then_some(self.extensive.hints())
+    }
+
     pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
         self.multi_rebuild_gaps
     }
@@ -10798,9 +10811,13 @@ impl Engine {
             else {
                 continue;
             };
+            let pid = view_data.pid;
             if self.admitted_cgroup_views.insert(view, view_data).is_none() {
                 self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
             }
+            // 6.14 Option B: an admitted PID's exits match its
+            // admission, never a gap, so its stash entry is dead.
+            self.extensive.drop_stash_for_pid(pid);
         }
     }
 
@@ -10834,6 +10851,10 @@ impl Engine {
         }
         self.unmatched_leader_exit_events.insert(key);
         self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+        // 6.14 Option B: exactly one static hint per novel unmatched
+        // exit in extensive mode. The gap count above never depends
+        // on the hint outcome.
+        self.extensive.classify_gap(record);
     }
 
     fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {
@@ -19570,6 +19591,12 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
+        // 6.14 Option B: seed the exe-identity stash from every EXEC,
+        // matched or not; a gap exit may consume it later. Disabled
+        // captures ignore the record's exe words entirely.
+        if record.kind == DISCOVERY_KIND_EXEC {
+            self.extensive.note_exec_record(record);
+        }
         if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
             if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
                 // The validated prearm now also serves ordinary live loader

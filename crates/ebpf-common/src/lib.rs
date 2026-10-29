@@ -336,6 +336,10 @@ pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 /// Dedicated compact inventory object. Detailed objects deliberately reject it.
 pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
+/// 6.14 Option B: extensive mode arms the exec-time exe-identity word
+/// in EXEC records (`--track-short-lived`, default off). Detailed
+/// objects only; the inventory-only exact config refuses it.
+pub const FLAG_TRACK_SHORT_LIVED: u64 = 1 << 8;
 
 /// Inventory accepts one external scope and its own policy, without detail or pause.
 pub const fn valid_inventory_config(flags: u64) -> bool {
@@ -2581,6 +2585,45 @@ mod tests {
         let mut empty = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
         empty.status_flags = DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED;
         assert!(valid_discovery_record(&empty));
+    }
+
+    #[test]
+    fn exec_exe_identity_abi_pointers_shape() {
+        // 6.14 Option B RED: an EXEC may carry the raw exe (s_dev,
+        // i_ino) pair in pointers[0..2] when extensive mode is armed.
+        // The pair is data: any value validates, the tail stays zero,
+        // and every other EXEC rule is unchanged.
+        let mut present = discovery_record(DISCOVERY_KIND_EXEC);
+        present.pointers[0] = 0x103_00001;
+        present.pointers[1] = 802;
+        assert!(valid_discovery_record(&present));
+        let mut tail = discovery_record(DISCOVERY_KIND_EXEC);
+        tail.pointers[2] = 1;
+        assert!(!valid_discovery_record(&tail));
+        let absent = discovery_record(DISCOVERY_KIND_EXEC);
+        assert!(valid_discovery_record(&absent));
+    }
+
+    #[test]
+    fn track_short_lived_bit_arms_detailed_scopes_only() {
+        // 6.14 Option B RED: the extensive-mode bit is orthogonal to
+        // scope and policy on detailed objects, and refused by the
+        // inventory-only exact config (Detailed-only arming).
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            for policy in [
+                FLAG_POLICY_ALLOWLISTED,
+                FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+                FLAG_POLICY_AGGREGATE,
+            ] {
+                assert!(
+                    valid_config(scope | policy | FLAG_TRACK_SHORT_LIVED),
+                    "scope {scope:#x}"
+                );
+            }
+        }
+        assert!(!valid_inventory_config(
+            FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
+        ));
     }
 
     #[test]

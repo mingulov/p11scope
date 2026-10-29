@@ -4,6 +4,7 @@
 pub mod attribution;
 pub(crate) mod caller_registry;
 pub(crate) mod confirm_shards;
+pub(crate) mod elf_needed;
 pub mod engine;
 pub mod hooks;
 pub mod identity;

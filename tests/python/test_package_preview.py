@@ -210,6 +210,14 @@ sys.stdout.write((api / name).read_text())
                         job["conclusion"] = change
                     self.assert_refused(self.validate())
 
+    def test_delivery_only_green_ci_cannot_qualify_as_ordinary_checks(self):
+        self.jobs = [job for job in self.jobs if job["name"] == "dedupe"]
+        for index, name in enumerate(("package-delivery / validate", "package-delivery / package-full"), 100):
+            job = copy.deepcopy(self.jobs[0])
+            job.update(id=index, name=name)
+            self.jobs.append(job)
+        self.assert_refused(self.validate())
+
     def test_stale_duplicate_and_invalid_job_or_gate_step_refuse(self):
         baseline = copy.deepcopy(self.jobs)
         mutations = (
@@ -411,7 +419,7 @@ else:
         self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
         document = workflow()
         trigger = document.get("on", document.get(True))
-        self.assertEqual(set(trigger), {"workflow_dispatch"})
+        self.assertEqual(set(trigger), {"workflow_dispatch", "workflow_call"})
         inputs = trigger["workflow_dispatch"]["inputs"]
         self.assertEqual(set(inputs), {"accepted_ci_run_id", "capture_mode", "jobs"})
         self.assertTrue(inputs["accepted_ci_run_id"]["required"])
@@ -421,11 +429,12 @@ else:
         self.assertEqual(document["permissions"], {"contents": "read", "actions": "read"})
         self.assertEqual(set(document["jobs"]), {"validate", "package"})
         standard = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-        ordinary = set(standard["jobs"]) - {"contracts", "coverage", "privileged-e2e", "release-preview", "quarantine"}
+        ordinary = set(standard["jobs"]) - {"contracts", "coverage", "privileged-e2e", "release-preview", "quarantine",
+                                             "package-delivery", "docker-delivery", "kubernetes-delivery"}
         ordinary.update(f"contracts-{index}" for index in standard["jobs"]["contracts"]["strategy"]["matrix"]["shard"])
         ordinary.update(f"coverage ({partition})" for partition in standard["jobs"]["coverage"]["strategy"]["matrix"]["partition"])
         self.assertEqual(ordinary, set(REQUIRED), "new CI gates must update the acceptance helper and its controls")
-        pins = {item["uses"] for job in standard["jobs"].values() for item in job["steps"] if "uses" in item}
+        pins = {item["uses"] for job in standard["jobs"].values() for item in job.get("steps", ()) if "uses" in item}
         for job in document["jobs"].values():
             self.assertEqual(job["runs-on"], "ubuntu-26.04")
             self.assertEqual(job["steps"][0]["with"]["fetch-depth"], 0)

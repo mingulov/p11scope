@@ -11272,9 +11272,10 @@ fn hosted_caches_hold_only_tool_binaries_and_build_products() {
     }
 }
 
-/// One full check matrix per commit: every check and coverage job waits on
+/// One full ordinary check matrix per commit; manual delivery opts out.
+/// Every check and coverage job waits on
 /// the dedupe job and runs only when it says so (coverage-report follows the
-/// coverage shards). The dedupe job reads the Actions API and nothing else,
+/// coverage shards). Dedupe reads the manual selection or the Actions API,
 /// and the workflow keeps its per-ref group that sequences a moved branch's
 /// runs instead of cancelling them.
 #[test]
@@ -11313,7 +11314,7 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "dedupe holds exactly actions: read"
     );
     for marker in [
-        // Only push runs deduplicate; pull requests and dispatches run.
+        // Only push runs deduplicate; pull requests and manual checks run.
         "if [ \"$GITHUB_EVENT_NAME\" != push ]; then",
         // Only earlier push or dispatch runs of this workflow on this commit.
         "/runs?head_sha=$GITHUB_SHA&per_page=100",
@@ -11327,10 +11328,41 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
     ] {
         assert!(dedupe.contains(marker), "dedupe lacks {marker:?}");
     }
+    assert!(dedupe.contains("DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}"));
+    let delivery_only = concat!(
+        "          if [ \"$GITHUB_EVENT_NAME\" = workflow_dispatch ]; then\n",
+        "            case \"$DELIVERY_TASK\" in\n",
+        "              checks) ;;\n",
+        "              packages|docker|kubernetes)\n",
+        "                decide false \"delivery task $DELIVERY_TASK selected; ordinary checks were not requested\" ;;\n",
+        "              *) echo \"invalid delivery task: $DELIVERY_TASK\" >&2; exit 1 ;;\n",
+        "            esac\n",
+        "          fi\n",
+    );
+    assert!(
+        dedupe.contains(delivery_only),
+        "only the three explicit manual delivery choices may skip ordinary checks"
+    );
+    assert!(
+        dedupe.find(delivery_only).unwrap()
+            < dedupe
+                .find("if [ \"$GITHUB_EVENT_NAME\" != push ]; then")
+                .unwrap(),
+        "manual delivery selection must precede the ordinary non-push path"
+    );
+    let covering = concat!(
+        "                if [ \"$ran\" = 3 ]; then\n",
+        "                  decide false \"commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it\"\n",
+        "                fi\n",
+    );
+    assert!(
+        dedupe.contains(covering),
+        "the other skip must remain guarded by the successful ordinary-job proof"
+    );
     assert_eq!(
         dedupe.matches("decide false ").count(),
-        1,
-        "dedupe skips the matrix on exactly one condition: a covering run"
+        2,
+        "only explicit manual delivery or a covering ordinary run skips the matrix"
     );
 }
 

@@ -35,6 +35,10 @@ PACKAGE_GATES = {
     "validate": ("Validate accepted ordinary CI",),
     "package-full": ("Verify package checkout", "Build and assemble public package"),
 }
+DELIVERY_GATES = {
+    "package-delivery / validate": PACKAGE_GATES["validate"],
+    "package-delivery / package-full": PACKAGE_GATES["package-full"],
+}
 MAX_ARCHIVE = 512 * 1024 * 1024
 MAX_FILE = 256 * 1024 * 1024
 
@@ -72,9 +76,8 @@ def check_run(run, repository, run_id, sha, tree, workflow):
     path = workflow["path"]
     require(run.get("path") == path and positive(run.get("workflow_id"))
             and run["workflow_id"] == workflow["id"], "preview workflow identity mismatch")
-    conclusions = ("success", "failure") if path == PACKAGE_WORKFLOW else ("success",)
-    require(run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
-            and run.get("conclusion") in conclusions, "completed eligible preview dispatch required")
+    require(run.get("event") == "workflow_dispatch" and run.get("status") == "completed",
+            "completed preview dispatch required")
     repo, head_repo = run.get("repository", {}), run.get("head_repository", {})
     require(isinstance(repo, dict) and isinstance(head_repo, dict)
             and repo.get("full_name") == repository and positive(repo.get("id"))
@@ -118,6 +121,34 @@ def artifact_freshness(artifact, job):
     require(created <= updated, "artifact update precedes creation")
 
 
+def producer_route(path, jobs):
+    direct = set(PACKAGE_GATES) | {"package-p0"}
+    nested = set(DELIVERY_GATES) | {"package-delivery / package-p0", "package-delivery"}
+    known = direct | nested | {"release-preview"}
+    # Lookalikes never authorize a route or hide an attempted producer behind
+    # a different successful job. Only literal names below grant admission.
+    for name in jobs:
+        if any(token in name for token in ("package-delivery", "package-full", "package-p0")):
+            require(name in known, "unrecognized package producer job name")
+    if path == PACKAGE_WORKFLOW:
+        require(not (nested | {"release-preview"}) & jobs.keys(),
+                "conflicting standalone package producer route")
+        return PACKAGE_GATES, "package-full"
+    require(not direct & jobs.keys(), "foreign standalone package jobs in CI producer")
+
+    def skipped(name):
+        return jobs[name].get("status") == "completed" and jobs[name].get("conclusion") == "skipped"
+
+    delivery = bool((nested - {"package-delivery"}) & jobs.keys())
+    if "package-delivery" in jobs and not skipped("package-delivery"):
+        delivery = True
+    legacy = "release-preview" in jobs and not skipped("release-preview")
+    require(not (delivery and legacy), "conflicting CI package producer routes")
+    if delivery:
+        return DELIVERY_GATES, "package-delivery / package-full"
+    return None, "release-preview"
+
+
 def select_artifact(repository, run_id, sha, tree):
     prefix = f"repos/{repository}/actions"
     run = api(f"{prefix}/runs/{run_id}")
@@ -140,14 +171,17 @@ def select_artifact(repository, run_id, sha, tree):
                 and positive(job_attempt) and job_attempt == attempt, "stale preview job identity")
         by_name[name] = job
         identifiers.add(identifier)
-    required = tuple(PACKAGE_GATES) if path == PACKAGE_WORKFLOW else ("release-preview",)
+    gates, producer = producer_route(path, by_name)
+    conclusions = ("success", "failure") if gates is not None else ("success",)
+    require(run.get("conclusion") in conclusions, "completed eligible preview dispatch required")
+    required = tuple(gates) if gates is not None else (producer,)
     require(set(required) <= by_name.keys(), "required successful preview jobs missing")
     for name in required:
         job = by_name[name]
         require(job.get("status") == "completed" and job.get("conclusion") == "success",
                 "matching successful preview job required: " + name)
-        if path == PACKAGE_WORKFLOW:
-            package_gate(job, PACKAGE_GATES[name])
+        if gates is not None:
+            package_gate(job, gates[name])
     artifacts = complete_list(api(f"{prefix}/runs/{run_id}/artifacts?per_page=100"), "artifacts")
     matches = [item for item in artifacts if item.get("name") == ARTIFACT]
     require(len(matches) == 1, "one exact FULL public artifact required")
@@ -158,7 +192,6 @@ def select_artifact(repository, run_id, sha, tree):
     require(isinstance(binding, dict) and binding.get("id") == run_id and binding.get("head_sha") == sha
             and binding.get("repository_id") == run["repository"]["id"]
             and binding.get("head_repository_id") == run["repository"]["id"], "artifact run/source mismatch")
-    producer = "package-full" if path == PACKAGE_WORKFLOW else "release-preview"
     artifact_freshness(artifact, by_name[producer])
     require(positive(artifact.get("size_in_bytes")) and artifact["size_in_bytes"] <= MAX_ARCHIVE,
             "artifact archive size exceeds bound")

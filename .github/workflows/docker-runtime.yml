@@ -5,7 +5,13 @@ on:
   workflow_dispatch:
     inputs:
       preview_run_id:
-        description: Successful CI release-preview run ID for this exact source SHA (FULL public assets)
+        description: Completed exact-source FULL package producer run ID
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      preview_run_id:
+        description: Completed exact-source FULL package producer run ID
         required: true
         type: string
 

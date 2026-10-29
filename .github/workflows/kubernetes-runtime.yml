@@ -12,12 +12,26 @@ on:
         required: true
         type: string
       artifact_run_id:
-        description: Successful same-repository CI run with the matching FULL preview artifact
+        description: Completed same-repository run with the matching FULL package artifact
         required: true
         type: string
       run_k2:
         description: Also run the attach-pod exact, idle and late-provider cell on a separate VM
         required: true
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact full source SHA of the successful artifact producer
+        required: true
+        type: string
+      artifact_run_id:
+        description: Completed same-repository run with the matching FULL package artifact
+        required: true
+        type: string
+      run_k2:
+        description: Also run the attach-pod exact, idle and late-provider cell on a separate VM
         type: boolean
         default: false
 

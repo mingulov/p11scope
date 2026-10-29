@@ -26,7 +26,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_manual_host_job_has_read_only_permissions_and_bounded_outer_deadline(self):
         workflow = self.workflow()
-        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch", "workflow_call"})
         supplied = workflow["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(set(supplied), {"preview_run_id"})
         self.assertEqual(supplied["preview_run_id"]["required"], "true")

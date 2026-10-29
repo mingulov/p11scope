@@ -289,9 +289,15 @@ class CanonicalBtfTests(unittest.TestCase):
                     ".BTF.ext": self.btf_ext([])}
         flipped = {".text": b"code", ".BTF": self.btf(b"BBBBAAAA", [b"a"]),
                    ".BTF.ext": self.btf_ext([])}
+        self.root = self.root / "baseline-ancestor"
+        self.root.mkdir()
         left, right = self.pair(sections, flipped)
         def dump(path, name):
-            return "dump-a" if "baseline" in str(path) else "dump-b"
+            if path == left[name]:
+                return "dump-a"
+            if path == right[name]:
+                return "dump-b"
+            self.fail(f"unexpected BTF dump path: {path}")
         with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
             self.driver.compare_objects(left, right, dump_c=dump)
 
@@ -1064,7 +1070,7 @@ if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         control, integration = self.calls()
-        baseline = "ad01d1b65bf980403aa652f140ce06088e9d591d"
+        baseline = "2bd623133214f5a2598b1ac2ed8165bc5563a1e7"
         self.assertEqual((control["baseline"], control["candidate"], control["repeat_baseline"]),
                          (baseline, baseline, True))
         self.assertEqual((integration["baseline"], integration["candidate"], integration["repeat_baseline"]),

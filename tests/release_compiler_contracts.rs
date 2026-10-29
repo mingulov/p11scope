@@ -154,7 +154,7 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        .any(|line| line == "          BASELINE=ad01d1b65bf980403aa652f140ce06088e9d591d")
+        .any(|line| line == "          BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -234,7 +234,7 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        "BASELINE=ad01d1b65bf980403aa652f140ce06088e9d591d",
+        "BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

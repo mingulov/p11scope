@@ -5083,14 +5083,14 @@ fn assert_no_executable_loader_arm(start_time_only: bool) {
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     child.0.kill().unwrap();
-    // Exe disappearance can precede the original pidfd's final readiness.
-    // Keep both proofs inside the fixture's existing total bound. Never reap
-    // here: the weak twin still needs the same unreaped start time.
+    // Exe disappearance can precede both stat's Z state and the original
+    // pidfd's final readiness. Wait for the actual claimed zombie within the
+    // same total bound. Never reap: the weak twin needs its unreaped start time.
     let exe = format!("/proc/{pid}/exe");
-    while std::fs::read_link(&exe).is_ok() {
+    while std::fs::read_link(&exe).is_ok() || !process::process_is_zombie(pid) {
         assert!(
             std::time::Instant::now() < deadline,
-            "SIGKILLed child kept its executable"
+            "SIGKILLed child did not become an unreaped zombie"
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -5108,6 +5108,10 @@ fn assert_no_executable_loader_arm(start_time_only: bool) {
         std::fs::read_link(&exe).map_err(|error| error.kind()),
         Err(std::io::ErrorKind::NotFound),
         "the zombie fixture must present exe-ENOENT"
+    );
+    assert!(
+        process::process_is_zombie(pid),
+        "the fixture must retain stat Z"
     );
     assert_eq!(view.still_the_same(), start_time_only);
     assert_eq!(view.original_exited(), Ok(!start_time_only));

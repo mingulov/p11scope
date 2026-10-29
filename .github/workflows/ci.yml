@@ -437,12 +437,10 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin the reviewed R52 marker-off source: Detailed intentionally removes
-      # the unused birth-marker map and calls. Other objects retain executable
-      # code/data and BTF/CO-RE behavior; debug metadata may change. The earlier
-      # WIDE-only parity result remains historical, not proof of this change.
-      # Subsequent comparisons include whole objects, including debug metadata.
-      # Later changes must preserve all three complete baseline objects.
+      # Pin the root-reviewed checkpoint where native journal P1/GAP remains
+      # inactive in ordinary Detailed. Instructions, maps, data, effective BTF
+      # and CO-RE are unchanged; source and debug metadata changed. Compare
+      # complete objects, including metadata, from this baseline forward.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
@@ -450,7 +448,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=ad01d1b65bf980403aa652f140ce06088e9d591d
+          BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

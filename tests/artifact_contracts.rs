@@ -10,19 +10,22 @@ mod transport_boundaries;
 
 #[test]
 fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
+    // Ordinary flavors keep these two literal owner exports. The private
+    // journal mode retains its reason-aware removal through a separate gate;
+    // native_journal_link checks the actual ordinary/private ELF separation.
     let source = std::fs::read_to_string("build.rs").expect("read build script");
     for helper in ["p11_owner_lease", "p11_owner_refund"] {
         let export = format!("link-arg=--export={helper}");
         assert_eq!(
             source.matches(&export).count(),
             1,
-            "missing exact {helper} export"
+            "missing exact ordinary {helper} export"
         );
     }
     assert_eq!(
         source.matches("link-arg=--export=p11_owner_").count(),
         2,
-        "no pointer-taking owner transaction may be exported"
+        "ordinary owner exports must not add a pointer-taking transaction"
     );
 }
 
@@ -609,7 +612,7 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        "BASELINE=ad01d1b65bf980403aa652f140ce06088e9d591d",
+        "BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9625,7 +9628,7 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        "BASELINE=ad01d1b65bf980403aa652f140ce06088e9d591d",
+        "BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

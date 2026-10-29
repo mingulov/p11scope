@@ -6,6 +6,9 @@
  * pin the same value; update them together or not at all. The
  * capacity_contract test suite enforces this. */
 #include "task_owner.h"
+#ifdef P11SCOPE_LOADER_GATE
+#include "loader_gate.h"
+#endif
 
 struct {
     __uint(type, 29);
@@ -657,6 +660,54 @@ __attribute__((noinline)) long p11_owner_start_remove_reason(const struct owner_
                                                             u32 required, u32 reason)
 {
     return start_remove_reason(key, required, reason);
+}
+#endif
+
+#ifdef P11SCOPE_LOADER_GATE
+/* T-L2 loader retirement: the ordinary START removal plus the owned gate
+ * disposition report for the producer's loader cookie. The gate is
+ * reported if and only if the START row retired on this call (present
+ * before, absent after). 0 means START retired and the gate recorded the
+ * disposition. -2 is the absent no-op, and only that: it requires
+ * required == 0 on a healthy control, and reports nothing. An absent
+ * START with required == 1 is -1 with row-missing bookkeeping (inherited
+ * start_remove_reason semantics), never -2. A NULL key is -1 before any
+ * map access, like the sibling removal. -1 is a kept row (failed
+ * deletion, blocked settle: the gate is untouched, retry is meaningful)
+ * or a START-side fault whose START did retire (a contradicted side row
+ * still retired its START, so the gate report was still attempted, but
+ * the fault dominates the return). On a fault-with-retire -1 the gate
+ * outcome is NOT encoded in the return: a good cookie recorded the
+ * disposition (the row is RETIRED), a stale or foreign cookie lost it
+ * (the row stays ARMED, one refusal counted) -- the caller cannot tell
+ * which from -1 alone, and retrying this wrapper cannot re-report
+ * (had == 0 short-circuits). Reconcile through the gate instead: an
+ * ARMED row for the cookie at lookup means the disposition was lost and
+ * must be re-reported with a direct note_producer_end; anything else
+ * means it landed or the cookie was never admitted (consult the
+ * admission records). -3 means START retired while the gate refused the
+ * cookie (stale, foreign or old-format cookie, or an unknown reason, for
+ * which no disposition is owned): the disposition is definitively lost,
+ * no retry can re-report it, and the caller must escalate. The gate row
+ * is untouched on -3, but the post-cutover refusal counter still
+ * increments: L4b reads that count as fact. */
+__attribute__((noinline)) long p11_owner_start_remove_loader(const struct owner_start_key *key,
+                                                             u32 required, u32 reason,
+                                                             u64 loader_cookie)
+{
+    int had;
+    if (!key)
+        return -1;
+    had = owner_map_lookup(&START, key) != (void *)0;
+    long rc = start_remove_reason(key, required, reason);
+    long gate;
+
+    if (!had || owner_map_lookup(&START, key))
+        return rc;
+    gate = p11_loader_gate_note_producer_end(loader_cookie, reason);
+    if (rc)
+        return rc;
+    return gate ? -3 : 0;
 }
 #endif
 

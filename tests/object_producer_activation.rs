@@ -976,10 +976,38 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
         returned.contains("object_required"),
         "emission stays behind the required-object marker"
     );
+    // Each return implementation reserves exactly its own record form:
+    // the ordinary half its 368-byte record, each object copy its own
+    // 608-byte record. The whole-region count guards against added
+    // sites.
+    for (name, start, end) in [
+        (
+            "ordinary return",
+            "fn ordinary_return(",
+            "fn object_return_ordinary(",
+        ),
+        (
+            "ordinary object copy",
+            "fn object_return_ordinary(",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        ),
+        (
+            "generic object copy",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "pub extern \"C\" fn p11_link_fork_allowed",
+        ),
+    ] {
+        let body = source_between(&source, start, end);
+        assert_eq!(
+            body.matches("EVENTS.reserve").count(),
+            1,
+            "{name} reserves exactly its own record form"
+        );
+    }
     assert_eq!(
         returned.matches("EVENTS.reserve").count(),
-        2,
-        "return reserves exactly the ordinary and the object record forms"
+        3,
+        "return reserves exactly the ordinary and the two object record forms"
     );
     // The userspace decode gate needs the receipt-bound table: the
     // session freezes object rows against its attested receipt.
@@ -1457,53 +1485,63 @@ fn assert_reads_subset(
 
 fn pin_continuity_gate_precedes_fills() {
     let source = bpf_source();
-    let returned = source_between(
-        &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
-        "pub extern \"C\" fn p11_link_fork_allowed",
-    );
-    // The continuity fill and its join gate precede every object result
-    // read; the gate arm retires ownership and faults, preserves only the
+    // Each object copy fills continuity and gates on the join before
+    // every object result read; the refused gate arm retires ownership
+    // through the copy's own removal and faults, preserves only the
     // ordinary base, then discards the unfilled object reservation.
-    let continuity = returned
-        .find("p11_instance_return(&key,")
-        .expect("return must fill continuity on the object arm");
-    let gate = returned
-        .find("continuity_joins(")
-        .expect("return must gate object reads on the shared stamp join");
-    let fill = returned
-        .find("object_fill_return(")
-        .expect("emission fills after the gate");
-    let find = returned
-        .find("object_emit_find(")
-        .expect("Find emits after the gate");
-    assert!(
-        continuity < gate && gate < fill && fill < find,
-        "continuity fill, join gate, result fill and Find emission must run in that order"
-    );
-    let arm = &returned[gate..fill];
-    for marker in [
-        "entry.discard(0)",
-        "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED)",
-        "p11_object_fault()",
+    // The ordinary copy retires through the owned removal, the generic
+    // copy through the journal removal with its identity reason.
+    for (name, start, end, retire) in [
+        (
+            "ordinary copy",
+            "fn object_return_ordinary(",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "owned_start_remove(&key, true)",
+        ),
+        (
+            "generic copy",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "pub extern \"C\" fn p11_link_fork_allowed",
+            "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED)",
+        ),
     ] {
+        let body = source_between(&source, start, end);
+        let continuity = body
+            .find("p11_instance_return(&key,")
+            .unwrap_or_else(|| panic!("{name} must fill continuity on the object arm"));
+        let gate = body
+            .find("continuity_joins(")
+            .unwrap_or_else(|| panic!("{name} must gate object reads on the shared stamp join"));
+        let fill = body
+            .find("object_fill_return(")
+            .unwrap_or_else(|| panic!("{name} emission fills after the gate"));
+        let find = body
+            .find("object_emit_find(")
+            .unwrap_or_else(|| panic!("{name} Find emits after the gate"));
         assert!(
-            arm.contains(marker),
-            "the refused gate arm must {marker} before any object read"
+            continuity < gate && gate < fill && fill < find,
+            "{name}: continuity fill, join gate, result fill and Find emission must run in that order"
+        );
+        let arm = &body[gate..fill];
+        for marker in ["entry.discard(0)", retire, "p11_object_fault()"] {
+            assert!(
+                arm.contains(marker),
+                "{name}: the refused gate arm must {marker} before any object read"
+            );
+        }
+        // The copy threads its verdict into the fill adapters, which
+        // enforce it again inside the executed production flow.
+        let filled_call = source_between(body, "let filled = object_fill_return(", ");");
+        assert!(
+            filled_call.contains("joined"),
+            "{name}: the result fill must receive the root continuity verdict"
+        );
+        let emitted_call = source_between(body, "let emitted =", ";");
+        assert!(
+            emitted_call.contains("joined"),
+            "{name}: Find emission must receive the root continuity verdict"
         );
     }
-    // The root threads its verdict into the fill adapters, which enforce
-    // it again inside the executed production flow.
-    let filled_call = source_between(returned, "let filled = object_fill_return(", ");");
-    assert!(
-        filled_call.contains("joined"),
-        "the result fill must receive the root continuity verdict"
-    );
-    let emitted_call = source_between(returned, "let emitted =", ";");
-    assert!(
-        emitted_call.contains("joined"),
-        "Find emission must receive the root continuity verdict"
-    );
     // Delegation: the BPF wrappers bind BPF-local state and call the
     // shared adapters the harness executes — no second inline copy.
     for (wrapper, shared) in [
@@ -1546,43 +1584,61 @@ fn pin_continuity_gate_precedes_fills() {
 fn object_return_refused_continuity_keeps_ordinary_base() {
     pin_continuity_gate_precedes_fills();
     let source = bpf_source();
-    let returned = source_between(
-        &source,
-        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
-        "pub extern \"C\" fn p11_link_fork_allowed",
-    );
-    let arm = source_between(returned, "if !joined {", "let tail =");
-    let preserve = arm
-        .find("preserve_refused_base(")
-        .expect("a refused object join must preserve one ordinary base after checked retirement");
-    let output = arm
-        .find(".output::<EventRecord>(unsafe { &(*raw).base }, 0)")
-        .expect("copy exactly the initialized 368-byte EventRecord, with its original stamps");
-    let discard = arm
-        .find("entry.discard(0)")
-        .expect("release the original reservation");
-    assert!(
-        preserve < output && output < discard,
-        "output must run while the original reservation is owned"
-    );
-    assert!(arm.contains(
-        "|| start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok()"
-    ));
-    assert!(arm.contains("RefusedBaseOutcome::OutputFailed"));
-    assert!(arm.contains("bump_evidence(EVIDENCE_RING_LOSS)"));
-    assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
-    assert!(
-        !arm[discard..].contains("raw"),
-        "never read a discarded reservation"
-    );
-    assert!(!arm.contains("object_fill_return("));
-    assert!(!arm.contains("object_tail_fill("));
-    assert!(!arm.contains("object_emit_"));
-    let healthy = source_between(returned, "let tail =", "entry.submit(0)");
-    assert!(
-        !healthy.contains("EVENTS.output"),
-        "healthy 608-byte returns do not copy a second record"
-    );
+    // Both object copies preserve exactly the initialized 368-byte base
+    // on refused continuity: same output shape and stamps, same loss
+    // accounting, no fill/emission in the refused arm, no second record
+    // on the healthy path. Only the retirement differs per copy.
+    for (name, start, end, retire) in [
+        (
+            "ordinary copy",
+            "fn object_return_ordinary(",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "|| owned_start_remove(&key, true).is_ok()",
+        ),
+        (
+            "generic copy",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "pub extern \"C\" fn p11_link_fork_allowed",
+            "|| start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok()",
+        ),
+    ] {
+        let returned = source_between(&source, start, end);
+        let arm = source_between(returned, "if !joined {", "let tail =");
+        let preserve = arm.find("preserve_refused_base(").unwrap_or_else(|| {
+            panic!("{name}: a refused object join must preserve one ordinary base after checked retirement")
+        });
+        let output = arm
+            .find(".output::<EventRecord>(unsafe { &(*raw).base }, 0)")
+            .unwrap_or_else(|| {
+                panic!("{name}: copy exactly the initialized 368-byte EventRecord, with its original stamps")
+            });
+        let discard = arm
+            .find("entry.discard(0)")
+            .unwrap_or_else(|| panic!("{name}: release the original reservation"));
+        assert!(
+            preserve < output && output < discard,
+            "{name}: output must run while the original reservation is owned"
+        );
+        assert!(
+            arm.contains(retire),
+            "{name}: refused arm must retire through its own removal"
+        );
+        assert!(arm.contains("RefusedBaseOutcome::OutputFailed"));
+        assert!(arm.contains("bump_evidence(EVIDENCE_RING_LOSS)"));
+        assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
+        assert!(
+            !arm[discard..].contains("raw"),
+            "{name}: never read a discarded reservation"
+        );
+        assert!(!arm.contains("object_fill_return("));
+        assert!(!arm.contains("object_tail_fill("));
+        assert!(!arm.contains("object_emit_"));
+        let healthy = source_between(returned, "let tail =", "entry.submit(0)");
+        assert!(
+            !healthy.contains("EVENTS.output"),
+            "{name}: healthy 608-byte returns do not copy a second record"
+        );
+    }
 }
 
 /// G02/E1: refused continuity performs zero result-handle reads. Healthy
@@ -2342,14 +2398,39 @@ fn pin_attribute_wrappers_delegate_to_shared_adapters() {
         );
     }
     // Exactly one production caller per wrapper: the definition plus the
-    // single root call site, counted over stripped code.
-    for wrapper in ["object_entry_attributes(", "object_emit_get_attributes("] {
+    // single root call site, counted over stripped code. The attribute
+    // emission wrapper keeps one call site in each object copy.
+    assert_eq!(
+        stripped.matches("object_entry_attributes(").count(),
+        2,
+        "object_entry_attributes( keeps its single definition plus one root call site"
+    );
+    for (name, start, end) in [
+        (
+            "ordinary copy",
+            "fn object_return_ordinary(",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        ),
+        (
+            "generic copy",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            // String-free: the prose stripper removes the `"C"` ABI
+            // string, so the full `pub extern` anchor cannot match.
+            "fn p11_link_fork_allowed",
+        ),
+    ] {
+        let body = source_between(&stripped, start, end);
         assert_eq!(
-            stripped.matches(wrapper).count(),
-            2,
-            "{wrapper} keeps its single definition plus one root call site"
+            body.matches("object_emit_get_attributes(").count(),
+            1,
+            "{name} keeps its single attribute-emission call site"
         );
     }
+    assert_eq!(
+        stripped.matches("object_emit_get_attributes(").count(),
+        3,
+        "object_emit_get_attributes( keeps its single definition plus one root call site per object copy"
+    );
 }
 
 /// G05(b) regression: the prose stripper behind the delegation pin must

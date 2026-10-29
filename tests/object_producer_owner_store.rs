@@ -132,51 +132,114 @@ fn object_producer_missing_side_state_faults_before_return() {
         !returned.contains("p11_object_return_remove"),
         "no monolithic native drain: query plus retire fits the chain budget"
     );
-    let query = returned
-        .find("p11_object_side_get(&key, descriptor, 0)")
-        .expect("return must query the side row before retiring");
-    let agree = returned
-        .find("row.descriptor_index == descriptor")
-        .expect("drain must check attached-descriptor agreement");
-    let abi = returned
-        .find("row.layout == 0 || u32::from(row.layout) == layout_code")
-        .expect("drain must check retained-ABI agreement");
+    // Each return implementation is bounded separately: the ordinary
+    // half, the monomorphic ordinary object copy and the generic
+    // (journal) object copy. The whole-region counts below guard
+    // against added sites; every site is justified in its own copy.
+    let ordinary = source_between(&source, "fn ordinary_return(", "fn object_return_ordinary(");
+    let object_ordinary = source_between(
+        &source,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    let object = source_between(
+        &source,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    assert_eq!(
+        ordinary.matches("owned_start_remove(&key, true)").count(),
+        1,
+        "ordinary retires once before accounting"
+    );
+    assert_eq!(
+        ordinary.matches("EVENTS.reserve").count(),
+        1,
+        "ordinary keeps its single 368-byte reservation"
+    );
+    for (name, body, retire, reserve) in [
+        (
+            "ordinary object copy",
+            object_ordinary,
+            "owned_start_remove(&key, true)",
+            "reserve::<ObjectEventRecord>",
+        ),
+        (
+            "generic object copy",
+            object,
+            "start_remove_for::<JOURNAL>",
+            "reserve::<Record>",
+        ),
+    ] {
+        let query = body
+            .find("p11_object_side_get(&key, descriptor, 0)")
+            .unwrap_or_else(|| panic!("{name} must query the side row before retiring"));
+        let agree = body
+            .find("row.descriptor_index == descriptor")
+            .unwrap_or_else(|| panic!("{name} drain must check attached-descriptor agreement"));
+        let abi = body
+            .find("row.layout == 0 || u32::from(row.layout) == layout_code")
+            .unwrap_or_else(|| panic!("{name} drain must check retained-ABI agreement"));
+        // Ready, agreement, aggregate, image, reserve-failure,
+        // continuity-gate and emission arms each retire through the
+        // copy's own removal; the other removal form must not leak in.
+        assert_eq!(
+            body.matches(retire).count(),
+            7,
+            "{name} must retire at each of its seven arms"
+        );
+        let other = if retire.starts_with("owned") {
+            "start_remove_for::<"
+        } else {
+            "owned_start_remove("
+        };
+        assert!(
+            !body.contains(other),
+            "{name} must not use the other copy's removal"
+        );
+        let drain_retire = body
+            .rfind(retire)
+            .unwrap_or_else(|| panic!("{name} emission arm retires"));
+        assert!(
+            query < drain_retire,
+            "{name} drain must query before retiring (retire deletes the row)"
+        );
+        let fault = body
+            .find("p11_object_fault()")
+            .unwrap_or_else(|| panic!("{name} failed settle must fault"));
+        let reserve = body
+            .find(reserve)
+            .unwrap_or_else(|| panic!("{name} slice D reserves the complete object record"));
+        let fill = body
+            .find("object_fill_return(")
+            .unwrap_or_else(|| panic!("{name} emission fills after the reservation"));
+        assert!(
+            query < reserve && agree < reserve && abi < reserve && fault < reserve,
+            "{name}: queries, agreement and fault must precede the object reservation"
+        );
+        assert!(
+            reserve < fill && fill < drain_retire,
+            "{name}: emission reads run between reservation and retire"
+        );
+        assert_eq!(
+            body.matches("EVENTS.reserve").count(),
+            1,
+            "{name} reserves exactly its own object record form"
+        );
+    }
+    // No-new-site guards: 1 ordinary + 7 + 7 retire sites, 3 reserves.
     assert_eq!(
         returned.matches("owned_start_remove(&key, true)").count()
             + returned.matches("start_remove_for::<JOURNAL>").count(),
-        8,
-        "ordinary, ready, agreement, aggregate, image, continuity-gate, reserve-failure and emission arms each retire"
-    );
-    let drain_retire = returned
-        .rfind("start_remove_for::<JOURNAL>")
-        .expect("emission arm retires");
-    assert!(
-        query < drain_retire,
-        "drain must query before retiring (retire deletes the row)"
-    );
-    let fault = returned
-        .find("p11_object_fault()")
-        .expect("failed settle must fault");
-    let reserve = returned
-        .find("reserve::<Record>")
-        .expect("slice D reserves the complete object record");
-    let fill = returned
-        .find("object_fill_return(")
-        .expect("emission fills after the reservation");
-    assert!(
-        query < reserve && agree < reserve && abi < reserve && fault < reserve,
-        "queries, agreement and fault must precede the object reservation"
-    );
-    assert!(
-        reserve < fill && fill < drain_retire,
-        "emission reads run between reservation and retire"
+        15,
+        "ordinary plus both object copies retire at every documented arm"
     );
     // Slice D emits the completed tail behind the required-object
     // marker: ordinary calls keep their single 368-byte reservation.
     assert_eq!(
         returned.matches("EVENTS.reserve").count(),
-        2,
-        "return reserves exactly the ordinary and the object record forms"
+        3,
+        "return reserves exactly the ordinary and the two object record forms"
     );
 }
 
@@ -315,21 +378,47 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     let whole_dispatch = dispatch;
     let ordinary_at = dispatch
         .rfind("    if unsafe { (*start).object_required } == 0 {")
-        .expect("ordinary false-specialized dispatch");
+        .expect("ordinary monomorphic dispatch");
+    // The journal-roots dispatch above keeps the generic body for the
+    // journal instantiation only; the monomorphic tail below routes the
+    // ordinary lane. Each dispatch is bounded separately.
+    let journal_dispatch = &dispatch[..ordinary_at];
+    assert!(
+        journal_dispatch.contains(
+            "if JOURNAL {\n        return if unsafe { (*start).object_required } == 0 {\n            journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)\n        } else {\n            object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(\n                ctx, &key, start, flags, layout,\n            )\n        };\n    }"
+        ),
+        "journal dispatch must tail-route through a plain else to the journal instantiation"
+    );
+    for half in [
+        "journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)",
+        "object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(",
+    ] {
+        assert_eq!(
+            journal_dispatch.matches(half).count(),
+            1,
+            "journal dispatch must call {half} exactly once with the live pointer"
+        );
+    }
+    assert!(
+        !whole_dispatch.contains("object_return::<false"),
+        "no false-specialized generic call site may remain at dispatch"
+    );
     let dispatch = &dispatch[ordinary_at..];
     // The outlined halves gap a lost in-scope call at their own arms, in
     // place at depth 3 inside return's 512-byte chain. The dispatcher
     // still owns no lifetime: it only tail-routes to the two halves and
-    // consumes no lost code, keeping the 6.1/5.15 verifier shape.
+    // consumes no lost code, keeping the 6.1/5.15 verifier shape. The
+    // object half is the monomorphic ordinary copy: the generic body is
+    // retained for the journal instantiation only (see above).
     assert!(
         dispatch.contains(
-            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n    }"
+            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {\n        object_return_ordinary(ctx, &key, start, flags, layout)\n    }"
         ),
         "dispatcher must tail-route ordinary and object calls through a plain else"
     );
     for half in [
         "ordinary_return(ctx, &key, start, flags, layout)",
-        "object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)",
+        "object_return_ordinary(ctx, &key, start, flags, layout)",
     ] {
         assert_eq!(
             dispatch.matches(half).count(),
@@ -345,13 +434,14 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     // matches the old unindented anchor and both exact-once counts, so only
     // the 4-space anchor above catches it.
     let nested = dispatch.replacen(
-        "\n    } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n    }",
-        "\n        } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n        }",
+        "\n    } else {\n        object_return_ordinary(ctx, &key, start, flags, layout)\n    }",
+        "\n        } else {\n        object_return_ordinary(ctx, &key, start, flags, layout)\n        }",
         1,
     );
     assert_ne!(nested, dispatch, "nesting mutant must change the dispatch");
     assert!(
-        nested.contains("} else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)"),
+        nested
+            .contains("} else {\n        object_return_ordinary(ctx, &key, start, flags, layout)"),
         "nesting mutant must stay on target for the unindented anchor"
     );
     assert_eq!(
@@ -363,7 +453,7 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     );
     assert_eq!(
         nested
-            .matches("object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)")
+            .matches("object_return_ordinary(ctx, &key, start, flags, layout)")
             .count(),
         1,
         "nesting mutant must keep the object count"
@@ -385,11 +475,7 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
             "dispatcher must not {forbidden}"
         );
     }
-    let ordinary = source_between(
-        &source,
-        "fn ordinary_return(",
-        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
-    );
+    let ordinary = source_between(&source, "fn ordinary_return(", "fn object_return_ordinary(");
     let snapshot = ordinary
         .find("let start = unsafe { *start };")
         .expect("ordinary snapshot");
@@ -403,40 +489,233 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         .find("capture_return_facts::<")
         .expect("ordinary private reads");
     assert!(snapshot < retire && retire < account && account < reads);
+    let object_ordinary = source_between(
+        &source,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
     let object = source_between(
         &source,
         "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
-    assert!(
-        !object.contains("let start = unsafe { *start }"),
-        "object must retain only live raw START"
-    );
-    assert!(
-        !object.contains("let ev = Event"),
-        "object fills the reservation directly"
-    );
-    let fill = object
-        .find("fill_call_event(")
-        .expect("in-place initialization");
-    let retire = object
-        .find("emission_finalize(")
-        .expect("checked terminal retirement");
-    let submit = object
-        .find("entry.submit(0)")
-        .expect("submit only after retirement");
-    assert!(fill < retire && retire < submit);
-    for forbidden in [
-        "(*start)",
-        "&*start",
-        "p11_object_side_get",
-        "fill_call_event(",
-    ] {
+    // Both object-return copies keep the same owned lifetime: raw START
+    // only, in-place initialization, one checked terminal retirement,
+    // submit after retirement, no reads past it.
+    for (name, body) in [("ordinary copy", object_ordinary), ("generic copy", object)] {
         assert!(
-            !object[retire..].contains(forbidden),
-            "no {forbidden} after terminal retirement"
+            !body.contains("let start = unsafe { *start }"),
+            "{name} must retain only live raw START"
+        );
+        assert!(
+            !body.contains("let ev = Event"),
+            "{name} fills the reservation directly"
+        );
+        let fill = body
+            .find("fill_call_event(")
+            .unwrap_or_else(|| panic!("{name} in-place initialization"));
+        let retire = body
+            .find("emission_finalize(")
+            .unwrap_or_else(|| panic!("{name} checked terminal retirement"));
+        let submit = body
+            .find("entry.submit(0)")
+            .unwrap_or_else(|| panic!("{name} submit only after retirement"));
+        assert!(fill < retire && retire < submit);
+        for forbidden in [
+            "(*start)",
+            "&*start",
+            "p11_object_side_get",
+            "fill_call_event(",
+        ] {
+            assert!(
+                !body[retire..].contains(forbidden),
+                "{name}: no {forbidden} after terminal retirement"
+            );
+        }
+    }
+}
+
+/// The two object-return implementations evolve together: the
+/// monomorphic ordinary copy keeps the verifier-friendly linear shape
+/// while the generic copy keeps the journal lifetime optimisation.
+/// Both run the same ordered semantic skeleton; their differences are
+/// exactly the documented list below. A semantic edit to one copy must
+/// update the other (or this contract with a reviewed reason):
+/// recombining the shapes would reopen the v6.1 verifier/stack
+/// tradeoff the split resolves.
+#[test]
+fn object_return_copies_keep_shared_skeleton_and_documented_differences() {
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF return source");
+    let object_ordinary = source_between(
+        &source,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    let object = source_between(
+        &source,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    // Both copies stay outlined: the split's stack/verifier tradeoff
+    // depends on neither body inlining into the return root.
+    for (name, definition) in [
+        ("ordinary copy", "fn object_return_ordinary("),
+        (
+            "generic copy",
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        ),
+    ] {
+        let at = source
+            .find(definition)
+            .unwrap_or_else(|| panic!("{name} definition"));
+        let window = &source[at.saturating_sub(400)..at];
+        assert!(
+            window.contains("#[inline(never)]"),
+            "{name} must stay #[inline(never)]"
+        );
+        assert!(
+            window.contains("#[cfg(not(feature = \"inventory-only\"))]"),
+            "{name} must keep its inventory-only exclusion"
         );
     }
+    // Shared skeleton: the same semantic stages in the same order.
+    // Successive finds (not whole-body contains) pin the order.
+    let skeleton = [
+        "p11_object_side_get(&key, descriptor, 1)",
+        "row.descriptor_index == descriptor",
+        "FLAG_POLICY_AGGREGATE",
+        "p11_link_current_identity",
+        "capture_return_facts::<",
+        "EVENTS.reserve",
+        "fill_call_event(",
+        "p11_instance_return(&key,",
+        "continuity_joins(",
+        "preserve_refused_base(",
+        "entry.discard(0)",
+        "object_fill_return(",
+        "object_tail_fill(",
+        "object_emit_find(",
+        "object_emit_get_attributes(",
+        "emission_finalize(",
+        "entry.submit(0)",
+    ];
+    for (name, body) in [("ordinary copy", object_ordinary), ("generic copy", object)] {
+        let mut offset = 0;
+        for stage in skeleton {
+            let at = body[offset..]
+                .find(stage)
+                .unwrap_or_else(|| panic!("{name} skeleton must reach {stage}"));
+            offset += at + stage.len();
+        }
+    }
+    // Documented difference 1: removal helper. The ordinary copy
+    // retires through the owned removal; the generic copy through the
+    // journal-parameterized removal with per-arm reasons.
+    assert_eq!(
+        object_ordinary
+            .matches("owned_start_remove(&key, true)")
+            .count(),
+        7,
+        "ordinary copy retires through the owned removal only"
+    );
+    assert!(
+        !object_ordinary.contains("start_remove_for::<"),
+        "ordinary copy must not use the journal removal"
+    );
+    assert_eq!(
+        object.matches("start_remove_for::<JOURNAL>").count(),
+        7,
+        "generic copy retires through the journal removal only"
+    );
+    assert!(
+        !object.contains("owned_start_remove("),
+        "generic copy must not use the owned removal"
+    );
+    // Documented difference 2: reservation type. The ordinary copy
+    // reserves the concrete record; the generic copy reserves through
+    // its Record parameter.
+    assert_eq!(
+        object_ordinary
+            .matches("EVENTS.reserve::<ObjectEventRecord>(0)")
+            .count(),
+        1
+    );
+    assert!(
+        !object_ordinary.contains("EVENTS.reserve::<Record>(0)"),
+        "ordinary copy reserves the concrete record"
+    );
+    assert_eq!(object.matches("EVENTS.reserve::<Record>(0)").count(), 1);
+    assert!(
+        !object_ordinary.contains("Record::payload("),
+        "ordinary copy addresses the concrete payload directly"
+    );
+    assert_eq!(object.matches("Record::payload(").count(), 2);
+    // Documented difference 3: capture specialization. The ordinary
+    // copy captures with the false specialization; the generic copy
+    // threads its JOURNAL parameter.
+    assert_eq!(
+        object_ordinary
+            .matches("capture_return_facts::<false>")
+            .count(),
+        1
+    );
+    assert!(
+        !object_ordinary.contains("capture_return_facts::<JOURNAL>"),
+        "ordinary copy captures without the journal parameter"
+    );
+    assert_eq!(object.matches("capture_return_facts::<JOURNAL>").count(), 1);
+    // Documented difference 4: accounting/facts lifetime. The generic
+    // copy ends the aggregate lifetime in a block before the deep
+    // attribute readers (the journal stack optimisation); the ordinary
+    // copy keeps the linear green shape.
+    assert!(
+        object.contains("let (mut entry, rv, mechanism, capture_flags) = {"),
+        "generic copy keeps the lifetime-ending block"
+    );
+    assert!(
+        !object_ordinary.contains("let (mut entry, rv, mechanism, capture_flags) = {"),
+        "ordinary copy keeps the linear shape"
+    );
+    assert!(
+        object_ordinary.contains("let facts = unsafe { capture_return_facts::<false>"),
+        "ordinary copy captures facts linearly"
+    );
+    // Documented difference 5: journal program calls. Only the generic
+    // copy routes, gaps and completes through the journal program.
+    for call in [
+        "journal_roots::program::route(",
+        "journal_roots::program::gap()",
+        "journal_roots::program::complete(",
+    ] {
+        assert!(
+            object.contains(call),
+            "generic copy must keep its {call} journal call"
+        );
+        assert!(
+            !object_ordinary.contains(call),
+            "ordinary copy must not call {call}"
+        );
+    }
+    assert!(
+        !object_ordinary.contains("journal_roots"),
+        "ordinary copy must not name the journal program"
+    );
+    // Documented difference 6: ring-loss gap guard. The ordinary copy
+    // gaps on the plain settled guard; the generic copy conjoins the
+    // journal parameter. The journal gap test pins each guard's exact
+    // block and rejects the flipped-guard mutant per copy.
+    assert!(
+        object_ordinary.contains("if !failed {"),
+        "ordinary copy gaps on the plain settled guard"
+    );
+    assert!(
+        !object_ordinary.contains("JOURNAL ||"),
+        "ordinary copy guard names no journal parameter"
+    );
+    assert!(
+        object.contains("if !failed && (JOURNAL || cfg!(p11scope_birth_marker)) {"),
+        "generic copy gaps on the journal-conjoined guard"
+    );
 }
 
 #[test]

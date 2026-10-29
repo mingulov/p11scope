@@ -4051,7 +4051,7 @@ fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
     if unsafe { (*start).object_required } == 0 {
         ordinary_return(ctx, &key, start, flags, layout)
     } else {
-        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)
+        object_return_ordinary(ctx, &key, start, flags, layout)
     }
 }
 
@@ -4276,6 +4276,180 @@ impl ReturnPayload for ObjectEventRecord {
     unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
         record
     }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_return_ordinary(
+    ctx: RetProbeContext,
+    key: &StartKey,
+    start: *const CallStart,
+    flags: u64,
+    layout: LinuxLayout,
+) -> u32 {
+    let ctx = &ctx;
+    let key = *key;
+    // Slice D activation: query the validated side row and require
+    // ready phase, attached-descriptor and retained-ABI agreement.
+    // The drain retire moves after emission below: the side row must
+    // stay alive while the 608-byte record is reserved and filled.
+    // Query plus retire stays the drain (a monolithic native drain
+    // nests too deep for return's 512-byte call-chain budget; see
+    // object_producer_compiled_frames_are_bounded). Any failure
+    // discards the record: no ring reservation, no facts.
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
+        LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
+    };
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
+    if ready.is_none() {
+        // H7-E2: every refusal retires identifiable owned state
+        // through the checked removal before returning; the fault
+        // below fires whether or not the retire settles.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let agreed = side.is_some_and(|row| {
+        row.descriptor_index == descriptor
+            && (row.layout == 0 || u32::from(row.layout) == layout_code)
+    });
+    if !agreed {
+        // H7-E2: retire before returning, as on every refusal arm.
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        if owned_start_remove(&key, true).is_err() {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        return 0;
+    }
+    let mut image = ImageIdentity::default();
+    if unsafe { p11_link_current_identity(&mut image) } != 1
+        || !image_pair_matches(unsafe { (*start).image }, image)
+    {
+        let _ = owned_start_remove(&key, true);
+        unsafe { p11_object_fault() };
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return 0;
+    }
+    // This short immutable borrow ends before reservation/native continuity
+    // or side-row helpers. All retained START reads finish before removal.
+    let facts = unsafe { capture_return_facts::<false>(ctx, &*start, flags, layout, accounting) };
+    // Slice D emission: reserve the complete 608-byte record BEFORE
+    // any result/attribute read. Reservation failure performs no new
+    // reads: disclose loss, clean ownership, keep the aggregate
+    // return/RV accounting recorded above, and return.
+    let descriptor = cookie_descriptor(cookie_of(ctx));
+    let rv = accounting.rv;
+    let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
+        // The fault below already refuses births; gap only when the
+        // START removal settles. The gap runs here in place; the root
+        // stays a plain tail dispatch for the 6.1/5.15 verifiers.
+        let failed = owned_start_remove(&key, true).is_err();
+        if failed {
+            unsafe { p11_object_fault() };
+        }
+        bump_evidence(EVIDENCE_RING_LOSS);
+        // H8-D birth marker: a ring-loss return whose START removal
+        // settled loses the completion, so it gaps here in place.
+        #[cfg(p11scope_birth_marker)]
+        #[cfg(not(feature = "counter-broad"))]
+        if !failed {
+            unsafe {
+                p11_instance_scope_gap();
+            }
+        }
+        return 0;
+    };
+    // H7-E1: populate in place under ownership with the base event
+    // and its continuity landing in the reserved record FIRST, then
+    // the join gate before any object result read, then (with the S1
+    // return-time mechanism evidence the return body just captured)
+    // the result fills and tail sections. A refused join preserves only
+    // the ordinary base. A found continuity entry is not a join: only the full
+    // stamp predicate authorizes result/Find/attribute reads.
+    let raw = entry.as_mut_ptr();
+    unsafe {
+        fill_call_event(
+            core::ptr::addr_of_mut!((*raw).base.event),
+            &*start,
+            key.slot,
+            &facts,
+        );
+        let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+    }
+    let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
+    if !joined {
+        let outcome = preserve_refused_base(
+            || owned_start_remove(&key, true).is_ok(),
+            || unsafe { p11_object_fault() },
+            // SAFETY: fill_call_event and p11_instance_return initialized
+            // every byte of this 368-byte base while the reservation was
+            // owned. Copy it before discard; the unfilled object tail is
+            // never read, and the original failing stamps remain unchanged.
+            || EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok(),
+        );
+        entry.discard(0);
+        if outcome == RefusedBaseOutcome::OutputFailed {
+            bump_evidence(EVIDENCE_RING_LOSS);
+        }
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
+    let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+    let filled = object_fill_return(
+        ready,
+        rv,
+        facts.capture_flags & capture::MECHANISM_MASK,
+        facts.mechanism,
+        encode_return_gate(layout, joined),
+    );
+    // Each emission level re-queries its side row like the entry
+    // adapters: the helpers stay leaf-flat (no nested native query)
+    // and their measured frames count in the complete 512-byte chain.
+    let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
+    let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+    let emitted = tailed
+        && object_emit_find(
+            tail,
+            find_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        )
+        && object_emit_get_attributes(
+            tail,
+            get_side,
+            descriptor,
+            rv,
+            encode_return_gate(layout, joined),
+        );
+    // Submit the completed ring record only after successful
+    // removal; otherwise discard it and fault. H7-E2: the shared
+    // cleanup decision evaluates the retirement independently of
+    // emission success, so a failed fill/emission still retires owned
+    // state and no read runs after either failure.
+    let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
+    if !outcome.submitted {
+        unsafe { p11_object_fault() };
+        entry.discard(0);
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
+    entry.submit(0);
+    0
 }
 
 #[cfg(not(feature = "inventory-only"))]

@@ -174,4 +174,44 @@ __attribute__((noinline)) u64 p11_link_current_cookie(void)
     return result.cookie;
 }
 
+#ifdef P11SCOPE_LOADER_GATE
+/* T-L2 typed-task ticket query: the cookie-only domain for an explicit
+ * task, without identity_for's self_exec_id read. The ticket number is
+ * the cookie: burned tickets advance the watermark but never issue, and
+ * no issued number is ever reused. */
+__attribute__((noinline)) u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out)
+{
+    struct cookie_result result;
+    if (!ticket_out)
+        return COOKIE_STATUS_BAD_TASK;
+    *ticket_out = 0;
+    if (!task)
+        return COOKIE_STATUS_BAD_TASK;
+    result = cookie_for(task);
+    if (result.status != COOKIE_STATUS_OK)
+        return result.status;
+    *ticket_out = result.cookie;
+    return COOKIE_STATUS_OK;
+}
+
+/* T-L2 issuance watermark: factual observation for incarnation pairing
+ * and the later L4b producer. Read-only: never spends a ticket and never
+ * bumps a counter, so observers cannot perturb the issuance they read. */
+__attribute__((noinline)) u32 p11_image_identity_issued(u64 *watermark_out)
+{
+    struct control *control;
+    if (!watermark_out)
+        return COOKIE_STATUS_BAD_TASK;
+    *watermark_out = 0;
+    control = get_control();
+    if (!control)
+        return COOKIE_STATUS_NO_CONTROL;
+    if (control->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
+        control->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT)
+        return COOKIE_STATUS_BAD_CONFIG;
+    *watermark_out = control->next_ticket;
+    return COOKIE_STATUS_OK;
+}
+#endif
+
 char LICENSE[] SEC("license") = "GPL";

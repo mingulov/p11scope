@@ -1066,6 +1066,26 @@ impl LifetimeRegistry {
         Ok(())
     }
 
+    /// Settled pre-check for the Finish path: validate the fence domain
+    /// first (like every registry entry point), then report the fence's
+    /// own token when its slot already sits reclaimable for that
+    /// generation. Anything else returns `None` and the caller runs the
+    /// full acknowledgement, which keeps custody on every refusal. The
+    /// fence position needs no comparison here: it is fixed once per
+    /// retirement, and post-reclaim currency comes from the slot state.
+    pub(crate) fn fence_settled(
+        &self,
+        fence: &LoaderRetirementFence,
+    ) -> Result<Option<LoaderToken>, LifetimeError> {
+        self.check_domain(fence.domain)?;
+        match &self.slots[usize::from(fence.token.slot())] {
+            Slot::Reclaimable { generation } if *generation == fence.token.generation() => {
+                Ok(Some(fence.token))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Acknowledge a same-domain fence after the fixed prefix drained, every
     /// queued reference and scan reached disposition, every descriptor
     /// settled and link cleanup succeeded. Success preserves the immutable

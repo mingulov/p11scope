@@ -1128,8 +1128,9 @@ impl MachineScene {
     }
 
     fn with_initial_files(providers: usize, mapped: &[u32], quiet: bool) -> Self {
-        let (held, attached) = HeldProviders::with_attachment(
+        Self::with_initial_files_and_functions(
             providers,
+            mapped,
             if quiet {
                 &[
                     "C_CreateObject",
@@ -1146,7 +1147,21 @@ impl MachineScene {
                     "C_SignFinal",
                 ]
             },
-        );
+            false,
+        )
+    }
+
+    fn with_initial_files_and_functions(
+        providers: usize,
+        mapped: &[u32],
+        functions: &[&str],
+        standard_interface: bool,
+    ) -> Self {
+        let (held, attached) = if standard_interface {
+            HeldProviders::with_interface_attachment(providers, functions)
+        } else {
+            HeldProviders::with_attachment(providers, functions)
+        };
         let mut scene = JointScene::from_held(held, Some(attached));
         let pid = std::process::id();
         SIGHT_NS.with(|clock| clock.set(1_005));
@@ -1170,7 +1185,7 @@ impl MachineScene {
                     identity_source: Some("held-provider".into()),
                     admission: AdmissionState::Admitted,
                     admission_class: Some("exact".into()),
-                    admission_endpoints: Some(if quiet { 5 } else { 4 }),
+                    admission_endpoints: Some(functions.len()),
                     admission_reasons: Vec::new(),
                 },
                 60,
@@ -14041,6 +14056,7 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             binding.image().task_cookie == 71
         );
     }
+    assert_original_resource_loss_scope(&fixture, &mut frame, &targets, proof);
     {
         let ports = fixture
             .scene
@@ -14051,7 +14067,18 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             .unwrap();
         frame.bind_targets(&ports).unwrap();
     }
+    let physical_counts = resource_fixture_physical_api_counts(&fixture);
+    let association_owners = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .keyuse_for_test()
+        .open()
+        .clone();
     fixture.finish_bounded_batch(frame, false);
+    assert_original_resource_loss_terminal(&fixture, &targets, proof, caller);
     assert_eq!(
         fixture
             .scene
@@ -14059,8 +14086,15 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             .scene
             .coordinator
             .registry()
-            .joint_feeds(),
-        1
+            .keyuse_for_test()
+            .open(),
+        &association_owners,
+        "loss delivery preserves the exact independent ordinary S1 operation identity and ticket"
+    );
+    assert_eq!(
+        resource_fixture_physical_api_counts(&fixture),
+        physical_counts,
+        "semantic history loss never relabels or drops original physical API returns"
     );
     assert_eq!(
         fixture
@@ -14070,7 +14104,7 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             .coordinator
             .registry()
             .feed_mode_for_test(healthy.id()),
-        Some(crate::semantics_key_use::FeedMode::Joint)
+        Some(crate::semantics_key_use::FeedMode::S1Only)
     );
     assert!(
         fixture
@@ -14083,6 +14117,232 @@ fn joint_s1only_exact_subject_preserves_preexisting_image_taint() {
             .proof_refused_for_test(proof)
     );
     fixture.scene.assert_claims(&[]);
+    finish_resource_subject_operation(&mut fixture, child.id(), caller);
+}
+
+fn resource_fixture_physical_api_counts(
+    fixture: &CanonicalFanoutScene,
+) -> Vec<(RegistryInstanceId, Option<u64>)> {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| (record.id, record.api_returns))
+        .collect()
+}
+
+fn prepare_disposing_s1_batch(
+    scene: &mut JointScene,
+    count: usize,
+    grant: &SessionDrainGrant,
+) -> IngestedRaw {
+    let raw = scene.prepare(count);
+    let coordinator = &mut scene.real.scene.coordinator;
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &scene.producers,
+            grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("actual terminal batch ingestion: {reason:?}"));
+    let mut claims = 0;
+    while let Some((_, proof)) = coordinator
+        .claim_next_prepared_admission(&scene.producers, &ingested)
+        .unwrap()
+    {
+        proof.expect("the completed original retains its actual key-era");
+        claims += 1;
+    }
+    assert_eq!(claims, count);
+    let mut staged = 0;
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&scene.producers, &mut ingested)
+        .unwrap()
+    {
+        staged += 1;
+    }
+    assert_eq!(staged, count);
+    assert!(coordinator.finish_prepared_semantic_batch(&scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
+        .unwrap();
+    ingested
+}
+
+fn assert_live_sign_associations(
+    registry: &crate::discovery::caller_registry::CallerRegistry,
+    expected: &[RegistryInstanceId],
+) {
+    let mut actual = registry
+        .keyuse_for_test()
+        .open()
+        .iter()
+        .map(|((instance, _operation), association)| {
+            assert_eq!(*instance, association.instance);
+            assert_eq!(association.category, "sign");
+            assert_eq!(association.mechanism, Some(0x000d));
+            let record = registry
+                .instance_semantic_edges()
+                .find(|record| record.id == *instance)
+                .unwrap();
+            assert_eq!(
+                record
+                    .semantics
+                    .as_ref()
+                    .unwrap()
+                    .active_summary()
+                    .iter()
+                    .map(|(_, _, count)| *count)
+                    .sum::<u64>(),
+                1,
+                "this exact association still has its original live S1 operation"
+            );
+            *instance
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(registry.keyuse_for_test().refused_opens().is_empty());
+}
+
+fn assert_original_resource_loss_scope(
+    fixture: &CanonicalFanoutScene,
+    frame: &mut IngestedJointQuantum,
+    targets: &[JointFeedTarget],
+    exact: JournalDomainProof,
+) {
+    use crate::semantics_key_use::SealFailureDisposition;
+    use crate::semantics_objects::journal::JournalGap;
+    assert!(frame.audit_for_test().resource_refused_for_test());
+    let originals = frame.original_failures_for_test().collect::<Vec<_>>();
+    assert_eq!(originals.len(), 2);
+    assert_eq!(originals[0].gap, JournalGap::ImageTainted);
+    assert_eq!(originals[1].gap, JournalGap::ResourceUnavailable);
+    assert!(originals[1].affects_proof_for_test(&exact));
+    let disjoint = targets
+        .iter()
+        .find(|target| !originals[0].affects_domain(target.bootstrap().domain()))
+        .unwrap();
+    for target in targets {
+        assert!(originals[1].affects_domain(target.bootstrap().domain()));
+        assert_eq!(
+            frame
+                .audited_failure_for_test(target.bootstrap().domain())
+                .unwrap()
+                .disposition(),
+            SealFailureDisposition::HistoryLoss
+        );
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_history_targets()
+            .all(|(target, _)| target.bootstrap().proof() != exact),
+        "the new S1Only subject has no invented selected H9 history"
+    );
+    frame.assert_resource_disposition_provenance_for_test(disjoint.bootstrap().domain());
+}
+
+fn assert_original_resource_loss_terminal(
+    fixture: &CanonicalFanoutScene,
+    targets: &[JointFeedTarget],
+    exact: JournalDomainProof,
+    subject: CallerId,
+) {
+    use crate::semantics_key_use::FeedMode;
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.registry().joint_feeds(), 0);
+    for target in targets {
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(target.id()),
+            Some(FeedMode::S1Only)
+        );
+        let feed = fixture
+            .feeds()
+            .into_iter()
+            .find(|feed| feed.id == target.id())
+            .unwrap();
+        assert!(feed.degraded);
+        assert_eq!(feed.staged, 0);
+    }
+    assert!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(exact)
+    );
+    let subject_id = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|record| record.caller == subject)
+        .unwrap()
+        .id;
+    assert_live_sign_associations(coordinator.registry(), &[subject_id]);
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        [0, 0, 0, 0, 1],
+        "only this exact live ordinary S1 operation keeps association custody"
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test()
+            .0,
+        0
+    );
+}
+
+fn finish_resource_subject_operation(
+    fixture: &mut CanonicalFanoutScene,
+    pid: u32,
+    caller: CallerId,
+) {
+    let subject = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|record| record.caller == caller)
+        .unwrap()
+        .id;
+    let before = fixture.s1_counts(subject);
+    assert_eq!(before.4, 1);
+    fixture.scene.push(pid, 0, "C_SignFinal", 2);
+    let ingested = prepare_disposing_s1_batch(&mut fixture.scene, 1, &fixture.grant);
+    let mut terminal = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        terminal.bind_targets(&ports).unwrap();
+    }
+    fixture.finish_bounded_batch(terminal, false);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert!(coordinator.registry().keyuse_for_test().open().is_empty());
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        [0; 5]
+    );
+    let after = fixture.s1_counts(subject);
+    assert_eq!(after.0, before.0 + 1);
+    assert_eq!(after.2, before.2 + 1);
+    assert_eq!(after.4, 0);
 }
 
 /// Catches treating truthful acquired H3Pending as a permanent local retry.
@@ -20771,4 +21031,155 @@ fn joint_machine_h0_pending_q_progress_keeps_trip_clear() {
         None,
         "no trip across a progressing PendingQ merge"
     );
+}
+
+#[test]
+fn joint_s1only_preexisting_image_ordinary_return_delivery_reproducer() {
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let targets = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    let child = OwnedStoppedChild::new();
+    let caller = fixture.scene.real.bind(
+        child.id(),
+        ImageIdentity {
+            task_cookie: 74,
+            exec_id: 0,
+        },
+        0,
+    );
+    let (mut begin, end) = fixture
+        .scene
+        .encoded(std::process::id(), 0, "C_SignInit", 2);
+    let original_ip = u64::from_le_bytes(begin[56..64].try_into().unwrap());
+    begin[56..64].copy_from_slice(&(original_ip + 1).to_le_bytes());
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    fixture.scene.drain.source_mut().push_record(end.to_vec());
+    fixture.scene.push(child.id(), 0, "C_SignInit", 1);
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture.scene.admit_providers(child.id(), caller, &[0]);
+    fixture.scene.prepare_batch(batch, 2);
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original independent image taint: {reason:?}"));
+    assert_eq!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+            .unwrap()
+            .1,
+        Err(AttestationRefusal::ImageTainted)
+    );
+    let (at, proof) = coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(at, 4);
+    let proof = proof.expect("the unrelated S1Only subject has its retained exact key");
+    assert!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+            .is_none()
+    );
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let original = frame.original_failures_for_test().next().unwrap();
+    assert_eq!(original.gap, JournalGap::ImageTainted);
+    assert!(original.affects_proof_for_test(&proof));
+    for target in &targets {
+        let binding = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(target.caller())
+            .unwrap();
+        assert_eq!(
+            original.affects_domain(target.bootstrap().domain()),
+            binding.image().task_cookie == 71
+        );
+    }
+    assert_original_resource_loss_scope(&fixture, &mut frame, &targets, proof);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    let physical_counts = resource_fixture_physical_api_counts(&fixture);
+    let association_owners = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .keyuse_for_test()
+        .open()
+        .clone();
+    fixture.finish_bounded_batch(frame, false);
+    assert_original_resource_loss_terminal(&fixture, &targets, proof, caller);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .open(),
+        &association_owners,
+        "loss delivery preserves the exact independent ordinary S1 operation identity and ticket"
+    );
+    assert_eq!(
+        resource_fixture_physical_api_counts(&fixture),
+        physical_counts,
+        "semantic history loss never relabels or drops original physical API returns"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(proof)
+    );
+    fixture.scene.assert_claims(&[]);
+    finish_resource_subject_operation(&mut fixture, child.id(), caller);
 }

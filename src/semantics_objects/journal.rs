@@ -458,6 +458,10 @@ struct ImageSighting {
 struct JournalDomainState {
     era: u64,
     refused: bool,
+    /// A genuinely marked S1Only original was disposed for this retained
+    /// exact key. This negative provenance survives image-independent voids;
+    /// it never restores a live key, changes its era or authorizes a seal.
+    s1only_original_refused: bool,
     tainted: bool,
     era_ended: bool,
     sealed_through: u64,
@@ -1722,6 +1726,9 @@ impl JournalAdapter {
                     assert_eq!(claim.admission, original.admission);
                     assert_eq!(claim.return_ns, original.return_ns);
                 }
+                if let Some(state) = self.keys.get_mut(&key) {
+                    state.s1only_original_refused = true;
+                }
                 let ordinal = entry.begin_ordinal;
                 self.ledger.release_h8open(ordinal);
             }
@@ -2547,6 +2554,11 @@ impl JournalAuditReceipt {
         &self.h3
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_refused_for_test(&self) -> bool {
+        self.resource_refused
+    }
+
     /// Production audit from one collection plus the actual H3
     /// finalizer's latest disposition (taken through
     /// [`H3EvidenceSource`], never caller-supplied) and the live
@@ -2694,9 +2706,10 @@ impl JournalAuditReceipt {
                 }
             }
         }
-        // Resource-only refusal may fall back through a complete H3 stream.
-        // It must never downgrade genuine native loss or H3 exhaustion/loss
-        // into fallback, nor consume a route-pending quantum as complete.
+        // Original audit resource refusal voids H8 custody in reject_audit;
+        // canonical delivery classifies that same original/audit as loss.
+        // Seal-time resource refusal with retained custody may still fall
+        // back. Neither may downgrade native/H3 loss or complete pending H3.
         if self.resource_refused {
             return Err(JournalGap::ResourceUnavailable);
         }

@@ -48,10 +48,25 @@ impl HeldProviders {
         (held, attachment.unwrap())
     }
 
+    fn with_interface_attachment(count: usize, resolved: &[&str]) -> (Self, AttestedSubset) {
+        let (held, attachment) =
+            Self::with_optional_attachment_on_surface(count, resolved, true, true);
+        (held, attachment.unwrap())
+    }
+
     fn with_optional_attachment(
         count: usize,
         resolved: &[&str],
         attach: bool,
+    ) -> (Self, Option<AttestedSubset>) {
+        Self::with_optional_attachment_on_surface(count, resolved, attach, false)
+    }
+
+    fn with_optional_attachment_on_surface(
+        count: usize,
+        resolved: &[&str],
+        attach: bool,
+        standard_interface: bool,
     ) -> (Self, Option<AttestedSubset>) {
         let dir = tempfile::tempdir().unwrap();
         let mut providers = Vec::new();
@@ -60,7 +75,7 @@ impl HeldProviders {
             std::fs::copy("/usr/bin/true", &path).unwrap();
             providers.push(path);
         }
-        Self::from_paths_with_optional_attachment(dir, &providers, resolved, attach)
+        Self::from_paths_on_surface(dir, &providers, resolved, attach, standard_interface)
     }
 
     fn from_paths(dir: tempfile::TempDir, providers: &[std::path::PathBuf]) -> Self {
@@ -81,7 +96,38 @@ impl HeldProviders {
         resolved: &[&str],
         attach: bool,
     ) -> (Self, Option<AttestedSubset>) {
+        Self::from_paths_on_surface(dir, providers, resolved, attach, false)
+    }
+
+    fn from_paths_on_surface(
+        dir: tempfile::TempDir,
+        providers: &[std::path::PathBuf],
+        resolved: &[&str],
+        attach: bool,
+        standard_interface: bool,
+    ) -> (Self, Option<AttestedSubset>) {
         let count = providers.len();
+        let version = if standard_interface {
+            Version { major: 3, minor: 2 }
+        } else {
+            Version {
+                major: 2,
+                minor: 40,
+            }
+        };
+        let native_version = cryptoki_sys::CK_VERSION {
+            major: version.major,
+            minor: version.minor,
+        };
+        let surface = if standard_interface {
+            pkcs11_module::Surface::StandardInterface {
+                version: native_version,
+            }
+        } else {
+            pkcs11_module::Surface::LegacyFunctionList {
+                version: native_version,
+            }
+        };
         let mut paths = Vec::new();
         for (index, path) in providers.iter().enumerate() {
             let file = open_object(path).unwrap();
@@ -92,31 +138,25 @@ impl HeldProviders {
                 .iter()
                 .find(|(start, end)| end - start > (resolved.len() as u64 + 1) * 0x100)
                 .unwrap();
-            let functions =
-                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
-                    version: cryptoki_sys::CK_VERSION {
-                        major: 2,
-                        minor: 40,
-                    },
-                }) {
-                    pkcs11_module::TableSet::Walk(spans) => spans
-                        .iter()
-                        .flat_map(|span| span.fields())
-                        .map(|field| FunctionRecord {
-                            name: field.name.into(),
-                            resolution: match resolved.iter().position(|name| *name == field.name) {
-                                Some(at) => Resolution::Resolved {
-                                    object: 0,
-                                    file_offset: executable.0 + (at as u64 + 1) * 0x100,
-                                },
-                                _ => Resolution::NullPointer,
+            let functions = match pkcs11_module::tables_for(surface) {
+                pkcs11_module::TableSet::Walk(spans) => spans
+                    .iter()
+                    .flat_map(|span| span.fields())
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: match resolved.iter().position(|name| *name == field.name) {
+                            Some(at) => Resolution::Resolved {
+                                object: 0,
+                                file_offset: executable.0 + (at as u64 + 1) * 0x100,
                             },
-                        })
-                        .collect(),
-                    _ => panic!("the complete standard 2.40 surface is required"),
-                };
+                            _ => Resolution::NullPointer,
+                        },
+                    })
+                    .collect(),
+                _ => panic!("the complete supported standard surface is required"),
+            };
             let path = path.to_str().unwrap().to_owned();
-            let manifest = Manifest {
+            let mut manifest = Manifest {
                 schema: SCHEMA.into(),
                 module_path: path.clone(),
                 objects: vec![ObjectRecord {
@@ -131,14 +171,26 @@ impl HeldProviders {
                     inode: mapping.inode,
                     identity: inspected.identity,
                 }],
-                interface_list: Acquisition::Absent,
+                interface_list: if standard_interface {
+                    Acquisition::Ok
+                } else {
+                    Acquisition::Absent
+                },
                 surfaces: vec![SurfaceRecord {
-                    source: SurfaceSource::LegacyFunctionList,
+                    source: if standard_interface {
+                        SurfaceSource::Interface {
+                            index: 0,
+                            raw_name_hex: Some("504b4353203131".into()),
+                            name_lossy: Some("PKCS 11".into()),
+                            name_error: None,
+                            flags: 0,
+                            classification: InterfaceClassification::ExactStandard,
+                        }
+                    } else {
+                        SurfaceSource::LegacyFunctionList
+                    },
                     acquisition: Acquisition::Ok,
-                    version: Some(Version {
-                        major: 2,
-                        minor: 40,
-                    }),
+                    version: Some(version),
                     walk: WalkOutcome::Full,
                     functions,
                 }],
@@ -146,7 +198,22 @@ impl HeldProviders {
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
             };
-            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            if standard_interface {
+                // The manifest records every legacy acquisition even when
+                // only the standard interface supplied a function table.
+                manifest.surfaces.insert(
+                    0,
+                    SurfaceRecord {
+                        source: SurfaceSource::LegacyFunctionList,
+                        acquisition: Acquisition::Absent,
+                        version: None,
+                        walk: WalkOutcome::NotWalked,
+                        functions: Vec::new(),
+                    },
+                );
+            }
+            let problems = crate::manifest_input::validate_structure(&manifest);
+            assert!(problems.is_empty(), "held provider surface: {problems:?}");
             let input = dir.path().join(format!("attestation-{index}.json"));
             std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
             paths.push(input);

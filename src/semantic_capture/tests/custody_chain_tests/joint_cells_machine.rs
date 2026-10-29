@@ -1924,6 +1924,17 @@ fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
 fn add_initial_machine_image(scene: &mut MachineScene, pid: u32, image: ImageIdentity) {
     let caller = scene.scene.real.scene.admit(pid, 50);
     let (module, path) = &scene.scene.real.modules[0];
+    let admission_endpoints = scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .io
+        .endpoints
+        .iter()
+        .filter(|(_, _, endpoint)| endpoint.file_slot == 0)
+        .count();
     scene
         .scene
         .real
@@ -1941,7 +1952,7 @@ fn add_initial_machine_image(scene: &mut MachineScene, pid: u32, image: ImageIde
                 identity_source: Some("held-provider".into()),
                 admission: AdmissionState::Admitted,
                 admission_class: Some("exact".into()),
-                admission_endpoints: Some(5),
+                admission_endpoints: Some(admission_endpoints),
                 admission_reasons: Vec::new(),
             },
             60,
@@ -1973,10 +1984,51 @@ fn add_initial_machine_image(scene: &mut MachineScene, pid: u32, image: ImageIde
 
 #[test]
 fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
-    use crate::semantics_key_use::FeedMode;
-    use crate::semantics_objects::journal::JournalGap;
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::Pending);
+}
 
-    let mut scene = MachineScene::with_initial_files(1, &[0], true);
+#[test]
+fn joint_machine_pending_refusal_requires_exact_original_provenance() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::Provenance);
+}
+
+#[test]
+fn joint_machine_resource_flag_with_pending_h3_keeps_originals_local() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::ResourcePending);
+}
+
+#[test]
+fn joint_machine_negative_only_image_taint_preserves_unrelated_joint() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::ImageOnly);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixedRefusalControl {
+    Pending,
+    Provenance,
+    ResourcePending,
+    ImageOnly,
+}
+
+fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::{EndpointClass, JournalGap, endpoint_class};
+    let pending = scenario != MixedRefusalControl::ImageOnly;
+    let resource_refused = scenario == MixedRefusalControl::ResourcePending;
+
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &[
+            "C_CreateObject",
+            "C_SignInit",
+            "C_SignUpdate",
+            "C_SignFinal",
+            "C_GetSessionInfo",
+            "C_EncapsulateKey",
+        ],
+        true,
+    );
     let c_pid = std::process::id();
     let child_b = OwnedStoppedChild::new();
     let child_a = OwnedStoppedChild::new();
@@ -2118,23 +2170,44 @@ fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
         exec_id: 0,
     };
     scene.scene.real.bind(child_e.id(), e_image, 0);
-    let (begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_SignInit", 2);
-    scene.scene.drain.source_mut().push_record(begin_a.to_vec());
-    scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    if resource_refused {
+        let (begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_SignInit", 2);
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    } else {
+        assert_eq!(
+            endpoint_class(function_id("C_EncapsulateKey")),
+            Some(EndpointClass::NegativeOnlyAffecting)
+        );
+        assert_ne!(
+            crate::kinds::descriptor("C_EncapsulateKey").unwrap(),
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        let (mut begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_EncapsulateKey", 2);
+        begin_a[5] = p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+        assert!(
+            p11scope_ebpf_common::object_journal::validate_begin(&begin_a, None)
+                .unwrap()
+                .no_end()
+        );
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    }
     scene.scene.push(child_b.id(), 0, "C_SignInit", 5);
     scene.scene.push(c_pid, 0, "C_SignInit", 5);
-    scene.scene.push(child_e.id(), 0, "C_SignInit", 1);
+    if pending {
+        scene.scene.push(child_e.id(), 0, "C_SignInit", 1);
+    }
     let mut raw = scene.scene.collect_with_fault(&BirthFault);
     let first = {
         let mut held = scene.scene.real.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *held;
-        io.script.fail_cookie = Some(e_image.task_cookie);
+        io.script.fail_cookie = pending.then_some(e_image.task_cookie);
         let first = capture.tick_collected_with(io, &mut raw).unwrap();
         assert_eq!(first.calls().count(), 2);
-        assert_eq!(first.awaiting_floor(), Some(12));
+        assert_eq!(first.awaiting_floor(), pending.then_some(12));
         first
     };
-    {
+    if pending {
         let mut held = scene.scene.real.h0.0.borrow_mut();
         let HeldH0 {
             capture, io, stash, ..
@@ -2196,13 +2269,22 @@ fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
     let mut frame = coordinator
         .audit_ingested_quantum(ingested, &scene.scene.producers, attached, &BirthFault)
         .unwrap_or_else(|(_, reason)| panic!("original mixed-scope audit: {reason:?}"));
+    assert_eq!(
+        frame.audit_for_test().resource_refused_for_test(),
+        resource_refused,
+        "valid negative-only NO_END taints A without a resource-custody contradiction"
+    );
     let failures = frame.original_failures_for_test().collect::<Vec<_>>();
     assert_eq!(
         failures
             .iter()
             .map(|failure| failure.gap)
             .collect::<Vec<_>>(),
-        [JournalGap::ImageTainted, JournalGap::H3Pending]
+        if pending {
+            vec![JournalGap::ImageTainted, JournalGap::H3Pending]
+        } else {
+            vec![JournalGap::ImageTainted]
+        }
     );
     assert!(failures[0].affects_proof_for_test(&a_proof));
     assert!(failures[0].affects_proof_for_test(&c_proof));
@@ -2223,6 +2305,111 @@ fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
     );
     let work =
         failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();
+    if scenario == MixedRefusalControl::Provenance {
+        frame.assert_pending_refusal_provenance_for_test(
+            coordinator.joint_capture_mut().adapter_mut(),
+            c_proof,
+            a_proof,
+            b.bootstrap().proof(),
+        );
+    }
+    if !pending {
+        let attached = scene.scene.attached.take().unwrap();
+        let mut rows = vec![(
+            b.bootstrap().domain(),
+            scene.native.rows.remove(&b.bootstrap().domain()).unwrap(),
+        )];
+        finish_reserved_birth_frame(
+            &mut scene.scene,
+            &attached,
+            scene.machine.retained_births_for_test(),
+            &mut rows,
+            frame,
+        );
+        let coordinator = &scene.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(b.id()),
+            Some(FeedMode::Joint)
+        );
+        for target in [b, c] {
+            assert_eq!(
+                coordinator
+                    .registry()
+                    .instance_semantic_edges()
+                    .find(|record| record.id == target.id())
+                    .unwrap()
+                    .api_returns,
+                Some(5)
+            );
+        }
+        assert_live_sign_associations(coordinator.registry(), &[b.id(), c.id()]);
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            [0, 0, 0, 0, 2],
+            "only the exact B/C live operations retain association custody"
+        );
+        scene.scene.assert_claims(&[]);
+        let before = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter(|record| [b.id(), c.id()].contains(&record.id))
+            .map(|record| {
+                (
+                    record.id,
+                    (
+                        record.semantics.as_ref().unwrap().completed(),
+                        record.api_returns.unwrap(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        scene.scene.push(child_b.id(), 0, "C_SignFinal", 6);
+        scene.scene.push(c_pid, 0, "C_SignFinal", 6);
+        let ingested = prepare_disposing_s1_batch(
+            &mut scene.scene,
+            2,
+            scene.machine.retained_drain_grant_for_test().unwrap(),
+        );
+        let terminal = acquire(&mut scene.scene, ingested, &attached, &BirthFault);
+        finish_reserved_birth_frame(
+            &mut scene.scene,
+            &attached,
+            scene.machine.retained_births_for_test(),
+            &mut rows,
+            terminal,
+        );
+        let coordinator = &scene.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(b.id()),
+            Some(FeedMode::Joint)
+        );
+        assert!(coordinator.registry().keyuse_for_test().open().is_empty());
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            [0; 5]
+        );
+        for record in coordinator.registry().instance_semantic_edges() {
+            if let Some((completed, physical)) = before.get(&record.id) {
+                assert_eq!(record.api_returns, Some(physical + 1));
+                assert_eq!(
+                    record.semantics.as_ref().unwrap().completed(),
+                    completed + 1
+                );
+                assert!(
+                    record
+                        .semantics
+                        .as_ref()
+                        .unwrap()
+                        .active_summary()
+                        .is_empty()
+                );
+            }
+        }
+        scene.scene.assert_claims(&[]);
+        return;
+    }
     let mut ports = coordinator
         .joint_frame_ports(&scene.scene.producers)
         .unwrap();
@@ -2240,6 +2427,55 @@ fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
         frame.negative_effects_complete_for_test(c.bootstrap().domain()),
         Some(true)
     );
+    if resource_refused {
+        use crate::semantics_key_use::{SealFailureDisposition, disposition_of};
+        assert_eq!(
+            disposition_of(
+                frame
+                    .original_failures_for_test()
+                    .find(|failure| failure.gap == JournalGap::H3Pending)
+                    .unwrap()
+                    .gap
+            ),
+            SealFailureDisposition::Retry
+        );
+        assert!(
+            frame
+                .original_failures_for_test()
+                .all(|failure| failure.gap != JournalGap::ResourceUnavailable)
+        );
+        assert_eq!(
+            frame
+                .audited_failure_for_test(c.bootstrap().domain())
+                .unwrap()
+                .disposition(),
+            SealFailureDisposition::Fallback,
+            "the resource flag cannot manufacture an absent ResourceUnavailable original"
+        );
+        let before = (
+            ports.read().1.adapter().invocation_claims_for_test(),
+            ports.read().1.ledger().roles_for_test(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame.defer_pending_h3(&mut ports, &scene.scene.real.lane),
+                Ok(QuantumSealProgress::LocalPending)
+            );
+        }
+        let (_, refusal) = frame
+            .finish_pending_h3(&mut ports, &scene.scene.real.lane)
+            .err()
+            .expect("incomplete resource custody must remain local");
+        assert_eq!(refusal, RawQuantumRefusal::H3Undisposed);
+        assert_eq!(
+            (
+                ports.read().1.adapter().invocation_claims_for_test(),
+                ports.read().1.ledger().roles_for_test(),
+            ),
+            before
+        );
+        return;
+    }
     assert_eq!(
         frame.defer_pending_h3(&mut ports, &scene.scene.real.lane),
         Ok(QuantumSealProgress::AwaitFutureInput),

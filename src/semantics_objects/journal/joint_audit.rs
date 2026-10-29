@@ -216,6 +216,17 @@ impl AuditedFailure<'_> {
             .iter()
             .flatten()
             .any(|failure| disposition_of(failure.gap) == SealFailureDisposition::HistoryLoss)
+            // This original audit failure has already fenced and disposed
+            // H8 custody in reject_audit. Its retained H9 rows must receive
+            // loss rather than exact-completed fallback. A seal-time
+            // ResourceUnavailable with retained custody keeps its ordinary
+            // Fallback disposition; the flag alone creates no failure.
+            || (self.audit.resource_refused
+                && self
+                    .originals
+                    .iter()
+                    .flatten()
+                    .any(|failure| failure.gap == JournalGap::ResourceUnavailable))
             || matches!(
                 self.audit.h3,
                 H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted
@@ -781,6 +792,116 @@ impl IngestedJointQuantum {
         self.retained_storage_bytes()
             .expect("retained bounded storage")
     }
+
+    /// Classification controls borrow this real frame's original affected
+    /// ResourceUnavailable. Restore the audit before any actual delivery.
+    #[cfg(test)]
+    pub(crate) fn assert_resource_disposition_provenance_for_test(&mut self, domain: ObjectDomain) {
+        assert!(self.audit.resource_refused);
+        assert_eq!(
+            self.failure_for(domain).unwrap().disposition(),
+            SealFailureDisposition::HistoryLoss
+        );
+        assert_eq!(
+            disposition_of(JournalGap::ResourceUnavailable),
+            SealFailureDisposition::Fallback,
+            "seal-time resource refusal with retained custody still falls back"
+        );
+        self.audit.resource_refused = false;
+        assert_eq!(
+            self.failure_for(domain).unwrap().disposition(),
+            SealFailureDisposition::Fallback,
+            "ResourceUnavailable alone does not prove original audit disposal"
+        );
+        self.audit.resource_refused = true;
+        assert_eq!(
+            self.failure_for(domain).unwrap().disposition(),
+            SealFailureDisposition::HistoryLoss
+        );
+    }
+
+    /// Exercise rejection interlocks using the real mixed frame's three
+    /// retained proofs. Every adversarial state/scope change is restored
+    /// before the original frame continues through actual bounded delivery.
+    #[cfg(test)]
+    pub(crate) fn assert_pending_refusal_provenance_for_test(
+        &mut self,
+        adapter: &mut JournalAdapter,
+        exact: super::JournalDomainProof,
+        image: super::JournalDomainProof,
+        healthy: super::JournalDomainProof,
+    ) {
+        assert_eq!(size_of::<super::JournalDomainState>(), 72);
+        assert_eq!(std::mem::align_of::<super::JournalDomainState>(), 8);
+        assert_ne!(exact.key, image.key);
+        assert_ne!(exact.key, healthy.key);
+        assert_ne!(image.key, healthy.key);
+        assert!(!adapter.is_tainted((exact.key.cookie, exact.key.exec)));
+        assert!(adapter.is_tainted((image.key.cookie, image.key.exec)));
+        assert!(!adapter.is_tainted((healthy.key.cookie, healthy.key.exec)));
+        assert!(adapter.keys[&exact.key].s1only_original_refused);
+        assert!(!adapter.keys[&image.key].s1only_original_refused);
+        assert!(!adapter.keys[&healthy.key].s1only_original_refused);
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), Some(exact));
+        assert_eq!(self.pending_refused_proof(adapter, image.key), Some(image));
+        assert_eq!(self.pending_refused_proof(adapter, healthy.key), None);
+
+        // An actual unrelated key cannot borrow the exact subject's flag,
+        // even if a purported union names it and it also appears refused.
+        let mut purported = vec![exact.domain(), healthy.domain()];
+        purported.sort_unstable();
+        let original_scope = std::mem::replace(
+            &mut self.raw_failure.as_mut().unwrap().scope,
+            SealFailureScope::AffectedDomains(purported),
+        );
+        let healthy_refused = adapter.keys[&healthy.key].refused;
+        adapter.keys.get_mut(&healthy.key).unwrap().refused = true;
+        assert_eq!(self.pending_refused_proof(adapter, healthy.key), None);
+        adapter.keys.get_mut(&healthy.key).unwrap().refused = healthy_refused;
+        self.raw_failure.as_mut().unwrap().scope =
+            SealFailureScope::AffectedDomains(vec![image.domain()]);
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        self.raw_failure.as_mut().unwrap().scope = original_scope;
+
+        // The DomainTainted class alone is never exact-original provenance.
+        // The same genuine original's flag, retained era and refusal must
+        // all still qualify against the original immutable union.
+        adapter
+            .keys
+            .get_mut(&exact.key)
+            .unwrap()
+            .s1only_original_refused = false;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        let original_gap = self.raw_failure.as_ref().unwrap().gap;
+        self.raw_failure.as_mut().unwrap().gap = JournalGap::DomainTainted;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        self.raw_failure.as_mut().unwrap().gap = original_gap;
+        adapter
+            .keys
+            .get_mut(&exact.key)
+            .unwrap()
+            .s1only_original_refused = true;
+
+        adapter.keys.get_mut(&exact.key).unwrap().era = exact.era.checked_add(1).unwrap();
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        adapter.keys.get_mut(&exact.key).unwrap().era = exact.era;
+        adapter.keys.get_mut(&exact.key).unwrap().era_ended = true;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        adapter.keys.get_mut(&exact.key).unwrap().era_ended = false;
+        adapter.keys.get_mut(&exact.key).unwrap().refused = false;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        adapter.keys.get_mut(&exact.key).unwrap().refused = true;
+
+        assert!(self.raw_failure.as_ref().unwrap().h3_voided.is_none());
+        self.raw_failure.as_mut().unwrap().h3_voided = Some(self.audit.h0_below);
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        self.raw_failure.as_mut().unwrap().h3_voided = None;
+        self.raw_failure.as_mut().unwrap().gap = JournalGap::H3Pending;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), None);
+        self.raw_failure.as_mut().unwrap().gap = original_gap;
+        assert_eq!(self.pending_refused_proof(adapter, exact.key), Some(exact));
+        assert_eq!(self.pending_refused_proof(adapter, image.key), Some(image));
+    }
 }
 
 impl IngestedJointQuantum {
@@ -822,7 +943,7 @@ impl IngestedJointQuantum {
         };
         (state.refused
             && !state.era_ended
-            && (raw.gap == JournalGap::DomainTainted || adapter.is_tainted((key.cookie, key.exec)))
+            && (adapter.is_tainted((key.cookie, key.exec)) || state.s1only_original_refused)
             && self.pending_raw_scope_contains(proof.domain()))
         .then_some(proof)
     }

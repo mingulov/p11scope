@@ -9,11 +9,15 @@ arrival, physical cut, post-cut burst; providers and tokens prepared by
 mk-providers.sh) against snapshot rows: per-feed positives on one caller
 with distinct modules, handle-collision evidence, cut arithmetic with
 mapping-interruption and identity-gap evidence, uncertainty that preserves
-the sibling feed, file-local negatives, module identity resolution, and
-the association bound.
+the sibling feed, file-local negatives, module identity resolution,
+forwarding sums echoed exactly and never merged into hardware tallies,
+and the association bound.
 
 Healthy and mutation twins run unignored; the live-emission tests build
 the fixtures with gcc and validate the real emitted ledgers.
+The provider-free forward-sparse-stub.c emitter covers forwarding sums
+and sparse per-feed seqs; a stripped inline provider (no
+C_GetFunctionList export) proves the sibling driver refuses it.
 """
 
 import importlib.util
@@ -32,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ORACLE_PATH = ROOT / "scripts" / "joint-two-provider-compare.py"
 SIBS_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "dlmopen-sibs.c"
 LATE_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "late-b.c"
+STUB_SRC = ROOT / "tests" / "fixtures" / "two-providers" / "forward-sparse-stub.c"
 MK_PROVIDERS = ROOT / "tests" / "fixtures" / "two-providers" / "mk-providers.sh"
 
 SOFT_LIBS = (
@@ -61,8 +66,13 @@ SHA_B = "bb" * 32
 
 
 def ledger_rows(calls_a=10, calls_b=10, order="ab", rv_a=0, rv_b=0,
-                handles=True, cut_at=None, pid=4242, tid=4242):
-    """Canned two-feed ledger: readys, handles, interleaved calls, cut, ack."""
+                handles=True, cut_at=None, pid=4242, tid=4242,
+                forwards=()):
+    """Canned two-feed ledger: readys, handles, interleaved calls, cut, ack.
+
+    forwards is a list of (feed, count) batches, emitted as forward
+    marker rows between the calls and the ack.
+    """
     rows = [
         {"kind": "ready", "feed": "A", "pid": pid, "tid": tid, "t": 1_000,
          "clock": "CLOCK_MONOTONIC", "unit": "ns"},
@@ -101,6 +111,10 @@ def ledger_rows(calls_a=10, calls_b=10, order="ab", rv_a=0, rv_b=0,
         rows.append({"kind": "cut", "feed": "B", "at_seq": cut_at,
                      "t": tick + 5})
         tick += 5
+    for feed, count in forwards:
+        rows.append({"kind": "forward", "feed": feed, "count": count,
+                     "t": tick + 5})
+        tick += 5
     rows.append({"kind": "ack", "issued": seq, "t": tick + 10})
     return rows
 
@@ -119,11 +133,12 @@ def instance_row(iid, caller, module, feed, state="observed", reason=None,
 
 
 def key_row(iid, feed, started, completed, failed=0, unknown=0,
-            cut_published=0, cut_published_failed=0):
+            cut_published=0, cut_published_failed=0, forwarded=0):
     return {"instance": iid, "feed": feed, "started": started,
             "completed": completed, "failed": failed, "unknown": unknown,
             "cut_published": cut_published,
-            "cut_published_failed": cut_published_failed}
+            "cut_published_failed": cut_published_failed,
+            "forwarded": forwarded}
 
 
 def split_snapshot(calls_a=10, calls_b=10, failed_a=0, failed_b=0,
@@ -254,6 +269,10 @@ unsigned long C_GetFunctionList(void **out) {
     *out = &plain_table;
     return 0;
 }
+"""
+
+STRIPPED_PROVIDER = """/* Test-only stripped provider: no C_GetFunctionList export at all. */
+int TwoProvidersStrippedPadding;
 """
 
 
@@ -459,7 +478,7 @@ class LedgerShapeTwins(unittest.TestCase):
     def test_mutation_row_limit_rejected(self):
         oracle = require_oracle(self)
         with self.assertRaisesRegex(oracle.LedgerError, "row limit"):
-            oracle.read_ledger(io.StringIO("{}\n" * 200065))
+            oracle.read_ledger(io.StringIO("{}\n" * (oracle.MAX_ROWS + 1)))
 
     def test_boundary_count_200000_passes(self):
         oracle = require_oracle(self)
@@ -469,6 +488,72 @@ class LedgerShapeTwins(unittest.TestCase):
             read = oracle.read_ledger(stream)
         summary = oracle.validate_ledger(read)
         self.assertEqual(summary["issued"], 200000)
+
+    def test_healthy_forward_markers_pass_transparent_to_issued(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 7), ("A", 5), ("B", 3)])
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual(summary["issued"], 20)
+        self.assertEqual(summary["feeds"]["A"]["calls"], 10)
+        self.assertEqual(summary["feeds"]["A"]["forwarded"], 12)
+        self.assertEqual(summary["feeds"]["B"]["forwarded"], 3)
+
+    def test_mutation_forward_undeclared_feed_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("Z", 4)])
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "forward names undeclared feed"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_forward_count_zero_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 0)])
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "forward count out of range"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_forward_outside_window_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 4)])
+        for row in rows:
+            if row.get("kind") == "forward":
+                row["t"] = rows[-1]["t"] + 1
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "forward lies outside the ready/ack window"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_forward_before_own_ready_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("B", 4)])
+        for row in rows:
+            if row.get("kind") == "forward":
+                row["t"] = 1005
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "forward precedes the B ready row"):
+            oracle.validate_ledger(rows)
+
+    def test_mutation_forward_extra_fields_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 4)])
+        for row in rows:
+            if row.get("kind") == "forward":
+                row["seq"] = 1
+                row["fn"] = "table[4]"
+        with self.assertRaisesRegex(oracle.LedgerError, "unexpected fields"):
+            oracle.validate_ledger(rows)
+
+    def test_boundary_64_forwards_pass(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 1)] * 64)
+        summary = oracle.validate_ledger(rows)
+        self.assertEqual(summary["feeds"]["A"]["forwarded"], 64)
+        self.assertEqual(summary["issued"], 20)
+
+    def test_mutation_65th_forward_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 1)] * 65)
+        with self.assertRaisesRegex(oracle.LedgerError, "forward row limit"):
+            oracle.validate_ledger(rows)
 
 
 class CompareTwins(unittest.TestCase):
@@ -926,6 +1011,98 @@ class CompareTwins(unittest.TestCase):
                                     "duplicate key row instance"):
             oracle.read_snapshot(io.StringIO(json.dumps(snapshot)))
 
+    def test_healthy_forwarded_echo_passes(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 7), ("B", 3)])
+        snapshot = split_snapshot()
+        snapshot["key_rows"][0]["forwarded"] = 7
+        snapshot["key_rows"][1]["forwarded"] = 3
+        result = compare_pair(oracle, rows, snapshot)
+        self.assertEqual(result["path"], "split")
+
+    def test_mutation_forwarded_merged_into_completed_rejected(self):
+        # The forwarding sum must never enter the hardware-operation
+        # tally: completed carries ok + forwarded and the exact per-feed
+        # match refuses it.
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("A", 7)])
+        snapshot = split_snapshot()
+        snapshot["key_rows"][0]["forwarded"] = 7
+        snapshot["key_rows"][0]["completed"] = 17
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    r"feed A completed 17 disagrees"):
+            compare_pair(oracle, rows, snapshot)
+
+    def test_mutation_forwarded_overstated_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("B", 3)])
+        snapshot = split_snapshot()
+        snapshot["key_rows"][1]["forwarded"] = 4
+        with self.assertRaisesRegex(
+                oracle.LedgerError,
+                r"feed B forwarded 4 disagrees with 3 ledgered forwarded calls"):
+            compare_pair(oracle, rows, snapshot)
+
+    def test_mutation_forwarded_invented_without_markers_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows()
+        snapshot = split_snapshot()
+        snapshot["key_rows"][0]["forwarded"] = 5
+        with self.assertRaisesRegex(
+                oracle.LedgerError,
+                r"feed A forwarded 5 disagrees with 0 ledgered forwarded calls"):
+            compare_pair(oracle, rows, snapshot)
+
+    def test_mutation_merge_claims_forwarded_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows()
+        snapshot = merge_snapshot()
+        snapshot["key_rows"] = [key_row("i0", "A", 0, 0, forwarded=2)]
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "double-loaded calls claim forwarded sums"):
+            compare_pair(oracle, rows, snapshot)
+
+    def test_mutation_uncertain_feed_overclaims_forwarded_rejected(self):
+        oracle = require_oracle(self)
+        rows = ledger_rows(forwards=[("B", 3)])
+        snapshot = split_snapshot(b_state="uncertain")
+        snapshot["instances"][1]["reason"] = "caller_unbound"
+        snapshot["key_rows"][1]["forwarded"] = 9
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "over-claims forwarded while uncertain"):
+            compare_pair(oracle, rows, snapshot)
+
+    def test_healthy_forwarded_with_cut_passes(self):
+        # Forwarding is orthogonal to cuts: the cut feed echoes its
+        # forwarded sum while the pre/post arithmetic is unchanged.
+        oracle = require_oracle(self)
+        rows = ledger_rows(handles=False, cut_at=12, forwards=[("B", 5)])
+        snapshot = split_snapshot()
+        key_b = snapshot["key_rows"][1]
+        key_b["completed"] = 4
+        key_b["unknown"] = 6
+        key_b["forwarded"] = 5
+        snapshot["gaps"] = [
+            {"subject": "inventory attach target changed identity",
+             "reason": "object changed identity since its endpoints were taken"}
+        ]
+        snapshot["edges"] = [
+            {"module": "m0",
+             "mapping": {"state": "mapped", "interruptions": 0}},
+            {"module": "m1",
+             "mapping": {"state": "mapped", "interruptions": 1}},
+        ]
+        result = compare_pair(oracle, rows, snapshot)
+        self.assertEqual(result["path"], "split")
+
+    def test_mutation_snapshot_forwarded_shape_rejected(self):
+        oracle = require_oracle(self)
+        snapshot = split_snapshot()
+        snapshot["key_rows"][0]["forwarded"] = "7"
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "key row forwarded out of range"):
+            oracle.read_snapshot(io.StringIO(json.dumps(snapshot)))
+
 
 class ComparisonCliTwins(unittest.TestCase):
     def test_cli_healthy_pair_passes(self):
@@ -957,6 +1134,22 @@ class ComparisonCliTwins(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertRegex(completed.stderr,
                              r"comparison refused: feed A completed 6 disagrees")
+
+    def test_cli_forwarded_pair_passes(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            snap = Path(tmp) / "snapshot.json"
+            write_jsonl(ledger, ledger_rows(forwards=[("A", 7), ("B", 3)]))
+            snapshot = split_snapshot()
+            snapshot["key_rows"][0]["forwarded"] = 7
+            snapshot["key_rows"][1]["forwarded"] = 3
+            write_snapshot(snap, snapshot)
+            completed = subprocess.run(
+                ["python3", "-I", str(ORACLE_PATH), str(ledger), str(snap)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["path"], "split")
 
     def test_cli_string_payload_not_echoed(self):
         require_oracle(self)
@@ -1046,6 +1239,19 @@ class EmissionTests(unittest.TestCase):
             capture_output=True, text=True, timeout=120)
         self.assertEqual(build.returncode, 0, build.stderr)
         return provider
+
+    def build_forward_stub(self, tmp):
+        if not shutil.which("gcc"):
+            self.skipTest("requires gcc; installs nothing")
+        if not STUB_SRC.is_file():
+            self.fail(f"fixture missing: {STUB_SRC} (implementation not present)")
+        stub = Path(tmp) / "forward-sparse-stub"
+        build = subprocess.run(
+            ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             str(STUB_SRC), "-o", str(stub)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        return stub
 
     def test_fixture_emits_valid_ledger_both_orders(self):
         oracle = require_oracle(self)
@@ -1338,6 +1544,100 @@ class EmissionTests(unittest.TestCase):
             with open(ledger, encoding="utf-8") as stream:
                 summary = oracle.validate_ledger(oracle.read_ledger(stream))
             self.assertEqual(summary["issued"], 18)
+
+    def test_stub_emits_valid_forward_ledger(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "10", "--forward", "A:7,B:3"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 20)
+            self.assertEqual(summary["feeds"]["A"]["forwarded"], 7)
+            self.assertEqual(summary["feeds"]["B"]["forwarded"], 3)
+            snapshot = split_snapshot()
+            snapshot["key_rows"][0]["forwarded"] = 7
+            snapshot["key_rows"][1]["forwarded"] = 3
+            result = oracle.compare(summary, snapshot)
+            self.assertEqual(result["path"], "split")
+
+    def test_stub_merged_forward_sum_is_refused(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "10", "--forward", "A:7"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            snapshot = split_snapshot()
+            snapshot["key_rows"][0]["forwarded"] = 7
+            snapshot["key_rows"][0]["completed"] = 17
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        r"feed A completed 17 disagrees"):
+                oracle.compare(summary, snapshot)
+
+    def test_stub_sparse_holes_stay_exact(self):
+        oracle = require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(stub), str(ledger), "12", "--sparse", "3"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(ledger, encoding="utf-8") as stream:
+                summary = oracle.validate_ledger(oracle.read_ledger(stream))
+            self.assertEqual(summary["issued"], 16)
+            seqs = summary["feeds"]["B"]["seqs"]
+            self.assertEqual(len(seqs), 4)
+            self.assertGreater(max(seqs) - min(seqs) + 1, len(seqs))
+            result = oracle.compare(
+                summary, split_snapshot(calls_a=12, calls_b=4))
+            self.assertEqual(result["path"], "split")
+
+    def test_stub_refuses_bad_argv(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = self.build_forward_stub(tmp)
+            cases = ([], ["10"], [str(Path(tmp) / "ledger.jsonl"), "0"],
+                     [str(Path(tmp) / "ledger.jsonl"), "abc"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--sparse", "1"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--sparse", "99"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "A:0"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "C:3"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--forward", "A:"],
+                     [str(Path(tmp) / "ledger.jsonl"), "10", "--bogus"])
+            for argv in cases:
+                with self.subTest(argv=argv):
+                    ledger = Path(tmp) / "ledger.jsonl"
+                    if ledger.exists():
+                        ledger.unlink()
+                    completed = subprocess.run(
+                        [str(stub)] + argv,
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(completed.returncode, 2, argv)
+                    self.assertFalse(ledger.exists())
+
+    def test_fixture_refuses_stripped_provider(self):
+        require_oracle(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = self.build_sibs_driver(tmp)
+            provider = self.build_inline_provider(
+                tmp, "stripped", STRIPPED_PROVIDER)
+            ledger = Path(tmp) / "ledger.jsonl"
+            completed = subprocess.run(
+                [str(driver), str(provider), "ab", "5", str(ledger)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("C_GetFunctionList failed", completed.stderr)
+            self.assertFalse(ledger.exists())
 
 
 if __name__ == "__main__":

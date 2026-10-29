@@ -3676,8 +3676,7 @@ fn cgroup_generation_engine() -> Engine {
 /// (A4 classifies this shape `mapped`).
 #[test]
 fn leader_exit_mappings_single_slot_marks_gap_mapped() {
-    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
-        std::collections::BTreeSet::new();
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> = std::collections::BTreeSet::new();
     let mut engine = cgroup_generation_engine();
     let mut exit = kind7_exit(7101, 11);
     exit.pointers[0] = 3;
@@ -3685,15 +3684,17 @@ fn leader_exit_mappings_single_slot_marks_gap_mapped() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(7101, 11));
-    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+    assert!(
+        completed_calls.is_empty(),
+        "R57: no completed call is joined"
+    );
 }
 
 /// RED: a kind-7 summary with the hooks-refused flag must count its exit
 /// gap as `unknown`, never `mapped` (A4).
 #[test]
 fn leader_exit_mappings_refused_flag_marks_gap_unknown() {
-    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
-        std::collections::BTreeSet::new();
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> = std::collections::BTreeSet::new();
     let mut engine = cgroup_generation_engine();
     let mut exit = kind7_exit(7102, 12);
     exit.status_flags = 0x40; // DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED (A3)
@@ -3701,15 +3702,17 @@ fn leader_exit_mappings_refused_flag_marks_gap_unknown() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(7102, 12));
-    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+    assert!(
+        completed_calls.is_empty(),
+        "R57: no completed call is joined"
+    );
 }
 
 /// RED: a kind-7 summary with SHARED_MM and empty slots must count its
 /// exit gap as `unknown` (A4).
 #[test]
 fn leader_exit_mappings_shared_mm_marks_gap_unknown() {
-    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
-        std::collections::BTreeSet::new();
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> = std::collections::BTreeSet::new();
     let mut engine = cgroup_generation_engine();
     let mut exit = kind7_exit(7103, 13);
     exit.status_flags = 0x08; // DISCOVERY_STATUS_EXIT_MAP_SHARED_MM (A3)
@@ -3717,15 +3720,17 @@ fn leader_exit_mappings_shared_mm_marks_gap_unknown() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(7103, 13));
-    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+    assert!(
+        completed_calls.is_empty(),
+        "R57: no completed call is joined"
+    );
 }
 
 /// RED: a kind-7 summary with OVERFLOW plus named slots must count its
 /// exit gap (A4 still classifies this shape `mapped`: slots win).
 #[test]
 fn leader_exit_mappings_overflow_with_slots_still_mapped() {
-    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
-        std::collections::BTreeSet::new();
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> = std::collections::BTreeSet::new();
     let mut engine = cgroup_generation_engine();
     let mut exit = kind7_exit(7104, 14);
     exit.pointers[0] = 3;
@@ -3734,22 +3739,27 @@ fn leader_exit_mappings_overflow_with_slots_still_mapped() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(7104, 14));
-    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+    assert!(
+        completed_calls.is_empty(),
+        "R57: no completed call is joined"
+    );
 }
 
 /// RED: a kind-7 negative whose watch inserted between exec and exit must
 /// count its exit gap as `unknown`, failing closed (A4 downgrades it).
 #[test]
 fn leader_exit_mappings_late_watch_downgrades_negative_to_unknown() {
-    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
-        std::collections::BTreeSet::new();
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> = std::collections::BTreeSet::new();
     let mut engine = cgroup_generation_engine();
     let exit = kind7_exit(7105, 15);
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(7105, 15));
-    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+    assert!(
+        completed_calls.is_empty(),
+        "R57: no completed call is joined"
+    );
 }
 
 /// Guard: the kind-6 inventory build keeps counting its gap unchanged,

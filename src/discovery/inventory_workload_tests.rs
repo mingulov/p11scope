@@ -1053,6 +1053,7 @@ fn system_sweep_releases_its_pins() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::System,
         metrics: false,

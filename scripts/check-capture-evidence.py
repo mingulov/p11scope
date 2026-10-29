@@ -148,7 +148,43 @@ DISCOVERY_LOSS_COUNTERS = (
 )
 MAX_MANIFEST_OBJECT_FALLBACKS = 512
 MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
-ALLOWED_SOURCE_ARRAYS = (["scan"], ["manifest"], ["scan", "manifest"])
+ALLOWED_SOURCE_ARRAYS = (
+    ["scan"],
+    ["manifest"],
+    ["prearm"],
+    ["scan", "manifest"],
+    ["scan", "prearm"],
+    ["manifest", "prearm"],
+    ["scan", "manifest", "prearm"],
+)
+ALLOWED_WATCH_STATES = {
+    "pinned_unarmed",
+    "armed",
+    "armed_idle",
+    "unavailable",
+    "ended",
+}
+ALLOWED_WATCH_ENDS = {
+    "attached",
+    "scope_end",
+    "stop",
+    "object_changed",
+    "health_loss",
+    "scope_uncertain",
+}
+ALLOWED_UNOBSERVED_REASONS = {
+    "pre_attach",
+    "late_discovery",
+    "mapped_unattached",
+    "health_loss",
+    "scope_uncertain",
+}
+# Residual 6.13 review: the watch/window shapes are closed. `since_ns` is
+# always present (null until armed); `until_ns`/`ended_by` appear only when
+# the end actually happened; `changed` is the object_changed bracket.
+WATCH_KEYS = {"since_ns", "state", "until_ns", "ended_by", "changed"}
+WATCH_CHANGED_KEYS = {"last_ok_ns", "detected_ns", "previous_ino"}
+UNOBSERVED_WINDOW_KEYS = {"start_ns", "end_ns", "reason"}
 ALLOWED_TABLE_SOURCES = {"scan", "manifest"}
 ALLOWED_CORROBORATION = {
     "single_source",
@@ -1603,6 +1639,101 @@ def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
     )
 
 
+def exact_prearm_keys(module):
+    """Packet 6.13 additive keys: `watch`, `attached_at_ns`,
+    `unobserved_windows`. Absent unless pre-arm named the module; present
+    keys must match the frozen shapes."""
+    if "watch" in module:
+        watch = module["watch"]
+        require(
+            isinstance(watch, dict)
+            and {"since_ns", "state"} <= set(watch)
+            and set(watch) <= WATCH_KEYS,
+            f"invalid watch keys: {module}",
+        )
+        require(
+            watch["state"] in ALLOWED_WATCH_STATES,
+            f"invalid watch state: {module}",
+        )
+        require(
+            watch["since_ns"] is None or u64(watch["since_ns"]),
+            f"invalid watch since_ns: {module}",
+        )
+        if "until_ns" in watch:
+            require(u64(watch["until_ns"]), f"invalid watch until_ns: {module}")
+        if "ended_by" in watch:
+            require(
+                watch["ended_by"] in ALLOWED_WATCH_ENDS,
+                f"invalid watch ended_by: {module}",
+            )
+        if "changed" in watch:
+            changed = watch["changed"]
+            require(
+                isinstance(changed, dict) and set(changed) == WATCH_CHANGED_KEYS,
+                f"invalid watch changed keys: {module}",
+            )
+            require(
+                u64(changed["last_ok_ns"])
+                and u64(changed["detected_ns"])
+                and u64(changed["previous_ino"])
+                and changed["last_ok_ns"] <= changed["detected_ns"],
+                f"invalid watch changed bracket: {module}",
+            )
+        # Interval ordering and state/end coherence. The legitimate
+        # clock-unknown end (`ended` + `attached`, no stamps) stays valid:
+        # only invented or contradictory shapes are rejected.
+        since = watch["since_ns"]
+        until = watch.get("until_ns")
+        state = watch["state"]
+        ended_by = watch.get("ended_by")
+        if since is not None and until is not None:
+            require(since <= until, f"invalid watch interval: {module}")
+        if state in ("armed", "armed_idle"):
+            require(since is not None, f"invalid watch arm: {module}")
+        if state in ("pinned_unarmed", "unavailable"):
+            require(since is None, f"invalid watch arm: {module}")
+        if state == "ended":
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if ended_by is not None:
+            require(
+                state in ("ended", "armed_idle"),
+                f"invalid watch end: {module}",
+            )
+        if state == "armed_idle" and ended_by is not None:
+            require(
+                ended_by in ("scope_end", "stop"),
+                f"invalid watch end: {module}",
+            )
+        if until is not None:
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if "changed" in watch:
+            require(
+                state == "ended" and ended_by == "object_changed",
+                f"invalid watch changed: {module}",
+            )
+    if "attached_at_ns" in module:
+        attached = module["attached_at_ns"]
+        require(
+            attached is None or u64(attached),
+            f"invalid attached_at_ns: {module}",
+        )
+    if "unobserved_windows" in module:
+        windows = module["unobserved_windows"]
+        require(isinstance(windows, list), f"invalid unobserved_windows: {module}")
+        for window in windows:
+            require(
+                isinstance(window, dict) and set(window) == UNOBSERVED_WINDOW_KEYS,
+                f"invalid unobserved window keys: {module}",
+            )
+            require(
+                u64(window["start_ns"])
+                and u64(window["end_ns"])
+                and window["start_ns"] <= window["end_ns"]
+                and window["reason"] in ALLOWED_UNOBSERVED_REASONS,
+                f"invalid unobserved window: {module}",
+            )
+
+
 def exact_discovery_semantics(evidence):
     conflicts = 0
     for module in evidence["discovery"]:
@@ -1627,6 +1758,14 @@ def exact_discovery_semantics(evidence):
             }
         elif sources == ["manifest"]:
             source_outcomes_ok = outcome_set == {"uncorroborated"}
+        elif sources == ["prearm"]:
+            # Packet 6.13: a pin is custody, never coverage — pre-arm-only
+            # reads uncorroborated, like manifest-only.
+            source_outcomes_ok = outcome_set == {"uncorroborated"}
+        elif sources == ["manifest", "prearm"]:
+            # No scan pairing (else "scan" would be a source), so every
+            # manifest outcome is uncorroborated and pre-arm adds none.
+            source_outcomes_ok = outcome_set == {"uncorroborated"}
         else:
             source_outcomes_ok = not outcome_set.intersection(
                 {"single_source", "uncorroborated"}
@@ -1645,6 +1784,7 @@ def exact_discovery_semantics(evidence):
             source = table["source"]
             require(source in ALLOWED_TABLE_SOURCES, f"invalid table source: {table}")
             require(source in module["sources"], f"table source absent from module: {module}")
+        exact_prearm_keys(module)
     require(
         evidence["discovery_conflicts"] == conflicts,
         f"discovery_conflicts: want {conflicts}, got {evidence['discovery_conflicts']}",
@@ -3244,12 +3384,16 @@ def function_items(pairs, identity=None):
 
 def discovery_fixture(sources=("scan",)):
     sources = list(sources)
-    corroborated = sources == ["scan", "manifest"]
+    corroborated = sources in (
+        ["scan", "manifest"],
+        ["scan", "prearm"],
+        ["scan", "manifest", "prearm"],
+    )
     outcome = (
         "agreed"
         if corroborated
         else "uncorroborated"
-        if sources == ["manifest"]
+        if sources and set(sources) <= {"manifest", "prearm"}
         else "single_source"
     )
     return [
@@ -3275,7 +3419,10 @@ def discovery_fixture(sources=("scan",)):
                     "linkage": "exports" if source == "scan" else "manifest",
                     "exports_agreeing": 68 if source == "scan" else None,
                 }
+                # Packet 6.13: pre-arm emits proved offsets, never decoded
+                # tables — a prearm fixture carries no prearm table.
                 for source in sources
+                if source in ("scan", "manifest")
             ],
             interfaces=0,
             skipped=[],
@@ -3419,7 +3566,9 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         **{name: 0 for name in COUNTERS},
         # A fixture is self-consistent: a module only the manifest described is
         # uncorroborated, by definition of the word.
-        "discovery_uncorroborated": 1 if list(sources) == ["manifest"] else 0,
+        "discovery_uncorroborated": (
+            1 if list(sources) and set(sources) <= {"manifest", "prearm"} else 0
+        ),
         "discovery_uncorroborated_candidates": 0,
         "templates_truncated": False,
         "provider_changed": False,

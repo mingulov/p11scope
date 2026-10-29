@@ -12,7 +12,7 @@
 use crate::attach::{CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
-use crate::discovery::engine::Engine;
+use crate::discovery::engine::{Engine, EngineSession};
 use crate::discovery::pause::{
     ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
 };
@@ -21,6 +21,7 @@ use crate::process::{PidPin, ProcessView, ProcessViewId};
 use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard};
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -1908,6 +1909,131 @@ impl CaptureEnd {
             Self::Error => render::LOOP_END_ERROR,
         }
     }
+
+    /// Maps the capture end onto the pre-arm watch end cause (packet 6.13,
+    /// R2-D1-7): the scope's lifetime ending normally closes watches with
+    /// `scope_end`; an operator signal or capture error stops them.
+    fn prearm_end_cause(self) -> crate::render::PrearmWatchEnd {
+        match self {
+            Self::DurationExpired | Self::TargetExit | Self::LimitReached => {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            }
+            Self::Signal | Self::Error => crate::render::PrearmWatchEnd::Stop,
+        }
+    }
+}
+
+/// Modules with observed use at capture end (packet 6.13, R2-D1-4): any
+/// report with completed, error or in-flight calls counts for its
+/// attributed module. Ambiguous use (a shared target with no sole owner)
+/// counts for every owner the target resolves to; truly unresolvable use
+/// counts for every module — a quiet claim needs proven no-use, and
+/// unknown association never proves it (physical counts are still
+/// preserved in the reports themselves).
+fn prearm_used_modules(
+    reports: &[crate::metrics::SlotReport],
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let mut used = BTreeSet::new();
+    let mut unattributable = false;
+    for report in reports {
+        if report.calls == 0 && report.errors == 0 && report.in_flight == 0 {
+            continue;
+        }
+        match report.module {
+            Some(module) => {
+                used.insert(module);
+            }
+            None => {
+                let owners = prearm_report_owners(report, plan, pinned);
+                if owners.is_empty() {
+                    unattributable = true;
+                } else {
+                    used.extend(owners);
+                }
+            }
+        }
+    }
+    if unattributable {
+        used.extend(plan.modules.iter().map(|module| module.id));
+    }
+    used
+}
+
+/// Owner modules of one ownerless report, resolved through its recorded
+/// target identity and offset back into the plan's slots.
+fn prearm_report_owners(
+    report: &crate::metrics::SlotReport,
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let Some(target) = report.target_object.as_ref() else {
+        return BTreeSet::new();
+    };
+    let mut owners = BTreeSet::new();
+    for slot in &plan.slots {
+        let Some(pin) = pinned.summary(slot.object) else {
+            continue;
+        };
+        if (pin.key.device.major, pin.key.device.minor) == (target.dev.0, target.dev.1)
+            && pin.key.inode == target.ino
+            && slot.file_offset == report.file_offset
+        {
+            owners.extend(slot.module_ids.iter().copied());
+        }
+    }
+    owners
+}
+
+/// The terminal watch-close boundary (packet 6.13 round-2, F3): the first
+/// effective STOP when the gate recorded one, else the loop-end stamp. The
+/// minimum wins, so a later publication sample never extends the published
+/// interval past the earliest stop. A stop requested at an unknown instant
+/// stays unknown (round-3 re-audit finding 2): the blind tail is never
+/// backfilled with a later request or the loop-end sample.
+fn prearm_stop_ns(first_stop: crate::attach::FirstStop, loop_end_ns: Option<u64>) -> Option<u64> {
+    use crate::attach::FirstStop;
+    match (first_stop, loop_end_ns) {
+        (FirstStop::Known(first), Some(loop_end)) => Some(first.min(loop_end)),
+        (FirstStop::Known(first), None) => Some(first),
+        (FirstStop::NotRequested, loop_end) => loop_end,
+        (FirstStop::Unknown, _) => None,
+    }
+}
+
+/// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
+/// idle qualification over observed use and terminal health, the end for
+/// the capture end, and the attach-key assembly merge onto the discovery
+/// records — all before the evidence seals. Watches close at the frozen
+/// first-stop boundary `stop_ns`, never at a later publication read, so the
+/// published interval excludes the blind tail. Generic captures without
+/// watches still assemble their attach/window keys.
+#[allow(clippy::too_many_arguments)]
+fn finish_prearm_terminal(
+    engine: &mut Engine,
+    session: &impl EngineSession,
+    attach_failures: &[(u32, String)],
+    end: CaptureEnd,
+    reports: &[metrics::SlotReport],
+    kernel: &metrics::KernelEvidence,
+    malformed_records: u64,
+    stop_ns: Option<u64>,
+) {
+    let used = if engine.has_prearm_watches() {
+        prearm_used_modules(reports, engine.plan(), engine.pinned())
+    } else {
+        BTreeSet::new()
+    };
+    engine.finish_prearm_capture(
+        session,
+        end.prearm_end_cause(),
+        &used,
+        attach_failures,
+        stop_ns,
+        kernel,
+        malformed_records,
+    );
 }
 
 /// All three operator stop signals end a capture the same clean way. SIGTERM
@@ -3201,6 +3327,9 @@ fn run_owned_inner_with_host(
                 reason: reason.to_owned(),
             });
 
+    // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
+    // unobserved outer bound cannot understate the spawn-to-attach gap.
+    let scope_start_ns = crate::attach::monotonic_ns();
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
@@ -3212,6 +3341,7 @@ fn run_owned_inner_with_host(
         kind: args.kind,
         modules: args.modules.clone(),
         manifests: args.manifests.clone(),
+        prearm_modules: args.prearm_modules.clone(),
         hooks: args.hooks.clone(),
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,
@@ -3231,6 +3361,7 @@ fn run_owned_inner_with_host(
     let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    engine.set_scope_start_ns(scope_start_ns);
     engine.retain_return_probe_admission(return_admission);
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
     // signalled `always` failure can be named an interruption, not a refusal.
@@ -5190,6 +5321,9 @@ fn capture_profile(
     // loss sampling, with the loop's real ending (an Err result is an
     // error ending — the loop still ended).
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample.
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -5363,6 +5497,10 @@ fn capture_profile(
                         &uretprobe_override,
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
+                        // Sealing during a quiesce failure: the watches end
+                        // stopped, never as a clean scope end.
+                        CaptureEnd::Error,
+                        watch_stop_ns,
                     )
                     .map(|_| ())
                 },
@@ -5407,7 +5545,7 @@ fn capture_profile(
             poll_terminal_cancellation();
             result
         },
-        |context, _end, _detached| {
+        |context, end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -5525,6 +5663,8 @@ fn capture_profile(
                         &uretprobe_override,
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
+                        end,
+                        watch_stop_ns,
                     )
                 },
             )
@@ -5553,6 +5693,8 @@ fn capture_profile(
         uretprobe_override: &Option<render::UretprobeOverride>,
         capture_tracking_degraded: bool,
         poll_terminal_cancellation: &impl Fn(),
+        end: CaptureEnd,
+        stop_ns: Option<u64>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -5572,6 +5714,16 @@ fn capture_profile(
             .pinned()
             .check_unchanged()
             .map_err(anyhow::Error::msg)?;
+        finish_prearm_terminal(
+            context.0,
+            &*context.1,
+            context.1.attach_failures(),
+            end,
+            reports,
+            &kernel_evidence,
+            *consumers.malformed_records,
+            stop_ns,
+        );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
         consumers.scheduling.span_stage(
@@ -6091,6 +6243,9 @@ fn capture_trace(
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending.
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample (which follows the identity stop).
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -6406,6 +6561,20 @@ fn capture_trace(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
+                    // Terminal observation health is sampled beside the
+                    // reports, before the watches close on it.
+                    let kernel_start = Instant::now();
+                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
+                    finish_prearm_terminal(
+                        context.0,
+                        &*context.1,
+                        context.1.attach_failures(),
+                        end,
+                        &reports,
+                        &terminal_kernel,
+                        *consumers.malformed_records,
+                        watch_stop_ns,
+                    );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
                     consumers.scheduling.span_stage(
@@ -6415,11 +6584,9 @@ fn capture_trace(
                         crate::attach::monotonic_ns(),
                     );
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
-                    let maps_start = Instant::now();
-                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
                     consumers
                         .scheduling
-                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
+                        .add_phase(SchedulingPhase::Maps, kernel_start.elapsed());
                     consumers.scheduling.note_terminal(
                         terminal_kernel.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
@@ -12071,11 +12238,231 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn prearm_end_cause_maps_ends() {
+        use render::PrearmWatchEnd;
+        assert_eq!(
+            CaptureEnd::DurationExpired.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::TargetExit.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::LimitReached.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(CaptureEnd::Signal.prearm_end_cause(), PrearmWatchEnd::Stop);
+        assert_eq!(CaptureEnd::Error.prearm_end_cause(), PrearmWatchEnd::Stop);
+    }
+
+    fn prearm_test_report(
+        module: Option<crate::plan::ModuleId>,
+        calls: u64,
+        errors: u64,
+        in_flight: u64,
+    ) -> metrics::SlotReport {
+        metrics::SlotReport {
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantic_authorized: true,
+            module,
+            module_ambiguous: false,
+            module_unresolved: module.is_none(),
+            mode: p11scope_ebpf_common::CounterMode::Latency,
+            calls,
+            errors,
+            in_flight,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: std::collections::BTreeMap::new(),
+            file_offset: 0x1000,
+            target_object: None,
+            ordinals: Vec::new(),
+        }
+    }
+
+    fn prearm_test_plan(modules: &[u32]) -> crate::plan::AttachPlan {
+        let mut plan = crate::plan::AttachPlan::from_slots(Vec::new());
+        plan.modules = modules
+            .iter()
+            .map(|id| crate::plan::ModuleSummary {
+                id: crate::plan::ModuleId(*id),
+                object: crate::discovery::identity::PinnedObjectId(*id),
+                key: crate::plan::TEST_OBJECT,
+                path: format!("/prearm/{id}.so"),
+                tables: Vec::new(),
+                interfaces: 0,
+                source: "prearm",
+                corroborated: false,
+                skipped: Vec::new(),
+            })
+            .collect();
+        plan
+    }
+
+    #[test]
+    fn prearm_used_modules_counts_attributed_and_inflight() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        let reports = vec![
+            prearm_test_report(Some(ModuleId(3)), 5, 0, 0),
+            // All-zero rows are silence, not use.
+            prearm_test_report(Some(ModuleId(7)), 0, 0, 0),
+        ];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(3)]),
+        );
+        // Entered-but-unreturned calls still count as observed use.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 0, 2)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+        // Error rows count too: the endpoint was reached.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 1, 0)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+    }
+
+    #[test]
+    fn prearm_used_modules_fails_closed_on_unattributable() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        // An ownerless report no pin resolves marks every module used: a
+        // quiet claim needs proven no-use, and unknown association never
+        // proves it.
+        let mut report = prearm_test_report(None, 4, 0, 0);
+        report.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 42,
+            sha256: None,
+        });
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        let report = prearm_test_report(None, 4, 0, 0);
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        assert!(prearm_report_owners(&prearm_test_report(None, 4, 0, 0), &plan, &pins).is_empty());
+    }
+
+    #[test]
+    fn prearm_terminal_freezes_watches_at_stop_not_publication() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // A trivial provider with no standard exports: the watch waits
+        // unarmed — the close boundary is what this test pins, not coverage.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stop-freeze.c");
+        std::fs::write(&src, "int stop_freeze_marker;\n").unwrap();
+        let provider = dir.path().join("stop-freeze.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        // Stop long ago, publication now: duration, signal and error ends
+        // all close at the frozen stop, excluding the blind tail.
+        for (end, cause) in [
+            (
+                CaptureEnd::DurationExpired,
+                crate::render::PrearmWatchEnd::ScopeEnd,
+            ),
+            (CaptureEnd::Signal, crate::render::PrearmWatchEnd::Stop),
+            (CaptureEnd::Error, crate::render::PrearmWatchEnd::Stop),
+        ] {
+            let args = CaptureArgs {
+                kind: Kind::Profile,
+                modules: Vec::new(),
+                manifests: Vec::new(),
+                prearm_modules: vec![provider.clone()],
+                hooks: HookRegistry::builtin(),
+                scope: ScopeArg::Pid(pid),
+                metrics: false,
+                counter_mode: None,
+                duration: None,
+                out: None,
+                max_events: None,
+                max_scan_pids: None,
+                ring_bytes: None,
+                drain_interval: None,
+                unsafe_requested: false,
+                allow_confined_uretprobe: false,
+                attach_backend: BackendSelection::default(),
+            };
+            let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+            let mut engine =
+                Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+            assert!(engine.has_prearm_watches());
+            let session = ScriptedSession::default();
+            let reports: Vec<metrics::SlotReport> = Vec::new();
+            finish_prearm_terminal(
+                &mut engine,
+                &session,
+                &[],
+                end,
+                &reports,
+                &metrics::KernelEvidence::default(),
+                0,
+                Some(1000),
+            );
+            let watch = engine.discovery().modules[0]
+                .watch
+                .as_ref()
+                .expect("finish renders every watch");
+            assert_eq!(watch.until_ns, Some(1000));
+            assert_eq!(watch.ended_by, Some(cause));
+        }
+    }
+
+    #[test]
+    fn prearm_stop_uses_first_stop_not_later_loop_end() {
+        use crate::attach::FirstStop;
+        // The earliest stop wins; a later loop-end sample never extends it.
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(1000), Some(5000)),
+            Some(1000)
+        );
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(5000), Some(1000)),
+            Some(1000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::Known(1000), None), Some(1000));
+        assert_eq!(
+            prearm_stop_ns(FirstStop::NotRequested, Some(5000)),
+            Some(5000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::NotRequested, None), None);
+        // Round-3 (re-audit finding 2): a stop requested at an unknown
+        // instant stays unknown — never backfilled with a later value.
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, Some(5000)), None);
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, None), None);
+    }
+
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
             counter_mode: None,
@@ -12124,6 +12511,7 @@ mod tests {
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             scope,
             metrics: false,

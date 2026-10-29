@@ -244,6 +244,10 @@ pub(crate) struct CgroupCollectRequest {
     pub(crate) scan_budget: CaptureWorkBudget,
     pub(crate) observer: Option<crate::cgroup_stop_acceptance::Observer>,
     pub(crate) count_manifests: Vec<PathBuf>,
+    /// Already-retained `--prearm-module` pin usage (packet 6.13 round-3,
+    /// finding 3), charged against the shared manifest+pre-arm budget when
+    /// count manifests pin.
+    pub(crate) prearm_prior: (usize, u64),
 }
 
 pub(crate) struct CgroupCollection {
@@ -879,7 +883,13 @@ fn collect_with(
     } else {
         None
     };
-    prepare_count_manifests(&mut collection, &mut bound, &request.count_manifests);
+    prepare_count_manifests(
+        &mut collection,
+        &mut bound,
+        &request.count_manifests,
+        request.prearm_prior.0,
+        request.prearm_prior.1,
+    );
     if collection.budget.stopped_reason().is_some() && outcome == ScopedCollectionOutcome::Complete
     {
         outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete);
@@ -1337,6 +1347,7 @@ mod tests {
             }),
             observer: None,
             count_manifests: Vec::new(),
+            prearm_prior: (0, 0),
         }
     }
     fn fixture(pid: u32) -> (tempfile::TempDir, Arc<File>) {

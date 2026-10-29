@@ -298,6 +298,7 @@ fn scenario(
         kind,
         modules: vec![stage.join("provider.so")],
         manifests: vec![stage.join("provider.json")],
+        prearm_modules: vec![],
         hooks: crate::discovery::hooks::HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,

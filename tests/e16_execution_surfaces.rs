@@ -430,6 +430,7 @@ fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
         kind: Kind::Profile,
         modules: vec![hint.to_path_buf()],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,

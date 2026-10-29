@@ -9049,7 +9049,11 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
             old_pair.len() == 2,
             "old high-slot pair lacks two unique IDs"
         );
-        let attachment = session.attach_targets(&[plan.slots[2_048].clone()], &fixture.pins);
+        let attachment = session.attach_targets(
+            &[plan.slots[2_048].clone()],
+            &fixture.pins,
+            &std::collections::BTreeSet::new(),
+        );
         let rebound = OwnedIds::detailed(&session)?;
         task4_ids_phase("post_rebind_attempt", &rebound);
         ids.links.extend(rebound.links.iter().copied());

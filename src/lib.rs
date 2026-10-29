@@ -76,6 +76,7 @@ pub mod metrics;
 pub mod output;
 pub mod pidns;
 pub mod plan;
+pub(crate) mod prearm_module;
 pub mod process;
 pub mod render;
 pub(crate) mod run;

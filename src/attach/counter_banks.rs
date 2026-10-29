@@ -14,6 +14,7 @@ use aya::programs::UProbe;
 use p11scope_ebpf_common::{
     CallStart, CounterMode, MAX_SLOTS, RING_BYTES, RV_ENTRIES, START_ENTRIES, SlotStats,
 };
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd};
@@ -3093,9 +3094,11 @@ impl BankIo for NativeIo<'_> {
             .as_ref()
             .ok_or(BankRefusal::Shape(BankShapeCause::AttachWithoutBanks))?;
         let _stage = banks.begin_link_stage((u64::from(first) << 32) | u64::from(end))?;
+        // Separate lane, separate watches: the counter session never ends
+        // pre-arm watches, so its ended set is always empty.
         let (failed, mut completed) = self
             .session
-            .attach_targets(slots, self.objects)
+            .attach_targets(slots, self.objects, &BTreeSet::new())
             .map_err(|_| BankRefusal::Links)?;
         completed.sort_unstable_by_key(|(slot, _)| *slot);
         let sides = self.session.current_static_sides();

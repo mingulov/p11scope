@@ -615,7 +615,8 @@ fn detailed_nonleader_exec_gate(failed: bool) -> Result<()> {
                 links: removed.clone(),
             }
             .released()?;
-            let attachment = session.attach_targets(&plan.slots, &pins);
+            let attachment =
+                session.attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new());
             // Observe every retained replacement link even if the attach result
             // fails; the final absence oracle owns old/new link IDs together.
             let replacement = OwnedIds::observe(&session)?;

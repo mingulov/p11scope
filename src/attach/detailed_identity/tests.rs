@@ -1083,3 +1083,89 @@ fn detailed_proof_baseline_completion_precedes_all_sample_reads() {
         assert_eq!(proof.usage(), (0, 0));
     }
 }
+
+#[test]
+fn detailed_first_entry_seeds_identity_and_reserves_exactly_once() {
+    // 6.05 step 1(a): the first instrumented call seeds identity and
+    // reserves exactly one entry through ProofSession::reserve. The BPF
+    // half (identity via p11_link_current_identity on call entry) is
+    // pinned by the entry-object shape tests; this pins the userspace
+    // reservation half at the real sample_from seam: one seed, one
+    // charge, registration visible in the ledger.
+    let (proof, view, mut work) = sample_fixture();
+    let mut source = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    let seed = proof
+        .sample_from(&view, &mut work, &mut source)
+        .expect("first entry seeds identity");
+    assert_eq!(seed.identity.path.as_deref(), Some("/owned/fixture"));
+    assert_eq!(seed.identity.ino, 2);
+    assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
+    let ledger = proof.ledger().unwrap();
+    assert_eq!(ledger.pids.get(&view.pid()), Some(&seed.id()));
+    assert!(ledger.pending.contains_key(&seed.id()));
+    drop(ledger);
+    drop(seed);
+    assert_eq!(proof.usage(), (0, 0));
+}
+
+#[test]
+fn detailed_second_first_entry_for_same_pid_keeps_no_charge() {
+    // 6.05 step 1(a) refusal twin: a second first-entry for an already
+    // seeded pid refuses ProofPending and keeps no reservation charge;
+    // the refusal is not sticky once the first seed drops.
+    let (proof, view, mut work) = sample_fixture();
+    let mut source = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    let seed = proof
+        .sample_from(&view, &mut work, &mut source)
+        .expect("first entry seeds identity");
+    assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
+    let mut retry = TraceWorkTicket::test_new(
+        proof.clone(),
+        proof.test_time(),
+        proof.test_time() + 5_000_000,
+    );
+    let mut dup = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    assert!(matches!(
+        proof.sample_from(&view, &mut retry, &mut dup),
+        Err(TraceWorkError::Unknown(TraceProofUnknown::ProofPending))
+    ));
+    assert_eq!(
+        proof.usage(),
+        (1, "/owned/fixture".len()),
+        "duplicate first-entry keeps no charge"
+    );
+    assert_eq!(proof.ledger().unwrap().pending.len(), 1);
+    drop(seed);
+    assert_eq!(proof.usage(), (0, 0));
+    let mut reseed = TraceWorkTicket::test_new(
+        proof.clone(),
+        proof.test_time(),
+        proof.test_time() + 5_000_000,
+    );
+    let mut fresh = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    let seed = proof
+        .sample_from(&view, &mut reseed, &mut fresh)
+        .expect("re-seed after drop succeeds");
+    assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
+    drop(seed);
+}

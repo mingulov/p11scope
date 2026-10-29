@@ -1886,6 +1886,49 @@ mod tests {
         let bad_end = [row(3, 7, 0, 2, 0, 1), row(3, 0, 1, 1, 1, 3)].concat();
         assert!(parse_batch(domain(), 3, &[7], &bad_end).is_err());
     }
+    #[test]
+    fn image_query_swapped_slots_refuse_while_ordered_batch_answers() {
+        // 6.05 step 1(b): the lookup answers only for the requested
+        // cookies in their requested slots. Correctly slotted rows
+        // answer with the queried domain stamped; swapped or wild
+        // slots refuse with Stream even when every cookie was
+        // requested. The pidfd live-before/after half is pinned by
+        // a_cookie_answer_needs_the_pidfd_live_before_and_after_the_lookup.
+        let ordered = [
+            row(3, 7, 0, 2, 0, 1),
+            row(3, 8, 1, 4, 1, 1),
+            row(3, 0, 2, 3, 2, 3),
+        ]
+        .concat();
+        let owner = domain();
+        let batch = parse_batch(owner, 3, &[7, 8], &ordered).expect("ordered batch answers");
+        assert_eq!(batch.domain(), owner);
+        assert_eq!(batch.image(7).unwrap().exec_id, 0);
+        assert_eq!(batch.image(8).unwrap().exec_id, 1);
+        assert!(batch.image(9).is_none(), "no unrequested cookie answers");
+        let swapped = [
+            row(3, 8, 1, 4, 0, 1),
+            row(3, 7, 0, 2, 1, 1),
+            row(3, 0, 2, 3, 2, 3),
+        ]
+        .concat();
+        assert_eq!(
+            parse_batch(domain(), 3, &[7, 8], &swapped),
+            Err(ImageQueryRefusal::Stream),
+            "requested cookies in swapped slots refuse"
+        );
+        let wild = [
+            row(3, 7, 0, 2, 5, 1),
+            row(3, 8, 1, 4, 1, 1),
+            row(3, 0, 2, 3, 2, 3),
+        ]
+        .concat();
+        assert_eq!(
+            parse_batch(domain(), 3, &[7, 8], &wild),
+            Err(ImageQueryRefusal::Stream),
+            "a slot past the request set refuses"
+        );
+    }
 
     #[test]
     fn post_scan_audit_failure_empty_ranges_and_late_io_never_seal() {

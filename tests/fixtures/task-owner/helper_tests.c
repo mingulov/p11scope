@@ -2886,6 +2886,49 @@ static void journal_removal_hook(void)
     assert(row(&START, &key) && ctl.outstanding == 1);
 }
 #endif
+/* 6.05 step 1(d): the journal lifetime words are minted once, never
+ * recycled, and preserved across idle and exec/exit cleanup while lease
+ * state clears; no non-journal leaf mints them. Drives the production
+ * task_owner.c insert/remove/cleanup bodies. */
+static void journal_custody_never_reused(void)
+{
+    /* Non-inventory region only (inventory-only objects carry no journal
+     * words; that absence is pinned by the ABI static asserts in
+     * task_owner.h). */
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 7, .pad = 0 };
+    reset();
+    /* A full call cycle mints nothing: custody stays unminted (zero)
+     * without the journal producer. */
+    assert(!p11_owner_start_insert(&key, value));
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(!owners[0].journal_thread && !owners[0].journal_sequence);
+    assert(!owners[0].flags && !owners[0].original_pid_tgid);
+    /* The one mint (modeled here: the producer mints once per retained
+     * row; the mint itself belongs to object_journal, not this unit). */
+    owners[0].journal_thread = 7;
+    owners[0].journal_sequence = 3;
+    /* Re-lease over minted custody: the stash path restores the minted
+     * words instead of resetting them. */
+    assert(!p11_owner_start_insert(&key, value));
+    assert(owners[0].journal_thread == 7 && owners[0].journal_sequence == 3);
+    assert(owners[0].flags == OWNER_LEASED && ctl.outstanding == 1);
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(!owners[0].flags && !owners[0].original_pid_tgid && !owners[0].start_count);
+    assert(!ctl.outstanding && !ctl.poison);
+    assert(owners[0].journal_thread == 7 && owners[0].journal_sequence == 3);
+    /* Exec/exit cleanup with a live START abandons the call but preserves
+     * the lifetime words while the lease clears. */
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+    assert(!ctl.poison && !ctl.outstanding);
+    assert(owners[0].journal_thread == 7 && owners[0].journal_sequence == 3);
+    assert(!owners[0].flags && !owners[0].original_pid_tgid && !owners[0].start_count);
+    assert(ctl.abandoned_start == 1);
+    /* Idle cleanup is a no-op that preserves custody too. */
+    assert(!p11_owner_cleanup());
+    assert(owners[0].journal_thread == 7 && owners[0].journal_sequence == 3);
+    assert(!ctl.poison && !ctl.outstanding);
+}
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -2905,6 +2948,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "threads")) threaded_contention();
         else if (!strcmp(argv[1], "idle")) idle_owner_retention();
         else if (!strcmp(argv[1], "lease")) lease_boundary();
+        else if (!strcmp(argv[1], "journal_custody_never_reused")) journal_custody_never_reused();
         else if (!strcmp(argv[1], "object_producer_owner_terminal_matrix")) object_producer_owner_terminal_matrix();
         else if (!strcmp(argv[1], "object_producer_side_state_n_and_n_plus_one")) object_producer_side_state_n_and_n_plus_one();
         else if (!strcmp(argv[1], "object_producer_missing_side_state_faults_before_return")) object_producer_missing_side_state_faults_before_return();
@@ -2946,7 +2990,7 @@ int main(int argc, char **argv)
         object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();
         object_seeded_start_construction(); object_seeded_start_failures(); object_aggregate_start_construction();
-        object_producer_cleanup_idle_returns_zero();
+        object_producer_cleanup_idle_returns_zero(); journal_custody_never_reused();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

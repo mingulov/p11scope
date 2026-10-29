@@ -2025,6 +2025,69 @@ fn joint_exec_marker_birth_without_publication_refuses_closed() {
     );
 }
 
+#[test]
+fn joint_refused_exec_marker_row_stays_unready_and_stage1_continues() {
+    // 6.05 step 1(c), marker half: a collection-window EXEC the ticket
+    // path refused leaves the marker row un-READY-able — every
+    // un-READY native row state (unpublished, DIRTY, READY naming
+    // another exec) refuses the ExecMarker birth with MarkerNotReady —
+    // while the ordinary S1 stream still classifies Continued. The
+    // exec half of this twin lives in the inventory_coordinator tests
+    // (a_refused_collection_exec_leaves_no_birth_path_and_keeps_stage1_useful):
+    // the refused EXEC mints nothing.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    // Every dumped row comes from the real marker leaves; only the argv
+    // parameters are injected.
+    for (args, what) in [
+        (vec!["0", "0", "0", "0", "1"], "unpublished"),
+        (vec!["0", "0", "1", "0", "1"], "DIRTY"),
+        (vec!["9", "0", "0", "9", "0"], "READY naming another exec"),
+    ] {
+        let (row, control, _) = publisher.publish(&args);
+        let mut rows = NativeBirthRows { row, control };
+        assert!(
+            matches!(
+                crate::attach::observe_retained_birth(
+                    &mut rows,
+                    harness.fixture.binding(),
+                    harness.fixture.attachment(),
+                    &binding,
+                    BirthKind::ExecMarker,
+                ),
+                Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
+            ),
+            "{what}: a refused EXEC leaves no READY-able marker row"
+        );
+    }
+    // The same unpublished row still issues absence freshness: the
+    // refusal above is the row state, not a dead harness.
+    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    let mut rows = NativeBirthRows { row, control };
+    crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::AbsenceAppearance,
+    )
+    .expect("the unpublished row issues absence freshness");
+    // S1 intact: the next ordinary observation still continues.
+    harness.push_ordinary(ImageIdentity::default());
+    let mut next = harness.collect();
+    let (report, admitted) = harness.route(&mut next);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    next.classify_ordinary(&admitted).unwrap();
+    harness.ingest(next, &admitted);
+}
+
 pub(super) fn actual_absence_birth_fixture() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     let mut harness = JointBirthHarness::new();

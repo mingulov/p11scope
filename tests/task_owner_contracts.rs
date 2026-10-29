@@ -45,6 +45,54 @@ fn production_task_owner_conditional_journal_settlement() {
     }
 }
 
+/// 6.05 step 1(d): journal lifetime custody is minted once, never
+/// recycled, and preserved across idle and exec/exit cleanup while lease
+/// state clears; no non-journal leaf mints it. The busy/null/refund
+/// accounting twins stay covered by the cas/contention/threads selectors
+/// in the lifecycle suite below.
+#[test]
+fn production_task_owner_journal_custody_never_reused() {
+    let work = tempfile::tempdir().expect("custody fixture directory");
+    for (name, flags) in [
+        ("default", vec![]),
+        ("small", vec!["-DP11SCOPE_SMALL_STATE_MAPS"]),
+        ("journal", vec!["-DP11SCOPE_OBJECT_JOURNAL"]),
+    ] {
+        let binary = work.path().join(name);
+        let output = Command::new("clang-18")
+            .args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/task-owner/helper_tests.c",
+                "-o",
+            ])
+            .arg(&binary)
+            .args(flags)
+            .output()
+            .expect("compile custody fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(binary)
+            .arg("journal_custody_never_reused")
+            .output()
+            .expect("run custody fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn production_task_owner_transactions_and_lifecycle() {
     let temporary = tempfile::tempdir().expect("native owner test directory");

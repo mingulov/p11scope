@@ -13737,6 +13737,94 @@ exit 0
     }
 
     #[test]
+    fn a_refused_collection_exec_leaves_no_birth_path_and_keeps_stage1_useful() {
+        // 6.05 step 1(c), exec half: a collection-window EXEC the ticket
+        // path refused (zero/mismatch/cross-domain) records its gap, mints
+        // nothing, retires nothing, and keeps the provider observation
+        // useful (S1 intact). The marker half of this twin lives in
+        // semantic_capture/tests.rs: the marker row stays un-READY-able.
+        let foreign = NativeDomainId::mint();
+        for (binding, setup) in [
+            (0u64, "zero ticket performs no lookup"),
+            (41u64, "cross-domain ticket"),
+            (41u64, "same-domain mismatch"),
+            (41u64, "no ticket held yet"),
+        ] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            match setup {
+                "zero ticket performs no lookup" => native.answer(7, 500, 41),
+                "cross-domain ticket" => native.query_answer(
+                    7,
+                    500,
+                    CookieQuery::Cookie(DomainCookie::scripted(foreign, 41)),
+                ),
+                "same-domain mismatch" => native.answer(7, 500, 42),
+                _ => native.query_answer(7, 500, CookieQuery::NoCookie),
+            }
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let modules: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert!(!modules.is_empty(), "{setup}: provider observation exists");
+            let gaps_before = native.scene.coordinator.registry.gaps().len();
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = binding;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty(), "{setup}: {:?}", receipt.events);
+            assert_eq!(
+                native.scene.coordinator.adapter.live_id(7),
+                Some(caller),
+                "{setup}: the incarnation is not retired"
+            );
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired,
+                "{setup}: the incarnation is not replaced"
+            );
+            let retained: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert_eq!(retained, modules, "{setup}: S1 stays useful");
+            assert_eq!(
+                native.cookies.queries,
+                usize::from(binding != 0),
+                "{setup}: only a nonzero ticket queries the pin"
+            );
+            let gaps = native.scene.coordinator.registry.gaps();
+            assert_eq!(gaps.len(), gaps_before + 1, "{setup}: one refusal gap");
+            let gap = gaps.last().unwrap();
+            assert_eq!(gap.subject, "collection-window exec task unproven");
+            assert_eq!(gap.caller, Some(caller));
+            assert_eq!(gap.pid, Some(7));
+            assert!(
+                gap.reason.contains("ticket"),
+                "{setup}: the gap names the ticket: {}",
+                gap.reason
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                native.scene.coordinator.adapter.live_id(7),
+                Some(caller),
+                "{setup}: still live after commit"
+            );
+        }
+    }
+
+    #[test]
     fn a_stopped_collection_exec_needs_the_original_task_before_retirement() {
         for ticket in [0, 42, 41] {
             let (mut native, caller) = NativeScene::with_collection_admission_window();

@@ -4291,11 +4291,9 @@ impl ScanIo for ProcScanIo {
         if let Some(member) = self.cold_member_for(view.pid()) {
             return Ok(Box::new(member.open_maps()?));
         }
-        view.with_filesystem(budget, |filesystem, _| {
-            filesystem.open_maps().map_err(|error| error.to_string())
-        })
-        .map(|file| Box::new(file) as Box<dyn Read>)
-        .map_err(std::io::Error::other)
+        view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_maps()))
+            .map_err(std::io::Error::other)
+            .and_then(|file| file.map(|file| Box::new(file) as Box<dyn Read>))
     }
 
     fn open_mem(
@@ -4303,10 +4301,8 @@ impl ScanIo for ProcScanIo {
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<File> {
-        view.with_filesystem(budget, |filesystem, _| {
-            filesystem.open_memory().map_err(|error| error.to_string())
-        })
-        .map_err(std::io::Error::other)
+        view.with_filesystem(budget, |filesystem, _| Ok(filesystem.open_memory()))
+            .map_err(std::io::Error::other)?
     }
 
     fn final_generation(

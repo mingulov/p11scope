@@ -2133,7 +2133,7 @@ impl BankProofDriver {
         let stdout = child.stdout.take().expect("piped stdout");
         Ok(ControlledChild {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             pending: Vec::new(),
         })
@@ -2151,7 +2151,7 @@ impl Drop for BankProofDriver {
 /// after 30 seconds so a stuck cell fails loudly instead of hanging.
 pub(crate) struct ControlledChild {
     pub child: Child,
-    pub stdin: ChildStdin,
+    pub stdin: Option<ChildStdin>,
     stdout: std::process::ChildStdout,
     pending: Vec<u8>,
 }
@@ -2198,13 +2198,17 @@ impl ControlledChild {
     }
 
     pub fn release(&mut self) -> anyhow::Result<()> {
-        self.stdin.write_all(b"go\n")?;
-        self.stdin.flush()?;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("fixture control stdin already closed"))?;
+        stdin.write_all(b"go\n")?;
+        stdin.flush()?;
         Ok(())
     }
 
     pub fn finish(mut self) -> anyhow::Result<std::process::Output> {
-        drop(self.stdin);
+        drop(self.stdin.take());
         let mut stderr = Vec::new();
         if let Some(mut pipe) = self.child.stderr.take() {
             let _ = pipe.read_to_end(&mut stderr);
@@ -2217,6 +2221,41 @@ impl ControlledChild {
             stdout,
             stderr,
         })
+    }
+}
+
+impl Drop for ControlledChild {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        match self.child.try_wait() {
+            // try_wait reaps an exited child or returns its cached status.
+            // In particular, finish already waited: never signal that PID.
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "killing owned fixture child {} failed: {error}",
+                        self.child.id()
+                    );
+                }
+            }
+            Err(error) => {
+                // An unknown status does not authorize a PID-based signal.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "checking owned fixture child {} failed: {error}",
+                    self.child.id()
+                );
+            }
+        }
+        if let Err(error) = self.child.wait() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "reaping owned fixture child {} failed: {error}",
+                self.child.id()
+            );
+        }
     }
 }
 
@@ -4819,6 +4858,81 @@ mod tests {
     fn verifier_tail_keeps_short_logs_whole() {
         let tail = super::verifier_tail("only\ntwo");
         assert_eq!(tail, "only\ntwo", "short logs pass through whole");
+    }
+
+    fn short_controlled_child() -> ControlledChild {
+        // Shell builtins keep this one direct owned child: EOF ends the
+        // held phase, while release has distinct output and exit status.
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'HELD\\n'; if IFS= read -r reply; then printf 'OUT:%s\\n' \"$reply\"; printf 'ERR:finished\\n' >&2; exit 17; fi; exit 19",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn one short controlled child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut controlled = ControlledChild {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            pending: Vec::new(),
+        };
+        controlled.read_line("HELD").expect("child reaches hold");
+        controlled
+    }
+
+    fn assert_owned_child_reaped(pid: u32) {
+        let mut status = 0;
+        // SAFETY: pid names the direct child this test owned. If a
+        // regression left it unreaped, this also reaps it before failing;
+        // closing its only control pipe makes the short child exit on EOF.
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            waited, -1,
+            "owned child {pid} was not reaped by cleanup: waitpid={waited}, status={status}"
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child PID is absent immediately after cleanup"
+        );
+    }
+
+    #[test]
+    fn controlled_child_early_drop_reaps_held_child() {
+        let held = short_controlled_child();
+        let pid = held.pid();
+        drop(held);
+        assert_owned_child_reaped(pid);
+    }
+
+    #[test]
+    fn controlled_child_panic_unwind_reaps_held_child() {
+        let held = short_controlled_child();
+        let pid = held.pid();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = held;
+            panic!("controlled child cleanup unwind");
+        }));
+        assert!(outcome.is_err(), "controlled panic unwinds");
+        assert_owned_child_reaped(pid);
+    }
+
+    #[test]
+    fn controlled_child_finish_preserves_output_and_reaped_status() {
+        let mut held = short_controlled_child();
+        let pid = held.pid();
+        held.release().expect("release held child");
+        let output = held.finish().expect("finish released child");
+        assert_eq!(output.status.code(), Some(17), "normal wait status");
+        assert_eq!(output.stdout, b"OUT:go\n", "remaining stdout retained");
+        assert_eq!(output.stderr, b"ERR:finished\n", "stderr retained");
+        assert_owned_child_reaped(pid);
     }
 
     static FAKE_UNMOUNT_CALLS: std::sync::atomic::AtomicUsize =

@@ -319,10 +319,14 @@ pub struct MountNamespaceId {
 }
 
 fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
+    mount_namespace_id_io(pid)
+        .map_err(|error| format!("cannot identify process mount namespace: {error}"))
+}
+
+fn mount_namespace_id_io(pid: u32) -> io::Result<MountNamespaceId> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
-        .map_err(|error| format!("cannot identify process mount namespace: {error}"))?;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))?;
     Ok(MountNamespaceId {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -792,11 +796,9 @@ pub(crate) fn unprovable_process_view_for_test(
     Ok(view)
 }
 
-/// A view pinned by `/proc` start time only, for the no-executable loader
-/// test: the child is killed into a zombie AFTER this opens, so
-/// `/proc/PID/exe` readlinks ENOENT while the retained start time still
-/// matches and `still_the_same()` stays true (the kthread shape — a live
-/// generation with no executable — without needing a kernel thread).
+/// A view pinned by `/proc` start time only. An unreaped zombie still
+/// matches this weak generation check; it has no original pidfd authority
+/// for full-image custody or cold filesystem proof.
 #[cfg(test)]
 pub(crate) fn start_time_pinned_process_view_for_test(
     id: ProcessViewId,

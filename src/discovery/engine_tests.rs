@@ -5042,13 +5042,19 @@ fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
     );
 }
 
-/// Task E1: a view whose `/proc/PID/exe` readlinks ENOENT (the kthread
-/// shape — a live generation with no executable) is NotArmable, not
-/// partial: silent `Ok(false)`, no mark, no loader record. The zombie
-/// child below is that shape without needing a kernel thread; the
-/// start-time pin keeps `still_the_same()` true across the kill.
+/// Whole-group exit has no executable and no surviving filesystem owner.
+/// Test the actual NotArmable guard before the separate generation postcheck.
 #[test]
 fn arming_a_view_without_an_executable_is_not_armable_not_partial() {
+    assert_no_executable_loader_arm(false);
+}
+
+#[test]
+fn a_start_time_only_zombie_cannot_bypass_full_image_custody() {
+    assert_no_executable_loader_arm(true);
+}
+
+fn assert_no_executable_loader_arm(start_time_only: bool) {
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
@@ -5064,39 +5070,94 @@ fn arming_a_view_without_an_executable_is_not_armable_not_partial() {
             .unwrap(),
     );
     let pid = child.0.id();
-    let view =
-        crate::process::start_time_pinned_process_view_for_test(ProcessViewId(0), pid).unwrap();
+    let view = if start_time_only {
+        crate::process::start_time_pinned_process_view_for_test(ProcessViewId(0), pid).unwrap()
+    } else {
+        ProcessView::open(ProcessViewId(0), pid).unwrap()
+    };
+    if !start_time_only {
+        assert!(
+            view.retained_pin().pidfd().is_ok(),
+            "retain actual strong custody"
+        );
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     child.0.kill().unwrap();
-    // The unwaited child is now a zombie: its exe link is gone while its
-    // start time still matches the retained pin. Never `wait` here — that
-    // would reap it and change the fixture.
+    // Exe disappearance can precede the original pidfd's final readiness.
+    // Keep both proofs inside the fixture's existing total bound. Never reap
+    // here: the weak twin still needs the same unreaped start time.
     let exe = format!("/proc/{pid}/exe");
-    let mut spins = 0;
     while std::fs::read_link(&exe).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGKILLed child kept its executable"
+        );
         std::thread::sleep(std::time::Duration::from_millis(1));
-        spins += 1;
-        assert!(spins < 10_000, "SIGKILLed child never became a zombie");
+    }
+    if !start_time_only {
+        assert!(
+            view.retained_pin()
+                .wait_ready(Some(
+                    deadline.saturating_duration_since(std::time::Instant::now())
+                ))
+                .unwrap(),
+            "the retained original pidfd must prove whole-group exit"
+        );
     }
     assert_eq!(
         std::fs::read_link(&exe).map_err(|error| error.kind()),
         Err(std::io::ErrorKind::NotFound),
         "the zombie fixture must present exe-ENOENT"
     );
-    assert!(
-        view.still_the_same(),
-        "the zombie keeps its start-time generation"
-    );
+    assert_eq!(view.still_the_same(), start_time_only);
+    assert_eq!(view.original_exited(), Ok(!start_time_only));
 
     let mut engine = Engine::empty();
     engine.views.push(view);
     let mut session = ScriptedSession::default();
-    let armed = engine.arm_loader_or_partial(
-        0,
-        &mut session,
-        &mut true,
-        &mut PendingViewRetirements::new(),
-    );
-    assert!(!armed.unwrap(), "a view without an executable never arms");
+    if start_time_only {
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        assert!(!armed.unwrap(), "weak custody never arms the dead leader");
+        assert_eq!(
+            engine.counters.object_skips,
+            [Skipped {
+                subject: "live loader arming".into(),
+                reason: "full-image custody requires the original pidfd".into(),
+            }]
+        );
+        assert_eq!(
+            engine.loader_contexts,
+            BTreeMap::from([(
+                (ProcessViewId(0), LoaderAggregateKey::Unbound, false),
+                LoaderContextClass {
+                    bound: false,
+                    initial_set: false,
+                }
+            ),])
+        );
+        assert!(
+            engine
+                .loader_registry
+                .ids_for_view(ProcessViewId(0))
+                .is_empty()
+        );
+        assert_eq!(engine.loader_discovery().strategies.unavailable, 1);
+        return;
+    }
+    assert!(matches!(
+        engine.arm_loader_for_view(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        ),
+        Err(LoaderArmFailure::NotArmable)
+    ));
 
     assert!(
         engine.counters.object_skips.is_empty(),
@@ -30621,14 +30682,10 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     );
 }
 
-/// Package C: cancellation is the capture budget's deadline, and it
-/// cancels work — not admission. An expired deadline refuses a newcomer
-/// provider's scan, which is then admitted empty (Package B's partial-first-
-/// scan semantic) with the deadline named in evidence and no bytes charged;
-/// crucially the refused scan dirties nothing, so clearing the deadline lets
-/// the next reconcile's polling rescan find the provider and upgrade the
-/// view to owned and armed. The tick quantum is untouched throughout:
-/// budget cancellation and the time quantum are independent mechanisms.
+/// Cancellation also bounds filesystem proof before admission. The request
+/// and released ID survive that refusal, so real polling can recover the
+/// same child and provider after cancellation clears. The tick quantum is
+/// untouched: capture cancellation and scheduler deferral are independent.
 #[test]
 fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     let sleeps = e06_spawn_sleeps(2);
@@ -30648,6 +30705,9 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     pids.push(newcomer);
     e06_write_listing(scope_dir.path(), &pids);
     engine.request_refresh(newcomer, None);
+    let original_request = engine.refresh_requested[&newcomer].clone();
+    let next_view_id = engine.next_view_id;
+    let dirty_before = engine.exploratory_dirty.clone();
     engine.budget.set_deadline(Some(0));
 
     // Ordinary frames cannot reach the newcomer (no free slots); the queued
@@ -30664,13 +30724,12 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
         "the queued request survives the ordinary frames"
     );
 
-    // The reconcile admits the newcomer, but the expired deadline refuses
-    // its scan: an empty view with deadline evidence and no work charged.
+    // The reconcile cannot mint a view without its filesystem proof.
     let bytes_before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     assert!(
-        engine.views.iter().any(|view| view.pid() == newcomer),
-        "the refused newcomer is admitted empty, not dropped"
+        !engine.views.iter().any(|view| view.pid() == newcomer),
+        "an expired budget cannot mint a newcomer view"
     );
     assert!(
         engine.plan.modules.is_empty(),
@@ -30681,39 +30740,78 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
         0,
         "cancellation charges no bytes"
     );
-    assert!(
+    assert_eq!(
         engine
             .counters
             .object_skips
             .iter()
-            .any(|skip| { skip.reason.contains("deadline") }),
-        "the deadline is named in evidence: {:?}",
-        engine.counters.object_skips
+            .filter(|skip| {
+                skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+            })
+            .count(),
+        1,
+        "the constructor refusal has one finite public evidence record"
     );
-    let newcomer_view = engine
-        .views
-        .iter()
-        .find(|view| view.pid() == newcomer)
-        .unwrap()
-        .id();
-    assert!(
-        !engine.exploratory_dirty.contains(&newcomer_view),
-        "a refused scan dirties nothing, so recovery stays possible"
+    assert_eq!(engine.budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+    let noise = engine.counters.noise.lines();
+    assert!(noise.contains(&format!(
+        "p11scope: discovery: process-view: discovery skipped process view — the process generation could not be retained: {SCAN_DEADLINE_REASON}"
+    )), "the scrubbed bounded diagnostic preserves the actual deadline: {noise:?}");
+    assert_eq!(
+        engine.refresh_requested.get(&newcomer),
+        Some(&original_request)
     );
+    assert_eq!(engine.exploratory_dirty, dirty_before);
+    assert!(engine.loader_contexts.is_empty());
+    assert_eq!(engine.next_view_id, next_view_id, "refusal burns no ID");
+    let released: BTreeSet<_> = engine.retired_view_ids.iter().copied().collect();
+    assert_eq!(
+        released.len(),
+        engine.retired_view_ids.len(),
+        "no double release"
+    );
+    assert_eq!(released.len(), 1, "the unadmitted reservation returns once");
+    let retry_id = ProcessViewId(*released.first().unwrap());
+    assert!(!engine.views.iter().any(|view| view.id() == retry_id));
+    let active: BTreeSet<_> = engine.views.iter().map(|view| view.id().0).collect();
+    assert!(active.is_disjoint(&released));
+    assert_eq!(active.len() + released.len(), next_view_id as usize);
 
-    // Clearing the deadline recovers through the polling rescan: the next
-    // reconcile re-examines the clean empty view, finds the provider, and
-    // upgrades it to owned and armed.
+    // Clearing cancellation lets the queued request recover the actual child.
     engine.budget.set_deadline(None);
     for _ in 5..=8 {
         refresh_inventory_once(&mut engine);
     }
+    let newcomer_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == newcomer)
+        .expect("the same child is admitted after cancellation")
+        .id();
+    assert_eq!(
+        newcomer_view, retry_id,
+        "recovery reuses the released reservation"
+    );
     assert!(
         engine
-            .plan
+            .views
+            .iter()
+            .find(|view| view.id() == newcomer_view)
+            .unwrap()
+            .still_the_same()
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&newcomer),
+        "the original request completes"
+    );
+    assert_eq!(engine.next_view_id, next_view_id);
+    assert!(!engine.retired_view_ids.contains(&newcomer_view.0));
+    assert!(
+        engine
             .modules
             .iter()
-            .any(|module| module.path.ends_with("cancel-unique.so")),
+            .any(|module| module.scanned.path.ends_with("cancel-unique.so")
+                && module.scanned.view == newcomer_view),
         "the polling rescan recovers the provider after cancellation"
     );
     assert!(

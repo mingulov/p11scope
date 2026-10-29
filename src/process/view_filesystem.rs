@@ -119,6 +119,9 @@ pub(crate) struct ViewFilesystem<'a> {
 }
 
 fn spend(work: &mut CaptureWorkBudget, deadline: Instant, units: u64) -> Result<(), String> {
+    if let Some(reason) = work.stopped_now() {
+        return Err(reason.into());
+    }
     if Instant::now() >= deadline {
         return Err("cold process filesystem proof deadline exhausted".into());
     }
@@ -377,17 +380,48 @@ impl<'a> ViewFilesystem<'a> {
         deadline: Instant,
         observed_z: impl FnOnce(),
     ) -> Result<Self, String> {
+        Self::open_before_with_namespace(
+            pin,
+            require_cold,
+            work,
+            deadline,
+            observed_z,
+            mount_namespace_id_io,
+        )
+    }
+
+    fn open_before_with_namespace(
+        pin: &'a PidPin,
+        require_cold: bool,
+        work: &mut CaptureWorkBudget,
+        deadline: Instant,
+        observed_z: impl FnOnce(),
+        namespace: impl FnOnce(u32) -> io::Result<MountNamespaceId>,
+    ) -> Result<Self, String> {
         let deadline = deadline.min(cold_filesystem_deadline(work));
         spend(work, deadline, 1)?;
-        if !require_cold && let Ok(namespace) = mount_namespace_id(pin.pid()) {
-            if pin.original_exited()? {
-                return Err("original process exited while its filesystem was identified".into());
+        if !require_cold {
+            match namespace(pin.pid()) {
+                Ok(namespace) => {
+                    if pin.original_exited()? {
+                        return Err(
+                            "original process exited while its filesystem was identified".into(),
+                        );
+                    }
+                    return Ok(Self {
+                        pin,
+                        namespace,
+                        cold: None,
+                    });
+                }
+                // A departed leader loses its namespace link while real
+                // survivors may retain the filesystem. A denied lookup is
+                // unknown, never evidence that this cold path applies.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("cannot identify process mount namespace: {error}"));
+                }
             }
-            return Ok(Self {
-                pin,
-                namespace,
-                cold: None,
-            });
         }
         spend(work, deadline, 3)?;
         let original = pin.open_proc_dir()?;
@@ -623,6 +657,117 @@ impl<'a> ViewFilesystem<'a> {
 mod tests {
     use super::*;
     use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    #[test]
+    fn capture_stop_precedes_the_local_filesystem_cutoff() {
+        use crate::discovery::scan::{CollectionWork, SCAN_DEADLINE_REASON};
+
+        let mut expired = CaptureWorkBudget::default();
+        expired.set_deadline(Some(0));
+        assert_eq!(
+            spend(&mut expired, Instant::now(), 1).unwrap_err(),
+            SCAN_DEADLINE_REASON
+        );
+        assert_eq!(expired.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(expired.attempted_io_bytes(), 0);
+        assert_eq!(expired.work_units_count(), 0);
+
+        let mut cancelled = CaptureWorkBudget::default();
+        cancelled.set_collection_work(CollectionWork::new(|_| false));
+        let error = spend(&mut cancelled, Instant::now(), 1).unwrap_err();
+        assert_eq!(Some(error.as_str()), cancelled.stopped_reason());
+        assert_eq!(cancelled.attempted_io_bytes(), 0);
+        assert_eq!(cancelled.work_units_count(), 0);
+    }
+
+    #[test]
+    fn a_local_filesystem_cutoff_does_not_stop_a_healthy_capture() {
+        let mut work = CaptureWorkBudget::default();
+        work.set_deadline(Some(u64::MAX));
+        assert_eq!(
+            spend(&mut work, Instant::now(), 1).unwrap_err(),
+            "cold process filesystem proof deadline exhausted"
+        );
+        assert_eq!(work.stopped_reason(), None);
+        assert_eq!(work.work_units_count(), 0);
+        spend(&mut work, Instant::now() + PROOF_GRACE, 1).unwrap();
+        assert_eq!(work.work_units_count(), 1);
+        assert_eq!(work.attempted_io_bytes(), 0);
+    }
+
+    #[test]
+    fn an_absent_leader_namespace_still_proves_the_survivor_filesystem() {
+        let mut group = ColdLeaderSubject::spawn(1);
+        let pin = PidPin::open(group.pid()).unwrap();
+        let expected = mount_namespace_id_io(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        assert!(!ViewFilesystem::open(&pin, &mut work).unwrap().is_cold());
+        group.leave_leader();
+        assert_eq!(
+            mount_namespace_id_io(group.pid()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let filesystem = ViewFilesystem::open(&pin, &mut work).unwrap();
+        assert!(filesystem.is_cold());
+        assert_eq!(filesystem.namespace(), expected);
+        filesystem.validate(&mut work).unwrap();
+        group.call_three();
+    }
+
+    #[test]
+    fn a_denied_warm_namespace_is_not_cold_absence() {
+        // Keep real original pidfd custody and run the actual acquisition
+        // body, replacing only this one typed namespace syscall result.
+        // Unlike a PID-1 fixture, this denial is also meaningful as root.
+        let group = ColdLeaderSubject::spawn(1);
+        let pin = PidPin::open(group.pid()).unwrap();
+        assert!(pin.pidfd().is_ok());
+        let mut work = CaptureWorkBudget::default();
+        let healthy = ViewFilesystem::open(&pin, &mut work).unwrap();
+        assert!(!healthy.is_cold());
+        assert_eq!(
+            healthy.namespace(),
+            mount_namespace_id_io(group.pid()).unwrap()
+        );
+        drop(healthy);
+        for errno in [libc::EACCES, libc::EPERM, libc::EIO] {
+            let mut work = CaptureWorkBudget::default();
+            let observed_z = std::cell::Cell::new(false);
+            let error = ViewFilesystem::open_before_with_namespace(
+                &pin,
+                false,
+                &mut work,
+                Instant::now() + PROOF_GRACE,
+                || observed_z.set(true),
+                |pid| {
+                    assert_eq!(pid, group.pid());
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+            )
+            .err()
+            .expect("a denied namespace never mints a filesystem proof");
+            assert_eq!(
+                error,
+                format!(
+                    "cannot identify process mount namespace: {}",
+                    io::Error::from_raw_os_error(errno)
+                )
+            );
+            assert!(!observed_z.get(), "denial cannot mint the cold boundary");
+            assert_eq!(work.attempted_io_bytes(), 0, "no cold metadata was read");
+            assert_eq!(
+                work.work_units_count(),
+                1,
+                "only the warm lookup was charged"
+            );
+            assert_eq!(pin.original_exited(), Ok(false));
+        }
+        assert!(
+            !ViewFilesystem::open(&pin, &mut CaptureWorkBudget::default())
+                .unwrap()
+                .is_cold()
+        );
+    }
 
     fn assert_real_census_boundary(workers: u32) {
         let mut group = ColdLeaderSubject::spawn(workers);

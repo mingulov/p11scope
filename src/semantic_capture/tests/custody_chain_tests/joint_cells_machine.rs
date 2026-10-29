@@ -1535,3 +1535,953 @@ fn joint_machine_refused_first_file_birth_keeps_sibling_joint() {
 fn joint_machine_refused_second_file_birth_keeps_sibling_joint() {
     two_births_one_refused(1);
 }
+
+/// The extra modeled call on the refused provider must not cost a different
+/// incarnation its Joint feed. Real prepared proofs, rather than file/router
+/// aliases, establish which subjects are distinct before birth or audit.
+fn journaled_refusal_keeps_joint_sibling(refused_file: u32, unrelated_image: bool) {
+    use crate::key_operation_projection::ObsStatus;
+
+    let mut scene = if unrelated_image {
+        MachineScene::with_initial_files(1, &[0], true)
+    } else {
+        MachineScene::with_initial_files(2, &[0, 1], true)
+    };
+    let refused_pid = std::process::id();
+    let child = unrelated_image.then(OwnedStoppedChild::new);
+    let healthy_pid = if let Some(child) = &child {
+        // Mirror the machine's initial physical setup: retain the actual
+        // pidfd and mapping, then let the collected original bind H3. A
+        // legacy pre-bind would scan New before these calls arrive.
+        let caller = scene.scene.real.scene.admit(child.id(), 50);
+        let (module, path) = &scene.scene.real.modules[0];
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .note_mapping(
+                caller,
+                child.id(),
+                ModuleInfo {
+                    path: path.clone(),
+                    key: module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("held-provider".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(5),
+                    admission_reasons: Vec::new(),
+                },
+                60,
+            );
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .commit_batch(false)
+            .unwrap();
+        let candidate = scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepare_legacy_semantic_candidate(caller, scene.scene.real.lane.domain())
+            .unwrap();
+        scene.scene.real.h0.0.borrow_mut().io.targets.insert(
+            child.id(),
+            (
+                candidate.pin(),
+                ImageIdentity {
+                    task_cookie: 73,
+                    exec_id: 0,
+                },
+            ),
+        );
+        drop(candidate);
+        child.id()
+    } else {
+        refused_pid
+    };
+    let mut sequence = 1;
+    for subject in 0..2 {
+        let file = if unrelated_image { 0 } else { subject };
+        let pid = if subject == refused_file {
+            refused_pid
+        } else {
+            healthy_pid
+        };
+        if subject == refused_file {
+            // This original makes the native birth observation refuse.
+            push_bare_call_on(&mut scene, pid, file, "C_GetSessionInfo", sequence);
+        } else {
+            scene.scene.push(pid, file, "C_SignInit", sequence);
+        }
+        sequence += 1;
+        // Unlike the prerequisite twin, the refused provider has its own
+        // genuine BEGIN/END and admitted affecting call in this frame.
+        scene.scene.push(pid, file, "C_SignInit", sequence);
+        sequence += 1;
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let prepared = coordinator.prepared_semantic_batch().unwrap();
+    let inputs = prepared.admissions().cloned().collect::<Vec<_>>();
+    let proofs = prepared
+        .claims()
+        .map(|(_, proof)| (*proof).expect("all four original admissions have genuine claims"))
+        .collect::<Vec<_>>();
+    assert_eq!((inputs.len(), proofs.len()), (4, 4));
+    for (input, proof) in inputs.iter().zip(&proofs) {
+        assert!(proof.matches_admitted(input));
+        assert_eq!(
+            input.journal_binding().0,
+            scene.scene.producers.native_domain()
+        );
+    }
+    assert_eq!(proofs[0], proofs[1]);
+    assert_eq!(proofs[2], proofs[3]);
+    assert_ne!(
+        proofs[0], proofs[2],
+        "actual admitted incarnation keys differ"
+    );
+    assert_eq!(
+        inputs[0].journal_binding().1 == inputs[2].journal_binding().1,
+        !unrelated_image,
+        "the control changes the actual process image, not a router label"
+    );
+    reach_any(&mut scene, &["Staging"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let refused_proof = proofs[(refused_file * 2) as usize];
+    eprintln!(
+        "journaled_refusal pre_audit refused_file={refused_file} unrelated_image={unrelated_image} \
+         births={:?} refusals={:?} remaining_current={:?}",
+        scene.native.birth_outcomes,
+        staged_birth_refusals(coordinator),
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .current_receipts()
+            .iter()
+            .map(|receipt| (receipt.image(), receipt.birth_quantum().is_some()))
+            .collect::<Vec<_>>(),
+    );
+    for input in &inputs {
+        assert_eq!(
+            coordinator.registry().admitted_feed_is_s1only(input),
+            refused_proof.matches_admitted(input),
+            "only the genuinely refused incarnation lacks its original grant"
+        );
+    }
+    let mut decisions = scene
+        .native
+        .birth_outcomes
+        .iter()
+        .map(|(file, result)| (*file, result.as_ref().err().copied()))
+        .collect::<Vec<_>>();
+    decisions.sort_by_key(|(file, _)| *file);
+    if unrelated_image {
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|(file, _)| *file == 0));
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|(_, refusal)| *refusal == Some(BirthObservationRefusal::MarkerNotReady))
+                .count(),
+            1,
+            "the other real image uses the same physical provider without sharing its incarnation"
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|(_, refusal)| refusal.is_none())
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(
+            decisions,
+            (0..2)
+                .map(|file| {
+                    (
+                        file,
+                        (file == refused_file).then_some(BirthObservationRefusal::MarkerNotReady),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "both original births are decided before any refusal fanout"
+        );
+    }
+    reach_any(&mut scene, &["Audited"]);
+    let audit = scene.machine.diagnostic_audit_for_test();
+    scene.published_labeled("journaled-refused-sibling", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let mut counts = registry
+        .instance_semantic_edges()
+        .map(|record| record.api_returns)
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [Some(2), Some(2)],
+        "all four original API returns survive"
+    );
+    let refusals = registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(refusals, ["joint_birth_native_MarkerNotReady"]);
+    assert_eq!(
+        scene.native.birth_outcomes.len(),
+        2,
+        "no repeated birth read"
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    eprintln!(
+        "journaled_refusal refused_file={refused_file} unrelated_image={unrelated_image} \
+         decisions={decisions:?} audit={audit:?} feeds={} counts={counts:?} observation={:?}/{}",
+        registry.joint_feeds(),
+        observations.status,
+        observations.reason,
+    );
+    assert_eq!(
+        (
+            registry.joint_feeds(),
+            observations.status,
+            observations.reason
+        ),
+        (1, ObsStatus::Populated, "none"),
+        "a different admitted incarnation retains its healthy Joint observations"
+    );
+}
+
+#[test]
+fn joint_machine_journaled_refused_first_file_keeps_sibling_joint() {
+    journaled_refusal_keeps_joint_sibling(0, false);
+}
+
+#[test]
+fn joint_machine_journaled_refused_second_file_keeps_sibling_joint() {
+    journaled_refusal_keeps_joint_sibling(1, false);
+}
+
+#[test]
+fn joint_machine_journaled_refusal_keeps_unrelated_image_joint() {
+    journaled_refusal_keeps_joint_sibling(0, true);
+}
+
+/// A live Joint key is structurally excluded from the S1Only marking gate.
+/// Its own failed fresh native read still falls back. Once S1Only, later
+/// admitted originals can name that exact retained key and take the real
+/// S1Only-subject path without ever reactivating its Joint history.
+#[test]
+fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let mut scene = MachineScene::with_initial_files(1, &[0], false);
+    let pid = std::process::id();
+    for sequence in [1, 2] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("same-incarnation-initial-birth", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let targets = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 1);
+    let target = targets[0];
+    let proof = target.bootstrap().proof();
+    assert_eq!(scene.native.birth_outcomes.len(), 1);
+    assert!(scene.native.birth_outcomes[0].1.is_ok());
+
+    for sequence in [3, 4] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let prepared = coordinator.prepared_semantic_batch().unwrap();
+    assert_eq!(prepared.admissions().count(), 2);
+    for input in prepared.admissions() {
+        assert!(proof.matches_admitted(input));
+        assert!(input.joint_resource_origin().is_some());
+        assert!(
+            !coordinator.registry().admitted_feed_is_s1only(input),
+            "the exact still-Joint incarnation cannot enter S1Only disposition"
+        );
+    }
+    for (_, claim) in prepared.claims() {
+        assert_eq!(*claim, Ok(proof), "same actual retained key and era");
+    }
+    let generation = scene.scene.attached.as_ref().unwrap().generation();
+    let (row, control, _) = scene
+        .native
+        .publisher
+        .publish_stamped(&["0", "0", "0", "0", "1"], generation);
+    assert!(
+        scene
+            .native
+            .rows
+            .insert(
+                target.bootstrap().domain(),
+                NativeBirthRows { row, control }
+            )
+            .is_some(),
+        "replace only the selected incarnation's real native read leaf"
+    );
+    scene.published_labeled("same-incarnation-native-read-refusal", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let registry = scene.scene.real.scene.coordinator.registry();
+    assert_eq!(registry.joint_feeds(), 0);
+    assert_eq!(
+        registry.feed_mode_for_test(target.id()),
+        Some(FeedMode::S1Only)
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    eprintln!(
+        "same_incarnation native_read_refusal observation={:?}/{}",
+        observations.status, observations.reason
+    );
+    assert_eq!(observations.status, ObsStatus::Unavailable);
+
+    for (sequences, count) in [([5, 6], 6), ([7, 8], 8)] {
+        for sequence in sequences {
+            scene.scene.push(pid, 0, "C_SignInit", sequence);
+        }
+        scene.machine.begin_commit(true).unwrap();
+        reach_any(&mut scene, &["Births"]);
+        let coordinator = &scene.scene.real.scene.coordinator;
+        let prepared = coordinator.prepared_semantic_batch().unwrap();
+        assert_eq!(prepared.admissions().count(), 2);
+        for input in prepared.admissions() {
+            assert!(
+                proof.matches_admitted(input),
+                "actual same-key S1Only original"
+            );
+            assert!(input.joint_resource_origin().is_some());
+            assert!(coordinator.registry().admitted_feed_is_s1only(input));
+        }
+        reach_any(&mut scene, &["Audited"]);
+        let audit = scene.machine.diagnostic_audit_for_test().unwrap();
+        assert_eq!(audit.0, Some(JournalGap::DomainTainted));
+        scene.published_labeled("same-incarnation-s1only-history", None);
+        assert!(matches!(
+            scene.poll_commit(0).unwrap(),
+            JointCommitProgress::Published(_)
+        ));
+        let coordinator = &scene.scene.real.scene.coordinator;
+        let registry = coordinator.registry();
+        let history = registry.joint_history_targets().collect::<Vec<_>>();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.id(), target.id());
+        assert!(history[0].0.bootstrap() == target.bootstrap());
+        assert_eq!(history[0].1, FeedMode::S1Only);
+        let records = registry.instance_semantic_edges().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].api_returns, Some(count));
+        assert_eq!(registry.joint_feeds(), 0);
+        assert_eq!(
+            scene.native.birth_outcomes.len(),
+            1,
+            "no rebirth after refusal"
+        );
+        assert!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .proof_refused_for_test(proof)
+        );
+        let observations = registry.joint_observations(registry.published_revision());
+        eprintln!(
+            "same_incarnation s1only_subject audit={audit:?} observation={:?}/{}",
+            observations.status, observations.reason
+        );
+        assert_eq!(observations.status, ObsStatus::Unavailable);
+        scene.scene.assert_claims(&[]);
+    }
+}
+
+fn add_initial_machine_image(scene: &mut MachineScene, pid: u32, image: ImageIdentity) {
+    let caller = scene.scene.real.scene.admit(pid, 50);
+    let (module, path) = &scene.scene.real.modules[0];
+    let admission_endpoints = scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .io
+        .endpoints
+        .iter()
+        .filter(|(_, _, endpoint)| endpoint.file_slot == 0)
+        .count();
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: path.clone(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("held-provider".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(admission_endpoints),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .unwrap();
+    let candidate = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepare_legacy_semantic_candidate(caller, scene.scene.real.lane.domain())
+        .unwrap();
+    scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(pid, (candidate.pin(), image));
+}
+
+#[test]
+fn joint_machine_mixed_image_and_exact_refusal_keeps_pending_continuation() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::Pending);
+}
+
+#[test]
+fn joint_machine_pending_refusal_requires_exact_original_provenance() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::Provenance);
+}
+
+#[test]
+fn joint_machine_resource_flag_with_pending_h3_keeps_originals_local() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::ResourcePending);
+}
+
+#[test]
+fn joint_machine_negative_only_image_taint_preserves_unrelated_joint() {
+    mixed_image_and_exact_refusal_pending(MixedRefusalControl::ImageOnly);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixedRefusalControl {
+    Pending,
+    Provenance,
+    ResourcePending,
+    ImageOnly,
+}
+
+fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::{EndpointClass, JournalGap, endpoint_class};
+    let pending = scenario != MixedRefusalControl::ImageOnly;
+    let resource_refused = scenario == MixedRefusalControl::ResourcePending;
+
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &[
+            "C_CreateObject",
+            "C_SignInit",
+            "C_SignUpdate",
+            "C_SignFinal",
+            "C_GetSessionInfo",
+            "C_EncapsulateKey",
+        ],
+        true,
+    );
+    let c_pid = std::process::id();
+    let child_b = OwnedStoppedChild::new();
+    let child_a = OwnedStoppedChild::new();
+    add_initial_machine_image(
+        &mut scene,
+        child_b.id(),
+        ImageIdentity {
+            task_cookie: 72,
+            exec_id: 0,
+        },
+    );
+    add_initial_machine_image(
+        &mut scene,
+        child_a.id(),
+        ImageIdentity {
+            task_cookie: 74,
+            exec_id: 0,
+        },
+    );
+    for (pid, sequence) in [(c_pid, 1), (c_pid, 2), (child_b.id(), 1), (child_b.id(), 2)] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    push_bare_call_on(&mut scene, child_a.id(), 0, "C_GetSessionInfo", 1);
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let prepared = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let a_input = prepared
+        .admissions()
+        .find(|input| input.journal_binding().1.task_cookie == 74)
+        .unwrap()
+        .clone();
+    let a_proof = prepared
+        .claims()
+        .find(|(at, _)| *at == a_input.h0_ordinal())
+        .unwrap()
+        .1
+        .as_ref()
+        .copied()
+        .expect("the irrelevant A original binds its actual retained key");
+    scene.published_labeled("mixed-scope-original-births", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let targets = coordinator
+        .registry()
+        .joint_feed_targets()
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2);
+    let c = targets
+        .iter()
+        .copied()
+        .find(|target| {
+            coordinator
+                .semantic_bindings()
+                .get(target.caller())
+                .unwrap()
+                .image()
+                .task_cookie
+                == 71
+        })
+        .unwrap();
+    let b = targets
+        .iter()
+        .copied()
+        .find(|target| target.id() != c.id())
+        .unwrap();
+    let c_proof = c.bootstrap().proof();
+    assert_ne!(a_proof, c_proof);
+
+    for (pid, sequence) in [(c_pid, 3), (c_pid, 4), (child_b.id(), 3), (child_b.id(), 4)] {
+        scene.scene.push(pid, 0, "C_SignInit", sequence);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Births"]);
+    let prepared = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let c_input = prepared
+        .admissions()
+        .find(|input| c_proof.matches_admitted(input))
+        .unwrap()
+        .clone();
+    let (row, control, _) = scene.native.publisher.publish_stamped(
+        &["0", "0", "0", "0", "1"],
+        scene.scene.attached.as_ref().unwrap().generation(),
+    );
+    assert!(
+        scene
+            .native
+            .rows
+            .insert(c.bootstrap().domain(), NativeBirthRows { row, control })
+            .is_some()
+    );
+    scene.published_labeled("mixed-scope-native-c-refusal", None);
+    assert!(matches!(
+        scene.poll_commit(0).unwrap(),
+        JointCommitProgress::Published(_)
+    ));
+    let coordinator = &mut scene.scene.real.scene.coordinator;
+    assert_eq!(
+        coordinator.registry().feed_mode_for_test(c.id()),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(
+        coordinator.registry().feed_mode_for_test(b.id()),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&c_input),
+        Ok(c_proof),
+        "C retains its original key-era without an image taint"
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&a_input),
+        Ok(a_proof)
+    );
+
+    let child_e = OwnedStoppedChild::new();
+    let e_image = ImageIdentity {
+        task_cookie: 75,
+        exec_id: 0,
+    };
+    scene.scene.real.bind(child_e.id(), e_image, 0);
+    if resource_refused {
+        let (begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_SignInit", 2);
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    } else {
+        assert_eq!(
+            endpoint_class(function_id("C_EncapsulateKey")),
+            Some(EndpointClass::NegativeOnlyAffecting)
+        );
+        assert_ne!(
+            crate::kinds::descriptor("C_EncapsulateKey").unwrap(),
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        let (mut begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_EncapsulateKey", 2);
+        begin_a[5] = p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+        assert!(
+            p11scope_ebpf_common::object_journal::validate_begin(&begin_a, None)
+                .unwrap()
+                .no_end()
+        );
+        scene.scene.drain.source_mut().push_record(begin_a.to_vec());
+    }
+    scene.scene.push(child_b.id(), 0, "C_SignInit", 5);
+    scene.scene.push(c_pid, 0, "C_SignInit", 5);
+    if pending {
+        scene.scene.push(child_e.id(), 0, "C_SignInit", 1);
+    }
+    let mut raw = scene.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut held = scene.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *held;
+        io.script.fail_cookie = pending.then_some(e_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 2);
+        assert_eq!(first.awaiting_floor(), pending.then_some(12));
+        first
+    };
+    if pending {
+        let mut held = scene.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *held;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().count(), 1);
+        assert_eq!(completed.calls().next().unwrap().position(), Some(12));
+        assert_eq!(completed.allocated_below(), 13);
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert_eq!(stash.min_outcome_position(), Some(12));
+    }
+    let coordinator = &mut scene.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(
+        SemanticBatch::from_tick_report(
+            scene.scene.real.lane.domain(),
+            first,
+            Vec::new(),
+            now_ns(),
+        )
+        .unwrap(),
+    );
+    coordinator
+        .prepare_staged_semantic_batch(&mut scene.scene.real.lane, None)
+        .unwrap();
+    let mut ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &scene.scene.producers,
+            scene.machine.retained_drain_grant_for_test().unwrap(),
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original mixed-scope raw: {reason:?}"));
+    let mut claims = Vec::new();
+    while let Some(claim) = coordinator
+        .claim_next_prepared_admission(&scene.scene.producers, &ingested)
+        .unwrap()
+    {
+        claims.push(claim);
+    }
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0], (10, Ok(b.bootstrap().proof())));
+    let exact = coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .find(|input| input.h0_ordinal() == 11)
+        .unwrap();
+    assert!(c_proof.matches_admitted(exact));
+    assert!(coordinator.registry().admitted_feed_is_s1only(exact));
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&scene.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&scene.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut scene.scene.real.lane))
+        .unwrap();
+    let attached = scene.scene.attached.as_ref().unwrap();
+    let mut frame = coordinator
+        .audit_ingested_quantum(ingested, &scene.scene.producers, attached, &BirthFault)
+        .unwrap_or_else(|(_, reason)| panic!("original mixed-scope audit: {reason:?}"));
+    assert_eq!(
+        frame.audit_for_test().resource_refused_for_test(),
+        resource_refused,
+        "valid negative-only NO_END taints A without a resource-custody contradiction"
+    );
+    let failures = frame.original_failures_for_test().collect::<Vec<_>>();
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.gap)
+            .collect::<Vec<_>>(),
+        if pending {
+            vec![JournalGap::ImageTainted, JournalGap::H3Pending]
+        } else {
+            vec![JournalGap::ImageTainted]
+        }
+    );
+    assert!(failures[0].affects_proof_for_test(&a_proof));
+    assert!(failures[0].affects_proof_for_test(&c_proof));
+    assert!(!failures[0].affects_domain(b.bootstrap().domain()));
+    assert!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(c_proof)
+    );
+    assert_eq!(
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .bind_admitted_key(&c_input),
+        Ok(c_proof),
+        "the exact refused C image is still untainted and keeps its era"
+    );
+    let work =
+        failures[0].effects.effects.len() + coordinator.registry().joint_history_targets().count();
+    if scenario == MixedRefusalControl::Provenance {
+        frame.assert_pending_refusal_provenance_for_test(
+            coordinator.joint_capture_mut().adapter_mut(),
+            c_proof,
+            a_proof,
+            b.bootstrap().proof(),
+        );
+    }
+    if !pending {
+        let attached = scene.scene.attached.take().unwrap();
+        let mut rows = vec![(
+            b.bootstrap().domain(),
+            scene.native.rows.remove(&b.bootstrap().domain()).unwrap(),
+        )];
+        finish_reserved_birth_frame(
+            &mut scene.scene,
+            &attached,
+            scene.machine.retained_births_for_test(),
+            &mut rows,
+            frame,
+        );
+        let coordinator = &scene.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(b.id()),
+            Some(FeedMode::Joint)
+        );
+        for target in [b, c] {
+            assert_eq!(
+                coordinator
+                    .registry()
+                    .instance_semantic_edges()
+                    .find(|record| record.id == target.id())
+                    .unwrap()
+                    .api_returns,
+                Some(5)
+            );
+        }
+        assert_live_sign_associations(coordinator.registry(), &[b.id(), c.id()]);
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            [0, 0, 0, 0, 2],
+            "only the exact B/C live operations retain association custody"
+        );
+        scene.scene.assert_claims(&[]);
+        let before = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter(|record| [b.id(), c.id()].contains(&record.id))
+            .map(|record| {
+                (
+                    record.id,
+                    (
+                        record.semantics.as_ref().unwrap().completed(),
+                        record.api_returns.unwrap(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        scene.scene.push(child_b.id(), 0, "C_SignFinal", 6);
+        scene.scene.push(c_pid, 0, "C_SignFinal", 6);
+        let ingested = prepare_disposing_s1_batch(
+            &mut scene.scene,
+            2,
+            scene.machine.retained_drain_grant_for_test().unwrap(),
+        );
+        let terminal = acquire(&mut scene.scene, ingested, &attached, &BirthFault);
+        finish_reserved_birth_frame(
+            &mut scene.scene,
+            &attached,
+            scene.machine.retained_births_for_test(),
+            &mut rows,
+            terminal,
+        );
+        let coordinator = &scene.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
+        assert_eq!(
+            coordinator.registry().feed_mode_for_test(b.id()),
+            Some(FeedMode::Joint)
+        );
+        assert!(coordinator.registry().keyuse_for_test().open().is_empty());
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            [0; 5]
+        );
+        for record in coordinator.registry().instance_semantic_edges() {
+            if let Some((completed, physical)) = before.get(&record.id) {
+                assert_eq!(record.api_returns, Some(physical + 1));
+                assert_eq!(
+                    record.semantics.as_ref().unwrap().completed(),
+                    completed + 1
+                );
+                assert!(
+                    record
+                        .semantics
+                        .as_ref()
+                        .unwrap()
+                        .active_summary()
+                        .is_empty()
+                );
+            }
+        }
+        scene.scene.assert_claims(&[]);
+        return;
+    }
+    let mut ports = coordinator
+        .joint_frame_ports(&scene.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    for _ in 0..work {
+        if frame.negative_effects_complete_for_test(c.bootstrap().domain()) == Some(true) {
+            break;
+        }
+        let mut remaining = 1;
+        frame
+            .deliver_next_bounded(&mut ports, &mut remaining)
+            .unwrap();
+    }
+    assert_eq!(
+        frame.negative_effects_complete_for_test(c.bootstrap().domain()),
+        Some(true)
+    );
+    if resource_refused {
+        use crate::semantics_key_use::{SealFailureDisposition, disposition_of};
+        assert_eq!(
+            disposition_of(
+                frame
+                    .original_failures_for_test()
+                    .find(|failure| failure.gap == JournalGap::H3Pending)
+                    .unwrap()
+                    .gap
+            ),
+            SealFailureDisposition::Retry
+        );
+        assert!(
+            frame
+                .original_failures_for_test()
+                .all(|failure| failure.gap != JournalGap::ResourceUnavailable)
+        );
+        assert_eq!(
+            frame
+                .audited_failure_for_test(c.bootstrap().domain())
+                .unwrap()
+                .disposition(),
+            SealFailureDisposition::Fallback,
+            "the resource flag cannot manufacture an absent ResourceUnavailable original"
+        );
+        let before = (
+            ports.read().1.adapter().invocation_claims_for_test(),
+            ports.read().1.ledger().roles_for_test(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame.defer_pending_h3(&mut ports, &scene.scene.real.lane),
+                Ok(QuantumSealProgress::LocalPending)
+            );
+        }
+        let (_, refusal) = frame
+            .finish_pending_h3(&mut ports, &scene.scene.real.lane)
+            .err()
+            .expect("incomplete resource custody must remain local");
+        assert_eq!(refusal, RawQuantumRefusal::H3Undisposed);
+        assert_eq!(
+            (
+                ports.read().1.adapter().invocation_claims_for_test(),
+                ports.read().1.ledger().roles_for_test(),
+            ),
+            before
+        );
+        return;
+    }
+    assert_eq!(
+        frame.defer_pending_h3(&mut ports, &scene.scene.real.lane),
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the mixed union preserves exact-key negative delivery and original pending custody"
+    );
+    frame
+        .finish_pending_h3(&mut ports, &scene.scene.real.lane)
+        .unwrap_or_else(|(_, reason)| panic!("original mixed pending finish: {reason:?}"));
+}

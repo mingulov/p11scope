@@ -382,7 +382,11 @@ fn stale_reconciliation_refusal_preserves_newer_committed_facts() {
     let old_receipt = engine.scan_inventory_owner(&lease_a, &mut guard).unwrap();
     engine.budget.finish_scan(checkpoint_a).unwrap();
     engine.budget.finish_window(window_a).unwrap();
-    let _old_complete = receipt_is_complete(&old_receipt, "pre-load");
+    let old_complete = receipt_is_complete(&old_receipt, "pre-load");
+    assert!(
+        old_complete,
+        "pre-load receipt must be Complete; an AdditionsOnly receipt here requires test redesign"
+    );
     let old_prepared = engine
         .prepare_inventory_reconciliation(old_receipt, &mut guard)
         .unwrap();
@@ -409,6 +413,10 @@ fn stale_reconciliation_refusal_preserves_newer_committed_facts() {
     engine.budget.finish_scan(checkpoint_b).unwrap();
     engine.budget.finish_window(window_b).unwrap();
     let new_complete = receipt_is_complete(&new_receipt, "post-load");
+    assert!(
+        new_complete,
+        "post-load receipt must be Complete; an AdditionsOnly receipt here requires test redesign"
+    );
     let new_prepared = engine
         .prepare_inventory_reconciliation(new_receipt, &mut guard)
         .unwrap();
@@ -502,6 +510,10 @@ fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
     engine.budget.finish_scan(checkpoint_one).unwrap();
     engine.budget.finish_window(window_one).unwrap();
     let first_complete = receipt_is_complete(&first_receipt, "epoch-1");
+    assert!(
+        first_complete,
+        "epoch-1 receipt must be Complete; an AdditionsOnly receipt here requires test redesign"
+    );
     let first_prepared = engine
         .prepare_inventory_reconciliation(first_receipt, &mut guard)
         .unwrap();
@@ -550,6 +562,10 @@ fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
     engine.budget.finish_scan(checkpoint_two).unwrap();
     engine.budget.finish_window(window_two).unwrap();
     let second_complete = receipt_is_complete(&second_receipt, "epoch-2");
+    assert!(
+        second_complete,
+        "epoch-2 receipt must be Complete; an AdditionsOnly receipt here requires test redesign"
+    );
     let second_prepared = engine
         .prepare_inventory_reconciliation(second_receipt, &mut guard)
         .unwrap();

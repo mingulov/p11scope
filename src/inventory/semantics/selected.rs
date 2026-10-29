@@ -80,6 +80,27 @@ impl ProvisionalSelectedLane {
         self.lane.live.as_ref().map(|live| &live.session)
     }
 
+    /// The sealed conversion envelope this lane was converted with:
+    /// the prepared child's provider/endpoint coverage. The detail
+    /// gate binds its reservation against this envelope (plus the
+    /// sealed original and baseline below), never against
+    /// caller-supplied values.
+    pub(crate) fn convert_subset(&self) -> &AttestedSubset {
+        self.lane.subset()
+    }
+
+    /// The sealed original custody this lane was prepared with.
+    pub(crate) fn original(&self) -> &std::sync::Arc<crate::process::PidPin> {
+        self.permit.original()
+    }
+
+    /// The sealed pre-view baseline this lane was prepared with.
+    pub(crate) fn baseline(
+        &self,
+    ) -> &crate::attach::selected_detailed::baseline::PromotionImageBaseline {
+        self.permit.baseline()
+    }
+
     /// Poll joined disposal of a lane that must never install
     /// (cancelled, or CAS/mint/install refused). The first poll moves
     /// the live Session into a real failure owner; every poll runs

@@ -16,6 +16,13 @@ mod counter_reader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod counter_projection;
 
+// Selected-detail handoff→gate adapter (6.15 phase 2). Crate-visible
+// (unlike the private collector siblings) because the attach gate
+// shims and the future driver call into it; the banks-level seams
+// stay `pub(super)` so only metrics code handles raw reads.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod selected_detail;
+
 pub(crate) use counter_projection::{CaptureCollection, CaptureSnapshot, CounterCaptureInputs};
 
 #[cfg(test)]

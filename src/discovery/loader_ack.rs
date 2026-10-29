@@ -7,31 +7,55 @@
 //! allocation stays on [`LoaderRegistry`]'s 256-context refusal path until
 //! activation; no production caller exists yet.
 //!
-//! QueueKind to Engine mapping (OPEN-2; activation connects these sites):
+//! QueueKind to Engine mapping (OPEN-2; activation connects these sites).
+//! Charge/dispose below means queue entry/exit per loader incarnation: a
+//! record already charged that leaves its queue structure temporarily
+//! (take/drain) and returns without dispatch keeps its single charge —
+//! only fresh entries charge, only true exits dispose. Re-park and
+//! put-back sites are marked so activation never double-charges them.
 //! - `Collected`: `Engine::pending_discovery_records` (`engine.rs:391`);
-//!   charge at ring-pull append (`:20002`, `:22404`, Finish `:26466`),
-//!   dispose at dispatch drain (Finish `:26668-26673`).
-//! - `Pending`: `Engine::pending_loader_arm_scans` (`engine.rs:620`); charge
-//!   at owed-catch-up insert (`:17228-17231`), dispose at serve (`:14905`,
-//!   `:14920`, `:14923`, `:15522`) or retirement prune (`:18235`).
+//!   charge at fresh entry (Finish pull `:26466`, diverted-fresh rejoins
+//!   `:20153`, `:20229`), dispose at per-record dispatch drain (Finish
+//!   `:26668-26673`). Internal moves, never a new charge: re-parks
+//!   (`:20002`, parked extends `:20152`, `:20162`, `:20172`, `:20187`),
+//!   take/put-backs (`:26683`, `:26899` with `:26916`/`:26965`/`:26971`/
+//!   `:26989`, `:27098` with `:27168`) and the deferred re-queue
+//!   (`:22404`).
+//! - `Pending`: `Engine::pending_loader_arm_scans` (`engine.rs:620`, a
+//!   `BTreeSet`); charge only on new-key insert (`:17228-17231`),
+//!   dispose at serve (`:14905`, `:14920`, `:14923`, `:15522`),
+//!   retirement prune (`:18235`) or bulk dispose (capture-end clear
+//!   `:10458`, `release_view_id` retain `:10972`, shutdown clear `:17762`).
 //! - `Deferred`: `TerminalDispatch::deferred_mismatches` (`engine.rs:4686`);
-//!   charge at deferral (`:15475`), dispose at
-//!   `settle_deferred_loader_mismatches` (`:20230`, `:19475`).
-//! - `TerminalBatch`: `Engine::terminal_batch` (`engine.rs:389`); charge at
-//!   `retain_terminal_batch` (`:17822`), `TerminalBatch::extend` (`:4703`)
-//!   and `handoff_precharged_terminal_records` (`:17792`), dispose at
-//!   `dispatch_terminal_batch` (`:18031`) or `take_terminal_batch_for_deferred`
-//!   (`:17945`).
-//! - `SelectionHandoff`: `TerminalSelectionHandoffs` (`engine.rs:2601`);
-//!   charge per-context handoff vecs (`:20012`, `:25976`), dispose at the move
-//!   into the batch (`:18302`) or `reject_terminal_selection_handoffs`
-//!   (`:18299`, `:18354`).
-//! - scans: `Engine::pending_loader_scans` (`engine.rs:617`); charge at
-//!   `defer_loader_memory_scan` (`:11882`, `:15524`), settle at `:11911`,
-//!   `:11928`, `:11945`, `:15317` and `:15557`.
+//!   charge at deferral (`:15475`), dispose at the ordinary settle
+//!   (`:20230` into `:19475`) or the terminal-path settle (`:18122-18123`).
+//! - `TerminalBatch`: `Engine::terminal_batch` (`engine.rs:389`); charge
+//!   at `retain_terminal_batch` (`:17822`, extends at `:17833`),
+//!   `TerminalBatch::extend` (`:4703`) and
+//!   `handoff_precharged_terminal_records` (`:17792`, extends at `:17807`);
+//!   dispose per record at `dispatch_terminal_batch` (`:18031`, removed
+//!   per credit `:18084-18087`, restored if incomplete `:18129-18131`).
+//!   Deferred transfer (`take_terminal_batch_for_deferred`, `:17945`,
+//!   via `:18169`/`:18322`) is not a dispose: the charge stays on the
+//!   token while the deferred item holds the batch, and disposition
+//!   happens only at terminal dispatch after
+//!   `reconcile_terminal_authority` (`:17951`) returns it.
+//! - `SelectionHandoff`: `TerminalSelectionHandoffs` (`engine.rs:2601`),
+//!   created empty per pass (`:20012`) and per graph-consume step
+//!   (`:25976`, always empty there — "no record dispatch fills them",
+//!   `:25961-25965`); charge per record at the dispatch push
+//!   (`:19828-19831`), dispose at the move into the batch (`:18302`,
+//!   after remove plus owner check `:18283-18292`), per-pass rejects
+//!   (`:18299`, `:18354`) or the reject-all dispose (`:20474-20478`).
+//! - scans: `Engine::pending_loader_scans` (`engine.rs:617`); charge only
+//!   on new-key insert (`:11893`; a dedup hit lowers the timestamp at
+//!   `:11883-11885` and a capacity drop at `:11887-11892` charges
+//!   nothing), settle at `:11911`, `:11928`, `:11945`, `:15317` and
+//!   `:15557` (`defer_loader_memory_scan` `:11882`, RT_ADD call `:15524`).
 //! - descriptors: per-context dynamic export cookies (`attach_dynamic_export`,
-//!   `:16818`); charge at attach success, release at `detach_dynamic_context`
-//!   (`:17555`, `:18250`), settle at terminal dispatch completion.
+//!   `:16818`, success arm `:16835`); charge at attach success, release at
+//!   `detach_dynamic_context` (`:17555`, `:18250`), settle at terminal
+//!   dispatch completion (`loader_registry.remove(owner)`, `:18133`).
 //! - link cleanup: the `EngineSession::detach_dynamic_context` verdict
 //!   (`:17555`, `:18250`): `record_link_cleanup(!detach_failed)`.
 //! - native retirement: T-L2 `insert_state`/`remove_state`; a failed removal
@@ -112,7 +136,9 @@ impl LoaderAckDriver {
         registry.id_for_token(token)
     }
 
-    /// Collected: one loader record entered `pending_discovery_records`.
+    /// Collected: one loader record entered `pending_discovery_records`
+    /// fresh. Re-parks and take/put-backs keep the existing charge and
+    /// never call this again.
     pub(crate) fn note_collected_record(
         &mut self,
         token: LoaderToken,
@@ -130,13 +156,15 @@ impl LoaderAckDriver {
             .dispose_record(self.domain, token, QueueKind::Collected)
     }
 
-    /// Pending: one catch-up scan owed (`pending_loader_arm_scans` insert).
+    /// Pending: one catch-up scan owed. Charge only on new-key insert:
+    /// activation calls this only when the `BTreeSet` insert reports a
+    /// new key, never for a duplicate.
     pub(crate) fn note_arm_scan_owed(&mut self, token: LoaderToken) -> Result<(), LifetimeError> {
         self.registry
             .collect_record(self.domain, token, QueueKind::Pending)
     }
 
-    /// Pending: one owed catch-up scan served or pruned.
+    /// Pending: one owed catch-up scan served, pruned or bulk-disposed.
     pub(crate) fn note_arm_scan_served(&mut self, token: LoaderToken) -> Result<(), LifetimeError> {
         self.registry
             .dispose_record(self.domain, token, QueueKind::Pending)
@@ -151,7 +179,8 @@ impl LoaderAckDriver {
             .collect_record(self.domain, token, QueueKind::Deferred)
     }
 
-    /// Deferred: one deferred mismatch settled.
+    /// Deferred: one deferred mismatch settled, on the ordinary or the
+    /// terminal path.
     pub(crate) fn note_mismatch_settled(
         &mut self,
         token: LoaderToken,
@@ -169,7 +198,9 @@ impl LoaderAckDriver {
             .collect_record(self.domain, token, QueueKind::TerminalBatch)
     }
 
-    /// TerminalBatch: one terminal record dispatched or transferred.
+    /// TerminalBatch: one terminal record dispatched. Deferred transfer
+    /// into a `DeferredDiscoveryItem` is not a dispose: the charge stays
+    /// on the token while the deferred item holds the batch.
     pub(crate) fn note_terminal_record_dispatched(
         &mut self,
         token: LoaderToken,
@@ -178,7 +209,8 @@ impl LoaderAckDriver {
             .dispose_record(self.domain, token, QueueKind::TerminalBatch)
     }
 
-    /// SelectionHandoff: one precharged selection record staged.
+    /// SelectionHandoff: one selection record pushed onto the per-pass
+    /// handoff map at dispatch.
     pub(crate) fn note_handoff_staged(&mut self, token: LoaderToken) -> Result<(), LifetimeError> {
         self.registry
             .collect_record(self.domain, token, QueueKind::SelectionHandoff)
@@ -190,8 +222,9 @@ impl LoaderAckDriver {
             .dispose_record(self.domain, token, QueueKind::SelectionHandoff)
     }
 
-    /// SelectionHandoff: one staged record rejected (wrong owner or failed
-    /// authority). A disposed rejection, like the move.
+    /// SelectionHandoff: one staged record rejected (wrong owner, failed
+    /// authority, or the end-of-pass reject-all). A disposed rejection,
+    /// like the move.
     pub(crate) fn note_handoff_rejected(
         &mut self,
         token: LoaderToken,
@@ -200,7 +233,9 @@ impl LoaderAckDriver {
             .dispose_record(self.domain, token, QueueKind::SelectionHandoff)
     }
 
-    /// Scans: one loader memory scan deferred (`pending_loader_scans`).
+    /// Scans: one loader memory scan deferred. Charge only on new-key
+    /// insert: activation calls this only on the `:11893` insert path,
+    /// never for a dedup hit or a capacity drop.
     pub(crate) fn note_scan_deferred(&mut self, token: LoaderToken) -> Result<(), LifetimeError> {
         self.registry.register_scan(self.domain, token)
     }
@@ -229,7 +264,7 @@ impl LoaderAckDriver {
         self.registry.release_export(self.domain, token, cookie)
     }
 
-    /// Descriptors: one export settled after its deferred dispatch.
+    /// Descriptors: one export settled at terminal dispatch completion.
     pub(crate) fn note_export_settled(
         &mut self,
         token: LoaderToken,

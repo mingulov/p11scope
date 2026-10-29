@@ -5,7 +5,7 @@ use super::input::*;
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::MetadataExt};
 
-const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/inventory-diff/scan-current.json");
+const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/inventory-diff/scan-current.json");
 
 fn fixture() -> Value {
     serde_json::from_slice(FIXTURE).unwrap()

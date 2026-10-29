@@ -5658,7 +5658,7 @@ fn cnt1_dead_pin_tick_keeps_capture_loss_cancellation() {
 }
 
 /// The production pass order for one steady `--pid` caller
-/// (`inventory_capture.rs`, `run_classic_finalizing`): read the pass
+/// (`inventory/capture.rs`, `run_classic_finalizing`): read the pass
 /// clock, collect (the deep scan, while collection ticks drain and hold
 /// lifecycle quanta), apply the catalog, stage the held quanta, one
 /// service quantum and the witness read, commit, then service ticks

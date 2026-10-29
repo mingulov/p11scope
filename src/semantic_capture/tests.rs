@@ -5361,7 +5361,7 @@ mod custody_chain_tests {
         scene.answer(pid, detailed, 7);
         scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
         // The production refresh pin: one duplication off the live pin,
-        // given to H0's refresh (inventory.rs `bind_semantic_callers`).
+        // given to H0's refresh (inventory/mod.rs `bind_semantic_callers`).
         let pin: Arc<PidPin> = Arc::new(
             scene
                 .coordinator

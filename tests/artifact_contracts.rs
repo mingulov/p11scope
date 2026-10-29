@@ -13815,9 +13815,9 @@ const LICENSE_C_FIXTURES: &[&str] = &[
 const LICENSE_RUST_INCLUDE_FILES: &[(&str, &str, &str)] = &[
     // (exempt file, include-site file, exact `include!` snippet).
     (
-        "src/inventory_joint_cells_tests.rs",
-        "src/inventory.rs",
-        "include!(\"inventory_joint_cells_tests.rs\")",
+        "src/inventory/joint_cells_tests.rs",
+        "src/inventory/mod.rs",
+        "include!(\"joint_cells_tests.rs\")",
     ),
 ];
 
@@ -14393,7 +14393,7 @@ fn license_rust_include_exemption_is_exact_path() {
         "an unlisted Rust file must still require the `//!` header"
     );
     let pinned = license_header_error(
-        "src/inventory_joint_cells_tests.rs",
+        "src/inventory/joint_cells_tests.rs",
         b"// SPDX-License-Identifier: GPL-3.0-or-later\nfn f() {}\n",
     );
     assert!(

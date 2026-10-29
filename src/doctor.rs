@@ -3410,7 +3410,7 @@ mod tests {
         // DR-RETRO-PIDNS-2: a /proc with no entry for this observer fails
         // the row for every scope, saying every capture except inventory
         // --system is refused (inventory --system warns and carries the
-        // pid namespace gap instead: inventory.rs lets that scope
+        // pid namespace gap instead: inventory/mod.rs lets that scope
         // through, run.rs refuses every classic scope by name).
         let unserved = PidNumbering {
             observer: ObserverPidNs::Unknown("gone".into()),

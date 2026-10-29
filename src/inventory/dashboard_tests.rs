@@ -1427,7 +1427,7 @@ fn pty_a_panic_message_survives_the_dashboard() {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _display = display_over(&pty, &stderr, StderrRoute::Capture);
         // What the panic hook writes to the process's stderr.
-        stderr.write("thread 'main' panicked at src/inventory.rs:1:1:");
+        stderr.write("thread 'main' panicked at src/inventory/mod.rs:1:1:");
         stderr.write("an injected invariant failure");
         panic!("an injected invariant failure");
     }));
@@ -1435,7 +1435,7 @@ fn pty_a_panic_message_survives_the_dashboard() {
     let text = stderr.text();
     assert!(
         text.contains(
-            "thread 'main' panicked at src/inventory.rs:1:1:\nan injected invariant failure\n"
+            "thread 'main' panicked at src/inventory/mod.rs:1:1:\nan injected invariant failure\n"
         ),
         "{text}"
     );
@@ -4047,8 +4047,8 @@ fn pty_promotion_restore_untaken_ends_synchronously() {
 fn pty_promotion_restore_requests_stop_then_genuine_end() {
     // Driver-order contract: the real Inventory driver calls
     // `display.restore()` from its `Publish::Retiring` callback
-    // (`src/inventory.rs:2930`) BEFORE the native lane stops
-    // (`src/inventory_capture.rs:1714`). Restore therefore requests
+    // (`src/inventory/mod.rs:2930`) BEFORE the native lane stops
+    // (`src/inventory/capture.rs:1714`). Restore therefore requests
     // stop and latches shutdown; only the lane's own disposal ends
     // transferred work. A core-only test that blesses restore as
     // completion would certify the wrong hook.

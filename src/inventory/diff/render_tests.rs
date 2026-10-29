@@ -6,7 +6,7 @@ use crate::cli::InventoryDiffArgs;
 use serde_json::{Value, json};
 use std::io::{self, Write};
 
-const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/inventory-diff/scan-current.json");
+const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/inventory-diff/scan-current.json");
 
 fn document() -> Value {
     serde_json::from_slice(FIXTURE).unwrap()

@@ -1592,9 +1592,9 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
 }
 
 #[cfg(test)]
-#[path = "inventory_present_tests.rs"]
+#[path = "present_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "inventory_present_key_ops_tests.rs"]
+#[path = "present_key_ops_tests.rs"]
 mod inventory_present_key_ops_tests;

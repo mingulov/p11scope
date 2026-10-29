@@ -2432,7 +2432,7 @@ pub(crate) fn ended_payload(
 }
 
 #[cfg(test)]
-#[path = "inventory_events_tests.rs"]
+#[path = "events_tests.rs"]
 mod tests;
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ fn app_path<'a>(r: &'a model::DiffReport, a: &model::ApplicationChange) -> &'a s
     &r.comparison.application_paths[a.key.exe_path_ref.0]
 }
 
-const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/inventory-diff/scan-current.json");
+const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/inventory-diff/scan-current.json");
 fn document() -> Value {
     serde_json::from_slice(FIXTURE).unwrap()
 }

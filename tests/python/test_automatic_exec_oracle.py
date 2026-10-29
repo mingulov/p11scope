@@ -5988,7 +5988,7 @@ class R5FreshAdmissionTest(unittest.TestCase):
 
     def record(self, seq, kind, event):
         # Serialized shapes from started_payload/pass_payload and emit_commit
-        # (inventory_events.rs / inventory.rs), including the additive fields.
+        # (inventory/events.rs / inventory/mod.rs), including the additive fields.
         if kind == "started":
             event = {"scope": "cgroup:/controlled/selected",
                      "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},

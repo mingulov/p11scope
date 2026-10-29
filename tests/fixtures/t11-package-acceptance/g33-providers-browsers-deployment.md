@@ -44,7 +44,7 @@ P11SCOPE_BIN=/abs/path/to/candidate/p11scope sh scripts/matrix/verify-kind-pod.s
    check exists anywhere in the product checkout at base: no script,
    doc, or qualification fixture (the only tree-wide "firefox" hits are
    incidental unit-test path strings in `src/discovery/noise.rs` and
-   `src/inventory_present_tests.rs`; "chromium"/"chrome" have zero hits).
+   `src/inventory/present_tests.rs`; "chromium"/"chrome" have zero hits).
    G33 requires own fresh Firefox/NSS and Google Chrome profiles
    for the promised application checks: do not substitute Chromium for
    Chrome, do not infer PKCS#11 use from successful TLS, preserve strict

@@ -17258,7 +17258,7 @@ exit 0
             edge_of(&native).2
         );
         // Stop begins (production order: the coverage ends before the
-        // post-stop terminal refresh, inventory_capture.rs).
+        // post-stop terminal refresh, inventory/capture.rs).
         let live_last_seen = edge_of(&native)
             .1
             .expect("the positive read left a last-seen");

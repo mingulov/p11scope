@@ -289,6 +289,8 @@ class CanonicalBtfTests(unittest.TestCase):
                     ".BTF.ext": self.btf_ext([])}
         flipped = {".text": b"code", ".BTF": self.btf(b"BBBBAAAA", [b"a"]),
                    ".BTF.ext": self.btf_ext([])}
+        self.root = self.root / "baseline-ancestor"
+        self.root.mkdir()
         left, right = self.pair(sections, flipped)
         def dump(path, name):
             if path == left[name]:

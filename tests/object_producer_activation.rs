@@ -2710,6 +2710,10 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// threading through the entry/return roots, outlined capture with an
 /// explicit completion token, and the reason-aware removal wrapper:
 /// 131833 B, sha256 below, measured with the unchanged executable lexer.
+/// Re-baselined for the combined tree: the EXEC generation-witness
+/// cookie (binding_id stamping plus the extern helper declaration) is
+/// the only main.rs delta atop the journal-roots baseline: 132203 B,
+/// sha256 below, measured with the unchanged executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2719,8 +2723,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            131833,
-            "42124c3adc2bffdeac95b541d1870f9f3575292faa5fc071f4381392d18cb487"
+            132203,
+            "d5c7b12be570ae1bf0ac6ec401b800d4529cd7f6f078c8d47cbd157a8689f68b"
         ),
         "stripped BPF dump must stay byte-identical"
     );

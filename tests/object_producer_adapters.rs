@@ -145,7 +145,7 @@ fn object_producer_adapters_entry_fill_shape() {
     // Entry: ABI record, then fill, then abandon on refusal.
     let entry = source_between(
         &source,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(\n    ctx: ProbeContext,\n    completed: *mut CompletedEntry,\n) -> u32 {",
         "fn rv_count_add(key: &RvKey) -> bool {",
     );
     let abi = entry
@@ -155,16 +155,19 @@ fn object_producer_adapters_entry_fill_shape() {
         .find("object_fill_entry(")
         .expect("entry must fill the side row after the ABI record");
     assert!(abi < fill, "entry fill must run after the ABI record");
-    // Refusal abandons through the ordinary removal plus the fault leaf.
+    // Refusal abandons through the journal-aware removal plus the fault leaf.
     let abandon = entry[fill..]
-        .find("owned_start_remove(&key, true)")
-        .expect("entry fill refusal must abandon through the ordinary removal");
+        .find("start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED)")
+        .expect("entry fill refusal must abandon through the journal-aware removal");
     let fault = entry[fill..]
         .find("p11_object_fault()")
         .expect("entry fill refusal must fault");
     // Both abandon sites (ABI record + fill) retire through the same removal.
     assert!(
-        entry.matches("owned_start_remove(&key, true)").count() >= 2,
+        entry
+            .matches("start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED)")
+            .count()
+            >= 2,
         "entry keeps ABI-record and fill abandon arms"
     );
     let _ = (abandon, fault);
@@ -185,7 +188,7 @@ fn object_producer_adapters_return_fill_shape() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // Return (slice D): ready/agreement queries, then the complete
@@ -198,7 +201,7 @@ fn object_producer_adapters_return_fill_shape() {
         .find("p11_object_side_get(&key, descriptor, 1)")
         .expect("return fill must query ready with required=1");
     let reserve = returned
-        .find("reserve::<ObjectEventRecord>")
+        .find("reserve::<Record>")
         .expect("emission must reserve the complete object record");
     let fill = returned
         .find("object_fill_return(")
@@ -210,7 +213,7 @@ fn object_producer_adapters_return_fill_shape() {
         .find("object_emit_find(")
         .expect("return must emit the Find section after the tail");
     let drain = returned
-        .rfind("owned_start_remove(&key, true)")
+        .rfind("start_remove_for::<JOURNAL>(&key, true, reason)")
         .expect("emission arm retires");
     assert!(
         ready < reserve && reserve < fill && fill < tail && tail < find && find < drain,
@@ -1066,11 +1069,20 @@ fn pin_root_refusals_retire() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // Ready/agreement refusal arms retire ownership before returning.
-    for arm in ["if ready.is_none() {", "if !agreed {"] {
+    for (arm, removal) in [
+        (
+            "if ready.is_none() {",
+            "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)",
+        ),
+        (
+            "if !agreed {",
+            "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED)",
+        ),
+    ] {
         let at = returned
             .find(arm)
             .unwrap_or_else(|| panic!("return must keep its {arm} refusal arm"));
@@ -1078,10 +1090,7 @@ fn pin_root_refusals_retire() {
             .find("\n    }\n")
             .expect("refusal arm closes");
         let body = &returned[at..at + end];
-        assert!(
-            body.contains("owned_start_remove(&key, true)"),
-            "{arm} must retire ownership"
-        );
+        assert!(body.contains(removal), "{arm} must retire ownership");
         assert!(
             body.contains("p11_object_fault()"),
             "{arm} must fault visibly"
@@ -1089,7 +1098,9 @@ fn pin_root_refusals_retire() {
     }
     // The object branch alone owns late retirement; ordinary returns
     // already retired before accounting and cannot delete twice.
-    let object = &returned[returned.find("fn object_return(").expect("object branch")..];
+    let object = &returned[returned
+        .find("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .expect("object branch")..];
     let image_at = object
         .find("image_pair_matches(unsafe { (*start).image }, image)")
         .expect("object return must retain its live START image refusal");
@@ -1097,13 +1108,20 @@ fn pin_root_refusals_retire() {
         .find("EVIDENCE_SEMANTIC_CAPTURE_FAILURES")
         .expect("image arm books its loss");
     let image_body = &object[image_at..image_at + image_end];
-    for marker in ["owned_start_remove(&key, true)", "p11_object_fault()"] {
+    for marker in [
+        "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED)",
+        "p11_object_fault()",
+    ] {
         assert!(
             image_body.contains(marker),
             "object image refusal must {marker}"
         );
     }
-    let ordinary = source_between(returned, "fn ordinary_return(", "fn object_return(");
+    let ordinary = source_between(
+        returned,
+        "fn ordinary_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
     assert_eq!(
         ordinary.matches("owned_start_remove(&key, true)").count(),
         1,
@@ -1131,7 +1149,7 @@ fn pin_root_refusals_retire() {
         .expect("delegated call terminates");
     let stmt = &returned[finalize..finalize + stmt_end];
     assert!(
-        stmt.contains("owned_start_remove(&key, true)"),
+        stmt.contains("start_remove_for::<JOURNAL>(&key, true, reason)"),
         "the delegated decision must carry the checked removal"
     );
     let gate = returned

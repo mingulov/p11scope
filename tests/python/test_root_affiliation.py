@@ -11,7 +11,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    start = source.index("fn " + name + "(")
+    needle = "fn " + name
+    pos = 0
+    while True:
+        start = source.index(needle, pos)
+        if start + len(needle) < len(source) and source[start + len(needle)] in "(<":
+            break
+        pos = start + 1
     start = source.index("{", start)
     depth = 1
     end = start + 1
@@ -95,22 +101,28 @@ def hook_contract(main, identity):
         if "p11_root_current_exit" in function(main, site):
             raise AssertionError("return must retain affiliation")
     impl = function(main, "p11_return_impl")
-    for branch in ("ordinary_return", "object_return"):
-        if impl.count(branch + "(") != 1:
-            raise AssertionError(f"return must dispatch once to {branch}")
+    ordinary = "ordinary_return(ctx, &key, start, flags, layout)"
+    if impl.count(ordinary) != 2 or impl.count("journal_roots::program::" + ordinary) != 1:
+        raise AssertionError("return must dispatch once per arm to ordinary_return")
+    if impl.count("object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)") != 1:
+        raise AssertionError("return must dispatch once to object_return")
+    if impl.count("object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(") != 1:
+        raise AssertionError("return must dispatch once to the journal object_return")
     if ("image_pair_matches" in impl or "p11_root_current_tag" in impl
             or "capture_return_facts" in impl):
         raise AssertionError("return dispatch must not inline the image guard or CALL tag")
     facts = function(main, "capture_return_facts")
     if facts.count("p11_root_current_tag") != 1:
         raise AssertionError("CALL tag must live exactly once in capture_return_facts")
+    facts_calls = {"ordinary_return": "capture_return_facts::<false>(ctx, &start, flags, layout, accounting)",
+                   "object_return": "capture_return_facts::<JOURNAL>(ctx, &*start, flags, layout, accounting)"}
     for branch in ("ordinary_return", "object_return"):
         body = function(main, branch)
         if body.count("image_pair_matches") != 1:
             raise AssertionError(f"{branch} must carry exactly one image guard")
-        if body.count("capture_return_facts(") != 1:
+        if body.count(facts_calls[branch]) != 1:
             raise AssertionError(f"{branch} must capture CALL facts exactly once")
-        if body.index("image_pair_matches") > body.index("capture_return_facts("):
+        if body.index("image_pair_matches") > body.index(facts_calls[branch]):
             raise AssertionError("CALL tag must follow image guard")
     fork = function(main, "p11_link_emit_fork")
     if "root_affiliation: unsafe { p11_root_current_tag() }" not in fork:
@@ -213,17 +225,17 @@ class RootAffiliationTests(unittest.TestCase):
                  "        }\n"
                  "        return 0;\n"
                  "    }\n")
-        facts_line = ("    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);\n")
+        facts_line = ("    let facts = capture_return_facts::<false>(ctx, &start, flags, layout, accounting);\n")
         swapped = ordinary.replace(guard + facts_line, facts_line + guard, 1)
         self.assertNotEqual(swapped, ordinary, "guard/facts swap must apply")
         mutants += [
             main.replace("        ordinary_return(ctx, &key, start, flags, layout)\n",
-                         "        object_return(ctx, &key, start, flags, layout)\n", 1),
-            main.replace("        object_return(ctx, &key, start, flags, layout)\n",
+                         "        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n", 1),
+            main.replace("        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n",
                          "        ordinary_return(ctx, &key, start, flags, layout)\n", 1),
             main.replace(ordinary, swapped, 1),
             main.replace("        || !image_pair_matches(start.image, image)\n", "", 1),
-            main.replace("        || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),
+            main.replace("            || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),
             main.replace("        root_affiliation: unsafe { p11_root_current_tag() },\n", "", 1),
         ]
         for mutant in mutants:

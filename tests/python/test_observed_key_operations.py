@@ -10,7 +10,9 @@ tests/fixtures/key-operations/observed/ stand in for the installed
 Joint driver lands: only clean.json is accepted, and each twin must be
 refused naming its targeted condition. Fixture `encoded_bytes` is
 illustrative, never asserted. No fixture, input, output or diagnostic here
-carries PIN, key, payload, handle or arbitrary bytes.
+carries PIN, key, payload, handle or arbitrary bytes. The keyed-*.json
+fixtures (6.08 phase 1) pin the RSA-cell boundary: extended keyed
+populations stay refused until the 6.06/6.07 linked contract lands.
 
 S1 twins preserve historical observed-parent comparisons and the current
 physical 68/instance 65 topology, including the actual stopped-child disclosure.
@@ -116,6 +118,26 @@ class ObservedRsaTests(unittest.TestCase):
 
     def test_loss_twin_is_refused(self):
         self.assert_refused(APP_TESTS.application_rows(), observed("loss.json"), "loss")
+
+    def test_keyed_create_twin_is_refused(self):
+        self.assert_refused(APP_TESTS.application_rows(), observed("keyed-create.json"),
+                            "unexpected observed category generate_key_pair")
+
+    def test_keyed_message_twin_is_refused(self):
+        self.assert_refused(APP_TESTS.application_rows(), observed("keyed-message.json"),
+                            "unexpected observed category message_sign")
+
+    def test_keyed_kem_twin_is_refused(self):
+        self.assert_refused(APP_TESTS.application_rows(), observed("keyed-kem.json"),
+                            "unexpected observed category encapsulate")
+
+    def test_keyed_wrap_twin_is_refused(self):
+        self.assert_refused(APP_TESTS.application_rows(), observed("keyed-wrap.json"),
+                            "unexpected observed category wrap")
+
+    def test_keyed_async_twin_is_refused(self):
+        self.assert_refused(APP_TESTS.application_rows(), observed("keyed-async.json"),
+                            "observed sign has unsettled outcomes")
 
     def test_inventory_document_dispatch(self):
         rows = APP_TESTS.application_rows()

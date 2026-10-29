@@ -906,6 +906,7 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         return (
             {"p11_entry"}
             | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
             | checker.REQUIRED_GLOBAL_EXEC_HELPERS
             | checker.SELECTED_GLOBAL_HELPERS
         ) - set(missing)

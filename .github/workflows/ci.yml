@@ -502,10 +502,10 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin the root-reviewed checkpoint where native journal P1/GAP remains
-      # inactive in ordinary Detailed. Instructions, maps, data, effective BTF
-      # and CO-RE are unchanged; source and debug metadata changed. Compare
-      # complete objects, including metadata, from this baseline forward.
+      # Pin the reviewed v0.6.0 combined tree: journal roots plus the
+      # EXEC generation-witness cookie are the BPF input changes since
+      # the previous baseline. Compare complete objects, including
+      # metadata, from this baseline forward.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
@@ -513,7 +513,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=2bd623133214f5a2598b1ac2ed8165bc5563a1e7
+          BASELINE=b172bef608021943a317532771d051a632668124
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

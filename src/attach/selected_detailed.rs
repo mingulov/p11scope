@@ -1156,6 +1156,7 @@ fn start_selected_attempt(
             Some(original),
             // Promotion stays Detailed; child counter specs arrive later.
             None,
+            None,
         )
     })()
     .map_err(SelectedPreparationFailure::before_links)?;

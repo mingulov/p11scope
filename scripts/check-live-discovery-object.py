@@ -905,10 +905,28 @@ def map_call_sites(lines, map_name, helper=None):
 
 def internal_call_targets(disassembly):
     blocks = function_blocks(disassembly)
-    by_pc = {
-        instruction_entries(lines)[0][1]: name
-        for name, lines in blocks.items() if instruction_entries(lines)
-    }
+    section = None
+    sections = {}
+    for line in disassembly.splitlines():
+        if match := re.fullmatch(r"Disassembly of section (.+):", line):
+            section = match.group(1)
+        elif match := re.fullmatch(r"\s*[0-9a-f]+ <([^>]+)>:\s*", line):
+            name = match.group(1)
+            if name in sections:
+                fail(f"duplicate disassembled function {name}")
+            sections[name] = section
+    starts = {name: instruction_entries(lines)[0][1]
+              for name, lines in blocks.items() if instruction_entries(lines)}
+    by_pc = {}
+    for name, pc in starts.items():
+        by_pc.setdefault((sections[name], pc), []).append(name)
+    sectionless = all(section is None for section in sections.values())
+    known_sections = set(sections.values()) - {None}
+
+    def unique(section, pc):
+        candidates = by_pc.get((section, pc), [])
+        return candidates[0] if len(candidates) == 1 else None
+
     calls = []
     for function, lines in blocks.items():
         for line_index, pc, text in instruction_entries(lines):
@@ -921,16 +939,19 @@ def internal_call_targets(disassembly):
             relocation = next((target for index, kind, target in relocation_targets(lines)
                                if index == line_index + 1 and kind == "32"), None)
             value = int(match.group("value"), 16) * (-1 if match.group("sign") else 1)
-            if relocation == ".text":
-                target = by_pc.get(value + 1)
+            if relocation in known_sections or relocation == ".text":
+                target = unique(None if sectionless else relocation, value + 1)
+            elif relocation in starts:
+                target = unique(sections[relocation], starts[relocation] + value + 1)
             elif relocation:
-                target = relocation if relocation in blocks else None
-            elif re.match(r"85 10 ", text) or match.group("sign"):
-                target = by_pc.get(pc + 1 + value)
-            else:
                 target = None
-            if target:
-                calls.append((function, line_index, pc, target))
+            elif re.match(r"85 10 ", text) or match.group("sign"):
+                target = unique(sections[function], pc + 1 + value)
+            else:
+                continue  # Unencoded, nonrelocated positive calls are helpers.
+            # Keep unresolved internal edges visible to each bounded consumer;
+            # another section or an ambiguous synthetic alias grants no target.
+            calls.append((function, line_index, pc, target))
     return calls
 
 
@@ -2694,6 +2715,66 @@ def _finite_counter_key_self_test():
             raise AssertionError(f"counter key mutation accepted: {label}")
 
 
+def _internal_call_resolution_self_test():
+    collision = """Disassembly of section .text:
+0000000000000000 <scope_auth>:
+0: exit
+0000000000000010 <native_helper>:
+2: exit
+0000000000000050 <local_caller>:
+10: 85 10 00 00 f5 ff ff ff call -0xb
+11: 85 00 00 00 01 00 00 00 call 0x1
+12: exit
+Disassembly of section uprobe:
+00000000000000a0 <root>:
+20: 85 10 00 00 ff ff ff ff call -0x1
+                 00000000000000a0: R_BPF_64_32 .text
+21: 85 10 00 00 ff ff ff ff call -0x1
+                 00000000000000a8: R_BPF_64_32 native_helper
+22: exit
+Disassembly of section fentry/foreign:
+0000000000000000 <foreign_program>:
+0: exit
+0000000000000010 <foreign_helper>:
+2: exit
+"""
+    wanted = [("local_caller", 10, "scope_auth"),
+              ("root", 20, "scope_auth"), ("root", 21, "native_helper")]
+
+    def targets(disassembly):
+        return [(caller, pc, target) for caller, _, pc, target in internal_call_targets(disassembly)]
+
+    if targets(collision) != wanted:
+        raise AssertionError("colliding program PCs replaced a .text call target")
+    no_text_target = collision.replace("<scope_auth>:\n0: exit", "<scope_auth>:\n1: exit")
+    if ("root", 20, None) not in targets(no_text_target):
+        raise AssertionError("foreign section supplied a missing .text target")
+    offset = collision.replace("21: 85 10 00 00 ff ff ff ff call -0x1",
+                               "21: 85 10 00 00 00 00 00 00 call 0x0")
+    if ("root", 21, None) not in targets(offset):
+        raise AssertionError("named relocation ignored its call addend")
+    alias = collision.replace("0000000000000010 <native_helper>:",
+                              "0000000000000000 <scope_alias>:\n0: exit\n0000000000000010 <native_helper>:")
+    if ("root", 20, None) not in targets(alias):
+        raise AssertionError("ambiguous .text alias supplied a call target")
+    sectionless = """0000000000000000 <one>:
+0: exit
+0000000000000050 <caller>:
+10: call -0x1
+                 0000000000000050: R_BPF_64_32 .text
+11: exit
+"""
+    if targets(sectionless) != [("caller", 10, "one")]:
+        raise AssertionError("unambiguous sectionless fixture was refused")
+    relative = sectionless.replace("call -0x1", "call -0xb").replace(
+        "                 0000000000000050: R_BPF_64_32 .text\n", "")
+    if targets(relative) != [("caller", 10, "one")]:
+        raise AssertionError("sectionless relative call used a relocation addend")
+    ambiguous = sectionless + "\n0000000000000000 <two>:\n0: exit\n"
+    if targets(ambiguous) != [("caller", 10, None)]:
+        raise AssertionError("ambiguous sectionless fixture was resolved")
+
+
 def self_test():
     good = _source()
     source_contract(good)
@@ -2816,6 +2897,7 @@ interface_continuation_pack(count, 0, symbol_id)
         raise AssertionError("valid reservation-loss disassembly fixture was rejected")
     _initializer_polarity_self_test()
     _finite_counter_key_self_test()
+    _internal_call_resolution_self_test()
     initializer_mutations = [
         (
             "initializer success branch retarget",

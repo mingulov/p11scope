@@ -9864,7 +9864,33 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
 /// does (`receipt-fcntl-experiment.py`, positional `self-test`) is covered inside
 /// the ordinary `cargo test` gate by `tests/receipt_build_subjects.rs`. `scripts/gates.sh` is the local entry point
 /// that only invokes the others; `lib.sh`, `cleanup-traps.sh` and `fixtures/`
-/// are not validators.
+/// are not validators. `scripts/run-python-suites.py` is the suite driver whose
+/// RUN registry names other suites' flags as data, not its own argv parsing.
+fn is_self_test_capable(path: &str) -> bool {
+    if [
+        "scripts/gates.sh",
+        "scripts/lib.sh",
+        "scripts/cleanup-traps.sh",
+        // Suite-driver registry data is not capability: the RUN row
+        // `("test_h4a_prepost_userspace.py", ["--self-test"])` names another
+        // file's flag, and the driver's own argv parsing implements only
+        // `--list`/`--check` plus suite names. Without this exclusion the
+        // detector demands a hosted `run-python-suites.py --self-test` step
+        // that would fail on the runner, which has no such flag.
+        "scripts/run-python-suites.py",
+    ]
+    .contains(&path)
+    {
+        return false;
+    }
+    // A comment merely mentioning --self-test does not make the
+    // script self-test-capable; without this, a line explaining that
+    // a script has no self-test would demand a hosted step for it.
+    read(path)
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains("--self-test"))
+}
+
 #[test]
 fn hosted_pipeline_runs_every_unprivileged_self_test() {
     let ci = read(".github/workflows/ci.yml");
@@ -9880,19 +9906,7 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
                 Some((_, "py")) => "python3 -I ",
                 _ => continue,
             };
-            if [
-                "scripts/gates.sh",
-                "scripts/lib.sh",
-                "scripts/cleanup-traps.sh",
-            ]
-            .contains(&path)
-                // A comment merely mentioning --self-test does not make the
-                // script self-test-capable; without this, a line explaining that
-                // a script has no self-test would demand a hosted step for it.
-                || !read(path).lines().any(|line| {
-                    !line.trim_start().starts_with('#') && line.contains("--self-test")
-                })
-            {
+            if !is_self_test_capable(path) {
                 continue;
             }
             expected.insert(format!("- run: {interpreter}{path} --self-test"));
@@ -9918,6 +9932,45 @@ fn hosted_pipeline_runs_every_unprivileged_self_test() {
     assert_eq!(
         hosted, expected,
         "the hosted `--self-test` steps must be exactly the self-test-capable scripts"
+    );
+}
+
+/// Negative twin of `hosted_pipeline_runs_every_unprivileged_self_test`: a
+/// data-only `--self-test` mention must demand no hosted step. Fails pre-fix,
+/// when the detector classifies the driver's registry row as capability. The
+/// two-way guard lives on in the main test's unchanged `assert_eq`: a capable
+/// script with no step and a stale step whose oracle is gone both still fail
+/// there.
+#[test]
+fn hosted_self_test_detector_ignores_registry_data_mentions() {
+    // Premise: the registry still carries a non-comment --self-test mention,
+    // so this twin is load-bearing rather than vacuous.
+    assert!(
+        read("scripts/run-python-suites.py")
+            .lines()
+            .any(|line| { !line.trim_start().starts_with('#') && line.contains("--self-test") }),
+        "twin premise: scripts/run-python-suites.py must still carry a \
+         data-only --self-test mention"
+    );
+    // The detector must not classify registry data as capability ...
+    assert!(
+        !is_self_test_capable("scripts/run-python-suites.py"),
+        "registry data naming another file's --self-test flag must not demand \
+         a hosted step"
+    );
+    // ... and the hosted job must carry no such step.
+    let ci = read(".github/workflows/ci.yml");
+    assert!(
+        !checks_job(&ci)
+            .lines()
+            .any(|line| line.trim().contains("run-python-suites.py --self-test")),
+        "no hosted step may invoke the suite driver with --self-test"
+    );
+    // Positive control: a genuinely capable script is still detected, so the
+    // exclusion cannot silently empty the whole derivation.
+    assert!(
+        is_self_test_capable("scripts/verify-canaries.sh"),
+        "positive control: verify-canaries.sh implements --self-test"
     );
 }
 

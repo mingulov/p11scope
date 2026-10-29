@@ -232,6 +232,11 @@ impl std::fmt::Debug for PromotionBaselineBatch {
 
 /// Request-qualified selection of the genuine pre-view batch. Neither numeric
 /// cookie equality across domains nor a later query can create this wrapper.
+/// `Clone` shares the immutable receipt (the batch and frame are frozen
+/// pre-view; every method takes `&self`): the detail adapter (6.15)
+/// retains one for bind-time agreement while the bundle carries the
+/// other into preparation. Cloning never re-derives or widens it.
+#[derive(Clone)]
 pub(crate) struct PromotionImageBaseline {
     batch: Arc<PromotionBaselineBatch>,
     viewed: Arc<PromotionView>,

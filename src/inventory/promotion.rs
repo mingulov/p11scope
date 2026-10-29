@@ -151,6 +151,7 @@ pub(crate) struct PromotionRequest {
     viewed: Arc<PromotionView>,
     caller: CallerId,
     provider: ModuleId,
+    endpoint: Option<SelectedEndpointReceipt>,
 }
 
 impl std::fmt::Debug for PromotionRequest {
@@ -160,6 +161,7 @@ impl std::fmt::Debug for PromotionRequest {
             .field("viewed", &self.viewed)
             .field("caller", &self.caller)
             .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -180,6 +182,14 @@ impl PromotionRequest {
 
     pub(crate) fn provider(&self) -> ModuleId {
         self.provider
+    }
+
+    /// The selected-endpoint receipt carried by
+    /// [`Promoter::request_with_endpoint`], if any. `None` (the legacy
+    /// path) never selects an endpoint: the detail adapter refuses
+    /// such requests closed.
+    pub(crate) fn endpoint(&self) -> Option<SelectedEndpointReceipt> {
+        self.endpoint
     }
 
     /// Build a capture-qualified status update from this exact held
@@ -223,7 +233,35 @@ struct PendingPromotion {
     viewed: Arc<PromotionView>,
     caller: CallerId,
     provider: ModuleId,
+    endpoint: Option<SelectedEndpointReceipt>,
     id: RequestId,
+}
+
+/// The selected-endpoint receipt (6.15 M1, R2-D2-A carrier): the
+/// endpoint file offset the request selected, bound to the viewed
+/// revision that offered it. The receipt rides the request
+/// structurally (pending → taken), so request binding is by
+/// containment; the revision is checked at queue time (a receipt
+/// naming another view is stale, never rebound) and re-checked by
+/// the detail adapter at resolve time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectedEndpointReceipt {
+    view: ViewRevision,
+    file_offset: u64,
+}
+
+impl SelectedEndpointReceipt {
+    pub(crate) fn new(view: ViewRevision, file_offset: u64) -> Self {
+        Self { view, file_offset }
+    }
+
+    pub(crate) fn view(self) -> ViewRevision {
+        self.view
+    }
+
+    pub(crate) fn file_offset(self) -> u64 {
+        self.file_offset
+    }
 }
 
 impl Promoter {
@@ -252,6 +290,33 @@ impl Promoter {
         caller: CallerId,
         provider: ModuleId,
     ) -> Result<RequestId, PromotionRequestError> {
+        self.request_inner(viewed, caller, provider, None)
+    }
+
+    /// Queue the request with its selected-endpoint receipt (6.15 M1):
+    /// the pair checks are identical, and the receipt must name this
+    /// viewed revision — a receipt for another view is stale (the
+    /// selection raced a redraw) and refuses without queueing.
+    pub(crate) fn request_with_endpoint(
+        &mut self,
+        viewed: Arc<PromotionView>,
+        caller: CallerId,
+        provider: ModuleId,
+        endpoint: SelectedEndpointReceipt,
+    ) -> Result<RequestId, PromotionRequestError> {
+        if endpoint.view() != viewed.revision {
+            return Err(PromotionRequestError::Refused(PromotionRefusal::StaleView));
+        }
+        self.request_inner(viewed, caller, provider, Some(endpoint))
+    }
+
+    fn request_inner(
+        &mut self,
+        viewed: Arc<PromotionView>,
+        caller: CallerId,
+        provider: ModuleId,
+        endpoint: Option<SelectedEndpointReceipt>,
+    ) -> Result<RequestId, PromotionRequestError> {
         if Some(viewed.capture) != self.control.capture() {
             return Err(PromotionRequestError::ForeignCapture);
         }
@@ -267,6 +332,7 @@ impl Promoter {
             viewed,
             caller,
             provider,
+            endpoint,
             id,
         });
         Ok(id)
@@ -329,6 +395,7 @@ impl Promoter {
             viewed: Arc::clone(&pending.viewed),
             caller: pending.caller,
             provider: pending.provider,
+            endpoint: pending.endpoint,
         })
     }
 

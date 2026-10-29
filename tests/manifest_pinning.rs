@@ -2326,14 +2326,12 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
         skipped[0]
     );
     assert_eq!(skipped[0].subject, exe.display().to_string());
+}
 
-    // Force `mapping_file_key` to be unavailable: memfd's internal mount does not
-    // appear in /proc/self/mountinfo. The inode still agrees, while the mapping device
-    // deliberately does not. Incomparable identity must fail closed, never fall back
-    // to accepting the inode by itself.
+fn unlisted_memfd() -> std::fs::File {
     use std::ffi::CString;
-    use std::io::{Seek as _, Write as _};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
 
     let name = CString::new("p11scope-identity-unavailable").unwrap();
     // SAFETY: valid NUL-terminated name and supported memfd flags; success returns a
@@ -2341,16 +2339,18 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
     let mut memfd = unsafe { std::fs::File::from_raw_fd(fd) };
-    memfd.write_all(&std::fs::read(&exe).unwrap()).unwrap();
-    memfd.rewind().unwrap();
+    memfd.write_all(b"owned identity fixture").unwrap();
+    memfd
+}
+
+#[test]
+fn a_memfd_magic_link_is_refused_before_target_identity() {
+    use p11scope::discovery::scan::ScannedModule;
+    use p11scope_manifest::maps::{Device, ObjectKey};
+    use std::os::fd::AsRawFd as _;
+
+    let memfd = unlisted_memfd();
     let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
-    let opened = p11scope_manifest::identity::open_object(Path::new(&memfd_path)).unwrap();
-    let mapping_error = p11scope_manifest::identity::mapping_file_key(&opened)
-        .expect_err("memfd mount identity must be absent from mountinfo");
-    assert!(
-        mapping_error.contains("missing from the mount table"),
-        "{mapping_error}"
-    );
     let metadata = memfd.metadata().unwrap();
     let module = ScannedModule {
         mapped_identity: None,
@@ -2384,9 +2384,39 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     assert_eq!(skipped[0].subject, memfd_path);
     assert!(
-        skipped[0].reason.contains("mapping identity") && skipped[0].reason.contains("unavailable"),
+        skipped[0]
+            .reason
+            .starts_with("opening object within retained target root:")
+            && skipped[0].reason.contains("os error 40"),
         "{:?}",
         skipped[0]
+    );
+}
+
+#[test]
+fn an_unlisted_retained_memfd_never_uses_inode_only_identity() {
+    // The exact fd's internal mount is absent from mountinfo. Its real
+    // inode remains available, but it cannot supply a comparable maps key.
+    let memfd = unlisted_memfd();
+    assert_ne!(memfd.metadata().unwrap().ino(), 0);
+    let mapping_error = p11scope_manifest::identity::mapping_file_key(&memfd)
+        .expect_err("memfd mount identity must be absent from mountinfo");
+    assert!(
+        mapping_error.contains("missing from the mount table"),
+        "{mapping_error}"
+    );
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let error = p11scope::discovery::identity::retained_object_key(&view, &memfd, &mut budget)
+        .expect_err("an actual retained inode cannot replace a missing mount identity");
+    assert!(
+        error.starts_with("mapping identity unavailable:"),
+        "{error}"
+    );
+    assert!(error.contains("missing from the mount table"), "{error}");
+    assert!(
+        budget.attempted_io_bytes() > 0,
+        "the real target mount table was read"
     );
 }
 
@@ -2479,10 +2509,11 @@ fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
 fn expired_deadline_refuses_pin_hash_before_reading() {
     let child = ScannedChild::new("hash-deadline-child", None);
     let modules = child.scan();
+    let view = ProcessView::open(modules[0].view, child.pid()).unwrap();
     let mut budget = CaptureWorkBudget::default();
     budget.set_deadline(Some(0));
     let (pinned, skipped) =
-        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+        p11scope::discovery::identity::pin_scanned_view_objects(&view, &modules, &mut budget)
             .unwrap();
     assert_eq!(pinned.pinned().count(), 0);
     assert_eq!(budget.attempted_io_bytes(), 0);
@@ -2492,6 +2523,35 @@ fn expired_deadline_refuses_pin_hash_before_reading() {
             .any(|skip| skip.reason.contains("capture discovery deadline")),
         "the refused hash must name the deadline: {skipped:?}"
     );
+}
+
+#[test]
+fn expired_deadline_refuses_pin_view_construction_before_reading() {
+    let child = ScannedChild::new("pin-construction-deadline-child", None);
+    let modules = child.scan();
+    let mut budget = CaptureWorkBudget::default();
+    budget.set_deadline(Some(0));
+    let error =
+        p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
+            .err()
+            .expect("an expired budget cannot construct a process view");
+    assert_eq!(
+        error,
+        "capture discovery deadline reached; remaining provider bytes were not scanned"
+    );
+    assert_eq!(budget.attempted_io_bytes(), 0);
+
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        child.pid(),
+        &modules,
+        &mut CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    assert!(
+        skipped.is_empty(),
+        "healthy construction/pinning: {skipped:?}"
+    );
+    assert_eq!(pinned.pinned().count(), 1);
 }
 
 #[test]

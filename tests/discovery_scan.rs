@@ -1505,6 +1505,9 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    let raw_mem_errno = std::fs::File::open(format!("/proc/{pid}/mem"))
+        .err()
+        .and_then(|error| error.raw_os_error());
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::default();
     let outcome = scan_pid(
@@ -1526,9 +1529,14 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
     let is_root = unsafe { libc::geteuid() } == 0;
     let refused = if is_root { scope > 2 } else { scope > 0 };
     eprintln!(
-        "MEASURED: euid_root={is_root}, ptrace_scope={scope}, outcome={:?}",
+        "MEASURED: euid_root={is_root}, ptrace_scope={scope}, raw_mem_errno={raw_mem_errno:?}, outcome={:?}",
         outcome.unavailable_reason()
     );
+    if refused {
+        assert!(matches!(raw_mem_errno, Some(libc::EACCES | libc::EPERM)));
+    } else {
+        assert_eq!(raw_mem_errno, None, "the healthy memory open must succeed");
+    }
     assert_eq!(
         outcome.unavailable_reason(),
         refused.then_some("ptrace"),

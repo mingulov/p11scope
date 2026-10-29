@@ -7144,7 +7144,7 @@ fn pin_scanned_object(
         ));
     }
     #[cfg(test)]
-    tests::run_before_hash_test_hook();
+    tests::run_before_hash_test_hook(budget);
     // A repeat pin of the unchanged file reuses the cached inspection with zero
     // reads. The key's (device, inode) is the mountinfo-validated identity above.
     let validated = object_key(found);
@@ -7765,14 +7765,16 @@ mod tests {
         }
     }
 
+    type BeforeHashHook = Box<dyn FnOnce(&mut CaptureWorkBudget)>;
+
     thread_local! {
-        static BEFORE_HASH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static BEFORE_HASH_HOOK: RefCell<Option<BeforeHashHook>> = RefCell::new(None);
     }
 
     struct BeforeHashHookGuard;
 
     impl BeforeHashHookGuard {
-        fn install(hook: impl FnOnce() + 'static) -> Self {
+        fn install(hook: impl FnOnce(&mut CaptureWorkBudget) + 'static) -> Self {
             BEFORE_HASH_HOOK.with(|slot| {
                 assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
             });
@@ -7788,10 +7790,10 @@ mod tests {
         }
     }
 
-    pub(super) fn run_before_hash_test_hook() {
+    pub(super) fn run_before_hash_test_hook(budget: &mut CaptureWorkBudget) {
         let hook = BEFORE_HASH_HOOK.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
-            hook();
+            hook(budget);
         }
     }
 
@@ -8350,7 +8352,7 @@ mod tests {
             interfaces: Vec::new(),
         };
         let changed_path = path.clone();
-        let _hook = BeforeHashHookGuard::install(move || {
+        let _hook = BeforeHashHookGuard::install(move |_| {
             let mut changed = std::fs::OpenOptions::new()
                 .append(true)
                 .open(changed_path)
@@ -8370,6 +8372,63 @@ mod tests {
         assert_eq!(
             skipped[0].reason,
             "file changed while it was being identified — retry"
+        );
+    }
+
+    #[test]
+    fn a_deadline_expiring_at_the_actual_hash_gate_reads_no_object_bytes() {
+        use crate::discovery::scan::SCAN_DEADLINE_REASON;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline-at-hash.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut module = test_fixture::module(object_key(mapping));
+        module.view = view.id();
+        module.mount_namespace = view.mount_namespace();
+        module.path = path.display().to_string();
+        module.tables.clear();
+        let before_hash = Rc::new(Cell::new(None));
+        let observed = before_hash.clone();
+        let _hook = BeforeHashHookGuard::install(move |budget| {
+            observed.set(Some(budget.attempted_io_bytes()));
+            budget.set_deadline(Some(0));
+        });
+        let mut budget = CaptureWorkBudget::default();
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        let metadata_bytes = before_hash
+            .get()
+            .expect("the actual hash boundary was reached");
+        assert!(
+            metadata_bytes > 0,
+            "mount identity was proved before cancellation"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            metadata_bytes,
+            "no hash byte was read"
+        );
+        assert_eq!(budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(pinned.pinned().count(), 0);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].subject, module.path);
+        assert!(
+            skipped[0].reason.contains(SCAN_DEADLINE_REASON),
+            "{skipped:?}"
+        );
+
+        let (healthy, skipped) =
+            pin_scanned_view_objects(&view, &[module], &mut CaptureWorkBudget::default()).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            healthy.pinned().count(),
+            1,
+            "fresh healthy hashing still succeeds"
         );
     }
 

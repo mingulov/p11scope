@@ -1871,7 +1871,37 @@ impl EdgeSemantics {
                 if call.rv == CkRv::PENDING.0 {
                     return;
                 }
-                if let Some(pending) = self.pending.remove(&(call.session, call.target_function)) {
+                // 6.07b Complete-once (§3.3): eligible at the
+                // completion's own invocation cut are the pending
+                // (session, target) plus detached ids owned by the
+                // completer for that target. Exactly one eligible
+                // record consumes once; zero or ≥2 orphan with
+                // evidence and consume none. Pending-first and
+                // BTree-first selection are withdrawn as proof.
+                let pending_key = (call.session, call.target_function);
+                let has_pending = self.pending.contains_key(&pending_key);
+                let mut detached_match = None;
+                let mut detached_count = 0usize;
+                for (key, id) in &self.detached {
+                    if id.owner == Some(call.session) && key.1 == call.target_function {
+                        detached_count += 1;
+                        detached_match = Some(*key);
+                    }
+                }
+                let eligible = usize::from(has_pending) + detached_count;
+                if eligible != 1 {
+                    self.orphans = self.orphans.saturating_add(1);
+                    if eligible >= 2 {
+                        self.evidence.async_duplicates =
+                            self.evidence.async_duplicates.saturating_add(1);
+                    }
+                    return;
+                }
+                if has_pending {
+                    let pending = self
+                        .pending
+                        .remove(&pending_key)
+                        .expect("eligible pending record");
                     let PendingCall {
                         call: original,
                         origin,
@@ -1883,18 +1913,11 @@ impl EdgeSemantics {
                     drop(resource);
                     return;
                 }
-                let detached_key = self.detached.iter().find_map(|(key, id)| {
-                    (id.owner == Some(call.session) && key.1 == call.target_function)
-                        .then_some(*key)
-                });
-                let Some(detached_key) = detached_key else {
-                    self.orphans = self.orphans.saturating_add(1);
-                    return;
-                };
-                let Some(id) = self.detached.remove(&detached_key) else {
-                    self.orphans = self.orphans.saturating_add(1);
-                    return;
-                };
+                let detached_key = detached_match.expect("eligible detached record");
+                let id = self
+                    .detached
+                    .remove(&detached_key)
+                    .expect("eligible detached record");
                 let AsyncId {
                     call: original,
                     origin,
@@ -1910,6 +1933,18 @@ impl EdgeSemantics {
                     self.orphans = self.orphans.saturating_add(1);
                     return;
                 };
+                // 6.07b GetID mint (§3.1): vacancy is checked BEFORE
+                // custody moves. A same-key remint over a live origin
+                // refuses/orphans the second mint and counts
+                // ambiguity — it never overwrites the first origin,
+                // and the refused mint's pending stays intact.
+                let detached_key = (slot, call.target_function, call.async_value);
+                if self.detached.contains_key(&detached_key) {
+                    self.orphans = self.orphans.saturating_add(1);
+                    self.evidence.async_duplicates =
+                        self.evidence.async_duplicates.saturating_add(1);
+                    return;
+                }
                 let Some(pending) = self.pending.remove(&(call.session, call.target_function))
                 else {
                     self.orphans = self.orphans.saturating_add(1);
@@ -1917,26 +1952,16 @@ impl EdgeSemantics {
                 };
                 self.sequence = self.sequence.wrapping_add(1);
                 let sequence = self.sequence;
-                if self
-                    .detached
-                    .insert(
-                        (slot, call.target_function, call.async_value),
-                        AsyncId {
-                            owner: Some(call.session),
-                            call: pending.call,
-                            origin: pending.origin,
-                            sequence,
-                            resource: pending.resource,
-                        },
-                    )
-                    .is_some()
-                {
-                    // Same-scope re-mint (the only possible claimant
-                    // inside one edge): overwrite and count, exactly
-                    // like the capture-wide same-owner rule.
-                    self.evidence.async_duplicates =
-                        self.evidence.async_duplicates.saturating_add(1);
-                }
+                self.detached.insert(
+                    detached_key,
+                    AsyncId {
+                        owner: Some(call.session),
+                        call: pending.call,
+                        origin: pending.origin,
+                        sequence,
+                        resource: pending.resource,
+                    },
+                );
                 self.evict_async_if_needed(sink);
             }
             lifecycle::ASYNC_JOIN if call.rv == CkRv::OK.0 => {
@@ -1974,25 +1999,27 @@ impl EdgeSemantics {
             self.orphans = self.orphans.saturating_add(1);
             return;
         }
+        // 6.07b duplicate queue (§3.5): a live (session, target)
+        // refuses the second PENDING — first wins, counted ambiguity,
+        // never an overwrite. No charge is taken for a refused queue.
+        if self.pending.contains_key(&(call.session, function_id)) {
+            self.evidence.async_duplicates = self.evidence.async_duplicates.saturating_add(1);
+            self.orphans = self.orphans.saturating_add(1);
+            return;
+        }
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
         let resource = self.take_resource_charge(Self::async_charge(call, &descriptor));
         let origin = self.capture_origin(call.session, &descriptor);
-        if self
-            .pending
-            .insert(
-                (call.session, function_id),
-                PendingCall {
-                    call: call.clone(),
-                    origin,
-                    sequence,
-                    resource,
-                },
-            )
-            .is_some()
-        {
-            self.evidence.async_duplicates = self.evidence.async_duplicates.saturating_add(1);
-        }
+        self.pending.insert(
+            (call.session, function_id),
+            PendingCall {
+                call: call.clone(),
+                origin,
+                sequence,
+                resource,
+            },
+        );
         self.evict_async_if_needed(sink);
     }
 

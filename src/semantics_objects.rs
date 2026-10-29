@@ -827,6 +827,14 @@ pub(crate) enum ObjectEffect {
         call: CallToken,
         reason: ObjectGap,
     },
+    /// A PENDING origin END minted deferred origin custody (6.07b): the
+    /// frozen receipt vector (possibly empty — unknown stays unknown)
+    /// is retained under the origin ticket until the completion quantum
+    /// redeems it or a death path disposes it. Emitted even with zero
+    /// frozen inputs; absent when mint was impossible.
+    DeferredMinted {
+        call: CallToken,
+    },
     Gap {
         reason: ObjectGap,
     },
@@ -966,6 +974,9 @@ pub(crate) struct StateUsage {
     pub(crate) live_bindings: usize,
     pub(crate) tombstones: usize,
     pub(crate) pending_calls: usize,
+    /// Live deferred async origins (6.07b): pending plus detached
+    /// records awaiting their completion quantum or a death path.
+    pub(crate) deferred_origins: usize,
     /// Lifetime counts (IDs minted) versus occupancy above: records are
     /// pruned and refunded only once no fence can still need them.
     pub(crate) lifetime_objects: u64,
@@ -1217,6 +1228,42 @@ impl ObjectSemantics {
     /// them).
     pub(crate) fn receipt_snapshot(&self, key: ObjectId) -> Option<ReceiptSnapshot> {
         self.state.receipt_snapshot(key)
+    }
+
+    /// 6.07b deferred custody: move one origin pending→detached
+    /// (GetID mint). Seal-path (Q2) primitive; only tests drive it
+    /// until the journal P1 packet lands.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(crate) fn detach_deferred(
+        &mut self,
+        session: SessionIncarnation,
+        target: u32,
+        value: u64,
+    ) -> Result<(), state::DeferredRefusal> {
+        self.state.detach_deferred(session, target, value)
+    }
+
+    /// 6.07b deferred custody: move whole detached custody to the
+    /// joiner (Join transfer). Seal-path (Q2) primitive; only tests
+    /// drive it until the journal P1 packet lands.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(crate) fn join_deferred_holder(
+        &mut self,
+        domain: ObjectDomain,
+        target: u32,
+        value: u64,
+        joiner: SessionIncarnation,
+    ) -> bool {
+        self.state
+            .join_deferred_holder(domain, target, value, joiner)
+    }
+
+    /// 6.07b deferred custody: consume one live origin exactly once
+    /// (Complete). Seal-path (Q2) primitive; only tests drive it
+    /// until the journal P1 packet lands.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(crate) fn redeem_deferred(&mut self, ticket: CallToken) -> Option<ObjectEffects> {
+        self.state.redeem_deferred(ticket)
     }
 
     pub(crate) fn state_estimate(&self) -> StateEstimate {

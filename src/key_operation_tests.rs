@@ -13407,3 +13407,687 @@ fn producer_commit_without_linked_journal_reports_journal_unavailable() {
         "linked without births keeps its 0.6.0 meaning"
     );
 }
+
+// ==================== 6.07b async userspace contract ====================
+// S1: GetID mint (§3.1), Join transfer (§3.2), Complete-once (§3.3),
+// duplicate (§3.5), stale (§3.6), failed (§3.7). Model redeem + seal
+// path follow later (journal frozen; U-5 open: no proved async rows).
+
+/// One PENDING C_SignInit on a session: queues S1-side, completes by
+/// starting the machine (the :3618 carve-out shape).
+fn pending_init(session: u64, ts_ns: u64) -> SemanticCall {
+    let mut pending = init("C_SignInit", session, RSA_PKCS, ts_ns);
+    pending.rv = CkRv::PENDING.0;
+    pending
+}
+
+fn async_control(
+    function: &str,
+    session: u64,
+    target: u32,
+    value: u64,
+    ts_ns: u64,
+) -> SemanticCall {
+    let mut control = call(function, session, CkRv::OK.0, ts_ns);
+    control.target_function = target;
+    control.async_value = value;
+    control
+}
+
+fn sign_init_target() -> u32 {
+    crate::kinds::function_id("C_SignInit").unwrap()
+}
+
+/// R2-D3-5: ≥2 eligible records ⇒ ambiguous: orphan with evidence,
+/// consume none. Pending-first and BTree-first are withdrawn as proof.
+#[test]
+fn key_operation_async_complete_ambiguous_orphans_without_consuming() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 95),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 7, target, 42, 110),
+    );
+    feed(&mut edge, &mut sink, &pending_init(8, 120));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 8, target, 43, 130),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 7, target, 43, 140),
+    );
+    // Session 7 now owns two detached ids for one target: the
+    // completion is ambiguous and consumes neither.
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 150),
+    );
+    assert!(effects.is_empty(), "ambiguous completion replays nothing");
+    assert_eq!(edge.started(), 0);
+    assert_eq!(edge.orphans(), 1);
+    assert_eq!(edge.evidence().async_duplicates, 1);
+    // Non-vacuity: both records are still live. Moving one id away
+    // leaves exactly one eligible record, which completes.
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 8, target, 42, 160),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 170),
+    );
+    assert_eq!(effects.len(), 1);
+    assert_eq!(edge.started(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 8, 120),
+        "the surviving record keeps its first origin"
+    );
+}
+
+/// R2-D3-3: same-key remint over a live origin refuses (orphan +
+/// ambiguity evidence); the first origin and the refused mint's
+/// pending both stay intact.
+#[test]
+fn key_operation_async_getid_remint_refuses_first_origin_intact() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 95),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 7, target, 42, 110),
+    );
+    feed(&mut edge, &mut sink, &pending_init(8, 120));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 8, target, 42, 130),
+    );
+    assert_eq!(edge.orphans(), 1, "the second mint orphans");
+    assert_eq!(edge.evidence().async_duplicates, 1);
+    assert_eq!(edge.started(), 0);
+    // The first origin is intact: session 7 completes its own call.
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 140),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 100),
+        "first origin never overwritten"
+    );
+    // The refused mint's pending survived: session 8 completes direct.
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 8, target, 0, 150),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 8, 120)
+    );
+    assert_eq!(edge.started(), 2);
+}
+
+/// R2-D3-5 (§3.5): duplicate PENDING queue for a live
+/// (session, target) refuses; the first record completes.
+#[test]
+fn key_operation_async_duplicate_pending_refuses_first_intact() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    feed(&mut edge, &mut sink, &pending_init(7, 200));
+    assert_eq!(edge.evidence().async_duplicates, 1);
+    assert_eq!(edge.orphans(), 1, "the refused queue orphans");
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 300),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 100),
+        "first pending intact"
+    );
+    assert_eq!(edge.started(), 1);
+}
+
+/// R2-D3-5 zero arm: a completion with no eligible record orphans and
+/// consumes nothing.
+#[test]
+fn key_operation_async_complete_zero_eligible_orphans() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 100),
+    );
+    assert!(effects.is_empty());
+    assert_eq!(edge.started(), 0);
+    assert_eq!(edge.orphans(), 1);
+    assert_eq!(edge.evidence().async_duplicates, 0);
+}
+
+/// R2-D3-5 once-token: a pending-only completion consumes exactly
+/// once; redelivery finds no record and orphans.
+#[test]
+fn key_operation_async_complete_pending_only_consumes_once() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 200),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 100)
+    );
+    assert_eq!(edge.started(), 1);
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 300),
+    );
+    assert!(effects.is_empty(), "redelivery replays nothing");
+    assert_eq!(edge.started(), 1);
+    assert_eq!(edge.orphans(), 1);
+}
+
+/// R2-D3-4: Join moves whole custody to the joiner (origin, receipts,
+/// position unchanged); floating ids stay joinable; failed Join and
+/// unknown keys mutate nothing / orphan.
+#[test]
+fn key_operation_async_join_moves_whole_custody() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 95),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 7, target, 42, 110),
+    );
+    // A failed Join mutates nothing: no custody move, no evidence.
+    let mut failed = async_control("C_AsyncJoin", 8, target, 42, 120);
+    failed.rv = CkRv::GENERAL_ERROR.0;
+    feed(&mut edge, &mut sink, &failed);
+    assert_eq!(edge.orphans(), 0);
+    // An unknown-key Join orphans.
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 8, target, 999, 125),
+    );
+    assert_eq!(edge.orphans(), 1);
+    // The successful Join moves whole custody; the completion keeps
+    // the original (7, 100) identity.
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 8, target, 42, 130),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 8, target, 0, 140),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 100)
+    );
+    // Floating ids (owner None after close) stay joinable in-edge.
+    feed(&mut edge, &mut sink, &pending_init(7, 200));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 7, target, 43, 210),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_CloseSession", 7, CkRv::OK.0, 220),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 8, target, 43, 230),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 8, target, 0, 240),
+    );
+    assert_eq!(effects.len(), 1);
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 200)
+    );
+    assert_eq!(edge.started(), 2);
+}
+
+/// R2-D3-7 (§3.7): failed controls and CKR_PENDING completions mutate
+/// nothing and dispose nothing; the pending stays completable.
+#[test]
+fn key_operation_async_failed_controls_mutate_nothing() {
+    let target = sign_init_target();
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(&mut edge, &mut sink, &pending_init(7, 100));
+    let mut pending_complete = async_control("C_AsyncComplete", 7, target, 0, 110);
+    pending_complete.rv = CkRv::PENDING.0;
+    feed(&mut edge, &mut sink, &pending_complete);
+    assert_eq!(edge.started(), 0);
+    assert_eq!(edge.orphans(), 0);
+    let mut failed_get = async_control("C_AsyncGetID", 7, target, 42, 120);
+    failed_get.rv = CkRv::GENERAL_ERROR.0;
+    feed(&mut edge, &mut sink, &failed_get);
+    assert_eq!(edge.started(), 0);
+    assert_eq!(edge.orphans(), 0);
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 130),
+    );
+    assert_eq!(effects.len(), 1, "pending survived both failures");
+    let (_, _, _, origin) = started(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_SignInit", 7, 100)
+    );
+}
+
+/// R2-D3-5/§3.6: a joined completion landing on the receiver's own
+/// newer machine is stale and orphans instead of joining.
+#[test]
+fn key_operation_async_stale_completion_orphans() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 95),
+    );
+    feed(&mut edge, &mut sink, &init("C_SignInit", 7, RSA_PKCS, 100));
+    let mut pending = op("C_Sign", 7, 110);
+    pending.rv = CkRv::PENDING.0;
+    feed(&mut edge, &mut sink, &pending);
+    let sign = crate::kinds::function_id("C_Sign").unwrap();
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncGetID", 7, sign, 42, 120),
+    );
+    // The receiver holds its own newer sign machine before joining.
+    feed(&mut edge, &mut sink, &init("C_SignInit", 8, RSA_PKCS, 130));
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 8, sign, 42, 140),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncComplete", 8, sign, 0, 150),
+    );
+    assert!(effects.is_empty(), "stale completion replays nothing");
+    assert_eq!(edge.started(), 2, "only the two Inits started");
+    assert_eq!(edge.completed(), 0);
+    assert_eq!(edge.orphans(), 1);
+}
+
+/// 6.07b Q1: a qualified PENDING origin END mints a deferred origin
+/// (DeferredMinted + stored record); the Q2 primitive redeems it once
+/// with the origin ticket and frozen inputs.
+#[test]
+fn key_operation_joint_async_pending_mints_deferred_origin() {
+    use crate::semantics_objects::{KeyLabel, ObjectEffect};
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Create + label a key so the PENDING Init freezes a settled input.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    assert!(
+        !scene.model.project().objects.is_empty(),
+        "the key exists before the PENDING origin"
+    );
+    let (_, _) = prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_SignInit", CkRv::PENDING.0, RSA_PKCS, init_capture()),
+    );
+    let success = scene.seal().expect("pending quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    let ticket = success
+        .effects
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ObjectEffect::DeferredMinted { call } => Some(*call),
+            _ => None,
+        })
+        .expect("origin PENDING END mints a deferred origin");
+    assert_eq!(scene.model.project().usage.deferred_origins, 1);
+    let redeemed = scene
+        .model
+        .redeem_deferred(ticket)
+        .expect("live record redeems once");
+    let refs: Vec<_> = redeemed
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            ObjectEffect::Referenced {
+                call,
+                object: _,
+                key_use,
+                input,
+                metadata: _,
+                label,
+                attribution_valid,
+            } => Some((*call, *key_use, *input, *label, *attribution_valid)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refs.len(), 1, "one frozen input redeems one reference");
+    assert_eq!(refs[0].0, ticket, "origin ticket");
+    assert!(refs[0].1, "access input is a key use");
+    assert_eq!(refs[0].2, Some(0));
+    assert_eq!(refs[0].3, Some(KeyLabel::Rsa { modulus_bits: 2048 }));
+    assert!(refs[0].4);
+    assert_eq!(scene.model.project().usage.deferred_origins, 0);
+    assert!(
+        scene.model.redeem_deferred(ticket).is_none(),
+        "removal is the once-token"
+    );
+}
+
+/// 6.07b F3: a PENDING origin with an unknown session mints the
+/// effect but stores no record: permanently unknown, never repaired.
+#[test]
+fn key_operation_joint_async_deferred_unknown_session_stays_unknown() {
+    use crate::semantics_objects::ObjectEffect;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut shape = ShapedS1::shaped("C_SignInit", CkRv::PENDING.0, RSA_PKCS, init_capture());
+    shape.session = Some(0x0BEEF);
+    let (_, _) = prepare_call(&mut scene, &mut staging, &shape);
+    let success = scene.seal().expect("pending quantum seals");
+    let ticket = success
+        .effects
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ObjectEffect::DeferredMinted { call } => Some(*call),
+            _ => None,
+        })
+        .expect("unknown-session origin still mints the effect");
+    assert_eq!(
+        scene.model.project().usage.deferred_origins,
+        0,
+        "no incarnation, no record"
+    );
+    assert!(
+        scene.model.redeem_deferred(ticket).is_none(),
+        "nothing to redeem"
+    );
+}
+
+/// 6.07b carve-out replacement (userspace): Q1 mints the deferred
+/// origin; the completion still reduces S1Only-direct (journal frozen,
+/// so `Unsealable` stays); the S1 machine starts once; the row stays
+/// unknown-key `unbound` (U-5 open: no proved async rows); S1 twins agree.
+#[test]
+fn key_operation_joint_async_pending_mint_then_unbound_completion() {
+    use crate::semantics_objects::ObjectEffect;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut joint_sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut assoc_ledger = StagingLedger::new();
+
+    // Q0: create + label a key so Q1 freezes a settled input.
+    for shape in [
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    ] {
+        let (facts, _) = prepare_call(&mut scene, &mut staging, &shape);
+        let success = scene.seal().expect("setup quantum seals");
+        let (outcome, _) = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut joint,
+            &mut keyuse,
+            instance,
+            &mut joint_sink,
+            None,
+        );
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+        let origin = EffectOrigin::from(&facts);
+        direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    }
+
+    // Q1: the PENDING Init stages, seals, replays and queues — and now
+    // mints a deferred origin.
+    let pending = ShapedS1::shaped("C_SignInit", CkRv::PENDING.0, RSA_PKCS, init_capture());
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &pending);
+    let success = scene.seal().expect("pending quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    assert!(
+        success
+            .effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::DeferredMinted { .. })),
+        "Q1 mints the deferred origin"
+    );
+    assert_eq!(scene.model.project().usage.deferred_origins, 1);
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut joint_sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_s1_equal(&joint, &direct);
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (0, 0),
+        "queued, not started"
+    );
+
+    // Q2: the completion still cannot stage (journal frozen), so the
+    // driver reduces it S1Only-direct on both feeds; the S1 machine
+    // starts once with the original identity.
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: target,
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    let origin = EffectOrigin::from(&complete);
+    assert_eq!(
+        staging.stage(
+            complete.clone(),
+            origin.clone(),
+            999,
+            scene.adapter.ledger_mut()
+        ),
+        Err(StagingRefusal::Unsealable)
+    );
+    let effects_before = joint_sink.len();
+    joint.observe_with_effects(&complete, &origin, &mut joint_sink);
+    for effect in &joint_sink[effects_before..] {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    direct.observe_with_effects(&complete, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_s1_equal(&joint, &direct);
+    assert_eq!(joint.started(), 1, "the completion starts the machine");
+    let (_, _, _, corigin) = started(joint_sink.last().unwrap());
+    assert_eq!(corigin.function, "C_SignInit", "original call identity");
+
+    // The Sign completes the async-started machine on both feeds; its
+    // row stays unknown-key `unbound` (U-5 open: no proved async rows).
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &sign);
+    let success = scene.seal().expect("terminal quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut joint_sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+    assert!(
+        keyuse.aggregates().is_empty(),
+        "async start binds no receipt"
+    );
+    assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("async completion rows unknown-key");
+    assert_eq!((row.completed, row.active), (1, 0));
+}

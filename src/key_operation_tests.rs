@@ -7,7 +7,7 @@
 //! appear only where the brief's algorithm twins require them.
 
 use crate::semantics_edge::{
-    EdgeSemantics, EffectOrigin, OperationEffect, OperationOutcome, SemanticCall,
+    EdgeSemantics, EffectOrigin, OpState, OperationEffect, OperationOutcome, SemanticCall,
 };
 use p11scope_ebpf_common::{FUNCTION_NONE, capture};
 use pkcs11_types::CkRv;
@@ -2599,6 +2599,978 @@ fn key_operation_s1_matrix_through_both_feeds() {
         before,
         "fallback invents no object facts"
     );
+}
+
+// ==================== Message units: contexts, never signatures ====================
+
+/// Drive one Joint quantum plus the S1Only-direct twin: the twin
+/// reduces the same proved payload, and effects (sans receipts)
+/// plus S1 counters agree after every call.
+#[allow(clippy::too_many_arguments)] // One explicit quantum per axis: scene, staging, both reducers, both sinks, call.
+fn drive_message_quantum(
+    scene: &mut JointScene,
+    staging: &mut JointStaging,
+    joint: &mut EdgeSemantics,
+    keyuse: &mut KeyUseReducer,
+    joint_sink: &mut Vec<OperationEffect>,
+    direct: &mut EdgeSemantics,
+    direct_sink: &mut Vec<OperationEffect>,
+    call: &ShapedS1,
+) -> (SemanticCall, u64) {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let (facts, position) = prepare_call(scene, staging, call);
+    let success = scene.seal().expect("message quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        joint,
+        keyuse,
+        instance,
+        joint_sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
+    assert_eq!(refused, 0, "{}", call.name);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, direct_sink);
+    assert_eq!(strip_receipts(joint_sink), *direct_sink, "{}", call.name);
+    assert_s1_equal(joint, direct);
+    (facts, position)
+}
+
+/// Ground one labelled RSA key: create plus the Class/KeyType/
+/// ModulusBits GET the role tests pin to `rsa_2048`.
+fn drive_message_grounding(
+    scene: &mut JointScene,
+    staging: &mut JointStaging,
+    joint: &mut EdgeSemantics,
+    keyuse: &mut KeyUseReducer,
+    joint_sink: &mut Vec<OperationEffect>,
+    direct: &mut EdgeSemantics,
+    direct_sink: &mut Vec<OperationEffect>,
+) {
+    let create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    drive_message_quantum(
+        scene,
+        staging,
+        joint,
+        keyuse,
+        joint_sink,
+        direct,
+        direct_sink,
+        &create,
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_message_quantum(
+        scene,
+        staging,
+        joint,
+        keyuse,
+        joint_sink,
+        direct,
+        direct_sink,
+        &get,
+    );
+}
+
+/// Message units: one init/update/final lifetime is ONE message
+/// context, however many per-message calls it carries. Five updates
+/// retain the context without effects; the final completes exactly
+/// one context; the proved row counts `message_contexts`, never
+/// signatures — through seal, reducer and projection.
+#[test]
+fn key_operation_message_context_counts_contexts_not_signatures() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    drive_message_grounding(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+    );
+    let init = ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &init,
+    );
+    // Non-vacuous: the context bound the labelled key as its
+    // operation key.
+    let (id, category, _, _) = started(joint_sink.last().expect("init starts the context"));
+    assert_eq!(category, "message_sign");
+    let receipt = match joint_sink.last() {
+        Some(OperationEffect::Started {
+            key_receipt: Some(receipt),
+            ..
+        }) => *receipt,
+        other => panic!("init binds a receipt, got {other:?}"),
+    };
+    assert_eq!(receipt.role, KeyRole::OperationKey);
+    assert_eq!(
+        receipt.label,
+        Some(crate::semantics_objects::KeyLabel::Rsa { modulus_bits: 2048 })
+    );
+
+    // Five per-message updates retain the one context: no new effects.
+    // (The Joint attestation fixture admits only the `C_SignMessage`
+    // spelling; the Begin/Next spellings share its RETAIN_ALWAYS
+    // descriptor arm and pin at the S1Only-direct seam below.)
+    for name in [
+        "C_SignMessage",
+        "C_SignMessage",
+        "C_SignMessage",
+        "C_SignMessage",
+        "C_SignMessage",
+    ] {
+        let update = ShapedS1::shaped(name, CkRv::OK.0, 0, op_capture());
+        let before = joint_sink.len();
+        drive_message_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+            &mut direct,
+            &mut direct_sink,
+            &update,
+        );
+        assert_eq!(joint_sink.len(), before, "{name} retains the context");
+    }
+    assert_eq!(
+        joint.active_summary(),
+        vec![("message_sign".to_string(), OpState::InProgress, 1)]
+    );
+    assert_eq!(
+        (joint.started(), joint.completed(), joint.orphans()),
+        (1, 0, 0)
+    );
+
+    // Mid-flow link: one open context, unit `message_contexts`.
+    let mid = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!((mid.status, mid.reason), (ObsStatus::Populated, "none"));
+    let row = mid
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("one open proved context");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!((row.started, row.completed, row.active), (1, 0, 1));
+    assert!(
+        mid.unknown_key_operations
+            .iter()
+            .all(|row| row.category != "message_sign"),
+        "the bound context rows proved, never unknown: {:?}",
+        mid.unknown_key_operations
+    );
+
+    // The final completes exactly one context — not five signatures.
+    let terminal = ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &terminal,
+    );
+    let (end_id, category, outcome, _) = ended(joint_sink.last().expect("final ends the context"));
+    assert_eq!(
+        (end_id, category, outcome),
+        (id, "message_sign", OperationOutcome::Completed)
+    );
+    assert!(
+        joint_sink
+            .iter()
+            .all(|effect| !matches!(effect, OperationEffect::DirectCompleted { .. })),
+        "message flows never complete direct"
+    );
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    assert_eq!(committed.revision, 2);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("the completed proved context");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!(
+        (
+            row.started,
+            row.completed,
+            row.failed,
+            row.cancelled,
+            row.active
+        ),
+        (1, 1, 0, 0, 0),
+        "one context completed, however many messages it carried"
+    );
+    assert_eq!((row.role, row.metadata_at_use), ("key", "rsa_2048"));
+    assert_eq!(committed.budgets.key_occupied, 1);
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no unknown rows: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
+/// Message units: a failed final retains the context without a
+/// terminal — the attempt invents no keys and moves no rows — and
+/// the retained context still completes exactly once.
+#[test]
+fn key_operation_message_failed_final_retains_context_without_terminal() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    drive_message_grounding(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+    );
+    let init = ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &init,
+    );
+    let (id, _, _, _) = started(joint_sink.last().expect("init starts the context"));
+
+    let failed = ShapedS1::shaped(
+        "C_MessageSignFinal",
+        CkRv::FUNCTION_FAILED.0,
+        0,
+        op_capture(),
+    );
+    let before = joint_sink.len();
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &failed,
+    );
+    assert_eq!(joint_sink.len(), before, "a failed final emits no terminal");
+    assert_eq!(
+        (
+            joint.started(),
+            joint.completed(),
+            joint.failed(),
+            joint.unknown()
+        ),
+        (1, 0, 0, 0)
+    );
+    assert!(joint.has_live_operations());
+    assert_eq!(
+        joint.active_summary(),
+        vec![("message_sign".to_string(), OpState::InProgress, 1)]
+    );
+    // The failed terminal attempt invents no keys and moves no rows.
+    let mid = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(keyuse.aggregates().len(), 1);
+    let row = mid
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("the retained proved context");
+    assert_eq!(
+        (row.started, row.completed, row.failed, row.active),
+        (1, 0, 0, 1)
+    );
+    assert!(
+        mid.unknown_key_operations.is_empty(),
+        "no unknown rows: {:?}",
+        mid.unknown_key_operations
+    );
+
+    // The retained context still completes exactly once.
+    let terminal = ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &terminal,
+    );
+    let (end_id, category, outcome, _) = ended(joint_sink.last().expect("final ends the context"));
+    assert_eq!(
+        (end_id, category, outcome),
+        (id, "message_sign", OperationOutcome::Completed)
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("the completed proved context");
+    assert_eq!(
+        (row.completed, row.failed, row.active),
+        (1, 0, 0),
+        "the failed attempt left no failed terminal behind"
+    );
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no unknown rows: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
+/// Message units: updates, finals and cross-session calls with no
+/// live context orphan — even though a labelled key exists, nothing
+/// binds it, and neither proved nor unknown rows appear.
+#[test]
+fn key_operation_message_missing_context_invents_no_keys() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    drive_message_grounding(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "non-vacuous: a key exists that nothing may bind"
+    );
+
+    let wrong_session = ShapedS1 {
+        session: Some(SESSION + 100),
+        ..ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture())
+    };
+    // Only spellings the Joint attestation fixture admits; sibling
+    // categories pin at the S1Only-direct seam below.
+    let missing = [
+        ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped(
+            "C_MessageSignFinal",
+            CkRv::FUNCTION_FAILED.0,
+            0,
+            op_capture(),
+        ),
+        ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture()),
+        wrong_session,
+    ];
+    for call in &missing {
+        let before = joint_sink.len();
+        drive_message_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+            &mut direct,
+            &mut direct_sink,
+            call,
+        );
+        assert_eq!(joint_sink.len(), before, "{} joins no context", call.name);
+    }
+    // A cancel naming the message operation is inert with no live
+    // context: no terminal, no orphan, no row.
+    let cancel = ShapedS1 {
+        flags: 0x0000_0008,
+        ..ShapedS1::shaped("C_SessionCancel", CkRv::OK.0, 0, 0)
+    };
+    let before = joint_sink.len();
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &cancel,
+    );
+    assert_eq!(
+        joint_sink.len(),
+        before,
+        "cancel on a missing context is inert"
+    );
+    assert_eq!(
+        (joint.started(), joint.completed(), joint.orphans()),
+        (0, 0, 6)
+    );
+    assert!(keyuse.aggregates().is_empty());
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    assert!(
+        committed.key_operations.is_empty(),
+        "no context started, no proved rows: {:?}",
+        committed.key_operations
+    );
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no context started, no unknown rows either: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
+/// Message units: a competing init replaces the shared context —
+/// the old terminal emits before the new start, both bind the same
+/// qualified key, and no third key is invented. A context is
+/// per-session: another session's update joins nothing.
+#[test]
+fn key_operation_message_competing_init_replaces_without_new_keys() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    drive_message_grounding(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+    );
+    let first = ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &first,
+    );
+    let (id1, _, _, _) = started(joint_sink.last().expect("first init starts"));
+    let key1 = match joint_sink.last() {
+        Some(OperationEffect::Started {
+            key_receipt: Some(receipt),
+            ..
+        }) => receipt.key,
+        other => panic!("first init binds a receipt, got {other:?}"),
+    };
+
+    // The competing init ends the shared context cancelled, then
+    // starts its own — in that order, on the same key.
+    let second = ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &second,
+    );
+    let tail = &joint_sink[joint_sink.len() - 2..];
+    let (end_id, end_category, end_outcome, _) = ended(&tail[0]);
+    assert_eq!(
+        (end_id, end_category, end_outcome),
+        (id1, "message_sign", OperationOutcome::Cancelled)
+    );
+    let (id2, start_category, _, _) = started(&tail[1]);
+    assert_eq!(start_category, "message_sign");
+    assert_ne!(id1, id2, "the replacement is a new context");
+    let receipt2 = match &tail[1] {
+        OperationEffect::Started {
+            key_receipt: Some(receipt),
+            ..
+        } => *receipt,
+        other => panic!("replacement binds its own receipt, got {other:?}"),
+    };
+    assert_eq!(receipt2.role, KeyRole::OperationKey);
+    assert_eq!(receipt2.key, key1, "same qualified key, no third key");
+
+    // Another session's update joins nothing: contexts are per-session.
+    let foreign = ShapedS1 {
+        session: Some(SESSION + 100),
+        ..ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture())
+    };
+    let before = joint_sink.len();
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &foreign,
+    );
+    assert_eq!(
+        joint_sink.len(),
+        before,
+        "a foreign-session update joins nothing"
+    );
+
+    let terminal = ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &terminal,
+    );
+    let (end_id, _, outcome, _) = ended(joint_sink.last().expect("final ends the context"));
+    assert_eq!((end_id, outcome), (id2, OperationOutcome::Completed));
+    assert_eq!(
+        (
+            joint.started(),
+            joint.completed(),
+            joint.cancelled(),
+            joint.orphans()
+        ),
+        (2, 1, 1, 1)
+    );
+
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(keyuse.aggregates().len(), 1, "one shared-key bucket");
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("the shared-key bucket");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!(
+        (row.started, row.completed, row.cancelled, row.active),
+        (2, 1, 1, 0)
+    );
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no unknown rows: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
+/// Message units: a cancel naming another operation leaves the
+/// context live; a cancel naming the message operation ends it
+/// cancelled — and the cancel itself invents no keys.
+#[test]
+fn key_operation_message_cancel_ends_context_without_new_keys() {
+    // Mirrors src/semantics.rs (its CKF_* vocabulary is private there).
+    const CKF_SIGN: u64 = 0x0000_0800;
+    const CKF_MESSAGE_SIGN: u64 = 0x0000_0008;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    drive_message_grounding(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+    );
+    let init = ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &init,
+    );
+    let (id, _, _, _) = started(joint_sink.last().expect("init starts the context"));
+
+    // A cancel naming another operation leaves the context live.
+    let wrong = ShapedS1 {
+        flags: CKF_SIGN,
+        ..ShapedS1::shaped("C_SessionCancel", CkRv::OK.0, 0, 0)
+    };
+    let before = joint_sink.len();
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &wrong,
+    );
+    assert_eq!(
+        joint_sink.len(),
+        before,
+        "a foreign-flag cancel ends nothing"
+    );
+    assert!(joint.has_live_operations());
+
+    // A cancel naming the message operation ends it cancelled.
+    let cancel = ShapedS1 {
+        flags: CKF_MESSAGE_SIGN,
+        ..ShapedS1::shaped("C_SessionCancel", CkRv::OK.0, 0, 0)
+    };
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &cancel,
+    );
+    let (end_id, category, outcome, _) = ended(joint_sink.last().expect("cancel ends the context"));
+    assert_eq!(
+        (end_id, category, outcome),
+        (id, "message_sign", OperationOutcome::Cancelled)
+    );
+    assert_eq!((joint.started(), joint.cancelled()), (1, 1));
+
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(keyuse.aggregates().len(), 1);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "message_sign")
+        .expect("the cancelled proved context");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!((row.cancelled, row.completed, row.active), (1, 0, 0));
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "the cancel invents no keys: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
+/// Message units: a context the model cannot bind rows unknown-key
+/// with reason `unbound` — and the unknown row still counts
+/// `message_contexts`, one completion per context. The S1Only-direct
+/// twin rows the same unknown unit without object proof.
+#[test]
+fn key_operation_message_unbound_context_rows_message_contexts() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    // Unreadable input: the model explicitly leaves the join
+    // unresolved, so the context starts receipt-less.
+    let unreadable = ShapedS1 {
+        input0: Some((0, 2)),
+        ..ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &unreadable);
+    let success = scene.seal().expect("quantum seals");
+    assert!(
+        success.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Unresolved { .. }
+        )),
+        "the model explicitly leaves the join unresolved"
+    );
+    assert!(
+        success.effects.effects.iter().all(|effect| !matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Referenced { .. }
+        )),
+        "no reference to associate"
+    );
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut joint_sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_s1_equal(&joint, &direct);
+    let (id, category, _, _) = started(joint_sink.last().expect("init starts the context"));
+    assert_eq!(category, "message_sign");
+    assert!(
+        matches!(
+            joint_sink.last(),
+            Some(OperationEffect::Started {
+                key_receipt: None,
+                ..
+            })
+        ),
+        "the context started receipt-less"
+    );
+
+    // Updates retain and the final completes — all without a key.
+    for name in ["C_SignMessage", "C_SignMessage"] {
+        let update = ShapedS1::shaped(name, CkRv::OK.0, 0, op_capture());
+        let before = joint_sink.len();
+        drive_message_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+            &mut direct,
+            &mut direct_sink,
+            &update,
+        );
+        assert_eq!(joint_sink.len(), before, "{name} retains the context");
+    }
+    let terminal = ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture());
+    drive_message_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+        &mut direct,
+        &mut direct_sink,
+        &terminal,
+    );
+    let (end_id, _, outcome, _) = ended(joint_sink.last().expect("final ends the context"));
+    assert_eq!((end_id, outcome), (id, OperationOutcome::Completed));
+
+    assert!(keyuse.aggregates().is_empty(), "no key bound");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "message_sign" && row.reason == "unbound")
+        .expect("the keyless context rows unknown-key");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!((row.completed, row.active), (1, 0));
+
+    // S1Only-direct twin: no object proof, same unknown row and unit.
+    let mut s1only = EdgeSemantics::default();
+    let mut s1only_sink = Vec::new();
+    let mut s1only_keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    let c = init("C_MessageSignInit", 7, RSA_PKCS, 100);
+    feed(&mut s1only, &mut s1only_sink, &c);
+    let c = op("C_SignMessage", 7, 200);
+    feed(&mut s1only, &mut s1only_sink, &c);
+    let c = op("C_MessageSignFinal", 7, 300);
+    feed(&mut s1only, &mut s1only_sink, &c);
+    for effect in &s1only_sink {
+        s1only_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    assert!(s1only_keyuse.aggregates().is_empty());
+    let s1only_staging = JointStaging::select_s1_only();
+    let twin = crate::key_operation_projection::producer::commit_with_journal_linked(
+        1,
+        &[&s1only_staging],
+        &scene.model.project(),
+        &s1only_keyuse,
+        true,
+    );
+    assert_eq!(
+        (twin.status, twin.reason),
+        (ObsStatus::Unavailable, "bootstrap_unavailable")
+    );
+    let row = twin
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "message_sign" && row.reason == "unbound")
+        .expect("the S1Only twin rows the same unknown unit");
+    assert_eq!(row.unit, "message_contexts");
+    assert_eq!((row.completed, row.active), (1, 0));
+}
+
+/// Message units at the S1Only-direct seam: every message category's
+/// init/update/cancel flow counts `message_contexts` through the real
+/// reducer and projection, and each category's cancel flag selects
+/// exactly its own context. (The Joint attestation fixture admits
+/// only the message_sign spellings, so the sibling categories and
+/// update spellings pin here, where no H3 admission is needed — the
+/// same S1Only path fallback feeds reduce.)
+#[test]
+fn key_operation_message_all_categories_count_contexts_direct() {
+    // Mirrors src/semantics.rs (its CKF_* vocabulary is private there).
+    let matrix = [
+        (
+            "C_MessageEncryptInit",
+            "C_EncryptMessage",
+            0x0000_0002u64,
+            AES_GCM,
+            "message_encrypt",
+        ),
+        (
+            "C_MessageDecryptInit",
+            "C_DecryptMessage",
+            0x0000_0004u64,
+            AES_GCM,
+            "message_decrypt",
+        ),
+        (
+            "C_MessageSignInit",
+            "C_SignMessageBegin",
+            0x0000_0008u64,
+            RSA_PKCS,
+            "message_sign",
+        ),
+        (
+            "C_MessageVerifyInit",
+            "C_VerifyMessageNext",
+            0x0000_0010u64,
+            RSA_PKCS,
+            "message_verify",
+        ),
+    ];
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut assoc_ledger = StagingLedger::new();
+    let mut s1only = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+
+    let mut ts = 100u64;
+    for (init_fn, update_fn, flag, mechanism, category) in &matrix {
+        let c = init(init_fn, 7, *mechanism, ts);
+        ts += 100;
+        let effects = feed(&mut s1only, &mut sink, &c);
+        assert_eq!(effects.len(), 1, "{init_fn} starts its context");
+        let (id, started_category, _, _) = started(&effects[0]);
+        assert_eq!(started_category, *category);
+
+        let c = op(update_fn, 7, ts);
+        ts += 100;
+        let effects = feed(&mut s1only, &mut sink, &c);
+        assert!(effects.is_empty(), "{update_fn} retains the context");
+
+        let mut c = call("C_SessionCancel", 7, CkRv::OK.0, ts);
+        ts += 100;
+        c.flags = *flag;
+        let effects = feed(&mut s1only, &mut sink, &c);
+        assert_eq!(effects.len(), 1, "the matching flag ends the context");
+        let (end_id, end_category, outcome, _) = ended(&effects[0]);
+        assert_eq!(
+            (end_id, end_category, outcome),
+            (id, *category, OperationOutcome::Cancelled)
+        );
+    }
+    // One sibling completion, so `completed` units pin beyond cancel.
+    let c = init("C_MessageVerifyInit", 7, RSA_PKCS, ts);
+    let effects = feed(&mut s1only, &mut sink, &c);
+    assert_eq!(effects.len(), 1);
+    let c = op("C_VerifyMessage", 7, ts + 100);
+    assert!(feed(&mut s1only, &mut sink, &c).is_empty());
+    let c = op("C_MessageVerifyFinal", 7, ts + 200);
+    let effects = feed(&mut s1only, &mut sink, &c);
+    assert_eq!(effects.len(), 1);
+    assert_eq!(ended(&effects[0]).2, OperationOutcome::Completed);
+
+    assert!(
+        sink.iter()
+            .all(|effect| !matches!(effect, OperationEffect::DirectCompleted { .. })),
+        "message flows never complete direct"
+    );
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    assert!(keyuse.aggregates().is_empty(), "no key bound");
+    let scene = JointScene::new();
+    let s1only_staging = JointStaging::select_s1_only();
+    let committed = crate::key_operation_projection::producer::commit_with_journal_linked(
+        1,
+        &[&s1only_staging],
+        &scene.model.project(),
+        &keyuse,
+        true,
+    );
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Unavailable, "bootstrap_unavailable")
+    );
+    for (_, _, _, _, category) in &matrix {
+        let row = committed
+            .unknown_key_operations
+            .iter()
+            .find(|row| row.category == *category && row.reason == "unbound")
+            .expect("every message category rows its unit");
+        assert_eq!(row.unit, "message_contexts");
+        let completed = u64::from(*category == "message_verify");
+        assert_eq!(
+            (row.completed, row.cancelled, row.active),
+            (completed, 1, 0),
+            "{category}: one terminal per context"
+        );
+    }
 }
 
 // ==================== Checkbox 3: key receipts and rows ====================

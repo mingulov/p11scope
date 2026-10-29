@@ -785,22 +785,10 @@ static void check_scope_gap(void)
 }
 #endif
 
-/* Packet 6.14 phase 1 (Option A RED): local mirror of the A1 exit-summary
- * struct. The header carries the authority from GREEN; this mirror and the
- * weak declaration below are deleted there. */
-struct instance_exit_summary {
-    u64 slot_plus1[INST_RECORD_SLOTS];
-    u64 flags;
-};
-_Static_assert(sizeof(struct instance_exit_summary) == 72, "exit summary ABI");
-__attribute__((weak)) u32 p11_instance_exit_summary(struct instance_exit_summary *out);
-
+/* Packet 6.14 (Option A): the exit-summary struct and helper come from
+ * instance_epoch.h/.c via the include above. */
 static void check_exit_summary(void)
 {
-    /* RED-only probe: the helper is absent until A1 GREEN, so the weak
-     * reference is null and the harness fails at runtime (never a link
-     * error). GREEN deletes this probe. */
-    assert(p11_instance_exit_summary != 0 && "exit summary helper absent");
     struct instance_exit_summary out;
     /* No record: a no-create read contributes zero slots and no flags. */
     reset();
@@ -835,6 +823,7 @@ static void check_exit_summary(void)
     assert(out.flags == 0x40);
     reset();
     record_present[0] = 1;
+    current_task = &leader; /* the exiting thread is the leader */
     leader.group_leader = 0;
     memset(&out, 0xa5, sizeof(out));
     assert(p11_instance_exit_summary(&out) == 0);

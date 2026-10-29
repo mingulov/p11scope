@@ -10,11 +10,13 @@
 /* Scripted compare-exchange: the next `cas_lose` rounds are lost races. */
 static int cas_lose;
 static unsigned long long cas_calls;
-#ifdef P11SCOPE_JOURNAL_MARKER
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 #include "journal_marker.h"
+static unsigned exec_id_reads;
+#endif
+#ifdef P11SCOPE_JOURNAL_MARKER
 /* The birth marker counts exec-ID reads through the production seam:
  * the gap path must never read one. */
-static unsigned exec_id_reads;
 #define INST_MARKER_EXEC_ID(leader) (exec_id_reads++, (leader)->self_exec_id)
 /* A scripted scope gap landing between the birth's gen store and its
  * publication CAS: the victim cell is dirtied, so our compare fails. */
@@ -44,7 +46,7 @@ static unsigned long long test_cas(unsigned long long *cell, unsigned long long 
     return seen;
 }
 #include "instance_epoch.c"
-#ifdef P11SCOPE_JOURNAL_MARKER
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 /* The real marker leaves over a host control cell served by the
  * scripted lookup below; the BPF map definition stays out. */
 #define P11SCOPE_JOURNAL_MARKER_NO_MAPS
@@ -213,7 +215,7 @@ static void *lookup(void *map, const void *key)
         return index == 0 ? &calib : 0;
     if (map == &INSTANCE_COUNT)
         return index == 0 ? &counters : 0;
-#ifdef P11SCOPE_JOURNAL_MARKER
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
     if (map == &JOURNAL_MARKER_CTL)
         return !marker_ctl_missing && index == 0 ? &marker_ctl_cell : 0;
 #endif
@@ -298,10 +300,12 @@ static void reset(void)
     memset(slot_file, 0, sizeof(slot_file));
     memset(start_used, 0, sizeof(start_used));
     start_update_fail = 0;
-#ifdef P11SCOPE_JOURNAL_MARKER
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
     memset(&marker_ctl_cell, 0, sizeof(marker_ctl_cell));
     marker_ctl_missing = 0;
     exec_id_reads = 0;
+#endif
+#ifdef P11SCOPE_JOURNAL_MARKER
     dirty_interleave_armed = 0;
     dirty_interleave_cell = 0;
     leader.self_exec_id = 0;
@@ -643,6 +647,9 @@ static void check_exec_birth(void)
     assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
 }
 
+#endif
+
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 static void check_scope_gap(void)
 {
     /* Closure gate: gen 0 writes nothing, charges nothing, faults nothing. */
@@ -651,6 +658,11 @@ static void check_scope_gap(void)
     assert(p11_instance_scope_gap() == 0);
     assert(!storage_creates && !marker_ctl_cell.spent && !marker_ctl_cell.failed);
     assert(!gen[INST_GEN_FAULT] && !exec_id_reads);
+    reset();
+    gen_missing = 1;
+    assert(p11_instance_scope_gap() == 0);
+    assert(!storage_creates && !marker_ctl_cell.spent && !marker_ctl_cell.failed);
+    assert(!gen[INST_GEN_FAULT] && !counters.faults && !exec_id_reads);
     /* A missing control row cannot latch: nothing is allocated. */
     reset();
     gen[INST_GEN_ATTACH] = 7;
@@ -687,6 +699,10 @@ static void check_scope_gap(void)
     assert(marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
     assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
     assert(!gen[INST_GEN_FAULT] && !exec_id_reads);
+    assert(p11_instance_scope_gap() == 1);
+    assert(storage_creates == 1 && marker_ctl_cell.spent == 1 && !marker_ctl_cell.failed);
+    assert(records[0].journal_bootstrap == P11_JOURNAL_MARKER_DIRTY);
+    assert(!gen[INST_GEN_FAULT] && !counters.faults);
 
     /* Existing word 0: charge, DIRTY. */
     reset();
@@ -741,6 +757,9 @@ static void check_scope_gap(void)
     assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
     assert(!record_present[0]);
     assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
+    assert(p11_instance_scope_gap() == 0);
+    assert(marker_ctl_cell.spent == 1 && marker_ctl_cell.failed == 1);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
 
     /* After the latch: no-op with no further fault. */
     reset();
@@ -755,16 +774,18 @@ static void check_scope_gap(void)
     /* The gap path never reads the exec ID. */
     reset();
     gen[INST_GEN_ATTACH] = 7;
+#ifdef P11SCOPE_JOURNAL_MARKER
     leader.self_exec_id = 0xdeadbeef;
+#endif
     assert(p11_instance_scope_gap() == 1);
     record_present[0] = 1;
     records[0].journal_bootstrap = ((9ULL << 2) | 2ULL);
     assert(p11_instance_scope_gap() == 1);
-    assert(!exec_id_reads);
+    assert(!exec_id_reads && !reads);
 }
 #endif
 
-int main(void)
+int main(int argc, char **argv)
 {
     stop_gate_map_lookup = lookup;
     bpf_get_current_task_btf = birth_current_task;
@@ -777,6 +798,19 @@ int main(void)
     inst_current_task = task;
     leader.group_leader = &leader;
     leader.mm = &mm;
+    if (argc != 1) {
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
+        if (argc == 2 && !strcmp(argv[1], "scope-gap")) {
+            check_scope_gap();
+            puts("instance scope gap: retained DIRTY/latch controls verified");
+            return 0;
+        }
+#else
+        (void)argv;
+#endif
+        fputs("unknown instance fixture selector\n", stderr);
+        return 2;
+    }
     denied_scope_shared_mm_birth();
 
     /* A disabled/poisoned image may never leave a joinable entry stamp. */
@@ -995,6 +1029,8 @@ int main(void)
     assert(records[0].flags == INST_RECORD_OVERFLOW && records[0].exec_attach_gen == 9);
 #ifdef P11SCOPE_JOURNAL_MARKER
     check_exec_birth();
+#endif
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
     check_scope_gap();
 #endif
 

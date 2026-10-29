@@ -7566,14 +7566,18 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
     let directory = tempfile::tempdir().expect("temporary native instance test");
     // Both state sizes (F5): the small-state build must shrink
     // INSTANCE_START (pinned by a static assert in the harness) while the
-    // native hook logic passes unchanged. Both marker modes (H8-D): the
-    // marker build runs the birth and gap tests, while the marker-off
-    // build keeps today's exec assertions, which cover counter flavors.
+    // native hook logic passes unchanged. GAP supplies only loss marking;
+    // MARKER also runs the existing exec-birth controls. Ordinary builds
+    // keep their existing exec assertions and expose no gap selector.
     for small in [false, true] {
-        for marker in [false, true] {
-            let binary = directory.path().join(format!(
-                "instance-epoch-tests-small-{small}-marker-{marker}"
-            ));
+        for (mode, flag) in [
+            ("ordinary", None),
+            ("gap", Some("-DP11SCOPE_JOURNAL_GAP")),
+            ("marker", Some("-DP11SCOPE_JOURNAL_MARKER")),
+        ] {
+            let binary = directory
+                .path()
+                .join(format!("instance-epoch-tests-small-{small}-{mode}"));
             let mut compiler = Command::new("clang-18");
             compiler.args([
                 "-O2",
@@ -7589,9 +7593,7 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
             if small {
                 compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
             }
-            if marker {
-                compiler.arg("-DP11SCOPE_JOURNAL_MARKER");
-            }
+            compiler.args(flag);
             let compile = compiler
                 .arg("-o")
                 .arg(&binary)
@@ -7599,18 +7601,130 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
                 .expect("execute clang-18 for native instance regression");
             assert!(
                 compile.status.success(),
-                "native compile failed (small={small} marker={marker}): {}",
+                "native compile failed (small={small} mode={mode}): {}",
                 String::from_utf8_lossy(&compile.stderr)
             );
-            let run = Command::new(binary)
+            let run = Command::new(&binary)
                 .output()
                 .expect("execute native instance regression");
             assert!(
                 run.status.success(),
-                "native instance regression failed (small={small} marker={marker}): {}",
+                "native instance regression failed (small={small} mode={mode}): {}",
                 String::from_utf8_lossy(&run.stderr)
             );
+            let gap = Command::new(&binary).arg("scope-gap").output().unwrap();
+            if mode == "ordinary" {
+                assert_eq!(gap.status.code(), Some(2));
+            } else {
+                assert!(
+                    gap.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&gap.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&gap.stdout)
+                        .contains("instance scope gap: retained DIRTY/latch controls verified")
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn instance_epoch_journal_gap_selector_keeps_birth_and_exec_reads_separate() {
+    let directory = tempfile::tempdir().expect("native selector objects");
+    for (mode, flag, gap, birth) in [
+        ("ordinary", None, false, false),
+        ("gap", Some("-DP11SCOPE_JOURNAL_GAP"), true, false),
+        ("marker", Some("-DP11SCOPE_JOURNAL_MARKER"), true, true),
+    ] {
+        let preprocessed = Command::new("clang-18")
+            .args([
+                "-target",
+                "bpf",
+                "-E",
+                "-P",
+                "-dD",
+                "-I",
+                "crates/ebpf/native",
+            ])
+            .args(flag)
+            .arg("crates/ebpf/native/instance_epoch.c")
+            .output()
+            .expect("preprocess actual native selector");
+        assert!(preprocessed.status.success());
+        let source = String::from_utf8(preprocessed.stdout).unwrap();
+        for (name, expected) in [
+            ("u32 p11_instance_scope_gap(void)", gap),
+            ("void marker_latch(", gap),
+            ("extern unsigned char JOURNAL_MARKER_CTL;", gap),
+            ("u32 p11_instance_exec_birth(void)", birth),
+            ("self_exec_id", birth),
+            ("#define INST_MARKER_EXEC_ID(", birth),
+        ] {
+            assert_eq!(source.contains(name), expected, "{mode}: {name}");
+        }
+        assert!(!source.contains("probe_read_user"), "{mode}: new user read");
+        let object = directory.path().join(format!("instance-{mode}.o"));
+        let compiled = Command::new("clang-18")
+            .args([
+                "-target",
+                "bpf",
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-c",
+                "-I",
+                "crates/ebpf/native",
+            ])
+            .args(flag)
+            .arg("crates/ebpf/native/instance_epoch.c")
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .expect("compile actual native selector object");
+        assert!(
+            compiled.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let names = |selection: &str| {
+            let output = Command::new("llvm-nm")
+                .arg(selection)
+                .arg(&object)
+                .output()
+                .expect("inspect actual native selector symbols");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+                .collect::<BTreeSet<_>>()
+        };
+        let defined = names("--defined-only");
+        let undefined = names("--undefined-only");
+        assert_eq!(defined.contains("p11_instance_scope_gap"), gap, "{mode}");
+        assert_eq!(defined.contains("p11_instance_exec_birth"), birth, "{mode}");
+        for (name, expected) in [
+            ("JOURNAL_MARKER_CTL", gap),
+            ("p11_journal_marker_reserve", gap),
+            ("p11_journal_marker_dirty", gap),
+            ("p11_journal_marker_publish", birth),
+        ] {
+            assert_eq!(undefined.contains(name), expected, "{mode}: {name}");
+        }
+        // Actual emitted type/debug strings corroborate the preprocessor:
+        // GAP has neither an exec-id field nor a path to the READY publisher.
+        let bytes = fs::read(&object).unwrap();
+        assert_eq!(
+            bytes
+                .windows(b"self_exec_id\0".len())
+                .any(|part| part == b"self_exec_id\0"),
+            birth,
+            "{mode}"
+        );
     }
 }
 

@@ -13,9 +13,9 @@
  * (F1). The hooks read kernel metadata only and emit nothing. */
 #include "instance_epoch.h"
 #include "image_identity_query.h"
-#ifdef P11SCOPE_JOURNAL_MARKER
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 #include "journal_marker.h"
-/* The marker control row lives in the journal_marker unit. */
+/* Shared loss/birth admission row. GAP alone never enables exec birth. */
 extern unsigned char JOURNAL_MARKER_CTL;
 #endif
 
@@ -544,7 +544,9 @@ __attribute__((noinline)) u32 p11_instance_exec(void)
 #ifndef INST_MARKER_EXEC_ID
 #define INST_MARKER_EXEC_ID(leader) (*(volatile u64 *)&(leader)->self_exec_id)
 #endif
+#endif
 
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 /* Sticky failure latch: `failed` is only ever 0->1, so an exchange trips
  * it exactly once and never needs a retry. */
 static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
@@ -553,7 +555,9 @@ static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
         return;
     __sync_lock_test_and_set(&ctl->failed, 1);
 }
+#endif
 
+#ifdef P11SCOPE_JOURNAL_MARKER
 /* H8-D post-attach birth marker, exec half (Detailed only): publish
  * READY(self_exec_id) on the leader's PROC_EPOCH row after closure.
  * p11_instance_exec stays unchanged and runs first; this only marks.
@@ -635,7 +639,9 @@ latch:
     marker_latch(ctl);
     return 0;
 }
+#endif
 
+#if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
 /* H8-D scope gap (Detailed only): a watched call refused for scope or
  * ABI dirties the leader's marker, so a later exec cannot claim the
  * uncaptured prefix as born. Reads no argument, user memory, path,

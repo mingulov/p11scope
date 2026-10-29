@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""H4a matched pre/post userspace identity regression gate (DRIVEN suite).
+"""H4a matched pre/post userspace identity regression gate (RUN suite).
+
+RUN registration runs ``--self-test`` in CI; the live gate runs via the
+manual qualified runner, not DRIVEN.
 
 Compares per-pass userspace confirmation cost of two prebuilt release
 binaries on a frozen holder population past the scan cap: the R-14 pre
@@ -39,7 +42,9 @@ M set, and every sampled pass agrees with the first pre run on
 totals.modules/edges, so ambient provider mappings are tolerated when
 stable but arm divergence fails) AND the V5-34 guards (paired median
 delta <= 5%, bootstrap 95% CI upper <= 10%, 0 count errors) AND the
-wall-clock guard (median post wall <= 110% of median pre wall).
+wall-clock guard (median post wall <= 110% of median pre wall) AND the
+qualifying floor (distinct rounds >= 10, n >= 20/arm) AND matched
+sampled pass indices across arms.
 The spawn check (every holder maps all 8 providers) anchors the
 population; the cross-run totals check needs no absolute edge count.
 Verdict line::
@@ -48,9 +53,15 @@ Verdict line::
         total_reg_pct=<f> coverage=<ok|MISMATCH> median_pct=<f>
         ci95_upper_pct=<f> wall_guard=<ok|FAIL>
 
-Run as a script (qualified runner: scripts/run-h4a-prepost-userspace.py)::
+Qualified 6.16 shape: M=400 holders, K=40 cap, D=30s per run,
+ROUNDS=10 (ABBA/BAAB, 20 samples/arm), POP rebuilt from the current
+ledger. The K=8/M=100 example below is development shape only.
+
+Run as a script (manual qualified runner:
+scripts/run-h4a-prepost-userspace.py)::
 
     python3 -I tests/python/test_h4a_prepost_userspace.py --self-test
+    # Development shape only (K=8/M=100):
     P11SCOPE_H4A_PRE_BIN=... P11SCOPE_H4A_POST_BIN=... P11SCOPE_H4A_POP=... \\
         P11SCOPE_H4A_K=8 P11SCOPE_H4A_M=100 \\
         python3 -I tests/python/test_h4a_prepost_userspace.py -v
@@ -101,6 +112,8 @@ TOTAL_REG_BAR = 5.0
 MEDIAN_BAR = 5.0
 CI_UPPER_BAR = 10.0
 WALL_BAR = 1.10
+QUALIFYING_ROUNDS = 10
+QUALIFYING_N_PER_ARM = 20
 
 TIMING_LINE = re.compile(r"p11scope: pass (\d+): stage timings: (.+)")
 OP_VALUE = re.compile(r"(\S+)\s+([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s)")
@@ -145,16 +158,24 @@ def parse_event_log(path):
     """(pass_committed events in order, ended event). Rotation fails closed."""
     committed = []
     ended = None
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            if record.get("kind") == "pass_committed":
-                committed.append(record["event"])
-            elif record.get("kind") == "ended":
-                ended = record["event"]
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise H4aError(
+                        f"{path}: bad JSON line ({exc})"
+                    ) from exc
+                if record.get("kind") == "pass_committed":
+                    committed.append(record["event"])
+                elif record.get("kind") == "ended":
+                    ended = record["event"]
+    except OSError as exc:
+        raise H4aError(f"{path}: cannot read event log ({exc})") from exc
     if ended is None:
         raise H4aError(f"{path}: missing ended record (truncated stream?)")
     rotations = ended.get("stream", {}).get("rotations", 0)
@@ -172,8 +193,16 @@ def parse_event_log(path):
 
 def parse_final_callers(path):
     """Caller pid set plus raw caller rows of the final JSON."""
-    with open(path, encoding="utf-8") as handle:
-        document = json.load(handle)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            try:
+                document = json.load(handle)
+            except json.JSONDecodeError as exc:
+                raise H4aError(
+                    f"{path}: bad final JSON ({exc})"
+                ) from exc
+    except OSError as exc:
+        raise H4aError(f"{path}: cannot read final JSON ({exc})") from exc
     callers = document.get("callers")
     if not isinstance(callers, list) or not callers:
         raise H4aError(f"{path}: final JSON has no callers")
@@ -350,13 +379,42 @@ def run_arm(config, binary, extra_flags, tag):
     }
 
 
-def evaluate(pre_samples, post_samples, holder_pids):
+def evaluate(pre_samples, post_samples, holder_pids, k=None, m=None,
+             duration=None, rounds_expected=None):
     """Gate verdict over one campaign. Returns (passed, verdict, detail)."""
     count_errors = 0
     problems = []
     if not pre_samples or not post_samples:
         count_errors += 1
         problems.append("empty arm")
+    n_pre = len(pre_samples)
+    n_post = len(post_samples)
+    rounds_observed = len(
+        {s.get("round", 0) for s in [*pre_samples, *post_samples]}
+    )
+    qualifying = (
+        rounds_observed >= QUALIFYING_ROUNDS
+        and n_pre >= QUALIFYING_N_PER_ARM
+        and n_post >= QUALIFYING_N_PER_ARM
+    )
+    if not qualifying:
+        problems.append(
+            f"non-qualifying shape: rounds={rounds_observed} "
+            f"n_pre={n_pre} n_post={n_post} "
+            f"(need >={QUALIFYING_ROUNDS} rounds, "
+            f">={QUALIFYING_N_PER_ARM}/arm)"
+        )
+    pre_passes = sorted({s.get("pass") for s in pre_samples})
+    post_passes = sorted({s.get("pass") for s in post_samples})
+    pass_match = True
+    if pre_samples and post_samples and set(pre_passes) != set(post_passes):
+        pass_match = False
+        problems.append(
+            f"sampled pass indices diverge: pre={pre_passes} "
+            f"post={post_passes}"
+        )
+    if m is None:
+        m = len(holder_pids)
     holder_set = set(holder_pids)
     coverage_ok = True
     baseline = None
@@ -417,6 +475,8 @@ def evaluate(pre_samples, post_samples, holder_pids):
         ("ci95<=10%", ci95_upper_pct <= CI_UPPER_BAR),
         ("count-errors==0", count_errors == 0),
         ("wall", wall_ok),
+        ("qualifying-shape", qualifying),
+        ("pass-match", pass_match),
     ]
     failed = [name for name, held in gates if not held]
     passed = not failed
@@ -431,6 +491,10 @@ def evaluate(pre_samples, post_samples, holder_pids):
     detail = {
         "gates": gates, "failed": failed, "problems": problems,
         "n_pre": len(pre_samples), "n_post": len(post_samples),
+        "pre_passes": pre_passes, "post_passes": post_passes,
+        "k": k, "m": m, "duration": duration,
+        "rounds_observed": rounds_observed,
+        "rounds_expected": rounds_expected,
     }
     return passed, verdict, detail
 
@@ -487,9 +551,12 @@ def make_sample(tag, confirm_ns, total_ns, wall_ns, holder_pids,
     }
 
 
-def good_campaign(holders=10, rounds=2, confirm=1_000_000_000.0,
+def good_campaign(holders=10, rounds=10, confirm=1_000_000_000.0,
                   total=1_800_000_000.0, drift=0.0):
-    """Two-arm synthetic campaign with equal coverage and `drift` uplift."""
+    """Two-arm synthetic campaign with equal coverage and `drift` uplift.
+
+    Defaults to the qualifying shape: 10 rounds, 20 samples/arm.
+    """
     holder_pids = list(range(1000, 1000 + holders))
     pre, post = [], []
     for rnd in range(1, rounds + 1):
@@ -520,9 +587,15 @@ class H4aGateTests(unittest.TestCase):
         if len(frozen) != config.holders:
             self.fail(f"H4A FAIL (frozen population {len(frozen)} "
                       f"!= M={config.holders})")
-        passed, verdict, detail = evaluate(pre, post, frozen)
-        print(f"h4a: rounds={config.rounds} n_pre={detail['n_pre']} "
-              f"n_post={detail['n_post']} {verdict}", flush=True)
+        passed, verdict, detail = evaluate(
+            pre, post, frozen, k=config.cap, m=config.holders,
+            duration=config.duration, rounds_expected=config.rounds,
+        )
+        print(f"h4a: rounds={config.rounds} K={config.cap} "
+              f"M={config.holders} duration={config.duration} "
+              f"n_pre={detail['n_pre']} n_post={detail['n_post']} "
+              f"pre_passes={detail['pre_passes']} "
+              f"post_passes={detail['post_passes']} {verdict}", flush=True)
         for problem in detail["problems"]:
             print(f"h4a: problem: {problem}", flush=True)
         self.assertTrue(passed, verdict)
@@ -623,6 +696,28 @@ class H4aParserTests(unittest.TestCase):
         self.assertTrue(passed, f"{verdict} {detail['problems']}")
         self.assertIn("H4A PASS", verdict)
 
+    def test_single_round_campaign_fails_non_qualifying(self):
+        pre, post, holders = good_campaign(rounds=1, drift=0.01)
+        passed, verdict, detail = evaluate(pre, post, holders)
+        self.assertFalse(passed, verdict)
+        self.assertIn("FAIL", verdict)
+        self.assertTrue(
+            any("non-qualifying shape" in p for p in detail["problems"]),
+            f"{verdict} {detail['problems']}",
+        )
+
+    def test_single_sample_per_arm_fails_non_qualifying(self):
+        holders = list(range(1000, 1010))
+        pre = [make_sample("pre0", 1e9, 1.8e9, 3e9, holders, rnd=1)]
+        post = [make_sample("post0", 1e9, 1.8e9, 3e9, holders, rnd=1)]
+        passed, verdict, detail = evaluate(pre, post, holders)
+        self.assertFalse(passed, verdict)
+        self.assertIn("FAIL", verdict)
+        self.assertTrue(
+            any("non-qualifying shape" in p for p in detail["problems"]),
+            f"{verdict} {detail['problems']}",
+        )
+
     def test_over_budget_campaign_fails(self):
         pre, post, holders = good_campaign(drift=0.20)
         passed, verdict, _ = evaluate(pre, post, holders)
@@ -637,6 +732,83 @@ class H4aParserTests(unittest.TestCase):
                                           "modules": 9, "edges": 850}}
         passed, verdict, detail = evaluate(pre, post, holders)
         self.assertTrue(passed, f"{verdict} {detail['problems']}")
+
+    def test_divergent_sampled_passes_fail(self):
+        pre, post, holders = good_campaign(drift=0.01)
+        for sample in pre:
+            sample["pass"] = 0
+        for sample in post:
+            sample["pass"] = 7
+        passed, verdict, detail = evaluate(pre, post, holders)
+        self.assertFalse(passed, verdict)
+        self.assertIn("FAIL", verdict)
+        self.assertTrue(
+            any("pass" in p and "diverge" in p for p in detail["problems"]),
+            f"{verdict} {detail['problems']}",
+        )
+
+    def test_detail_records_comparability(self):
+        pre, post, holders = good_campaign(drift=0.01)
+        _, _, detail = evaluate(
+            pre, post, holders, k=8, m=10, duration="30s",
+            rounds_expected=10,
+        )
+        for key in ("pre_passes", "post_passes", "k", "m",
+                    "duration", "rounds_observed", "rounds_expected"):
+            self.assertIn(key, detail)
+        self.assertEqual(detail["k"], 8)
+        self.assertEqual(detail["m"], 10)
+        self.assertEqual(detail["duration"], "30s")
+        self.assertEqual(detail["rounds_observed"], 10)
+        self.assertEqual(detail["rounds_expected"], 10)
+
+    def test_docstring_records_run_registration(self):
+        doc = __doc__
+        self.assertIn("RUN", doc)
+        self.assertIn("--self-test", doc)
+        self.assertIn("manual qualified runner", doc)
+        self.assertNotIn("(DRIVEN suite)", doc)
+
+    def test_qualified_runner_references_suite(self):
+        runner = ROOT / "scripts/run-h4a-prepost-userspace.py"
+        text = runner.read_text(encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "run_python_suites",
+            str(ROOT / "scripts/run-python-suites.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state = module.driven_state(
+            text, "test_h4a_prepost_userspace.py",
+            "scripts/run-h4a-prepost-userspace.py",
+        )
+        self.assertEqual(state, "driven")
+
+    def test_missing_event_log_raises_h4aerror(self):
+        with tempfile.TemporaryDirectory(prefix="h4a-missing-") as tmp:
+            missing = str(Path(tmp) / "absent.jsonl")
+            with self.assertRaisesRegex(H4aError, "absent.jsonl"):
+                parse_event_log(missing)
+
+    def test_missing_final_json_raises_h4aerror(self):
+        with tempfile.TemporaryDirectory(prefix="h4a-missing-") as tmp:
+            missing = str(Path(tmp) / "absent.json")
+            with self.assertRaisesRegex(H4aError, "absent.json"):
+                parse_final_callers(missing)
+
+    def test_empty_final_json_raises_h4aerror(self):
+        with tempfile.TemporaryDirectory(prefix="h4a-empty-") as tmp:
+            empty = Path(tmp) / "empty.json"
+            empty.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(H4aError, "empty.json"):
+                parse_final_callers(str(empty))
+
+    def test_malformed_event_log_raises_h4aerror(self):
+        with tempfile.TemporaryDirectory(prefix="h4a-bad-") as tmp:
+            bad = Path(tmp) / "bad.jsonl"
+            bad.write_text("not json\n", encoding="utf-8")
+            with self.assertRaisesRegex(H4aError, "bad.jsonl"):
+                parse_event_log(str(bad))
 
 
 def self_test():

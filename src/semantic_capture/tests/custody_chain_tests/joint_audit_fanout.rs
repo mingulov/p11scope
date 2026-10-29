@@ -11174,7 +11174,7 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     let failure = localized.failure_for_test().unwrap();
     assert_eq!(
         failure.gap,
-        crate::semantics_objects::journal::JournalGap::ImageTainted
+        crate::semantics_objects::journal::JournalGap::DomainTainted
     );
     assert!(
         claims
@@ -11621,7 +11621,7 @@ impl CanonicalFanoutScene {
         } else {
             assert_eq!(
                 frame.failure_for_test().unwrap().gap,
-                crate::semantics_objects::journal::JournalGap::ImageTainted
+                crate::semantics_objects::journal::JournalGap::DomainTainted
             );
         }
         (

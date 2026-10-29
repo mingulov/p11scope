@@ -805,6 +805,18 @@ impl Engine {
         } = prepared;
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         let changed = candidate.plan != self.plan;
+        // Fallible eligibility before any fact mutation: a stale or
+        // retired receipt refuses here and replaces nothing.
+        {
+            let state = self.inventory.as_ref().expect("checked Inventory state");
+            let owner = state
+                .owners
+                .get(&identity.owner)
+                .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?;
+            if owner.serviced_epoch > identity.requested_epoch {
+                bail!("inventory owner serviced a refresh newer than the committed receipt");
+            }
+        }
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -826,14 +838,13 @@ impl Engine {
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
+        // Eligibility was proved before the swap, which cannot retire the
+        // owner, so closing the serviced epoch cannot fail.
         let state = self.inventory.as_mut().expect("checked Inventory state");
         let owner = state
             .owners
             .get_mut(&identity.owner)
-            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?;
-        if owner.serviced_epoch > identity.requested_epoch {
-            bail!("inventory owner serviced a refresh newer than the committed receipt");
-        }
+            .expect("checked retained owner");
         owner.serviced_epoch = identity.requested_epoch;
         let refresh_pending = owner.requested_epoch != owner.serviced_epoch;
         if !refresh_pending {

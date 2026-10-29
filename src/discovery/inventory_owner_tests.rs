@@ -428,11 +428,7 @@ fn stale_reconciliation_refusal_preserves_newer_committed_facts() {
     assert_eq!(new_commit.complete, new_complete);
     assert_eq!(new_commit.serviced_epoch, 2);
     assert!(!new_commit.refresh_pending);
-    assert_actual_provider_facts(
-        &engine.modules,
-        fixture.provider_path(),
-        "newer committed",
-    );
+    assert_actual_provider_facts(&engine.modules, fixture.provider_path(), "newer committed");
     let committed_epochs = engine.inventory_owner_epochs(owner).unwrap();
     assert_eq!(committed_epochs.requested, 2);
     assert_eq!(committed_epochs.serviced, 2);
@@ -502,9 +498,7 @@ fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
         .begin_window(WindowId::new(0), u64::MAX)
         .unwrap();
     let checkpoint_one = engine.budget.checkpoint(window_one.clone()).unwrap();
-    let first_receipt = engine
-        .scan_inventory_owner(&lease_one, &mut guard)
-        .unwrap();
+    let first_receipt = engine.scan_inventory_owner(&lease_one, &mut guard).unwrap();
     engine.budget.finish_scan(checkpoint_one).unwrap();
     engine.budget.finish_window(window_one).unwrap();
     let first_complete = receipt_is_complete(&first_receipt, "epoch-1");
@@ -552,9 +546,7 @@ fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
         .begin_window(WindowId::new(1), u64::MAX)
         .unwrap();
     let checkpoint_two = engine.budget.checkpoint(window_two.clone()).unwrap();
-    let second_receipt = engine
-        .scan_inventory_owner(&lease_two, &mut guard)
-        .unwrap();
+    let second_receipt = engine.scan_inventory_owner(&lease_two, &mut guard).unwrap();
     engine.budget.finish_scan(checkpoint_two).unwrap();
     engine.budget.finish_window(window_two).unwrap();
     let second_complete = receipt_is_complete(&second_receipt, "epoch-2");

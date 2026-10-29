@@ -15092,6 +15092,259 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.discovery_truncated > truncated_before);
 }
 
+/// R57 boundary fixture: both subjects have the same vendor factory and
+/// no standard PKCS#11 exports. Only one returns a real sparse table. Its
+/// private callback executes three times before the target is ended.
+fn exit_loader_subject(
+    private_provider: bool,
+) -> (LoadedSeedProvider, Engine, DiscoveryRecord, ScriptedSession) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("subject.c");
+    let library = dir.path().join("subject.so");
+    let runner = dir.path().join("runner");
+    let ready = dir.path().join("ready");
+    let go = dir.path().join("go");
+    std::fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+typedef unsigned long (*callback)(void *);
+struct table { unsigned char version[2]; callback functions[68]; };
+#ifdef SUBJECT_LIBRARY
+#ifdef PRIVATE_PROVIDER
+static unsigned long hidden_init(void *arg) { (void)arg; return 0; }
+static struct table surface = { {3,2}, { [0] = hidden_init } };
+__attribute__((visibility("default"))) void *VendorSurface(void) { return &surface; }
+#else
+__attribute__((visibility("default"))) void *VendorSurface(void) { return 0; }
+#endif
+#else
+static int signal_ready(const char *path, const char *state, unsigned calls) {
+    FILE *f = fopen(path, "w");
+    if (!f) return 1;
+    int failed = fprintf(f, "%s calls=%u\n", state, calls) < 0;
+    return fclose(f) != 0 || failed;
+}
+int main(int argc, char **argv) {
+    if (argc != 4 || signal_ready(argv[2], "READY", 0)) return 2;
+    while (access(argv[3], F_OK) != 0) usleep(1000);
+    void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return 3;
+    void *(*factory)(void) = (void *(*)(void))dlsym(handle, "VendorSurface");
+    if (!factory) return 4;
+    struct table *t = factory();
+    unsigned calls = 0;
+    if (t) {
+        if (t->version[0] != 3 || t->version[1] != 2 || !t->functions[0]) return 5;
+        for (unsigned i = 1; i < 68; i++) if (t->functions[i]) return 6;
+        for (unsigned i = 0; i < 3; i++) {
+            if (t->functions[0](0) != 0) return 7;
+            calls++;
+        }
+    }
+    if (signal_ready(argv[2], t ? "PRIVATE" : "BENIGN", calls)) return 8;
+    while (access(argv[3], F_OK) == 0) usleep(1000);
+    return 0;
+}
+#endif
+"#,
+    )
+    .unwrap();
+    let mut compile = std::process::Command::new("gcc");
+    compile.args([
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fvisibility=hidden",
+        "-shared",
+        "-fPIC",
+        "-DSUBJECT_LIBRARY",
+    ]);
+    if private_provider {
+        compile.arg("-DPRIVATE_PROVIDER");
+    }
+    assert!(
+        compile
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&runner)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let child = std::process::Command::new(&runner)
+        .arg(&library)
+        .arg(&ready)
+        .arg(&go)
+        .spawn()
+        .unwrap();
+    let mut fixture = LoadedSeedProvider {
+        child,
+        peers: Vec::new(),
+        _dir: dir,
+    };
+    let wait_for = |fixture: &mut LoadedSeedProvider, expected: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if std::fs::read_to_string(&ready).is_ok_and(|line| line == expected) {
+                break;
+            }
+            assert!(
+                fixture.child.try_wait().unwrap().is_none(),
+                "subject exited before its handshake"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "subject readiness timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    wait_for(&mut fixture, "READY calls=0\n");
+    let view = ProcessView::open(ProcessViewId(0), fixture.child.id()).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(fixture.child.id());
+    engine.next_view_id = 1;
+    engine.module_hints = vec![library.clone()];
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    session.counters.loader_hits = 2;
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    let context = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+    let spec = engine
+        .loader_registry
+        .context(context)
+        .unwrap()
+        .spec
+        .clone();
+    let mapping = spec.mapping.as_ref().unwrap();
+    let mut record = loader_record_for(context, fixture.child.id());
+    record.table_ptr = mapping.start + (spec.hook.file_offset - mapping.file_offset);
+    record.hook_ts_ns = engine.views[0].admitted_ns();
+    record.announced_count = 1;
+    std::fs::write(&go, b"go").unwrap();
+    wait_for(
+        &mut fixture,
+        if private_provider {
+            "PRIVATE calls=3\n"
+        } else {
+            "BENIGN calls=0\n"
+        },
+    );
+    // An export-only acquisition intentionally cannot see the private
+    // table. Its empty tables are not negative provider authority.
+    let (metadata, _) = Engine::scan_retained_view_without_memory(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        engine.broad_admit,
+        &mut engine.stage_timings,
+    );
+    let (modules, _, _) = metadata.unwrap();
+    assert_eq!(
+        modules.len(),
+        1,
+        "the hinted subject must actually be examined"
+    );
+    assert_eq!(Path::new(&modules[0].path), library.as_path());
+    assert!(modules[0].tables.is_empty() && modules[0].interfaces.is_empty());
+    assert!(modules[0].exports.is_empty());
+    (fixture, engine, record, session)
+}
+
+fn finish_exit_loader_subject(fixture: &mut LoadedSeedProvider) {
+    std::fs::remove_file(fixture._dir.path().join("go")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = fixture.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subject exit timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Future R57 desired positive, expected RED until the observer has a
+/// provider-free transaction receipt. This draft has not been run. ADD/zero
+/// and empty metadata-only surface currently do not supply that receipt.
+#[test]
+fn exit_loader_balanced_benign_transaction_needs_no_terminal_truncation() {
+    let (mut fixture, mut engine, record, mut session) = exit_loader_subject(false);
+    session.counters.loader_hits = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_records_accepted, 1);
+    finish_exit_loader_subject(&mut fixture);
+    let mut consistent = record;
+    consistent.announced_count = 0;
+    consistent.hook_ts_ns += 1;
+    session.counters.loader_hits = 2;
+    apply_ordinary_batch(&mut engine, &mut session, vec![consistent]).unwrap();
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "R57: balanced benign exit-time work needs a strong settlement receipt; empty metadata is insufficient"
+    );
+}
+
+#[test]
+fn exit_loader_same_metadata_private_sparse_provider_stays_unknown() {
+    let (mut fixture, mut engine, record, mut session) = exit_loader_subject(true);
+    session.counters.loader_hits = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_records_accepted, 1);
+    finish_exit_loader_subject(&mut fixture);
+    let mut consistent = record;
+    consistent.announced_count = 0;
+    consistent.hook_ts_ns += 1;
+    session.counters.loader_hits = 2;
+    apply_ordinary_batch(&mut engine, &mut session, vec![consistent]).unwrap();
+    assert!(
+        engine.discovery_truncated > 0,
+        "balanced states and no standard exports cannot erase a private sparse provider's unread table"
+    );
+}
+
+#[test]
+fn exit_loader_live_balanced_benign_transaction_runs_ordinary_scan() {
+    let (_fixture, mut engine, record, mut session) = exit_loader_subject(false);
+    let mut consistent = record;
+    consistent.announced_count = 0;
+    consistent.hook_ts_ns += 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record, consistent]).unwrap();
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert_eq!(engine.discovery_truncated, 0);
+}
+
 /// Live: `run --pause auto` of a child that dlopens SoftHSM2 captured
 /// 2000/2000 calls with 6-7 confirmed stops, and still read `concrete_gap`
 /// because its loader context's dlopen timing was "unproven". Timing is

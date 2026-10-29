@@ -3097,20 +3097,40 @@ def _outlined_disassembly():
             "lock *(u64 *)(r0 + 0x0) += r5",
         ]
 
-    def entry_body():
-        return (["r6 = r1", "r7 = 0x1",
-                 "*(u64 *)(r10 - 0x20) = r7",
-                 "*(u64 *)(r10 - 0x18) = r7",
-                 "*(u64 *)(r10 - 0x10) = r7",
-                 "r1 = r6", "r2 = r10", "r2 += -0x20"]
+    def cleanup_key(domain):
+        if domain == 1:
+            head = ["call 0xae", "r6 = r0", "r7 = r6", "r7 &= 0xffffff",
+                    "if r7 == 0x0 goto @exit"]
+        else:
+            head = ["call 0xae", "r6 = r0", "if r6 == 0x0 goto @exit"]
+        return head + ["call 0xe", "r1 = r10", "r1 += -0x18",
+                       "*(u64 *)(r1 + 0x0) = r0", "*(u64 *)(r1 + 0x8) = r6",
+                       f"r7 = 0x{domain:x}", "*(u64 *)(r1 + 0x10) = r7"]
+
+    def cleanup_remove():
+        return ["r1 = r10", "r1 += -0x18", "r2 = 0x0"] + call(REMOVE_AT)
+
+    def entry_body(counter_key):
+        return (["r9 = r1"] + cleanup_key(1) + cleanup_remove()
+                + counter_block(counter_key, -4)
+                + ["r7 = 0x1",
+                   "*(u64 *)(r10 - 0x20) = r7",
+                   "*(u64 *)(r10 - 0x18) = r7",
+                   "*(u64 *)(r10 - 0x10) = r7",
+                   "r1 = r9", "r2 = r10", "r2 += -0x20"]
                 + call(INSERT_AT) + ["label:exit", "exit"])
 
-    def return_body(take_at, extra=()):
-        return (["r6 = r1",
-                 "r1 = r10", "r1 += -0x40", "r2 = r6", "r3 = 0x0"]
-                + call(take_at)
-                + ["r1 = r10", "r1 += -0x40", "r2 = r6", "r3 = 0x1"]
-                + call(take_at) + list(extra) + ["label:exit", "exit"])
+    def return_body(take_at, domain, counter_key, removes=1, extra=()):
+        body = ["r9 = r1"] + cleanup_key(domain)
+        for _ in range(removes):
+            body += cleanup_remove()
+        if counter_key is not None:
+            body += counter_block(counter_key, -4)
+        body += (["r1 = r10", "r1 += -0x40", "r2 = r9", "r3 = 0x0"]
+                 + call(take_at)
+                 + ["r1 = r10", "r1 += -0x40", "r2 = r9", "r3 = 0x1"]
+                 + call(take_at) + list(extra) + ["label:exit", "exit"])
+        return body
 
     def take_tail(cell):
         staging = (["r1 = r10", "r1 += -0x48", "r2 = r10", "r2 += -0x18"]
@@ -3215,11 +3235,12 @@ def _outlined_disassembly():
                       "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5",
                       "label:exit", "exit"])
     roots = {
-        "function_list_entry": (entry_body(), 100),
-        "interface_list_entry": (entry_body(), 200),
-        "function_list_return": (return_body(TAKE_EXPORT_AT), 400),
-        "interface_list_return": (return_body(TAKE_EXPORT_AT, ilr_extra), 500),
-        "interface_return": (return_body(TAKE_SELECTION_AT), 600),
+        "function_list_entry": (entry_body(2), 100),
+        "interface_list_entry": (entry_body(2), 200),
+        "function_list_return": (return_body(TAKE_EXPORT_AT, 1, 1), 400),
+        "interface_list_return": (
+            return_body(TAKE_EXPORT_AT, 1, None, removes=2, extra=ilr_extra), 500),
+        "interface_return": (return_body(TAKE_SELECTION_AT, 2, None), 600),
     }
     out = base
     for name, (body, start) in roots.items():
@@ -3244,6 +3265,8 @@ def _outlined_wrapper_self_test():
         raise AssertionError("outlined healthy fixture refused: producer proof")
     if not counter_ownership_contract(object_counter_uses(good)):
         raise AssertionError("outlined healthy fixture refused: counter ownership")
+    if not cookie_object_contract(good):
+        raise AssertionError("outlined healthy fixture refused: cookie proof")
     blocks = function_blocks(good)
     starts = {name: instruction_entries(lines)[0][1] for name, lines in blocks.items()}
 
@@ -3273,6 +3296,16 @@ def _outlined_wrapper_self_test():
     cycle_call = (f"call 0x{starts['function_list_entry'] - 1:x}\n"
                   f"                0000000000000000:  R_BPF_64_32\t.text")
     alias_block = f"0000000000000000 <alias_take>:\n{starts['fixture_take_export_state']}:\texit\n"
+    m3_helper = ("0000000000000000 <m3_helper>:\n"
+                 f"9300:\tcall 0x{starts['function_list_entry'] - 1:x}\n"
+                 "                0000000000000000:  R_BPF_64_32\t.text\n"
+                 "9301:\texit\n")
+    m4_helper = ("0000000000000000 <m4_helper>:\n"
+                 "9400:\t*(u64 *)(r1 + 0x8) = r2\n"
+                 "9401:\texit\n")
+    extended = good + "\n" + m3_helper + m4_helper
+    m3_call = ("call 0x2453\n"
+               "                0000000000000000:  R_BPF_64_32\t.text")
     poisons = [
         ("foreign caller into insert",
          append_call("function_list_return", "fixture_insert_export_state")),
@@ -3315,12 +3348,85 @@ def _outlined_wrapper_self_test():
         ("unproved selection output write",
          mutate("fixture_take_selection_state",
                 "*(u64 *)(r1 + 0x0) = r3", "*(u64 *)(r8 + 0x0) = r3")),
+        ("lock payload store",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r3", "lock *(u64 *)(r1 + 0x0) += r9")),
+        ("lock key-slot store",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x0) = r7", "lock *(u64 *)(r1 + 0x0) += r7")),
+        ("deleted payload word",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x28) = r3", "r3 = r3")),
     ]
     for label, bad in poisons:
         if producer_object_contract(bad):
             raise AssertionError(f"outlined poison accepted by producer: {label}")
         if counter_ownership_contract(object_counter_uses(bad)):
             raise AssertionError(f"outlined poison accepted by ownership: {label}")
+    insert_block = "\n".join(blocks["fixture_insert_export_state"])
+    m3_bad = extended.replace(
+        insert_block, m3_call.join(insert_block.rsplit("r7 = 0x1", 1)), 1)
+    if m3_bad == extended:
+        raise AssertionError("cycle-via-helper mutation did not apply")
+    if producer_object_contract(m3_bad):
+        raise AssertionError("outlined poison accepted by producer: cycle via helper")
+    if counter_ownership_contract(object_counter_uses(m3_bad)):
+        raise AssertionError("outlined poison accepted by ownership: cycle via helper")
+    take_block = "\n".join(blocks["fixture_take_export_state"])
+    take_exit = take_block.splitlines()[-1]
+    take_exit_match = re.match(r"\s*(\d+):\s+exit\s*$", take_exit)
+    if not take_exit_match:
+        raise AssertionError("outlined take fixture does not end with an exit")
+    take_pc = int(take_exit_match.group(1))
+    m4_bad = extended.replace(
+        take_block,
+        take_block.replace(
+            take_exit,
+            f"{take_pc:8}:\tcall 0x24b7\n"
+            "                0000000000000000:  R_BPF_64_32\t.text\n"
+            f"{take_pc + 1:8}:\texit",
+            1,
+        ),
+        1,
+    )
+    if producer_object_contract(m4_bad):
+        raise AssertionError("outlined poison accepted by producer: helper writes output")
+    if counter_ownership_contract(object_counter_uses(m4_bad)):
+        raise AssertionError("outlined poison accepted by ownership: helper writes output")
+    if producer_object_contract(mutate("function_list_entry", "call 0x144f", "r0 = r0")):
+        raise AssertionError("outlined poison accepted by producer: root without cleanup")
+    cookie_poisons = [
+        ("selection domain",
+         mutate("fixture_take_selection_state", "r1 = 0x2", "r1 = 0x1")),
+        ("insert cookie source",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x8) = r7", "*(u64 *)(r1 + 0x8) = r9")),
+        ("take export domain",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r10 - 0x50) = r8", "*(u64 *)(r10 - 0x50) = r0")),
+        ("insert domain",
+         mutate("fixture_insert_export_state",
+                "*(u64 *)(r1 + 0x10) = r7", "*(u64 *)(r1 + 0x10) = r0")),
+    ]
+    for label, bad in cookie_poisons:
+        if cookie_object_contract(bad):
+            raise AssertionError(f"outlined poison accepted by cookie: {label}")
+    if take_block.count("*(u64 *)(r6 + 0x0) = r1") != 4:
+        raise AssertionError("discriminant anchor count changed")
+    no_disc = good.replace(
+        take_block, take_block.replace("*(u64 *)(r6 + 0x0) = r1", "r1 = r1"), 1)
+    if producer_object_contract(no_disc):
+        raise AssertionError("outlined poison accepted by producer: no discriminant")
+    if counter_ownership_contract(object_counter_uses(no_disc)):
+        raise AssertionError("outlined poison accepted by ownership: no discriminant")
+    renamed_wrapper = good.replace(
+        "<fixture_take_export_state>:", "<fixture_take_other_state>:", 1)
+    if renamed_wrapper == good:
+        raise AssertionError("outlined wrapper rename did not apply")
+    if producer_object_contract(renamed_wrapper):
+        raise AssertionError("outlined poison accepted by producer: wrapper rename")
+    if counter_ownership_contract(object_counter_uses(renamed_wrapper)):
+        raise AssertionError("outlined poison accepted by ownership: wrapper rename")
     renamed = good.replace("<interface_list_worker>:", "<renamed_worker>:", 1)
     if renamed == good:
         raise AssertionError("outlined rename mutation did not apply")
@@ -3476,6 +3582,27 @@ Disassembly of section fentry/foreign:
         raise AssertionError("ambiguous sectionless fixture was resolved")
 
 
+def _tail_trusted_facts_miss_self_test():
+    disassembly = (
+        "0000000000000000 <worker>:\n"
+        "0: r1 = 0x5\n"
+        "1: *(u64 *)(r10 - 0x60) = r1\n"
+        "2: call 0xe\n"
+        "                0000000000000010:  R_BPF_64_32\tsome_helper\n"
+        "4: r2 = *(u64 *)(r10 - 0x60)\n"
+        "5: exit\n"
+        "0000000000000000 <some_helper>:\n"
+        "100: exit\n"
+    )
+    calls = internal_call_targets(disassembly)
+    if [target for _, _, pc, target in calls if pc == 2] != [None]:
+        raise AssertionError("named-relocation miss fixture resolved unexpectedly")
+    blocks = function_blocks(disassembly)
+    facts = _tail_trusted_facts(blocks["worker"], calls, blocks)
+    if facts.get(4, {}).get(-0x60) is not None:
+        raise AssertionError("unresolved internal call preserved trusted stack facts")
+
+
 def self_test():
     good = _source()
     source_contract(good)
@@ -3599,6 +3726,7 @@ interface_continuation_pack(count, 0, symbol_id)
     _initializer_polarity_self_test()
     _finite_counter_key_self_test()
     _internal_call_resolution_self_test()
+    _tail_trusted_facts_miss_self_test()
     initializer_mutations = [
         (
             "initializer success branch retarget",

@@ -342,7 +342,7 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     let retire = contract_section(
         owner,
         "static __always_inline long remove_start",
-        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+        "static __always_inline long start_remove_reason",
     )?;
     require_before(
         retire,
@@ -352,22 +352,53 @@ fn assert_start_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     )?;
     let remove = contract_section(
         owner,
-        "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
-        "p11_owner_start_insert(const struct owner_start_key *key",
+        "static __always_inline long start_remove_reason",
+        "__attribute__((noinline)) long p11_owner_start_remove(",
     )?;
     for marker in [
-        "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad",
-        "start_key_valid(owner, key)",
-        "long rc = remove_start(ctl, owner, key);",
+        "if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)",
+        "if (!start_key_valid(owner, key)) {",
+        "long rc = remove_start(ctl, owner, key, reason);",
     ] {
         require_contract_marker(remove, marker, "native START remove")?;
     }
     require_before(
         remove,
-        "long rc = remove_start(ctl, owner, key);",
+        "if (!start_key_valid(owner, key)) {",
+        "long rc = remove_start(ctl, owner, key, reason);",
+        "START key validation before retirement",
+    )?;
+    require_before(
+        remove,
+        "long rc = remove_start(ctl, owner, key, reason);",
         "release_empty(ctl, owner)",
         "START retirement before owner release",
     )?;
+    require_contract_marker(
+        owner,
+        "#ifdef P11SCOPE_OBJECT_JOURNAL\n__attribute__((noinline)) long p11_owner_start_remove_reason(",
+        "journal START remove forwarding",
+    )?;
+    for (start, end, expected, contract) in [
+        (
+            "p11_owner_start_remove(const struct owner_start_key *key, u32 required)",
+            "\n#ifdef P11SCOPE_OBJECT_JOURNAL\n__attribute__((noinline)) long p11_owner_start_remove_reason(",
+            "{\n    return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);\n}",
+            "ordinary START remove forwarding",
+        ),
+        (
+            "p11_owner_start_remove_reason(const struct owner_start_key *key,\n                                                            u32 required, u32 reason)",
+            "\n#endif",
+            "{\n    return start_remove_reason(key, required, reason);\n}",
+            "journal START remove forwarding",
+        ),
+    ] {
+        if contract_section(owner, start, end)?.trim() != expected {
+            return Err(format!(
+                "{contract} must directly preserve its arguments and reason"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -6222,40 +6253,91 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
             .expect_err("the actual scheduler mutation must violate its contract");
         assert!(error.contains(reason), "{reason}: {error}");
     }
-    let remove_start = owner
-        .find("p11_owner_start_remove(const struct owner_start_key *key, u32 required)")
-        .expect("native START remover must exist");
+    let remove_start = between(
+        &owner,
+        "static __always_inline long start_remove_reason",
+        "__attribute__((noinline)) long p11_owner_start_remove(",
+    );
     let slot_bound = "key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad";
-    for (replacement, reason) in [
-        ("key->pad", "omitted slot bound"),
+    for (marker, replacement, reason) in [
+        (slot_bound, "key->pad", "omitted slot bound"),
         (
+            slot_bound,
             "key->slot >= P11SCOPE_OWNER_SLOT_BOUND && key->pad",
             "bypassed slot bound",
         ),
+        (
+            slot_bound,
+            "key->slot >= P11SCOPE_OWNER_SLOT_BOUND",
+            "omitted key pad check",
+        ),
+        (
+            "if (!start_key_valid(owner, key)) {",
+            "if (0) {",
+            "bypassed key validation",
+        ),
+        (
+            "long rc = remove_start(ctl, owner, key, reason);",
+            "long rc = 0;",
+            "skipped START retirement",
+        ),
+        (
+            "long rc = remove_start(ctl, owner, key, reason);",
+            "long rc = remove_start(ctl, owner, key, P11_OWNER_START_REASON_RETURN);",
+            "discarded retirement reason",
+        ),
     ] {
-        let changed_remove = owner[remove_start..].replacen(slot_bound, replacement, 1);
+        assert_eq!(
+            remove_start.matches(marker).count(),
+            1,
+            "{reason} must target the actual shared removal helper"
+        );
+        let changed_remove = remove_start.replacen(marker, replacement, 1);
         assert_ne!(
-            changed_remove,
-            &owner[remove_start..],
+            changed_remove, remove_start,
             "{reason} mutation must change the remover"
         );
-        let changed_owner = format!("{}{}", &owner[..remove_start], changed_remove);
+        let changed_owner = owner.replacen(remove_start, &changed_remove, 1);
+        assert_ne!(changed_owner, owner, "{reason} must change the real source");
         assert!(
             assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner, &flow)
                 .is_err(),
             "native START remover must reject {reason}"
         );
     }
-    let skipped_start_retirement = owner.replacen(
-        "long rc = remove_start(ctl, owner, key);",
-        "long rc = 0;",
-        1,
-    );
-    assert!(
-        assert_static_descriptor_cookie_contract(&attach, &ebpf, &skipped_start_retirement, &flow)
-            .is_err(),
-        "the native START remover must call the ownership-aware retirement helper"
-    );
+    for (forwarding, replacements, contract) in [
+        (
+            "return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);",
+            [
+                "return 0;",
+                "return start_remove_reason(key, P11_OWNER_START_REASON_RETURN, required);",
+                "return start_remove_reason(key, required, P11_OWNER_START_REASON_EXEC_EXIT);",
+            ],
+            "ordinary START remove forwarding",
+        ),
+        (
+            "return start_remove_reason(key, required, reason);",
+            [
+                "return 0;",
+                "return start_remove_reason(key, reason, required);",
+                "return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);",
+            ],
+            "journal START remove forwarding",
+        ),
+    ] {
+        assert_eq!(owner.matches(forwarding).count(), 1, "{contract} is unique");
+        for replacement in replacements {
+            let changed_owner = owner.replacen(forwarding, replacement, 1);
+            assert_ne!(
+                changed_owner, owner,
+                "{contract} mutation changes real code"
+            );
+            let error =
+                assert_static_descriptor_cookie_contract(&attach, &ebpf, &changed_owner, &flow)
+                    .expect_err("bypassed or swapped START forwarding must fail");
+            assert!(error.contains(contract), "{contract}: {error}");
+        }
+    }
     let dropped_return_descriptor = attach.replacen(
         "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),",
         "cookie: Some(attach_cookie(slot.index, 0)),",

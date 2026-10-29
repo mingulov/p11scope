@@ -32,6 +32,7 @@ use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
 
+#[path = "present/render_index.rs"]
 mod render_index;
 pub(crate) use render_index::{PresentationRenderIndex, SemanticChildren};
 

@@ -1,9 +1,12 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private authority carried from retained Inventory inputs to a Detailed lane.
 
+#[path = "semantics/joint.rs"]
 mod joint;
 #[cfg(test)]
+#[path = "semantics/joint_cells.rs"]
 mod joint_cells;
+#[path = "semantics/selected.rs"]
 pub(crate) mod selected;
 
 #[allow(unused_imports)]

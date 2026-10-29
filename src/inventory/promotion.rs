@@ -28,6 +28,7 @@
 //! record each terminal transition it observes in the normal bounded
 //! event/report path; the screen status alone is not that record.
 
+#[path = "promotion/state.rs"]
 mod state;
 
 pub(crate) use state::{
@@ -35,6 +36,7 @@ pub(crate) use state::{
     PromotionState, PromotionStatusUpdate, RequestId, ViewRevision,
 };
 
+#[path = "promotion/lifecycle.rs"]
 pub(crate) mod lifecycle;
 // STAGED (DR37): the driver names these from taken requests; until its
 // wiring lands the re-export is unused.

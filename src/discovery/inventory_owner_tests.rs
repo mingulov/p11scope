@@ -1,7 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
-use crate::discovery::scan::{InventoryRetainedLimits, InventoryWindowLimits};
+use crate::discovery::engine::tests::DiscoveryLifecycleFixture;
+use crate::discovery::scan::{InventoryRetainedLimits, InventoryWindowLimits, WindowId};
 
 fn config(owners: usize, leases: usize) -> InventoryDiscoveryConfig {
     InventoryDiscoveryConfig::new(
@@ -306,4 +307,284 @@ fn generic_refreshes_keep_distinct_dirty_causes_without_retirement() {
     assert_eq!(record.serviced_epoch, 0);
     assert_eq!(record.last_complete_revision, None);
     assert!(engine.retirement_intents.is_empty());
+}
+
+fn pid_scoped_engine(pid: u32) -> Engine {
+    Engine::inventory(
+        config(2, 1),
+        Scope::Pid(pid),
+        HookRegistry::builtin(),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn open_pid_owner(engine: &mut Engine, pid: u32, guard: &mut dyn ImageGuard) -> ProcessViewId {
+    engine.open_inventory_owner(pid, expected(), guard).unwrap()
+}
+
+/// Real receipts only: a deferred or unavailable scan is a failed
+/// prerequisite, never a reconciliation input. Returns whether complete.
+fn receipt_is_complete(receipt: &ScanReceipt, label: &str) -> bool {
+    match receipt {
+        ScanReceipt::Complete(_) => true,
+        ScanReceipt::AdditionsOnly(_) => false,
+        ScanReceipt::Deferred { reason, .. } => {
+            panic!("{label} scan deferred, cannot stage the reconciliation: {reason}")
+        }
+        ScanReceipt::Unavailable { reason, .. } => {
+            panic!("{label} scan unavailable, cannot stage the reconciliation: {reason}")
+        }
+    }
+}
+
+fn assert_actual_provider_facts(
+    modules: &[crate::discovery::identity::ReconciledModule],
+    provider: &std::path::Path,
+    label: &str,
+) {
+    assert!(
+        !modules.is_empty(),
+        "{label} must carry nonempty actual provider facts"
+    );
+    assert!(
+        modules.iter().any(|module| {
+            std::path::Path::new(&module.scanned.path) == provider
+                && !module.scanned.tables.is_empty()
+                && module
+                    .scanned
+                    .exports
+                    .iter()
+                    .any(|export| export == "C_GetFunctionList")
+        }),
+        "{label} must name the owned provider with decoded tables: {modules:?}",
+    );
+}
+
+#[test]
+fn stale_reconciliation_refusal_preserves_newer_committed_facts() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let pid = fixture.pid();
+    let mut engine = pid_scoped_engine(pid);
+    let mut guard = ScriptedImage(ImageCheck::Exact);
+    let owner = open_pid_owner(&mut engine, pid, &mut guard);
+
+    // Epoch 1: the owned child has not mapped its provider yet.
+    engine
+        .request_inventory_refresh(owner, RefreshCause::Periodic)
+        .unwrap();
+    let lease_a = engine.acquire_inventory_scan(owner).unwrap();
+    let window_a = engine
+        .budget
+        .begin_window(WindowId::new(0), u64::MAX)
+        .unwrap();
+    let checkpoint_a = engine.budget.checkpoint(window_a.clone()).unwrap();
+    let old_receipt = engine.scan_inventory_owner(&lease_a, &mut guard).unwrap();
+    engine.budget.finish_scan(checkpoint_a).unwrap();
+    engine.budget.finish_window(window_a).unwrap();
+    let _old_complete = receipt_is_complete(&old_receipt, "pre-load");
+    let old_prepared = engine
+        .prepare_inventory_reconciliation(old_receipt, &mut guard)
+        .unwrap();
+    assert!(
+        old_prepared.candidate().modules.is_empty(),
+        "the pre-load reconciliation must stage no provider facts"
+    );
+    engine.release_inventory_scan(&lease_a).unwrap();
+
+    // The owned child really loads its provider behind the acknowledged barrier.
+    fixture.load();
+
+    // Epoch 2: the provider is mapped; the newer reconciliation commits.
+    engine
+        .request_inventory_refresh(owner, RefreshCause::LoaderHint)
+        .unwrap();
+    let lease_b = engine.acquire_inventory_scan(owner).unwrap();
+    let window_b = engine
+        .budget
+        .begin_window(WindowId::new(1), u64::MAX)
+        .unwrap();
+    let checkpoint_b = engine.budget.checkpoint(window_b.clone()).unwrap();
+    let new_receipt = engine.scan_inventory_owner(&lease_b, &mut guard).unwrap();
+    engine.budget.finish_scan(checkpoint_b).unwrap();
+    engine.budget.finish_window(window_b).unwrap();
+    let new_complete = receipt_is_complete(&new_receipt, "post-load");
+    let new_prepared = engine
+        .prepare_inventory_reconciliation(new_receipt, &mut guard)
+        .unwrap();
+    assert_actual_provider_facts(
+        &new_prepared.candidate().modules,
+        fixture.provider_path(),
+        "post-load prepared",
+    );
+    let new_commit = engine
+        .commit_inventory_reconciliation(new_prepared, &mut guard)
+        .unwrap();
+    engine.release_inventory_scan(&lease_b).unwrap();
+
+    // Prerequisites: the newer commit is real, same-epoch, and complete
+    // exactly when its receipt was.
+    assert_eq!(new_commit.owner, owner);
+    assert_eq!(new_commit.complete, new_complete);
+    assert_eq!(new_commit.serviced_epoch, 2);
+    assert!(!new_commit.refresh_pending);
+    assert_actual_provider_facts(
+        &engine.modules,
+        fixture.provider_path(),
+        "newer committed",
+    );
+    let committed_epochs = engine.inventory_owner_epochs(owner).unwrap();
+    assert_eq!(committed_epochs.requested, 2);
+    assert_eq!(committed_epochs.serviced, 2);
+    assert_eq!(committed_epochs.dirty, 0);
+    assert_eq!(
+        engine.inventory_last_complete(owner).unwrap(),
+        if new_complete { Some(0) } else { None }
+    );
+
+    // Snapshot every committed fact the stale refusal must preserve.
+    let pins = engine.pinned.view_claims(owner).unwrap().clone();
+    let pin_revision = engine.pinned.revision();
+    let pin_debug = format!("{:?}", engine.pinned);
+    let modules = engine.modules.clone();
+    let plan = engine.plan.clone();
+    let bindings = engine.selection_bindings.clone();
+    let claims = engine.selection_claims.clone();
+    let tables = engine.selection_tables.clone();
+    let facts_revision = engine.facts_revision;
+
+    // The stale epoch-1 commit refuses: a newer refresh was serviced.
+    let error = engine
+        .commit_inventory_reconciliation(old_prepared, &mut guard)
+        .expect_err("the stale commit must refuse after a newer commit");
+    assert!(
+        error
+            .to_string()
+            .contains("serviced a refresh newer than the committed receipt"),
+        "{error:#}"
+    );
+
+    // The refusal preserves every newer committed fact.
+    assert_eq!(engine.pinned.view_claims(owner), Some(&pins));
+    assert_eq!(engine.pinned.revision(), pin_revision);
+    assert_eq!(format!("{:?}", engine.pinned), pin_debug);
+    assert_eq!(engine.modules, modules);
+    assert_eq!(engine.plan, plan);
+    assert_eq!(engine.selection_bindings, bindings);
+    assert_eq!(engine.selection_claims, claims);
+    assert_eq!(engine.selection_tables, tables);
+    assert_eq!(engine.facts_revision, facts_revision);
+    assert_eq!(
+        engine.inventory_owner_epochs(owner).unwrap(),
+        committed_epochs
+    );
+    assert_eq!(
+        engine.inventory_last_complete(owner).unwrap(),
+        committed_epochs.complete
+    );
+}
+
+#[test]
+fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let pid = fixture.pid();
+    let mut engine = pid_scoped_engine(pid);
+    let mut guard = ScriptedImage(ImageCheck::Exact);
+    let owner = open_pid_owner(&mut engine, pid, &mut guard);
+
+    // Epoch 1: prepared before the provider is mapped.
+    engine
+        .request_inventory_refresh(owner, RefreshCause::Periodic)
+        .unwrap();
+    let lease_one = engine.acquire_inventory_scan(owner).unwrap();
+    let window_one = engine
+        .budget
+        .begin_window(WindowId::new(0), u64::MAX)
+        .unwrap();
+    let checkpoint_one = engine.budget.checkpoint(window_one.clone()).unwrap();
+    let first_receipt = engine
+        .scan_inventory_owner(&lease_one, &mut guard)
+        .unwrap();
+    engine.budget.finish_scan(checkpoint_one).unwrap();
+    engine.budget.finish_window(window_one).unwrap();
+    let first_complete = receipt_is_complete(&first_receipt, "epoch-1");
+    let first_prepared = engine
+        .prepare_inventory_reconciliation(first_receipt, &mut guard)
+        .unwrap();
+    assert!(
+        first_prepared.candidate().modules.is_empty(),
+        "the epoch-1 reconciliation must stage no provider facts"
+    );
+    engine.release_inventory_scan(&lease_one).unwrap();
+
+    // The provider really loads; epoch 2 is requested but not serviced yet.
+    fixture.load();
+    engine
+        .request_inventory_refresh(owner, RefreshCause::LoaderHint)
+        .unwrap();
+
+    // Committing epoch 1 with a newer request outstanding succeeds and
+    // keeps the newer refresh pending with its dirty causes.
+    let first_commit = engine
+        .commit_inventory_reconciliation(first_prepared, &mut guard)
+        .unwrap();
+    assert_eq!(first_commit.owner, owner);
+    assert_eq!(first_commit.complete, first_complete);
+    assert_eq!(first_commit.serviced_epoch, 1);
+    assert!(first_commit.refresh_pending);
+    let pending_epochs = engine.inventory_owner_epochs(owner).unwrap();
+    assert_eq!(pending_epochs.requested, 2);
+    assert_eq!(pending_epochs.serviced, 1);
+    assert_eq!(
+        pending_epochs.dirty, 3,
+        "Periodic and LoaderHint causes stay dirty"
+    );
+    assert_eq!(
+        engine.inventory_last_complete(owner).unwrap(),
+        if first_complete { Some(0) } else { None }
+    );
+
+    // The later epoch-2 scan really runs and commits: same-epoch success
+    // retains the new provider facts and clears only serviced work.
+    let lease_two = engine.acquire_inventory_scan(owner).unwrap();
+    let window_two = engine
+        .budget
+        .begin_window(WindowId::new(1), u64::MAX)
+        .unwrap();
+    let checkpoint_two = engine.budget.checkpoint(window_two.clone()).unwrap();
+    let second_receipt = engine
+        .scan_inventory_owner(&lease_two, &mut guard)
+        .unwrap();
+    engine.budget.finish_scan(checkpoint_two).unwrap();
+    engine.budget.finish_window(window_two).unwrap();
+    let second_complete = receipt_is_complete(&second_receipt, "epoch-2");
+    let second_prepared = engine
+        .prepare_inventory_reconciliation(second_receipt, &mut guard)
+        .unwrap();
+    let second_commit = engine
+        .commit_inventory_reconciliation(second_prepared, &mut guard)
+        .unwrap();
+    engine.release_inventory_scan(&lease_two).unwrap();
+
+    assert_eq!(second_commit.owner, owner);
+    assert_eq!(second_commit.complete, second_complete);
+    assert_eq!(second_commit.serviced_epoch, 2);
+    assert!(!second_commit.refresh_pending);
+    assert_actual_provider_facts(
+        &engine.modules,
+        fixture.provider_path(),
+        "epoch-2 committed",
+    );
+    let settled_epochs = engine.inventory_owner_epochs(owner).unwrap();
+    assert_eq!(settled_epochs.requested, 2);
+    assert_eq!(settled_epochs.serviced, 2);
+    assert_eq!(settled_epochs.dirty, 0);
+    assert_eq!(
+        engine.inventory_last_complete(owner).unwrap(),
+        if first_complete || second_complete {
+            Some(0)
+        } else {
+            None
+        }
+    );
 }

@@ -7848,7 +7848,7 @@ fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
 /// Real child, /proc reads, offline table acquisition, inventory reconciliation,
 /// and publication. Only the BPF/link adapter is substituted. The child cannot
 /// load or exit until the test acknowledges the preceding engine operation.
-struct DiscoveryLifecycleFixture {
+pub(super) struct DiscoveryLifecycleFixture {
     _dir: tempfile::TempDir,
     provider: PathBuf,
     manifest: PathBuf,
@@ -7921,7 +7921,7 @@ impl DiscoveryLifecycleFixture {
         );
     }
 
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let dir = tempfile::tempdir().expect("a discovery lifecycle fixture directory");
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-lifecycle.c");
@@ -8045,7 +8045,7 @@ impl DiscoveryLifecycleFixture {
         engine
     }
 
-    fn load(&mut self) {
+    pub(super) fn load(&mut self) {
         use std::os::unix::fs::MetadataExt as _;
 
         self.child
@@ -8065,6 +8065,14 @@ impl DiscoveryLifecycleFixture {
                 identity.ino()
             )
         );
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+
+    pub(super) fn provider_path(&self) -> &Path {
+        &self.provider
     }
 
     fn exit_and_reap(&mut self) {

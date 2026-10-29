@@ -658,14 +658,26 @@ lane_mechanism() {
     fi
 }
 
+# SPID is the original child from start_observer. A failed signal probe may
+# mean EPERM while sudo is still live; only reap once its proc entry is gone.
+reap_observer_if_gone() {
+    [ -n "${SPID-}" ] || return 1
+    if kill -0 "$SPID" 2>/dev/null || [ -d "/proc/$SPID" ]; then
+        return 1
+    fi
+    if wait "$SPID"; then OBSERVER_EXIT_STATUS=0; else OBSERVER_EXIT_STATUS=$?; fi
+    SPID=
+    return 0
+}
+
 wait_for_lane_active() {
     wfla_end=$(( $(date +%s) + $2 ))
     while :; do
         if grep -Fq "$LANE_MARKER" "$1" 2>/dev/null; then
             return 0
         fi
-        if [ -n "${SPID-}" ] && ! kill -0 "$SPID" 2>/dev/null; then
-            echo "observer exited before the lane went active: $1" >&2
+        if reap_observer_if_gone; then
+            echo "observer exited before the lane went active: status=$OBSERVER_EXIT_STATUS log=$1" >&2
             tail -n 20 "$1" >&2 2>/dev/null || true
             return 1
         fi
@@ -690,8 +702,8 @@ wait_for_passes() {
         if [ "$wfp_n" -ge "$2" ]; then
             return 0
         fi
-        if [ -n "${SPID-}" ] && ! kill -0 "$SPID" 2>/dev/null; then
-            echo "observer exited before $2 passes committed: $1" >&2
+        if reap_observer_if_gone; then
+            echo "observer exited before $2 passes committed: status=$OBSERVER_EXIT_STATUS log=$1" >&2
             return 1
         fi
         [ "$(date +%s)" -lt "$wfp_end" ] || {

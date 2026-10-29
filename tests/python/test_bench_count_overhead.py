@@ -9,7 +9,12 @@ campaign with integer-exact counts renders a verdict. Run as a script:
     python3 -I tests/python/test_bench_count_overhead.py -v
 """
 import io
+import os
+import re
 import runpy
+import shlex
+import signal
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -20,6 +25,122 @@ ANALYZE = runpy.run_path(str(ROOT / "scripts/bench-count-overhead-analyze.py"))
 
 M2_CELLS = ("relevant-call-t1", "relevant-call-t4", "relevant-call-t12",
             "relevant-call-t12-nolock", "unrelated-mmap")
+
+
+class ObserverReadiness(unittest.TestCase):
+    def run_gate(self, function, mode, *, kill_zero_fails=False):
+        source = (ROOT / "scripts/bench-count-overhead.sh").read_text()
+        # Source only the actual definitions: sourcing the full script would
+        # launch the privileged campaign before these functions are defined.
+        names = ("cleanup", "reap_observer_if_gone", "wait_for_lane_active", "wait_for_passes")
+        definitions = []
+        for name in names:
+            matches = re.findall(r"^" + name + r"\(\) \{\n.*?^\}\n", source, re.M | re.S)
+            self.assertLessEqual(len(matches), 1, name)
+            if name != "reap_observer_if_gone":
+                self.assertEqual(len(matches), 1, name)
+            definitions.extend(matches)
+        marker = re.search(r"^LANE_MARKER=.*$", source, re.M).group()
+        with tempfile.TemporaryDirectory(prefix="count-readiness-") as work:
+            root = Path(work)
+            log, operations = root / "observer.stderr", root / "operations"
+            log.touch()
+            driver = root / "driver.sh"
+            command = (f'{function} "$OBSERVER_LOG" 1' if function == "wait_for_lane_active"
+                       else f'{function} "$OBSERVER_LOG" 2 1')
+            driver.write_text("set -eu\n" + "\n".join(definitions) + "\n" + marker + "\n"
+                + f"OBSERVER_LOG={shlex.quote(str(log))}\nOPERATIONS={shlex.quote(str(operations))}\n"
+                + f"KILL_ZERO_FAILS={int(kill_zero_fails)}\n"
+                + '''WPID= APID= SPID= BPF_STATS_BEFORE= KIND_PAUSED=0
+kill() {
+    printf 'KILL %s\n' "$*" >> "$OPERATIONS"
+    if [ "$1" = -0 ] && [ "$KILL_ZERO_FAILS" = 1 ]; then return 1; fi
+    command kill "$@"
+}
+wait() {
+    printf 'WAIT %s\n' "$*" >> "$OPERATIONS"
+    command wait "$@"
+}
+'''
+                + f". {shlex.quote(str(ROOT / 'scripts/cleanup-traps.sh'))}\n"
+                + ({"exit0": "sh -c 'exit 0' &\n", "exit7": "sh -c 'exit 7' &\n",
+                    "signal": "sh -c 'kill -TERM $$' &\n",
+                    "ready": '''sh -c 'printf "%s\\n" "$2 multi" "p11scope: pass 1: 1 scanned" "p11scope: pass 2: 1 scanned" > "$1"; exec sleep 60' observer "$OBSERVER_LOG" "$LANE_MARKER" &
+''', "live": "sleep 60 &\n"}[mode])
+                + "SPID=$!\nORIGINAL_SPID=$SPID\n"
+                + ("while [ -e \"/proc/$SPID\" ]; do sleep 0.01; done\n"
+                   if mode in ("exit0", "exit7", "signal") else "")
+                + f"if {command}; then ready_status=0; else ready_status=$?; fi\n"
+                + '''printf 'RESULT status=%s spid=%s original=%s\n' "$ready_status" "${SPID:-cleared}" "$ORIGINAL_SPID"
+if [ -e "/proc/$ORIGINAL_SPID" ]; then echo CHILD_PRESENT; else echo CHILD_GONE; fi
+exit "$ready_status"
+''')
+            foreign = subprocess.Popen(["sleep", "60"])
+            process = subprocess.Popen(["sh", str(driver)], cwd=ROOT, start_new_session=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate()
+                    self.fail("actual readiness shell exceeded the 5s fixture bound")
+                self.assertIsNone(foreign.poll(), "readiness or cleanup touched foreign work")
+                row = next(line for line in stdout.splitlines() if line.startswith("RESULT "))
+                fields = dict(part.split("=", 1) for part in row.split()[1:])
+                original = fields["original"]
+                calls = operations.read_text().splitlines()
+                self.assertEqual([line for line in calls if line.startswith("WAIT ")],
+                                 [f"WAIT {original}"], "original child must be reaped once")
+                self.assertFalse(any(str(foreign.pid) in line.split() for line in calls))
+                self.assertFalse(Path(f"/proc/{original}").exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(process.pid, 0)
+                return process.returncode, fields, stdout, stderr, calls
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait()
+                foreign.terminate()
+                foreign.wait(timeout=3)
+
+    def test_early_observer_exit_reports_exact_status_and_stays_failure(self):
+        for function in ("wait_for_lane_active", "wait_for_passes"):
+            for mode, status in (("exit0", 0), ("exit7", 7), ("signal", 143)):
+                with self.subTest(function=function, mode=mode):
+                    rc, fields, stdout, stderr, calls = self.run_gate(function, mode)
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(fields["status"], "1")
+                    self.assertEqual(fields["spid"], "cleared")
+                    self.assertIn(f"status={status}", stderr)
+                    self.assertIn("CHILD_GONE", stdout)
+                    self.assertFalse(any(line.startswith("KILL ") and not line.startswith("KILL -0 ")
+                                         for line in calls))
+
+    def test_ready_observer_keeps_original_child_until_cleanup(self):
+        for function in ("wait_for_lane_active", "wait_for_passes"):
+            with self.subTest(function=function):
+                rc, fields, stdout, stderr, _ = self.run_gate(function, "ready")
+                self.assertEqual(rc, 0, stderr)
+                self.assertEqual(fields["spid"], fields["original"])
+                self.assertIn("CHILD_PRESENT", stdout)
+                self.assertNotIn("observer exited", stderr)
+
+    def test_live_observer_reaches_timeout_even_if_kill_zero_fails(self):
+        for function, message in (("wait_for_lane_active", "lane never went active within 1s"),
+                                  ("wait_for_passes", "only 0/2 passes committed within 1s")):
+            for permission_failure in (False, True):
+                with self.subTest(function=function, permission_failure=permission_failure):
+                    rc, fields, stdout, stderr, _ = self.run_gate(
+                        function, "live", kill_zero_fails=permission_failure)
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(fields["spid"], fields["original"])
+                    self.assertIn("CHILD_PRESENT", stdout)
+                    self.assertIn(message, stderr)
+                    self.assertNotIn("observer exited", stderr)
 
 
 def sample(cell, arm, rnd, threads, ops, wall, **kw):

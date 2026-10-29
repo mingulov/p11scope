@@ -373,7 +373,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
                 let held = frame.as_mut().expect("same original service frame");
-                held.seal_next(&mut ports, &mut births, &fault)
+                held.seal_next_bounded(&mut ports, &mut births, &fault, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
                 held.deliver_next_bounded(&mut ports, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;

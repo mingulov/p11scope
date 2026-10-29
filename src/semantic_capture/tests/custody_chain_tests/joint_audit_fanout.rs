@@ -13480,14 +13480,83 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 .coordinator
                 .joint_frame_ports(&fixture.scene.producers)
                 .unwrap();
+            let mut zero = 0;
+            assert_eq!(
+                q1.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut zero),
+                Err(RawQuantumRefusal::DispositionMismatch),
+                "zero credit still validates the original target binding"
+            );
             q1.bind_targets(&ports).unwrap();
             let mut future = 0;
             let mut delivered = 0;
             for _ in 0..2 {
-                match q1.seal_next(&mut ports, &mut births, &BirthFault).unwrap() {
-                    QuantumSealProgress::AwaitFutureInput => future += 1,
+                let original_progress = q1.consumer_progress_for_test();
+                let seen = births.inner.seen.len();
+                let (registry, owner, _, _) = ports.read();
+                let charged = registry.semantic_resource_snapshot().charged_bytes;
+                let roles = owner.ledger().roles_for_test();
+                let claims = owner.adapter().invocation_claims_for_test();
+                for _ in 0..2 {
+                    assert_eq!(
+                        q1.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut zero),
+                        Ok(QuantumSealProgress::LocalPending)
+                    );
+                    assert_eq!(zero, 0);
+                    assert_eq!(q1.consumer_progress_for_test(), original_progress);
+                    assert_eq!(
+                        births.inner.seen.len(),
+                        seen,
+                        "zero credit takes no native birth"
+                    );
+                    let (registry, owner, _, _) = ports.read();
+                    assert_eq!(registry.semantic_resource_snapshot().charged_bytes, charged);
+                    assert_eq!(owner.ledger().roles_for_test(), roles);
+                    assert_eq!(owner.adapter().invocation_claims_for_test(), claims);
+                }
+                let mut remaining = 1;
+                match q1
+                    .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
+                    .unwrap()
+                {
+                    QuantumSealProgress::AwaitFutureInput => {
+                        future += 1;
+                        assert_eq!(
+                            remaining, 0,
+                            "one real Future transition costs one shared action"
+                        );
+                        assert_eq!(
+                            q1.consumer_progress_for_test(),
+                            (
+                                original_progress.0 - 1,
+                                original_progress.1 + 1,
+                                original_progress.2 + 1
+                            )
+                        );
+                        let advanced = q1.consumer_progress_for_test();
+                        let seen = births.inner.seen.len();
+                        assert_eq!(
+                            q1.seal_next_bounded(
+                                &mut ports,
+                                &mut births,
+                                &BirthFault,
+                                &mut remaining,
+                            ),
+                            Ok(if advanced.0 == 0 {
+                                QuantumSealProgress::AwaitFutureInput
+                            } else {
+                                QuantumSealProgress::LocalPending
+                            })
+                        );
+                        assert_eq!(remaining, 0);
+                        assert_eq!(q1.consumer_progress_for_test(), advanced);
+                        assert_eq!(births.inner.seen.len(), seen);
+                    }
                     QuantumSealProgress::DeliveryReady => {
                         delivered += 1;
+                        assert_eq!(
+                            remaining, 1,
+                            "ordinary delivery keeps its own existing charges"
+                        );
                         assert!(matches!(
                             q1.deliver_next(&mut ports).unwrap(),
                             QuantumSealProgress::LocalPending
@@ -13498,10 +13567,21 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 }
             }
             assert_eq!((future, delivered), (1, 1));
-            assert_eq!(
-                q1.seal_next(&mut ports, &mut births, &BirthFault),
-                Ok(QuantumSealProgress::AwaitFutureInput)
-            );
+            let finished_progress = q1.consumer_progress_for_test();
+            let seen = births.inner.seen.len();
+            let mut remaining = 1;
+            for _ in 0..2 {
+                assert_eq!(
+                    q1.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+                    Ok(QuantumSealProgress::AwaitFutureInput)
+                );
+                assert_eq!(
+                    remaining, 1,
+                    "an already Future consumer is not charged twice"
+                );
+                assert_eq!(q1.consumer_progress_for_test(), finished_progress);
+                assert_eq!(births.inner.seen.len(), seen);
+            }
         }
         drop(births);
         let starts = fixture

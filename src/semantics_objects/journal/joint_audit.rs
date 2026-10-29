@@ -1377,15 +1377,19 @@ impl IngestedJointQuantum {
         )
     }
 
-    pub(crate) fn seal_next(
+    pub(crate) fn seal_next_bounded(
         &mut self,
         ports: &mut JointPublicationPorts<'_>,
         births: &mut impl JointBirthEvidenceSource,
         fault: &impl FaultEpoch,
+        remaining: &mut usize,
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         self.preflight(ports)?;
         if !self.bound {
             return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        if *remaining == 0 {
+            return Ok(self.progress());
         }
         if self.active.is_some() {
             return Ok(QuantumSealProgress::DeliveryReady);
@@ -1485,6 +1489,10 @@ impl IngestedJointQuantum {
             if failure.gap == JournalGap::BoundNotReady
                 && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)
             {
+                // This original target advanced without a delivery. Charge
+                // the same shared slice so later targets and the machine's
+                // no-progress guard observe the actual committed work.
+                *remaining -= 1;
                 self.advance_consumer(ConsumerState::Future);
                 return Ok(QuantumSealProgress::AwaitFutureInput);
             }
@@ -1496,6 +1504,17 @@ impl IngestedJointQuantum {
             _storage: storage,
         });
         Ok(QuantumSealProgress::DeliveryReady)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_next(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        births: &mut impl JointBirthEvidenceSource,
+        fault: &impl FaultEpoch,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut remaining = usize::MAX;
+        self.seal_next_bounded(ports, births, fault, &mut remaining)
     }
 
     /// One shared service budget covers original effects, empty phases,

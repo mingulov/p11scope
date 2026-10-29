@@ -27,7 +27,9 @@ and [H7-E4 attribute capture](#h7-e4-attribute-capture-2026-10-20):
 the H7-E4 read set, the six attribute rows, the finite vocabulary,
 the GetAttributeValue result rules, the output/retention table and
 the [H9 publication section](#object-observations-publication-h9) are
-APPROVED (owner decision OD11, 2026-10-24).**
+APPROVED (owner decision OD11, 2026-10-24),
+and [extensive-mode executable dependency hints](#extensive-mode-executable-dependency-hints-614-option-b-d-transitive),
+which implements the ratified D-transitive hint contract below.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1107,3 +1109,110 @@ caller slots,64 starts/100ms,25ms cooperative job budget,1s target refresh and
 actual old/new immutable frame overlap and retained job/completion ownership.
 Cancellation cannot preempt a blocked kernel operation; its owned job retains
 original custody and reservations until it actually returns and joins.
+
+## Extensive-mode executable dependency hints (6.14 Option B, D-transitive)
+
+**Status: APPROVED (owner ratification 2026-10-29, batch item 5,
+merged P5 text, branch D-transitive; the D-direct branch was
+considered and not ratified).** The rows below are additive in v3
+and precede any B1 capture code. Default capture is OFF
+(`--track-short-lived`, extensive mode); allowlist-v1 is unchanged.
+Option A (kernel exit summaries) needs no decision here and is
+unaffected. All numbers are the ratified initial bounds, stated in
+these rows themselves.
+
+**Row A — Executable identity (extensive mode only).** At
+`sched_process_exec` the kernel reads `current->mm->exe_file`'s
+`(dev, ino)` (kernel file metadata only; no path, argv,
+environment, or user-memory read) into the exec record, only in
+builds/captures with extensive mode armed. With the flag off, no
+exe `(dev, ino)` is recorded anywhere, including counters and
+aggregates — not "captured but unclassified." Any exit↔exec join
+reuses the existing (domain, ticket) discipline, never bare PID.
+Userspace resolves `(dev, ino)` to a path only from paths already
+learned by live scans of observed processes (never a `/proc` walk
+of dead PIDs, never a filesystem search), re-opens that path, and
+requires `fstat` `(dev, ino)` equality with the recorded pair,
+else `unknown`. The opened FD's `(dev, ino, size, mtime(sec,nsec),
+ctime(sec,nsec))` are rechecked for stability around parsing,
+within one identity domain (domains never interchanged,
+`identity.rs` map-files/pinned/probe rules); any change →
+`unknown`. Retention: private capture-local identity/cache tuples
+only; analysis FDs closed on completion/refusal. No executable
+path, inode, digest, cookie, or exec sequence is ever published.
+
+**Row B — Static metadata (span-bounded reader only).** Only ELF
+identification/header, program headers, `PT_DYNAMIC`,
+`DT_NEEDED`, and the bounded dynamic string-table spans needed to
+read them. The whole-file path is forbidden for never-admitted
+executables: no whole-file retention or snapshot reuse. Raw
+names/bytes are transient probe/userspace scratch, discarded
+after classification; only finite verdicts (Row C) are retained.
+No provider execution, no arbitrary section inspection, no
+symbol-table classification of unpinned files. The provider test
+is exact string equality of a `DT_NEEDED` name to the SONAME (or
+basename if no SONAME) of this capture's *pinned watched-provider*
+objects — pinned objects already carry held-file evidence, so
+SONAME equality to them is the complete test; equality to anything
+else, including provider-looking unpinned files, proves nothing
+here.
+
+**Row C — Hint result (finite, scoped, never a verdict).** The
+only published values are per-gap classification counts in
+{`links_provider`, `links_pkcs11_loader`,
+`no_static_link_within_scope`, `unknown`}, where the loader
+vocabulary is exactly one SONAME, `libp11-kit.so.0` (no extensible
+loader list). Every publication is labelled **STATIC HINT**
+including its depth/budget scope (Row D branch). A positive is
+complete when its witnessing needed-entry (D-transitive:
+witnessing chain) was fully read within budget; a negative is
+complete only when the entire in-scope needed set was examined;
+anything else — over-budget, unresolved, malformed, changed,
+unreadable, kernel-thread/zombie shape — is `unknown`, never a
+partial hint presented as complete and never truncation to a
+verdict. A hint is never a call, never a conformance or
+provider-free verdict, and is never merged into observed-call or
+caller-attribution shares (shares-unchanged twin required).
+Absence of a hint excludes nothing: `dlopen`-only, private, and
+sparse provider use are invisible by design and stay honestly
+`no_static_link_within_scope`/`unknown`. Cache hits require
+current same-file proof (Row A recheck) and supply no birth,
+admission, or absence authority. New wire fields/validators
+require coordinated producer/consumer/schema review.
+
+**Row D — Bounds (agreed core).** At most **1 MiB examined per
+executable analysis** and **64 MiB examined per capture**,
+charging every ELF/program/dynamic/string span read including
+duplicates and failed parses, within existing capture
+work/deadline limits (no limit waived for hints). Name strings
+longer than 255 bytes → `unknown`. Retention beyond Row C counts:
+none — `(dev, ino)`→path cache and all ELF bytes are
+capture-end-discarded scratch.
+
+**Row D — Depth + counts (ratified branch D-transitive).**
+Executable at depth 0, `DT_NEEDED` followed through depth 2; at
+most 32 ELF objects and 128 dependency edges per analysis; at
+most 1,024 retained verdict-cache entries per capture; needed
+names resolve *only* against pinned watched-object paths and the
+scan-learned path cache inside retained custody — no
+RUNPATH/LD search, no filesystem walks (an unresolved branch voids
+only the negative, per Row C).
+
+**Implementation notes (narrowing, not broadening).** The kernel
+word is the raw `s_dev` (`dev_t`), never a userspace `st_dev`:
+userspace decodes the kernel kdev_t `(major, minor)` pair and
+compares it against `makedev`-reconstructed `fstat` identity, the
+same decode the watched-file calibration uses. A zero ticket
+never seeds the exe-identity stash, and a stash entry is consumed
+at most once, in timestamp order; the live-comparison half of the
+ticket discipline is inapplicable to dead processes, so PID reuse
+under ring loss remains a documented residual — one reason the
+output is a hint, never evidence. Likewise a file replaced or
+modified between exec and analysis keeps its `(dev, ino)` while
+changing content; the stability recheck defeats racing
+modification, not earlier replacement. The scan-learned path
+cache keeps at most 4,096 entries (no-retain-when-full); the
+verdict cache stores size/mtime/ctime beside each verdict and a
+hit requires all-fields equality. This packet arms Detailed
+captures only (profile/trace/run); inventory arming is a
+follow-up, and inventory captures keep no exe identity.

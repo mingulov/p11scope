@@ -3644,6 +3644,139 @@ fn cgroup_unmatched_exit_overflow_latches_one_lower_bound() {
     );
 }
 
+// Packet 6.14 phase 1 (Option A RED): kind-7 leader-exit-mapping summaries.
+// A4 engine wiring is deferred, so these dispatch through the existing
+// lifecycle path and assert the gap the summary must eventually feed.
+// The kind-7 payload shapes below are inert today and lock in each case's
+// intent; the mapped/unknown split assertions land with A4's ledger API.
+// R57: an exit record is never a completed-observation receipt. Each case
+// owns its completed-call ledger (empty: the process exited before its
+// first binding) and asserts gap/ledger effects only, never a call join.
+const KIND7_EXIT_MAPPINGS: u8 = 7;
+
+fn kind7_exit(pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = KIND7_EXIT_MAPPINGS;
+    exit.pid_tgid = u64::from(pid) << 32;
+    exit.hook_ts_ns = hook_ts_ns;
+    exit
+}
+
+fn cgroup_generation_engine() -> Engine {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine
+}
+
+/// RED: a kind-7 summary naming one watched slot must count its exit gap
+/// (A4 classifies this shape `mapped`).
+#[test]
+fn leader_exit_mappings_single_slot_marks_gap_mapped() {
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
+        std::collections::BTreeSet::new();
+    let mut engine = cgroup_generation_engine();
+    let mut exit = kind7_exit(7101, 11);
+    exit.pointers[0] = 3;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7101, 11));
+    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+}
+
+/// RED: a kind-7 summary with the hooks-refused flag must count its exit
+/// gap as `unknown`, never `mapped` (A4).
+#[test]
+fn leader_exit_mappings_refused_flag_marks_gap_unknown() {
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
+        std::collections::BTreeSet::new();
+    let mut engine = cgroup_generation_engine();
+    let mut exit = kind7_exit(7102, 12);
+    exit.status_flags = 0x40; // DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED (A3)
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7102, 12));
+    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+}
+
+/// RED: a kind-7 summary with SHARED_MM and empty slots must count its
+/// exit gap as `unknown` (A4).
+#[test]
+fn leader_exit_mappings_shared_mm_marks_gap_unknown() {
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
+        std::collections::BTreeSet::new();
+    let mut engine = cgroup_generation_engine();
+    let mut exit = kind7_exit(7103, 13);
+    exit.status_flags = 0x08; // DISCOVERY_STATUS_EXIT_MAP_SHARED_MM (A3)
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7103, 13));
+    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+}
+
+/// RED: a kind-7 summary with OVERFLOW plus named slots must count its
+/// exit gap (A4 still classifies this shape `mapped`: slots win).
+#[test]
+fn leader_exit_mappings_overflow_with_slots_still_mapped() {
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
+        std::collections::BTreeSet::new();
+    let mut engine = cgroup_generation_engine();
+    let mut exit = kind7_exit(7104, 14);
+    exit.pointers[0] = 3;
+    exit.status_flags = 0x10; // DISCOVERY_STATUS_EXIT_MAP_OVERFLOW (A3)
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7104, 14));
+    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+}
+
+/// RED: a kind-7 negative whose watch inserted between exec and exit must
+/// count its exit gap as `unknown`, failing closed (A4 downgrades it).
+#[test]
+fn leader_exit_mappings_late_watch_downgrades_negative_to_unknown() {
+    let completed_calls: std::collections::BTreeSet<(u32, u64)> =
+        std::collections::BTreeSet::new();
+    let mut engine = cgroup_generation_engine();
+    let exit = kind7_exit(7105, 15);
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7105, 15));
+    assert!(completed_calls.is_empty(), "R57: no completed call is joined");
+}
+
+/// Guard: the kind-6 inventory build keeps counting its gap unchanged,
+/// before and after the kind-7 work.
+#[test]
+fn leader_exit_mappings_kind6_inventory_build_still_counts_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(pid) << 32;
+    exit.hook_ts_ns = 1;
+    let mut session = ScriptedSession::with_records([], 0);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+        .expect("a vanished candidate leaves its deferred exit processable");
+
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(pid, 1));
+}
+
 #[test]
 fn system_scope_admits_new_generations_and_counts_unmatched_exits() {
     let first = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();

@@ -514,6 +514,87 @@ fn native_semantic_resource_async_complete_preflights_original_call() {
 }
 
 #[test]
+fn native_semantic_resource_duplicate_pending_redelivery_grows_nothing() {
+    let pending = SemanticCall {
+        rv: CkRv::PENDING.0,
+        ..facts("C_SignEncryptUpdate", 1)
+    };
+    let descriptor = crate::kinds::descriptor(&pending.function).unwrap();
+    let asynchronous = EdgeSemantics::async_charge(&pending, &descriptor);
+    let resources = pool(REDUCER_BASE_CHARGE + asynchronous);
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    edge.observe_with_resources(&pending).unwrap();
+    assert_eq!(edge.resource_usage().pending_calls, 1);
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    let charged = resources.snapshot().charged_bytes;
+    // Redelivery of the live (session, target): first wins with
+    // counted ambiguity — ingress succeeds, reserving nothing new.
+    edge.observe_with_resources(&pending).unwrap();
+    assert_eq!(edge.resource_usage().pending_calls, 1);
+    assert_eq!(resources.snapshot().charged_bytes, charged);
+    assert_eq!(edge.orphans(), 1);
+    assert_eq!(edge.evidence().async_duplicates, 1);
+    assert_eq!(resources.snapshot().refused, 0);
+}
+
+#[test]
+fn native_semantic_resource_ambiguous_complete_preserves_both_records() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let pending = SemanticCall {
+        rv: CkRv::PENDING.0,
+        ..facts("C_SignInit", 1)
+    };
+    let descriptor = crate::kinds::descriptor(&pending.function).unwrap();
+    let asynchronous = EdgeSemantics::async_charge(&pending, &descriptor);
+    let resources = pool(REDUCER_BASE_CHARGE + OPEN_BINDING_CHARGE + 2 * asynchronous);
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    edge.observe_with_resources(&facts("C_OpenSession", 1))
+        .unwrap();
+    edge.observe_with_resources(&pending).unwrap();
+    edge.observe_with_resources(&SemanticCall {
+        target_function: target,
+        async_value: 91,
+        ..facts("C_AsyncGetID", 1)
+    })
+    .unwrap();
+    // The detached key freed the pending slot: a second PENDING for
+    // the same (session, target) queues, so the completion below is
+    // ambiguous (pending + detached both eligible).
+    edge.observe_with_resources(&pending).unwrap();
+    assert_eq!(
+        (
+            edge.resource_usage().pending_calls,
+            edge.resource_usage().detached_calls
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    let charged = resources.snapshot().charged_bytes;
+    edge.observe_with_resources(&SemanticCall {
+        target_function: target,
+        ..facts("C_AsyncComplete", 1)
+    })
+    .unwrap();
+    assert_eq!(
+        (
+            edge.resource_usage().pending_calls,
+            edge.resource_usage().detached_calls
+        ),
+        (1, 1)
+    );
+    assert_eq!(resources.snapshot().charged_bytes, charged);
+    assert_eq!(edge.orphans(), 1);
+    assert_eq!(edge.evidence().async_duplicates, 1);
+    assert_eq!(resources.snapshot().refused, 0);
+}
+
+#[test]
 fn native_semantic_resource_invalidation_does_not_allocate() {
     let resources = pool(REDUCER_BASE_CHARGE + sign_history_charge() + ACTIVE_MACHINE_CHARGE);
     let mut edge = EdgeSemantics::with_resources(&resources).unwrap();

@@ -12970,9 +12970,7 @@ mod tests {
             .position(|step| *step == SessionPreparation::FreezeDeferred("JOURNAL_CLASSES"))
             .unwrap();
         assert!(last_load < classes_freeze);
-        assert!(
-            !expected.contains(&SessionPreparation::LoadCounterPrograms)
-        );
+        assert!(!expected.contains(&SessionPreparation::LoadCounterPrograms));
         for fail_classes in [false, true] {
             let mut seen = Vec::new();
             let mut activated = false;

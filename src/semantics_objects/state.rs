@@ -564,6 +564,84 @@ struct InstanceUsage {
     views: usize,
 }
 
+/// One frozen async input (6.07b deferred mint): the origin-END join
+/// verdict for one input ordinal. Frozen values never change except
+/// `lost`, which death paths set; a lost input yields no receipt at
+/// completion. Raw handle words are never retained: only resolved ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredInput {
+    Absent,
+    Unproven(ObjectGap),
+    Frozen {
+        object: ObjectId,
+        key_use: bool,
+        metadata: super::KeyMetadataFlags,
+        label: Option<super::KeyLabel>,
+        attribution_valid: bool,
+        lost: bool,
+    },
+}
+
+/// A minted deferred origin (6.07b): the frozen receipt vector of one
+/// PENDING origin END, retained model-side until the completion
+/// quantum redeems it or a death path disposes it. S1 records carry
+/// only the origin ticket (the deferred key); the snapshot lives
+/// once, here. No raw handle, async value, or replacement view is
+/// ever consulted at completion time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredOrigin {
+    /// Origin ticket (F1): the cross-side deferred key.
+    ticket: CallToken,
+    /// Origin H0 position (F1): the origin key's admission ordinal.
+    /// First production reader lands with the Q2 seal path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    position: u64,
+    /// Origin catalog function (F1).
+    /// First production reader lands with the Q2 seal path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    function: u32,
+    /// Origin domain (F2).
+    domain: ObjectDomain,
+    /// Snapshot proof generation (F2).
+    generation: u64,
+    /// Acting session incarnation (F3): `None` (with no frozen
+    /// inputs) when resolution was not Live at the origin END.
+    session: Option<SessionIncarnation>,
+    /// Frozen inputs (F4–F6).
+    inputs: [DeferredInput; 2],
+    /// Mint order for oldest-first eviction.
+    sequence: u64,
+}
+
+/// A detached deferred origin (6.07b): the GetID-minted custody form,
+/// mirroring S1 `AsyncId`. `holder` is the current owning session
+/// incarnation (`None` floats — joinable, a live state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetachedDeferred {
+    origin: DeferredOrigin,
+    holder: Option<SessionIncarnation>,
+}
+
+/// Shared-budget charge for one deferred origin (6.07b §§2.2/3.8):
+/// the larger (detached) table form, held for the record's whole
+/// lifetime. The constant stays stable across detach, so the charge
+/// moves with the record keyed by origin ticket — no recharge, no
+/// release — until consumption, eviction or disposal releases it.
+const DEFERRED_ORIGIN_CHARGE: u64 = size_of::<DetachedDeferred>() as u64;
+
+/// Why a deferred custody move was refused (6.07b). Refusals keep the
+/// first origin intact and count ambiguity; they never overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredRefusal {
+    /// No live record for the named key.
+    NoRecord,
+    /// The detached key already names a live origin: first wins.
+    Occupied,
+    /// The origin session's slot scope is Unknown: no exact detached
+    /// key exists (U-4: refuse to detach).
+    UnknownSlot,
+}
+
 /// Debug prints cardinalities and finite gap counts only: no handle, domain
 /// word, cut or epoch.
 pub(super) struct ModelState {
@@ -576,6 +654,22 @@ pub(super) struct ModelState {
     sessions: BTreeMap<SessionIncarnation, SessionRecord>,
     objects: BTreeMap<ObjectId, ViewRecord>,
     pending: BTreeMap<CallToken, PendingCall>,
+    /// Live deferred origins by (origin session, target function):
+    /// PENDING origins awaiting GetID or direct completion (6.07b).
+    deferred_pending: BTreeMap<(SessionIncarnation, u32), DeferredOrigin>,
+    /// Detached deferred origins by (domain, target, value word):
+    /// GetID-minted custody awaiting Join or completion (6.07b).
+    deferred_detached: BTreeMap<(ObjectDomain, u32, u64), DetachedDeferred>,
+    /// Mint order for oldest-first deferred eviction.
+    deferred_sequence: u64,
+    /// Origin tickets whose deferred records were consumed or
+    /// disposed on a path without ledger access (redeem, session
+    /// death): their shared-budget charges release at every disposal
+    /// return with ledger access (invalidation, abandonment,
+    /// session-disposal ends), at the next deferred mint (before its
+    /// charge) and at every prune, so the queue never spans settles
+    /// and a remint observes freed budget.
+    deferred_releases: Vec<u64>,
     /// Live tombstone bindings (usage reporting).
     tombstones: usize,
     /// Tombstone charges still held: a cleared tombstone's charge is
@@ -630,6 +724,10 @@ impl ModelState {
             sessions: BTreeMap::new(),
             objects: BTreeMap::new(),
             pending: BTreeMap::new(),
+            deferred_pending: BTreeMap::new(),
+            deferred_detached: BTreeMap::new(),
+            deferred_sequence: 0,
+            deferred_releases: Vec::new(),
             tombstones: 0,
             tombstone_charges: 0,
             pruned_objects: 0,
@@ -1229,6 +1327,9 @@ impl ModelState {
         for token in doomed {
             self.remove_call(token, ledger);
         }
+        // Consumed or disposed deferred records release here, so
+        // their charges never pin budget past their settle.
+        self.flush_deferred_releases(ledger);
     }
 
     // -----------------------------------------------------------------------
@@ -1328,6 +1429,9 @@ impl ModelState {
         } else if rv == CkRv::GENERAL_ERROR {
             self.retire_scope(call.domain, scope, ObjectGap::AmbiguousOutcome, effects);
         }
+        // Device-loss escalation above may dispose sessions; flush their
+        // queued releases so no dead charge denies later admissions.
+        self.flush_deferred_releases(ledger);
     }
 
     /// Joins and actions of a qualified end. Returns false when the call
@@ -1391,6 +1495,12 @@ impl ModelState {
                 if outcome.may_affect() {
                     self.widen_unknown_session(call, scope, effects);
                 }
+                // 6.07b F3: an Unknown-session PENDING origin mints the
+                // effect with no frozen inputs (no record is stored:
+                // no incarnation key exists). Permanently unknown.
+                if outcome == Outcome::Pending && matches!(call.kind, CallKind::Object(_)) {
+                    self.mint_deferred(token, call, None, interference, effects, ledger);
+                }
                 return;
             }
         };
@@ -1400,7 +1510,25 @@ impl ModelState {
             && call.kind != CallKind::Lifecycle(lifecycle::CLOSE_SESSION)
         {
             self.close_session(s, Some(ObjectGap::SessionContradiction), None, effects);
+            self.flush_deferred_releases(ledger);
             return;
+        }
+
+        // 6.07b: a PENDING object END freezes its origin BEFORE the
+        // action arm runs (destroy-PENDING retires its target below;
+        // joins evaluate pre-mutation, like the Ok path).
+        if outcome == Outcome::Pending && matches!(call.kind, CallKind::Object(_)) {
+            // F3: only a snapshot-proven Live session freezes inputs —
+            // a FirstObserved incarnation never qualifies (a session
+            // bound after entry never joins retroactively).
+            let live = session.filter(|s| {
+                call.snapshot.session == Some(*s)
+                    && self
+                        .sessions
+                        .get(s)
+                        .is_some_and(|record| record.state == SessionState::Live)
+            });
+            self.mint_deferred(token, call, live, interference, effects, ledger);
         }
 
         match call.kind {
@@ -1469,6 +1597,10 @@ impl ModelState {
             // runs, so an invalid acting session stays conservative.
             CallKind::Neutral => {}
         }
+        // Close, close-all, creation-overflow and open-reuse arms
+        // above may dispose sessions; flush their queued releases
+        // before returning.
+        self.flush_deferred_releases(ledger);
     }
 
     /// Boundary effects of a call whose acting session is not known.
@@ -2088,6 +2220,7 @@ impl ModelState {
         view.lifetime = lifetime;
         let (domain, session, handle) = (view.domain, view.session, view.handle);
         self.mark_retired(id, domain);
+        self.mark_deferred_lost(id);
         effects.push(match lifetime {
             Lifetime::Retired(reason) => ObjectEffect::Retired { object: id, reason },
             Lifetime::AccessEnded(reason) => ObjectEffect::AccessEnded { object: id, reason },
@@ -2111,6 +2244,7 @@ impl ModelState {
         view.lifetime = Lifetime::Destroyed;
         let (domain, session, handle) = (view.domain, view.session, view.handle);
         self.mark_retired(id, domain);
+        self.mark_deferred_lost(id);
         effects.push(ObjectEffect::Destroyed { call, object: id });
         if self.domains[&domain].bindings.get(&(session, handle)) == Some(&Binding::View(id)) {
             self.set_binding(domain, session, handle, None);
@@ -2154,6 +2288,7 @@ impl ModelState {
             SessionEnd::Uncertain(reason) => SessionState::Ended(reason),
         };
         let (domain, handle) = (record.domain, record.handle);
+        self.dispose_session_deferred(s);
         let at = self.position(domain);
         self.domains
             .get_mut(&domain)
@@ -2174,6 +2309,259 @@ impl ModelState {
         }
         if let Some(usage) = self.instances.get_mut(&domain.instance_key()) {
             usage.live_sessions -= 1;
+        }
+    }
+
+    /// Mint one deferred origin at a PENDING object END (6.07b
+    /// §2.1–§2.2): the origin ticket, H0 position and catalog function
+    /// (F1), domain and proof generation (F2), acting session
+    /// incarnation or `None` (F3), and per-input frozen verdicts
+    /// (F4–F6). Emits `DeferredMinted` on every mint (even with zero
+    /// frozen inputs); a duplicate key mints nothing and resolves
+    /// `AmbiguousOutcome` instead (first wins).
+    fn mint_deferred(
+        &mut self,
+        token: CallToken,
+        call: &PendingCall,
+        session: Option<SessionIncarnation>,
+        interference: Option<ObjectGap>,
+        effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
+    ) {
+        // F4 key-use rule, per arm exactly as the Ok path: creation
+        // freezes a use only for derive/unwrap; access freezes a use
+        // for Access/OperationImport except GetObjectSize; destroy,
+        // find and attributes never freeze a key use.
+        let key_use = match call.kind {
+            CallKind::Object(action) => match creation_family(action) {
+                Some(CreationFamily::Derive | CreationFamily::Unwrap) => true,
+                Some(_) => false,
+                None => {
+                    matches!(action, ObjectAction::Access | ObjectAction::OperationImport)
+                        && !is_function(call.function, "C_GetObjectSize")
+                }
+            },
+            _ => false,
+        };
+        let mut inputs = [DeferredInput::Absent; 2];
+        if let Some(s) = session {
+            for (index, slot) in inputs.iter_mut().enumerate() {
+                *slot = match call.snapshot.inputs[index] {
+                    OriginState::Absent => DeferredInput::Absent,
+                    OriginState::Unproven(reason) => DeferredInput::Unproven(reason),
+                    OriginState::Settled(id) => match call.inputs[index] {
+                        HandleInput::Value(handle)
+                            if self.domains[&call.domain].bindings.get(&(s, handle))
+                                == Some(&Binding::View(id)) =>
+                        {
+                            match self.objects.get(&id) {
+                                Some(view) => DeferredInput::Frozen {
+                                    object: id,
+                                    key_use,
+                                    metadata: Self::metadata_flags_of(view),
+                                    label: view.label(),
+                                    attribution_valid: view.attribution
+                                        == super::Attribution::Valid,
+                                    lost: false,
+                                },
+                                // The binding names a view the model no
+                                // longer holds: nothing to freeze.
+                                None => DeferredInput::Unproven(ObjectGap::StaleOrigin),
+                            }
+                        }
+                        _ => DeferredInput::Unproven(ObjectGap::StaleOrigin),
+                    },
+                    // F6: the deferred mint NEVER first-observes — no
+                    // `alloc_view` here, however the Ok path reads.
+                    OriginState::Deferred => {
+                        DeferredInput::Unproven(ObjectGap::PendingResultUnavailable)
+                    }
+                };
+            }
+            // F5: the mint runs the interference verdict the Pending
+            // arm skips; any gap voids every non-absent input.
+            if let Some(gap) = interference {
+                for slot in inputs.iter_mut() {
+                    if !matches!(slot, DeferredInput::Absent) {
+                        *slot = DeferredInput::Unproven(gap);
+                    }
+                }
+            }
+        }
+        let Some(s) = session else {
+            // F3: no incarnation key exists, so no record is stored.
+            // Unknown stays unknown, explicitly.
+            effects.push(ObjectEffect::DeferredMinted { call: token });
+            return;
+        };
+        if self.deferred_pending.contains_key(&(s, call.function)) {
+            // First wins: the live record stands; this origin joins
+            // nothing and mints no effect of its own.
+            self.unresolved(effects, token, ObjectGap::AmbiguousOutcome);
+            return;
+        }
+        // Charge-before-insert (§§2.2/3.8): previously consumed or
+        // disposed records release first, so a remint observes freed
+        // budget; an exhausted budget refuses with counted evidence —
+        // no record, no sequence advance, no growth.
+        self.flush_deferred_releases(ledger);
+        if ledger
+            .charge_deferred(token.0, DEFERRED_ORIGIN_CHARGE)
+            .is_err()
+        {
+            self.unresolved(effects, token, ObjectGap::PendingCapacity);
+            return;
+        }
+        self.deferred_sequence = self.deferred_sequence.wrapping_add(1);
+        let sequence = self.deferred_sequence;
+        self.evict_deferred_if_needed(call.domain, ledger);
+        self.deferred_pending.insert(
+            (s, call.function),
+            DeferredOrigin {
+                ticket: token,
+                position: call.key.admission(),
+                function: call.function,
+                domain: call.domain,
+                generation: call.snapshot.generation,
+                session: Some(s),
+                inputs,
+                sequence,
+            },
+        );
+        effects.push(ObjectEffect::DeferredMinted { call: token });
+    }
+
+    /// Oldest-first deferred eviction past the per-domain combined
+    /// bound (6.07b §2.2/§3.8): the model's scope for the shared S1
+    /// `MAX_EDGE_PENDING` bound is the domain, whose custody never
+    /// crosses to another domain. The S1 twin ends the matching
+    /// originating machine Unknown; the model side disposes with
+    /// capacity evidence.
+    fn evict_deferred_if_needed(
+        &mut self,
+        domain: ObjectDomain,
+        ledger: &mut super::journal::StagingLedger,
+    ) {
+        let bound = crate::semantics_edge::MAX_EDGE_PENDING;
+        let held = self
+            .deferred_pending
+            .values()
+            .filter(|record| record.domain == domain)
+            .count()
+            + self
+                .deferred_detached
+                .keys()
+                .filter(|(held, _, _)| *held == domain)
+                .count();
+        if held < bound {
+            return;
+        }
+        let oldest_pending = self
+            .deferred_pending
+            .iter()
+            .filter(|(_, record)| record.domain == domain)
+            .min_by_key(|(_, record)| record.sequence)
+            .map(|(key, record)| (*key, record.sequence));
+        let oldest_detached = self
+            .deferred_detached
+            .iter()
+            .filter(|(key, _)| key.0 == domain)
+            .min_by_key(|(_, detached)| detached.origin.sequence)
+            .map(|(key, detached)| (*key, detached.origin.sequence));
+        match (oldest_pending, oldest_detached) {
+            (Some((key, pending_seq)), Some((detached_key, detached_seq))) => {
+                if pending_seq <= detached_seq {
+                    if let Some(record) = self.deferred_pending.remove(&key) {
+                        ledger.release_deferred(record.ticket.0);
+                    }
+                } else if let Some(detached) = self.deferred_detached.remove(&detached_key) {
+                    ledger.release_deferred(detached.origin.ticket.0);
+                }
+            }
+            (Some((key, _)), None) => {
+                if let Some(record) = self.deferred_pending.remove(&key) {
+                    ledger.release_deferred(record.ticket.0);
+                }
+            }
+            (None, Some((key, _))) => {
+                if let Some(detached) = self.deferred_detached.remove(&key) {
+                    ledger.release_deferred(detached.origin.ticket.0);
+                }
+            }
+            (None, None) => return,
+        }
+        self.gap(ObjectGap::PendingCapacity);
+    }
+
+    /// Release the shared-budget charges of deferred records
+    /// consumed or disposed without ledger access. Idempotent and
+    /// exact: tickets never recycle, so each queued ticket names a
+    /// charge this ledger still holds or a no-op.
+    fn flush_deferred_releases(&mut self, ledger: &mut super::journal::StagingLedger) {
+        for ticket in self.deferred_releases.drain(..) {
+            ledger.release_deferred(ticket);
+        }
+    }
+
+    /// 6.07b D1: a frozen input naming a dead view can never redeem a
+    /// receipt. The record survives (its other input may be live);
+    /// completion skips lost inputs. Death never re-resolves through
+    /// current bindings.
+    fn mark_deferred_lost(&mut self, id: ObjectId) {
+        for record in self.deferred_pending.values_mut() {
+            for input in record.inputs.iter_mut() {
+                Self::lose_deferred_input(input, id);
+            }
+        }
+        for detached in self.deferred_detached.values_mut() {
+            for input in detached.origin.inputs.iter_mut() {
+                Self::lose_deferred_input(input, id);
+            }
+        }
+    }
+
+    fn lose_deferred_input(input: &mut DeferredInput, id: ObjectId) {
+        if let DeferredInput::Frozen { object, lost, .. } = input
+            && *object == id
+        {
+            *lost = true;
+        }
+    }
+
+    /// 6.07b D2: the acting session's death ends its deferred
+    /// authority on both tables (a completion can never prove a dead
+    /// origin live again); a dead non-origin holder merely floats the
+    /// id it held (joinable). Session close, close-all, logout-widen
+    /// retirement, finalize, exec/device loss and proof void all
+    /// funnel through `end_session`, so one hook covers them.
+    fn dispose_session_deferred(&mut self, s: SessionIncarnation) {
+        // Disposal has no ledger access: queue each removed record's
+        // ticket so its charge releases at the next disposal return,
+        // mint or prune with ledger access.
+        let dead_pending: Vec<((SessionIncarnation, u32), u64)> = self
+            .deferred_pending
+            .iter()
+            .filter(|((session, _), _)| *session == s)
+            .map(|(key, record)| (*key, record.ticket.0))
+            .collect();
+        for (key, ticket) in dead_pending {
+            self.deferred_pending.remove(&key);
+            self.deferred_releases.push(ticket);
+        }
+        let dead_detached: Vec<((ObjectDomain, u32, u64), u64)> = self
+            .deferred_detached
+            .iter()
+            .filter(|(_, detached)| detached.origin.session == Some(s))
+            .map(|(key, detached)| (*key, detached.origin.ticket.0))
+            .collect();
+        for (key, ticket) in dead_detached {
+            self.deferred_detached.remove(&key);
+            self.deferred_releases.push(ticket);
+        }
+        for detached in self.deferred_detached.values_mut() {
+            if detached.holder == Some(s) {
+                detached.holder = None;
+            }
         }
     }
 
@@ -3106,6 +3494,9 @@ impl ModelState {
         let state = self.domains.get_mut(&domain).expect("domain");
         state.ended = Some(reason);
         state.bootstrap = None;
+        // Ended sessions dispose their deferred records above; flush
+        // the queued releases so no dead charge denies later admissions.
+        self.flush_deferred_releases(ledger);
     }
 
     fn clear_domain(
@@ -3191,6 +3582,10 @@ impl ModelState {
             return;
         };
         state.generation = next;
+        // Retired sessions dispose their deferred records above; flush
+        // the queued releases so no dead charge denies later admissions.
+        // (The exhaustion arm returns through `end_domain`, which flushes.)
+        self.flush_deferred_releases(ledger);
     }
 
     /// A contradicted or unrepresentable history (`reason`): downgrade every
@@ -3304,6 +3699,9 @@ impl ModelState {
         ledger: &mut super::journal::StagingLedger,
     ) {
         if affected.is_empty() {
+            // No void follows on this path, but the caller may have
+            // disposed sessions already: flush their queued releases.
+            self.flush_deferred_releases(ledger);
             return;
         }
         for token in affected {
@@ -3491,6 +3889,166 @@ impl ModelState {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // 6.07b deferred async custody: seal-path (Q2) primitives. The completion
+    // control quantum calls these once the journal P1 packet lands; until
+    // then only tests drive them. Each refuses instead of overwriting.
+    // -----------------------------------------------------------------------
+
+    /// Move one deferred origin pending→detached (GetID mint): the
+    /// record keeps its origin ticket, frozen inputs and position;
+    /// custody opens under the origin session as holder. The
+    /// shared-budget charge follows the origin ticket — no recharge.
+    /// Refuses when no record is live, when the detached key already
+    /// names a live origin (first wins), or when the origin session's
+    /// slot scope is Unknown (U-4: no exact detached key exists).
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(super) fn detach_deferred(
+        &mut self,
+        session: SessionIncarnation,
+        target: u32,
+        value: u64,
+    ) -> Result<(), DeferredRefusal> {
+        let Some(record) = self.deferred_pending.get(&(session, target)).copied() else {
+            return Err(DeferredRefusal::NoRecord);
+        };
+        if self.session_scope(Some(session)) == SlotScope::Unknown {
+            return Err(DeferredRefusal::UnknownSlot);
+        }
+        let key = (record.domain, target, value);
+        if self.deferred_detached.contains_key(&key) {
+            return Err(DeferredRefusal::Occupied);
+        }
+        // Successful detach re-queues the record behind still-pending
+        // elders (§3.1, S1 GetID order): the sequence advances only
+        // here — refused detaches change nothing.
+        self.deferred_sequence = self.deferred_sequence.wrapping_add(1);
+        let mut record = record;
+        record.sequence = self.deferred_sequence;
+        self.deferred_pending.remove(&(session, target));
+        self.deferred_detached.insert(
+            key,
+            DetachedDeferred {
+                origin: record,
+                holder: Some(session),
+            },
+        );
+        Ok(())
+    }
+
+    /// Move whole detached custody to the joiner (Join transfer):
+    /// origin, frozen inputs and position unchanged; the
+    /// shared-budget charge follows the origin ticket. Join acquires
+    /// no destination key; a missing record mutates nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(super) fn join_deferred_holder(
+        &mut self,
+        domain: ObjectDomain,
+        target: u32,
+        value: u64,
+        joiner: SessionIncarnation,
+    ) -> bool {
+        match self.deferred_detached.get_mut(&(domain, target, value)) {
+            Some(detached) => {
+                detached.holder = Some(joiner);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Consume one live deferred origin exactly once (Complete): emits
+    /// `Referenced` effects with the ORIGIN ticket and the frozen
+    /// input ordinals/objects/metadata — current view state is never
+    /// consulted. Lost/absent/unproven inputs yield nothing. Removal
+    /// is the once-token; a second redeem finds no record. Refuses
+    /// (consuming nothing) when the origin session is not Live or the
+    /// domain's generation moved on.
+    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    pub(super) fn redeem_deferred(&mut self, ticket: CallToken) -> Option<ObjectEffects> {
+        let pending_key = self
+            .deferred_pending
+            .iter()
+            .find_map(|(key, record)| (record.ticket == ticket).then_some(*key));
+        if let Some(key) = pending_key {
+            if !self.redeem_legal(&self.deferred_pending[&key]) {
+                return None;
+            }
+            let record = self.deferred_pending.remove(&key).expect("legal record");
+            // Consumption has no ledger access: the charge releases
+            // at the next disposal return, mint or prune with ledger access.
+            self.deferred_releases.push(record.ticket.0);
+            return Some(self.redeem_effects(&record));
+        }
+        let detached_key = self
+            .deferred_detached
+            .iter()
+            .find_map(|(key, detached)| (detached.origin.ticket == ticket).then_some(*key));
+        if let Some(key) = detached_key {
+            if !self.redeem_legal(&self.deferred_detached[&key].origin) {
+                return None;
+            }
+            let detached = self.deferred_detached.remove(&key).expect("legal record");
+            self.deferred_releases.push(detached.origin.ticket.0);
+            return Some(self.redeem_effects(&detached.origin));
+        }
+        None
+    }
+
+    /// A record redeems only while its frozen origin session is Live
+    /// and its domain generation is current on a live domain.
+    fn redeem_legal(&self, record: &DeferredOrigin) -> bool {
+        let session_live = record.session.is_some_and(|s| {
+            self.sessions
+                .get(&s)
+                .is_some_and(|record| record.state == SessionState::Live)
+        });
+        let domain_current = self
+            .domains
+            .get(&record.domain)
+            .is_some_and(|state| state.ended.is_none() && state.generation == record.generation);
+        session_live && domain_current
+    }
+
+    /// The completion's `Referenced` effects: origin ticket, frozen
+    /// input ordinal, frozen object id, frozen metadata/label/
+    /// attribution. Reference counters bump like `reference` (key
+    /// history retention), but no current value is read — a redeemed
+    /// reference can only repeat what the origin END froze.
+    fn redeem_effects(&mut self, record: &DeferredOrigin) -> ObjectEffects {
+        let mut effects = ObjectEffects::default();
+        for (index, input) in record.inputs.iter().enumerate() {
+            let DeferredInput::Frozen {
+                object,
+                key_use,
+                metadata,
+                label,
+                attribution_valid,
+                lost: false,
+            } = input
+            else {
+                continue;
+            };
+            if let Some(view) = self.objects.get_mut(object) {
+                view.references = view.references.saturating_add(1);
+                if *key_use {
+                    view.key_uses = view.key_uses.saturating_add(1);
+                    view.key_retained = true;
+                }
+            }
+            effects.push(ObjectEffect::Referenced {
+                call: record.ticket,
+                object: *object,
+                key_use: *key_use,
+                input: u8::try_from(index).ok(),
+                metadata: *metadata,
+                label: *label,
+                attribution_valid: *attribution_valid,
+            });
+        }
+        effects
+    }
+
     pub(super) fn project(&self) -> ObjectProjection {
         // Access relations are derived from live bindings, not assumed.
         let mut relations: BTreeMap<ObjectId, usize> = BTreeMap::new();
@@ -3571,6 +4129,7 @@ impl ModelState {
             live_bindings,
             tombstones: self.tombstones,
             pending_calls: self.pending.len(),
+            deferred_origins: self.deferred_pending.len() + self.deferred_detached.len(),
             lifetime_objects: self.next_object,
             lifetime_sessions: self.next_session,
             pruned_objects: self.pruned_objects,
@@ -3592,6 +4151,10 @@ impl ModelState {
             * (size_of::<(CallToken, PendingCall)>()
                 + size_of::<(CallKey, CallToken)>()
                 + 2 * size_of::<u64>());
+        let deferred_origins = self.deferred_pending.len()
+            * size_of::<((SessionIncarnation, u32), DeferredOrigin)>()
+            + self.deferred_detached.len()
+                * size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
         let prune_lists: usize = self
             .domains
             .values()
@@ -3611,11 +4174,13 @@ impl ModelState {
                 + session_records
                 + live_bindings
                 + pending_calls
+                + deferred_origins
                 + fixed,
             object_records,
             session_records,
             live_bindings,
             pending_calls,
+            deferred_origins,
         }
     }
 }
@@ -3794,5 +4359,1387 @@ mod tests {
             ]);
             assert_eq!(view.label(), None, "{name}");
         }
+    }
+
+    // ==================== 6.07b deferred-mint (userspace) ====================
+
+    const DSESSION: u64 = 7;
+    const DKEY: u64 = 9;
+
+    struct DeferredFixture {
+        state: ModelState,
+        domain: ObjectDomain,
+        session: SessionIncarnation,
+        object: ObjectId,
+        next_key: u64,
+        next_token: u64,
+    }
+
+    impl DeferredFixture {
+        fn new() -> Self {
+            let mut state = ModelState::new(ObjectLimits::policy());
+            let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+            state.register_domain(domain).expect("domain registers");
+            state.domains.get_mut(&domain).expect("domain").bootstrap = Some(0);
+            let session = state
+                .alloc_session(
+                    domain,
+                    SessionHandle::new(DSESSION).unwrap(),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            let object = state
+                .alloc_view(
+                    domain,
+                    session,
+                    ObjectHandle::new(DKEY).unwrap(),
+                    ViewOrigin::FirstObserved,
+                    Birth::Unknown,
+                    [FieldState::Unknown; METADATA_FIELDS],
+                    Lifetime::Live,
+                )
+                .expect("view binds");
+            // Establish an AES-128 label with valid attribution, plus
+            // one requested field, so the frozen triple is nontrivial.
+            let view = state.objects.get_mut(&object).expect("view");
+            view.established[field_index(SafeAttributeKind::Class)] = scalar(4);
+            view.established[field_index(SafeAttributeKind::KeyType)] = scalar(0x1f);
+            view.established[field_index(SafeAttributeKind::ValueLen)] = scalar(16);
+            view.requested[field_index(SafeAttributeKind::ValueLen)] = scalar(16);
+            Self {
+                state,
+                domain,
+                session,
+                object,
+                next_key: 100,
+                next_token: 100,
+            }
+        }
+
+        fn target(&mut self, name: &str) -> u32 {
+            crate::kinds::function_id(name).expect("catalog function")
+        }
+
+        /// Drive one PENDING Access END through begin+end replay.
+        fn pending_access(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            input0: HandleInput<ObjectHandle>,
+            function: u32,
+        ) -> (CallToken, ObjectEffects) {
+            let mut ledger = super::super::journal::StagingLedger::new();
+            self.pending_access_with_ledger(session, input0, function, &mut ledger)
+        }
+
+        /// Drive one PENDING Access END through begin+end replay
+        /// against a caller-held ledger, so deferred charges
+        /// accumulate in it across mints.
+        fn pending_access_with_ledger(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            input0: HandleInput<ObjectHandle>,
+            function: u32,
+            ledger: &mut super::super::journal::StagingLedger,
+        ) -> (CallToken, ObjectEffects) {
+            self.next_key += 1;
+            self.next_token += 1;
+            let token = CallToken(self.next_token);
+            let call = PendingCall {
+                domain: self.domain,
+                key: CallKey::reference(self.next_key),
+                begin: 10,
+                entry_ns: 100,
+                function,
+                kind: CallKind::Object(ObjectAction::Access),
+                session,
+                inputs: [input0, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 11,
+                    end_ns: 110,
+                    rv: CkRv::PENDING.0,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            self.state.pending.insert(token, call);
+            self.state.apply_begin(token);
+            let mut effects = ObjectEffects::default();
+            self.state.apply_end(token, &mut effects, ledger);
+            (token, effects)
+        }
+
+        /// Drive one C_CloseSession OK END through begin+end replay
+        /// against a caller-held ledger, so session disposal runs on
+        /// the production end path with ledger access.
+        fn close_session_with_ledger(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            ledger: &mut super::super::journal::StagingLedger,
+        ) {
+            self.next_key += 1;
+            self.next_token += 1;
+            let token = CallToken(self.next_token);
+            let call = PendingCall {
+                domain: self.domain,
+                key: CallKey::reference(self.next_key),
+                begin: 10,
+                entry_ns: 100,
+                function: crate::kinds::function_id("C_CloseSession").expect("catalog function"),
+                kind: CallKind::Lifecycle(lifecycle::CLOSE_SESSION),
+                session,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 11,
+                    end_ns: 110,
+                    rv: CkRv::OK.0,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            self.state.pending.insert(token, call);
+            self.state.apply_begin(token);
+            let mut effects = ObjectEffects::default();
+            self.state.apply_end(token, &mut effects, ledger);
+        }
+
+        fn minted(effects: &ObjectEffects, token: CallToken) -> bool {
+            effects
+                .effects
+                .contains(&ObjectEffect::DeferredMinted { call: token })
+        }
+    }
+
+    // F1–F4: a qualified PENDING END with a settled input freezes the
+    // origin ticket, position, function, domain, generation, session
+    // and the reference-grade metadata/label/attribution triple.
+    #[test]
+    fn deferred_mint_freezes_qualified_inputs() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let before = fx.state.objects.len();
+        let (token, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record stored under (origin session, target)");
+        assert_eq!(record.ticket, token);
+        assert_eq!(record.position, fx.state.pending[&token].key.admission());
+        assert_eq!(record.function, target);
+        assert_eq!(record.domain, fx.domain);
+        assert_eq!(record.generation, fx.state.domains[&fx.domain].generation);
+        assert_eq!(record.session, Some(fx.session));
+        let view = fx.state.objects[&fx.object].clone();
+        match record.inputs[0] {
+            DeferredInput::Frozen {
+                object,
+                key_use,
+                metadata,
+                label,
+                attribution_valid,
+                lost,
+            } => {
+                assert_eq!(object, fx.object);
+                assert!(key_use, "access input is a key use");
+                assert_eq!(metadata, ModelState::metadata_flags_of(&view));
+                assert_eq!(label, view.label());
+                assert_eq!(label, Some(super::KeyLabel::Aes { value_len: 16 }));
+                assert!(attribution_valid);
+                assert!(!lost);
+            }
+            other => panic!("input 0 freezes, got {other:?}"),
+        }
+        assert_eq!(record.inputs[1], DeferredInput::Absent);
+        assert_eq!(fx.state.objects.len(), before, "mint allocates nothing");
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+    }
+
+    // F6: the deferred mint NEVER first-observes: a Deferred (unbound
+    // at cut) input freezes Unproven, and no view is allocated.
+    #[test]
+    fn deferred_mint_never_first_observes() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let before = fx.state.objects.len();
+        let (token, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(0xBEEF).unwrap()),
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record stored");
+        assert_eq!(
+            record.inputs[0],
+            DeferredInput::Unproven(ObjectGap::PendingResultUnavailable)
+        );
+        assert_eq!(fx.state.objects.len(), before, "no first-observed view");
+    }
+
+    // F6: a Settled snapshot whose binding changed before the END
+    // freezes Unproven(StaleOrigin), never the replacement.
+    #[test]
+    fn deferred_mint_stale_binding_yields_unproven() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        fx.next_key += 1;
+        fx.next_token += 1;
+        let token = CallToken(fx.next_token);
+        let call = PendingCall {
+            domain: fx.domain,
+            key: CallKey::reference(fx.next_key),
+            begin: 10,
+            entry_ns: 100,
+            function: target,
+            kind: CallKind::Object(ObjectAction::Access),
+            session: HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            inputs: [
+                HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+                HandleInput::Absent,
+            ],
+            requested: [None, None],
+            derive_protocol: DeriveResultProtocol::Unavailable,
+            entry_mechanism: MechClass::Value,
+            scope: SlotScope::Unknown,
+            completion: Some(Completion {
+                cut: 11,
+                end_ns: 110,
+                rv: CkRv::PENDING.0,
+                return_mechanism: MechanismEvidence::NotCaptured,
+                results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                session_out: HandleInput::Absent,
+                found: FindResult::NotCaptured,
+                attributes: None,
+                malformed: false,
+            }),
+            fenced: false,
+            begin_applied: false,
+            end_applied: false,
+            snapshot: EMPTY_SNAPSHOT,
+        };
+        fx.state.pending.insert(token, call);
+        fx.state.apply_begin(token);
+        assert_eq!(
+            fx.state.pending[&token].snapshot.inputs[0],
+            OriginState::Settled(fx.object),
+            "begin settles the input"
+        );
+        // The binding changes before the END (close/destroy/recreate).
+        fx.state.set_binding(
+            fx.domain,
+            fx.session,
+            ObjectHandle::new(DKEY).unwrap(),
+            None,
+        );
+        let mut effects = ObjectEffects::default();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        fx.state.apply_end(token, &mut effects, &mut ledger);
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record stored");
+        assert_eq!(
+            record.inputs[0],
+            DeferredInput::Unproven(ObjectGap::StaleOrigin)
+        );
+    }
+
+    // F3: an Unknown/NoSession resolution mints the effect but stores
+    // no record (no incarnation key exists): permanently unknown.
+    #[test]
+    fn deferred_mint_unknown_session_stores_nothing() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(0x0BAD).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        assert!(
+            fx.state.deferred_pending.is_empty(),
+            "no incarnation, no record"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 0);
+        assert!(
+            fx.state.redeem_deferred(token).is_none(),
+            "nothing to redeem"
+        );
+    }
+
+    // Duplicate PENDING for a live (session, target): first wins, the
+    // second joins nothing (AmbiguousOutcome), no second record.
+    #[test]
+    fn deferred_mint_duplicate_key_keeps_first() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        let input = HandleInput::Value(ObjectHandle::new(DKEY).unwrap());
+        let (first, _) = fx.pending_access(session, input, target);
+        let (second, effects) = fx.pending_access(session, input, target);
+        assert!(!DeferredFixture::minted(&effects, second), "no second mint");
+        assert!(
+            effects.effects.contains(&ObjectEffect::Unresolved {
+                call: second,
+                reason: ObjectGap::AmbiguousOutcome,
+            }),
+            "second join stays unknown"
+        );
+        assert_eq!(fx.state.deferred_pending.len(), 1);
+        assert_eq!(
+            fx.state.deferred_pending[&(fx.session, target)].ticket,
+            first
+        );
+    }
+
+    // D1: object death marks frozen inputs lost; redeem skips them.
+    #[test]
+    fn deferred_death_object_marks_lost() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        let mut effects = ObjectEffects::default();
+        fx.state.destroy_view(token, fx.object, &mut effects);
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record survives object death");
+        assert!(
+            matches!(record.inputs[0], DeferredInput::Frozen { lost: true, .. }),
+            "frozen input lost"
+        );
+        let redeemed = fx
+            .state
+            .redeem_deferred(token)
+            .expect("consumption still runs once");
+        assert!(
+            !redeemed
+                .effects
+                .iter()
+                .any(|e| matches!(e, ObjectEffect::Referenced { .. })),
+            "lost inputs yield no receipt"
+        );
+        assert!(fx.state.deferred_pending.is_empty());
+    }
+
+    // D2: acting-session death disposes the record on both tables.
+    #[test]
+    fn deferred_death_session_disposes() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("detaches while live");
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+        let mut effects = ObjectEffects::default();
+        fx.state
+            .close_session(fx.session, None, Some(token), &mut effects);
+        assert!(
+            fx.state.deferred_pending.is_empty() && fx.state.deferred_detached.is_empty(),
+            "acting-session death disposes deferred custody"
+        );
+        assert!(
+            fx.state.redeem_deferred(token).is_none(),
+            "no redeem after session death"
+        );
+    }
+
+    // D2 (holder): a non-origin holder's death floats the id (holder
+    // None, joinable); the origin record survives.
+    #[test]
+    fn deferred_death_holder_floats() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("detaches while live");
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("joiner session opens");
+        assert!(fx.state.join_deferred_holder(fx.domain, target, 42, joiner));
+        let mut effects = ObjectEffects::default();
+        fx.state
+            .close_session(joiner, None, Some(token), &mut effects);
+        let detached = fx
+            .state
+            .deferred_detached
+            .get(&(fx.domain, target, 42))
+            .expect("record survives holder death");
+        assert_eq!(detached.holder, None, "holder floats, still joinable");
+        assert_eq!(detached.origin.ticket, token);
+    }
+
+    // D3: domain end disposes every deferred record of the domain.
+    #[test]
+    fn deferred_death_domain_disposes() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+        let mut effects = ObjectEffects::default();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        fx.state
+            .end_domain(fx.domain, ObjectGap::Finalize, &mut effects, &mut ledger);
+        assert!(
+            fx.state.deferred_pending.is_empty() && fx.state.deferred_detached.is_empty(),
+            "domain end disposes deferred custody"
+        );
+        assert!(
+            fx.state.redeem_deferred(token).is_none(),
+            "no redeem after domain end"
+        );
+    }
+
+    // R2-D3-7: one domain holds at most 256 deferred records;
+    // oldest-first eviction disposes the rest with evidence.
+    #[test]
+    fn deferred_pressure_evicts_oldest_first() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut first_session = None;
+        for index in 0..257u64 {
+            let word = 1000 + index;
+            let session = fx
+                .state
+                .alloc_session(
+                    fx.domain,
+                    SessionHandle::new(word).unwrap(),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            if index == 0 {
+                first_session = Some(session);
+            }
+            fx.pending_access(
+                HandleInput::Value(SessionHandle::new(word).unwrap()),
+                HandleInput::Absent,
+                target,
+            );
+        }
+        assert_eq!(fx.state.deferred_pending.len(), 256);
+        assert_eq!(fx.state.usage().deferred_origins, 256);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(first_session.unwrap(), target)),
+            "oldest evicted first"
+        );
+        assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
+    }
+
+    // Mixed pending/detached oldest-first order (§§2.2/3.8): detach
+    // re-queues the record behind still-pending elders, exactly like
+    // S1 — queue A, queue B, detach A, then 255 pendings evicts B on
+    // both sides, never the detached A.
+    #[test]
+    fn deferred_mixed_pending_detached_eviction_matches_s1_order() {
+        use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+
+        // S1 reference: the same trace on the real edge reducer.
+        let mut edge = EdgeSemantics::default();
+        let s1_target = crate::kinds::function_id("C_SignInit").unwrap();
+        let s1_call = |function: &str, session: u64, rv: u64| SemanticCall {
+            function: function.into(),
+            session,
+            rv,
+            ..SemanticCall::default()
+        };
+        edge.observe(&s1_call("C_OpenSession", 7, CkRv::OK.0));
+        edge.observe(&s1_call("C_SignInit", 7, CkRv::PENDING.0));
+        edge.observe(&s1_call("C_SignInit", 8, CkRv::PENDING.0));
+        let mut get_id = s1_call("C_AsyncGetID", 7, CkRv::OK.0);
+        get_id.target_function = s1_target;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        for index in 0..255u64 {
+            edge.observe(&s1_call("C_SignInit", 1000 + index, CkRv::PENDING.0));
+        }
+        // S1 evicts the still-pending B (255 new pendings survive, the
+        // detached A survives): the order the model must match.
+        assert_eq!(edge.resource_usage().pending_calls, 255);
+        assert_eq!(edge.resource_usage().detached_calls, 1);
+        assert_eq!(edge.evidence().async_evictions, 1);
+
+        // Model twin: A on the fixture session, B on a second session.
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let session_b = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("B session opens");
+        let (token_b, effects_b) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("A detaches");
+        let seq_a = fx.state.deferred_detached[&(fx.domain, target, 42)]
+            .origin
+            .sequence;
+        let seq_b = fx.state.deferred_pending[&(session_b, target)].sequence;
+        assert!(
+            seq_a > seq_b,
+            "detached A re-queues behind still-pending B (S1 GetID order)"
+        );
+        for index in 0..255u64 {
+            let word = 1000 + index;
+            fx.state
+                .alloc_session(
+                    fx.domain,
+                    SessionHandle::new(word).unwrap(),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            fx.pending_access(
+                HandleInput::Value(SessionHandle::new(word).unwrap()),
+                HandleInput::Absent,
+                target,
+            );
+        }
+        assert_eq!(fx.state.deferred_pending.len(), 255);
+        assert_eq!(fx.state.deferred_detached.len(), 1);
+        assert!(
+            !fx.state.deferred_pending.contains_key(&(session_b, target)),
+            "model evicts B, the oldest still-pending record"
+        );
+        assert!(
+            fx.state
+                .deferred_detached
+                .contains_key(&(fx.domain, target, 42)),
+            "model keeps the detached A"
+        );
+        assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
+        assert_eq!(
+            (
+                edge.resource_usage().pending_calls,
+                edge.resource_usage().detached_calls
+            ),
+            (
+                fx.state.deferred_pending.len(),
+                fx.state.deferred_detached.len()
+            ),
+            "model and S1 retain the same survivor shape"
+        );
+    }
+
+    // Charge-before-insert (§§2.2/3.8): each deferred record holds
+    // a real shared-budget charge for its whole lifetime. An
+    // exhausted shared pool refuses the mint with counted evidence —
+    // no record, no sequence advance, no growth. Exhaustion is pinned
+    // at the pool, never at a ledger-local byte cap, so the refusal
+    // exercises the actual shared budget; disposing one record then
+    // releases its charge and admits the previously refused mint.
+    #[test]
+    fn deferred_mint_exhausted_budget_refuses_without_growth() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let pool = SemanticResourcePool::default();
+        let mut ledger = super::super::journal::StagingLedger::with_resources(pool.reserver());
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("B session opens");
+        let (token_b, effects_b) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        assert_eq!(fx.state.usage().deferred_origins, 2);
+        let full = ledger.charged_bytes();
+        assert_eq!(full, 2 * one, "two mints hold real shared-budget charges");
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 2).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("C session opens");
+        let sequence_before = fx.state.deferred_sequence;
+        let (token_c, effects_c) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 2).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(
+            !DeferredFixture::minted(&effects_c, token_c),
+            "exhausted mint stores no record"
+        );
+        assert!(
+            effects_c.effects.contains(&ObjectEffect::Unresolved {
+                call: token_c,
+                reason: ObjectGap::PendingCapacity,
+            }),
+            "exhausted mint counts capacity evidence"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 2);
+        assert_eq!(ledger.charged_bytes(), full, "refused mint grows nothing");
+        assert_eq!(
+            fx.state.deferred_sequence, sequence_before,
+            "refused mint advances nothing"
+        );
+        assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
+        // Disposing A through session invalidation releases its pool
+        // charge eagerly: the ledger drops to B's charge alone, and
+        // the previously refused mint is admitted on retry.
+        fx.state.invalidate(
+            AffectedScope::Session(fx.domain, SessionHandle::new(DSESSION).unwrap()),
+            ObjectGap::DeviceLoss,
+            &mut ledger,
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+        assert_eq!(
+            ledger.charged_bytes(),
+            one,
+            "disposing A releases its shared-pool charge"
+        );
+        let (token_d, effects_d) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 2).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(
+            DeferredFixture::minted(&effects_d, token_d),
+            "the released charge admits the refused mint on retry"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 2);
+        assert_eq!(ledger.charged_bytes(), full);
+    }
+
+    // The charge moves with the record across detach/Join (same
+    // origin ticket, no recharge) and releases on consumption,
+    // readmitting one remint under a capped budget.
+    #[test]
+    fn deferred_charge_moves_with_record_and_releases_on_consume() {
+        let mut fx = DeferredFixture::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("B session opens");
+        let (token_b, effects_b) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        let full = ledger.charged_bytes();
+        assert!(full > 0, "two mints hold real shared-budget charges");
+        assert_eq!(
+            ledger.roles_for_test()[2],
+            2,
+            "both charges sit in the Model role"
+        );
+        ledger.set_byte_limit(full);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("A detaches");
+        assert_eq!(
+            ledger.charged_bytes(),
+            full,
+            "detach moves the charge, never doubles it"
+        );
+        assert_eq!(ledger.roles_for_test()[2], 2);
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 2).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("joiner session opens");
+        assert!(fx.state.join_deferred_holder(fx.domain, target, 42, joiner));
+        assert_eq!(
+            ledger.charged_bytes(),
+            full,
+            "join moves the charge, never doubles it"
+        );
+        assert!(fx.state.redeem_deferred(token_a).is_some());
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 3).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("C session opens");
+        let (token_c, effects_c) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 3).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(
+            DeferredFixture::minted(&effects_c, token_c),
+            "consuming A frees its charge for one remint"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 2);
+        assert_eq!(ledger.charged_bytes(), full);
+        assert_eq!(ledger.roles_for_test()[2], 2);
+    }
+
+    // Session-death disposal releases the record's charge: a remint
+    // fits under the same cap the disposed record filled.
+    #[test]
+    fn deferred_disposal_releases_budget_for_remint() {
+        let mut fx = DeferredFixture::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
+        ledger.set_byte_limit(one);
+        let mut effects = ObjectEffects::default();
+        fx.state
+            .close_session(fx.session, None, Some(token_a), &mut effects);
+        assert_eq!(fx.state.usage().deferred_origins, 0);
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("B session opens");
+        let (token_b, effects_b) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(
+            DeferredFixture::minted(&effects_b, token_b),
+            "disposing A frees its charge for one remint"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+        assert_eq!(ledger.charged_bytes(), one);
+    }
+
+    // Pool-backed disposal twin driver (607b-F3 round 2): mint one
+    // deferred origin against the shared pool, pin the pool at its
+    // charged baseline, dispose the record through `dispose`, then
+    // require the dead charge released AND a subsequent pool
+    // admission granted. While the queued ticket lingers, the dead
+    // charge denies the intervening admission.
+    fn disposal_releases_for_admission(
+        dispose: impl FnOnce(&mut DeferredFixture, &mut super::super::journal::StagingLedger),
+    ) {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let pool = SemanticResourcePool::default();
+        let mut ledger = super::super::journal::StagingLedger::with_resources(pool.reserver());
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        dispose(&mut fx, &mut ledger);
+        assert_eq!(fx.state.usage().deferred_origins, 0);
+        let admit = usize::try_from(one).expect("test charge fits");
+        assert!(
+            pool.reserver().reserve(admit).is_ok(),
+            "the released charge admits an intervening pool reservation"
+        );
+        assert_eq!(
+            ledger.charged_bytes(),
+            0,
+            "disposal releases the dead charge eagerly"
+        );
+    }
+
+    // Session disposal through invalidation flushes the queued
+    // release before returning: no dead charge lingers to deny the
+    // next admission.
+    #[test]
+    fn deferred_session_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state.invalidate(
+                AffectedScope::Session(fx.domain, SessionHandle::new(DSESSION).unwrap()),
+                ObjectGap::DeviceLoss,
+                ledger,
+            );
+        });
+    }
+
+    // Domain disposal through removal-class invalidation (the
+    // end-domain path) flushes the queued release before returning.
+    #[test]
+    fn deferred_domain_removal_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state
+                .invalidate(AffectedScope::Domain(fx.domain), ObjectGap::Exec, ledger);
+        });
+    }
+
+    // Domain disposal through loss-class invalidation (the
+    // clear-and-void path) flushes the queued release before
+    // returning.
+    #[test]
+    fn deferred_domain_loss_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state
+                .invalidate(AffectedScope::Domain(fx.domain), ObjectGap::Loss, ledger);
+        });
+    }
+
+    // Domain abandonment flushes the queued release before
+    // returning: no dead charge lingers to deny the next admission.
+    #[test]
+    fn deferred_domain_abandonment_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state.abandon_domain(fx.domain, ledger);
+        });
+    }
+
+    // Session disposal on the production close path (C_CloseSession
+    // end replay) flushes the queued release before returning: no
+    // dead charge lingers to deny the next admission.
+    #[test]
+    fn deferred_close_session_end_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.close_session_with_ledger(
+                HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+                ledger,
+            );
+        });
+    }
+
+    // Oldest-first eviction releases the evicted record's charge:
+    // 258 mints under a 257-charge cap hold exactly 256 live charges.
+    #[test]
+    fn deferred_eviction_releases_its_charge() {
+        let mut fx = DeferredFixture::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let target = fx.target("C_SignInit");
+        let (token_first, effects_first) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_first, token_first));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
+        ledger.set_byte_limit(257 * one);
+        let mut first_loop_session = None;
+        for index in 0..257u64 {
+            let word = 1000 + index;
+            let session = fx
+                .state
+                .alloc_session(
+                    fx.domain,
+                    SessionHandle::new(word).unwrap(),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            if index == 0 {
+                first_loop_session = Some(session);
+            }
+            let (token, effects) = fx.pending_access_with_ledger(
+                HandleInput::Value(SessionHandle::new(word).unwrap()),
+                HandleInput::Absent,
+                target,
+                &mut ledger,
+            );
+            assert!(
+                DeferredFixture::minted(&effects, token),
+                "mint {index} fits: eviction frees each overflow charge"
+            );
+        }
+        assert_eq!(fx.state.usage().deferred_origins, 256);
+        assert_eq!(
+            ledger.charged_bytes(),
+            256 * one,
+            "every evicted record released its charge"
+        );
+        assert_eq!(ledger.roles_for_test()[2], 256);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(fx.session, target)),
+            "oldest (fixture session) evicted first"
+        );
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(first_loop_session.unwrap(), target)),
+            "second-oldest evicted second"
+        );
+        assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&2));
+    }
+
+    // The occupancy estimate counts both deferred maps, like every
+    // other retained structure. Measured across consumption (which
+    // removes exactly one entry per map and touches no other
+    // counted structure), so setup growth cannot leak into the delta.
+    #[test]
+    fn deferred_state_estimate_counts_deferred_maps() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("B session opens");
+        let (token_b, effects_b) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("A detaches");
+        let pending_entry = size_of::<((SessionIncarnation, u32), DeferredOrigin)>();
+        let detached_entry = size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
+        let live = fx.state.estimate();
+        assert_eq!(
+            live.deferred_origins,
+            pending_entry + detached_entry,
+            "the deferred component names its bytes"
+        );
+        assert!(fx.state.redeem_deferred(token_a).is_some());
+        assert!(fx.state.redeem_deferred(token_b).is_some());
+        let consumed = fx.state.estimate();
+        assert_eq!(consumed.deferred_origins, 0);
+        assert_eq!(
+            live.occupied_bytes - consumed.occupied_bytes,
+            pending_entry + detached_entry,
+            "occupied_bytes counts both deferred maps"
+        );
+    }
+
+    // Full custody chain: mint → detach → join → redeem once with the
+    // origin ticket and frozen inputs; no second redeem.
+    #[test]
+    fn deferred_detach_join_redeem_chain() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("detaches while live");
+        assert!(fx.state.deferred_pending.is_empty());
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("joiner session opens");
+        assert!(fx.state.join_deferred_holder(fx.domain, target, 42, joiner));
+        let detached = fx.state.deferred_detached[&(fx.domain, target, 42)];
+        assert_eq!(detached.holder, Some(joiner));
+        assert_eq!(detached.origin.ticket, token);
+        assert_eq!(detached.origin.session, Some(fx.session));
+        let redeemed = fx
+            .state
+            .redeem_deferred(token)
+            .expect("live record redeems once");
+        let refs: Vec<_> = redeemed
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                ObjectEffect::Referenced {
+                    call,
+                    object,
+                    key_use,
+                    input,
+                    metadata,
+                    label,
+                    attribution_valid,
+                } => Some((
+                    *call,
+                    *object,
+                    *key_use,
+                    *input,
+                    *metadata,
+                    *label,
+                    *attribution_valid,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 1, "one frozen input redeems one reference");
+        let (call, object, key_use, input, metadata, label, valid) = refs[0];
+        assert_eq!(call, token, "origin ticket, never the completion's");
+        assert_eq!(object, fx.object);
+        assert!(key_use);
+        assert_eq!(input, Some(0), "holes stay holes");
+        let view = fx.state.objects[&fx.object].clone();
+        assert_eq!(metadata, ModelState::metadata_flags_of(&view));
+        assert_eq!(label, Some(super::KeyLabel::Aes { value_len: 16 }));
+        assert!(valid);
+        assert!(fx.state.deferred_detached.is_empty());
+        assert!(
+            fx.state.redeem_deferred(token).is_none(),
+            "removal is the once-token"
+        );
+    }
+
+    // U-4 + first-wins: an occupied detached key refuses the second
+    // mint, and an Unknown slot scope refuses to detach at all.
+    #[test]
+    fn deferred_detach_refuses_occupied_and_unknown_slot() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (first, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("first detaches");
+        let other = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("second session opens");
+        let (second, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        let sequence_before_refusals = fx.state.deferred_sequence;
+        assert_eq!(
+            fx.state.detach_deferred(other, target, 42),
+            Err(DeferredRefusal::Occupied),
+            "same-key remint refuses, first intact"
+        );
+        assert_eq!(
+            fx.state.deferred_sequence, sequence_before_refusals,
+            "refused detach advances no sequence"
+        );
+        assert_eq!(
+            fx.state.deferred_detached[&(fx.domain, target, 42)]
+                .origin
+                .ticket,
+            first
+        );
+        assert!(
+            fx.state.deferred_pending.contains_key(&(other, target)),
+            "refused mint keeps its pending"
+        );
+        assert!(fx.state.redeem_deferred(second).is_some());
+        // Unknown slot scope: no exact detached key exists.
+        let floating = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 2).unwrap(),
+                SessionOrigin::FirstObserved,
+                SlotScope::Unknown,
+            )
+            .expect("unknown-scope session opens");
+        fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 2).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        // The floating mint above advanced the sequence; the refused
+        // detach below must not.
+        let sequence_before_unknown_slot = fx.state.deferred_sequence;
+        assert_eq!(
+            fx.state.detach_deferred(floating, target, 43),
+            Err(DeferredRefusal::UnknownSlot)
+        );
+        assert_eq!(
+            fx.state.deferred_sequence, sequence_before_unknown_slot,
+            "refused detach advances no sequence"
+        );
+    }
+
+    // Mint-before-dispatch ordering: a destroy-PENDING freezes its
+    // target first, then the existing Pending arm retires it — the
+    // record survives with the input lost (D1), never rebound.
+    #[test]
+    fn deferred_mint_destroy_pending_freezes_then_loses() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_DestroyObject");
+        fx.next_key += 1;
+        fx.next_token += 1;
+        let token = CallToken(fx.next_token);
+        let call = PendingCall {
+            domain: fx.domain,
+            key: CallKey::reference(fx.next_key),
+            begin: 10,
+            entry_ns: 100,
+            function: target,
+            kind: CallKind::Object(ObjectAction::Destroy),
+            session: HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            inputs: [
+                HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+                HandleInput::Absent,
+            ],
+            requested: [None, None],
+            derive_protocol: DeriveResultProtocol::Unavailable,
+            entry_mechanism: MechClass::Value,
+            scope: SlotScope::Unknown,
+            completion: Some(Completion {
+                cut: 11,
+                end_ns: 110,
+                rv: CkRv::PENDING.0,
+                return_mechanism: MechanismEvidence::NotCaptured,
+                results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                session_out: HandleInput::Absent,
+                found: FindResult::NotCaptured,
+                attributes: None,
+                malformed: false,
+            }),
+            fenced: false,
+            begin_applied: false,
+            end_applied: false,
+            snapshot: EMPTY_SNAPSHOT,
+        };
+        fx.state.pending.insert(token, call);
+        fx.state.apply_begin(token);
+        let mut effects = ObjectEffects::default();
+        let mut ledger = super::super::journal::StagingLedger::new();
+        fx.state.apply_end(token, &mut effects, &mut ledger);
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record stored");
+        assert!(
+            matches!(
+                record.inputs[0],
+                DeferredInput::Frozen {
+                    lost: true,
+                    key_use: false,
+                    ..
+                }
+            ),
+            "destroy freezes no key use and loses immediately"
+        );
+    }
+
+    // F5: an overlapping same-session call voids the frozen inputs
+    // with its interference gap; Absent stays Absent.
+    #[test]
+    fn deferred_mint_interference_voids_inputs() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        // An overlapping same-session call the mint must void against.
+        fx.next_key += 1;
+        fx.next_token += 1;
+        let other = CallToken(fx.next_token);
+        let other_key = CallKey::reference(fx.next_key);
+        fx.state.pending.insert(
+            other,
+            PendingCall {
+                domain: fx.domain,
+                key: other_key,
+                begin: 5,
+                entry_ns: 50,
+                function: target,
+                kind: CallKind::Object(ObjectAction::Access),
+                session: HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 50,
+                    end_ns: 150,
+                    rv: CkRv::PENDING.0,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            },
+        );
+        fx.state
+            .domains
+            .get_mut(&fx.domain)
+            .expect("domain")
+            .keys
+            .insert(other_key, other);
+        let (token, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        let record = fx
+            .state
+            .deferred_pending
+            .get(&(fx.session, target))
+            .expect("record stored");
+        assert_eq!(
+            record.inputs[0],
+            DeferredInput::Unproven(ObjectGap::SameSessionOverlap)
+        );
+        assert_eq!(record.inputs[1], DeferredInput::Absent);
+    }
+
+    // Redeem refuses a dead origin session and a voided generation.
+    #[test]
+    fn deferred_redeem_refuses_dead_session_and_voided_generation() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        fx.state.exhaust_generation(fx.domain);
+        assert!(
+            fx.state.redeem_deferred(token).is_none(),
+            "voided generation refuses"
+        );
+        // The record is still live custody (refusal consumes nothing).
+        assert_eq!(fx.state.usage().deferred_origins, 1);
     }
 }

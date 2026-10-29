@@ -446,6 +446,12 @@ pub const DISCOVERY_KIND_LOADER: u8 = 3;
 pub const DISCOVERY_KIND_INTERFACE_RETURN: u8 = 4;
 pub const DISCOVERY_KIND_EXEC: u8 = 5;
 pub const DISCOVERY_KIND_LEADER_EXIT: u8 = 6;
+/// Leader exit with an instance-epoch mapping summary: `pointers[0..8]`
+/// carry the leader record's eight slot+1 cells (0 = empty, else the
+/// watched-file slot + 1, at most `instance::FILE_SLOTS`), and
+/// `status_flags` projects the record refusal bits below. Kind 6 stays
+/// byte-identical; inventory-only builds keep emitting it.
+pub const DISCOVERY_KIND_LEADER_EXIT_MAPPINGS: u8 = 7;
 
 /// Private EXEC classification: candidacy alone never proves paired links.
 pub const DISCOVERY_EXEC_UNKNOWN: u8 = 0;
@@ -488,6 +494,18 @@ pub const DISCOVERY_VERSION_OTHER: u8 = 6;
 pub const DISCOVERY_STATUS_READ_FAILURE: u8 = 0x01;
 pub const DISCOVERY_STATUS_COALESCED_NO_HELPER: u8 = 0x02;
 pub const DISCOVERY_STATUS_LOADER_CONTEXT_INVALID: u8 = 0x04;
+/// Kind 7 only: the leader record carried SHARED_MM, so the summary is
+/// not localizable to the exiting process (`unknown`, never negative).
+pub const DISCOVERY_STATUS_EXIT_MAP_SHARED_MM: u8 = 0x08;
+/// Kind 7 only: the leader record overflowed; named slots still count,
+/// but the set may be partial.
+pub const DISCOVERY_STATUS_EXIT_MAP_OVERFLOW: u8 = 0x10;
+/// Kind 7 only: a local fault was recorded for the exiting process.
+pub const DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT: u8 = 0x20;
+/// Kind 7 only: instance hooks were refused or off in this session, so
+/// an empty summary is `unknown`, never a watched-provider negative.
+/// Bit 0x80 stays free.
+pub const DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED: u8 = 0x40;
 
 pub const DISCOVERY_COUNTER_RING_LOSS: u32 = 0;
 pub const DISCOVERY_COUNTER_EXPORT_STATE_FAILURES: u32 = 1;
@@ -751,10 +769,9 @@ fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
     record.binding_id == 0 && zero_discovery_payload_except_binding(record)
 }
 
-fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
+fn zero_discovery_scalar_payload(record: &DiscoveryRecord) -> bool {
     record.table_ptr == 0
         && record.interface_flags == 0
-        && record.pointers.iter().all(|pointer| *pointer == 0)
         && record.interface_index == 0
         && record.name_class == DISCOVERY_NAME_NA
         && record.usable_n == 0
@@ -766,6 +783,10 @@ fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
         && record.symbol_id == 0
         && record.return_rv == 0
         && record.request_flags == 0
+}
+
+fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
+    zero_discovery_scalar_payload(record) && record.pointers.iter().all(|pointer| *pointer == 0)
 }
 
 fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
@@ -960,6 +981,25 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.announced_count == 0
                 && record.send_signal_rc == 0
                 && zero_discovery_payload(record)
+        }
+        DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
+            record.status_flags
+                & !(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM
+                    | DISCOVERY_STATUS_EXIT_MAP_OVERFLOW
+                    | DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT
+                    | DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED)
+                == 0
+                && record.case_id == 0
+                && record.announced_count == 0
+                && record.send_signal_rc == 0
+                && record.binding_id == 0
+                && record.pointers[..instance::RECORD_SLOTS]
+                    .iter()
+                    .all(|cell| *cell <= u64::from(instance::FILE_SLOTS))
+                && record.pointers[instance::RECORD_SLOTS..]
+                    .iter()
+                    .all(|cell| *cell == 0)
+                && zero_discovery_scalar_payload(record)
         }
         _ => false,
     }
@@ -2493,12 +2533,9 @@ mod tests {
         assert_eq!(key.pad, 0);
     }
 
-    /// Packet 6.14 phase 1 (Option A RED): kind-7 leader-exit-mapping
-    /// summaries reuse `DiscoveryRecord` byte-identical and validate their
-    /// exact payload shape. A3 GREEN lands the named kind/status consts
-    /// and the validator arm; this RED uses literals so it compiles
-    /// before them. Guards first (they hold before and after GREEN);
-    /// the accept assertion last (it fails until GREEN).
+    /// Packet 6.14 (Option A): kind-7 leader-exit-mapping summaries reuse
+    /// `DiscoveryRecord` byte-identical and validate their exact payload
+    /// shape: slot+1 cells in `pointers[0..8]`, kind-7 status bits only.
     #[test]
     fn leader_exit_mappings_abi_offsets_unchanged() {
         use core::mem::{offset_of, size_of};
@@ -2508,29 +2545,37 @@ mod tests {
         assert_eq!(offset_of!(DiscoveryRecord, status_flags), 868);
         assert_eq!(offset_of!(DiscoveryRecord, binding_id), 912);
 
-        // Guards: nonzero reserved words, wrong kind and oversized slot
-        // ids stay invalid. Slot cells are slot+1, so 1024
-        // (instance::FILE_SLOTS) is the largest encodable value.
-        let mut reserved = discovery_record(7);
+        // Guards: nonzero reserved words, wrong kind, oversized slot ids
+        // and unknown status bits stay invalid. Slot cells are slot+1, so
+        // instance::FILE_SLOTS is the largest encodable value.
+        let mut reserved = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
         reserved.pointers[8] = 1;
         assert!(!valid_discovery_record(&reserved));
         let mut wrong_kind = discovery_record(8);
         wrong_kind.pointers[0] = 3;
         assert!(!valid_discovery_record(&wrong_kind));
-        let mut oversized = discovery_record(7);
-        oversized.pointers[0] = 1025;
+        let mut oversized = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        oversized.pointers[0] = u64::from(instance::FILE_SLOTS) + 1;
         assert!(!valid_discovery_record(&oversized));
-        let mut bad_status = discovery_record(7);
+        let mut bad_status = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
         bad_status.pointers[0] = 3;
-        bad_status.status_flags = 0x80;
+        bad_status.status_flags = 0x80; // the remaining free bit
         assert!(!valid_discovery_record(&bad_status));
+        let mut foreign_status = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        foreign_status.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        assert!(!valid_discovery_record(&foreign_status));
 
-        // RED: the exact kind-7 payload shape validates.
-        let mut summary = discovery_record(7);
+        // The exact kind-7 payload shape validates.
+        let mut summary = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
         summary.pointers[0] = 3;
         assert!(valid_discovery_record(&summary));
-        let mut empty = discovery_record(7);
-        empty.status_flags = 0x40; // EXIT_MAP_HOOKS_REFUSED (A3)
+        let mut boundary = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        boundary.pointers[7] = u64::from(instance::FILE_SLOTS);
+        boundary.status_flags =
+            DISCOVERY_STATUS_EXIT_MAP_SHARED_MM | DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+        assert!(valid_discovery_record(&boundary));
+        let mut empty = discovery_record(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        empty.status_flags = DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED;
         assert!(valid_discovery_record(&empty));
     }
 
@@ -2726,6 +2771,7 @@ mod tests {
         assert_eq!(DISCOVERY_KIND_INTERFACE_RETURN, 4);
         assert_eq!(DISCOVERY_KIND_EXEC, 5);
         assert_eq!(DISCOVERY_KIND_LEADER_EXIT, 6);
+        assert_eq!(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, 7);
         assert_eq!(DISCOVERY_NAME_NA, 0);
         assert_eq!(DISCOVERY_NAME_EXACT_STANDARD, 1);
         assert_eq!(DISCOVERY_NAME_OTHER, 2);
@@ -2734,6 +2780,10 @@ mod tests {
         assert_eq!(DISCOVERY_STATUS_READ_FAILURE, 0x01);
         assert_eq!(DISCOVERY_STATUS_COALESCED_NO_HELPER, 0x02);
         assert_eq!(DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, 0x04);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM, 0x08);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_OVERFLOW, 0x10);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT, 0x20);
+        assert_eq!(DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED, 0x40);
         assert_eq!(PAUSE_ARMED, 1);
         assert_eq!(PAUSE_REQUESTED, 2);
         assert_eq!(COALESCED_NO_HELPER_RC, i64::MIN);
@@ -3453,7 +3503,7 @@ mod tests {
         assert!(!valid_discovery_record(&exit));
 
         assert!(!valid_discovery_record(&discovery_record(0)));
-        assert!(!valid_discovery_record(&discovery_record(7)));
+        assert!(!valid_discovery_record(&discovery_record(8)));
     }
 
     /// Mutation caught: pause can be enabled for a cgroup or without the PID

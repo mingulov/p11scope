@@ -6212,6 +6212,205 @@ mod tests {
         );
     }
 
+    // ---- selected-detail toggle (A2.8, R5) ----
+
+    /// Scripted cumulative sample with explicit row counts: the reader
+    /// seam for collector behavior across a detail window (cadence,
+    /// failure and replacement are all collector-side).
+    fn toggle_scripted(
+        entered: [u64; 2],
+        returned: [u64; 2],
+        errors: [u64; 2],
+        rvs: [[u64; 3]; 2],
+    ) -> Scripted {
+        let mut stats = BTreeMap::new();
+        for (slot, ((entered, returned), errors)) in
+            entered.into_iter().zip(returned).zip(errors).enumerate()
+        {
+            stats.insert(
+                slot as u32,
+                vec![
+                    SlotStats {
+                        entered,
+                        returned,
+                        errors,
+                        total_ns: 10 * returned,
+                        max_ns: if returned == 0 { 0 } else { 10 },
+                        buckets: [0; 32],
+                    },
+                    SlotStats::ZERO,
+                ],
+            );
+        }
+        let mut rv_list = Vec::new();
+        for (slot, counts) in rvs.into_iter().enumerate() {
+            for (rv, count) in [0, HIGH_RV, u64::MAX].into_iter().zip(counts) {
+                rv_list.push((key(slot as u32, rv), [count, 0]));
+            }
+        }
+        Scripted {
+            mode: CounterMode::Counts,
+            cpus: 2,
+            stats,
+            rvs: rv_list,
+            rv_lookup: None,
+            published: None,
+            health: CounterHealth::default(),
+            kernel: KernelEvidence::default(),
+            routing: None,
+            fault_bits: 0,
+            fail: None,
+            accesses: Cell::new(0),
+            rv_reads: Cell::new(0),
+            clocks: [Some(10), Some(20)],
+            clock_reads: Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn counter_detail_two_collectors_telescope_across_window() {
+        // Parent §2 collectors clause: A reads every sample, B reads a
+        // sparse cadence with one injected scrape failure; after
+        // settlement both telescopes equal terminal-minus-baseline, and
+        // a replacement generation discontinues without cross-deltas.
+        let pool = test_pool();
+        let mut a = CounterCollector::new(LIMITS, pool.reserver());
+        let mut b = CounterCollector::new(LIMITS, pool.reserver());
+        let generation = NonZeroU64::new(7).unwrap();
+        let r0 = toggle_scripted([3, 1], [5, 1], [1, 0], [[2, 1, 2], [1, 0, 0]]);
+        let r1 = toggle_scripted([5, 2], [7, 2], [1, 0], [[3, 2, 2], [2, 0, 0]]);
+        let r2 = toggle_scripted([8, 2], [9, 2], [2, 0], [[4, 2, 3], [2, 0, 0]]);
+        let read = |sample: &Scripted, gen_id| {
+            acquire(sample, gen_id, &plan(), LIMITS, &pool.reserver()).unwrap()
+        };
+        assert_eq!(
+            a.observe(Ok(read(&r0, generation))),
+            CounterObservation::Initial
+        );
+        assert_eq!(
+            b.observe(Ok(read(&r0, generation))),
+            CounterObservation::Initial
+        );
+        let CounterObservation::Advanced { deltas: a1, .. } = a.observe(Ok(read(&r1, generation)))
+        else {
+            panic!("A advances across its first span");
+        };
+        assert_eq!((a1[0].entered, a1[0].returned, a1[0].errors), (2, 2, 0));
+        // B skips the middle sample, then fails one scrape: neither its
+        // baseline nor its generation moves.
+        assert_eq!(
+            b.observe(Err(ReadStage::Budget)),
+            CounterObservation::ReadFailed(ReadStage::Budget)
+        );
+        assert!(b.current().is_some(), "a failed scrape keeps its baseline");
+        let CounterObservation::Advanced { deltas: a2, .. } = a.observe(Ok(read(&r2, generation)))
+        else {
+            panic!("A advances across its second span");
+        };
+        assert_eq!((a2[0].entered, a2[0].returned, a2[0].errors), (3, 2, 1));
+        let CounterObservation::Advanced { deltas: b_span, .. } =
+            b.observe(Ok(read(&r2, generation)))
+        else {
+            panic!("B advances across its skipped span");
+        };
+        // B skipped a read and failed a scrape, yet its single span
+        // equals A's summed spans equals terminal-minus-baseline.
+        for (index, delta) in b_span.iter().enumerate() {
+            let pair = &a1[index];
+            let latter = &a2[index];
+            assert_eq!(
+                (delta.entered, delta.returned, delta.errors),
+                (
+                    pair.entered + latter.entered,
+                    pair.returned + latter.returned,
+                    pair.errors + latter.errors
+                ),
+                "row {index} telescopes across the skipped read"
+            );
+            let mut both = BTreeMap::new();
+            for (rv, count) in pair.rv_counts.iter().chain(latter.rv_counts.iter()) {
+                *both.entry(*rv).or_insert(0) += count;
+            }
+            assert_eq!(delta.rv_counts, both, "row {index} RVs telescope");
+        }
+        assert_eq!((b_span[0].entered, b_span[0].returned), (5, 4));
+        // Session replacement: both collectors discontinue with no
+        // cross-generation delta, then telescope again within the new
+        // generation.
+        let next = NonZeroU64::new(8).unwrap();
+        let r3 = toggle_scripted([1, 0], [1, 0], [0, 0], [[1, 0, 0], [0, 0, 0]]);
+        let r4 = toggle_scripted([4, 1], [3, 1], [1, 0], [[2, 1, 0], [1, 0, 0]]);
+        for collector in [&mut a, &mut b] {
+            assert_eq!(
+                collector.observe(Ok(read(&r3, next))),
+                CounterObservation::GenerationChanged {
+                    previous: 7,
+                    current: 8
+                }
+            );
+            let CounterObservation::Advanced { deltas, .. } =
+                collector.observe(Ok(read(&r4, next)))
+            else {
+                panic!("the new generation telescopes");
+            };
+            assert_eq!((deltas[0].entered, deltas[0].returned), (3, 2));
+        }
+    }
+
+    #[test]
+    fn counter_detail_generation_change_reports_discontinuity_without_merge() {
+        // "Never summed" at the reader seam: a detail-generation read
+        // observed on a broad collector reports GenerationChanged with
+        // no cross-delta; an independent detail collector telescopes on
+        // its own stream. Broad and detail rows never add together.
+        let pool = test_pool();
+        let broad_gen = NonZeroU64::new(7).unwrap();
+        let detail_gen = NonZeroU64::new(9).unwrap();
+        let mut broad = CounterCollector::new(LIMITS, pool.reserver());
+        let mut detail = CounterCollector::new(LIMITS, pool.reserver());
+        let b0 = toggle_scripted([3, 1], [5, 1], [1, 0], [[2, 1, 2], [1, 0, 0]]);
+        let b1 = toggle_scripted([5, 2], [7, 2], [1, 0], [[3, 2, 2], [2, 0, 0]]);
+        let d0 = toggle_scripted([0, 0], [0, 0], [0, 0], [[0, 0, 0], [0, 0, 0]]);
+        let d1 = toggle_scripted([2, 0], [2, 0], [0, 0], [[2, 0, 0], [0, 0, 0]]);
+        let read = |sample: &Scripted, gen_id| {
+            acquire(sample, gen_id, &plan(), LIMITS, &pool.reserver()).unwrap()
+        };
+        assert_eq!(
+            broad.observe(Ok(read(&b0, broad_gen))),
+            CounterObservation::Initial
+        );
+        assert_eq!(
+            broad.observe(Ok(read(&d0, detail_gen))),
+            CounterObservation::GenerationChanged {
+                previous: 7,
+                current: 9
+            },
+            "a detail read never merges into a broad baseline"
+        );
+        assert_eq!(
+            detail.observe(Ok(read(&d0, detail_gen))),
+            CounterObservation::Initial
+        );
+        let CounterObservation::Advanced { deltas, .. } = detail.observe(Ok(read(&d1, detail_gen)))
+        else {
+            panic!("the detail stream telescopes on its own");
+        };
+        assert_eq!((deltas[0].entered, deltas[0].returned), (2, 2));
+        // The broad stream, continued on its own generation elsewhere,
+        // still telescopes exactly (proves the streams stay separate).
+        let mut broad_alone = CounterCollector::new(LIMITS, pool.reserver());
+        assert_eq!(
+            broad_alone.observe(Ok(read(&b0, broad_gen))),
+            CounterObservation::Initial
+        );
+        let CounterObservation::Advanced { deltas, .. } =
+            broad_alone.observe(Ok(read(&b1, broad_gen)))
+        else {
+            panic!("the broad stream telescopes on its own");
+        };
+        assert_eq!((deltas[0].entered, deltas[0].returned), (2, 2));
+    }
+
     #[test]
     fn growth_fd_floor_covers_retained_links_and_stage_charge() {
         assert_eq!(growth_fd_soft_floor(513), 5122);

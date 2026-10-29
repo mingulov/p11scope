@@ -54,6 +54,7 @@ enum BankProof {
     None,
     Counter,
     Image,
+    Journal,
 }
 
 impl BpfFlavor {
@@ -94,6 +95,14 @@ fn image_bank_proof_requested() -> bool {
         Err(env::VarError::NotPresent) | Ok("0") => false,
         Ok("1") => true,
         _ => panic!("P11SCOPE_IMAGE_BANK_PROOF must be unset, 0 or 1"),
+    }
+}
+
+fn journal_proof_requested() -> bool {
+    match env::var("P11SCOPE_JOURNAL_PROOF").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_JOURNAL_PROOF must be unset, 0 or 1"),
     }
 }
 
@@ -146,6 +155,7 @@ fn main() {
     let counter_artifacts = counter_artifacts_requested();
     let counter_objects_request = counter_objects_requested();
     let image_bank_proof = image_bank_proof_requested();
+    let journal_proof = journal_proof_requested();
     println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
     if BIRTH_MARKER_ENABLED {
         println!("cargo:rustc-cfg=p11scope_birth_marker");
@@ -196,6 +206,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_ARTIFACTS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_COUNTER_OBJECTS");
     println!("cargo:rerun-if-env-changed=P11SCOPE_IMAGE_BANK_PROOF");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL_PROOF");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
@@ -249,6 +260,18 @@ fn main() {
         !(image_bank_proof && counter_artifacts),
         "private image bank proof and counter artifacts require separate build configurations"
     );
+    assert!(
+        !journal_proof
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
+        "private journal proof requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !(journal_proof && (image_bank_proof || counter_artifacts)),
+        "private journal proof requires a separate configuration from image proof and counter artifacts"
+    );
     // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
     // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
     // here, before any compiler work. P0 and unsafe-compiled builds embed
@@ -262,6 +285,18 @@ fn main() {
         CounterObjectsRequest::Unset | CounterObjectsRequest::Enabled
     ) && !small_build
         && !wide_detailed;
+    // Private discovery for the real early-refusal driver. This records the
+    // actual independent selection used below, before any compiler is called.
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_COUNTER_OBJECTS={}",
+        u8::from(counter_objects)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_BUILD_SCRIPT={}",
+        env::current_exe()
+            .expect("build script executable")
+            .display()
+    );
     semantic_rustc::emit_proof();
 
     for flavor in [
@@ -325,6 +360,29 @@ fn main() {
             BankProof::Image,
         );
     }
+    if journal_proof {
+        build_variant_with_proof(
+            BpfFlavor::Detailed,
+            false,
+            false,
+            false,
+            false,
+            false,
+            BankProof::Journal,
+        );
+    }
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_ENABLED={}",
+        u8::from(journal_proof)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_OUTPUTS={}",
+        if journal_proof {
+            "journal-proof-v1"
+        } else {
+            ""
+        }
+    );
     println!(
         "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_ENABLED={}",
         u8::from(image_bank_proof)
@@ -412,6 +470,7 @@ fn build_variant_with_proof(
 ) {
     let counter_bank_proof = matches!(bank_proof, BankProof::Counter);
     let image_bank_proof = matches!(bank_proof, BankProof::Image);
+    let journal_proof = matches!(bank_proof, BankProof::Journal);
     let inventory = matches!(
         flavor,
         BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
@@ -419,7 +478,10 @@ fn build_variant_with_proof(
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let mut out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
-    if counter_bank_proof || image_bank_proof {
+    if journal_proof {
+        out_dir.push("journal-proof-v1");
+        std::fs::create_dir_all(&out_dir).expect("creating private journal proof output");
+    } else if counter_bank_proof || image_bank_proof {
         out_dir.push(if image_bank_proof {
             "image-bank-proof-v1"
         } else {
@@ -478,14 +540,21 @@ fn build_variant_with_proof(
     // control row; counter and inventory flavors keep no marker state.
     // One gate for the unit, define and exports below: Image is Detailed
     // and retains the canonical marker dependencies; Counter excludes them.
-    let journal_marker =
-        BIRTH_MARKER_ENABLED && matches!(flavor, BpfFlavor::Detailed) && !counter_bank_proof;
+    let journal_marker = BIRTH_MARKER_ENABLED
+        && matches!(flavor, BpfFlavor::Detailed)
+        && !counter_bank_proof
+        && !journal_proof;
     if journal_marker {
         selected_native_units.push("journal_marker");
     }
+    if journal_proof {
+        selected_native_units.extend(["object_journal", "journal_marker"]);
+    }
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
-        let suffix = if counter_bank_proof || image_bank_proof {
+        let suffix = if journal_proof {
+            "journal-proof-v1"
+        } else if counter_bank_proof || image_bank_proof {
             match flavor {
                 BpfFlavor::Detailed if image_bank_proof => "image-bank-proof-v1",
                 BpfFlavor::CounterCounts => "counts-bank-growth-v2",
@@ -565,6 +634,14 @@ fn build_variant_with_proof(
         if journal_marker && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_JOURNAL_MARKER");
         }
+        if journal_proof {
+            if matches!(*unit, "task_owner" | "object_journal") {
+                compile.arg("-DP11SCOPE_OBJECT_JOURNAL");
+            }
+            if *unit == "instance_epoch" {
+                compile.arg("-DP11SCOPE_JOURNAL_GAP");
+            }
+        }
         if counter_bank_proof && *unit == "counter_bank_timing" {
             compile.arg("-DP11SCOPE_COUNTER_BANK_PROOF");
             compile.arg(match flavor {
@@ -594,7 +671,9 @@ fn build_variant_with_proof(
     }
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let target_dir = out_dir.join(if counter_bank_proof || image_bank_proof {
+    let target_dir = out_dir.join(if journal_proof {
+        "ebpf-journal-proof-v1-target"
+    } else if counter_bank_proof || image_bank_proof {
         match flavor {
             BpfFlavor::Detailed if image_bank_proof => "ebpf-image-bank-proof-v1-target",
             BpfFlavor::CounterCounts => "ebpf-counts-bank-growth-v2-target",
@@ -725,6 +804,26 @@ fn build_variant_with_proof(
             append_flag(&format!("link-arg=--export={name}"));
         }
     }
+    if journal_proof {
+        for name in [
+            "p11_journal_begin",
+            "p11_journal_returning",
+            "p11_journal_settle_prepare",
+            "p11_journal_settle_finish",
+            "p11_owner_start_remove_reason",
+            "p11_instance_scope_gap",
+            "JOURNAL_START",
+            "JOURNAL_CTL",
+            "JOURNAL_MARKER_CTL",
+            "EVENTS",
+            "DESCRIPTORS",
+            "INSTANCE_START",
+            "EVIDENCE",
+        ] {
+            append_flag("-C");
+            append_flag(&format!("link-arg=--export={name}"));
+        }
+    }
     if matches!(flavor, BpfFlavor::InventoryCallers) {
         append_flag("-C");
         append_flag("link-arg=--export=p11_inventory_image_baseline");
@@ -840,6 +939,7 @@ fn build_variant_with_proof(
     println!(
         "cargo:rustc-env={}={flags}",
         match flavor {
+            BpfFlavor::Detailed if journal_proof => "P11SCOPE_BPF_RUSTFLAGS_JOURNAL_PROOF",
             BpfFlavor::Detailed if image_bank_proof => "P11SCOPE_BPF_RUSTFLAGS_IMAGE_BANK_PROOF",
             BpfFlavor::Detailed => "P11SCOPE_BPF_RUSTFLAGS_DETAILED",
             BpfFlavor::InventoryGlobal => "P11SCOPE_BPF_RUSTFLAGS_INVENTORY",
@@ -890,7 +990,9 @@ fn build_variant_with_proof(
     let built = target_dir.join(target).join("release/p11scope-ebpf");
     std::fs::copy(
         &built,
-        out_dir.join(if counter_bank_proof || image_bank_proof {
+        out_dir.join(if journal_proof {
+            "p11scope-ebpf-journal-proof-v1"
+        } else if counter_bank_proof || image_bank_proof {
             match flavor {
                 BpfFlavor::Detailed if image_bank_proof => "p11scope-ebpf-image-bank-proof-v1",
                 BpfFlavor::CounterCounts => "p11scope-ebpf-counts-bank-growth-v2",

@@ -10,19 +10,22 @@ mod transport_boundaries;
 
 #[test]
 fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
+    // Ordinary flavors keep these two literal owner exports. The private
+    // journal mode retains its reason-aware removal through a separate gate;
+    // native_journal_link checks the actual ordinary/private ELF separation.
     let source = std::fs::read_to_string("build.rs").expect("read build script");
     for helper in ["p11_owner_lease", "p11_owner_refund"] {
         let export = format!("link-arg=--export={helper}");
         assert_eq!(
             source.matches(&export).count(),
             1,
-            "missing exact {helper} export"
+            "missing exact ordinary {helper} export"
         );
     }
     assert_eq!(
         source.matches("link-arg=--export=p11_owner_").count(),
         2,
-        "no pointer-taking owner transaction may be exported"
+        "ordinary owner exports must not add a pointer-taking transaction"
     );
 }
 

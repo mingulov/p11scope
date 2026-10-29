@@ -233,6 +233,57 @@ fn production_wide_owner_full_bound_cleanup_is_fail_closed() {
     }
 }
 
+/// T-L2 loader retirement over the actual C owner plus the real gate
+/// unit: real START insert/remove/cleanup paired with owned gate
+/// dispositions for every removal reason, failure twins and the
+/// no-recycle-before-ack rule. Host-only; no BPF load, no attach.
+#[test]
+fn production_loader_retirement_reports_owned_gate_dispositions() {
+    let temporary = tempfile::tempdir().expect("loader retirement test directory");
+    let binary = temporary.path().join("loader-retirement");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-DP11SCOPE_LOADER_GATE",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual loader retirement fixture");
+    assert!(
+        output.status.success(),
+        "native loader retirement compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for selector in [
+        "loader_retirement_return_end",
+        "loader_retirement_collision_no_end",
+        "loader_retirement_exec_exit_abandon",
+        "loader_retirement_failures",
+        "loader_retirement_no_recycle_before_ack",
+    ] {
+        let output = Command::new(&binary).arg(selector).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "native loader retirement {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("SCENARIO {selector} PASS")),
+            "native loader retirement {selector} must print PASS:\n{stdout}"
+        );
+    }
+}
+
 /// Timing-bank producer units over the actual C helpers: saturating add,
 /// exact maximum, ts-before-remove ordering and entry-write fences.
 /// Host-only; no BPF load, no attach.

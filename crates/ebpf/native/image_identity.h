@@ -56,6 +56,13 @@ _Static_assert(__builtin_offsetof(struct control, retry_exhausted) == 32, "retry
 u32 p11_link_task_identity(struct task_struct *task, struct image_identity *out);
 /* Cookie only; zero is unavailable. No exec-ID or target-memory read. */
 u64 p11_link_current_cookie(void);
+#ifdef P11SCOPE_LOADER_GATE
+/* T-L2 ticket-query extends (see image_identity.c). Host harnesses define
+ * P11SCOPE_LOADER_GATE; no production build does, so production objects
+ * are unchanged. */
+u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out);
+u32 p11_image_identity_issued(u64 *watermark_out);
+#endif
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static u64 *(*bpf_task_storage_get)(void *map, struct task_struct *task,

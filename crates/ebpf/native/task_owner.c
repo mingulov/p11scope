@@ -6,6 +6,9 @@
  * pin the same value; update them together or not at all. The
  * capacity_contract test suite enforces this. */
 #include "task_owner.h"
+#ifdef P11SCOPE_LOADER_GATE
+#include "loader_gate.h"
+#endif
 
 struct {
     __uint(type, 29);
@@ -657,6 +660,35 @@ __attribute__((noinline)) long p11_owner_start_remove_reason(const struct owner_
                                                             u32 required, u32 reason)
 {
     return start_remove_reason(key, required, reason);
+}
+#endif
+
+#ifdef P11SCOPE_LOADER_GATE
+/* T-L2 loader retirement: the ordinary START removal plus the owned gate
+ * disposition report for the producer's loader cookie. The gate is
+ * reported if and only if the START row retired on this call (present
+ * before, absent after): a kept row (failed deletion, blocked settle)
+ * leaves the gate untouched for retry, and an absent no-op reports
+ * nothing. 0 means START retired and the gate recorded the disposition;
+ * -2 is the absent no-op; -1 is a kept row or a START-side fault (a
+ * contradicted side row still retired its START, so its disposition is
+ * still reported, but the fault dominates the return); -3 means START
+ * retired while the gate refused the cookie (stale, foreign or
+ * old-format: fail closed, gate untouched). */
+__attribute__((noinline)) long p11_owner_start_remove_loader(const struct owner_start_key *key,
+                                                             u32 required, u32 reason,
+                                                             u64 loader_cookie)
+{
+    int had = owner_map_lookup(&START, key) != (void *)0;
+    long rc = start_remove_reason(key, required, reason);
+    long gate;
+
+    if (!had || owner_map_lookup(&START, key))
+        return rc;
+    gate = p11_loader_gate_note_producer_end(loader_cookie, reason);
+    if (rc)
+        return rc;
+    return gate ? -3 : 0;
 }
 #endif
 

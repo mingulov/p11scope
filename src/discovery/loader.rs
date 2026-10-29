@@ -10,7 +10,9 @@ use p11scope_manifest::maps::MapEntry;
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::process::ProcessViewId;
 
-use super::loader_lifetime::LoaderToken;
+use super::loader_lifetime::{
+    LoaderToken, decode_loader_cookie as decode_token_cookie, loader_attach_cookie,
+};
 
 pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
 /// Generation pinned by the pre-reuse token adapter: production allocation
@@ -420,6 +422,23 @@ impl LoaderRegistry {
         self.context(id)?;
         Some(id)
     }
+
+    /// T-L2c gate wire view: the attach cookie for one allocated context is
+    /// exactly its adapter token bits. Never-allocated and removed ids
+    /// refuse without touching the registry.
+    pub(crate) fn attach_cookie_for(&self, id: LoaderContextId) -> Option<u64> {
+        self.token_for(id).map(loader_attach_cookie)
+    }
+
+    /// T-L2c gate lookup view: only adapter token cookies for allocated
+    /// storage resolve. Stale/foreign tokens, malformed cookies and
+    /// old-format cookies refuse closed, except that an old-format present
+    /// cookie with a zero delta is the numeric twin of the generation-1
+    /// token for the same case and resolves while that slot is allocated
+    /// (the atomic cutover requires drained old-format producers).
+    pub(crate) fn id_for_attach_cookie(&self, cookie: u64) -> Option<LoaderContextId> {
+        self.id_for_token(decode_token_cookie(cookie)?)
+    }
 }
 
 fn expected_hook_ip(mapping: &MapEntry, hook_file_offset: u64) -> Result<u64, String> {
@@ -709,5 +728,87 @@ mod tests {
         registry.remove(id).unwrap();
         assert_eq!(registry.token_for(id), None);
         assert_eq!(registry.id_for_token(token), None);
+    }
+
+    #[test]
+    fn loader_attach_cookie_gate_round_trips_only_allocated_storage() {
+        // T-L2c gate healthy twin: the attach cookie is exactly the adapter
+        // token bits, and only allocated storage resolves back.
+        let mut registry = LoaderRegistry::default();
+        let unallocated = LoaderContextId::from_case_id(0);
+        assert_eq!(registry.attach_cookie_for(unallocated), None);
+        assert_eq!(registry.id_for_attach_cookie(0x100), None);
+
+        let id = prepare(&mut registry, spec(None));
+        let cookie = registry
+            .attach_cookie_for(id)
+            .expect("allocated context has an attach cookie");
+        assert_eq!(cookie, 0x100);
+        assert_eq!(registry.id_for_attach_cookie(cookie), Some(id));
+
+        // Prepared, attached and tombstoned storage all resolve; only the
+        // generation and the allocation are checked.
+        registry.mark_attached(id).unwrap();
+        assert_eq!(registry.attach_cookie_for(id), Some(cookie));
+        registry.tombstone(id).unwrap();
+        assert_eq!(registry.id_for_attach_cookie(cookie), Some(id));
+
+        // Removed storage loses its cookie.
+        registry.remove(id).unwrap();
+        assert_eq!(registry.attach_cookie_for(id), None);
+        assert_eq!(registry.id_for_attach_cookie(cookie), None);
+    }
+
+    #[test]
+    fn loader_attach_cookie_gate_refuses_stale_foreign_and_old_format() {
+        // T-L2c gate failure twins: stale/foreign tokens, malformed cookies
+        // and old-format cookies refuse closed.
+        let mut registry = LoaderRegistry::default();
+        let id = prepare(&mut registry, spec(None));
+        let cookie = registry.attach_cookie_for(id).unwrap();
+        assert_eq!(cookie, 0x100);
+
+        // Any other generation refuses, even for the allocated slot.
+        let stale = LoaderToken::new(2, 0).unwrap().bits();
+        assert_eq!(registry.id_for_attach_cookie(stale), None);
+        // Generation-1 tokens past the allocation refuse.
+        let foreign = LoaderToken::new(1, 5).unwrap().bits();
+        assert_eq!(registry.id_for_attach_cookie(foreign), None);
+        // Malformed cookies refuse: zero, generation zero, over 40 bits.
+        for malformed in [0, 5, 0xff, 1 << 40, u64::MAX] {
+            assert_eq!(registry.id_for_attach_cookie(malformed), None);
+        }
+        // Old-format absent cookies refuse (generation 2, never adapter 1).
+        let old_absent = encode_loader_cookie(1, None).unwrap();
+        assert_eq!(old_absent, 0x200);
+        assert_eq!(registry.id_for_attach_cookie(old_absent), None);
+        // Old-format present cookies with a nonzero delta refuse.
+        let old_delta = encode_loader_cookie(1, Some(5)).unwrap();
+        assert_eq!(old_delta, 0xb00);
+        assert_eq!(registry.id_for_attach_cookie(old_delta), None);
+    }
+
+    #[test]
+    fn loader_attach_cookie_old_format_delta_zero_is_a_generation_one_twin() {
+        // Quiescence obligation, pinned: an old-format present cookie with a
+        // zero delta is numerically identical to the generation-1 adapter
+        // token for the same case, so the atomic cutover is only safe after
+        // every old-format producer has drained through an owned disposition.
+        assert_eq!(encode_loader_cookie(1, Some(0)).unwrap(), 0x100);
+        assert_eq!(encode_loader_cookie(3, Some(0)).unwrap(), 0x102);
+        assert_eq!(
+            LoaderToken::new(1, 0).unwrap().bits(),
+            encode_loader_cookie(1, Some(0)).unwrap()
+        );
+        assert_eq!(
+            LoaderToken::new(1, 2).unwrap().bits(),
+            encode_loader_cookie(3, Some(0)).unwrap()
+        );
+
+        let mut registry = LoaderRegistry::default();
+        let id = prepare(&mut registry, spec(None));
+        // While the twin slot is allocated, the old-format cookie resolves
+        // through the token path: the gate cannot tell them apart.
+        assert_eq!(registry.id_for_attach_cookie(0x100), Some(id));
     }
 }

@@ -115,6 +115,13 @@ u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
 u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
 long p11_owner_start_remove_reason(const struct owner_start_key *key, u32 required, u32 reason);
 #endif
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* T-L2 loader retirement: START removal plus the owned gate disposition
+ * report (see task_owner.c). Host harnesses define P11SCOPE_LOADER_GATE;
+ * no production build does, so production objects are unchanged. */
+long p11_owner_start_remove_loader(const struct owner_start_key *key, u32 required, u32 reason,
+                                   u64 loader_cookie);
+#endif
 struct owner_discovery_key { u64 pid_tgid; u64 cookie; u64 domain; };
 #ifdef P11SCOPE_INVENTORY_ONLY
 _Static_assert(sizeof(struct thread_owner) == 544, "owner ABI");

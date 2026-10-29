@@ -66,6 +66,13 @@ static u64 add_racing_claims;
 u64 controlled_add(u64 *cell, u64 delta);
 #define __sync_fetch_and_add controlled_add
 #include "task_owner.c"
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* T-L2 retirement: the real gate unit advances real gate state while the
+ * real owner advances real START state. task_owner.h precedes
+ * loader_gate.h so the START-reason literals static-assert. */
+#include "loader_gate.h"
+#include "loader_gate.c"
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
 /* The object fault leaf lives with the checked fault cell; include the real
  * unit so the fixture advances production state, not a model. */
@@ -89,6 +96,13 @@ u64 controlled_add(u64 *cell, u64 delta);
 unsigned char START, DISCOVERY_STATE;
 #ifndef P11SCOPE_INVENTORY_ONLY
 unsigned char OBJECT_START, OBJECT_DESCRIPTORS, OBJECT_ZERO;
+#endif
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* Map identities for the loader gate (extern in its TU). */
+unsigned char LOADER_GATE, LOADER_GATE_CTL;
+static struct loader_gate_row gate_rows[LOADER_GATE_SLOTS];
+static struct loader_gate_control gate_ctl;
+static int gate_ctl_present = 1;
 #endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Map identities for the timing bank producer (extern in its TU). */
@@ -222,6 +236,14 @@ static struct row *row(void *map, const void *key)
 static void *lookup(void *map, const void *key)
 {
     if (map == &OWNER_CTL) return &ctl;
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+    if (map == &LOADER_GATE_CTL) return gate_ctl_present ? &gate_ctl : NULL;
+    if (map == &LOADER_GATE) {
+        u32 slot;
+        memcpy(&slot, key, sizeof(slot));
+        return slot < LOADER_GATE_SLOTS ? &gate_rows[slot] : NULL;
+    }
+#endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
     if (map == &COUNTER_BANKS) {
         u32 bank = *(const u32 *)key;
@@ -433,6 +455,13 @@ static void reset(void)
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+    memset(gate_rows, 0, sizeof(gate_rows));
+    memset(&gate_ctl, 0, sizeof(gate_ctl));
+    gate_ctl.limit = LOADER_GATE_SLOTS;
+    gate_ctl_present = 1;
+    loader_gate_map_lookup = lookup;
+#endif
 #ifdef P11SCOPE_HOST_OWNER_LOOP
     bank_loop_calls = bank_loop_error_on = bank_loop_short_on = 0;
     bank_hide_start_slot = -1;
@@ -2831,6 +2860,133 @@ int main(void)
     puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
 }
 #else
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+#define LOADER_TOKEN(gen, slot) ((((u64)(gen)) << 8) | (u64)(slot))
+
+/* T-L2 healthy twin: a real START retires through the combined removal and
+ * the gate records the owned END disposition. */
+static void loader_retirement_return_end(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 5 };
+    u64 cookie = LOADER_TOKEN(1, 11);
+    reset();
+    assert(p11_loader_gate_admit(11, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == 0);
+    assert(!row(&START, &key) && !ctl.outstanding);
+    assert(gate_rows[11].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[11].disposition == LOADER_GATE_DISP_END);
+    assert(p11_loader_gate_lookup(cookie) == -1);
+    /* The retired lookup above is the one counted refusal. */
+    assert(gate_ctl.retired == 1 && gate_ctl.refusals == 1);
+    puts("SCENARIO loader_retirement_return_end PASS");
+}
+
+/* T-L2 entry-collision twin: the colliding entry fails, the internal
+ * COLLISION removal drops the row without touching the gate, and the entry
+ * path then reports its owned NO_END disposition. */
+static void loader_retirement_collision_no_end(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 6 };
+    u64 cookie = LOADER_TOKEN(1, 12);
+    reset();
+    assert(p11_loader_gate_admit(12, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_insert(&key, value));
+    assert(!row(&START, &key) && !ctl.outstanding);
+    assert(gate_rows[12].state == LOADER_GATE_ARMED);
+    assert(p11_loader_gate_note_producer_end(cookie, P11_OWNER_START_REASON_COLLISION) == 0);
+    assert(gate_rows[12].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[12].disposition == LOADER_GATE_DISP_NO_END);
+    assert(p11_loader_gate_lookup(cookie) == -1);
+    puts("SCENARIO loader_retirement_collision_no_end PASS");
+}
+
+/* T-L2 exec/exit twin: the real cleanup sweep abandons the live START and
+ * the producer role reports the owned ABANDON disposition. The sweep owns
+ * no cookie; automatic cleanup-path reporting needs a key-to-cookie
+ * association, which is a later T-L3 seam, not this packet. */
+static void loader_retirement_exec_exit_abandon(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 7 };
+    u64 cookie = LOADER_TOKEN(1, 13);
+    reset();
+    assert(p11_loader_gate_admit(13, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+    assert(!row(&START, &key) && !ctl.outstanding);
+    assert(gate_rows[13].state == LOADER_GATE_ARMED);
+    assert(p11_loader_gate_note_producer_end(cookie, P11_OWNER_START_REASON_EXEC_EXIT) == 0);
+    assert(gate_rows[13].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[13].disposition == LOADER_GATE_DISP_ABANDON);
+    puts("SCENARIO loader_retirement_exec_exit_abandon PASS");
+}
+
+/* T-L2 failure twins: reserve/insert/remove failures keep START and the
+ * ARMED row with the failure recorded, never a phantom disposition; a
+ * fresh cycle then retires cleanly and an absent no-op reports nothing. */
+static void loader_retirement_failures(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 8 };
+    u64 cookie = LOADER_TOKEN(1, 14);
+    reset();
+    assert(p11_loader_gate_admit(14, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    fail_create = 1;
+    assert(p11_owner_start_insert(&key, value));
+    assert(!row(&START, &key));
+    assert(gate_rows[14].state == LOADER_GATE_ARMED);
+    assert(gate_ctl.retired == 0 && gate_ctl.refusals == 0);
+    fail_create = 0;
+    assert(!p11_owner_start_insert(&key, value));
+    fail_start_delete = 1;
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) != 0);
+    assert(row(&START, &key) && ctl.outstanding == 1);
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    assert(gate_rows[14].state == LOADER_GATE_ARMED);
+    assert(gate_ctl.retired == 0 && gate_ctl.refusals == 0);
+    fail_start_delete = 0;
+    /* Poison is terminal, so recovery is a fresh cycle, not a same-row
+     * retry: the kept START above stays visible for teardown. */
+    reset();
+    assert(p11_loader_gate_admit(14, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == 0);
+    assert(gate_rows[14].disposition == LOADER_GATE_DISP_END);
+    assert(p11_owner_start_remove_loader(&key, 0, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == -2);
+    assert(gate_ctl.refusals == 0);
+    puts("SCENARIO loader_retirement_failures PASS");
+}
+
+/* No token or map identity recycles before acknowledgement: after a real
+ * retirement the slot refuses every re-admission, while START keys stay
+ * reusable for unrelated producers. */
+static void loader_retirement_no_recycle_before_ack(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 9 };
+    u64 cookie = LOADER_TOKEN(1, 15);
+    reset();
+    assert(p11_loader_gate_admit(15, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == 0);
+    assert(p11_loader_gate_admit(15, 1) == -1);
+    assert(p11_loader_gate_admit(15, 2) == -1);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_loader_gate_lookup(cookie) == -1);
+    assert(gate_ctl.retired == 1 && gate_ctl.admitted == 1);
+    puts("SCENARIO loader_retirement_no_recycle_before_ack PASS");
+}
+#endif
 #ifdef P11SCOPE_OBJECT_JOURNAL
 static void journal_removal_hook(void)
 {
@@ -2971,6 +3127,13 @@ int main(int argc, char **argv)
 #if P11SCOPE_OWNER_SLOT_BOUND == 2112U
         else if (!strcmp(argv[1], "wide_owner_full_bound")) wide_owner_full_bound();
 #endif
+#endif
+#if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
+        else if (!strcmp(argv[1], "loader_retirement_return_end")) loader_retirement_return_end();
+        else if (!strcmp(argv[1], "loader_retirement_collision_no_end")) loader_retirement_collision_no_end();
+        else if (!strcmp(argv[1], "loader_retirement_exec_exit_abandon")) loader_retirement_exec_exit_abandon();
+        else if (!strcmp(argv[1], "loader_retirement_failures")) loader_retirement_failures();
+        else if (!strcmp(argv[1], "loader_retirement_no_recycle_before_ack")) loader_retirement_no_recycle_before_ack();
 #endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
         else if (!strcmp(argv[1], "bank_timing_add_saturates")) bank_timing_add_saturates();

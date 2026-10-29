@@ -41,7 +41,7 @@ def site(variant, suffix, pattern, occurrence=None):
 def call_site(variant, suffix, target_suffix, occurrence=0):
     name, _ = instructions(variant, suffix)
     calls = [pc for caller, _, pc, target in CHECKER["D"].internal_call_targets(OBJECTS[variant])
-             if caller == name and target.endswith(target_suffix)]
+             if caller == name and target is not None and target.endswith(target_suffix)]
     return calls[occurrence]
 
 
@@ -72,7 +72,8 @@ def internal_contract(variant, name, disassembly=None):
     blocks = CHECKER["D"].function_blocks(split[".text"])
     calls = {}
     for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
-        calls.setdefault(caller, {})[pc] = target
+        if target is not None:
+            calls.setdefault(caller, {})[pc] = target
     if name == "scalar_body_contract":
         return CHECKER[name](blocks, calls, variant)
     return CHECKER[name](blocks, calls)
@@ -84,8 +85,9 @@ def entry_contract(variant, name, disassembly=None):
     split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
     blocks = CHECKER["D"].function_blocks(split[".text"])
     calls = {}
-    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split["uprobe"]+"\n"+split[".text"]):
-        calls.setdefault(caller, {})[pc] = target
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(CHECKER["joined"](split, "uprobe", ".text")):
+        if target is not None:
+            calls.setdefault(caller, {})[pc] = target
     consumer = CHECKER["_SeedCaller"]("uprobe", name,
         CHECKER["D"].function_blocks(split["uprobe"])[name], calls[name])
     selectors = [0x33] if variant == "unsafe" and name == "p11_entry" else [0x23] if name == "p11_entry_ia32" else [0x23, 0x33]
@@ -97,8 +99,9 @@ def return_contract(variant, disassembly=None):
     split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
     blocks = CHECKER["D"].function_blocks(split[".text"])
     calls = {}
-    for caller, _, pc, target in CHECKER["D"].internal_call_targets(split["uretprobe"]+"\n"+split[".text"]):
-        calls.setdefault(caller, {})[pc] = target
+    for caller, _, pc, target in CHECKER["D"].internal_call_targets(CHECKER["joined"](split, "uretprobe", ".text")):
+        if target is not None:
+            calls.setdefault(caller, {})[pc] = target
     root = CHECKER["_SeedCaller"]("uretprobe", "p11_return",
         CHECKER["D"].function_blocks(split["uretprobe"])["p11_return"], calls["p11_return"])
     return CHECKER["final_sink_contract"](root, variant, [0x23, 0x33], blocks, calls)
@@ -112,8 +115,8 @@ def consumer_case(variant, suffix, disassembly=None):
     if len(matches) != 1:
         raise AssertionError((suffix, len(matches)))
     section, name, lines = matches[0]
-    text = split[section] + ("\n"+split[".text"] if section != ".text" else "")
-    calls = {pc: target for caller, _, pc, target in CHECKER["D"].internal_call_targets(text) if caller == name}
+    text = CHECKER["joined"](split, section) if section == ".text" else CHECKER["joined"](split, section, ".text")
+    calls = {pc: target for caller, _, pc, target in CHECKER["D"].internal_call_targets(text) if caller == name and target is not None}
     outlined = section == ".text" and name.endswith(("ordinary_return", "object_return"))
     cls = CHECKER["_ReturnCaller"] if outlined or name == "p11_return" else CHECKER["_SeedCaller"]
     initial = {"r1": ("context", 0), "r2": ("external_key", ("uretprobe", "p11_return"), 0),
@@ -147,7 +150,8 @@ def entry_role_contract(variant, name, role, disassembly=None):
     split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
     internal_calls = {}
     for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
-        internal_calls.setdefault(caller, {})[pc] = target
+        if target is not None:
+            internal_calls.setdefault(caller, {})[pc] = target
     consumer.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
     calls = sorted(pc for pc, target in consumer.calls.items() if target.endswith("capture_scalar"))
     if len(calls) != 9:
@@ -177,7 +181,8 @@ def request_publication_case(variant, disassembly=None, initial_patch=None, post
     split = CHECKER["sections"](OBJECTS[variant] if disassembly is None else disassembly)
     internal_calls = {}
     for caller, _, pc, target in CHECKER["D"].internal_call_targets(split[".text"]):
-        internal_calls.setdefault(caller, {})[pc] = target
+        if target is not None:
+            internal_calls.setdefault(caller, {})[pc] = target
     consumer = CHECKER["_OwnedCaller"](original.section, original.name, original.lines, original.calls)
     consumer.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
     reference, _, _, _ = consumer_case(variant, "p11_entry")
@@ -463,7 +468,8 @@ class EntryObjectTests(unittest.TestCase):
             split = CHECKER["sections"](OBJECTS[variant])
             internal_calls = {}
             for owner, _, at, target in CHECKER["D"].internal_call_targets(split[".text"]):
-                internal_calls.setdefault(owner, {})[at] = target
+                if target is not None:
+                    internal_calls.setdefault(owner, {})[at] = target
             caller.closed_callees = CHECKER["closed_entry_callees_contract"](blocks, internal_calls)
             proof = CHECKER["_OwnedSinkProof"](6, 0, True, ("owned", 77, 0))
             caller.proof = proof
@@ -862,10 +868,10 @@ class EntryObjectTests(unittest.TestCase):
                     _, insns = instructions(variant, name)
                     texts = dict(insns)
                     split = CHECKER["sections"](disassembly)
-                    calls = CHECKER["D"].internal_call_targets(split["uprobe"] + "\n" + split[".text"])
+                    calls = CHECKER["D"].internal_call_targets(CHECKER["joined"](split, "uprobe", ".text"))
                     consumer = CHECKER["_SeedCaller"]("uprobe", name,
                         CHECKER["D"].function_blocks(split["uprobe"])[name],
-                        {pc: target for caller, _, pc, target in calls if caller == name})
+                        {pc: target for caller, _, pc, target in calls if caller == name and target is not None})
                     facts = consumer.facts()
                     if scalar is not None:
                         pc = next(pc for pc, target in consumer.calls.items() if target == scalar)
@@ -1515,7 +1521,7 @@ class EntryObjectTests(unittest.TestCase):
                     self.assertIn(11, result["roles"])
                 _, insns = instructions(variant, name)
                 calls = [pc for caller, _, pc, target in CHECKER["D"].internal_call_targets(OBJECTS[variant])
-                         if caller == name and target.endswith("capture_scalar")]
+                         if caller == name and target is not None and target.endswith("capture_scalar")]
                 roles = (6, 7, 10, 11, 9, 8) + ((16, "join", "get") if name in ("p11_entry", "p11_entry_ia32") else (12, 13))
                 self.assertEqual(len(calls), len(roles))
                 for role, (offset, size) in expected.items():
@@ -1763,14 +1769,14 @@ class EntryObjectTests(unittest.TestCase):
     def test_each_consumer_descriptor_fields_and_word(self):
         for variant in OBJECTS:
             split = CHECKER["sections"](OBJECTS[variant])
-            all_calls = CHECKER["D"].internal_call_targets(split["uprobe"]+"\n"+split[".text"])
+            all_calls = CHECKER["D"].internal_call_targets(CHECKER["joined"](split, "uprobe", ".text"))
             for section in ("uprobe", ".text"):
                 for name, lines in CHECKER["D"].function_blocks(split[section]).items():
                     outlined = name.endswith(("ordinary_return", "object_return"))
                     if not (name.startswith("p11_entry") or outlined):
                         continue
                     consumer = CHECKER["_ReturnCaller" if outlined else "_SeedCaller"](section, name, lines,
-                        {pc: target for caller, _, pc, target in all_calls if caller == name})
+                        {pc: target for caller, _, pc, target in all_calls if caller == name and target is not None})
                     initial = {"r1": ("context", 0), "r2": ("external_key", ("uretprobe", "p11_return"), 0),
                         "r3": ("owned", 7, 0), "r4": ("scope_flags", ("uretprobe", "p11_return")),
                         "r5": ("constant", 0), "r10": ("stack", 0)} if outlined else None
@@ -2066,7 +2072,7 @@ class EntryObjectTests(unittest.TestCase):
                     if destination == ("event", 0x70):
                         self.assertNotIn(("event_user_type",), result)
         fill = next(target for _, _, _, target in CHECKER["D"].internal_call_targets(OBJECTS["default"])
-                    if target.endswith("object_fill_return"))
+                    if target is not None and target.endswith("object_fill_return"))
         outlined.calls[pc] = fill
         for destination in (("owned", 7, 0), ("external_key", identity, 0), ("context", 0),
                             ("stack", -64), ("event", 0)):

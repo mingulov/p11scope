@@ -664,6 +664,88 @@ class ReporterProbeTests(unittest.TestCase):
             foreign.close()
             pin.close()
 
+    def test_symbol_tool_timeout_reports_live_owned_child_and_reaps_it(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        tools = self.root / 'hanging-symbol-tool'
+        tools.mkdir()
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\n'
+            'import os, sys, time\nfrom pathlib import Path\n'
+            f'root = Path({str(tools)!r})\n'
+            'mode = "version" if sys.argv[1:] == ["--version"] else "symbols"\n'
+            '(root / (mode + ".pid")).write_text(str(os.getpid()))\n'
+            'if mode == "version":\n'
+            '    print("owned nm timeout diagnostic fixture")\n'
+            'else:\n'
+            '    time.sleep(60)\n')
+        tool.chmod(0o700)
+        pin = HARNESS['NATIVE'].FilePin(self.probe)
+        try:
+            with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    module['resolve_reporter'](pin)
+            error = caught.exception
+            self.assertEqual(error.cmd, ['nm', '--demangle=rust', '--defined-only',
+                                        '--format=posix', f'/proc/self/fd/{pin.fd}'])
+            self.assertEqual(error.timeout, 10)
+            self.assertEqual(error.args[0], error.cmd)
+            self.assertGreater(error.args[1], 0)
+            self.assertLessEqual(error.args[1], 10)
+            self.assertIsNone(error.output)
+            self.assertIsNone(error.stderr)
+            diagnostics = getattr(error, 'diagnostics', {})
+            self.assertEqual(diagnostics.get('resolved_command'), str(tool))
+            self.assertEqual(error.args, error.__cause__.args)
+            self.assertEqual((error.cmd, error.timeout, error.output, error.stderr),
+                             (error.__cause__.cmd, error.__cause__.timeout,
+                              error.__cause__.output, error.__cause__.stderr))
+            child = diagnostics['child']
+            child_pid = int((tools / 'symbols.pid').read_text())
+            self.assertEqual(child['pid'], child_pid)
+            self.assertEqual(child['executable'], str(Path(sys.executable).resolve()))
+            self.assertEqual(child['state'], 'S')
+            self.assertTrue(child['wchan'])
+            self.assertEqual(child['fds']['candidate'], str(pin.path))
+            self.assertNotEqual(child['fds']['stdout'], child['fds']['stderr'])
+            self.assertEqual(diagnostics['version']['status'], 'completed')
+            self.assertEqual(diagnostics['version']['returncode'], 0)
+            self.assertIn('owned nm timeout diagnostic fixture', diagnostics['version']['output'])
+            self.assertEqual(json.loads(str(error).split('; nm diagnostic: ', 1)[1]), diagnostics)
+            for mode in ('symbols', 'version'):
+                pid = int((tools / f'{mode}.pid').read_text())
+                self.assertFalse(Path(f'/proc/{pid}').exists())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+        finally:
+            pin.close()
+
+    def test_symbol_tool_version_diagnostic_bounds_output_time_and_reaps_child(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        self.assertTrue(callable(module.get('_nm_version')), 'bounded timeout diagnostic is absent')
+        for mode in ('hang', 'noisy'):
+            with self.subTest(mode=mode):
+                tool = self.root / f'version-{mode}'
+                pid_path = self.root / f'version-{mode}.pid'
+                tool.write_text(f'#!{sys.executable}\n'
+                    'import os, sys, time\nfrom pathlib import Path\n'
+                    f'Path({str(pid_path)!r}).write_text(str(os.getpid()))\n'
+                    + ('time.sleep(60)\n' if mode == 'hang' else
+                       'while True:\n    os.write(1, b"x" * 4096)\n'))
+                tool.chmod(0o700)
+                started = time.monotonic()
+                version = module['_nm_version'](str(tool))
+                elapsed = time.monotonic() - started
+                self.assertEqual(version['status'], 'timeout' if mode == 'hang' else 'output_limit')
+                self.assertLessEqual(len(version['output'].encode()), 4096)
+                if mode == 'hang':
+                    self.assertGreaterEqual(elapsed, 1)
+                else:
+                    self.assertEqual(version['output'], 'x' * 4096)
+                pid = int(pid_path.read_text())
+                self.assertFalse(Path(f'/proc/{pid}').exists())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+
     def test_wire_witness_requires_actual_mode_identity_and_loss_free_causal_once(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
         expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)

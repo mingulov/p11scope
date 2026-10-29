@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -216,6 +217,151 @@ sys.stdout.buffer.write((base / name).read_bytes())
     def test_exact_successful_full_artifact_stages_only_matching_static_observer(self):
         self.accepted()
 
+    def package_delivery(self, *, conclusion="success", p0="success"):
+        # Isolate vectors even when a prior negative unexpectedly staged output.
+        shutil.rmtree(self.output, ignore_errors=True)
+        self.package_preview(conclusion=conclusion, p0=p0)
+        self.run.update(workflow_id=71, path=".github/workflows/ci.yml")
+        for job in self.jobs["jobs"]:
+            job["name"] = "package-delivery / " + job["name"]
+        self.jobs["jobs"].append({"id": 24, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+                                 "name": "release-preview", "status": "completed", "conclusion": "skipped"})
+        self.jobs["total_count"] += 1
+
+    def test_exact_nested_package_full_is_accepted_with_failed_or_missing_p0(self):
+        for p0 in ("success", "failure", None):
+            with self.subTest(p0=p0):
+                self.package_delivery(conclusion="failure" if p0 == "failure" else "success", p0=p0)
+                self.accepted()
+                calls = (self.base / "calls").read_text()
+                self.assertIn("workflows/ci.yml", calls)
+                self.assertNotIn("workflows/package-preview.yml", calls)
+                shutil.rmtree(self.output)
+
+    def test_nested_producer_cannot_borrow_legacy_or_standalone_route(self):
+        for other in ("release-preview", "validate", "package-full"):
+            for nested_failure in (False, True):
+                with self.subTest(other=other, nested_failure=nested_failure):
+                    self.package_delivery()
+                    if nested_failure:
+                        self.jobs["jobs"][1]["conclusion"] = "failure"
+                    if other == "release-preview":
+                        job = self.jobs["jobs"][-1]
+                        job.update(conclusion="success", started_at="2026-10-28T10:00:00Z",
+                                   completed_at="2026-10-28T10:02:00Z")
+                    else:
+                        job = copy.deepcopy(self.jobs["jobs"][0 if other == "validate" else 1])
+                        job.update(id=25, name=other, conclusion="success")
+                        self.jobs["jobs"].append(job)
+                        self.jobs["total_count"] += 1
+                    self.refused()
+                    self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_nested_route_requires_exact_jobs_genuine_steps_and_original_attempt(self):
+        for index in (0, 1):
+            for change in ("missing", "failure", "skipped", "running", "no-steps", "skipped-gate",
+                           "foreign-run", "foreign-sha", "old-attempt", "duplicate", "prefix", "suffix", "other-caller"):
+                with self.subTest(index=index, change=change):
+                    self.package_delivery()
+                    job = self.jobs["jobs"][index]
+                    if change == "missing":
+                        self.jobs["jobs"].pop(index)
+                        self.jobs["total_count"] -= 1
+                    elif change in ("failure", "skipped"):
+                        job["conclusion"] = change
+                    elif change == "running":
+                        job["status"] = "in_progress"
+                    elif change == "no-steps":
+                        job["steps"] = []
+                    elif change == "skipped-gate":
+                        job["steps"][1]["conclusion"] = "skipped"
+                    elif change == "foreign-run":
+                        job["run_id"] = 13
+                    elif change == "foreign-sha":
+                        job["head_sha"] = "a" * 40
+                    elif change == "old-attempt":
+                        job["run_attempt"] = 2
+                    elif change == "duplicate":
+                        self.jobs["jobs"].append(copy.deepcopy(job))
+                        self.jobs["total_count"] += 1
+                    elif change == "prefix":
+                        job["name"] = "foreign / " + job["name"]
+                    elif change == "suffix":
+                        job["name"] += " / foreign"
+                    else:
+                        job["name"] = job["name"].replace("package-delivery", "foreign")
+                    self.refused()
+                    self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_all_routes_preserve_original_creation_despite_later_metadata_update(self):
+        original_jobs = copy.deepcopy(self.jobs)
+        original_run = copy.deepcopy(self.run)
+        for route in ("legacy", "standalone", "nested"):
+            for old_creation in (False, True):
+                with self.subTest(route=route, old_creation=old_creation):
+                    self.run = copy.deepcopy(original_run)
+                    self.jobs = copy.deepcopy(original_jobs)
+                    if route == "standalone":
+                        self.package_preview()
+                    elif route == "nested":
+                        self.package_delivery()
+                    self.artifact.update(created_at="2026-10-28T09:00:00Z" if old_creation else "2026-10-28T10:01:00Z",
+                                         updated_at="2026-10-28T12:00:00Z")
+                    if old_creation:
+                        self.refused()
+                        self.assertNotIn("/zip", (self.base / "calls").read_text())
+                    else:
+                        self.accepted()
+                        shutil.rmtree(self.output)
+
+    def test_nested_route_retains_full_payload_and_original_run_bindings(self):
+        original_run, original_release = copy.deepcopy(self.run), copy.deepcopy(self.release)
+        original_artifact = copy.deepcopy(self.artifact)
+        for change in ("sha", "tree", "repository", "artifact-sha", "artifact-repository", "p0-namespace",
+                       "p0-feature", "p0-only", "run-race"):
+            with self.subTest(change=change):
+                self.run = copy.deepcopy(original_run)
+                self.release = copy.deepcopy(original_release)
+                self.artifact = copy.deepcopy(original_artifact)
+                self.artifacts = [self.artifact]
+                self.run_after = None
+                self.package_delivery()
+                if change == "sha":
+                    self.run["head_sha"] = "a" * 40
+                elif change == "tree":
+                    self.run["head_commit"]["tree_id"] = "a" * 40
+                elif change == "repository":
+                    self.run["head_repository"]["id"] = 99
+                elif change == "artifact-sha":
+                    self.artifact["workflow_run"]["head_sha"] = "a" * 40
+                elif change == "artifact-repository":
+                    self.artifact["workflow_run"]["repository_id"] = 99
+                elif change == "p0-namespace":
+                    self.artifact["name"] += "-p0"
+                elif change == "p0-feature":
+                    self.release["p11scope_features"] = ["p0-evidence"]
+                elif change == "p0-only":
+                    self.jobs["jobs"].pop(1)
+                    self.jobs["total_count"] -= 1
+                else:
+                    self.run_after = copy.deepcopy(self.run)
+                    self.run_after["run_attempt"] = 2
+                self.refused()
+
+    def test_nested_current_attempt_uses_its_own_full_upload_interval(self):
+        for old_creation in (False, True):
+            with self.subTest(old_creation=old_creation):
+                self.package_delivery()
+                self.second_attempt()
+                self.artifact["updated_at"] = "2026-10-28T12:00:00Z"
+                if old_creation:
+                    self.artifact["created_at"] = "2026-10-28T10:01:00Z"
+                    self.refused()
+                    self.assertNotIn("/zip", (self.base / "calls").read_text())
+                else:
+                    self.accepted()
+                    shutil.rmtree(self.output)
+
     def test_successful_package_full_is_accepted_independently_of_failed_p0(self):
         self.package_preview(conclusion="failure", p0="failure")
         self.accepted()
@@ -241,7 +387,8 @@ sys.stdout.buffer.write((base / name).read_bytes())
         self.run["run_attempt"] = 2
         for job in self.jobs["jobs"]:
             job["run_attempt"] = 2
-            if job["name"] in ("release-preview", "validate", "package-full"):
+            if job["name"] in ("release-preview", "validate", "package-full",
+                               "package-delivery / validate", "package-delivery / package-full"):
                 job.update(started_at="2026-10-28T11:00:00Z", completed_at="2026-10-28T11:02:00Z")
         self.artifact.update(created_at="2026-10-28T11:01:00Z", updated_at="2026-10-28T11:01:00Z")
 

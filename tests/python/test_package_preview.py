@@ -210,6 +210,14 @@ sys.stdout.write((api / name).read_text())
                         job["conclusion"] = change
                     self.assert_refused(self.validate())
 
+    def test_delivery_only_green_ci_cannot_qualify_as_ordinary_checks(self):
+        self.jobs = [job for job in self.jobs if job["name"] == "dedupe"]
+        for index, name in enumerate(("package-delivery / validate", "package-delivery / package-full"), 100):
+            job = copy.deepcopy(self.jobs[0])
+            job.update(id=index, name=name)
+            self.jobs.append(job)
+        self.assert_refused(self.validate())
+
     def test_stale_duplicate_and_invalid_job_or_gate_step_refuse(self):
         baseline = copy.deepcopy(self.jobs)
         mutations = (

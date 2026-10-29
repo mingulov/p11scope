@@ -11346,19 +11346,14 @@ pub(crate) mod tests {
 
     /// Scripted broad banks with `history` staged through the injected
     /// map-I/O seam: published positions plus retained providers, the
-    /// same state the gate reads live. Returns the banks with the fake
-    /// native trace, routes and bank ids for prefix asserts. Shared
-    /// with the 6.15 detail adapter's tests.
+    /// same state the gate reads live. Shared with the 6.15 detail
+    /// adapter's tests (returns the banks only; the growth twin keeps
+    /// its own injected seam for trace asserts).
     pub(crate) fn stage_toggle_banks(
         pool: &SemanticResourcePool,
         objects: &PinnedObjects,
         history: &mut AttachPlan,
-    ) -> (
-        CounterBanks,
-        Vec<&'static str>,
-        BTreeMap<u32, super::CountsBankRoute>,
-        BTreeMap<u32, u32>,
-    ) {
+    ) -> CounterBanks {
         let geometry =
             BankGeometry::checked(p11scope_ebpf_common::CounterMode::Counts, 16, 512).unwrap();
         let keepalive_bytes = CounterKeepalive::allocation_bytes(geometry).unwrap();
@@ -11376,23 +11371,20 @@ pub(crate) mod tests {
             link_staging: Arc::new(AtomicU64::new(0)),
             terminal: None,
         };
-        let snapshot = {
-            let mut io = GrowthIo::new(pool);
-            io.target_store = Some(objects);
-            io.provider_owner = Some(&banks.keepalive.custody);
-            let publication = banks.directory.lock().unwrap().stage_with(
-                &mut io,
-                history,
-                toggle_reservation(),
-                &pool.reserver(),
-            );
-            assert!(
-                matches!(publication, BankPublication::Published { .. }),
-                "toggle prefix stages: {publication:?}"
-            );
-            (io.trace.clone(), io.routes.clone(), io.maps.clone())
-        };
-        (banks, snapshot.0, snapshot.1, snapshot.2)
+        let mut io = GrowthIo::new(pool);
+        io.target_store = Some(objects);
+        io.provider_owner = Some(&banks.keepalive.custody);
+        let publication = banks.directory.lock().unwrap().stage_with(
+            &mut io,
+            history,
+            toggle_reservation(),
+            &pool.reserver(),
+        );
+        assert!(
+            matches!(publication, BankPublication::Published { .. }),
+            "toggle prefix stages: {publication:?}"
+        );
+        banks
     }
 
     fn poison_toggle_mutex<T>(mutex: &Mutex<T>) {
@@ -11484,7 +11476,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let custody = banks.keepalive.custody.lock().unwrap();
         assert!(
             custody.providers[512].is_some(),
@@ -11566,7 +11558,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let child_slots = history.slots[512..513].to_vec();
         let charged = pool.snapshot().charged_bytes;
         assert_eq!(
@@ -11606,7 +11598,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         // Genuine directory states, set directly: the transitions that
         // produce them belong to staging (covered there); the gate must
         // match every non-published state.
@@ -11685,7 +11677,7 @@ pub(crate) mod tests {
         assert_eq!(foreign.pinned().next().unwrap().id, object);
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &old, &mut history);
+        let banks = stage_toggle_banks(&pool, &old, &mut history);
         let open = |objects: &PinnedObjects,
                     child_slots: &[Slot],
                     selected: u32|
@@ -11747,7 +11739,7 @@ pub(crate) mod tests {
                 }
                 let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
                 let mut history = toggle_object_plan(object, 513);
-                let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+                let banks = stage_toggle_banks(&pool, &objects, &mut history);
                 if poison_directory {
                     poison_toggle_mutex(&banks.directory);
                 }
@@ -11778,7 +11770,7 @@ pub(crate) mod tests {
         // The flag twin: a quarantined directory refuses with live locks.
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         banks.directory.lock().unwrap().quarantined = true;
         let child_slots = history.slots[512..513].to_vec();
         assert_eq!(
@@ -11815,7 +11807,7 @@ pub(crate) mod tests {
         // pool too small for the child envelope.
         let staging = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&staging, &objects, &mut history);
+        let banks = stage_toggle_banks(&staging, &objects, &mut history);
         let poor = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH);
         let child_slots = history.slots[512..513].to_vec();
         assert_eq!(
@@ -11892,7 +11884,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let over = toggle_object_plan(object, MAX_SLOTS + 1).slots;
         for child_slots in [&[][..], &over[..]] {
             assert_eq!(
@@ -11930,7 +11922,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let generation = NonZeroU64::new(7).unwrap();
         let child_slots = history.slots[512..513].to_vec();
         // A clean close joins through the lineage: same generation and
@@ -12375,7 +12367,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let generation = NonZeroU64::new(7).unwrap();
         let child_slots = history.slots[512..513].to_vec();
         let reservation = banks
@@ -12605,7 +12597,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let child_slots = history.slots[512..513].to_vec();
         for generation in [9, 10] {
             let reservation = banks
@@ -12675,7 +12667,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let child_slots = history.slots[512..513].to_vec();
         let reservation = banks
             .reserve_detail_window(
@@ -12790,7 +12782,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let child_slots = history.slots[512..513].to_vec();
         let reservation = banks
             .reserve_detail_window(
@@ -12841,7 +12833,7 @@ pub(crate) mod tests {
         let object = objects.pinned().next().unwrap().id;
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let mut history = toggle_object_plan(object, 513);
-        let (banks, _, _, _) = stage_toggle_banks(&pool, &objects, &mut history);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
         let child_slots = history.slots[512..513].to_vec();
         let reservation = banks
             .reserve_detail_window(

@@ -1,0 +1,3029 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Selected-detail handoff→gate adapter (6.15 phase 2).
+//!
+//! Maps a proved caller/provider request plus its selected-endpoint receipt
+//! to the published physical index and the genuine child envelope, across
+//! the two-phase reserve/bind shape. Design basis: WF §D2.3 as amended by
+//! R2-D2-A…E, on the adjudicated M1 (re-host on Inventory: the promotion
+//! lifecycle service owns the runtime; the pre-view broad-banks read is the
+//! baseline; the promotion request path carries the endpoint receipt;
+//! existing cancel + reselect), M2 (additive-first report rows, no schema
+//! v2) and M3 (reserve-split, `WindowActive` as a product rule).
+//!
+//! The driver flow this module serves (driver wiring itself is a follow-up
+//! packet; tests in this module act as the driver against the real seams):
+//! take the request once → resolve the bundle exactly as the Inventory
+//! resolver does → [`reserve_detail_window`] (validate + charge +
+//! before-mark, no generation; the reservation is placed in driver-owned
+//! custody before the worker starts) → `SelectedLifecycleService::start`
+//! with [`GatedActivationSource`] wrapping the genuine minter → on delivery
+//! the CAS seam binds the sealed generation, parks the window in custody
+//! and delegates the one CAS → on `Install` the driver takes the `Active`
+//! window (absent/`Unactivated` ⇒ reclaim for disposal, never install) →
+//! at end the lane winds down through genuine disposal first, then
+//! [`close_detail_window`] runs against the still-live broad banks.
+//!
+//! Stop linearization: the CAS inside `activate` is the point. A stop or
+//! cancel observed before delivery skips the CAS (the existing lifecycle
+//! cancel check) and the reservation closes as `Unactivated`; once the CAS
+//! has won, the stop owns the tail (lane disposal, then window close, then
+//! broad teardown). The activation source is `'static` and holds no broad
+//! handle, so no stopped re-read can run inside `activate` itself: that
+//! half of R2-D2-D needs a native-owned stop/CAS ordering and stays a
+//! recorded follow-up. What this module does instead is structural: the
+//! reservation reaches shared custody before the worker starts, so every
+//! cancel/failure path still ends in exactly one of {close `Active`, close
+//! `Unactivated`, explicit `close_refused` ledger entry} — never a silent
+//! charge drop with the source.
+
+use super::counter_collector::{CounterDeltas, CounterRead};
+use crate::attach::capture::NativeDomainId;
+use crate::attach::counter_banks::{
+    BroadToggleFacts, CounterBanks, CounterDetailLineage, CounterDetailWindow, DetailToggleDrift,
+    DetailToggleRefusal, DetailWindowReservation,
+};
+use crate::attach::selected_detailed::baseline::PromotionImageBaseline;
+use crate::attach::Session;
+use crate::discovery::caller_registry::{CallerId, ModuleId};
+use crate::discovery::identity::PinnedObjects;
+use crate::inventory_promotion::lifecycle::{
+    NativeActivationRefusal, NativeActivationSource, NativeCasReceipt, PreparationBundle,
+    SelectedActivationBinding,
+};
+use crate::inventory_promotion::{PromotionRequest, RequestId};
+use crate::inventory_semantics::AttestedSubset;
+use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan};
+use crate::process::PidPin;
+use crate::semantics_edge::resources::SemanticResourceReserver;
+use p11scope_ebpf_common::CounterMode;
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
+
+/// Why the adapter refused before/without touching the lifecycle service.
+/// [`DetailToggleRefusal`] stays the gate's own error; this maps the
+/// adapter's pre-checks. Never merged into `PromotionRefusal` silently:
+/// the driver records both vocabularies in the window ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedDetailRefusal {
+    Gate(DetailToggleRefusal),
+    /// The endpoint is not uniquely resolved for this request: the
+    /// request carries no receipt, the receipt names another view, the
+    /// provider subset is not exactly one object, the offset matches
+    /// other than one child slot, or the broad plan matches other than
+    /// one row. Never first-match.
+    EndpointUnresolved,
+    /// A child slot points outside the single required provider object
+    /// (forwarded/dependency entry): the gate would refuse `Foreign`;
+    /// the adapter names it distinctly before charging.
+    ChildForeignSlot,
+    /// The broad plan or the bracketing read is not this broad capture:
+    /// misindexed slots, a non-`Counters` admission policy, a stale or
+    /// foreign bracketing read, or a failed read offered as a bracket.
+    BroadPlanTopology,
+    /// One detail window at a time (M3 product rule): custody already
+    /// holds a reservation or a bound window.
+    WindowActive,
+}
+
+/// The resolved selection: the published broad original index plus the
+/// physical key it names. The gate re-validates both against live banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedEndpoint {
+    pub(crate) selected: u32,
+    pub(crate) physical: AttachKey,
+}
+
+/// Resolve the request's endpoint receipt to the published broad row
+/// (R2-D2-A): the unique broad plan slot whose file offset equals the
+/// receipt's offset on the convert subset's required provider file.
+/// Content keys narrow the file match across pin stores; the gate's
+/// reserve authoritatively proves it against live custody. Anything
+/// other than exactly one candidate refuses, never first-matches.
+pub(crate) fn resolve_endpoint(
+    request: &PromotionRequest,
+    convert: &AttestedSubset,
+    broad_plan: &AttachPlan,
+    broad_objects: &PinnedObjects,
+) -> Result<ResolvedEndpoint, SelectedDetailRefusal> {
+    let _ = (request, convert, broad_plan, broad_objects);
+    todo!("6.15b RED: endpoint receipt resolution")
+}
+
+/// A bound window: `Active` once the CAS has won (or may have), or
+/// `Unactivated` when the reservation never reached a successful CAS
+/// (bind refusal, CAS refusal, cancel, preparation failure). Both close
+/// through [`close_detail_window`]; only the ledger state differs.
+#[derive(Debug)]
+pub(crate) enum BoundWindow {
+    Active(CounterDetailWindow),
+    Unactivated(CounterDetailWindow),
+}
+
+#[derive(Debug)]
+enum DetailWindowSlot {
+    Vacant,
+    Reserved(DetailWindowReservation),
+    Bound(BoundWindow),
+}
+
+/// Driver-owned take-once custody for the reservation/window. The
+/// reservation is placed here by [`reserve_detail_window`] before the
+/// worker starts (so cancel/failure paths still close it); the
+/// activation source holds a clone of this handle, takes the
+/// reservation exactly once at the CAS seam, and parks the bound
+/// window back for the driver. `PendingInstall` stays untouched.
+#[derive(Debug, Clone)]
+pub(crate) struct DetailWindowCustody {
+    slot: Arc<Mutex<DetailWindowSlot>>,
+}
+
+impl DetailWindowCustody {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(DetailWindowSlot::Vacant)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DetailWindowSlot> {
+        self.slot.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Whether custody currently holds a reservation or a bound window.
+    /// The reserve-time `WindowActive` product rule reads this.
+    pub(crate) fn is_occupied(&self) -> bool {
+        !matches!(*self.lock(), DetailWindowSlot::Vacant)
+    }
+
+    /// Place a fresh reservation; fails (returning it) when occupied.
+    pub(crate) fn place_reserved(
+        &self,
+        reservation: DetailWindowReservation,
+    ) -> Result<(), DetailWindowReservation> {
+        let _ = reservation;
+        todo!("6.15b RED: custody place_reserved")
+    }
+
+    /// Take the reservation exactly once; `None` unless reserved.
+    /// A bound window is never taken through this path.
+    pub(crate) fn take_reserved(&self) -> Option<DetailWindowReservation> {
+        todo!("6.15b RED: custody take_reserved")
+    }
+
+    /// Park a bound window; fails (returning it) when occupied.
+    pub(crate) fn place_bound(&self, window: BoundWindow) -> Result<(), BoundWindow> {
+        let _ = window;
+        todo!("6.15b RED: custody place_bound")
+    }
+
+    /// Take the bound window exactly once; `None` unless bound.
+    pub(crate) fn take_bound(&self) -> Option<BoundWindow> {
+        todo!("6.15b RED: custody take_bound")
+    }
+}
+
+impl Default for DetailWindowCustody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Phase 1 (driver tick, BEFORE `SelectedLifecycleService::start`):
+/// resolve the endpoint receipt, validate the broad plan, take a live
+/// validated bracketing read, charge and mark through the gate, and
+/// place the reservation in custody. Refusal records the
+/// [`SelectedDetailRefusal`], queues nothing and starts no worker;
+/// aggregate capture is untouched. `read_seq_before` is the driver's
+/// count of successful broad `observe` accepts through its own
+/// bracketing read (the read-seq rule: seqs count successful observes
+/// only, minted by the driver, never by the gate). STAGED (6.15):
+/// the live bracketing read needs running maps; unit coverage runs
+/// through [`reserve_detail_window_on_banks`] with an injected
+/// accepted read over the same shared checks.
+#[allow(clippy::too_many_arguments)] // One driver orchestration over all retained inputs; the bundle keeps preparation inputs together.
+pub(crate) fn reserve_detail_window(
+    broad: &Session,
+    broad_plan: &AttachPlan,
+    broad_objects: &PinnedObjects,
+    request: &PromotionRequest,
+    bundle: &PreparationBundle,
+    read_seq_before: u64,
+    reserve: &SemanticResourceReserver,
+    custody: &DetailWindowCustody,
+) -> Result<(), SelectedDetailRefusal> {
+    let _ = (
+        broad, broad_plan, broad_objects, request, bundle, read_seq_before, reserve, custody,
+    );
+    todo!("6.15b RED: reserve_detail_window")
+}
+
+/// Banks-level phase 1 with an injected accepted bracketing read: the
+/// unit seam for the full reserve matrix (live Session/maps are
+/// unavailable to unit tests). Production reaches the same shared
+/// checks through [`reserve_detail_window`], which performs the
+/// bracketing read internally.
+#[allow(clippy::too_many_arguments)] // Test seam mirroring the driver orchestration above.
+pub(super) fn reserve_detail_window_on_banks(
+    banks: &CounterBanks,
+    facts: BroadToggleFacts,
+    broad_plan: &AttachPlan,
+    broad_objects: &PinnedObjects,
+    request: &PromotionRequest,
+    bundle: &PreparationBundle,
+    before_read: &CounterRead,
+    read_seq_before: u64,
+    reserve: &SemanticResourceReserver,
+    custody: &DetailWindowCustody,
+) -> Result<(), SelectedDetailRefusal> {
+    let _ = (
+        banks,
+        facts,
+        broad_plan,
+        broad_objects,
+        request,
+        bundle,
+        before_read,
+        read_seq_before,
+        reserve,
+        custody,
+    );
+    todo!("6.15b RED: reserve_detail_window_on_banks")
+}
+
+/// The shared reserve checks both entry points run: custody vacancy,
+/// receipt binding, baseline/request agreement (against the bundle's
+/// pre-view baseline), provider shape, endpoint uniqueness,
+/// child-envelope closure, and broad-plan topology. Returns the
+/// resolved selection; the caller then verifies its bracketing read
+/// and calls the gate.
+pub(crate) fn verify_reserve_inputs(
+    request: &PromotionRequest,
+    bundle: &PreparationBundle,
+    broad_plan: &AttachPlan,
+    broad_objects: &PinnedObjects,
+    custody: &DetailWindowCustody,
+) -> Result<ResolvedEndpoint, SelectedDetailRefusal> {
+    let _ = (request, bundle, broad_plan, broad_objects, custody);
+    todo!("6.15b RED: verify_reserve_inputs")
+}
+
+/// The shared before-bracket check: the offered read must be an
+/// accepted read of this broad capture (generation, rows and plan
+/// all agree). A failed or foreign read refuses; reserve never
+/// opens on an unbracketed mark.
+pub(super) fn verify_before_bracket(
+    before_read: &CounterRead,
+    facts_generation: NonZeroU64,
+    broad_plan: &AttachPlan,
+) -> Result<(), SelectedDetailRefusal> {
+    let _ = (before_read, facts_generation, broad_plan);
+    todo!("6.15b RED: verify_before_bracket")
+}
+
+/// Phase 2 (inside the CAS seam): binds the sealed generation, then
+/// delegates to the genuine minter. This is the ONLY new
+/// [`NativeActivationSource`] in the packet; the raw donor Session
+/// path is never used. The source holds no broad handle (`'static`
+/// service ownership): bind validation runs on owned retained data
+/// (reservation clones with live file checks, baseline receipt,
+/// original custody) plus the presented child session and binding.
+pub(crate) struct GatedActivationSource {
+    inner: Box<dyn NativeActivationSource>,
+    custody: DetailWindowCustody,
+    baseline: PromotionImageBaseline,
+    original: Arc<PidPin>,
+}
+
+impl std::fmt::Debug for GatedActivationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GatedActivationSource(<retained>)")
+    }
+}
+
+impl GatedActivationSource {
+    pub(crate) fn new(
+        inner: Box<dyn NativeActivationSource>,
+        custody: DetailWindowCustody,
+        baseline: PromotionImageBaseline,
+        original: Arc<PidPin>,
+    ) -> Self {
+        Self {
+            inner,
+            custody,
+            baseline,
+            original,
+        }
+    }
+
+    /// Bind validation (R2-D2-B) without the native CAS: takes the
+    /// reservation exactly once, binds `expected.generation()`, then
+    /// requires the binding's domain to name the presented child
+    /// session, the binding image's exec to still match the pre-view
+    /// baseline row for the resolved original, and the retained child
+    /// slots to still cover the reserved physical key on the same
+    /// retained object (live file checks). Any mismatch parks the
+    /// window `Unactivated` and refuses WITHOUT running the CAS; the
+    /// lifecycle maps the refusal to its unchanged `ActivationFailed`
+    /// path. Factored out of [`NativeActivationSource::activate`] so
+    /// the full validation matrix runs without a live child Session.
+    pub(crate) fn validate_and_bind(
+        &mut self,
+        expected: &SelectedActivationBinding,
+        child_domain: Option<NativeDomainId>,
+    ) -> Result<CounterDetailWindow, NativeActivationRefusal> {
+        let _ = (expected, child_domain);
+        todo!("6.15b RED: validate_and_bind")
+    }
+}
+
+impl NativeActivationSource for GatedActivationSource {
+    fn activate(
+        &mut self,
+        session: &Session,
+        expected: &SelectedActivationBinding,
+    ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+        // 1. take the reservation + bind the sealed generation +
+        //    validate (parks Unactivated on any failure, no CAS).
+        // 2. delegate the one genuine CAS to the inner minter.
+        // 3. park Active on success, Unactivated on CAS refusal.
+        let _ = (session, expected);
+        todo!("6.15b RED: gated activate")
+    }
+}
+
+/// The after bracket for [`close_detail_window`]: the driver's final
+/// successful-observe seq plus the collection mode and, when the final
+/// broad read was accepted, that read. `read: None` is the explicit
+/// failed-acquisition boundary: the last accepted seq brackets the
+/// close but must never masquerade as a fresh after-read. The read
+/// stays metrics-private (`CounterRead` is a collector type): only
+/// metrics code builds brackets, from live or injected reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CloseBracket<'a> {
+    seq_after: u64,
+    mode: CounterMode,
+    read: Option<&'a CounterRead>,
+}
+
+impl<'a> CloseBracket<'a> {
+    pub(super) fn new(seq_after: u64, mode: CounterMode, read: Option<&'a CounterRead>) -> Self {
+        Self {
+            seq_after,
+            mode,
+            read,
+        }
+    }
+}
+
+/// How the after bracket checked against the live close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseBracketVerdict {
+    /// The after read is fresh for this broad (generation, rows and
+    /// mode all match the close).
+    Matched,
+    /// No accepted final read (acquisition failed): the lineage still
+    /// delivers with the live after-mark, but the read bracket is
+    /// explicitly unavailable.
+    AfterUnavailable,
+    /// The offered after read does not bracket this close. The static
+    /// names the first mismatch (`generation`, `rows`, `mode`, or
+    /// `read_failed`); the close still delivers its true live marks,
+    /// and the report carries the defect — never a quiet mismatch.
+    Mismatched(&'static str),
+}
+
+/// A closed window: the lineage joining detail rows to broad rows,
+/// the first broad-identity drift if any, the bracketing successful-
+/// observe seqs, and the after-bracket verdict. Carries no sums:
+/// broad totals render only from broad reads, detail only from the
+/// child's own stream.
+#[derive(Debug)]
+pub(crate) struct DetailCloseReport {
+    pub(crate) lineage: CounterDetailLineage,
+    pub(crate) drift: Option<DetailToggleDrift>,
+    pub(crate) seq_before: u64,
+    pub(crate) seq_after: u64,
+    pub(crate) bracket: CloseBracketVerdict,
+}
+
+/// Phase 3 (driver tick): close exactly once, after the child's own
+/// terminal state is genuine (installed lane wound down / disposal
+/// settled / reclaim settled). Consumes the window; the after-mark
+/// comes from live banks plus a live validated after read when the
+/// final acquisition is accepted (R2-D2-C). A failed final
+/// acquisition closes with an explicit unavailable bracket; a
+/// quarantined close refuses with no lineage (the driver records a
+/// [`render_close_refused_row`] entry instead) — never a fabricated
+/// after-mark. STAGED (6.15): the live after read needs running
+/// maps; unit coverage runs through
+/// [`close_detail_window_on_banks`] with an injected bracket over
+/// the same shared verdict.
+pub(crate) fn close_detail_window(
+    window: CounterDetailWindow,
+    broad: &Session,
+    broad_plan: &AttachPlan,
+    mode: CounterMode,
+    seq_after: u64,
+) -> Result<DetailCloseReport, DetailToggleRefusal> {
+    let _ = (window, broad, broad_plan, mode, seq_after);
+    todo!("6.15b RED: close_detail_window")
+}
+
+/// Banks-level phase 3 with an injected after bracket: the unit seam
+/// for the full close matrix (live Session/maps are unavailable to
+/// unit tests). Production reaches the same shared verdict through
+/// [`close_detail_window`], which performs the after read internally.
+pub(super) fn close_detail_window_on_banks(
+    window: CounterDetailWindow,
+    banks: &CounterBanks,
+    generation: NonZeroU64,
+    broad_plan: &AttachPlan,
+    bracket: &CloseBracket<'_>,
+) -> Result<DetailCloseReport, DetailToggleRefusal> {
+    let _ = (window, banks, generation, broad_plan, bracket);
+    todo!("6.15b RED: close_detail_window_on_banks")
+}
+
+/// The shared after-bracket verdict both close paths report: the
+/// offered read must be fresh for this broad (generation, rows and
+/// mode all agree) for [`CloseBracketVerdict::Matched`]; no offered
+/// read is [`CloseBracketVerdict::AfterUnavailable`]; anything else
+/// names its first mismatch.
+pub(super) fn verify_after_bracket(
+    bracket: &CloseBracket<'_>,
+    generation: NonZeroU64,
+    broad_plan: &AttachPlan,
+) -> CloseBracketVerdict {
+    let _ = (bracket, generation, broad_plan);
+    todo!("6.15b RED: verify_after_bracket")
+}
+
+/// The window-lifecycle events the driver records in the normal
+/// bounded report path. Terminal transitions are recorded there;
+/// screen/custody state alone is never that record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailWindowEvent {
+    Reserved,
+    Bound,
+    CasWon,
+    CasRefused,
+    Closed,
+    CloseRefused,
+    CancelledUnactivated,
+}
+
+impl DetailWindowEvent {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Bound => "bound",
+            Self::CasWon => "cas_won",
+            Self::CasRefused => "cas_refused",
+            Self::Closed => "closed",
+            Self::CloseRefused => "close_refused",
+            Self::CancelledUnactivated => "cancelled_unactivated",
+        }
+    }
+}
+
+/// One additive window-ledger row for a lifecycle event. Static words
+/// plus stable numeric IDs only, so the row needs no escaping.
+pub(crate) fn render_window_event(
+    event: DetailWindowEvent,
+    request: RequestId,
+    caller: CallerId,
+    provider: ModuleId,
+    seq: u64,
+    note: Option<&str>,
+) -> serde_json::Value {
+    let _ = (event, request, caller, provider, seq, note);
+    todo!("6.15b RED: render_window_event")
+}
+
+/// The additive lineage row joining one window's detail rows to its
+/// broad rows (M2 additive-first: new `selected_detail` object, no
+/// existing key touched, no schema v2). The only join between the
+/// aggregate and detail ledgers; carries no sums.
+pub(crate) fn render_lineage_row(
+    request: &PromotionRequest,
+    endpoint_offset: u64,
+    report: &DetailCloseReport,
+) -> serde_json::Value {
+    let _ = (request, endpoint_offset, report);
+    todo!("6.15b RED: render_lineage_row")
+}
+
+/// The additive aggregate bracket: broad deltas between the window's
+/// bracketing seqs, scope-wide, per published original index.
+pub(crate) fn render_aggregate_bracket(
+    deltas: &CounterDeltas,
+    mode: CounterMode,
+    seq_before: u64,
+    seq_after: u64,
+) -> serde_json::Value {
+    let _ = (deltas, mode, seq_before, seq_after);
+    todo!("6.15b RED: render_aggregate_bracket")
+}
+
+/// The additive detail rows: the selected child's per-endpoint detail
+/// for the original caller only, keyed by detail generation and child
+/// slot, with per-mode units (counts vs timestamps vs latency).
+pub(crate) fn render_detail_rows(
+    deltas: &CounterDeltas,
+    mode: CounterMode,
+    detail_generation: u64,
+) -> serde_json::Value {
+    let _ = (deltas, mode, detail_generation);
+    todo!("6.15b RED: render_detail_rows")
+}
+
+/// The explicit ledger entry for an impossible close (quarantined
+/// banks): names the refusal, brackets nothing, fabricates nothing.
+pub(crate) fn render_close_refused_row(
+    request: &PromotionRequest,
+    endpoint_offset: u64,
+    refusal: DetailToggleRefusal,
+) -> serde_json::Value {
+    let _ = (request, endpoint_offset, refusal);
+    todo!("6.15b RED: render_close_refused_row")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::counter_collector::{
+        CounterCell, CounterCollector, CounterHealth, CounterIssue, CounterLimits,
+        CounterObservation, CounterRow, ReadReservation, ReadWindow,
+    };
+    use super::super::KernelEvidence;
+    use super::*;
+    use crate::attach::counter_banks::tests::{
+        stage_toggle_banks, toggle_object_plan, toggle_provider,
+    };
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::inventory_promotion::lifecycle::{
+        scripted_promotion_view_with_baseline_for_test, SelectedActivationBinding,
+    };
+    use crate::inventory_promotion::{Promoter, PromotionRequest};
+    use crate::plan::Slot;
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use p11scope_ebpf_common::{CountStats, SlotStats, TimestampStats};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::{Duration, Instant};
+
+    const BROAD_GENERATION: u64 = 7;
+    const DETAIL_GENERATION: u64 = 9;
+    const SEQ_BEFORE: u64 = 41;
+    const SEQ_AFTER: u64 = 87;
+
+    fn test_pool() -> SemanticResourcePool {
+        SemanticResourcePool::reference_limit(64 * 1024 * 1024)
+    }
+
+    fn limits_for(plan: &AttachPlan) -> CounterLimits {
+        CounterLimits {
+            rows: plan.slots.len(),
+            rv_keys: 0,
+        }
+    }
+
+    /// A real validated-shape read over `plan`: every row folded from
+    /// explicit per-CPU cells through the genuine `CounterRow::fold`
+    /// (checked folds, per-plan-cell binding), packed through the
+    /// genuine `CounterRead::new` (charged storage, capacity checks).
+    /// `counts` parallels `plan.slots`: (entered, returned, errors).
+    fn scripted_read(
+        pool: &SemanticResourcePool,
+        plan: &AttachPlan,
+        generation: NonZeroU64,
+        mode: CounterMode,
+        counts: &[(u64, u64, u64)],
+        window: Option<ReadWindow>,
+    ) -> CounterRead {
+        assert_eq!(
+            counts.len(),
+            plan.slots.len(),
+            "one explicit sample per plan slot"
+        );
+        let mut rows = Vec::with_capacity(plan.slots.len());
+        let held_counts: Vec<CountStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| CountStats {
+                entered,
+                returned,
+                errors,
+            })
+            .collect();
+        let held_timestamps: Vec<TimestampStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| TimestampStats {
+                entered,
+                returned,
+                errors,
+                total_ns: 10 * returned,
+                max_ns: u64::from(returned != 0) * 10,
+            })
+            .collect();
+        let held_latency: Vec<SlotStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| SlotStats {
+                entered,
+                returned,
+                errors,
+                total_ns: 10 * returned,
+                max_ns: u64::from(returned != 0) * 10,
+                buckets: [0; 32],
+            })
+            .collect();
+        for (slot, index) in plan.slots.iter().zip(0..) {
+            let cells: Vec<CounterCell<'_>> = match mode {
+                CounterMode::Counts => {
+                    vec![CounterCell::Counts(&held_counts[index])]
+                }
+                CounterMode::Timestamps => {
+                    vec![CounterCell::Timestamps(&held_timestamps[index])]
+                }
+                CounterMode::Latency => {
+                    vec![CounterCell::Latency(&held_latency[index])]
+                }
+            };
+            rows.push(
+                CounterRow::fold(slot, mode, cells, Vec::new(), limits_for(plan))
+                    .expect("explicit cells fold"),
+            );
+        }
+        let reservation =
+            ReadReservation::reserve(rows.len(), 0, &pool.reserver()).expect("read reserves");
+        CounterRead::new(
+            generation,
+            mode,
+            window,
+            Ok(rows),
+            CounterHealth::default(),
+            KernelEvidence::default(),
+            reservation,
+        )
+        .expect("scripted read packs")
+    }
+
+    fn window_of(started: u64, finished: u64) -> Option<ReadWindow> {
+        ReadWindow::new(Some(started), Some(finished))
+    }
+
+    /// One staged broad capture: a real pinned provider file, a
+    /// `Counters` plan over it, and banks staged through the genuine
+    /// publication algorithm. The directory holds the scene alive.
+    struct BroadScene {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        objects: PinnedObjects,
+        object: PinnedObjectId,
+        plan: AttachPlan,
+        banks: CounterBanks,
+        pool: SemanticResourcePool,
+    }
+
+    fn stage_single_provider(pool: SemanticResourcePool, slots: u32) -> BroadScene {
+        let dir = tempfile::tempdir().unwrap();
+        let path = toggle_provider(&dir, "provider.so", b"selected-detail broad provider bytes");
+        let objects = crate::discovery::identity::test_fixture::real_scan_pin(
+            &path,
+            None,
+            1,
+            "detail-digest",
+        );
+        let object = objects.pinned().next().unwrap().id;
+        let mut plan = toggle_object_plan(object, slots);
+        let banks = stage_toggle_banks(&pool, &objects, &mut plan);
+        BroadScene {
+            _dir: dir,
+            path,
+            objects,
+            object,
+            plan,
+            banks,
+            pool,
+        }
+    }
+
+    /// Two provider files in one shared pin store (the M1 host shape:
+    /// broad and convert resolve in the same id space), each with the
+    /// same endpoint offsets, so file identity — never the offset
+    /// alone — carries the distinction. Ids are read back after the
+    /// merge, never assumed.
+    struct MultiScene {
+        _dir: tempfile::TempDir,
+        path_a: std::path::PathBuf,
+        path_b: std::path::PathBuf,
+        objects: PinnedObjects,
+        id_a: PinnedObjectId,
+        id_b: PinnedObjectId,
+        plan: AttachPlan,
+        banks: CounterBanks,
+        pool: SemanticResourcePool,
+    }
+
+    fn provider_slot(index: u32, object: PinnedObjectId, offset: u64, name: &str) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 0,
+            object,
+            object_path: "/multi-provider.so".into(),
+            file_offset: offset,
+            names: vec![name.into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[0],
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![],
+        }
+    }
+
+    fn stage_two_providers(pool: SemanticResourcePool) -> MultiScene {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = toggle_provider(&dir, "provider-a.so", b"provider A bytes for detail");
+        let path_b = toggle_provider(&dir, "provider-b.so", b"provider B bytes for detail");
+        let mut objects = crate::discovery::identity::test_fixture::real_scan_pin(
+            &path_a,
+            None,
+            1,
+            "digest-a",
+        );
+        let other = crate::discovery::identity::test_fixture::real_scan_pin(
+            &path_b,
+            None,
+            1,
+            "digest-b",
+        );
+        assert!(
+            objects.absorb(other).is_empty(),
+            "two distinct files merge without skips"
+        );
+        let mut id_a = None;
+        let mut id_b = None;
+        for pin in objects.pinned() {
+            if pin.path.ends_with("provider-a.so") {
+                id_a = Some(pin.id);
+            } else if pin.path.ends_with("provider-b.so") {
+                id_b = Some(pin.id);
+            }
+        }
+        let (id_a, id_b) = (id_a.unwrap(), id_b.unwrap());
+        assert_ne!(id_a, id_b, "two files pin as two objects");
+        let mut plan = AttachPlan::from_slots_with_policy(
+            vec![
+                provider_slot(0, id_a, 0x80, "C_Sign"),
+                provider_slot(1, id_a, 0x90, "C_Verify"),
+                provider_slot(2, id_b, 0x80, "C_Sign"),
+                provider_slot(3, id_b, 0x90, "C_Verify"),
+            ],
+            crate::plan::AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(8192).unwrap(),
+            ),
+        )
+        .unwrap();
+        let banks = stage_toggle_banks(&pool, &objects, &mut plan);
+        MultiScene {
+            _dir: dir,
+            path_a,
+            path_b,
+            objects,
+            id_a,
+            id_b,
+            plan,
+            banks,
+            pool,
+        }
+    }
+
+    /// A proved request plus its preparation bundle, through the real
+    /// guards: `Promoter::request_with_endpoint` verifies the pair
+    /// against the immutable viewed frame, the pre-view baseline
+    /// batch genuinely derives the image baseline for the live
+    /// original, and the bundle carries scripted attach/convert
+    /// envelopes over the provider's real pinned subset.
+    struct PromotionScene {
+        promoter: Promoter,
+        request: PromotionRequest,
+        pin: Arc<PidPin>,
+        bundle: crate::inventory_promotion::lifecycle::PreparationBundle,
+    }
+
+    fn promotion_scene(
+        convert_plan: AttachPlan,
+        convert_pins: PinnedObjects,
+        required: PinnedObjectId,
+        endpoint: Option<u64>,
+        cookie: u64,
+        exec_id: u64,
+    ) -> PromotionScene {
+        promotion_scene_with_required(
+            convert_plan,
+            convert_pins,
+            BTreeMap::from([(required, BTreeSet::from([0]))]),
+            endpoint,
+            cookie,
+            exec_id,
+        )
+    }
+
+    fn promotion_scene_with_required(
+        convert_plan: AttachPlan,
+        convert_pins: PinnedObjects,
+        required_map: BTreeMap<PinnedObjectId, BTreeSet<u32>>,
+        endpoint: Option<u64>,
+        cookie: u64,
+        exec_id: u64,
+    ) -> PromotionScene {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        let custody = crate::process::WeakProcessCustody::pinned_for_test(&pin);
+        let view = scripted_promotion_view_with_baseline_for_test(
+            pin.pid(),
+            pin.start_time(),
+            1,
+            custody,
+            cookie,
+            exec_id,
+        );
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(crate::inventory_promotion::CaptureId::new(11)));
+        match endpoint {
+            Some(offset) => {
+                let receipt = crate::inventory_promotion::SelectedEndpointReceipt::new(
+                    view.revision(),
+                    offset,
+                );
+                promoter
+                    .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), receipt)
+                    .expect("exact pair with endpoint receipt queues");
+            }
+            None => {
+                promoter
+                    .request(Arc::clone(&view), CallerId(3), ModuleId(5))
+                    .expect("exact legacy pair queues");
+            }
+        }
+        let request = promoter.take_request().expect("mailbox holds it");
+        let baseline = view
+            .baseline()
+            .expect("view carries its pre-view batch")
+            .for_request(&request, &pin, 1)
+            .expect("genuine baseline derivation");
+        let bundle = crate::inventory_promotion::lifecycle::PreparationBundle {
+            attach: crate::inventory_semantics::AttestedSubset::scripted(
+                convert_plan.clone(),
+                convert_pins.clone(),
+                required_map.clone(),
+            ),
+            convert: crate::inventory_semantics::AttestedSubset::scripted(
+                convert_plan,
+                convert_pins,
+                required_map,
+            ),
+            baseline,
+            original: Arc::clone(&pin),
+            parent: crate::attach::Scope::Pid(pin.pid()),
+            backend: crate::attach::BackendSelection::Auto,
+            window: crate::attach::capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(30))
+                .expect("positive preparation window"),
+        };
+        PromotionScene {
+            promoter,
+            request,
+            pin,
+            bundle,
+        }
+    }
+
+    /// The convert envelope for one provider object: that provider's
+    /// broad slots verbatim (the child envelope IS this subset).
+    fn convert_for(plan: &AttachPlan, object: PinnedObjectId) -> AttachPlan {
+        AttachPlan::from_slots(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == object)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Counting inner activation source: records every CAS attempt
+    /// in a shared counter (the service owns and drops the source, so
+    /// tests observe attempts through the handle). Production passes
+    /// the genuine minter; tests assert zero attempts on every
+    /// pre-CAS refusal path.
+    struct StubInner {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        refusal: Option<crate::inventory_promotion::lifecycle::NativeActivationRefusal>,
+    }
+
+    impl StubInner {
+        fn succeeding(calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                calls,
+                refusal: None,
+            }
+        }
+    }
+
+    impl crate::inventory_promotion::lifecycle::NativeActivationSource for StubInner {
+        fn activate(
+            &mut self,
+            _session: &Session,
+            expected: &SelectedActivationBinding,
+        ) -> Result<
+            crate::inventory_promotion::lifecycle::NativeCasReceipt,
+            crate::inventory_promotion::lifecycle::NativeActivationRefusal,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.refusal {
+                Some(refusal) => Err(refusal),
+                None => Ok(
+                    crate::inventory_promotion::lifecycle::NativeCasReceipt::scripted(*expected),
+                ),
+            }
+        }
+    }
+
+    fn broad_facts(generation: u64, stopped: bool) -> BroadToggleFacts {
+        BroadToggleFacts {
+            generation: NonZeroU64::new(generation).unwrap(),
+            stopped,
+        }
+    }
+
+    fn expected_binding(
+        domain: crate::attach::capture::NativeDomainId,
+        generation: u64,
+        cookie: u64,
+        exec_id: u64,
+    ) -> SelectedActivationBinding {
+        SelectedActivationBinding::new(
+            domain,
+            generation,
+            p11scope_ebpf_common::ImageIdentity {
+                task_cookie: cookie,
+                exec_id,
+            },
+        )
+    }
+
+    fn counts_for(plan: &AttachPlan, entered: u64, returned: u64) -> Vec<(u64, u64, u64)> {
+        vec![(entered, returned, 0); plan.slots.len()]
+    }
+
+    #[test]
+    fn selected_detail_promotion_request_carries_endpoint_receipt() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        use crate::inventory_promotion::{
+            PromotionRequestError, PromotionRefusal, SelectedEndpointReceipt, ViewRevision,
+        };
+        let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        let custody = crate::process::WeakProcessCustody::pinned_for_test(&pin);
+        let view = scripted_promotion_view_with_baseline_for_test(
+            pin.pid(),
+            pin.start_time(),
+            1,
+            custody,
+            0xC00,
+            0xE9E,
+        );
+        // The receipt rides the request path structurally: queue with it,
+        // take it back with it.
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(crate::inventory_promotion::CaptureId::new(11)));
+        let receipt = SelectedEndpointReceipt::new(view.revision(), 0x80);
+        assert_eq!(receipt.view(), view.revision());
+        assert_eq!(receipt.file_offset(), 0x80);
+        promoter
+            .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), receipt)
+            .expect("exact pair with receipt queues");
+        let request = promoter.take_request().expect("mailbox holds it");
+        assert_eq!(request.endpoint(), Some(receipt));
+        // A receipt naming another view is stale, never rebound.
+        let mut stale = Promoter::new();
+        assert!(stale.enable(crate::inventory_promotion::CaptureId::new(11)));
+        let foreign = SelectedEndpointReceipt::new(ViewRevision::new(999), 0x80);
+        assert_eq!(
+            stale
+                .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), foreign)
+                .unwrap_err(),
+            PromotionRequestError::Refused(PromotionRefusal::StaleView)
+        );
+        // The legacy path carries no receipt; the adapter must refuse
+        // such requests closed (covered at resolve), never default.
+        let mut legacy = Promoter::new();
+        assert!(legacy.enable(crate::inventory_promotion::CaptureId::new(11)));
+        legacy
+            .request(Arc::clone(&view), CallerId(3), ModuleId(5))
+            .expect("exact legacy pair queues");
+        let taken: PromotionRequest = legacy.take_request().expect("mailbox holds it");
+        assert_eq!(taken.endpoint(), None);
+    }
+
+    #[test]
+    fn selected_detail_endpoint_unresolved_never_first_matches() {
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        // The positive control: provider A's 0x80 resolves to broad
+        // row 0 — exactly one of the two same-offset rows.
+        let proved = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let resolved = resolve_endpoint(
+            &proved.request,
+            proved.bundle.convert_subset(),
+            &scene.plan,
+            &scene.objects,
+        )
+        .expect("one file plus one offset resolves");
+        assert_eq!(resolved.selected, 0);
+        assert_eq!(
+            resolved.physical,
+            AttachKey {
+                object: scene.id_a,
+                file_offset: 0x80,
+            }
+        );
+        // No receipt: the legacy request fails closed, never defaults
+        // to a first row.
+        let legacy = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            None,
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &legacy.request,
+                legacy.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Offset absent from the provider subset: no child slot.
+        let absent = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0xDEAD),
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &absent.request,
+                absent.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Ambiguous provider subset: two required objects for one
+        // request never pick a first.
+        let ambiguous = promotion_scene_with_required(
+            convert_a.clone(),
+            scene.objects.clone(),
+            BTreeMap::from([
+                (scene.id_a, BTreeSet::from([0])),
+                (scene.id_b, BTreeSet::from([0])),
+            ]),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &ambiguous.request,
+                ambiguous.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Empty provider subset: nothing required, nothing resolved.
+        let empty = promotion_scene_with_required(
+            convert_a.clone(),
+            scene.objects.clone(),
+            BTreeMap::new(),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &empty.request,
+                empty.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Provider file absent from broad: the child names a file the
+        // broad plan never published.
+        let dir = tempfile::tempdir().unwrap();
+        let path_c = toggle_provider(&dir, "provider-c.so", b"provider C bytes, unpublished");
+        let pins_c = crate::discovery::identity::test_fixture::real_scan_pin(
+            &path_c, None, 1, "digest-c",
+        );
+        let id_c = pins_c.pinned().next().unwrap().id;
+        let convert_c = AttachPlan::from_slots(vec![provider_slot(0, id_c, 0x80, "C_Sign")]);
+        let missing = promotion_scene(convert_c, pins_c, id_c, Some(0x80), 0xC00, 0xE9E);
+        assert_eq!(
+            resolve_endpoint(
+                &missing.request,
+                missing.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Unpinned child object: without a content key the file match
+        // is incomparable and fails closed.
+        let unpinned = promotion_scene(
+            convert_a.clone(),
+            PinnedObjects::empty(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &unpinned.request,
+                unpinned.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::EndpointUnresolved
+        );
+        // Forwarded entry: a child slot outside the required object
+        // names ChildForeignSlot distinctly (the gate would refuse
+        // Foreign; the adapter refuses before charging).
+        let mut mixed_slots: Vec<Slot> = convert_a.slots.clone();
+        mixed_slots.push(provider_slot(2, scene.id_b, 0xA0, "C_Forwarded"));
+        let mixed = AttachPlan::from_slots(mixed_slots);
+        let forwarded = promotion_scene(
+            mixed,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &forwarded.request,
+                forwarded.bundle.convert_subset(),
+                &scene.plan,
+                &scene.objects,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::ChildForeignSlot
+        );
+    }
+
+    #[test]
+    fn selected_detail_custody_is_take_once() {
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        assert!(!custody.is_occupied());
+        assert!(custody.take_reserved().is_none());
+        assert!(custody.take_bound().is_none());
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("first reserve places its reservation");
+        assert!(custody.is_occupied());
+        assert!(custody.take_bound().is_none(), "reserved is not bound");
+        let reservation = custody.take_reserved().expect("take-once yields it");
+        assert_eq!(reservation.selected(), 512);
+        assert!(!custody.is_occupied(), "take drains the slot");
+        assert!(custody.take_reserved().is_none(), "no second take");
+        // A parked bound window takes through the bound path only.
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        custody
+            .place_bound(BoundWindow::Active(window))
+            .expect("vacant custody parks");
+        assert!(custody.is_occupied());
+        assert!(custody.take_reserved().is_none(), "bound is not reserved");
+        let parked = custody.take_bound().expect("bound takes once");
+        assert!(
+            matches!(parked, BoundWindow::Active(_)),
+            "the parked state survives the take"
+        );
+        assert!(!custody.is_occupied());
+        assert!(custody.take_bound().is_none(), "no second bound take");
+    }
+
+    #[test]
+    fn selected_detail_reserve_bind_close_conserves_both_ledgers() {
+        // Full window lifecycle through the real seams: staged broad
+        // banks, genuine collector observes, reserve, bind validation,
+        // ordered close. The CAS itself needs a live child Session
+        // (live-only, like the lifecycle's own CAS path), so this
+        // scene parks the validated window FORGED-ACTIVE to prove
+        // everything downstream of the CAS: custody handoff, the
+        // bracketing seqs, both ledgers, lineage, and charge release.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let mut broad = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let mut seq = 0;
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        assert_eq!(broad.observe(Ok(r0)), CounterObservation::Initial);
+        seq += 1;
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert!(matches!(
+            broad.observe(Ok(r1)),
+            CounterObservation::Advanced { .. }
+        ));
+        seq += 1;
+        let charged_before = scene.pool.snapshot().charged_bytes;
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        assert!(matches!(
+            broad.observe(Ok(before)),
+            CounterObservation::Advanced { .. }
+        ));
+        seq += 1;
+        // The bracketing read is a fresh accepted read, not the
+        // collector's retained baseline: rebuild it identically.
+        let bracket_before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &bracket_before,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let charged_reserved = scene.pool.snapshot().charged_bytes;
+        assert!(
+            charged_reserved > charged_before,
+            "reserve holds the child envelope charge"
+        );
+        // Bind validation against the sealed binding: the domain names
+        // the presented child, the exec still matches the pre-view
+        // baseline row, the slots still cover on the same file.
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let expected = expected_binding(domain, DETAIL_GENERATION, 0xC00, 0xE9E);
+        let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            proved.bundle.baseline.clone(),
+            Arc::clone(&proved.pin),
+        );
+        let window = source
+            .validate_and_bind(&expected, Some(domain))
+            .expect("sealed binding validates");
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bind validation never attempts the CAS"
+        );
+        assert_eq!(window.detail_generation(), DETAIL_GENERATION);
+        assert_eq!(window.selected(), 512);
+        // FORGED-ACTIVE: `activate` would run the one genuine CAS here
+        // and park Active on its receipt; without a live child Session
+        // the scene parks the validated window directly. Everything
+        // below the CAS (handoff, close, ledgers, lineage) is real.
+        custody
+            .place_bound(BoundWindow::Active(window))
+            .expect("CAS-won window parks");
+        // Broad keeps counting across the window; the detail stream
+        // telescopes on its own generation.
+        let r2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 12),
+            window_of(40, 50),
+        );
+        let CounterObservation::Advanced { deltas: span, .. } = broad.observe(Ok(r2)) else {
+            panic!("broad advances across the window");
+        };
+        assert_eq!((span[512].entered, span[512].returned), (3, 3));
+        seq += 1;
+        let mut detail = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let d0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(DETAIL_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 0, 0),
+            window_of(40, 50),
+        );
+        assert_eq!(detail.observe(Ok(d0)), CounterObservation::Initial);
+        let d1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(DETAIL_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 2, 2),
+            window_of(50, 60),
+        );
+        let CounterObservation::Advanced {
+            deltas: detail_span,
+            ..
+        } = detail.observe(Ok(d1))
+        else {
+            panic!("detail telescopes on its own stream");
+        };
+        assert_eq!((detail_span[512].entered, detail_span[512].returned), (2, 2));
+        // Driver takes the Active window on Install, then closes after
+        // genuine disposal with a fresh accepted after read.
+        let taken = custody.take_bound().expect("Install takes Active");
+        let BoundWindow::Active(active) = taken else {
+            panic!("a CAS-won window installs Active, never Unactivated");
+        };
+        let r3 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 13, 15),
+            window_of(60, 70),
+        );
+        assert!(matches!(
+            broad.observe(Ok(r3)),
+            CounterObservation::Advanced { .. }
+        ));
+        seq += 1;
+        let bracket_after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 13, 15),
+            window_of(60, 70),
+        );
+        let bracket = CloseBracket::new(seq, CounterMode::Counts, Some(&bracket_after));
+        let report = close_detail_window_on_banks(
+            active,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("ordered close delivers lineage");
+        assert_eq!(report.drift, None);
+        assert_eq!((report.seq_before, report.seq_after), (3, 5));
+        assert_eq!(report.bracket, CloseBracketVerdict::Matched);
+        assert_eq!(
+            (
+                report.lineage.broad_generation.get(),
+                report.lineage.broad_original_index,
+                report.lineage.detail_generation,
+            ),
+            (BROAD_GENERATION, 512, DETAIL_GENERATION)
+        );
+        assert_eq!(
+            (report.lineage.broad_read_seq_before, report.lineage.broad_read_seq_after),
+            (3, 5)
+        );
+        assert!(!custody.is_occupied(), "close drains custody");
+        let released = charged_reserved - scene.pool.snapshot().charged_bytes;
+        let envelope = crate::attach::counter_banks::detail_child_envelope(
+            proved.bundle.convert_subset().plan().slots.as_slice(),
+            &scene.objects,
+            aya::util::nr_cpus().unwrap(),
+        )
+        .expect("child envelope sizes");
+        assert!(
+            released >= envelope.bytes,
+            "close releases at least the sized child envelope: {released} >= {}",
+            envelope.bytes
+        );
+        // Never summed: the selected endpoint appears in both ledgers
+        // by design; the report joins them only through lineage.
+        let aggregate = render_aggregate_bracket(
+            &span,
+            CounterMode::Counts,
+            report.seq_before,
+            report.seq_after,
+        );
+        let detail_rows = render_detail_rows(&detail_span, CounterMode::Counts, DETAIL_GENERATION);
+        assert_eq!(aggregate["rows"][512]["entered"], serde_json::json!(3));
+        assert_eq!(detail_rows["rows"][512]["entered"], serde_json::json!(2));
+        assert!(aggregate.get("total").is_none());
+        assert!(detail_rows.get("total").is_none());
+        let lineage = render_lineage_row(&proved.request, 0x80 + 512 * 0x10, &report);
+        assert_eq!(
+            lineage["selected_detail"]["broad_original_index"],
+            serde_json::json!(512)
+        );
+        assert_eq!(
+            lineage["selected_detail"]["detail_generation"],
+            serde_json::json!(9)
+        );
+    }
+
+    #[test]
+    fn selected_detail_cancel_before_delivery_parks_unactivated_without_cas() {
+        // The stop-during-preparation race through the REAL lifecycle
+        // service: reserve places the reservation in driver custody
+        // before the worker starts; a cancel observed before delivery
+        // skips the CAS (existing linearization); the service drops
+        // the source, and the driver still abandons the surviving
+        // reservation with its charge released and a ledger row.
+        use crate::inventory_promotion::lifecycle::{
+            LifecycleEvent, PreparationOutcome, SelectedLifecycleService,
+        };
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let mut proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        let charged_before = scene.pool.snapshot().charged_bytes;
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let coordinator =
+            crate::discovery::engine::inventory_coordinator::InventoryCoordinator::new(
+                crate::attach::Scope::Pid(std::process::id()),
+                crate::discovery::hooks::HookRegistry::builtin(),
+                Vec::new(),
+                crate::discovery::caller_registry::OsProcessSource,
+                crate::discovery::caller_registry::RegistryLimits::default_limits(),
+            )
+            .expect("a test coordinator builds");
+        let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ledger_ids = (
+            proved.request.id(),
+            proved.request.caller(),
+            proved.request.provider(),
+        );
+        let source = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            proved.bundle.baseline.clone(),
+            Arc::clone(&proved.pin),
+        );
+        let mut service = SelectedLifecycleService::new();
+        service
+            .start(
+                proved.request,
+                coordinator.reserve_promotion_install().expect("capacity"),
+                Box::new(source),
+                || {
+                    PreparationOutcome::Failed(
+                        crate::attach::selected_detailed::SelectedPreparationFailure::scripted_settled(
+                        ),
+                    )
+                },
+            )
+            .expect("start runs");
+        service.note_cancel(crate::inventory_promotion::PromotionEnd::Cancelled);
+        let mut sink = std::io::sink();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Some(event) = service.poll(&mut sink) {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the service emits its terminal event"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let LifecycleEvent::Status(update) = event else {
+            panic!("a cancelled job must not install");
+        };
+        assert!(
+            matches!(
+                proved.promoter.set_status(update),
+                Some(crate::inventory_promotion::PromotionState::Ended(_))
+            ),
+            "cancel confirms an ended status"
+        );
+        assert!(service.is_idle());
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "cancel before delivery never attempts the CAS"
+        );
+        // The source died with the service, but the reservation
+        // survived in driver custody: abandon it explicitly (never
+        // bound — no lineage to join) and record the ledger row.
+        let reservation = custody.take_reserved().expect("reservation survives");
+        assert_eq!(reservation.selected(), 512);
+        assert_eq!(reservation.mark_before().seq, SEQ_BEFORE);
+        let abandoned = reservation.abandon();
+        assert_eq!(abandoned.selected, 512);
+        assert!(!custody.is_occupied());
+        assert!(
+            scene.pool.snapshot().charged_bytes <= charged_before,
+            "abandon releases the envelope charge"
+        );
+        let (req_id, caller, provider) = ledger_ids;
+        let row = render_window_event(
+            DetailWindowEvent::CancelledUnactivated,
+            req_id,
+            caller,
+            provider,
+            SEQ_BEFORE,
+            Some("cancelled before delivery"),
+        );
+        assert_eq!(row["event"], serde_json::json!("cancelled_unactivated"));
+        assert_eq!(row["seq"], serde_json::json!(SEQ_BEFORE));
+        assert_eq!(row["caller"], serde_json::json!(3));
+        assert_eq!(row["provider"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn selected_detail_bind_mismatch_parks_unactivated() {
+        use crate::inventory_promotion::lifecycle::NativeActivationRefusal;
+        // Every bind mismatch parks the window Unactivated and refuses
+        // WITHOUT running the CAS; the parked window still closes with
+        // a true lineage. The cookie positive control pins the
+        // documented semantics: across the pre-view baseline only the
+        // exec id plus original custody compare (cookies are tickets
+        // inside one domain, never compared across the baseline).
+        for (cookie, exec_id, child_domain_case, rewrite) in
+            [(0xC00, 0xFFF, "match", false), (0xC00, 0xE9E, "other", false), (0xC00, 0xE9E, "none", false), (0xC00, 0xE9E, "match", true)]
+        {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 513);
+            let convert = convert_for(&scene.plan, scene.object);
+            let proved = promotion_scene(
+                convert,
+                scene.objects.clone(),
+                scene.object,
+                Some(0x80 + 512 * 0x10),
+                0xC00,
+                0xE9E,
+            );
+            let custody = DetailWindowCustody::new();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 8, 9),
+                window_of(30, 40),
+            );
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &proved.request,
+                &proved.bundle,
+                &before,
+                SEQ_BEFORE,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .expect("proved request reserves");
+            if rewrite {
+                std::fs::write(&scene.path, b"selected-detail broad provider bytes, rewritten")
+                    .unwrap();
+            }
+            let domain =
+                crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+            let other =
+                crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+            let expected = expected_binding(domain, DETAIL_GENERATION, cookie, exec_id);
+            let child_domain = match child_domain_case {
+                "match" => Some(domain),
+                "other" => Some(other),
+                _ => None,
+            };
+            let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut source = GatedActivationSource::new(
+                Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+                custody.clone(),
+                proved.bundle.baseline.clone(),
+                Arc::clone(&proved.pin),
+            );
+            assert_eq!(
+                source.validate_and_bind(&expected, child_domain).unwrap_err(),
+                NativeActivationRefusal::BindingMismatch,
+                "case exec={exec_id:#x} domain={child_domain_case} rewrite={rewrite}"
+            );
+            assert_eq!(
+                cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "bind refusal never attempts the CAS"
+            );
+            let parked = custody.take_bound().expect("mismatch parks");
+            let BoundWindow::Unactivated(window) = parked else {
+                panic!("a refused bind parks Unactivated, never Active");
+            };
+            assert_eq!(window.detail_generation(), DETAIL_GENERATION);
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 11, 12),
+                window_of(40, 50),
+            );
+            let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+            let report = close_detail_window_on_banks(
+                window,
+                &scene.banks,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                &scene.plan,
+                &bracket,
+            )
+            .expect("Unactivated close delivers lineage");
+            assert_eq!((report.seq_before, report.seq_after), (SEQ_BEFORE, SEQ_AFTER));
+            assert!(!custody.is_occupied());
+        }
+        // Cookie positive control: a binding whose cookie differs from
+        // the baseline row but whose exec and custody agree validates.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let expected = expected_binding(domain, DETAIL_GENERATION, 0xBAD, 0xE9E);
+        let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            proved.bundle.baseline.clone(),
+            Arc::clone(&proved.pin),
+        );
+        source
+            .validate_and_bind(&expected, Some(domain))
+            .expect("cookie differences do not fail the bind");
+    }
+
+    #[test]
+    fn selected_detail_window_active_refuses_second_reserve_without_loss() {
+        // One detail window at a time (M3 product rule): a second
+        // reserve while custody is occupied refuses WindowActive with
+        // both charges intact (no envelope bytes, no worker), and the
+        // first reservation still closes cleanly; reselect then works.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let first = promotion_scene(
+            convert.clone(),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &first.request,
+            &first.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("first reserve places");
+        let charged_held = scene.pool.snapshot().charged_bytes;
+        let second = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let before2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        let charged_before_second = scene.pool.snapshot().charged_bytes;
+        assert_eq!(
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &second.request,
+                &second.bundle,
+                &before2,
+                SEQ_BEFORE + 1,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::WindowActive
+        );
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            charged_before_second,
+            "a refused reserve charges nothing"
+        );
+        assert!(custody.is_occupied(), "the first window still holds");
+        // The first reservation abandons cleanly (never bound), and
+        // the reselect then reserves on the freed custody.
+        let reservation = custody.take_reserved().expect("first survives");
+        assert_eq!(reservation.selected(), 512);
+        reservation.abandon();
+        assert!(
+            scene.pool.snapshot().charged_bytes < charged_held,
+            "abandon releases the first envelope"
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &second.request,
+            &second.bundle,
+            &before2,
+            SEQ_BEFORE + 1,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("reselect reserves after abandon");
+        let reselect = custody.take_reserved().expect("reselect placed");
+        assert_eq!(reselect.selected(), 0);
+        reselect.abandon();
+        assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_read_seq_counts_successful_observes_only() {
+        // The read-seq rule through the genuine collector: seqs count
+        // successful `observe` accepts only. A failed scrape keeps the
+        // baseline and advances no seq; the lineage carries exactly
+        // the minted seqs. Stale, foreign and failed bracketing reads
+        // refuse at reserve; a failed final acquisition closes with an
+        // explicit unavailable bracket.
+        use super::super::counter_collector::ReadStage;
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let mut broad = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let mut seq = 0;
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        assert_eq!(broad.observe(Ok(r0)), CounterObservation::Initial);
+        seq += 1;
+        assert_eq!(
+            broad.observe(Err(ReadStage::Budget)),
+            CounterObservation::ReadFailed(ReadStage::Budget)
+        );
+        assert!(broad.current().is_some(), "a failed scrape keeps its baseline");
+        // No seq for the failure: the next accepted read is still seq 2.
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert!(matches!(
+            broad.observe(Ok(r1)),
+            CounterObservation::Advanced { .. }
+        ));
+        seq += 1;
+        // A stale bracketing read (another generation) refuses: the
+        // mark must bracket a read of THIS broad capture.
+        let stale = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION + 1).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert_eq!(
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &proved.request,
+                &proved.bundle,
+                &stale,
+                seq,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert!(!custody.is_occupied(), "refused reserve places nothing");
+        // The accepted read brackets the reserve at exactly seq 2.
+        let bracket_before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &bracket_before,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("accepted read brackets");
+        let reservation = custody.take_reserved().expect("placed");
+        assert_eq!(reservation.mark_before().seq, 2);
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        // Failed final acquisition: close against the last accepted
+        // seq with NO fresh read. The lineage delivers with the live
+        // after-mark, but the bracket is explicitly unavailable — the
+        // last accepted read never masquerades as fresh.
+        let unavailable = CloseBracket::new(seq, CounterMode::Counts, None);
+        let report = close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &unavailable,
+        )
+        .expect("close delivers with unavailable bracket");
+        assert_eq!((report.seq_before, report.seq_after), (2, 2));
+        assert_eq!(report.bracket, CloseBracketVerdict::AfterUnavailable);
+        assert_eq!(
+            (report.lineage.broad_read_seq_before, report.lineage.broad_read_seq_after),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn selected_detail_held_return_brackets_without_transfer() {
+        // A call that began before the window and returns inside it
+        // belongs to whichever ledger its own records land in: broad
+        // (spanning the whole capture) shows entered and returned,
+        // while the detail stream (starting at bind) shows the return
+        // without the start under the existing child start-key rules.
+        // The adapter performs no transfer, subtraction, or stitching:
+        // each ledger telescopes exactly on its own reads.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let mut broad = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        // The held call enters before the window: row 0 shows one
+        // entered call with no return yet.
+        let mut held_entered = counts_for(&scene.plan, 0, 0);
+        held_entered[0] = (1, 0, 0);
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &held_entered,
+            window_of(10, 20),
+        );
+        assert_eq!(broad.observe(Ok(r0)), CounterObservation::Initial);
+        let bracket_before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &held_entered,
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &bracket_before,
+            1,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let bound = reservation.bind_generation(DETAIL_GENERATION);
+        custody
+            .place_bound(BoundWindow::Active(bound))
+            .expect("FORGED-ACTIVE parks (CAS is live-only)");
+        // The held call returns inside the window; a fresh call both
+        // enters and returns inside it on row 1.
+        let mut held_returned = counts_for(&scene.plan, 0, 0);
+        held_returned[0] = (1, 1, 0);
+        held_returned[1] = (1, 1, 0);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &held_returned,
+            window_of(20, 30),
+        );
+        let CounterObservation::Advanced { deltas: span, .. } = broad.observe(Ok(r1)) else {
+            panic!("broad advances across the held return");
+        };
+        assert_eq!((span[0].entered, span[0].returned), (0, 1));
+        assert_eq!((span[1].entered, span[1].returned), (1, 1));
+        // The detail stream starts at bind: its baseline has no
+        // entered record for the held call, so its span shows the
+        // return without the start — no backfill from broad.
+        let mut detail = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let d0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(DETAIL_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 0, 0),
+            window_of(20, 30),
+        );
+        assert_eq!(detail.observe(Ok(d0)), CounterObservation::Initial);
+        let mut detail_returned = counts_for(&scene.plan, 0, 0);
+        detail_returned[0] = (0, 1, 0);
+        detail_returned[1] = (1, 1, 0);
+        let d1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(DETAIL_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &detail_returned,
+            window_of(30, 40),
+        );
+        let CounterObservation::Advanced {
+            deltas: detail_span,
+            ..
+        } = detail.observe(Ok(d1))
+        else {
+            panic!("detail advances on its own stream");
+        };
+        assert_eq!((detail_span[0].entered, detail_span[0].returned), (0, 1));
+        assert_eq!((detail_span[1].entered, detail_span[1].returned), (1, 1));
+        // Close and prove the rows join only through lineage with no
+        // transfer between the ledgers.
+        let taken = custody.take_bound().expect("Install takes Active");
+        let BoundWindow::Active(active) = taken else {
+            panic!("FORGED-ACTIVE installs Active");
+        };
+        let bracket_after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &held_returned,
+            window_of(20, 30),
+        );
+        let bracket = CloseBracket::new(2, CounterMode::Counts, Some(&bracket_after));
+        let report = close_detail_window_on_banks(
+            active,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("ordered close delivers");
+        assert_eq!(report.drift, None);
+        let aggregate =
+            render_aggregate_bracket(&span, CounterMode::Counts, report.seq_before, report.seq_after);
+        let detail_rows = render_detail_rows(&detail_span, CounterMode::Counts, DETAIL_GENERATION);
+        assert_eq!(
+            aggregate["rows"][0]["returned"],
+            serde_json::json!(1),
+            "broad counts the held return"
+        );
+        assert_eq!(
+            detail_rows["rows"][0]["entered"],
+            serde_json::json!(0),
+            "Detail shows the return without a backfilled start"
+        );
+        assert_eq!(detail_rows["rows"][0]["returned"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn selected_detail_shared_target_stays_aggregate_only() {
+        // A second request sharing the target while a window is
+        // active refuses WindowActive (no second window, no shared
+        // detail): the target's rows keep counting only in the broad
+        // aggregate ledger, and the detail rows name exactly the one
+        // original caller the window was reserved for. (Per-caller
+        // filtering inside one window is the existing native
+        // selected gate, covered by its own host twin.)
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let first = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &first.request,
+            &first.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("first request reserves");
+        // A second request sharing the target cannot open detail on it.
+        let second = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x90),
+            0xC00,
+            0xE9E,
+        );
+        let before2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        assert_eq!(
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &second.request,
+                &second.bundle,
+                &before2,
+                SEQ_BEFORE + 1,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::WindowActive
+        );
+        // The shared target keeps counting in broad only: its rows
+        // telescope in the aggregate ledger while no detail exists.
+        let mut broad = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        assert_eq!(broad.observe(Ok(r0)), CounterObservation::Initial);
+        let mut shared = counts_for(&scene.plan, 8, 9);
+        shared[1] = (12, 14, 0);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &shared,
+            window_of(40, 50),
+        );
+        let CounterObservation::Advanced { deltas, .. } = broad.observe(Ok(r1)) else {
+            panic!("broad advances on the shared target");
+        };
+        assert_eq!((deltas[1].entered, deltas[1].returned), (4, 5));
+        let aggregate =
+            render_aggregate_bracket(&deltas, CounterMode::Counts, SEQ_BEFORE, SEQ_BEFORE + 1);
+        assert_eq!(aggregate["rows"][1]["entered"], serde_json::json!(4));
+        // The window's lineage names exactly the first caller: detail
+        // rows for this window can only ever join to that caller.
+        let reservation = custody.take_reserved().expect("first survives");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let bracket_after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &shared,
+            window_of(40, 50),
+        );
+        let bracket =
+            CloseBracket::new(SEQ_BEFORE + 1, CounterMode::Counts, Some(&bracket_after));
+        let report = close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("close delivers");
+        let lineage = render_lineage_row(&first.request, 0x80, &report);
+        assert_eq!(lineage["selected_detail"]["caller"], serde_json::json!(3));
+        assert_eq!(lineage["selected_detail"]["provider"], serde_json::json!(5));
+        assert_eq!(
+            lineage["selected_detail"]["broad_original_index"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
+    fn selected_detail_failed_bracket_close_discloses_without_fabrication() {
+        // A close offered a bracketing read that does not belong to it
+        // still delivers its TRUE live marks and seqs, and reports the
+        // bracket defect loudly — the read is disclaimed, never
+        // quietly mismatched, and nothing is fabricated. (Retirement
+        // between reserve and bind, and quarantine at close, need
+        // banks internals and are pinned by gate-section twins.)
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        for (label, make_read, make_mode, expected) in [
+            ("generation", 8u64, CounterMode::Counts, "generation"),
+            ("mode", 7u64, CounterMode::Latency, "mode"),
+        ] {
+            let proved = promotion_scene(
+                convert_a.clone(),
+                scene.objects.clone(),
+                scene.id_a,
+                Some(0x80),
+                0xC00,
+                0xE9E,
+            );
+            let custody = DetailWindowCustody::new();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 8, 9),
+                window_of(30, 40),
+            );
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &proved.request,
+                &proved.bundle,
+                &before,
+                SEQ_BEFORE,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .expect("proved request reserves");
+            let reservation = custody.take_reserved().expect("placed");
+            let window = reservation.bind_generation(DETAIL_GENERATION);
+            let minted = make_read;
+            let wrong = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(minted).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 11, 12),
+                window_of(40, 50),
+            );
+            let bracket = CloseBracket::new(SEQ_AFTER, make_mode, Some(&wrong));
+            let report = close_detail_window_on_banks(
+                window,
+                &scene.banks,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                &scene.plan,
+                &bracket,
+            )
+            .expect("close delivers its true marks");
+            assert_eq!(
+                report.bracket,
+                CloseBracketVerdict::Mismatched(expected),
+                "case {label} names its mismatch"
+            );
+            assert_eq!((report.seq_before, report.seq_after), (SEQ_BEFORE, SEQ_AFTER));
+            assert_eq!(
+                report.lineage.broad_mark_after.generation.get(),
+                BROAD_GENERATION,
+                "case {label}: the after-mark stays the live broad identity"
+            );
+        }
+        // Rows from another broad (same generation, other files) name
+        // the rows mismatch.
+        let proved = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let foreign_pool = test_pool();
+        let foreign_scene = stage_two_providers(foreign_pool);
+        let foreign = scripted_read(
+            &foreign_scene.pool,
+            &foreign_scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&foreign_scene.plan, 11, 12),
+            window_of(40, 50),
+        );
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&foreign));
+        let report = close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("close delivers its true marks");
+        assert_eq!(report.bracket, CloseBracketVerdict::Mismatched("rows"));
+        // A failed read offered as the after bracket names read_failed.
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let storage =
+            ReadReservation::reserve(4, 0, &scene.pool.reserver()).expect("failed read reserves");
+        let failed = CounterRead::new(
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            window_of(40, 50),
+            Err(CounterIssue::Topology),
+            CounterHealth::default(),
+            KernelEvidence::default(),
+            storage,
+        )
+        .expect("failed read packs");
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&failed));
+        let report = close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("close delivers its true marks");
+        assert_eq!(report.bracket, CloseBracketVerdict::Mismatched("read_failed"));
+        // The impossible-close ledger entry names the refusal and
+        // brackets nothing.
+        let refused =
+            render_close_refused_row(&proved.request, 0x80, DetailToggleRefusal::Quarantined);
+        assert_eq!(refused["event"], serde_json::json!("close_refused"));
+        assert_eq!(refused["refusal"], serde_json::json!("quarantined"));
+        assert!(refused.get("broad_read_seq_after").is_none());
+        assert!(refused.get("lineage").is_none());
+    }
+
+    #[test]
+    fn selected_detail_report_rows_never_sum_with_per_mode_units() {
+        // Additive-first report rows (M2): aggregate and detail render
+        // under distinct keys with no combined total, and each mode
+        // carries exactly its own fields (counts rows have no time
+        // keys, timestamps rows have no buckets). No existing counter
+        // JSON key is touched: everything new nests under
+        // `selected_detail` with mode-labeled units.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        for mode in [CounterMode::Counts, CounterMode::Timestamps, CounterMode::Latency] {
+            let mut collector =
+                CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+            let first = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                mode,
+                &counts_for(&scene.plan, 3, 5),
+                window_of(10, 20),
+            );
+            assert_eq!(collector.observe(Ok(first)), CounterObservation::Initial);
+            let second = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                mode,
+                &counts_for(&scene.plan, 5, 9),
+                window_of(20, 30),
+            );
+            let CounterObservation::Advanced { deltas, .. } = collector.observe(Ok(second))
+            else {
+                panic!("{mode:?} telescopes");
+            };
+            let aggregate =
+                render_aggregate_bracket(&deltas, mode, SEQ_BEFORE, SEQ_AFTER);
+            let detail = render_detail_rows(&deltas, mode, DETAIL_GENERATION);
+            assert_eq!(aggregate["unit"], serde_json::json!("calls"));
+            assert_eq!(aggregate["mode"], serde_json::json!(mode.name()));
+            assert_eq!(detail["unit"], serde_json::json!("calls"));
+            assert_eq!(detail["mode"], serde_json::json!(mode.name()));
+            assert_eq!(
+                detail["detail_generation"],
+                serde_json::json!(DETAIL_GENERATION)
+            );
+            assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(2));
+            assert_eq!(detail["rows"][0]["returned"], serde_json::json!(4));
+            assert!(aggregate.get("total").is_none(), "{mode:?} has no total");
+            assert!(detail.get("total").is_none(), "{mode:?} has no total");
+            match mode {
+                CounterMode::Counts => {
+                    assert!(aggregate["rows"][0].get("total_ns").is_none());
+                    assert!(detail["rows"][0].get("total_ns").is_none());
+                    assert!(detail["rows"][0].get("buckets").is_none());
+                }
+                CounterMode::Timestamps => {
+                    assert_eq!(
+                        detail["rows"][0]["total_ns"],
+                        serde_json::json!(40),
+                        "timestamps rows carry time"
+                    );
+                    assert!(detail["rows"][0].get("buckets").is_none());
+                }
+                CounterMode::Latency => {
+                    assert!(
+                        detail["rows"][0].get("buckets").is_some(),
+                        "latency rows carry buckets"
+                    );
+                    assert_eq!(
+                        detail["rows"][0]["buckets"].as_array().unwrap().len(),
+                        32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_detail_multi_provider_distinguishes_per_provider_files() {
+        // Multi-provider acceptance (owner-asked): one process with two
+        // loaded providers whose endpoints share file offsets. This
+        // test pins the measured behavior — per-provider distinction
+        // in selection, counting and detail — in all three dimensions.
+        // If any dimension ever aggregates, this test fails and the
+        // aggregation is a measured gap, never a silent one.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        // COUNTING: rows key by {object, offset}, so the two
+        // same-offset endpoints fold as distinct rows with distinct
+        // targets — never one aggregated row.
+        let mut broad = CounterCollector::new(limits_for(&scene.plan), scene.pool.reserver());
+        let mut counts = counts_for(&scene.plan, 0, 0);
+        counts[0] = (3, 3, 0);
+        counts[2] = (7, 7, 0);
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts,
+            window_of(10, 20),
+        );
+        {
+            let view = r0.view();
+            let rows = view.rows.expect("accepted read has rows");
+            assert_eq!(rows.len(), 4, "one row per plan slot, never merged");
+            assert_eq!(rows[0].view().target.object, scene.id_a);
+            assert_eq!(rows[2].view().target.object, scene.id_b);
+            assert_eq!(rows[0].view().target.file_offset, rows[2].view().target.file_offset);
+            assert_eq!(rows[0].view().entered, 3);
+            assert_eq!(rows[2].view().entered, 7);
+        }
+        assert_eq!(broad.observe(Ok(r0)), CounterObservation::Initial);
+        let mut counts = counts_for(&scene.plan, 0, 0);
+        counts[0] = (5, 5, 0);
+        counts[2] = (11, 11, 0);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts,
+            window_of(20, 30),
+        );
+        let CounterObservation::Advanced { deltas, .. } = broad.observe(Ok(r1)) else {
+            panic!("broad advances");
+        };
+        assert_eq!(deltas.len(), 4, "deltas stay per row, never merged");
+        assert_eq!(deltas[0].target.object, scene.id_a);
+        assert_eq!(deltas[2].target.object, scene.id_b);
+        assert_eq!((deltas[0].entered, deltas[2].entered), (2, 4));
+        // SELECTION: provider A's 0x80 resolves to broad row 0 only —
+        // never to provider B's same-offset row 2, never first-match.
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let resolved = resolve_endpoint(
+            &proved.request,
+            proved.bundle.convert_subset(),
+            &scene.plan,
+            &scene.objects,
+        )
+        .expect("provider file plus offset resolves");
+        assert_eq!(resolved.selected, 0);
+        assert_eq!(resolved.physical.object, scene.id_a);
+        // The ModuleId→file binding the driver's D10 liveness gate
+        // resolves: the convert subset proves provider A's live module
+        // key and refuses provider B's key for the same object.
+        let key_for = |name: &str| {
+            let pin = scene
+                .objects
+                .pinned()
+                .find(|pin| pin.path.ends_with(name))
+                .unwrap();
+            crate::discovery::caller_registry::ModuleKey::Physical {
+                dev_major: pin.key.device.major,
+                dev_minor: pin.key.device.minor,
+                ino: pin.key.inode,
+                sha256: Some(pin.sha256.to_string()),
+            }
+        };
+        assert!(
+            proved
+                .bundle
+                .convert_subset()
+                .proves_provider_module(scene.id_a, &key_for("provider-a.so")),
+            "the subset proves its own provider file"
+        );
+        assert!(
+            !proved.bundle.convert_subset().proves_provider_module(scene.id_a, &key_for("provider-b.so")),
+            "the subset refuses the other provider file"
+        );
+        // DETAIL: the window opens on provider A's row with A's
+        // physical key; provider B's endpoints stay aggregate-only
+        // (present in broad rows, absent from any detail window).
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 5),
+            window_of(20, 30),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("provider A reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        assert_eq!(reservation.selected(), 0);
+        assert_eq!(reservation.physical().object, scene.id_a);
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        assert_eq!(window.physical().object, scene.id_a);
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(30, 40),
+        );
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+        let report = close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("close delivers");
+        assert_eq!(report.lineage.broad_original_index, 0);
+        assert_eq!(report.lineage.broad_physical.object, scene.id_a);
+        assert_ne!(
+            report.lineage.broad_physical.object, scene.id_b,
+            "detail never names the other provider file"
+        );
+    }
+
+    #[test]
+    fn selected_detail_install_handoff_requires_active_window() {
+        // The Install handoff rule through the REAL service: a handoff
+        // with no Active window in custody reclaims for genuine
+        // disposal instead of installing (installing a detail lane
+        // with no open window would double-count silently). Scripted
+        // lanes dispose but never install (I4), so the genuine-install
+        // positive stays a controller-scheduled live cell; this scene
+        // proves the refusal side with a FORGED-ACTIVE close proving
+        // the Active-window close path (the CAS itself is live-only).
+        use crate::inventory_promotion::lifecycle::{
+            LifecycleEvent, PendingInstall, SelectedActivationProof, SelectedLifecycleService,
+        };
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_for(&scene.plan, scene.object);
+        let proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        // A posed install handoff over a scripted lane (reclaim-path
+        // scene): proof and lane agree, so only the missing Active
+        // window blocks the install.
+        let coordinator =
+            crate::discovery::engine::inventory_coordinator::InventoryCoordinator::new(
+                crate::attach::Scope::Pid(std::process::id()),
+                crate::discovery::hooks::HookRegistry::builtin(),
+                Vec::new(),
+                crate::discovery::caller_registry::OsProcessSource,
+                crate::discovery::caller_registry::RegistryLimits::default_limits(),
+            )
+            .expect("a test coordinator builds");
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let binding = expected_binding(domain, DETAIL_GENERATION, 0xC00, 0xE9E);
+        let lane = scripted_lane_for(&proved, binding);
+        let proof = SelectedActivationProof::mint(
+            &proved.request,
+            binding,
+            crate::inventory_promotion::lifecycle::NativeCasReceipt::scripted(binding),
+        )
+        .expect("matching receipt mints");
+        let pending = PendingInstall::from_parts(
+            proof,
+            lane,
+            coordinator.reserve_promotion_install().expect("capacity"),
+        );
+        let mut service = SelectedLifecycleService::new();
+        // The driver takes custody on Install: Reserved (never bound)
+        // is not Active, so the handoff reclaims for disposal.
+        assert!(
+            custody.take_bound().is_none(),
+            "a never-bound reservation is not an installable window"
+        );
+        service.seed_installing_for_test(take_request_like(&proved));
+        service
+            .reclaim_install(pending, None)
+            .expect("a windowless handoff reclaims");
+        let mut sink = std::io::sink();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Some(event) = service.poll(&mut sink) {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "disposal settles to its terminal event"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            matches!(event, LifecycleEvent::Status(_)),
+            "reclaim ends in a terminal status"
+        );
+        assert!(service.is_idle());
+        // The reservation never bound: abandon it explicitly, then
+        // prove the Active-window close path with a FORGED-ACTIVE
+        // park (downstream of the CAS only).
+        let reservation = custody.take_reserved().expect("reservation survives");
+        reservation.abandon();
+        assert!(!custody.is_occupied());
+        let proved2 = promotion_scene(
+            convert_for(&scene.plan, scene.object),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved2.request,
+            &proved2.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("second request reserves after reclaim");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        custody
+            .place_bound(BoundWindow::Active(window))
+            .expect("FORGED-ACTIVE parks");
+        let taken = custody.take_bound().expect("Install takes Active");
+        let BoundWindow::Active(active) = taken else {
+            panic!("an Active window installs");
+        };
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 12),
+            window_of(40, 50),
+        );
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+        let report = close_detail_window_on_banks(
+            active,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("Active close delivers");
+        assert_eq!(report.drift, None);
+        assert_eq!((report.seq_before, report.seq_after), (SEQ_BEFORE, SEQ_AFTER));
+    }
+
+    /// A scripted sealed lane over the scene's bundle (reclaim-path
+    /// scenes only: the lane must dispose, never install).
+    fn scripted_lane_for(
+        proved: &PromotionScene,
+        binding: SelectedActivationBinding,
+    ) -> crate::inventory_semantics::selected::ProvisionalSelectedLane {
+        let shell = crate::inventory_semantics::AttestedSemanticLane::start(
+            crate::inventory_semantics::AttestedSubset::scripted(
+                proved.bundle.convert_subset().plan().clone(),
+                proved.bundle.convert_subset().pins().clone(),
+                proved.bundle.convert_subset().required().clone(),
+            ),
+            &crate::attach::Scope::Pid(std::process::id()),
+            crate::attach::BackendSelection::Auto,
+        )
+        .expect("scripted subset forms a shell lane");
+        let permit = crate::attach::selected_detailed::SelectedConstructionPermit::scripted_for_test(
+            crate::events::EventsDomain::test_standin(0x70),
+            Arc::clone(&proved.pin),
+            crate::attach::Scope::Pid(proved.pin.pid()),
+            binding.domain(),
+            binding.image(),
+            binding.generation(),
+            proved.bundle.baseline.clone(),
+        );
+        crate::inventory_semantics::selected::ProvisionalSelectedLane::scripted_for_test(
+            shell, permit,
+        )
+    }
+
+    /// A taken request over the same viewed pair for posing the
+    /// `Installing` state (the reclaim scene's own request serial).
+    fn take_request_like(proved: &PromotionScene) -> PromotionRequest {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(crate::inventory_promotion::CaptureId::new(11)));
+        let receipt = crate::inventory_promotion::SelectedEndpointReceipt::new(
+            proved.request.viewed().revision(),
+            proved
+                .request
+                .endpoint()
+                .expect("scene carries a receipt")
+                .file_offset(),
+        );
+        promoter
+            .request_with_endpoint(
+                Arc::clone(proved.request.viewed()),
+                CallerId(3),
+                ModuleId(5),
+                receipt,
+            )
+            .expect("same pair queues again");
+        promoter.take_request().expect("mailbox holds it")
+    }
+
+    #[test]
+    fn selected_detail_bridge_matches_across_pin_stores() {
+        // The bridge matches files, never raw object ids: the convert
+        // subset may resolve the provider in another pin store (other
+        // id space) than the broad plan. Here the convert store pins
+        // B-then-A while broad pinned A-then-B, so provider A's id
+        // differs across the stores; the same file still resolves to
+        // the same broad row, by content key plus offset.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut convert_objects =
+            crate::discovery::identity::test_fixture::real_scan_pin(
+                &scene.path_b,
+                None,
+                1,
+                "digest-b",
+            );
+        let pins_a = crate::discovery::identity::test_fixture::real_scan_pin(
+            &scene.path_a,
+            None,
+            1,
+            "digest-a",
+        );
+        assert!(convert_objects.absorb(pins_a).is_empty());
+        let convert_id_a = convert_objects
+            .pinned()
+            .find(|pin| pin.path.ends_with("provider-a.so"))
+            .unwrap()
+            .id;
+        assert_ne!(
+            convert_id_a, scene.id_a,
+            "the premise: provider A's id differs across stores"
+        );
+        let convert_a = AttachPlan::from_slots(vec![
+            provider_slot(0, convert_id_a, 0x80, "C_Sign"),
+            provider_slot(1, convert_id_a, 0x90, "C_Verify"),
+        ]);
+        let proved = promotion_scene(
+            convert_a,
+            convert_objects,
+            convert_id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let resolved = resolve_endpoint(
+            &proved.request,
+            proved.bundle.convert_subset(),
+            &scene.plan,
+            &scene.objects,
+        )
+        .expect("same file across stores resolves");
+        assert_eq!(resolved.selected, 0);
+        assert_eq!(resolved.physical.object, scene.id_a);
+        // And the full reserve works across the stores: the gate
+        // proves the same retained file authoritatively.
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("cross-store reserve proves the same file");
+        let reservation = custody.take_reserved().expect("placed");
+        assert_eq!(reservation.selected(), 0);
+        reservation.abandon();
+        assert!(!custody.is_occupied());
+    }
+}

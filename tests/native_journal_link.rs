@@ -174,8 +174,25 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
     let bytes = fs::read(&path).unwrap();
     let object = aya_obj::Object::parse(&bytes).unwrap();
     let ordinary = aya_obj::Object::parse(p11scope::EBPF_OBJECT).unwrap();
+    let mut expected_programs: BTreeSet<_> = ordinary.programs.keys().map(String::as_str).collect();
+    assert!(expected_programs.remove("p11_entry"));
+    assert!(expected_programs.remove("p11_return"));
+    expected_programs.extend(["p11_entry_journal", "p11_return_journal"]);
+    assert_eq!(
+        object
+            .programs
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_programs
+    );
     let mut expected_maps: BTreeSet<_> = ordinary.maps.keys().map(String::as_str).collect();
-    expected_maps.extend(["JOURNAL_START", "JOURNAL_CTL", "JOURNAL_MARKER_CTL"]);
+    expected_maps.extend([
+        "JOURNAL_START",
+        "JOURNAL_CTL",
+        "JOURNAL_MARKER_CTL",
+        "JOURNAL_CLASSES",
+    ]);
     assert_eq!(
         object
             .maps
@@ -183,7 +200,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         expected_maps,
-        "private map inventory must be ordinary Detailed plus the three journal maps"
+        "private map inventory must be ordinary Detailed plus the four journal maps"
     );
     for (name, baseline) in &ordinary.maps {
         let map = &object.maps[name];
@@ -237,6 +254,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         ("JOURNAL_START", (1, 16, 24, 16_384, 0)),
         ("JOURNAL_CTL", (2, 4, 24, 1, 0)),
         ("JOURNAL_MARKER_CTL", (2, 4, 16, 1, 0)),
+        ("JOURNAL_CLASSES", (2, 4, 4, 105, 128)),
         ("THREAD_OWNER", (29, 4, 560, 0, 1)),
         ("START", (1, 16, 288, 16_384, 0)),
         ("OBJECT_START", (1, 16, 432, 16_384, 0)),
@@ -275,10 +293,10 @@ reader = load_path(Path('scripts/check-bpf-map-defs.py'), 'journal_link_btf')
 elf = reader.Elf(Path(sys.argv[1]).read_bytes())
 btf = reader.Btf(elf.sections['.BTF'][1])
 expected = {
-    'p11_journal_begin': (0, (('ptr', 16), ('ptr', 16))),
-    'p11_journal_returning': (0, (('ptr', 16), ('ptr', 24))),
-    'p11_journal_settle_prepare': (0, (('ptr', 16), ('int', 4), ('ptr', 72))),
-    'p11_journal_settle_finish': (0, (('ptr', 72), ('int', 4))),
+    'p11_journal_begin': (4, (('ptr', 16), ('ptr', 16))),
+    'p11_journal_returning': (4, (('ptr', 16), ('ptr', 24))),
+    'p11_journal_settle_prepare': (4, (('ptr', 16), ('int', 4), ('ptr', 72))),
+    'p11_journal_settle_finish': (4, (('ptr', 72), ('int', 4))),
     'p11_owner_start_remove_reason': (8, (('ptr', 16), ('int', 4), ('int', 4))),
     'p11_instance_scope_gap': (4, ()),
 }
@@ -287,11 +305,9 @@ for name, (result_size, arguments) in expected.items():
     assert len(functions) == 1 and functions[0][3] == 1, name + ' global BTF function'
     proto = btf.types[functions[0][2]]
     assert proto[0] == 13 and proto[3] == len(arguments), name + ' argument count'
-    if result_size:
-        result = btf.resolve(proto[2])
-        assert result[0] == 1 and result[2] == result_size, name + ' scalar result'
-    else:
-        assert proto[2] == 0, name + ' void result'
+    assert result_size != 0, name + ' must declare a scalar BTF result for the verifier'
+    result = btf.resolve(proto[2])
+    assert result[0] == 1 and result[2] == result_size, name + ' scalar result'
     for ref, (kind, size) in zip(proto[5][1::2], arguments, strict=True):
         node = btf.resolve(ref)
         if kind == 'ptr':
@@ -336,7 +352,18 @@ fn journal_proof_never_enters_ordinary_objects_or_loader_sources() {
     }
     for bytes in bodies {
         let object = aya_obj::Object::parse(bytes).unwrap();
-        for name in ["JOURNAL_START", "JOURNAL_CTL", "JOURNAL_MARKER_CTL"] {
+        for name in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                !object.programs.contains_key(name),
+                "ordinary object selected {name}"
+            );
+        }
+        for name in [
+            "JOURNAL_START",
+            "JOURNAL_CTL",
+            "JOURNAL_MARKER_CTL",
+            "JOURNAL_CLASSES",
+        ] {
             assert!(!object.maps.contains_key(name));
         }
         assert!(

@@ -1656,27 +1656,27 @@ fn assert_static_descriptor_cookie_contract(
     )?;
     for (marker, contract) in [
         (
-            "p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "default mixed-ABI p11_entry descriptor consumer",
         ),
         (
-            "p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_LP64, false>(ctx, core::ptr::null_mut())",
             "diagnostic p11_entry LP64 descriptor consumer",
         ),
         (
-            "p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx)",
+            "p11_entry_impl::<0, ENTRY_ABI_ILP32, false>(ctx, core::ptr::null_mut())",
             "diagnostic p11_entry_ia32 descriptor consumer",
         ),
         (
-            "p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<1, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template descriptor consumer",
         ),
         (
-            "p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<2, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template_types descriptor consumer",
         ),
         (
-            "p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx)",
+            "p11_entry_impl::<3, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut())",
             "p11_entry_template_pair descriptor consumer",
         ),
     ] {
@@ -1705,7 +1705,7 @@ fn assert_static_descriptor_cookie_contract(
 
     let entry = contract_section(
         ebpf,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
         "#[uretprobe]",
     )?;
     for (marker, contract) in [
@@ -1747,7 +1747,7 @@ fn assert_static_descriptor_cookie_contract(
             "ordinary Event.slot",
         ),
         (
-            "(*raw).base.event),\n            &*start,\n            key.slot,\n            &facts,",
+            "(*raw).base.event),\n                &*start,\n                key.slot,\n                &facts,",
             "object Event.slot",
         ),
         (
@@ -1760,7 +1760,7 @@ fn assert_static_descriptor_cookie_contract(
     // Both return branches build their facts through the shared outlined
     // consumer above: dropping either call would bypass descriptor
     // semantics for that branch's emission.
-    if returned.matches("capture_return_facts(ctx,").count() != 2 {
+    if returned.matches("capture_return_facts::<").count() != 2 {
         return Err("both return branches must consume descriptor facts".into());
     }
     // fill_call_event stores its slot parameter into Event.slot: the sink
@@ -1807,7 +1807,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     let ebpf = read("crates/ebpf/src/main.rs");
     let entry = between(
         &ebpf,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>",
         "#[uretprobe]\npub fn p11_return",
     );
     let classify = entry
@@ -1820,7 +1820,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     assert!(classify < lp64 && lp64 < ilp32 && ilp32 < entered && entered < aggregate);
     assert_eq!(
         entry[..entered]
-            .matches("owned_start_remove(&key, false)")
+            .matches("start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED)")
             .count(),
         3
     );
@@ -13645,7 +13645,11 @@ fn aggregate_policy_returns_before_both_events_reserves() {
     // the checked removal inside the gate, since dispatch guarantees an
     // object call there. The exact-text pins keep failing on any added
     // submit site.
-    let ordinary = between(&ebpf, "fn ordinary_return(", "fn object_return(");
+    let ordinary = between(
+        &ebpf,
+        "fn ordinary_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
     let ordinary_retire = ordinary
         .find("if owned_start_remove(&key, true).is_err()")
         .expect("ordinary return must retire before its aggregate gate");
@@ -13665,21 +13669,21 @@ fn aggregate_policy_returns_before_both_events_reserves() {
     );
     let object = between(
         &ebpf,
-        "fn object_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     let object_gate = object
         .find("if flags & FLAG_POLICY_AGGREGATE != 0")
         .expect("object return must gate aggregate policy");
     let object_reserve = object
-        .find("EVENTS.reserve::<ObjectEventRecord>(0)")
+        .find("EVENTS.reserve::<Record>(0)")
         .expect("object return must hold its EVENTS reserve");
     assert!(
         object_gate < object_reserve,
         "object aggregate gate must return before any submit"
     );
     assert!(
-        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        if owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
+        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)\n                .is_err()\n            {\n                unsafe { p11_object_fault() };\n                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n            }\n            return 0;\n        }"),
         "object aggregate gate must retire, then return before any submit"
     );
 
@@ -14496,6 +14500,7 @@ const OWNER_ADMISSION_TEST_CHILD: &str =
 const SUCCESSOR_REPLAY_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission/successor_replay.rs";
 const NATIVE_PRODUCER_TEST_CHILD: &str = transport_boundaries::NATIVE_PRODUCER_TEST_CHILD;
+const ROOT_PROOF_TEST_CHILD: &str = transport_boundaries::ROOT_PROOF_TEST_CHILD;
 
 fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
     // The newly external root has a common basename. Resolve literal path
@@ -14891,6 +14896,12 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         )),
         "the exact native fixture requires its unique direct cfg(test) inclusion"
     );
+    assert!(
+        transport_boundaries::root_proof_test_child_is_isolated(&read(
+            "src/semantics_objects/journal.rs"
+        )),
+        "the root proof fixture requires its unique direct test AND proof inclusion"
+    );
     let allowed = [
         "src/attach/instance.rs",
         "src/attach/instance_tests.rs",
@@ -14906,6 +14917,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
         NATIVE_PRODUCER_TEST_CHILD,
+        ROOT_PROOF_TEST_CHILD,
         // Test-only assertions that the public projection omits private fields.
         "src/s1_tests.rs",
     ];
@@ -14918,6 +14930,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
         NATIVE_PRODUCER_TEST_CHILD,
+        ROOT_PROOF_TEST_CHILD,
     ] {
         assert!(
             !refuses(path, "record.entry_ip"),
@@ -14935,6 +14948,8 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "src/semantics_objects/journal/producer.rs",
         "src/semantics_objects/journal/native_producer_tests_helpers.rs",
         "src/semantics_objects/journal/native_producer_tests/other.rs",
+        "src/semantics_objects/journal/root_proof_tests_helpers.rs",
+        "src/semantics_objects/journal/root_proof_tests/other.rs",
     ] {
         for source in [
             "record.continuity",
@@ -15016,6 +15031,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                     &source,
                 ),
                 "{} references the native fixture outside its canonical test inclusion",
+                path.display(),
+            );
+            assert!(
+                transport_boundaries::root_proof_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references the root proof outside its canonical test/proof inclusion",
                 path.display(),
             );
             if transport_boundaries::uses_private_record_fields(&path.to_string_lossy(), &source) {

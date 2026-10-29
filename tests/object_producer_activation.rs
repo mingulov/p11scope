@@ -859,7 +859,7 @@ fn object_producer_find_emits_result_cell_not_array_base() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The Find section is populated on the return path (bounded element
@@ -918,7 +918,7 @@ fn object_producer_derive_return_requires_s1_match() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The S1 return-time mechanism read supplies Derive return evidence,
@@ -969,7 +969,7 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
     // 368-byte reservation and never touch the tail.
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     assert!(
@@ -1002,8 +1002,8 @@ fn object_marker_arms_only_under_allowlisted_policy() {
     let source = bpf_source();
     let entry = source_between(
         &source,
-        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {",
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
     );
     // The seed starts ordinary: no marker without the policy branch.
     assert!(
@@ -1459,7 +1459,7 @@ fn pin_continuity_gate_precedes_fills() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The continuity fill and its join gate precede every object result
@@ -1484,7 +1484,7 @@ fn pin_continuity_gate_precedes_fills() {
     let arm = &returned[gate..fill];
     for marker in [
         "entry.discard(0)",
-        "owned_start_remove(&key, true)",
+        "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED)",
         "p11_object_fault()",
     ] {
         assert!(
@@ -1548,7 +1548,7 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn object_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     let arm = source_between(returned, "if !joined {", "let tail =");
@@ -1556,7 +1556,7 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
         .find("preserve_refused_base(")
         .expect("a refused object join must preserve one ordinary base after checked retirement");
     let output = arm
-        .find("EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0)")
+        .find(".output::<EventRecord>(unsafe { &(*raw).base }, 0)")
         .expect("copy exactly the initialized 368-byte EventRecord, with its original stamps");
     let discard = arm
         .find("entry.discard(0)")
@@ -1565,7 +1565,9 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
         preserve < output && output < discard,
         "output must run while the original reservation is owned"
     );
-    assert!(arm.contains("|| owned_start_remove(&key, true).is_ok()"));
+    assert!(arm.contains(
+        "|| start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok()"
+    ));
     assert!(arm.contains("RefusedBaseOutcome::OutputFailed"));
     assert!(arm.contains("bump_evidence(EVIDENCE_RING_LOSS)"));
     assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
@@ -2704,6 +2706,10 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// counter/inventory combination: 124730 B, measured with that same lexer.
 /// Re-baselined for the appended private image-bank-proof module cfg;
 /// the lexer and existing ordinary-source line positions are unchanged.
+/// Re-baselined for the private journal roots: const-generic JOURNAL
+/// threading through the entry/return roots, outlined capture with an
+/// explicit completion token, and the reason-aware removal wrapper:
+/// 131833 B, sha256 below, measured with the unchanged executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2713,8 +2719,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            124773,
-            "21d75a1af0b9542a3537a2fb1764d068b33c8d0a742ff74220da3754f72296cd"
+            131833,
+            "42124c3adc2bffdeac95b541d1870f9f3575292faa5fc071f4381392d18cb487"
         ),
         "stripped BPF dump must stay byte-identical"
     );

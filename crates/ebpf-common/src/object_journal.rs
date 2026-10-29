@@ -2,11 +2,11 @@
 //! Finite object-journal wire contracts (H8). Exact kernel/userspace layouts
 //! for BEGIN/END/ABANDON journal records plus their pure validators.
 //!
-//! These types pin the frozen inactive wire; they activate no producer and
-//! authorize no read by themselves. The native producer that would mint these
-//! bytes stays unwired: no BPF root emits them, and the userspace consumer
-//! (the journal child) treats every record as untrusted input until the
-//! validators below plus the Session-owned audit accept it.
+//! These frozen types authorize no target read by themselves. Ordinary
+//! production roots and Session remain unlinked; separately gated private
+//! proof roots exercise the native producer and these records. Host/compile
+//! checks do not establish kernel-load acceptance. The journal child treats
+//! records as untrusted until the validators and Session-owned audit accept them.
 //!
 //! Layouts are exact native little-endian `repr(C)` with zero padding. Like
 //! the H7 wire, validated records hold raw target words (pointers, handles,

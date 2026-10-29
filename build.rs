@@ -156,6 +156,10 @@ fn main() {
     let counter_objects_request = counter_objects_requested();
     let image_bank_proof = image_bank_proof_requested();
     let journal_proof = journal_proof_requested();
+    println!("cargo:rustc-check-cfg=cfg(p11scope_journal_roots)");
+    if journal_proof {
+        println!("cargo:rustc-cfg=p11scope_journal_roots");
+    }
     println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
     if BIRTH_MARKER_ENABLED {
         println!("cargo:rustc-cfg=p11scope_birth_marker");
@@ -758,6 +762,10 @@ fn build_variant_with_proof(
         }
         flags.push_str(flag);
     };
+    append_flag("--check-cfg=cfg(p11scope_journal_roots)");
+    if journal_proof {
+        append_flag("--cfg=p11scope_journal_roots");
+    }
     append_flag("--check-cfg=cfg(p11scope_birth_marker)");
     if journal_marker {
         append_flag("--cfg=p11scope_birth_marker");

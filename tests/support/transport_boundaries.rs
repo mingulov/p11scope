@@ -11,17 +11,21 @@ pub const NATIVE_PRODUCER_TEST_CHILD: &str =
     "src/semantics_objects/journal/native_producer_tests.rs";
 const NATIVE_PRODUCER_MODULE: &str = "#[cfg(test)]\nmod native_producer_tests;";
 const NATIVE_PRODUCER_NAME: &str = "native_producer_tests";
+pub const ROOT_PROOF_TEST_CHILD: &str = "src/semantics_objects/journal/root_proof_tests.rs";
+const ROOT_PROOF_MODULE: &str = "#[cfg(all(test, p11scope_journal_roots))]\nmod root_proof_tests;";
+const ROOT_PROOF_NAME: &str = "root_proof_tests";
 
 /// The only native fixture inclusion is a unique direct top-level test item.
 /// Comments/literals cannot supply it, and no preceding attribute may redirect it.
 pub fn native_producer_test_child_is_isolated(source: &str) -> bool {
+    test_child_is_isolated(source, NATIVE_PRODUCER_MODULE, NATIVE_PRODUCER_NAME)
+}
+
+fn test_child_is_isolated(source: &str, declaration: &str, name: &str) -> bool {
     let code = code_only(source);
     let mut declarations = source
-        .match_indices(NATIVE_PRODUCER_MODULE)
-        .filter(|(start, _)| {
-            code[*start..*start + NATIVE_PRODUCER_MODULE.len()]
-                == *NATIVE_PRODUCER_MODULE.as_bytes()
-        });
+        .match_indices(declaration)
+        .filter(|(start, _)| code[*start..*start + declaration.len()] == *declaration.as_bytes());
     let Some((start, _)) = declarations.next() else {
         return false;
     };
@@ -31,7 +35,7 @@ pub fn native_producer_test_child_is_isolated(source: &str) -> bool {
         .rev()
         .find(|byte| !byte.is_ascii_whitespace())
         .copied();
-    let end = start + NATIVE_PRODUCER_MODULE.len();
+    let end = start + declaration.len();
     declarations.next().is_none()
         && balanced(preceding, b'{', b'}')
         && balanced(preceding, b'(', b')')
@@ -39,8 +43,20 @@ pub fn native_producer_test_child_is_isolated(source: &str) -> bool {
         && matches!(boundary, None | Some(b';' | b'}'))
         // Exclude only the verified exact declaration. A second spelling,
         // including a path/include alias or comment, revokes the exemption.
-        && !source[..start].contains(NATIVE_PRODUCER_NAME)
-        && !source[end..].contains(NATIVE_PRODUCER_NAME)
+        && !source[..start].contains(name)
+        && !source[end..].contains(name)
+}
+
+pub fn root_proof_test_child_is_isolated(source: &str) -> bool {
+    test_child_is_isolated(source, ROOT_PROOF_MODULE, ROOT_PROOF_NAME)
+}
+
+pub fn root_proof_test_child_references_are_canonical(path: &str, source: &str) -> bool {
+    if path == JOURNAL {
+        root_proof_test_child_is_isolated(source)
+    } else {
+        !source.contains(ROOT_PROOF_NAME)
+    }
 }
 
 /// Applied to every src file, including the parent and the private child.
@@ -433,6 +449,76 @@ mod tests {
     }
 
     const NATIVE_CHILD_DECLARATION: &str = "#[cfg(test)]\nmod native_producer_tests;";
+
+    #[test]
+    fn root_proof_child_requires_both_real_direct_gates() {
+        let source = journal();
+        assert!(root_proof_test_child_is_isolated(&source));
+        assert!(root_proof_test_child_references_are_canonical(
+            JOURNAL, &source
+        ));
+        let child = std::fs::read_to_string(ROOT_PROOF_TEST_CHILD).unwrap();
+        assert!(root_proof_test_child_references_are_canonical(
+            ROOT_PROOF_TEST_CHILD,
+            &child
+        ));
+        assert!(uses_private_record_fields(ROOT_PROOF_TEST_CHILD, &child));
+        for mutant in [
+            ROOT_PROOF_MODULE.replace("all(test, p11scope_journal_roots)", "test"),
+            ROOT_PROOF_MODULE.replace(
+                "all(test, p11scope_journal_roots)",
+                "p11scope_journal_roots",
+            ),
+            format!("{ROOT_PROOF_MODULE}\n{ROOT_PROOF_MODULE}"),
+            format!("// {}", ROOT_PROOF_MODULE.replace('\n', "\n// ")),
+            format!("const DECOY: &str = r#\"{ROOT_PROOF_MODULE}\"#;"),
+            format!("mod nested {{\n{ROOT_PROOF_MODULE}\n}}"),
+            format!("macro_rules! hidden {{ () => {{\n{ROOT_PROOF_MODULE}\n}} }}"),
+            format!("#[path = \"journal/root_proof_tests.rs\"]\n{ROOT_PROOF_MODULE}"),
+            format!("#[cfg(any())]\n{ROOT_PROOF_MODULE}"),
+            format!("fn wrapper() {{\n{ROOT_PROOF_MODULE}\n}}"),
+        ] {
+            let changed = source.replace(ROOT_PROOF_MODULE, &mutant);
+            assert!(!root_proof_test_child_is_isolated(&changed));
+            assert!(!root_proof_test_child_references_are_canonical(
+                JOURNAL, &changed
+            ));
+        }
+    }
+
+    #[test]
+    fn root_proof_child_has_no_other_source_reference_or_path_exemption() {
+        for path in [
+            JOURNAL,
+            ROOT_PROOF_TEST_CHILD,
+            "src/lib.rs",
+            "src/semantics_objects/journal/production.rs",
+            "src/semantics_objects/journal/root_proof_tests_helpers.rs",
+            "src/semantics_objects/journal/root_proof_tests/other.rs",
+        ] {
+            for reference in [
+                "mod root_proof_tests;",
+                "#[path = \"journal/root_proof_tests.rs\"] mod alias;",
+                "include!(\"root_proof_tests.rs\");",
+                "include!(concat!(\"journal/\", \"root_proof_tests.rs\"));",
+            ] {
+                let source = if path == JOURNAL {
+                    format!("{}\n{reference}", journal())
+                } else {
+                    reference.to_owned()
+                };
+                assert!(!root_proof_test_child_references_are_canonical(
+                    path, &source
+                ));
+            }
+            if path != JOURNAL {
+                assert!(root_proof_test_child_references_are_canonical(
+                    path,
+                    "mod ordinary;"
+                ));
+            }
+        }
+    }
 
     #[test]
     fn native_producer_child_has_exact_real_test_ancestry() {

@@ -1218,6 +1218,18 @@ fn object_journal_leaves_are_inactive() {
     for program in ["main.rs", "inventory.rs", "inventory_callers.rs"] {
         let path = format!("crates/ebpf/src/{program}");
         let source = std::fs::read_to_string(&path).expect("read BPF program");
+        // Pure shared wire types/reason constants carry no native producer.
+        // The only root module inclusion is independently private-gated;
+        // actual OFF/ON object isolation is checked by the private ELF suite.
+        let source = if program == "main.rs" {
+            assert!(source.contains("#[cfg(p11scope_journal_roots)]\nmod journal_roots;"));
+            source.replace(
+                "p11scope_ebpf_common::object_journal",
+                "SHARED_JOURNAL_WIRE",
+            )
+        } else {
+            source
+        };
         for symbol in [
             "p11_journal_",
             "JOURNAL_START",
@@ -1406,6 +1418,7 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
     let lines: Vec<_> = source.lines().collect();
     let mut calls = 0;
     let mut declarations = 0;
+    let mut private_gap_calls = 0;
     for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
         let call = matches!(
@@ -1415,18 +1428,39 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
         let declaration = line.starts_with("fn p11_instance_exec_birth(")
             || line.starts_with("fn p11_instance_scope_gap(");
         if call || declaration {
-            assert!(
-                lines[index.saturating_sub(6)..index]
-                    .iter()
-                    .any(|line| line.trim() == "#[cfg(p11scope_birth_marker)]"),
-                "marker site must have the same compile-time gate: {line}"
-            );
+            let prefix = &lines[index.saturating_sub(6)..index];
+            let combined = prefix.iter().any(|line| {
+                line.trim() == "#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]"
+            });
+            if line.starts_with("fn p11_instance_scope_gap(") {
+                assert!(combined, "gap declaration needs both private selectors");
+            } else if combined {
+                assert_eq!(
+                    line, "p11_instance_scope_gap();",
+                    "private selector cannot enable birth"
+                );
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|line| line.contains("JOURNAL || cfg!(p11scope_birth_marker)")),
+                    "ordinary specialization must retain its birth-only gate"
+                );
+                private_gap_calls += 1;
+            } else {
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|line| line.trim() == "#[cfg(p11scope_birth_marker)]"),
+                    "marker site must retain its compile-time gate: {line}"
+                );
+            }
             calls += usize::from(call);
             declarations += usize::from(declaration);
         }
     }
     assert_eq!(calls, 15);
     assert_eq!(declarations, 2);
+    assert_eq!(private_gap_calls, 10);
 }
 
 /// H8-D marker drop arms: every silent in-scope drop arm calls the scope
@@ -1447,7 +1481,14 @@ fn object_journal_marker_drop_arms_call_the_gap() {
     // Keep the original local-arm bound after omitting only that selector.
     let lines: Vec<&str> = source
         .lines()
-        .filter(|line| line.trim() != "#[cfg(p11scope_birth_marker)]")
+        .filter(|line| {
+            !matches!(
+                line.trim(),
+                "#[cfg(p11scope_birth_marker)]"
+                    | "#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]"
+                    | "if JOURNAL || cfg!(p11scope_birth_marker) {"
+            )
+        })
         .collect();
     let entry_at = lines
         .iter()
@@ -1467,7 +1508,9 @@ fn object_journal_marker_drop_arms_call_the_gap() {
         .expect("ordinary half");
     let object_at = lines
         .iter()
-        .position(|line| line.starts_with("fn object_return("))
+        .position(|line| {
+            line.starts_with("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        })
         .expect("object half");
     let fork_at = lines
         .iter()
@@ -1555,8 +1598,8 @@ fn refused_base_ring_loss_is_fault_covered(object: &str) -> bool {
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(str::split_whitespace)
         .collect();
-    let fault = "preserve_refused_base(||owned_start_remove(&key,true).is_ok(),||unsafe{p11_object_fault()},";
-    let output = "||EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok(),";
+    let fault = "preserve_refused_base(||start_remove_for::<JOURNAL>(&key,true,JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),||unsafe{p11_object_fault()},";
+    let output = "||{EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok()},";
     let loss = "ifoutcome==RefusedBaseOutcome::OutputFailed{bump_evidence(EVIDENCE_RING_LOSS);}";
     match (
         code.find(fault),
@@ -1579,7 +1622,9 @@ fn object_journal_refused_base_loss_stays_fault_covered() {
     use p11scope_ebpf_common::object_flow::{RefusedBaseOutcome, preserve_refused_base};
 
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
-    let (_, object) = source.split_once("fn object_return(").expect("object half");
+    let (_, object) = source
+        .split_once("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .expect("object half");
     let (object, _) = object
         .split_once("pub extern \"C\" fn p11_link_fork_allowed")
         .expect("object half end");
@@ -1644,12 +1689,14 @@ fn object_journal_refused_base_loss_stays_fault_covered() {
 fn object_journal_object_ring_loss_gap_requires_settled_guard() {
     const GAP: &str = "p11_instance_scope_gap();";
     const CFG: &str = "#[cfg(not(feature = \"counter-broad\"))]";
-    const GUARD: &str = "if !failed {";
+    const GUARD: &str = "if !failed && (JOURNAL || cfg!(p11scope_birth_marker)) {";
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
     let lines: Vec<&str> = source.lines().collect();
     let object_at = lines
         .iter()
-        .position(|line| line.starts_with("fn object_return("))
+        .position(|line| {
+            line.starts_with("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        })
         .expect("object half");
     let fork_at = lines
         .iter()

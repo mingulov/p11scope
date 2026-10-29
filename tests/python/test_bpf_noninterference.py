@@ -291,7 +291,11 @@ class CanonicalBtfTests(unittest.TestCase):
                    ".BTF.ext": self.btf_ext([])}
         left, right = self.pair(sections, flipped)
         def dump(path, name):
-            return "dump-a" if "baseline" in str(path) else "dump-b"
+            if path == left[name]:
+                return "dump-a"
+            if path == right[name]:
+                return "dump-b"
+            self.fail(f"unexpected BTF dump path: {path}")
         with self.assertRaisesRegex(self.driver.CheckError, NAMES[0]):
             self.driver.compare_objects(left, right, dump_c=dump)
 

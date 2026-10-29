@@ -2627,6 +2627,291 @@ def _owned_self_test():
         raise AssertionError("width constants and an unrelated loop accepted as an index bound")
 
 
+def _outlined_disassembly():
+    """Outlined export-state wrapper fixture mirroring the actual objects.
+
+    Entries call the insert wrapper once with caller stack-32; returns call
+    their take wrapper twice with r3 0/1 and a caller-stack output. Direct
+    emitter/loader/interface blocks stay byte-identical to _owned_disassembly.
+    """
+    base = _owned_disassembly()
+    blocks = function_blocks(base)
+    INSERT_AT, TAKE_EXPORT_AT, TAKE_SELECTION_AT = 8000, 8300, 8700
+    BREAD_AT, COUNTERX_AT = 9100, 9200
+    GET_AT, INSERT_NATIVE_AT, REMOVE_AT = 5000, 5100, 5200
+
+    def call(target):
+        return [f"call 0x{target - 1:x}", "rel32:.text"]
+
+    def assemble(name, body, start):
+        labels = {}
+        pc = start
+        for text in body:
+            if text.startswith("label:"):
+                labels[text[6:]] = pc
+            elif not text.startswith("rel"):
+                pc += 1
+        pc = start
+        lines = [f"{start * 8:016x} <{name}>:"]
+        for text in body:
+            if text.startswith("label:"):
+                continue
+            if text.startswith("rel"):
+                kind, target = text[3:].split(":")
+                lines.append(f"                {(pc - 1) * 8:016x}:  R_BPF_64_{kind}\t{target}")
+                continue
+            if "@" in text:
+                prefix, label = text.split("@")
+                distance = labels[label] - pc - 1
+                text = prefix + ("+" if distance >= 0 else "-") + f"0x{abs(distance):x}"
+            lines.append(f"{pc:8}:\t{text}")
+            pc += 1
+        return "\n".join(lines)
+
+    def counter_block(key, slot, null_label="exit"):
+        off = f"-0x{-slot:x}"
+        return [
+            f"r7 = 0x{key:x}",
+            f"*(u32 *)(r10 - 0x{-slot:x}) = w7",
+            "r2 = r10",
+            f"r2 += {off}",
+            "r1 = 0x0 ll",
+            "rel64:COUNTERS",
+            "call 0x1",
+            f"if r0 == 0x0 goto @{null_label}",
+            "r5 = 0x1",
+            "lock *(u64 *)(r0 + 0x0) += r5",
+        ]
+
+    def entry_body():
+        return (["r6 = r1", "r7 = 0x1",
+                 "*(u64 *)(r10 - 0x20) = r7",
+                 "*(u64 *)(r10 - 0x18) = r7",
+                 "*(u64 *)(r10 - 0x10) = r7",
+                 "r1 = r6", "r2 = r10", "r2 += -0x20"]
+                + call(INSERT_AT) + ["label:exit", "exit"])
+
+    def return_body(take_at, extra=()):
+        return (["r6 = r1",
+                 "r1 = r10", "r1 += -0x40", "r2 = r6", "r3 = 0x0"]
+                + call(take_at)
+                + ["r1 = r10", "r1 += -0x40", "r2 = r6", "r3 = 0x1"]
+                + call(take_at) + list(extra) + ["label:exit", "exit"])
+
+    def take_tail(cell):
+        staging = (["r1 = r10", "r1 += -0x48", "r2 = r10", "r2 += -0x18"]
+                   + [line for off in ("0x0", "0x8", "0x10") for line in
+                      (f"r3 = *(u64 *)(r1 + {off})", f"*(u64 *)(r2 + {off}) = r3")]
+                   + ["r1 = r10", "r1 += -0x60", "r2 = r10", "r2 += -0x30"]
+                   + [line for off in ("0x0", "0x8", "0x10") for line in
+                      (f"r3 = *(u64 *)(r1 + {off})", f"*(u64 *)(r2 + {off}) = r3")]
+                   + ["r1 = r6", "r1 += 0x8"]
+                   + [line for off in ("0x0", "0x8", "0x10", "0x18", "0x20", "0x28")
+                      for line in (f"r3 = *(u64 *)(r2 + {off})",
+                                   f"*(u64 *)(r1 + {off}) = r3")])
+        return ([f"if {cell} == 0x0 goto @failed",
+                 "if r0 != 0x0 goto @failed",
+                 "if r7 != 0x0 goto @success",
+                 "goto @counter",
+                 "label:failed",
+                 "if r7 != 0x0 goto @counter",
+                 "r1 = 0x0",
+                 "*(u64 *)(r6 + 0x0) = r1",
+                 "exit",
+                 "label:counter"]
+                + counter_block(1, -0x30, "none")
+                + ["label:none",
+                   "r1 = 0x0",
+                   "*(u64 *)(r6 + 0x0) = r1",
+                   "exit",
+                   "label:success"]
+                + staging
+                + ["r1 = 0x1",
+                   "*(u64 *)(r6 + 0x0) = r1",
+                   "exit"])
+
+    insert_body = (["r6 = r2", "r7 = 0x1", "r1 = r10", "r1 += -0x28",
+                    "*(u64 *)(r1 + 0x0) = r7",
+                    "*(u64 *)(r1 + 0x8) = r7",
+                    "*(u64 *)(r1 + 0x10) = r7",
+                    "r2 = r6", "r3 = 0x1"]
+                   + call(INSERT_NATIVE_AT)
+                   + ["if r0 == 0x0 goto @exit"]
+                   + counter_block(1, -4)
+                   + ["label:exit", "exit"])
+    take_export_body = (["r7 = r3", "r6 = r1", "r1 = r2", "call 0xae",
+                         "r9 = r0", "r1 = r9", "r1 &= 0xffffff",
+                         "if r1 != 0x0 goto @keyed",
+                         "r1 = 0x0", "*(u64 *)(r6 + 0x0) = r1", "exit",
+                         "label:keyed", "call 0xe", "r8 = 0x1",
+                         "*(u64 *)(r10 - 0x50) = r8",
+                         "*(u64 *)(r10 - 0x58) = r9",
+                         "*(u64 *)(r10 - 0x60) = r0",
+                         "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
+                        + call(GET_AT)
+                        + ["r9 = r0",
+                           "if r9 == 0x0 goto @removing",
+                           "r1 = r10", "r1 += -0x48",
+                           "r2 = *(u64 *)(r9 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
+                           "r2 = *(u64 *)(r9 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
+                           "r2 = *(u64 *)(r9 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                           "if r9 != 0x0 goto @removing",
+                           "r8 = 0x0",
+                           "label:removing",
+                           "r1 = r10", "r1 += -0x60", "r2 = r8"]
+                        + call(REMOVE_AT)
+                        + take_tail("r9"))
+    take_selection_body = (["r7 = r3", "r6 = r1", "r1 = r2", "call 0xae",
+                            "r8 = r0",
+                            "if r8 != 0x0 goto @keyed",
+                            "r1 = 0x0", "*(u64 *)(r6 + 0x0) = r1", "exit",
+                            "label:keyed", "call 0xe",
+                            "r1 = 0x2",
+                            "*(u64 *)(r10 - 0x50) = r1",
+                            "*(u64 *)(r10 - 0x58) = r8",
+                            "*(u64 *)(r10 - 0x60) = r0",
+                            "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
+                           + call(GET_AT)
+                           + ["r8 = r0",
+                              "if r8 == 0x0 goto @removing",
+                              "r1 = r10", "r1 += -0x48",
+                              "r2 = *(u64 *)(r8 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
+                              "r2 = *(u64 *)(r8 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
+                              "r2 = *(u64 *)(r8 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                              "r2 = 0x1",
+                              "if r8 != 0x0 goto @removing",
+                              "r2 = 0x0",
+                              "label:removing",
+                              "r1 = r10", "r1 += -0x60"]
+                           + call(REMOVE_AT)
+                           + take_tail("r8"))
+    ilr_extra = (["r1 = r10", "r1 += -0x40", "r2 = 0x4", "call 0x70"]
+                 + counter_block(2, -4))
+    bread_body = counter_block(2, -4) + ["label:exit", "exit"]
+    counterx_body = (["r7 = 0x3", "*(u32 *)(r10 - 0x4) = w7", "r2 = r10",
+                      "r2 += -0x4", "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1",
+                      "if r0 == 0x0 goto @second",
+                      "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5",
+                      "label:second",
+                      "r7 = 0x4", "*(u32 *)(r10 - 0x8) = w7", "r2 = r10",
+                      "r2 += -0x8", "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1",
+                      "if r0 == 0x0 goto @exit",
+                      "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5",
+                      "label:exit", "exit"])
+    roots = {
+        "function_list_entry": (entry_body(), 100),
+        "interface_list_entry": (entry_body(), 200),
+        "function_list_return": (return_body(TAKE_EXPORT_AT), 400),
+        "interface_list_return": (return_body(TAKE_EXPORT_AT, ilr_extra), 500),
+        "interface_return": (return_body(TAKE_SELECTION_AT), 600),
+    }
+    out = base
+    for name, (body, start) in roots.items():
+        header = f"{start * 8:016x} <{name}>:"
+        old = header + "\n".join(blocks[name])
+        if out.count(old) != 1:
+            raise AssertionError(f"outlined root anchor not unique: {name}")
+        out = out.replace(old, assemble(name, body, start), 1)
+    extras = [
+        assemble("fixture_insert_export_state", insert_body, INSERT_AT),
+        assemble("fixture_take_export_state", take_export_body, TAKE_EXPORT_AT),
+        assemble("fixture_take_selection_state", take_selection_body, TAKE_SELECTION_AT),
+        assemble("fixture_bread_interface_entry", bread_body, BREAD_AT),
+        assemble("fixture_counter_dl_debug_state", counterx_body, COUNTERX_AT),
+    ]
+    return out + "\n" + "\n".join(extras)
+
+
+def _outlined_wrapper_self_test():
+    good = _outlined_disassembly()
+    if not producer_object_contract(good):
+        raise AssertionError("outlined healthy fixture refused: producer proof")
+    if not counter_ownership_contract(object_counter_uses(good)):
+        raise AssertionError("outlined healthy fixture refused: counter ownership")
+    blocks = function_blocks(good)
+    starts = {name: instruction_entries(lines)[0][1] for name, lines in blocks.items()}
+
+    def mutate(function, before, after, last=False):
+        block = "\n".join(blocks[function])
+        if last:
+            if before not in block:
+                raise AssertionError(f"outlined mutation missing in {function}: {before}")
+            changed = after.join(block.rsplit(before, 1))
+        else:
+            if block.count(before) != 1:
+                raise AssertionError(f"outlined mutation anchor not unique in {function}: {before}")
+            changed = block.replace(before, after, 1)
+        return good.replace(block, changed, 1)
+
+    def append_call(function, wrapper):
+        block = "\n".join(blocks[function])
+        match = re.match(r"\s*(\d+):\s+exit\s*$", block.splitlines()[-1])
+        if not match:
+            raise AssertionError(f"outlined {function} does not end with an exit")
+        pc = int(match.group(1))
+        replacement = (f"{pc:8}:\tcall 0x{starts[wrapper] - 1:x}\n"
+                       f"                0000000000000000:  R_BPF_64_32\t.text\n"
+                       f"{pc + 1:8}:\texit")
+        return good.replace(block, block.replace(block.splitlines()[-1], replacement, 1), 1)
+
+    cycle_call = (f"call 0x{starts['function_list_entry'] - 1:x}\n"
+                  f"                0000000000000000:  R_BPF_64_32\t.text")
+    alias_block = f"0000000000000000 <alias_take>:\n{starts['fixture_take_export_state']}:\texit\n"
+    poisons = [
+        ("foreign caller into insert",
+         append_call("function_list_return", "fixture_insert_export_state")),
+        ("foreign caller into take",
+         append_call("interface_list_entry", "fixture_take_selection_state")),
+        ("insert call count",
+         append_call("function_list_entry", "fixture_insert_export_state")),
+        ("take export scope",
+         mutate("function_list_return", "r3 = 0x0", "r3 = 0x2")),
+        ("take selection scope",
+         mutate("interface_return", "r3 = 0x0", "r3 = 0x2")),
+        ("alias take target", good + "\n" + alias_block),
+        ("wrapper cycle into root",
+         mutate("fixture_insert_export_state", "r7 = 0x1", cycle_call, last=True)),
+        ("unproved take output write",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r3", "*(u64 *)(r9 + 0x0) = r3")),
+        ("insert native flag",
+         mutate("fixture_insert_export_state", "r3 = 0x1", "r3 = 0x0")),
+        ("insert key slot",
+         mutate("fixture_insert_export_state", "r1 += -0x28", "r1 += -0x30")),
+        ("insert state retention",
+         mutate("fixture_insert_export_state", "r6 = r2", "r6 = r1")),
+        ("take get flag",
+         mutate("fixture_take_export_state", "r2 = 0x0", "r2 = 0x1")),
+        ("forged take remove flag",
+         mutate("fixture_take_export_state", "r2 = r8", "r2 = 0x1")),
+        ("take snapshot escape",
+         mutate("fixture_take_export_state",
+                "*(u64 *)(r1 + 0x0) = r2", "*(u64 *)(r6 + 0x8) = r2")),
+        ("insert counter writeback",
+         mutate("fixture_insert_export_state",
+                "lock *(u64 *)(r0 + 0x0) += r5", "r2 = r5")),
+        ("take payload source",
+         mutate("fixture_take_export_state",
+                "r3 = *(u64 *)(r2 + 0x28)", "r3 = *(u64 *)(r2 + 0x30)")),
+        ("take selection counter writeback",
+         mutate("fixture_take_selection_state",
+                "lock *(u64 *)(r0 + 0x0) += r5", "r2 = r5")),
+        ("unproved selection output write",
+         mutate("fixture_take_selection_state",
+                "*(u64 *)(r1 + 0x0) = r3", "*(u64 *)(r8 + 0x0) = r3")),
+    ]
+    for label, bad in poisons:
+        if producer_object_contract(bad):
+            raise AssertionError(f"outlined poison accepted by producer: {label}")
+        if counter_ownership_contract(object_counter_uses(bad)):
+            raise AssertionError(f"outlined poison accepted by ownership: {label}")
+    renamed = good.replace("<interface_list_worker>:", "<renamed_worker>:", 1)
+    if renamed == good:
+        raise AssertionError("outlined rename mutation did not apply")
+    if counter_ownership_contract(object_counter_uses(renamed)):
+        raise AssertionError("outlined wrong counter owner accepted")
+
+
 def _reject(action, label):
     try:
         action()
@@ -3040,6 +3325,7 @@ interface_continuation_pack(count, 0, symbol_id)
         ),
         "manifest output overwrites canonical source",
     )
+    _outlined_wrapper_self_test()
     print("live discovery source mutations rejected: OK")
     print("live discovery object mutations rejected: OK")
     print("unrelated memset positive control: OK")

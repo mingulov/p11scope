@@ -158,4 +158,20 @@ __attribute__((noinline)) u32 p11_link_current_identity(struct image_identity *o
     return identity_for(leader, out);
 }
 
+/* Private EXEC witness: task incarnation only. Reuse the same bounded
+ * allocator without identity_for's self_exec_id read. Callers acquire this
+ * only after scope admission and a successful lifecycle ring reservation. */
+__attribute__((noinline)) u64 p11_link_current_cookie(void)
+{
+    struct task_struct *current = bpf_get_current_task_btf();
+    struct cookie_result result;
+    if (!current)
+        return 0;
+    result = cookie_for(current->group_leader);
+    if (result.status != COOKIE_STATUS_OK || !result.cookie ||
+        result.cookie > IMAGE_IDENTITY_TICKET_LIMIT)
+        return 0;
+    return result.cookie;
+}
+
 char LICENSE[] SEC("license") = "GPL";

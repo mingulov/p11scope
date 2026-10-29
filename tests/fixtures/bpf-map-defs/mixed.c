@@ -11,6 +11,19 @@ __attribute__((visibility("hidden"), noinline, used))
 void *memset(void *dest, int value, unsigned long count) { return dest; }
 #define HELPER(name) __attribute__((noinline, used)) int name(void) { return 0; }
 HELPER(p11_link_current_identity)
+#ifdef EXEC_COOKIE
+/* Identity-bearing metadata fixture; no kernel load or allocator model. */
+static struct { UINT(type, 29); UINT(map_flags, 1); TYPE(key, int);
+                TYPE(value, unsigned long long); } TASK_COOKIE SEC(".maps");
+struct fixture_cookie_control { unsigned long long words[5]; };
+static struct { UINT(type, 2); UINT(max_entries, 1); TYPE(key, unsigned);
+                TYPE(value, struct fixture_cookie_control); } COOKIE_CTL SEC(".maps");
+#ifndef EXEC_COOKIE_MISSING
+__attribute__((noinline, used)) unsigned long long p11_link_current_cookie(void) {
+    return (unsigned long long)((void *(*)(void))158)();
+}
+#endif
+#endif
 HELPER(p11_link_emit_fork)
 HELPER(p11_link_fork_allowed)
 /* Task 3 Stage A continuity halves (native instance_epoch.c). */
@@ -60,7 +73,11 @@ SEC("tp_btf/task_newtask") int task_newtask(void *ctx) {
     return result;
 }
 SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) {
+#if defined(EXEC_COOKIE) && !defined(EXEC_COOKIE_MISSING)
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_link_current_cookie();
+#else
     return p11_owner_cleanup(ctx) + p11_exec_dumpability();
+#endif
 }
 SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
     return p11_owner_cleanup(ctx) + p11_root_current_exit(ctx);

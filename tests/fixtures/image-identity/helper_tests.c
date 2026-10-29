@@ -1,4 +1,7 @@
 #include "image_identity.h"
+/* A weak declaration makes the pre-implementation test fail at the actual
+ * missing helper assertion, without a link-error masquerading as runtime RED. */
+extern u64 p11_link_current_cookie(void) __attribute__((weak));
 /* A counter increment must survive another CPU winning a race on its cell. */
 static u64 *lost_race_cell;
 static unsigned int cas_attempts;
@@ -40,11 +43,8 @@ u32 p11_root_propagate_thread(struct task_struct *child, u64 flags) {
 u32 p11_link_emit_fork(u32 pid, u64 flags, const struct image_identity *a, const struct image_identity *b) {
     (void)pid; (void)flags; (void)a; (void)b; assert(0); return 0;
 }
-/* A weak declaration makes the pre-implementation test fail at the actual
- * missing helper assertion, without a link-error masquerading as runtime RED. */
-extern u64 p11_link_current_cookie(void) __attribute__((weak));
 static void exec_cookie_controls(void) {
-    assert(p11_link_current_cookie && "EXEC needs the actual cookie-only helper");
+    assert(&p11_link_current_cookie && "EXEC needs the actual cookie-only helper");
     ctl = (struct control){ .limit = IMAGE_IDENTITY_TICKET_LIMIT };
     control_present = current_present = 1; worker.group_leader = &leader;
     present = fail_create = 0; lost_race_cell = 0;
@@ -82,7 +82,11 @@ static void exec_cookie_controls(void) {
     current_present = 1; worker.group_leader = 0;
     assert(p11_link_current_cookie() == 0 && storage_calls == reads);
     worker.group_leader = &leader;
-    assert(p11_link_current_cookie() == 7 && ctl.next_ticket == 1);
+    ctl.next_ticket = 7;
+    assert(p11_link_current_cookie() == 7 && ctl.next_ticket == 7);
+    present = 0;
+    assert(p11_link_current_cookie() == 8);
+    assert(ctl.next_ticket == 8 && create_calls == 4);
     /* Put self_exec_id in an inaccessible page: the cookie-only path must
      * not touch that field, including when the existing ticket is reused. */
     long page = sysconf(_SC_PAGESIZE);
@@ -92,7 +96,7 @@ static void exec_cookie_controls(void) {
     assert(guard != MAP_FAILED);
     assert(mprotect(guard + page, (size_t)page, PROT_NONE) == 0);
     worker.group_leader = (void *)(guard + page - offsetof(struct task_struct, self_exec_id));
-    assert(p11_link_current_cookie() == 7 && ctl.next_ticket == 1);
+    assert(p11_link_current_cookie() == 8 && ctl.next_ticket == 8 && create_calls == 4);
     worker.group_leader = &leader;
     assert(munmap(guard, (size_t)page * 2) == 0);
     puts("EXEC cookie-only control: stable leader ticket, finite allocation/refusal/recovery passed");

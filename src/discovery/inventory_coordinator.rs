@@ -3500,11 +3500,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if record.kind != DISCOVERY_KIND_EXEC {
                         continue;
                     }
-                    let pid = (record.pid_tgid >> 32) as u32;
                     hook_events.extend(self.apply_exec_hook(
                         domain,
-                        pid,
-                        record.hook_ts_ns,
+                        record,
                         identity,
                         now_ns,
                         &mut crate::attach::monotonic_ns,
@@ -3601,15 +3599,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// `note_leader_exits`); every refusal to mint is a named gap, and the
     /// mint itself is disclosed: nothing here is silent. Under a mismatched
     /// PID numbering the hook does nothing at all (no lookup, no mint, no
-    /// gap): the kernel tgid cannot select an observer-/proc pid. No
-    /// `ExecProof` is synthesized (only the binder proves exact
-    /// transitions); the old owner's image invalidates through the normal
+    /// gap): the kernel tgid cannot select an observer-/proc pid.
+    /// A hook inside collection but before admission additionally needs its
+    /// original producer task ticket to match the retained pin in this same
+    /// native domain. Timestamp/PID or a current cookie alone cannot select
+    /// that incarnation. No `ExecProof` is synthesized (only the binder proves
+    /// exact transitions); the old owner's image invalidates through the normal
     /// guard revalidation instead.
     fn apply_exec_hook(
         &mut self,
         domain: NativeDomainId,
-        pid: u32,
-        hook_ts_ns: u64,
+        record: &p11scope_ebpf_common::DiscoveryRecord,
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
         detected: &mut dyn FnMut() -> Option<u64>,
@@ -3617,6 +3617,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !crate::pidns::numbering().agrees() {
             return Vec::new();
         }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let hook_ts_ns = record.hook_ts_ns;
+        let original_ticket = record.exec_task_ticket();
         let Some(caller) = self.adapter.live_id(pid) else {
             return Vec::new();
         };
@@ -3647,13 +3650,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return Vec::new();
         }
-        if self
-            .adapter
-            .record(caller)
-            .is_some_and(|incarnation| hook_ts_ns < incarnation.admitted_ns)
-        {
+        let Some(incarnation) = self.adapter.record(caller) else {
+            return Vec::new();
+        };
+        if hook_ts_ns < incarnation.first_seen_ns {
             return Vec::new();
         }
+        let collection_query = if hook_ts_ns < incarnation.admitted_ns {
+            // A zero original word never triggers a lookup that could adopt
+            // a reused PID's current task. Nonzero evidence is compared only
+            // as the exact typed domain/cookie pair, through the held pin's
+            // existing before/after liveness-checked lookup.
+            let expected = original_ticket.map(|ticket| DomainCookie::new(domain, ticket));
+            let query = original_ticket.and_then(|_| {
+                self.adapter
+                    .live_pin(pid)
+                    .map(|(_, pin)| identity.query_cookie(domain, pin))
+            });
+            if !matches!(&query, Some(CookieQuery::Cookie(actual)) if Some(*actual) == expected) {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: Some(pid),
+                    subject: "collection-window exec task unproven".into(),
+                    reason: "the original exec task ticket is unavailable or does not agree \
+                         with a live retained-pin ticket in this native domain; the current \
+                         incarnation is neither retired nor replaced"
+                        .into(),
+                    budget: None,
+                });
+                return Vec::new();
+            }
+            query
+        } else {
+            None
+        };
         // The successor's binding safety needs the staging clock (its
         // first_seen) to be later than the hook's timestamp: at or before
         // it, the binder would refuse every row the successor ever reads,
@@ -3687,10 +3718,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // hook still proved the old image ended, so the predecessor
         // retires honestly without a successor rather than being claimed
         // current, and the refusal names which answer it got.
-        let query = self
-            .adapter
-            .live_pin(pid)
-            .map(|(_, pin)| identity.query_cookie(domain, pin));
+        let query = collection_query.or_else(|| {
+            self.adapter
+                .live_pin(pid)
+                .map(|(_, pin)| identity.query_cookie(domain, pin))
+        });
         let refusal = match query {
             Some(CookieQuery::Cookie(_) | CookieQuery::NoCookie) => None,
             Some(CookieQuery::Exited) => Some(
@@ -13471,8 +13503,40 @@ exit 0
 
     #[test]
     fn an_exec_during_collection_mints_a_bindable_successor_before_admission() {
+        fn no_private_ticket_fields(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        // The established inventory schema retains these
+                        // null placeholders. An EXEC ticket must never turn
+                        // them into an exact-image authority or public value.
+                        if matches!(name.as_str(), "task_cookie" | "exec_id") {
+                            assert!(
+                                value.is_null(),
+                                "private EXEC data reached public JSON: {name}"
+                            );
+                        }
+                        assert!(
+                            !matches!(
+                                name.as_str(),
+                                "binding_id" | "exec_task_ticket" | "original_ticket"
+                            ),
+                            "private EXEC data reached public JSON: {name}"
+                        );
+                        no_private_ticket_fields(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        no_private_ticket_fields(value);
+                    }
+                }
+                _ => {}
+            }
+        }
         for hook_ts_ns in [50, 125] {
             for class in [
+                p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN,
                 p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
                 p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
             ] {
@@ -13536,6 +13600,16 @@ exit 0
                     native.scene.coverage(successor),
                     UseCoverage::Counted { lossy: false, .. }
                 ));
+                native.scene.coordinator.commit_batch(false).unwrap();
+                let public = crate::inventory::render_json(
+                    &native.scene.coordinator,
+                    "system",
+                    0,
+                    native.stamps.tick(),
+                    1,
+                );
+                assert!(!public["edges"].as_array().unwrap().is_empty());
+                no_private_ticket_fields(&public);
             }
         }
     }
@@ -13595,6 +13669,17 @@ exit 0
             let (mut native, caller) = NativeScene::with_collection_admission_window();
             native.query_answer(7, 500, answer.clone());
             native.scene.coordinator.exit_clocks_comparable = true;
+            let modules: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert!(
+                !modules.is_empty(),
+                "the physical provider observation exists"
+            );
             let at = native.stamps.tick();
             let mut drain = exec_hook_drain(native.domain, at, 125);
             drain.records[0].binding_id = 41;
@@ -13605,6 +13690,15 @@ exit 0
                 receipt.events
             );
             assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let retained: Vec<_> = native
+                .scene
+                .coordinator
+                .registry
+                .modules()
+                .map(|module| (module.id, module.key.clone()))
+                .collect();
+            assert_eq!(retained, modules, "the provider observation stays useful");
             assert!(
                 !native
                     .scene
@@ -13640,6 +13734,102 @@ exit 0
             );
             assert_eq!(native.cookies.queries, 1);
         }
+    }
+
+    #[test]
+    fn a_stopped_collection_exec_needs_the_original_task_before_retirement() {
+        for ticket in [0, 42, 41] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.stop();
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = ticket;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            let adapter = &native.scene.coordinator.adapter;
+            if ticket == 41 {
+                assert!(
+                    matches!(receipt.events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller)
+                );
+                assert!(adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), None);
+            } else {
+                assert!(
+                    receipt.events.is_empty(),
+                    "ticket={ticket}: {:?}",
+                    receipt.events
+                );
+                assert!(!adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), Some(caller));
+            }
+            assert_eq!(adapter.len(), 1, "stop never admits a successor");
+            assert!(native.scene.coordinator.pending_successors.is_empty());
+            assert_eq!(native.cookies.queries, usize::from(ticket != 0));
+        }
+    }
+
+    #[test]
+    fn a_held_image_keeps_the_collection_exec_on_the_row_proven_path() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 1, 7, 210, 0)]);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+        let queries = native.cookies.queries;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .holds_image(native.domain, caller)
+        );
+        assert_eq!(
+            native.cookies.queries, queries,
+            "held image bypasses the shortcut"
+        );
+    }
+
+    #[test]
+    fn a_collection_exec_without_comparable_clocks_queries_no_ticket() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = false;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.cookies.queries, 0);
     }
 
     #[test]

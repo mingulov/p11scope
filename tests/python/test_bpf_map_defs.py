@@ -232,6 +232,56 @@ class MapDefsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unclassified"):
             checker.inspect(self.mutate([(symbase + hook * 24 + 6, "H", elf.indices["uprobe"])], obj))
 
+    def test_exec_cookie_helper_boundary(self):
+        obj = Path(self.temp.name) / "exec-cookie.o"
+        command = ["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-DEXEC_COOKIE", "-c",
+                   str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)]
+        subprocess.run(command, check=True, capture_output=True)
+        try:
+            checker.inspect(obj)
+        except RuntimeError as error:
+            self.fail(f"healthy EXEC cookie helper was rejected: {error}")
+        body, elf, btf = self.metadata(obj)
+        checker.validate_exec_cookie_helper(elf)
+        checker.validate_exec_cookie_helper(elf, inventory=True, callers=True)
+        checker.validate_exec_cookie_helper(self.metadata()[1], inventory=True)
+        with self.assertRaisesRegex(RuntimeError, "InventoryGlobal.*EXEC cookie"):
+            checker.validate_exec_cookie_helper(elf, inventory=True)
+        missing = Path(self.temp.name) / "exec-cookie-missing.o"
+        command = command[:-2] + ["-DEXEC_COOKIE_MISSING", "-o", str(missing)]
+        subprocess.run(command, check=True, capture_output=True)
+        with self.assertRaisesRegex(RuntimeError, "missing.*EXEC cookie"):
+            checker.validate_exec_cookie_helper(checker.Elf(missing.read_bytes()))
+        helper_index = next(i for i, symbol in enumerate(elf.symbols)
+                            if symbol[0] == "p11_link_current_cookie")
+        symbol_at = elf.sections[".symtab"][0][4] + helper_index * 24
+        function = next(node for node in btf.types[1:]
+                        if node[:2] == (12, "p11_link_current_cookie"))
+        base = elf.sections[".BTF"][0][4]
+        function_at = base + function[6]
+        proto = btf.types[function[2]]
+        proto_at = base + proto[6]
+        scalar = btf.resolve(proto[2])
+        u32_type = next(node[2] for node in btf.types[1:]
+                        if node[:2] == (12, "p11_exec_dumpability"))
+        u32_result = btf.types[u32_type][2]
+        pointer_proto = next(node[2] for node in btf.types[1:]
+                             if node[:2] == (12, "p11_owner_cleanup"))
+        pointer_at = base + btf.types[pointer_proto][6]
+        cases = {
+            "local": ([(symbol_at + 4, "B", 2)], "EXEC cookie.*GLOBAL"),
+            "hidden": ([(symbol_at + 5, "B", 2)], "EXEC cookie.*GLOBAL"),
+            "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])], "EXEC cookie.*GLOBAL"),
+            "static_btf": ([(function_at + 4, "I", 12 << 24)], "EXEC cookie.*GLOBAL"),
+            "u32_result": ([(proto_at + 8, "I", u32_result)], "no-argument scalar|unsigned u64"),
+            "extra_argument": ([(function_at + 8, "I", pointer_proto),
+                                 (pointer_at + 8, "I", proto[2])], "no-argument scalar"),
+            "signed_result": ([(base + scalar[6] + 12, "I", (1 << 24) | 64)], "unsigned u64"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                checker.validate_exec_cookie_helper(checker.Elf(self.mutate(changes, obj).read_bytes()))
+
     def test_exec_predicate_boundary(self):
         obj = Path(self.temp.name) / "exec-linkage.o"
         subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-c",

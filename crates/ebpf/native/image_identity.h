@@ -54,6 +54,8 @@ _Static_assert(__builtin_offsetof(struct control, retry_exhausted) == 32, "retry
 
 /* Native-unit bridge; the definition is always inlined into its caller. */
 u32 p11_link_task_identity(struct task_struct *task, struct image_identity *out);
+/* Cookie only; zero is unavailable. No exec-ID or target-memory read. */
+u64 p11_link_current_cookie(void);
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static u64 *(*bpf_task_storage_get)(void *map, struct task_struct *task,

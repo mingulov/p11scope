@@ -395,6 +395,7 @@ OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
     "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell",
 })
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
+REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS = frozenset({"p11_link_current_cookie"})
 # H8-D post-attach birth marker (Detailed only): the exec half publishes
 # READY after closure, the gap half dirties on refused calls. Counter and
 # inventory objects carry neither these globals nor the control map.
@@ -448,7 +449,8 @@ DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
 
 
 def validate_private_helpers(elf, prefix, required, optional, label,
-                             global_helpers=frozenset(), required_map=None, inventory=False):
+                             global_helpers=frozenset(), required_map=None, inventory=False,
+                             global_result_bytes=4):
     """Verify exact native helper linkage, metadata, calls and map boundaries.
 
     Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
@@ -516,7 +518,7 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if name in global_helpers:
             proto = btf.types[node[2]]
             scalar = btf.resolve(proto[2])
-            if proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != 4:
+            if proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != global_result_bytes:
                 raise RuntimeError(
                     f"{label} helper {name} requires a no-argument scalar FUNC_PROTO"
                 )
@@ -675,6 +677,33 @@ def validate_exec_helpers(elf, inventory=False):
             calls.add(imm)
     if calls != {113, 158}:
         raise RuntimeError("EXEC predicate requires both checked kernel helper boundaries")
+
+
+def validate_exec_cookie_helper(elf, inventory=False, callers=False):
+    """One exact cookie-only EXEC ABI, confined to existing identity flavors.
+
+    Generic decoder fixtures carry neither identity maps nor this helper;
+    real identity objects must carry both maps and the complete boundary.
+    Existing u32 private helpers retain their unchanged default ABI check.
+    """
+    name = "p11_link_current_cookie"
+    symbols = {symbol[0] for symbol in elf.symbols}
+    identity_maps = {"TASK_COOKIE", "COOKIE_CTL"}
+    present = symbols & identity_maps
+    btf = Btf(elf.sections[".BTF"][1]) if ".BTF" in elf.sections else None
+    named = [node for node in btf.types[1:] if node[0] == 12 and node[1].startswith(name)] if btf else []
+    if not present and not named and not any(symbol.startswith(name) for symbol in symbols):
+        return
+    if inventory and not callers:
+        raise RuntimeError("InventoryGlobal cannot carry an EXEC cookie helper or identity maps")
+    if present != identity_maps:
+        raise RuntimeError("EXEC cookie helper requires both existing identity maps")
+    validate_private_helpers(elf, name, frozenset(), frozenset(), "EXEC cookie",
+                             frozenset({name}), inventory=inventory, global_result_bytes=8)
+    function = next(node for node in named if node[1] == name)
+    result = btf.resolve(btf.types[function[2]][2])
+    if result[5] != (64,):
+        raise RuntimeError("EXEC cookie helper requires an unsigned u64 result")
 
 
 def validate_marker_helpers(elf, inventory=False):
@@ -1870,6 +1899,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_object_capture_globals(elf, inventory)
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
+    validate_exec_cookie_helper(elf, inventory, callers)
     validate_marker_helpers(elf, inventory)
     validate_marker_call_sites(elf)
     if not inventory:
@@ -1887,8 +1917,8 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
                          if name.startswith((".rodata", ".data", ".bss")))
     if global_data:
         raise RuntimeError(f"object carries global-data sections {global_data}")
-    image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
-                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
+    image_helpers = (frozenset({"p11_link_current_identity", "p11_link_current_cookie"}) if callers else
+                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | SELECTED_GLOBAL_HELPERS
                      | REQUIRED_GLOBAL_MARKER_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
@@ -1935,6 +1965,7 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
                     | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
+                    | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
                     | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
                     | REQUIRED_GLOBAL_MARKER_HELPERS
                     | OBJECT_CAPTURE_GLOBAL_HELPERS):
@@ -2167,7 +2198,7 @@ def validate_inventory(variant, maps, programs, symbols):
         if markers:
             raise RuntimeError(f"release object contains forbidden birth marker symbols: {sorted(markers)}")
     if inventory:
-        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity",
+        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity", "p11_link_current_cookie",
                    "INV_BASELINE_RQ", "INV_BASELINE_CT",
                    "p11_inventory_image_baseline"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
@@ -2177,10 +2208,10 @@ def validate_inventory(variant, maps, programs, symbols):
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
+                        if inventory else REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | SELECTED_GLOBAL_HELPERS)
     required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
     if callers:
-        required_helpers |= {"p11_link_current_identity"}
+        required_helpers |= {"p11_link_current_identity", "p11_link_current_cookie"}
     missing_helpers = required_helpers - symbols
     if missing_helpers:
         raise RuntimeError(f"missing required .text helpers: {sorted(missing_helpers)}")
@@ -2237,7 +2268,7 @@ def self_test():
     assert len(UNSAFE_PROGRAMS) == 25
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -2251,7 +2282,7 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -2260,7 +2291,7 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):

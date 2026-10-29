@@ -343,7 +343,7 @@ fn exec_generation_ticket_helper_respects_flavor_and_reservation_boundary() {
         }
     }
     let script = r#"
-import re, subprocess, sys
+import re, struct, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, 'scripts')
 from _loader import load_path
@@ -376,6 +376,51 @@ target = m.relative_target(m.line_pc(branch), branch)
 following = next(m.line_pc(line) for line in lines[branch_row + 1:] if m.line_pc(line) is not None)
 null = target if '== 0x0 goto' in branch else following
 assert ticket not in m.reachable(graph, [null]), 'failed reservation acquired a ticket'
+kind_checks = [(pc, text) for pc, text in insns if re.search(r'\bif r\d+ (?:==|!=) 0x5 goto ', text)]
+assert len(kind_checks) == 1, 'only EXEC kind5 may acquire a lifecycle ticket'
+kind_pc, kind_text = kind_checks[0]
+kind_target = m.relative_target(kind_pc, kind_text)
+kind_next = next(pc for pc, _ in insns if pc > kind_pc)
+not_exec = kind_next if '== 0x5 goto' in kind_text else kind_target
+assert ticket not in m.reachable(graph, [not_exec]), 'another lifecycle kind acquired a ticket'
+
+# Resolve the actual linked root's local calls, including .text relocations.
+# The checked scope-auth return discriminator must dominate emission; its
+# refusal arm cannot reach the emitter that owns the only ticket call.
+symbols = [s for s in elf.symbols if s[1] & 15 == 2 and s[5]]
+root = next(s for s in symbols if s[0] == 'sched_process_exec')
+sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+calls = []
+for header, relocs in elf.sections.values():
+    if header[1] != 9 or header[7] != root[3]:
+        continue
+    for offset in range(0, len(relocs), 16):
+        address, info = struct.unpack_from('<QQ', relocs, offset)
+        if info & 0xffffffff != 10 or not root[4] <= address < root[4] + root[5]:
+            continue
+        op, regs, _, immediate = struct.unpack_from('<BBhi', sections[root[3]], address)
+        if op != 0x85 or regs >> 4 != 1:
+            continue
+        named = elf.symbols[info >> 32]
+        target = (named[3], named[4] + (immediate + 1) * 8)
+        resolved = [s for s in symbols if s[3:5] == target]
+        assert len(resolved) == 1, 'unresolved EXEC root call'
+        calls.append((address // 8, resolved[0][0]))
+auth = [pc for pc, name in calls if name.endswith('10scope_auth')]
+emit = [pc for pc, name in calls if name.endswith('14emit_lifecycle')]
+assert len(auth) == len(emit) == 1, 'EXEC root uses actual scope/emitter bodies'
+root_lines = blocks['sched_process_exec']
+root_insns, root_graph = m.instruction_graph(root_lines)
+assert emit[0] not in m.reachable(root_graph, [root_insns[0][0]], {auth[0]}), 'scope bypassed'
+after = [(pc, text) for pc, text in root_insns if auth[0] < pc <= auth[0] + 3]
+assert len(after) >= 2 and re.fullmatch(r'r\d+ = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)', after[0][1])
+scope_register = after[0][1].split(' = ', 1)[0]
+guard_pc, guard_text = after[1]
+assert re.search(r'\bif ' + scope_register + r' (?:==|!=) 0x1 goto ', guard_text), 'scope discriminator unchecked'
+scope_target = m.relative_target(guard_pc, guard_text)
+scope_next = next(pc for pc, _ in root_insns if pc > guard_pc)
+refused = scope_next if '== 0x1 goto' in guard_text else scope_target
+assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted an EXEC ticket'
 "#;
     for (name, bytes, identity) in variants {
         let object = aya_obj::Object::parse(bytes).unwrap();

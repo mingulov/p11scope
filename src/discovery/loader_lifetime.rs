@@ -192,6 +192,14 @@ pub(crate) struct LoaderRetirementFence {
     fence_q: u64,
 }
 
+impl LoaderRetirementFence {
+    /// The exact token this fence retires. T-L3 reads it to tell a settled
+    /// fence from a stale one without touching a successor.
+    pub(crate) fn token(self) -> LoaderToken {
+        self.token
+    }
+}
+
 /// Sealed reclamation receipt minted only by a successful acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReclaimedSlot {

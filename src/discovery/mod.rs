@@ -22,6 +22,10 @@ pub(crate) mod loader;
 // L3's Engine acknowledgement wires the retirement/fence API.
 #[allow(dead_code)]
 pub(crate) mod loader_lifetime;
+// T-L3 staged Engine acknowledgement endpoints (6.09b). No production
+// callers until activation; the driver is exercised by its own RED suite.
+#[allow(dead_code)]
+pub(crate) mod loader_ack;
 pub(crate) mod native_binding;
 pub mod noise;
 pub(crate) mod pause;

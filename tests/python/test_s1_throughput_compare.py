@@ -562,6 +562,36 @@ class ConservationGate(unittest.TestCase):
             self.run_mutation(mutate)
         self.assertIn("api_returns 24 != issued 25", str(ctx.exception))
 
+    def run_rsa_tally_confusion(self, mutate, token):
+        # 6.08 phase 1 (S2): the throughput denominator is all-issued from
+        # the per-thread T0 ledgers. The 65-call RSA semantic tally is a
+        # different cell's number and must never satisfy conservation.
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-cons65-") as tmp:
+            workdir = Path(tmp)
+            ledger_path, events_path, inventory_path = healthy_triple(
+                workdir, ack_ns=R0 + 2_000_000_000 + 500)
+            with open(inventory_path, encoding="utf-8") as stream:
+                inventory = json.load(stream)
+            mutate(inventory)
+            write_json(inventory_path, inventory)
+            with self.assertRaises(ValueError) as ctx:
+                s1.compare([str(ledger_path)], [str(events_path)],
+                           str(inventory_path), FULL_RATE)
+            self.assertIn(token, str(ctx.exception))
+
+    def test_rsa_semantic_calls_tally_is_not_the_throughput_denominator(self):
+        def mutate(inventory):
+            inventory["semantic_edges"][0]["operations"]["calls"] = 65
+        self.run_rsa_tally_confusion(
+            mutate, "operations.calls 65 != issued 20000")
+
+    def test_rsa_api_returns_tally_is_not_the_throughput_denominator(self):
+        def mutate(inventory):
+            inventory["semantic_edges"][0]["api_returns"]["count"] = 65
+        self.run_rsa_tally_confusion(
+            mutate, "api_returns 65 != issued 20000")
+
     def test_phantom_function_fails(self):
         def mutate(inventory):
             row = inventory["semantic_edges"][0]["mechanisms"][0]

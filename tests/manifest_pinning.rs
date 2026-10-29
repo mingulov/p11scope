@@ -2533,8 +2533,7 @@ fn expired_deadline_refuses_pin_view_construction_before_reading() {
     budget.set_deadline(Some(0));
     let error =
         p11scope::discovery::identity::pin_scanned_objects(child.pid(), &modules, &mut budget)
-            .err()
-            .expect("an expired budget cannot construct a process view");
+            .expect_err("an expired budget cannot construct a process view");
     assert_eq!(
         error,
         "capture discovery deadline reached; remaining provider bytes were not scanned"

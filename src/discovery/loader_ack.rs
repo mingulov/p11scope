@@ -330,16 +330,20 @@ impl LoaderAckDriver {
         drain: ConsumerDrain,
     ) -> LoaderFinishOutcome {
         // Idempotent Finish: a spent fence for already-reclaimed storage
-        // settles without touching any successor. Anything else goes through
-        // the acknowledgement, which keeps custody on every refusal.
-        let token = fence.token();
-        if let SlotView::Reclaimable { generation } = self.registry.slot_state(token.slot())
-            && generation == token.generation()
-        {
-            return LoaderFinishOutcome::AlreadySettled {
-                slot: token.slot(),
-                retired_generation: generation,
-            };
+        // settles without touching any successor. The pre-check validates
+        // the fence domain first, like the acknowledgement itself, so a
+        // foreign fence abandons instead of settling idempotently on
+        // another registry's settlement. Anything else goes through the
+        // acknowledgement, which keeps custody on every refusal.
+        match self.registry.fence_settled(fence) {
+            Err(error) => return LoaderFinishOutcome::Abandoned(error),
+            Ok(Some(token)) => {
+                return LoaderFinishOutcome::AlreadySettled {
+                    slot: token.slot(),
+                    retired_generation: token.generation(),
+                };
+            }
+            Ok(None) => {}
         }
         match self.registry.ack_fence(fence, drain) {
             Ok(receipt) => LoaderFinishOutcome::Settled(receipt),
@@ -820,6 +824,82 @@ mod tests {
         );
         assert_eq!(driver.phase_of(successor), Some(SlotPhase::Prepared));
         assert_eq!(driver.phase_of(token), None);
+    }
+
+    #[test]
+    fn t_l3_finish_ack_refuses_foreign_fence_despite_settled_slot() {
+        // Two Sessions retire their own slot-0 gen-1 incarnations. Driver A
+        // settles first; presenting B's fence to A must abandon with a
+        // foreign-domain refusal, never settle idempotently on A's
+        // settlement. The settled pre-check validates the fence domain
+        // before the slot state, like the acknowledgement itself.
+        let mut driver_a = driver();
+        let token_a = driver_a.prepare_new().unwrap();
+        let fence_a = drive_to_fence(&mut driver_a, token_a, 59);
+        driver_a.note_link_cleanup(token_a, true).unwrap();
+        assert!(matches!(
+            driver_a.finish_ack(&fence_a, drain_at(59)),
+            LoaderFinishOutcome::Settled(_)
+        ));
+        let mut driver_b = driver();
+        let token_b = driver_b.prepare_new().unwrap();
+        assert_eq!(token_b.slot(), token_a.slot());
+        assert_eq!(token_b.generation(), token_a.generation());
+        let fence_b = drive_to_fence(&mut driver_b, token_b, 61);
+        assert_eq!(
+            driver_a.finish_ack(&fence_b, drain_at(61)),
+            LoaderFinishOutcome::Abandoned(LifetimeError::ForeignDomain)
+        );
+        // The misrouted fence disturbs neither registry: A's settlement
+        // still reports idempotently and B's own fence still settles.
+        assert_eq!(
+            driver_a.finish_ack(&fence_a, drain_at(59)),
+            LoaderFinishOutcome::AlreadySettled {
+                slot: token_a.slot(),
+                retired_generation: token_a.generation(),
+            }
+        );
+        driver_b.note_link_cleanup(token_b, true).unwrap();
+        assert!(matches!(
+            driver_b.finish_ack(&fence_b, drain_at(61)),
+            LoaderFinishOutcome::Settled(_)
+        ));
+    }
+
+    #[test]
+    fn t_l3_spent_fence_after_successor_settles_abandons_without_naming_it() {
+        // Successor-settled twin of the stale token test above: the gen-1
+        // fence abandons as stale once the slot sits reclaimable for gen 2,
+        // and never names the successor's generation.
+        let mut driver = driver();
+        let first = driver.prepare_new().unwrap();
+        let first_fence = drive_to_fence(&mut driver, first, 47);
+        driver.note_link_cleanup(first, true).unwrap();
+        assert!(matches!(
+            driver.finish_ack(&first_fence, drain_at(47)),
+            LoaderFinishOutcome::Settled(_)
+        ));
+        let successor = driver.prepare_new().unwrap();
+        assert_eq!(successor.slot(), first.slot());
+        assert_eq!(successor.generation(), first.generation() + 1);
+        let successor_fence = drive_to_fence(&mut driver, successor, 53);
+        driver.note_link_cleanup(successor, true).unwrap();
+        assert!(matches!(
+            driver.finish_ack(&successor_fence, drain_at(53)),
+            LoaderFinishOutcome::Settled(_)
+        ));
+        assert_eq!(
+            driver.finish_ack(&first_fence, drain_at(47)),
+            LoaderFinishOutcome::Abandoned(LifetimeError::StaleToken)
+        );
+        // The settled generation's own fence still settles idempotently.
+        assert_eq!(
+            driver.finish_ack(&successor_fence, drain_at(53)),
+            LoaderFinishOutcome::AlreadySettled {
+                slot: successor.slot(),
+                retired_generation: successor.generation(),
+            }
+        );
     }
 
     #[test]

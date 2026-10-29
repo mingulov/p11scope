@@ -192,14 +192,6 @@ pub(crate) struct LoaderRetirementFence {
     fence_q: u64,
 }
 
-impl LoaderRetirementFence {
-    /// The exact token this fence retires. T-L3 reads it to tell a settled
-    /// fence from a stale one without touching a successor.
-    pub(crate) fn token(self) -> LoaderToken {
-        self.token
-    }
-}
-
 /// Sealed reclamation receipt minted only by a successful acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReclaimedSlot {
@@ -1072,6 +1064,26 @@ impl LifetimeRegistry {
         }
         context.cleanup = Some(success);
         Ok(())
+    }
+
+    /// Settled pre-check for the Finish path: validate the fence domain
+    /// first (like every registry entry point), then report the fence's
+    /// own token when its slot already sits reclaimable for that
+    /// generation. Anything else returns `None` and the caller runs the
+    /// full acknowledgement, which keeps custody on every refusal. The
+    /// fence position needs no comparison here: it is fixed once per
+    /// retirement, and post-reclaim currency comes from the slot state.
+    pub(crate) fn fence_settled(
+        &self,
+        fence: &LoaderRetirementFence,
+    ) -> Result<Option<LoaderToken>, LifetimeError> {
+        self.check_domain(fence.domain)?;
+        match &self.slots[usize::from(fence.token.slot())] {
+            Slot::Reclaimable { generation } if *generation == fence.token.generation() => {
+                Ok(Some(fence.token))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Acknowledge a same-domain fence after the fixed prefix drained, every

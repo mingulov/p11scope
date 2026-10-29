@@ -1913,8 +1913,8 @@ mod tests {
         ]
         .concat();
         assert_eq!(
-            parse_batch(domain(), 3, &[7, 8], &swapped),
-            Err(ImageQueryRefusal::Stream),
+            parse_batch(domain(), 3, &[7, 8], &swapped).err(),
+            Some(ImageQueryRefusal::Stream),
             "requested cookies in swapped slots refuse"
         );
         let wild = [
@@ -1924,8 +1924,8 @@ mod tests {
         ]
         .concat();
         assert_eq!(
-            parse_batch(domain(), 3, &[7, 8], &wild),
-            Err(ImageQueryRefusal::Stream),
+            parse_batch(domain(), 3, &[7, 8], &wild).err(),
+            Some(ImageQueryRefusal::Stream),
             "a slot past the request set refuses"
         );
     }

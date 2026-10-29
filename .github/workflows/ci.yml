@@ -156,6 +156,7 @@ jobs:
             sleep 60
           done
   package-delivery:
+    name: package-delivery
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'packages' }}
     permissions:
       contents: read
@@ -166,6 +167,7 @@ jobs:
       capture_mode: ${{ inputs.capture_mode }}
       jobs: ${{ inputs.delivery_jobs }}
   docker-delivery:
+    name: docker-delivery
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'docker' }}
     permissions:
       contents: read
@@ -174,6 +176,7 @@ jobs:
     with:
       preview_run_id: ${{ inputs.artifact_run_id }}
   kubernetes-delivery:
+    name: kubernetes-delivery
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'kubernetes' }}
     permissions:
       contents: read

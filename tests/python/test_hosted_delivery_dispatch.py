@@ -101,7 +101,7 @@ sys.stdout.write(answer.stdout)
                 self.assertIn(identifier, jobs)
                 job = jobs[identifier]
                 self.assertEqual(job["if"], "${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == '" + task + "' }}")
-                self.assertEqual(job.get("name", identifier), identifier)
+                self.assertEqual(job["name"], identifier)
                 self.assertEqual(job["uses"], "./.github/workflows/" + target + ".yml")
                 self.assertEqual(job["with"], supplied)
                 self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})

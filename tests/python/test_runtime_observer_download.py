@@ -73,12 +73,18 @@ class DownloadTests(unittest.TestCase):
         self.run_after = None
         self.workflows = {"ci": {"id": 71, "path": ".github/workflows/ci.yml"},
                           "package-preview": {"id": 72, "path": ".github/workflows/package-preview.yml"}}
-        self.jobs = {"total_count": 2, "jobs": [
+        self.jobs = {"total_count": 5, "jobs": [
             {"id": 21, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
              "name": "release-preview", "status": "completed", "conclusion": "success",
              "started_at": "2026-10-28T10:00:00Z", "completed_at": "2026-10-28T10:02:00Z"},
             {"id": 22, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
-             "name": "lint", "status": "completed", "conclusion": "success"}]}
+             "name": "lint", "status": "completed", "conclusion": "success"},
+            {"id": 23, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+             "name": "package-delivery", "status": "completed", "conclusion": "skipped"},
+            {"id": 24, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+             "name": "docker-delivery", "status": "completed", "conclusion": "skipped"},
+            {"id": 25, "run_id": 12, "run_attempt": 1, "head_sha": HEAD,
+             "name": "kubernetes-delivery", "status": "completed", "conclusion": "skipped"}]}
         self.artifact = {"id": 31, "name": "release-preview-public-assets", "expired": False,
                          "created_at": "2026-10-28T10:01:00Z", "updated_at": "2026-10-28T10:01:00Z",
                          "workflow_run": {"id": 12, "head_sha": HEAD,

@@ -2706,6 +2706,10 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// counter/inventory combination: 124730 B, measured with that same lexer.
 /// Re-baselined for the appended private image-bank-proof module cfg;
 /// the lexer and existing ordinary-source line positions are unchanged.
+/// Re-baselined for the private journal roots: const-generic JOURNAL
+/// threading through the entry/return roots, outlined capture with an
+/// explicit completion token, and the reason-aware removal wrapper:
+/// 131833 B, sha256 below, measured with the unchanged executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2715,8 +2719,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            124773,
-            "21d75a1af0b9542a3537a2fb1764d068b33c8d0a742ff74220da3754f72296cd"
+            131833,
+            "42124c3adc2bffdeac95b541d1870f9f3575292faa5fc071f4381392d18cb487"
         ),
         "stripped BPF dump must stay byte-identical"
     );

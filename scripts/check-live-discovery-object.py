@@ -1733,12 +1733,13 @@ def cookie_object_contract(disassembly):
 
 
 def finite_counter_key(lines, relocation):
+    """Prove the actual lookup's u32 stack key across every incoming path."""
     key_store = re.compile(
-        r"\*\(u32 \*\)\(r10 - 0x[0-9a-f]+\) = [rw](?P<register>\d+)"
+        r"\*\(u32 \*\)\(r10 - 0x(?P<offset>[0-9a-f]+)\) = [rw](?P<register>\d+)"
     )
     stored = next(
         (
-            (index, match.group("register"))
+            (index, -int(match.group("offset"), 16), match.group("register"))
             for index in range(relocation - 1, max(-1, relocation - 12), -1)
             if (match := key_store.search(lines[index]))
         ),
@@ -1746,17 +1747,47 @@ def finite_counter_key(lines, relocation):
     )
     if stored is None:
         return None
-    store_index, register = stored
-    assignment = re.compile(
-        rf"\br{register} = (?P<sign>-?)0x(?P<value>[0-9a-f]+)\b"
-    )
-    for index in range(store_index - 1, -1, -1):
-        if match := assignment.search(lines[index]):
-            value = int(match.group("value"), 16)
-            return -value if match.group("sign") else value
-        if re.search(rf"\br{register} =", lines[index]):
-            break
-    return None
+    lookups = [pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+               if index == relocation or ("R_BPF_64_64" in lines[relocation]
+                                           and relocation < index <= relocation + 6)]
+    if len(lookups) != 1:
+        return None
+    lookup = lookups[0]
+    store_index, slot, register = stored
+    store_pc = line_pc(lines[store_index])
+    facts = call_argument_facts(lines)
+    value = facts.get(store_pc, {}).get("r" + register)
+    if (not value or value[0] != "constant" or not 0 <= value[1] <= 0xffffffff
+            or facts.get(lookup, {}).get("r2") != ("stack", slot)):
+        return None
+    insns, graph = instruction_graph(lines)
+    if lookup in reachable(graph, [insns[0][0]], {store_pc}):
+        return None  # A path can reach the lookup without initializing its key.
+    reverse = {pc: [] for pc, _ in insns}
+    for pc, edges in graph.items():
+        for edge in edges:
+            reverse[edge].append(pc)
+    between = (reachable(graph, graph[store_pc], {lookup})
+               & reachable(reverse, [lookup], {store_pc}))
+    for pc, text in insns:
+        if pc not in between:
+            continue
+        # An intervening call or unknown/atomic write can mutate the key via
+        # aliases. Only disjoint, proven stack stores are accepted here.
+        if "call " in text or "lock " in text or "xchg" in text:
+            return None
+        write = re.fullmatch(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = .+", text)
+        if write:
+            width, base, sign, offset = write.groups()
+            address = facts.get(pc, {}).get("r" + base)
+            if not address or address[0] != "stack":
+                return None
+            offset = address[1] + int(offset, 16) * (1 if sign == "+" else -1)
+            if offset < slot + 4 and slot < offset + int(width) // 8:
+                return None
+        elif text.startswith("*("):
+            return None
+    return value[1]
 
 
 COUNTER_ATOMIC_ADD = re.compile(r"lock \*\(u64 \*\)\(r(\d+) \+ 0x0\) \+= r(\d+)")
@@ -2070,17 +2101,19 @@ def _initializer_block(function, tail="", null_to_failure=False):
         first = 9
     else:
         lines += [
-        "       7:\tif r6 != 0x0 goto +0x7",
-        "       8:\t*(u32 *)(r10 - 0x4) = r7",
-        "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
-        "       9:\tcall 0x1",
-        "      10:\tif r0 == 0x0 goto +0x78",
-        "      11:\tr1 = 0x1",
-        "      12:\tlock *(u64 *)(r0 + 0x0) += r1",
-        "      13:\tr1 = 0x0",
-        "      14:\tgoto +0x74",
+            "       7:\tif r6 != 0x0 goto +0xa",
+            "       8:\t*(u32 *)(r10 - 0x4) = r7",
+            "       9:\tr2 = r10",
+            "      10:\tr2 += -0x4",
+            "      11:\tr1 = 0x0 ll",
+            "\t\t0000000000000058:  R_BPF_64_64\tCOUNTERS",
+            "      13:\tcall 0x1",
+            "      14:\tif r0 == 0x0 goto +0x77",
+            "      15:\tr1 = 0x1",
+            "      16:\tlock *(u64 *)(r0 + 0x0) += r1",
+            "      17:\tgoto +0x74",
         ]
-        first = 15
+        first = 18
     lines.extend(
         f"{first + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
         for index in range(115)
@@ -2089,10 +2122,12 @@ def _initializer_block(function, tail="", null_to_failure=False):
     lines += [f"{end:8}:\tcall 0x84", f"{end + 1:8}:\tr0 = 0x0", f"{end + 2:8}:\texit"]
     if null_to_failure:
         lines += ["     127:\t*(u32 *)(r10 - 0x4) = r7",
-                  "\t\t00000000000003f8:  R_BPF_64_64\tCOUNTERS",
-                  "     128:\tcall 0x1", "     129:\tif r0 == 0x0 goto +0x3",
-                  "     130:\tr1 = 0x1", "     131:\tlock *(u64 *)(r0 + 0x0) += r1",
-                  "     132:\tr0 = 0x0", "     133:\texit"]
+                  "     128:\tr2 = r10", "     129:\tr2 += -0x4",
+                  "     130:\tr1 = 0x0 ll",
+                  "\t\t0000000000000410:  R_BPF_64_64\tCOUNTERS",
+                  "     132:\tcall 0x1", "     133:\tif r0 == 0x0 goto +0x3",
+                  "     134:\tr1 = 0x1", "     135:\tlock *(u64 *)(r0 + 0x0) += r1",
+                  "     136:\tr0 = 0x0", "     137:\texit"]
     if tail:
         lines.extend(tail.splitlines())
     return "\n".join(lines)
@@ -2256,10 +2291,14 @@ def _owned_disassembly(indexed_gap=None, metadata_spill=()):
                 body.append(f"rel{kind}:{target}")
             elif (match := re.match(r"\s*\d+:\s+(.*)", line)):
                 text = match.group(1)
-                if text == "if r0 == 0x0 goto +0x78":
+                if text == "if r6 != 0x0 goto +0xa":
+                    text = "if r6 != 0x0 goto @initialize"
+                elif text == "if r0 == 0x0 goto +0x77":
                     text = "if r0 == 0x0 goto @exit"
                 elif text == "goto +0x74":
                     text = "goto @exit"
+                if text == "*(u64 *)(r6 + 0x0) = r7":
+                    body.append("label:initialize")
                 body.append(text)
         parts.append(assemble(name, body[:-2] + tail + ["label:exit", "r0 = 0x0", "exit"], 7000 + index * 200))
     return "\n".join(parts)
@@ -2580,10 +2619,10 @@ def _initializer_polarity_self_test():
         good = _initializer_disassembly(null_to_failure=null_to_failure)
         if len(initializer_regions(good)) != 3 or not reservation_loss_contract(good):
             raise AssertionError(f"valid initializer polarity rejected: {null_to_failure}")
-        branch = "if r6 == 0x0 goto +0x77" if null_to_failure else "if r6 != 0x0 goto +0x7"
-        wrong = "if r6 == 0x0 goto +0x1" if null_to_failure else "if r6 != 0x0 goto +0x8"
-        escape_before = "     132:\tr0 = 0x0" if null_to_failure else "      14:\tgoto +0x74"
-        escape_after = "     132:\tgoto -0x7b" if null_to_failure else "      14:\tgoto +0x1"
+        branch = "if r6 == 0x0 goto +0x77" if null_to_failure else "if r6 != 0x0 goto +0xa"
+        wrong = "if r6 == 0x0 goto +0x1" if null_to_failure else "if r6 != 0x0 goto +0xb"
+        escape_before = "     136:\tr0 = 0x0" if null_to_failure else "      17:\tgoto +0x74"
+        escape_after = "     136:\tgoto -0x7f" if null_to_failure else "      17:\tgoto +0x1"
         cases = [
             ("partial initialization", good.replace("*(u64 *)(r6 + 0x378) = r7", "r1 = r1", 1)),
             ("wrong null/success target", good.replace(branch, wrong, 1)),
@@ -2594,6 +2633,65 @@ def _initializer_polarity_self_test():
         ]
         for label, bad in cases:
             _reject(lambda bad=bad: initializer_regions(bad), f"{label}, polarity={null_to_failure}")
+
+
+def _finite_counter_key_self_test():
+    # The other lexical arm clobbers r7 but cannot reach the key store. A
+    # callee preserves r7, just as the actual worker does before its lookup.
+    good = """0000000000000000 <fixture_counter>:
+       0: r7 = 0x1
+       1: if r0 == 0x0 goto +0x2
+       2: r7 = r0
+       3: exit
+       4: call 0x2962
+       5: *(u32 *)(r10 - 0x28) = w7
+       6: r2 = r10
+       7: r2 += -0x28
+       8: r1 = 0x0 ll
+                0000000000000040: R_BPF_64_64 COUNTERS
+      10: call 0x1
+      11: exit
+"""
+
+    def key(disassembly):
+        lines = function_blocks(disassembly)["fixture_counter"]
+        relocation = next(index for index, line in enumerate(lines) if "R_BPF_64_64" in line)
+        return finite_counter_key(lines, relocation)
+
+    def intervene(text, at=6):
+        lines = []
+        for line in good.splitlines():
+            if "R_BPF_" not in line and (match := re.match(r"(\s*)(\d+):(.*)", line)):
+                pc = int(match.group(2))
+                if pc == at:
+                    lines.append(f"{pc}: {text}")
+                if pc >= at:
+                    line = f"{match.group(1)}{pc + 1}:{match.group(3)}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    same_merge = good.replace("r7 = r0", "r7 = 0x1").replace("3: exit", "3: goto +0x0")
+    for positive in (good, same_merge, intervene("*(u8 *)(r10 - 0x30) = r0")):
+        if key(positive) != 1:
+            raise AssertionError("CFG-proven finite u32 counter key was refused")
+    for label, bad in (
+        ("unknown", good.replace("r7 = 0x1", "r7 = r0")),
+        ("high half", good.replace("r7 = 0x1", "r7 = 0x100000001 ll")),
+        ("uninitialized", good.replace("r7 = 0x1", "r8 = 0x1")),
+        ("unknown merge", good.replace("3: exit", "3: goto +0x0")),
+        ("unequal merge", same_merge.replace("2: r7 = 0x1", "2: r7 = 0x2")),
+        ("wrong width", good.replace("*(u32 *)", "*(u64 *)")),
+        ("wrong slot", good.replace("*(u32 *)(r10 - 0x28)", "*(u32 *)(r10 - 0x24)")),
+        ("wrong pointer", good.replace("r2 = r10", "r2 = r8")),
+        ("different pointer slot", good.replace("r2 += -0x28", "r2 += -0x24")),
+        ("partial overwrite", intervene("*(u16 *)(r10 - 0x26) = r0")),
+        ("aliased partial overwrite", intervene("*(u8 *)(r2 + 0x1) = r0", at=8)),
+        ("unknown write", intervene("*(u8 *)(r8 + 0x0) = r0")),
+        ("call clobber", intervene("call 0x70")),
+        ("uninitialized lookup path", good.replace("if r0 == 0x0 goto +0x2", "if r0 == 0x0 goto +0x8")),
+    ):
+        if key(bad) is not None:
+            raise AssertionError(f"counter key mutation accepted: {label}")
 
 
 def self_test():
@@ -2717,10 +2815,11 @@ interface_continuation_pack(count, 0, symbol_id)
     if not reservation_loss_contract(initializer):
         raise AssertionError("valid reservation-loss disassembly fixture was rejected")
     _initializer_polarity_self_test()
+    _finite_counter_key_self_test()
     initializer_mutations = [
         (
             "initializer success branch retarget",
-            initializer.replace("if r6 != 0x0 goto +0x7", "if r6 != 0x0 goto +0x6", 1),
+            initializer.replace("if r6 != 0x0 goto +0xa", "if r6 != 0x0 goto +0x9", 1),
         ),
         (
             "114 object stores",
@@ -2729,8 +2828,8 @@ interface_continuation_pack(count, 0, symbol_id)
         (
             "116 object stores",
             initializer.replace(
-                "     130:\tcall 0x84",
-                "     130:\t*(u64 *)(r6 + 0x398) = r7\n     131:\tcall 0x84",
+                "     133:\tcall 0x84\n     134:\tr0 = 0x0",
+                "     133:\t*(u64 *)(r6 + 0x398) = r7\n     134:\tcall 0x84",
                 1,
             ),
         ),

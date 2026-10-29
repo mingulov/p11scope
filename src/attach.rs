@@ -5759,24 +5759,24 @@ fn prepare_session_with(
         PublishShapes,
         PublishAttributes,
         PublishObjects,
+        FreezePublished,
+        SelectScope,
     ] {
+        // The journal class array is RDONLY_PROG like DESCRIPTORS: userspace
+        // fill runs before the published freeze, and only for journal roots.
+        if journal && step == FreezePublished {
+            operation(PublishJournalClasses)?;
+        }
         operation(step)?;
     }
-    // The journal class array is RDONLY_PROG like DESCRIPTORS: userspace
-    // fill runs before the published freeze, and only for journal roots.
     if journal {
-        operation(PublishJournalClasses)?;
-    }
-    for step in [FreezePublished, SelectScope] {
-        operation(step)?;
-    }
-    let loads = if journal {
-        journal::journal_expected_programs()
+        for name in journal::journal_expected_programs() {
+            operation(LoadProgram(name))?;
+        }
     } else {
-        expected_programs(object_has_unsafe)
-    };
-    for name in loads {
-        operation(LoadProgram(name))?;
+        for name in expected_programs(object_has_unsafe) {
+            operation(LoadProgram(name))?;
+        }
     }
     operation(LoadImagePrograms)?;
     if roots == StaticRoots::CounterBanks {
@@ -6573,6 +6573,9 @@ impl Session {
         counter: Option<counter_banks::CounterPreparation<'_>>,
         journal: Option<journal::JournalPreparation<'_>>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
+        if counter.is_some() && journal.is_some() {
+            bail!("journal preparation refuses alongside counter preparation: select one");
+        }
         // The bytes rule before anything loads or attaches: a stale or
         // mismatched embedded object refuses here with both values named.
         // Counter sessions check their own object's flavor, never the

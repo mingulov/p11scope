@@ -14296,6 +14296,7 @@ const OWNER_ADMISSION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission.rs";
 const SUCCESSOR_REPLAY_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission/successor_replay.rs";
+const NATIVE_PRODUCER_TEST_CHILD: &str = transport_boundaries::NATIVE_PRODUCER_TEST_CHILD;
 
 fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
     // The newly external root has a common basename. Resolve literal path
@@ -14685,6 +14686,12 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
 /// Other reducer reads and any rendering/reporting use remain leak paths.
 #[test]
 fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
+    assert!(
+        transport_boundaries::native_producer_test_child_is_isolated(&read(
+            "src/semantics_objects/journal.rs"
+        )),
+        "the exact native fixture requires its unique direct cfg(test) inclusion"
+    );
     let allowed = [
         "src/attach/instance.rs",
         "src/attach/instance_tests.rs",
@@ -14699,6 +14706,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
+        NATIVE_PRODUCER_TEST_CHILD,
         // Test-only assertions that the public projection omits private fields.
         "src/s1_tests.rs",
     ];
@@ -14710,6 +14718,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
         SUCCESSOR_REPLAY_TEST_CHILD,
+        NATIVE_PRODUCER_TEST_CHILD,
     ] {
         assert!(
             !refuses(path, "record.entry_ip"),
@@ -14724,6 +14733,9 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "src/semantic_capture/tests/custody_chain_tests/owner_admission/other.rs",
         "src/semantic_capture/semantic_validation.rs",
         "src/semantic_capture/owner_admission.rs",
+        "src/semantics_objects/journal/producer.rs",
+        "src/semantics_objects/journal/native_producer_tests_helpers.rs",
+        "src/semantics_objects/journal/native_producer_tests/other.rs",
     ] {
         for source in [
             "record.continuity",
@@ -14797,6 +14809,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                     &source,
                 ),
                 "{} references a private semantic fixture outside its canonical test inclusion",
+                path.display(),
+            );
+            assert!(
+                transport_boundaries::native_producer_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references the native fixture outside its canonical test inclusion",
                 path.display(),
             );
             if transport_boundaries::uses_private_record_fields(&path.to_string_lossy(), &source) {

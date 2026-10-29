@@ -7,6 +7,50 @@ const CORROBORATION: &str = "    if base.continuity.entry_ip != begin.entry_ip()
 const MODEL_PARAMETER: &str = "model: &crate::semantics_objects::ObjectSemantics,";
 const PRODUCER_TEST_MODULE: &str = "#[cfg(test)]\npub(crate) mod tests {";
 const PRODUCER_INITIALIZERS: &str = "        base.continuity.entry_ip = ENTRY_IP;\n        base.continuity.entry_stamp = InstanceStamp {\n            epoch: 7,\n            global: 8,\n            fault: 9,\n            file_slot_plus1: 3,\n            flags: STAMP_VALID,\n        };\n        base.continuity.return_stamp = base.continuity.entry_stamp;";
+pub const NATIVE_PRODUCER_TEST_CHILD: &str =
+    "src/semantics_objects/journal/native_producer_tests.rs";
+const NATIVE_PRODUCER_MODULE: &str = "#[cfg(test)]\nmod native_producer_tests;";
+const NATIVE_PRODUCER_NAME: &str = "native_producer_tests";
+
+/// The only native fixture inclusion is a unique direct top-level test item.
+/// Comments/literals cannot supply it, and no preceding attribute may redirect it.
+pub fn native_producer_test_child_is_isolated(source: &str) -> bool {
+    let code = code_only(source);
+    let mut declarations = source
+        .match_indices(NATIVE_PRODUCER_MODULE)
+        .filter(|(start, _)| {
+            code[*start..*start + NATIVE_PRODUCER_MODULE.len()]
+                == *NATIVE_PRODUCER_MODULE.as_bytes()
+        });
+    let Some((start, _)) = declarations.next() else {
+        return false;
+    };
+    let preceding = &code[..start];
+    let boundary = preceding
+        .iter()
+        .rev()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .copied();
+    let end = start + NATIVE_PRODUCER_MODULE.len();
+    declarations.next().is_none()
+        && balanced(preceding, b'{', b'}')
+        && balanced(preceding, b'(', b')')
+        && balanced(preceding, b'[', b']')
+        && matches!(boundary, None | Some(b';' | b'}'))
+        // Exclude only the verified exact declaration. A second spelling,
+        // including a path/include alias or comment, revokes the exemption.
+        && !source[..start].contains(NATIVE_PRODUCER_NAME)
+        && !source[end..].contains(NATIVE_PRODUCER_NAME)
+}
+
+/// Applied to every src file, including the parent and the private child.
+pub fn native_producer_test_child_references_are_canonical(path: &str, source: &str) -> bool {
+    if path == JOURNAL {
+        native_producer_test_child_is_isolated(source)
+    } else {
+        !source.contains(NATIVE_PRODUCER_NAME)
+    }
+}
 
 pub fn uses_private_record_fields(path: &str, source: &str) -> bool {
     let mut scan = source.as_bytes().to_vec();
@@ -386,6 +430,150 @@ mod tests {
 
     fn input() -> String {
         std::fs::read_to_string(INPUT).expect("read real evidence adapter")
+    }
+
+    const NATIVE_CHILD_DECLARATION: &str = "#[cfg(test)]\nmod native_producer_tests;";
+
+    #[test]
+    fn native_producer_child_has_exact_real_test_ancestry() {
+        assert_eq!(
+            NATIVE_PRODUCER_TEST_CHILD,
+            "src/semantics_objects/journal/native_producer_tests.rs"
+        );
+        assert!(native_producer_test_child_is_isolated(&journal()));
+        assert!(native_producer_test_child_references_are_canonical(
+            JOURNAL,
+            &journal()
+        ));
+        let child = std::fs::read_to_string(NATIVE_PRODUCER_TEST_CHILD).unwrap();
+        assert!(uses_private_record_fields(
+            NATIVE_PRODUCER_TEST_CHILD,
+            &child
+        ));
+        assert!(native_producer_test_child_references_are_canonical(
+            NATIVE_PRODUCER_TEST_CHILD,
+            &child
+        ));
+    }
+
+    #[test]
+    fn native_producer_child_refuses_decoy_duplicate_and_nested_gates() {
+        let source = format!("mod previous;\n{NATIVE_CHILD_DECLARATION}\nmod next;\n");
+        assert!(native_producer_test_child_is_isolated(&source));
+        for (case, changed) in [
+            ("missing gate", source.replace("#[cfg(test)]\n", "")),
+            (
+                "production gate",
+                source.replace("cfg(test)", "cfg(not(test))"),
+            ),
+            (
+                "comment gate",
+                source.replace("#[cfg(test)]", "/* #[cfg(test)] */"),
+            ),
+            (
+                "literal gate",
+                source.replace("#[cfg(test)]", "#[doc = \"#[cfg(test)]\"]"),
+            ),
+            ("comment declaration", format!("/* {source} */")),
+            (
+                "literal declaration",
+                format!("const DECOY: &str = r####\"{source}\"####;"),
+            ),
+            (
+                "duplicate declaration",
+                format!("{source}\n{NATIVE_CHILD_DECLARATION}"),
+            ),
+            (
+                "duplicate production declaration",
+                format!("{source}\nmod native_producer_tests;"),
+            ),
+            (
+                "duplicate commented declaration",
+                format!("{source}\n/* {NATIVE_CHILD_DECLARATION} */"),
+            ),
+            ("nested module", format!("mod nested {{\n{source}\n}}")),
+            ("nested function", format!("fn nested() {{\n{source}\n}}")),
+            (
+                "path override",
+                source.replace(
+                    NATIVE_CHILD_DECLARATION,
+                    &format!("#[path = \"other.rs\"]\n{NATIVE_CHILD_DECLARATION}"),
+                ),
+            ),
+        ] {
+            assert!(!native_producer_test_child_is_isolated(&changed), "{case}");
+            assert!(
+                !native_producer_test_child_references_are_canonical(JOURNAL, &changed),
+                "{case}"
+            );
+        }
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let changed = format!("strip_gate!{open}\n{source}\n{close};");
+            assert!(
+                !native_producer_test_child_is_isolated(&changed),
+                "macro {open}"
+            );
+            assert!(
+                !native_producer_test_child_references_are_canonical(JOURNAL, &changed),
+                "macro {open}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_producer_child_rejects_every_other_reference_site() {
+        for path in [
+            JOURNAL,
+            NATIVE_PRODUCER_TEST_CHILD,
+            "src/lib.rs",
+            "src/render.rs",
+            "src/semantics_objects/journal/other.rs",
+        ] {
+            for reference in [
+                "mod native_producer_tests;",
+                NATIVE_CHILD_DECLARATION,
+                "#[path = \"journal/native_producer_tests.rs\"]\nmod alias;",
+                "#[path = \"./journal/../journal/native_producer_tests.rs\"]\nmod alias;",
+                "include!(\"native_producer_tests.rs\");",
+                "include!(concat!(\"journal/\", \"native_producer_tests.rs\"));",
+                "// unmatched quote: \"\ninclude!(\"native_producer_tests.rs\");",
+            ] {
+                if path == JOURNAL && reference == NATIVE_CHILD_DECLARATION {
+                    continue;
+                }
+                let source = if path == JOURNAL {
+                    format!("{NATIVE_CHILD_DECLARATION}\n{reference}")
+                } else {
+                    reference.to_owned()
+                };
+                assert!(
+                    !native_producer_test_child_references_are_canonical(path, &source),
+                    "{path}: {reference}"
+                );
+            }
+        }
+        for path in [
+            "src/semantics_objects/journal/native_producer_tests_helpers.rs",
+            "src/semantics_objects/journal/native_producer_tests/other.rs",
+            "src/semantics_objects/journal/producer.rs",
+            "src/render.rs",
+        ] {
+            assert!(
+                uses_private_record_fields(path, "record.entry_ip"),
+                "{path}"
+            );
+            assert!(
+                !native_producer_test_child_references_are_canonical(
+                    path,
+                    NATIVE_CHILD_DECLARATION
+                ),
+                "{path}"
+            );
+            assert!(
+                native_producer_test_child_references_are_canonical(path, "mod ordinary;"),
+                "{path}"
+            );
+        }
     }
 
     fn producer_fixture_item() -> String {

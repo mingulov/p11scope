@@ -2,8 +2,9 @@
 name: Kubernetes runtime
 
 # Artifact consumer only: no ordinary CI, release preview or Rust rebuild.
-# The shared download-runtime-observer.py prerequisite must be integrated
-# before activation. A missing or rejected FULL artifact fails preparation.
+# Consumes the matching validated FULL static observer via
+# scripts/download-runtime-observer.py. A missing or rejected FULL
+# artifact fails preparation.
 on:
   workflow_dispatch:
     inputs:

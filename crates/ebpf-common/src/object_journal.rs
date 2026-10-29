@@ -21,9 +21,9 @@
 use crate::instance;
 use crate::object_policy::object_descriptor;
 use crate::object_wire::{
-    valid_attribute_list, validate_object_tail, ObjectDescriptorWire, OBJECT_ACTION_MAX,
-    OBJECT_GUARD_SCALAR_DERIVE, OBJECT_HANDLE_STATUS_MAX, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64,
-    OBJECT_TAIL_BYTES,
+    valid_attribute_list, validate_object_tail, ObjectDescriptorWire, ObjectEventRecord,
+    OBJECT_ACTION_MAX, OBJECT_GUARD_SCALAR_DERIVE, OBJECT_HANDLE_STATUS_MAX, OBJECT_LAYOUT_ILP32,
+    OBJECT_LAYOUT_LP64, OBJECT_TAIL_BYTES,
 };
 use crate::{capture, event_type, ARG_NONE, MAX_DESCRIPTORS};
 
@@ -58,6 +58,76 @@ pub const JOURNAL_END_TAIL_ABSENT: u8 = 0x02;
 /// Both identity words must be zero; dispatch treats the validated payload
 /// as one ordinary record, never a BEGIN/END transaction.
 pub const JOURNAL_END_UNJOURNALED: u8 = 0x04;
+
+/// Unvalidated frozen 24-byte END header. Field values, flags and identity
+/// still require [`validate_end`]; this layout conveys no authority.
+/// Private physical identity words deliberately have no `Debug`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JournalEndHeader {
+    pub version: u16,
+    pub length: u16,
+    pub kind: u8,
+    pub flags: u8,
+    pub reserved: u16,
+    pub thread: u64,
+    pub sequence: u64,
+}
+
+/// Unvalidated frozen 632-byte full END: the header followed by the exact
+/// existing 608-byte completed payload. No `Debug`: payload words are private.
+///
+/// A BPF producer must initialize every field directly in reserved ring
+/// storage, rather than constructing this full value on its stack. This
+/// representation neither emits bytes nor bypasses [`validate_end`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JournalEndFull {
+    pub header: JournalEndHeader,
+    pub payload: ObjectEventRecord,
+}
+
+// Pin the production ABI, including the inherited private continuity and
+// object tail. Header field boundaries and the last payload word account for
+// every byte: no implicit header, inter-record or trailing padding is allowed.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<JournalEndHeader>() == JOURNAL_COMMON_BYTES);
+    assert!(align_of::<JournalEndHeader>() == 8);
+    assert!(offset_of!(JournalEndHeader, version) == 0);
+    assert!(offset_of!(JournalEndHeader, length) == 2);
+    assert!(offset_of!(JournalEndHeader, kind) == 4);
+    assert!(offset_of!(JournalEndHeader, flags) == 5);
+    assert!(offset_of!(JournalEndHeader, reserved) == 6);
+    assert!(offset_of!(JournalEndHeader, thread) == 8);
+    assert!(offset_of!(JournalEndHeader, sequence) == 16);
+    assert!(
+        offset_of!(JournalEndHeader, sequence) + size_of::<u64>() == size_of::<JournalEndHeader>()
+    );
+
+    assert!(size_of::<JournalEndFull>() == JOURNAL_END_FULL_BYTES);
+    assert!(align_of::<JournalEndFull>() == 8);
+    assert!(offset_of!(JournalEndFull, header) == 0);
+    assert!(offset_of!(JournalEndFull, payload) == JOURNAL_COMMON_BYTES);
+    assert!(size_of::<ObjectEventRecord>() == 608);
+    assert!(align_of::<ObjectEventRecord>() == 8);
+    assert!(offset_of!(JournalEndFull, payload.base.event) == 24);
+    assert!(offset_of!(JournalEndFull, payload.base.continuity) == 352);
+    assert!(offset_of!(JournalEndFull, payload.base.continuity.entry_ip) == 352);
+    assert!(offset_of!(JournalEndFull, payload.base.continuity.entry_stamp) == 360);
+    assert!(offset_of!(JournalEndFull, payload.base.continuity.return_stamp) == 376);
+    assert!(offset_of!(JournalEndFull, payload.object) == 392);
+    assert!(offset_of!(JournalEndFull, payload.object.reserved2) == 628);
+    assert!(
+        offset_of!(JournalEndFull, payload.object.reserved2) + size_of::<u32>()
+            == size_of::<JournalEndFull>()
+    );
+    assert!(
+        offset_of!(JournalEndFull, payload) + size_of::<ObjectEventRecord>()
+            == size_of::<JournalEndFull>()
+    );
+};
 
 /// Finite ABANDON reasons. Wire carries the code only, never a string; the
 /// reason-to-disposition matrix lives with the journal consumer, and a wire
@@ -746,6 +816,248 @@ fn journal_u64(bytes: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_wire::{
+        canonical_object_wire, publish_object_descriptors, ObjectCallWire, ObjectEventRecord,
+        OBJECT_CALL_BYTES, OBJECT_CALL_VERSION,
+    };
+
+    fn function_named(name: &str) -> u32 {
+        (0..MAX_DESCRIPTORS - 1)
+            .find(|index| pkcs11_module::function_name(*index as usize) == Some(name))
+            .expect("the frozen catalog contains the named fixture function")
+    }
+
+    fn tracked_full_end() -> (JournalEndFull, ObjectDescriptorWire) {
+        let function = function_named("C_CreateObject");
+        let descriptor = canonical_object_wire(function);
+        let payload = ObjectEventRecord {
+            base: crate::EventRecord {
+                event: crate::Event {
+                    ts_ns: 17,
+                    duration_ns: 3,
+                    pid_tgid: 0x1111_2222_3333_4444,
+                    session: 0x5050,
+                    slot_id: 0x6060,
+                    slot: 11,
+                    target_function: function,
+                    event_type: event_type::CALL,
+                    image: crate::ImageIdentity {
+                        task_cookie: 0x1010,
+                        exec_id: 0x2020,
+                    },
+                    root_affiliation: 1,
+                    ..Default::default()
+                },
+                continuity: crate::InstanceContinuity {
+                    entry_ip: 0x4040,
+                    entry_stamp: crate::InstanceStamp {
+                        epoch: 7,
+                        global: 8,
+                        fault: 9,
+                        file_slot_plus1: 3,
+                        flags: instance::STAMP_VALID,
+                    },
+                    return_stamp: crate::InstanceStamp {
+                        epoch: 7,
+                        global: 8,
+                        fault: 9,
+                        file_slot_plus1: 3,
+                        flags: instance::STAMP_VALID,
+                    },
+                },
+            },
+            object: ObjectCallWire {
+                version: OBJECT_CALL_VERSION,
+                bytes: OBJECT_CALL_BYTES,
+                descriptor_index: function + 1,
+                layout: OBJECT_LAYOUT_LP64,
+                action: descriptor.action,
+                result_handles: [0x9090, 0],
+                result_status: [1, 0],
+                ..Default::default()
+            },
+        };
+        (
+            JournalEndFull {
+                header: JournalEndHeader {
+                    version: JOURNAL_VERSION,
+                    length: JOURNAL_END_FULL_BYTES as u16,
+                    kind: JOURNAL_KIND_END,
+                    flags: 0,
+                    reserved: 0,
+                    thread: 0x1111_2222_3333_4444,
+                    sequence: 0x5555_6666_7777_8888,
+                },
+                payload,
+            },
+            descriptor,
+        )
+    }
+
+    fn unjournaled_absent_full_end() -> JournalEndFull {
+        let (mut record, _) = tracked_full_end();
+        record.header.flags = JOURNAL_END_TAIL_ABSENT | JOURNAL_END_UNJOURNALED;
+        record.header.thread = 0;
+        record.header.sequence = 0;
+        record.payload.object = ObjectCallWire::default();
+        let function = function_named("C_Sign");
+        assert_eq!(canonical_object_wire(function).action, 0);
+        record.payload.base.event.target_function = function;
+        record
+    }
+
+    fn full_end_bytes(record: &JournalEndFull) -> &[u8] {
+        // SAFETY: the frozen repr(C) transports consist only of initialized
+        // integer fields. Their exact no-padding layout is compile-time pinned above.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(record).cast::<u8>(),
+                JOURNAL_END_FULL_BYTES,
+            )
+        }
+    }
+
+    fn assert_typed_end_interoperates(
+        record: &JournalEndFull,
+        descriptor: Option<&ObjectDescriptorWire>,
+    ) {
+        let bytes = full_end_bytes(record);
+        let payload = &bytes[JOURNAL_COMMON_BYTES..];
+        let full = validate_end(bytes, descriptor).expect("typed END passes the actual validator");
+        assert!(!full.compact());
+        assert_eq!(full.thread(), record.header.thread);
+        assert_eq!(full.sequence(), record.header.sequence);
+        assert!(full.raw_bytes() == bytes, "full wire bytes remain exact");
+        assert!(
+            full.payload_bytes().as_slice() == payload,
+            "the exact initialized payload survives"
+        );
+
+        let rows = publish_object_descriptors();
+        let Some(JournalRecord::End(decoded)) = decode_journal_record(bytes, &rows) else {
+            panic!("the actual dispatcher accepts the typed full END");
+        };
+        assert!(decoded.payload_bytes().as_slice() == payload);
+        assert!(end_compact_eligible(payload));
+        let packed = pack_compact_end(
+            record.header.thread,
+            record.header.sequence,
+            record.header.flags,
+            payload,
+        )
+        .expect("the unchanged compact packer accepts eligible typed payload bytes");
+        let compact = validate_end(&packed, descriptor).expect("actual compact END validation");
+        assert!(compact.compact());
+        assert_eq!(compact.thread(), full.thread());
+        assert_eq!(compact.sequence(), full.sequence());
+        assert_eq!(compact.tail_absent(), full.tail_absent());
+        assert_eq!(compact.unjournaled(), full.unjournaled());
+        assert!(
+            compact.payload_bytes().as_slice() == payload,
+            "compact reconstruction preserves every payload byte"
+        );
+    }
+
+    #[test]
+    fn object_journal_typed_full_end_preserves_tracked_payload() {
+        let (mut record, descriptor) = tracked_full_end();
+        for layout in [OBJECT_LAYOUT_LP64, OBJECT_LAYOUT_ILP32] {
+            record.payload.object.layout = layout;
+            assert_typed_end_interoperates(&record, Some(&descriptor));
+            let validated = validate_end(full_end_bytes(&record), Some(&descriptor)).unwrap();
+            assert!(!validated.tail_absent() && !validated.unjournaled());
+            let base = validated.payload_base();
+            assert_eq!(
+                base.continuity.entry_ip,
+                record.payload.base.continuity.entry_ip
+            );
+            assert!(base.continuity.entry_stamp == record.payload.base.continuity.entry_stamp);
+            assert!(base.continuity.return_stamp == record.payload.base.continuity.return_stamp);
+        }
+        record.payload.base.event.attr_count = 1;
+        let payload = &full_end_bytes(&record)[JOURNAL_COMMON_BYTES..];
+        assert!(!end_compact_eligible(payload));
+        assert!(
+            pack_compact_end(record.header.thread, record.header.sequence, 0, payload).is_none()
+        );
+        assert!(
+            validate_end(full_end_bytes(&record), Some(&descriptor)).is_some(),
+            "legacy data remains valid in the full form"
+        );
+    }
+
+    #[test]
+    fn object_journal_typed_full_end_preserves_unjournaled_absent_payload() {
+        let record = unjournaled_absent_full_end();
+        assert_typed_end_interoperates(&record, None);
+        let validated = validate_end(full_end_bytes(&record), None).unwrap();
+        assert!(validated.tail_absent() && validated.unjournaled());
+        assert!(validated.payload_tail().iter().all(|byte| *byte == 0));
+        let (_, descriptor) = tracked_full_end();
+        assert!(validate_end(full_end_bytes(&record), Some(&descriptor)).is_none());
+    }
+
+    #[test]
+    fn object_journal_typed_full_end_poison_is_not_repaired() {
+        let (record, descriptor) = tracked_full_end();
+        let poisons: &[fn(&mut JournalEndFull)] = &[
+            |end| end.header.version = 0,
+            |end| end.header.length = JOURNAL_END_COMPACT_BYTES as u16,
+            |end| end.header.kind = JOURNAL_KIND_BEGIN,
+            |end| end.header.reserved = 1,
+            |end| end.header.flags = JOURNAL_BEGIN_NO_END,
+            |end| end.header.flags = JOURNAL_END_UNJOURNALED,
+            |end| end.header.thread = 0,
+            |end| end.header.sequence = 0,
+            |end| end.payload.base.event.event_type = u32::MAX,
+            |end| end.payload.base.event.root_affiliation = 2,
+            |end| end.payload.object.reserved0 = 1,
+            |end| end.payload.object.reserved1 = 1,
+            |end| end.payload.object.reserved2 = 1,
+            |end| end.payload.object.flags = 0x100,
+            |end| end.payload.object.descriptor_index = 0,
+            |end| end.payload.object.layout = 0,
+            |end| end.payload.object.result_status[0] = 0,
+            |end| end.payload.object.result_handles[0] = 0,
+        ];
+        for (case, poison) in poisons.iter().enumerate() {
+            let mut invalid = record;
+            poison(&mut invalid);
+            assert!(
+                validate_end(full_end_bytes(&invalid), Some(&descriptor)).is_none(),
+                "typed poison {case} must refuse without repair"
+            );
+        }
+        assert!(validate_end(full_end_bytes(&record), Some(&descriptor)).is_some());
+    }
+
+    #[test]
+    fn object_journal_typed_absent_tail_rejects_identity_flags_and_any_tail_byte() {
+        let record = unjournaled_absent_full_end();
+        let poisons: &[fn(&mut JournalEndFull)] = &[
+            |end| end.header.reserved = 1,
+            |end| end.header.flags |= 0x80,
+            |end| end.header.flags &= !JOURNAL_END_TAIL_ABSENT,
+            |end| end.header.flags &= !JOURNAL_END_UNJOURNALED,
+            |end| end.header.thread = 1,
+            |end| end.header.sequence = 1,
+        ];
+        for poison in poisons {
+            let mut invalid = record;
+            poison(&mut invalid);
+            assert!(validate_end(full_end_bytes(&invalid), None).is_none());
+        }
+        for offset in JOURNAL_COMMON_BYTES + 368..JOURNAL_END_FULL_BYTES {
+            let mut invalid = [0u8; JOURNAL_END_FULL_BYTES];
+            invalid.copy_from_slice(full_end_bytes(&record));
+            invalid[offset] = 1;
+            assert!(
+                validate_end(&invalid, None).is_none(),
+                "absent-tail byte {offset} must be zero"
+            );
+        }
+        assert!(validate_end(full_end_bytes(&record), None).is_some());
+    }
 
     #[test]
     fn object_journal_sizes_match_h7_payload() {

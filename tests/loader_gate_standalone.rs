@@ -166,6 +166,33 @@ fn loader_gate_harness_old_format_twin_requires_quiescence() {
     );
 }
 
+/// Every old-format absent cookie is a generation-2 twin of its case slot.
+#[test]
+fn loader_gate_harness_old_absent_gen2_resolves() {
+    drive_gate(
+        "old-absent-gen2-resolves",
+        &[
+            "ASSERT absent_ctx1_resolves_slot0",
+            "ASSERT absent_ctx3_resolves_slot2",
+            "ASSERT twins_refuse_nothing",
+        ],
+    );
+}
+
+/// Every old-format present cookie with 0 <= d < 2^31 is a
+/// generation-2d+1 twin of its case slot.
+#[test]
+fn loader_gate_harness_old_delta1_gen3_resolves() {
+    drive_gate(
+        "old-delta1-gen3-resolves",
+        &[
+            "ASSERT delta1_ctx1_resolves_slot0",
+            "ASSERT delta5_ctx3_resolves_slot2",
+            "ASSERT twins_refuse_nothing",
+        ],
+    );
+}
+
 /// Every START-removal reason retires with its owned disposition; no
 /// identity recycles before acknowledgement.
 #[test]

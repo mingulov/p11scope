@@ -110,6 +110,38 @@ static int old_format_twin_requires_quiescence(const char *scenario)
     return 0;
 }
 
+/* Every old-format absent cookie is a generation-2 twin: (1<<9)|(c-1)
+ * reads as token (gen 2, slot c-1) and resolves while that row is armed. */
+static int old_absent_gen2_resolves(const char *scenario)
+{
+    gate_reset();
+    CHECK(p11_loader_gate_admit(0, 2) == 0, "admit_slot0_gen2_zero");
+    CHECK(p11_loader_gate_admit(2, 2) == 0, "admit_slot2_gen2_zero");
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
+    /* Old-format absent cookie for context 1: (1 << 9) | 0. */
+    CHECK(p11_loader_gate_lookup(0x200) == 0, "absent_ctx1_resolves_slot0");
+    /* Old-format absent cookie for context 3: (1 << 9) | 2. */
+    CHECK(p11_loader_gate_lookup(0x202) == 2, "absent_ctx3_resolves_slot2");
+    CHECK(gate_ctl.refusals == 0, "twins_refuse_nothing");
+    return 0;
+}
+
+/* Every old-format present cookie with 0 <= d < 2^31 is a generation-2d+1
+ * twin: (d<<9)|(1<<8)|(c-1) reads as token (gen 2d+1, slot c-1). */
+static int old_delta1_gen3_resolves(const char *scenario)
+{
+    gate_reset();
+    CHECK(p11_loader_gate_admit(0, 3) == 0, "admit_slot0_gen3_zero");
+    CHECK(p11_loader_gate_admit(2, 11) == 0, "admit_slot2_gen11_zero");
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
+    /* Old-format present cookie, delta 1, context 1: (1 << 9) | 0x100. */
+    CHECK(p11_loader_gate_lookup(0x300) == 0, "delta1_ctx1_resolves_slot0");
+    /* Old-format present cookie, delta 5, context 3: (5 << 9) | 0x102. */
+    CHECK(p11_loader_gate_lookup(0xb02) == 2, "delta5_ctx3_resolves_slot2");
+    CHECK(gate_ctl.refusals == 0, "twins_refuse_nothing");
+    return 0;
+}
+
 /* Every START-removal reason retires with its owned disposition, and no
  * token or map identity recycles before acknowledgement. */
 static int retire_no_recycle(const char *scenario)
@@ -228,6 +260,8 @@ int main(int argc, char **argv)
         { "refuse-twins", refuse_twins },
         { "old-format-after-cutover", old_format_after_cutover },
         { "old-format-twin-requires-quiescence", old_format_twin_requires_quiescence },
+        { "old-absent-gen2-resolves", old_absent_gen2_resolves },
+        { "old-delta1-gen3-resolves", old_delta1_gen3_resolves },
         { "retire-no-recycle", retire_no_recycle },
         { "reason-map", reason_map },
         { "admit-without-producer-keeps-debt", admit_without_producer_keeps_debt },

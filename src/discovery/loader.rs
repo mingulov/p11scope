@@ -432,10 +432,17 @@ impl LoaderRegistry {
 
     /// T-L2c gate lookup view: only adapter token cookies for allocated
     /// storage resolve. Stale/foreign tokens, malformed cookies and
-    /// old-format cookies refuse closed, except that an old-format present
-    /// cookie with a zero delta is the numeric twin of the generation-1
-    /// token for the same case and resolves while that slot is allocated
-    /// (the atomic cutover requires drained old-format producers).
+    /// old-format cookies refuse closed, except for the numeric twins in
+    /// the collision set. Read as 40-bit `(generation << 8) | slot`
+    /// tokens, every old-format absent cookie is a generation-2 token for
+    /// its case slot, and every old-format present cookie with
+    /// `0 <= delta < 2^31` is a generation-`2*delta+1` token for its case
+    /// slot (even generations >= 4 have no old twin; negative or
+    /// `>= 2^31` deltas overflow 40 bits and refuse). This adapter pins
+    /// generation 1, so only the delta-0 twin resolves here, while its
+    /// slot is allocated; the wider gate admits every generation and
+    /// resolves every twin. The atomic cutover requires every old-format
+    /// producer to drain first, not just delta-0 ones.
     pub(crate) fn id_for_attach_cookie(&self, cookie: u64) -> Option<LoaderContextId> {
         self.id_for_token(decode_token_cookie(cookie)?)
     }

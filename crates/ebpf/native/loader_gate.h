@@ -11,11 +11,19 @@
  * seam, not this packet). Unknown cookies fail closed: untracked (-2)
  * before the cutover, counted refusals (-1) after it.
  *
- * The cutover is a one-way latch, not a format detector: an old-format
- * present cookie with a zero delta is numerically identical to the
- * generation-1 adapter token for the same case, so the atomic cutover is
- * only safe after every old-format producer has drained through an owned
- * disposition (proved by the twin harnesses, required by activation).
+ * The cutover is a one-way latch, not a format detector: several
+ * old-format cookies are numerically identical to live tokens, and no code
+ * at this seam can tell the formats apart. Read as 40-bit tokens
+ * `(generation << 8) | slot`, the full collision set is: every old-format
+ * absent cookie is a generation-2 token for its case slot
+ * (`(1<<9)|(c-1)` == `(2<<8)|(c-1)`); every old-format present cookie with
+ * `0 <= delta < 2^31` is a generation-`2*delta+1` token for its case slot
+ * (delta 0 / generation 1 is just the first of these); negative or
+ * `>= 2^31` deltas overflow 40 bits and refuse. Even generations >= 4
+ * have no old twin. The atomic cutover is therefore only safe after every
+ * old-format producer has drained through an owned disposition (proved by
+ * the twin harnesses, required by activation): under-scoping the drain
+ * set to delta-0 producers strands live twins.
  *
  * Not yet compiled into any BPF object and not yet consulted by any
  * producer: activation wires the maps and call sites. Host harnesses

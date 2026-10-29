@@ -6243,6 +6243,7 @@ fn capture_start_members_that_ended_are_not_losses() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6308,6 +6309,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let mut args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6477,6 +6479,7 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("a cgroup.procs");
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
     let args_with = |max_scan_pids| CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6544,6 +6547,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6647,6 +6651,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6813,6 +6818,7 @@ fn retained_views_survive_ordinary_rotation_passes() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6939,6 +6945,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7176,6 +7183,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7373,6 +7381,7 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7507,6 +7516,7 @@ fn refresh_requests_survive_allocation_exhaustion() {
     let listing: String = pids[..3].iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7600,6 +7610,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -10140,6 +10151,7 @@ fn evidence_verdict(
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,
@@ -22710,6 +22722,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -26820,6 +26833,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,
@@ -28700,6 +28714,7 @@ fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> Syst
 
 fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
@@ -31075,6 +31090,7 @@ fn e06_cgroup_args(
     max_scan_pids: Option<usize>,
 ) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
@@ -54631,4 +54647,308 @@ fn acquired_ia32_sparse_table_uses_the_real_process_abi() {
     assert_eq!(module.tables[0].entries.len(), 1);
     assert_eq!(module.tables[0].entries[0].name, "C_WaitForSlotEvent");
     assert_eq!(module.tables[0].null_entries.len(), 67);
+}
+
+// 6.14 Option B (extensive-mode executable dependency hints) REDs.
+// Each novel unmatched exit in extensive mode yields exactly one
+// static hint; the gap count never depends on the hint outcome.
+
+fn gap_exe_exec_record(pid: u32, ts: u64, dev: u64, ino: u64, ticket: u64) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_EXEC;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = ts;
+    record.binding_id = ticket;
+    record.pointers[0] = dev;
+    record.pointers[1] = ino;
+    record
+}
+
+fn gap_exe_exit_record(pid: u32, ts: u64) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_LEADER_EXIT;
+    record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    record.hook_ts_ns = ts;
+    record
+}
+
+fn dispatch_gap_exe(engine: &mut Engine, exec: &DiscoveryRecord, exit: &DiscoveryRecord) {
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(&mut session, exec, &mut pending);
+    engine.dispatch_lifecycle_record(&mut session, exit, &mut pending);
+}
+
+fn gap_exe_hint_fixture(
+    engine: &mut Engine,
+    dir: &tempfile::TempDir,
+    soname: &[u8],
+    needed: &[&[u8]],
+) -> (u64, u64) {
+    use crate::discovery::elf_needed::WatchedProvider;
+    use crate::discovery::elf_needed::fixture as exf;
+    let provider = exf::write_elf(
+        dir.path(),
+        "libgap.so.1",
+        &exf::build_elf(&exf::ElfSpec::lib(soname, &[])),
+    );
+    let exe = exf::write_elf(
+        dir.path(),
+        "gexe",
+        &exf::build_elf(&exf::ElfSpec::exe(needed)),
+    );
+    let (provider_dev, provider_ino) = exf::record_identity_of(&provider);
+    engine.extensive.set_watched_for_test(vec![WatchedProvider {
+        path: provider.clone(),
+        soname: soname.to_vec(),
+        dev: provider_dev,
+        ino: provider_ino,
+    }]);
+    engine
+        .extensive
+        .learn_scan_path(exf::cache_key_of(&exe), &exe);
+    engine
+        .extensive
+        .learn_scan_path(exf::cache_key_of(&provider), &provider);
+    exf::record_identity_of(&exe)
+}
+
+#[test]
+fn gap_exe_identity_links_provider_hint() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_unknown_path_stays_unknown() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    // A (dev, ino) pair no live scan ever learned: no guess.
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, 0x801, 424242, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_changed_inode_refuses_stale_path() {
+    use crate::discovery::elf_needed::fixture as exf;
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    // Replace the executable at its learned path: the recorded
+    // identity no longer matches, so the stale path is refused.
+    let exe = dir.path().join("gexe");
+    std::fs::remove_file(&exe).unwrap();
+    std::fs::write(&exe, exf::build_elf(&exf::ElfSpec::exe(&[]))).unwrap();
+    let (new_dev, new_ino) = exf::record_identity_of(&exe);
+    assert_ne!((dev, ino), (new_dev, new_ino), "replacement kept identity");
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_dlopen_only_provider_stays_no_static_link() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    // No DT_NEEDED at all: dlopen-only use is invisible by design.
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.no_static_link_within_scope, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_kthread_shape_skipped() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    // Absent exe words (kernel could not read them): silent skip to
+    // unknown; the gap itself still counts.
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, 0, 0, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_zero_ticket_never_seeds_stash() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 0),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_loader_hint() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libp11-kit.so.0"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_pkcs11_loader, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+#[test]
+fn gap_exe_identity_over_budget_stays_unknown_with_earlier_hints_intact() {
+    use crate::discovery::elf_needed::fixture as exf;
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.extensive.set_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    // A second gap whose exe names 129 unresolvable entries: the
+    // edge budget voids it without touching the earlier hint. A
+    // distinct PID keeps the stash entries independent.
+    let pid2 = pid.wrapping_add(1 << 20);
+    let names: Vec<Vec<u8>> = (0..129)
+        .map(|index| format!("libq{index:03}.so").into_bytes())
+        .collect();
+    let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let big = exf::write_elf(
+        dir.path(),
+        "big",
+        &exf::build_elf(&exf::ElfSpec::exe(&refs)),
+    );
+    engine
+        .extensive
+        .learn_scan_path(exf::cache_key_of(&big), &big);
+    let (dev2, ino2) = exf::record_identity_of(&big);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid2, 300, dev2, ino2, 9),
+        &gap_exe_exit_record(pid2, 400),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 2);
+}
+
+#[test]
+fn gap_exe_identity_disabled_captures_keep_no_hints() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 7),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.gap_exe_hints().is_none());
+}
+
+#[test]
+fn gap_exe_identity_shares_unchanged_twin() {
+    let pid = std::process::id();
+    let (mut armed, _scope) = engine_over_cgroup_naming(&[pid]);
+    armed.extensive.set_enabled(true);
+    let (mut plain, _scope) = engine_over_cgroup_naming(&[pid]);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut armed, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let exec = gap_exe_exec_record(pid, 100, dev, ino, 7);
+    let exit = gap_exe_exit_record(pid, 200);
+    dispatch_gap_exe(&mut armed, &exec, &exit);
+    dispatch_gap_exe(&mut plain, &exec, &exit);
+    // Populating hints never moves the gap count, the unmatched
+    // ledger, or any call/attribution surface: only the new split
+    // differs between the twins.
+    assert_eq!(armed.pid_descendant_gaps(), plain.pid_descendant_gaps());
+    assert_eq!(armed.pid_descendant_gaps(), 1);
+    assert_eq!(
+        armed.unmatched_leader_exit_events,
+        plain.unmatched_leader_exit_events
+    );
+    assert_eq!(armed.gap_exe_hints().unwrap().total(), 1);
+    assert!(plain.gap_exe_hints().is_none());
+}
+
+// 614b P1 narrow authorization, engine layer: `arm_extensive` itself
+// refuses to enable on a scope that never classifies descendant
+// gaps, so no future caller can arm the exe-identity read (or retain
+// its stash/caches) for an exact-PID capture. A generation-admitting
+// scope arms exactly as before.
+#[test]
+fn extensive_arm_requires_generation_admitting_scope() {
+    let mut pid_engine = Engine::empty();
+    pid_engine.arm_extensive(true);
+    assert!(
+        pid_engine.gap_exe_hints().is_none(),
+        "exact-PID scope must not arm extensive mode"
+    );
+    let pid = std::process::id();
+    let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    cgroup_engine.arm_extensive(true);
+    assert!(
+        cgroup_engine.gap_exe_hints().is_some(),
+        "cgroup scope arms extensive mode"
+    );
+    cgroup_engine.arm_extensive(false);
+    assert!(cgroup_engine.gap_exe_hints().is_none());
 }

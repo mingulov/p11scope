@@ -935,6 +935,18 @@ impl CapturePolicy {
         }
     }
 
+    /// Whether this policy may arm extensive mode (`--track-short-lived`,
+    /// 6.14 Option B): the exe-identity read arms Detailed-object
+    /// captures only, never a counter object. Explicit match, not
+    /// `counter_mode().is_none()`: a future variant must decide here
+    /// at compile time.
+    pub const fn allows_track_short_lived(self) -> bool {
+        match self {
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata | Self::AggregateOnly => true,
+            Self::Counter(_) => false,
+        }
+    }
+
     /// Whether the policy can consume load-instance continuity (Task 3 Stage
     /// A): profile/trace join per-call records to load instances, so their
     /// sessions attach the three mapping hooks; metrics (aggregate-only)
@@ -6109,6 +6121,7 @@ impl Session {
             None,
             None,
             None,
+            false,
             require_multi_capable_host(),
             || crate::uretprobe_hazard::admit(None, false),
         )
@@ -6141,6 +6154,7 @@ impl Session {
             None,
             Some(counter),
             None,
+            false,
             require_multi_capable_host(),
             || crate::uretprobe_hazard::admit(None, false),
         )
@@ -6160,6 +6174,7 @@ impl Session {
         selection: BackendSelection,
         counter: Option<&counter_banks::CounterSpec>,
         admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
+        track_short_lived: bool,
     ) -> Result<Self> {
         Self::start_with_selected(
             plan,
@@ -6173,6 +6188,7 @@ impl Session {
             None,
             counter,
             None,
+            track_short_lived,
             require_multi_capable_host(),
             || match admission {
                 Some(admission) => Ok(admission),
@@ -6194,12 +6210,24 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
         host: MultiHostVerdict,
         admission: impl FnOnce() -> std::result::Result<
             crate::uretprobe_hazard::ReturnProbeAdmission,
             crate::uretprobe_hazard::Action,
         >,
     ) -> Result<Self> {
+        // 6.14 Option B: no factory path starts a counter session
+        // with the exe-identity read armed (Detailed objects only).
+        if track_short_lived && !policy.allows_track_short_lived() {
+            bail!(
+                "--track-short-lived arms Detailed captures only; refusing it for counter mode {}",
+                policy
+                    .counter_mode()
+                    .expect("non-Detailed policy here is a counter policy")
+                    .name()
+            );
+        }
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let _host = host?;
         let admission = admission().map_err(crate::uretprobe_hazard::refusal_error)?;
@@ -6225,6 +6253,7 @@ impl Session {
             selected,
             counter,
             journal,
+            track_short_lived,
             &admission,
         ) {
             Ok(session) => Ok((session, fallback)),
@@ -6256,6 +6285,7 @@ impl Session {
                     selected,
                     counter,
                     journal,
+                    track_short_lived,
                     &admission,
                 )
                 .map(|session| (session, Some(reason)))
@@ -6364,6 +6394,7 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
         admission: &crate::uretprobe_hazard::ReturnProbeAdmission,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
@@ -6381,6 +6412,7 @@ impl Session {
             selected,
             counter,
             journal,
+            track_short_lived,
         )
         .map_err(|error| {
             if counter.is_some() {
@@ -6438,6 +6470,7 @@ impl Session {
             None,
             None,
             None,
+            false,
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -6456,6 +6489,7 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
     ) -> Result<Self> {
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
             scope,
@@ -6467,6 +6501,7 @@ impl Session {
             selected,
             counter,
             journal,
+            track_short_lived,
         )?;
         session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
@@ -6520,6 +6555,7 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
+        track_short_lived: bool,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         match (counter, journal) {
             (None, None) => Self::prepare_inner_unlinked_with_object(
@@ -6532,6 +6568,7 @@ impl Session {
                 selected,
                 None,
                 None,
+                track_short_lived,
             ),
             (Some(spec), None) => {
                 let prepared = spec.prepare(backend)?;
@@ -6545,6 +6582,7 @@ impl Session {
                     selected,
                     Some(prepared),
                     None,
+                    track_short_lived,
                 )
             }
             (None, Some(spec)) => {
@@ -6559,6 +6597,7 @@ impl Session {
                     selected,
                     None,
                     Some(prepared),
+                    track_short_lived,
                 )
             }
             (Some(_), Some(_)) => {
@@ -6581,6 +6620,7 @@ impl Session {
         selected: Option<&crate::process::PidPin>,
         counter: Option<counter_banks::CounterPreparation<'_>>,
         journal: Option<journal::JournalPreparation<'_>>,
+        track_short_lived: bool,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         if counter.is_some() && journal.is_some() {
             bail!("journal preparation refuses alongside counter preparation: select one");
@@ -6697,8 +6737,14 @@ impl Session {
                     .context("validating exact eBPF program inventory")?;
                 }
                 SessionPreparation::PublishScope => {
-                    crate::scope::publish(&mut ebpf, scope, policy, generation_token)
-                        .context("publishing scope and capture policy")?;
+                    crate::scope::publish(
+                        &mut ebpf,
+                        scope,
+                        policy,
+                        generation_token,
+                        track_short_lived,
+                    )
+                    .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));
                 }
                 SessionPreparation::PrepareIdentity => {
@@ -9019,6 +9065,7 @@ impl Session {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -10152,6 +10199,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     Ok(super::multi_host::MultiCapableHost::for_test()),
                     || Err(refusal),
                 )
@@ -10189,6 +10237,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     Err(refusal),
                     || panic!("host refusal must precede the return-probe assessment"),
                 )
@@ -13080,6 +13129,7 @@ mod tests {
             None,
             None,
             Some(&journal::JournalSpec),
+            false,
         )
         .err()
         .expect("unbuilt journal preparation refuses");
@@ -13107,6 +13157,7 @@ mod tests {
             None,
             None,
             Some(prepared),
+            false,
         )
         .err()
         .expect("corrupt journal bytes refuse");
@@ -13136,6 +13187,7 @@ mod tests {
             None,
             None,
             Some(prepared),
+            false,
         )
         .err()
         .expect("pair-less journal bytes refuse");
@@ -13170,6 +13222,7 @@ mod tests {
             None,
             Some(&counter),
             Some(&journal::JournalSpec),
+            false,
         )
         .err()
         .expect("counter/journal combination refuses");
@@ -13200,6 +13253,7 @@ mod tests {
             None,
             None,
             Some(prepared),
+            false,
         )
         .err()
         .expect("counter policy with journal bytes refuses");

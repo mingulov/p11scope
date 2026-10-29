@@ -2332,7 +2332,13 @@ fn capture_with_host(
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
 ) -> Result<()> {
     let kind = a.kind;
-    let policy = capture_policy(kind, a.metrics, a.unsafe_requested, a.counter_mode)?;
+    let policy = capture_policy(
+        kind,
+        a.metrics,
+        a.unsafe_requested,
+        a.counter_mode,
+        a.track_short_lived,
+    )?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
         emit_capture_diagnostic(&warning);
     }
@@ -2386,6 +2392,17 @@ fn capture_with_host(
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
     engine.retain_return_probe_admission(return_admission);
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit; inventory never reaches this flow. Counter
+    // policies never arm (the CLI combination already refused), and
+    // neither do captures that cannot publish hints (614b P1).
+    engine.arm_extensive(extensive_effective(
+        a.track_short_lived,
+        kind,
+        a.metrics,
+        &scope,
+        policy,
+    ));
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
@@ -2459,11 +2476,35 @@ fn no_profile_duration_notice() -> String {
         .to_string()
 }
 
+/// 614b P1 narrow authorization: whether `--track-short-lived`
+/// actually arms the kernel exe-identity read for this capture. The
+/// read is granted only where the resulting STATIC HINT split can
+/// publish: a Detailed (non-counter) profile-kind, non-metrics
+/// capture over a generation-admitting scope (cgroup/system), the
+/// only shape that classifies descendant gaps. Everywhere else the
+/// flag stays accepted but records nothing — no exe identity is
+/// captured for a counter, trace, metrics, exact-PID or owned-`run`
+/// capture, where no hint could ever be published.
+pub(crate) fn extensive_effective(
+    track_short_lived: bool,
+    kind: Kind,
+    metrics: bool,
+    scope: &Scope,
+    policy: CapturePolicy,
+) -> bool {
+    track_short_lived
+        && policy.allows_track_short_lived()
+        && kind == Kind::Profile
+        && !metrics
+        && matches!(scope, Scope::Cgroup { .. } | Scope::System)
+}
+
 pub(crate) fn capture_policy(
     kind: Kind,
     metrics: bool,
     unsafe_requested: bool,
     counter_mode: Option<p11scope_ebpf_common::CounterMode>,
+    track_short_lived: bool,
 ) -> Result<CapturePolicy> {
     if let Some(mode) = counter_mode {
         if kind != Kind::Profile || !metrics {
@@ -2474,6 +2515,16 @@ pub(crate) fn capture_policy(
         }
         if unsafe_requested {
             anyhow::bail!("--counter-mode cannot be combined with --unsafe-unvalidated-metadata");
+        }
+        // 6.14 Option B: extensive mode arms Detailed captures only.
+        // Refused by name before build/flavor checks so no counter
+        // session can ever arm the exe-identity read.
+        if track_short_lived {
+            anyhow::bail!(
+                "--track-short-lived cannot be combined with --counter-mode {}: \
+                 extensive mode arms Detailed captures only",
+                mode.name()
+            );
         }
         // Builds without counter objects (WIDE, SMALL) refuse here by
         // name: the statics are empty there, and preparation never runs
@@ -3303,6 +3354,7 @@ fn run_owned_inner_with_host(
         args.metrics,
         args.unsafe_requested,
         args.counter_mode,
+        args.track_short_lived,
     )?;
     // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
     // observer's namespace; refuse before anything is forked.
@@ -3347,6 +3399,7 @@ fn run_owned_inner_with_host(
     })?;
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
+        track_short_lived: args.track_short_lived,
         kind: args.kind,
         modules: args.modules.clone(),
         manifests: args.manifests.clone(),
@@ -3379,6 +3432,18 @@ fn run_owned_inner_with_host(
     let out = OutputSink::open(args.kind, args.out.as_deref())
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit. Counter policies never arm (the CLI
+    // combination already refused), and neither do captures that
+    // cannot publish hints (614b P1): an owned `run` is an exact-PID
+    // scope, which never classifies descendant gaps.
+    engine.arm_extensive(extensive_effective(
+        args.track_short_lived,
+        args.kind,
+        args.metrics,
+        &scope,
+        policy,
+    ));
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -8229,6 +8294,9 @@ fn evidence_for(
         object_capture,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
+        // 6.14 Option B: `None` unless extensive mode armed; the JSON
+        // key is then omitted, never null.
+        gap_exe_hints: engine.gap_exe_hints().copied(),
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
         // what says a live window happened at all; the design forbids
@@ -12471,6 +12539,7 @@ mod tests {
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
@@ -12520,6 +12589,7 @@ mod tests {
 
     fn capture_args(scope: ScopeArg) -> CaptureArgs {
         CaptureArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
@@ -12774,12 +12844,13 @@ mod tests {
             // Metrics profile/run select the counter policy for every mode.
             if objects {
                 assert_eq!(
-                    capture_policy(Kind::Profile, true, false, Some(mode)).unwrap(),
+                    capture_policy(Kind::Profile, true, false, Some(mode), false).unwrap(),
                     CapturePolicy::Counter(mode),
                     "{mode:?}"
                 );
             } else {
-                let error = capture_policy(Kind::Profile, true, false, Some(mode)).unwrap_err();
+                let error =
+                    capture_policy(Kind::Profile, true, false, Some(mode), false).unwrap_err();
                 let text = format!("{error:#}");
                 assert!(
                     text.contains("counter-mode-unavailable-in-build"),
@@ -12805,7 +12876,7 @@ mod tests {
                 ),
             ] {
                 let error =
-                    capture_policy(kind, metrics, unsafe_requested, Some(mode)).unwrap_err();
+                    capture_policy(kind, metrics, unsafe_requested, Some(mode), false).unwrap_err();
                 let text = format!("{error:#}");
                 assert_eq!(
                     text, expected,
@@ -12816,17 +12887,127 @@ mod tests {
         }
         // Omission keeps every legacy selection.
         assert_eq!(
-            capture_policy(Kind::Profile, false, false, None).unwrap(),
+            capture_policy(Kind::Profile, false, false, None, false).unwrap(),
             CapturePolicy::Allowlisted
         );
         assert_eq!(
-            capture_policy(Kind::Profile, true, false, None).unwrap(),
+            capture_policy(Kind::Profile, true, false, None, false).unwrap(),
             CapturePolicy::AggregateOnly
         );
         assert_eq!(
-            capture_policy(Kind::Trace, false, false, None).unwrap(),
+            capture_policy(Kind::Trace, false, false, None, false).unwrap(),
             CapturePolicy::Allowlisted
         );
+    }
+
+    // 614b P2#2: `--track-short-lived` refuses beside every counter
+    // mode at policy selection, before build/flavor checks, so a
+    // counter session can never arm the exe-identity read. Detailed
+    // selections keep accepting the flag.
+    #[test]
+    fn counter_modes_refuse_track_short_lived_through_capture_policy() {
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            let error = capture_policy(Kind::Profile, true, false, Some(mode), true).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "--track-short-lived cannot be combined with --counter-mode {}: \
+                     extensive mode arms Detailed captures only",
+                    mode.name()
+                ),
+                "{mode:?}"
+            );
+        }
+        // Detailed positives: the flag alone changes no selection.
+        assert_eq!(
+            capture_policy(Kind::Profile, false, false, None, true).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            capture_policy(Kind::Profile, true, false, None, true).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            capture_policy(Kind::Trace, false, false, None, true).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+    }
+
+    // 614b P1 narrow authorization: the exe-identity read arms only
+    // where the STATIC HINT split can publish — Detailed profile-kind,
+    // non-metrics captures over generation-admitting scopes. Trace,
+    // metrics, exact-PID and counter captures accept the flag but must
+    // record no exe identity: capture without a possible consumer is
+    // outside the grant.
+    #[test]
+    fn extensive_arms_only_on_hint_publishing_captures() {
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+        let detailed = CapturePolicy::Allowlisted;
+        // The publishing shape arms, on either admitting scope.
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::System,
+            detailed
+        ));
+        // Default off stays off everywhere.
+        assert!(!extensive_effective(
+            false,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Trace publishes no profile evidence: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Trace,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Metrics renders no hint split: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            true,
+            &cgroup,
+            CapturePolicy::AggregateOnly
+        ));
+        // Exact-PID scope classifies no descendant gaps: never arm.
+        // (An owned `run` is this shape.)
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::Pid(41),
+            detailed
+        ));
+        // P2#2 confinement still holds inside the helper: a counter
+        // policy never arms, whatever the other inputs.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts)
+        ));
     }
 
     #[test]
@@ -17933,7 +18114,7 @@ mod tests {
             unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, false, None).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, false, None, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
     }
@@ -17949,7 +18130,7 @@ mod tests {
             unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, true, None).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, true, None, false).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
         assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");

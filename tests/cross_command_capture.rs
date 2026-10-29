@@ -74,6 +74,7 @@ fn evidence() -> Evidence {
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,

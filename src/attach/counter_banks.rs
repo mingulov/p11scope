@@ -3399,6 +3399,7 @@ pub(crate) fn counter_object_preflight(mode: CounterMode) -> Result<(), String> 
         None,
         Some(prepared),
         None,
+        false,
     )
     .map(|_| ())
     .map_err(|error| counter_load_refusal(&error))
@@ -3529,6 +3530,7 @@ impl Session {
                     None,
                     Some(preparation),
                     None,
+                    false,
                 )
                 .map_err(map_counter_verifier_budget_refusal)?;
                 let banks = session
@@ -3581,6 +3583,7 @@ impl Session {
             None,
             Some(preparation),
             None,
+            false,
         )
         .map_err(map_counter_verifier_budget_refusal)?;
         // The keepalive is already in Session before the first real producer.

@@ -37,6 +37,17 @@ __attribute__((noinline, used)) unsigned p11_exec_dumpability(void) {
     return !((long (*)(void *, unsigned, const void *))113)(&flags, sizeof(flags), task)
         && flags == 1;
 }
+/* 6.14 Option B exe-identity boundary: two out-word pointers and a u32
+ * success result, same checked-helper body shape as the predicate. */
+__attribute__((noinline, used)) unsigned p11_exe_identity(unsigned long *dev, unsigned long *ino) {
+    void *task = ((void *(*)(void))158)();
+    unsigned long id = 0;
+    if (((long (*)(void *, unsigned, const void *))113)(&id, sizeof(id), task))
+        return 0;
+    *dev = id;
+    *ino = id;
+    return 1;
+}
 #ifdef OWNER_GLOBAL
 #define OWNER_LINKAGE
 #else
@@ -73,10 +84,12 @@ SEC("tp_btf/task_newtask") int task_newtask(void *ctx) {
     return result;
 }
 SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) {
+    unsigned long dev = 0, ino = 0;
 #if defined(EXEC_COOKIE) && !defined(EXEC_COOKIE_MISSING)
-    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_link_current_cookie();
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_link_current_cookie()
+        + (int)p11_exe_identity(&dev, &ino);
 #else
-    return p11_owner_cleanup(ctx) + p11_exec_dumpability();
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability() + (int)p11_exe_identity(&dev, &ino);
 #endif
 }
 SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {

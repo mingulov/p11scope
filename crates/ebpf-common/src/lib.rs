@@ -336,6 +336,10 @@ pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 /// Dedicated compact inventory object. Detailed objects deliberately reject it.
 pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
+/// 6.14 Option B: extensive mode arms the exec-time exe-identity word
+/// in EXEC records (`--track-short-lived`, default off). Detailed
+/// objects only; the inventory-only exact config refuses it.
+pub const FLAG_TRACK_SHORT_LIVED: u64 = 1 << 8;
 
 /// Inventory accepts one external scope and its own policy, without detail or pause.
 pub const fn valid_inventory_config(flags: u64) -> bool {
@@ -433,7 +437,8 @@ pub const fn valid_config(flags: u64) -> bool {
         | FLAG_POLICY_ALLOWLISTED
         | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
         | FLAG_POLICY_AGGREGATE
-        | FLAG_PAUSE_ENABLED;
+        | FLAG_PAUSE_ENABLED
+        | FLAG_TRACK_SHORT_LIVED;
     matches!(
         scope,
         FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER
@@ -793,6 +798,15 @@ fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
     zero_discovery_scalar_payload(record) && record.pointers.iter().all(|pointer| *pointer == 0)
 }
 
+/// 6.14 Option B: EXEC payload shape. `pointers[0..2]` carry the raw
+/// exe `(s_dev, i_ino)` data pair when extensive mode is armed and
+/// stay zero otherwise; the pair is data, so any value validates.
+/// The tail always stays zero. `(0, 0)` means absent.
+fn zero_discovery_exec_tail(record: &DiscoveryRecord) -> bool {
+    zero_discovery_scalar_payload(record)
+        && record.pointers[2..].iter().all(|pointer| *pointer == 0)
+}
+
 fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
     record.return_rv == 0
         && record.request_flags == 0
@@ -977,7 +991,7 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
             ) && valid_exec_leader(record.pid_tgid)
                 && record.announced_count == 0
                 && record.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
-                && zero_discovery_payload_except_binding(record)
+                && zero_discovery_exec_tail(record)
         }
         DISCOVERY_KIND_LEADER_EXIT => {
             record.status_flags == 0
@@ -2584,6 +2598,45 @@ mod tests {
     }
 
     #[test]
+    fn exec_exe_identity_abi_pointers_shape() {
+        // 6.14 Option B RED: an EXEC may carry the raw exe (s_dev,
+        // i_ino) pair in pointers[0..2] when extensive mode is armed.
+        // The pair is data: any value validates, the tail stays zero,
+        // and every other EXEC rule is unchanged.
+        let mut present = discovery_record(DISCOVERY_KIND_EXEC);
+        present.pointers[0] = 0x103_00001;
+        present.pointers[1] = 802;
+        assert!(valid_discovery_record(&present));
+        let mut tail = discovery_record(DISCOVERY_KIND_EXEC);
+        tail.pointers[2] = 1;
+        assert!(!valid_discovery_record(&tail));
+        let absent = discovery_record(DISCOVERY_KIND_EXEC);
+        assert!(valid_discovery_record(&absent));
+    }
+
+    #[test]
+    fn track_short_lived_bit_arms_detailed_scopes_only() {
+        // 6.14 Option B RED: the extensive-mode bit is orthogonal to
+        // scope and policy on detailed objects, and refused by the
+        // inventory-only exact config (Detailed-only arming).
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            for policy in [
+                FLAG_POLICY_ALLOWLISTED,
+                FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+                FLAG_POLICY_AGGREGATE,
+            ] {
+                assert!(
+                    valid_config(scope | policy | FLAG_TRACK_SHORT_LIVED),
+                    "scope {scope:#x}"
+                );
+            }
+        }
+        assert!(!valid_inventory_config(
+            FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
+        ));
+    }
+
+    #[test]
     fn discovery_producer_decisions_cover_the_finite_edges() {
         assert_eq!(
             discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 0),
@@ -3032,7 +3085,10 @@ mod tests {
         let mutations: &[fn(&mut DiscoveryRecord)] = &[
             |r| r.table_ptr = 1,
             |r| r.interface_flags = 1,
-            |r| r.pointers[0] = 1,
+            // 6.14 Option B (ratified Row A, owner 2026-10-29 item 5):
+            // pointers[0..2] are the exe (s_dev, i_ino) data pair, not
+            // reserved; the reserved tail starts at pointers[2].
+            |r| r.pointers[2] = 1,
             |r| r.pointers[DISCOVERY_POINTERS - 1] = 1,
             |r| r.interface_index = 1,
             |r| r.name_class = 1,

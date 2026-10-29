@@ -395,6 +395,9 @@ OBJECT_CAPTURE_GLOBAL_HELPERS = frozenset({
     "p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell",
 })
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
+# 6.14 Option B: exec-time exe-file identity. Outside the no-argument
+# p11_exec_ global namespace: this helper needs two out-word pointers.
+REQUIRED_GLOBAL_EXE_HELPERS = frozenset({"p11_exe_identity"})
 REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS = frozenset({"p11_link_current_cookie"})
 # H8-D post-attach birth marker (Detailed only): the exec half publishes
 # READY after closure, the gap half dirties on refused calls. Counter and
@@ -450,12 +453,14 @@ DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
 
 def validate_private_helpers(elf, prefix, required, optional, label,
                              global_helpers=frozenset(), required_map=None, inventory=False,
-                             global_result_bytes=4):
+                             global_result_bytes=4, global_param_kinds=()):
     """Verify exact native helper linkage, metadata, calls and map boundaries.
 
     Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
     boundaries may be GLOBAL. Healthy alone may disappear after inlining. Do
     not retain dummy bodies or admit arbitrary clones/attachment targets.
+    A nonempty global_param_kinds tuple replaces the no-argument global
+    rule with an exact parameter-kind list (BTF kind per parameter).
     """
     owners = [s for s in elf.symbols if s[0].startswith(prefix)]
     production = any(s[0] in EXACT_PROGRAM_SECTIONS or s[0] in REQUIRED_GLOBAL_HELPERS
@@ -518,7 +523,20 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if name in global_helpers:
             proto = btf.types[node[2]]
             scalar = btf.resolve(proto[2])
-            if proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != global_result_bytes:
+            if global_param_kinds:
+                params = proto[5]
+                # Lengths first: resolving runs only when the arity
+                # already matches, so a short proto fails, never
+                # indexes out of range.
+                if (proto[3] != len(global_param_kinds)
+                        or len(params) != 2 * len(global_param_kinds)
+                        or scalar[0] != 1 or scalar[2] != global_result_bytes
+                        or any(btf.resolve(params[2 * i + 1])[0] != kind
+                               for i, kind in enumerate(global_param_kinds))):
+                    raise RuntimeError(
+                        f"{label} helper {name} requires the exact documented FUNC_PROTO"
+                    )
+            elif proto[3] or proto[5] or scalar[0] != 1 or scalar[2] != global_result_bytes:
                 raise RuntimeError(
                     f"{label} helper {name} requires a no-argument scalar FUNC_PROTO"
                 )
@@ -677,6 +695,38 @@ def validate_exec_helpers(elf, inventory=False):
             calls.add(imm)
     if calls != {113, 158}:
         raise RuntimeError("EXEC predicate requires both checked kernel helper boundaries")
+
+
+def validate_exe_helpers(elf, inventory=False):
+    """6.14 Option B exe-file identity: one global with two out-word
+    pointer arguments and a u32 success result. It lives outside the
+    no-argument p11_exec_ global namespace; the body boundary (exactly
+    current-task plus checked-read helpers, no maps or relocations)
+    mirrors the predicate it sits beside."""
+    validate_private_helpers(elf, "p11_exe_", frozenset(), frozenset(), "EXE identity",
+                             REQUIRED_GLOBAL_EXE_HELPERS, inventory=inventory,
+                             global_param_kinds=(2, 2))
+    selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_exe_identity"]
+    if not selected:
+        return  # Generic fixtures have no lifecycle producer.
+    helper = selected[0]
+    btf = Btf(elf.sections[".BTF"][1])
+    function = next(node for node in btf.types[1:] if node[:2] == (12, helper[0]))
+    scalar = btf.resolve(btf.types[function[2]][2])
+    if scalar[5] != (32,):
+        raise RuntimeError("EXE identity helper requires an unsigned u32 return")
+    body = checked_slice(elf.sections[".text"][1], helper[4], helper[5], "EXE identity body")
+    calls = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        if op == 0x18:
+            raise RuntimeError("EXE identity helper cannot carry map/global-data relocations")
+        if op == 0x85:
+            if reg >> 4 or imm not in {113, 158}:
+                raise RuntimeError("EXE identity helper permits only current-task and kernel-read helpers")
+            calls.add(imm)
+    if calls != {113, 158}:
+        raise RuntimeError("EXE identity helper requires both checked kernel helper boundaries")
 
 
 def validate_exec_cookie_helper(elf, inventory=False, callers=False):
@@ -1899,6 +1949,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_object_capture_globals(elf, inventory)
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
+    validate_exe_helpers(elf, inventory)
     validate_exec_cookie_helper(elf, inventory, callers)
     validate_marker_helpers(elf, inventory)
     validate_marker_call_sites(elf)
@@ -1922,7 +1973,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
                      | REQUIRED_GLOBAL_MARKER_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                          | REQUIRED_GLOBAL_EXEC_HELPERS
+                          | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS
                           | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS),
                           inventory=inventory), {
         record[-1] for record in records
@@ -1965,7 +2016,7 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
                     | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
-                    | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+                    | REQUIRED_GLOBAL_EXE_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
                     | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
                     | REQUIRED_GLOBAL_MARKER_HELPERS
                     | OBJECT_CAPTURE_GLOBAL_HELPERS):
@@ -2210,6 +2261,7 @@ def validate_inventory(variant, maps, programs, symbols):
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                         if inventory else REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | SELECTED_GLOBAL_HELPERS)
     required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
+    required_helpers |= REQUIRED_GLOBAL_EXE_HELPERS
     if callers:
         required_helpers |= {"p11_link_current_identity", "p11_link_current_cookie"}
     missing_helpers = required_helpers - symbols
@@ -2268,7 +2320,7 @@ def self_test():
     assert len(UNSAFE_PROGRAMS) == 25
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -2282,7 +2334,7 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -2291,7 +2343,7 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):

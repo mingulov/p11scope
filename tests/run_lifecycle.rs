@@ -27,6 +27,7 @@ fn work_dir(name: &str) -> PathBuf {
 
 fn run_args(command: &[&str]) -> RunArgs {
     RunArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         manifests: Vec::new(),

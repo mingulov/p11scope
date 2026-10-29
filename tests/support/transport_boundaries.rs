@@ -5,6 +5,8 @@ const JOURNAL: &str = "src/semantics_objects/journal.rs";
 const INPUT: &str = "src/discovery/caller_registry/instance_input.rs";
 const CORROBORATION: &str = "    if base.continuity.entry_ip != begin.entry_ip() {\n        return false;\n    }\n    if !stamp_agrees(&base.continuity.entry_stamp, &begin.entry_stamp()) {\n        return false;\n    }";
 const MODEL_PARAMETER: &str = "model: &crate::semantics_objects::ObjectSemantics,";
+const PRODUCER_TEST_MODULE: &str = "#[cfg(test)]\npub(crate) mod tests {";
+const PRODUCER_INITIALIZERS: &str = "        base.continuity.entry_ip = ENTRY_IP;\n        base.continuity.entry_stamp = InstanceStamp {\n            epoch: 7,\n            global: 8,\n            fault: 9,\n            file_slot_plus1: 3,\n            flags: STAMP_VALID,\n        };\n        base.continuity.return_stamp = base.continuity.entry_stamp;";
 
 pub fn uses_private_record_fields(path: &str, source: &str) -> bool {
     let mut scan = source.as_bytes().to_vec();
@@ -23,8 +25,13 @@ pub fn uses_private_record_fields(path: &str, source: &str) -> bool {
             scan[start..start + CORROBORATION.len()].fill(b' ');
         }
     }
+    if path == JOURNAL
+        && let Some(initializers) = producer_fixture_initializers(source)
+    {
+        scan[initializers].fill(b' ');
+    }
     let scan = String::from_utf8(scan)
-        .expect("only ASCII corroboration was masked")
+        .expect("only exact ASCII exceptions were masked")
         .replace("continuity_cuts", "")
         .replace("poll_records_to_position", "");
     [
@@ -42,6 +49,55 @@ pub fn uses_private_record_fields(path: &str, source: &str) -> bool {
                 .next()
                 .is_none_or(|next| !next.is_alphanumeric() && next != '_')
         })
+}
+
+fn producer_fixture_initializers(source: &str) -> Option<Span> {
+    let code = code_only(source);
+    let mut headers = source
+        .match_indices(PRODUCER_TEST_MODULE)
+        .filter(|(start, _)| {
+            code[*start..*start + PRODUCER_TEST_MODULE.len()] == *PRODUCER_TEST_MODULE.as_bytes()
+        });
+    let (module_start, _) = headers.next()?;
+    if headers.next().is_some()
+        || !balanced(&code[..module_start], b'{', b'}')
+        || !balanced(&code[..module_start], b'(', b')')
+        || !balanced(&code[..module_start], b'[', b']')
+    {
+        return None;
+    }
+    let module_open = module_start + PRODUCER_TEST_MODULE.len() - 1;
+    let module_close = closing(&code, module_open, b'{', b'}')?;
+    let (signature, body) = function(
+        source,
+        "producer_agreement_pair",
+        Some("pub(crate) mod tests {"),
+    )?;
+    // The known tuple/array return belongs to this fixture. A block in a
+    // different return type must not be mistaken for the helper's body.
+    if body.start <= module_open
+        || body.end >= module_close
+        || source[signature.end + 1..body.start - 1].trim() != "-> ([u8; 224], [u8; 632])"
+        || source.matches(PRODUCER_INITIALIZERS).count() != 1
+    {
+        return None;
+    }
+    let start = body.start + source[body.clone()].find(PRODUCER_INITIALIZERS)?;
+    let end = start + PRODUCER_INITIALIZERS.len();
+    let preceding = &code[body.start..start];
+    // Only the exact direct initializer statements following the producer
+    // call. Balanced delimiters exclude nested branches/callbacks/macros;
+    // the statement boundary also excludes an unbraced closure body.
+    (balanced(preceding, b'{', b'}')
+        && balanced(preceding, b'(', b')')
+        && balanced(preceding, b'[', b']')
+        && preceding
+            .iter()
+            .rev()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(&b';')
+        && code[start..end] == *PRODUCER_INITIALIZERS.as_bytes())
+    .then_some(start..end)
 }
 
 pub fn model_marker(path: &str, source: &str) -> Option<&'static str> {
@@ -263,6 +319,10 @@ fn function(source: &str, name: &str, owner: Option<&str>) -> Option<(Span, Span
     if matches.next().is_some() {
         return None;
     }
+    // A function-shaped token tree inside a () or [] macro is not an item.
+    if !balanced(&code[..start], b'(', b')') || !balanced(&code[..start], b'[', b']') {
+        return None;
+    }
     let mut outer = Vec::new();
     for (offset, byte) in code[..start].iter().enumerate() {
         match byte {
@@ -294,13 +354,17 @@ fn function(source: &str, name: &str, owner: Option<&str>) -> Option<(Span, Span
         return None;
     }
     let close = closing(&code, open, b'(', b')')?;
-    let body_open = close
-        + 1
-        + code[close + 1..]
-            .iter()
-            .position(|b| matches!(b, b'{' | b';' | b'}'))?;
-    if code[body_open] != b'{' {
-        return None;
+    let mut body_open = close + 1;
+    loop {
+        // Tuple/array return types can contain semicolons. Only a body or
+        // declaration delimiter outside those balanced groups decides here.
+        match *code.get(body_open)? {
+            b'(' => body_open = closing(&code, body_open, b'(', b')')? + 1,
+            b'[' => body_open = closing(&code, body_open, b'[', b']')? + 1,
+            b'{' => break,
+            b';' | b'}' => return None,
+            _ => body_open += 1,
+        }
     }
     let body_close = closing(&code, body_open, b'{', b'}')?;
     Some((open + 1..close, body_open + 1..body_close))
@@ -313,6 +377,8 @@ mod tests {
     const JOURNAL: &str = "src/semantics_objects/journal.rs";
     const INPUT: &str = "src/discovery/caller_registry/instance_input.rs";
     const GUARDS: &str = "    if base.continuity.entry_ip != begin.entry_ip() {\n        return false;\n    }\n    if !stamp_agrees(&base.continuity.entry_stamp, &begin.entry_stamp()) {\n        return false;\n    }";
+    const FIXTURE_INITIALIZERS: &str = "        base.continuity.entry_ip = ENTRY_IP;\n        base.continuity.entry_stamp = InstanceStamp {\n            epoch: 7,\n            global: 8,\n            fault: 9,\n            file_slot_plus1: 3,\n            flags: STAMP_VALID,\n        };\n        base.continuity.return_stamp = base.continuity.entry_stamp;";
+    const TEST_MODULE: &str = "#[cfg(test)]\npub(crate) mod tests {";
 
     fn journal() -> String {
         std::fs::read_to_string(JOURNAL).expect("read real journal")
@@ -320,6 +386,210 @@ mod tests {
 
     fn input() -> String {
         std::fs::read_to_string(INPUT).expect("read real evidence adapter")
+    }
+
+    fn producer_fixture_item() -> String {
+        let source = journal();
+        let start = source.find("    fn producer_agreement_pair(").unwrap();
+        let end = start
+            + source[start..]
+                .find("\n    fn producer_pair_agrees(")
+                .unwrap();
+        source[start..end].to_owned()
+    }
+
+    fn producer_fixture() -> String {
+        format!("{TEST_MODULE}\n{}\n}}", producer_fixture_item())
+    }
+
+    #[test]
+    fn real_journal_failure_is_isolated_to_the_producer_fixture_initializers() {
+        let source = journal();
+        assert_eq!(source.matches(FIXTURE_INITIALIZERS).count(), 1);
+        assert!(!uses_private_record_fields(
+            JOURNAL,
+            &source.replace(FIXTURE_INITIALIZERS, "")
+        ));
+    }
+
+    #[test]
+    fn exact_real_producer_fixture_is_permitted_in_its_test_module() {
+        assert!(!uses_private_record_fields(JOURNAL, &producer_fixture()));
+    }
+
+    #[test]
+    fn producer_fixture_requires_unique_direct_test_ancestry() {
+        let source = producer_fixture();
+        let item = producer_fixture_item();
+        for path in [
+            "src/render.rs",
+            "src/output.rs",
+            "src/semantics_objects/other.rs",
+        ] {
+            assert!(uses_private_record_fields(path, &source), "{path}");
+        }
+        for (case, changed) in [
+            ("missing gate", source.replace("#[cfg(test)]\n", "")),
+            (
+                "production gate",
+                source.replace("#[cfg(test)]", "#[cfg(not(test))]"),
+            ),
+            (
+                "comment gate",
+                source.replace("#[cfg(test)]", "/* #[cfg(test)] */"),
+            ),
+            (
+                "literal gate",
+                source.replace("#[cfg(test)]", "#[doc = \"#[cfg(test)]\"]"),
+            ),
+            (
+                "renamed module",
+                source.replace("mod tests {", "mod production {"),
+            ),
+            (
+                "renamed helper",
+                source.replace("fn producer_agreement_pair(", "fn other_fixture("),
+            ),
+            (
+                "different fixture return",
+                source.replace("-> ([u8; 224], [u8; 632])", "-> ([u8; 225], [u8; 632])"),
+            ),
+            ("production helper", item.clone()),
+            (
+                "decoy test gate beside production owner",
+                format!(
+                    "{TEST_MODULE}\n}}\n{}",
+                    source.replace("#[cfg(test)]", "#[cfg(not(test))]")
+                ),
+            ),
+            ("nested module", format!("mod production {{\n{source}\n}}")),
+            (
+                "nested fake gate",
+                format!("fn production() {{\n{source}\n}}"),
+            ),
+            ("comment source", format!("/* {source} */")),
+            (
+                "raw literal source",
+                format!("const HIDDEN: &str = r####\"{source}\"####;"),
+            ),
+            (
+                "duplicate helper",
+                source.replace(
+                    TEST_MODULE,
+                    &format!("{TEST_MODULE}\nfn producer_agreement_pair() {{}}"),
+                ),
+            ),
+        ] {
+            assert!(uses_private_record_fields(JOURNAL, &changed), "{case}");
+        }
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let module_input = format!("strip_test_gate!{open}\n{source}\n{close};");
+            assert!(
+                uses_private_record_fields(JOURNAL, &module_input),
+                "module macro {open}"
+            );
+            let helper_input = format!("{TEST_MODULE}\nstrip_helper!{open}\n{item}\n{close};\n}}");
+            assert!(
+                uses_private_record_fields(JOURNAL, &helper_input),
+                "helper macro {open}"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_fixture_exception_cannot_authorize_other_or_nested_private_uses() {
+        let source = producer_fixture();
+        for (case, replacement) in [
+            (
+                "nested branch",
+                format!("        if ready {{\n{FIXTURE_INITIALIZERS}\n        }}"),
+            ),
+            (
+                "nested callback",
+                format!("        let callback = || {{\n{FIXTURE_INITIALIZERS}\n        }};"),
+            ),
+            (
+                "unbraced callback",
+                format!("        let callback = ||\n{FIXTURE_INITIALIZERS}"),
+            ),
+            (
+                "nested helper",
+                format!("        fn nested() {{\n{FIXTURE_INITIALIZERS}\n        }}"),
+            ),
+            (
+                "duplicate initializers",
+                format!("{FIXTURE_INITIALIZERS}\n{FIXTURE_INITIALIZERS}"),
+            ),
+            (
+                "other initializer",
+                FIXTURE_INITIALIZERS.replace("= ENTRY_IP;", "= other_ip;"),
+            ),
+            (
+                "render",
+                format!("{FIXTURE_INITIALIZERS}\n        render(base.continuity.entry_ip);"),
+            ),
+            (
+                "private record read",
+                format!("{FIXTURE_INITIALIZERS}\n        let value = record.return_stamp;"),
+            ),
+            (
+                "whole continuity read",
+                format!("{FIXTURE_INITIALIZERS}\n        let value = base.continuity;"),
+            ),
+            (
+                "comment initializers",
+                format!("/*\n{FIXTURE_INITIALIZERS}\n*/"),
+            ),
+            (
+                "literal initializers",
+                format!("        let text = r####\"{FIXTURE_INITIALIZERS}\"####;"),
+            ),
+        ] {
+            let changed = source.replace(FIXTURE_INITIALIZERS, &replacement);
+            assert!(uses_private_record_fields(JOURNAL, &changed), "{case}");
+        }
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let replacement =
+                format!("        initializer!{open}\n{FIXTURE_INITIALIZERS}\n{close};");
+            let changed = source.replace(FIXTURE_INITIALIZERS, &replacement);
+            assert!(
+                uses_private_record_fields(JOURNAL, &changed),
+                "initializer macro {open}"
+            );
+        }
+        for added in [
+            "fn render(record: Record) { render(record.entry_ip); }",
+            "fn other(record: Record) { let raw = record.continuity; }",
+        ] {
+            assert!(uses_private_record_fields(
+                JOURNAL,
+                &format!("{source}\n{added}")
+            ));
+        }
+    }
+
+    #[test]
+    fn function_locator_handles_the_actual_array_return_without_accepting_declarations() {
+        let source = producer_fixture();
+        let (_, body) = function(
+            &source,
+            "producer_agreement_pair",
+            Some("pub(crate) mod tests {"),
+        )
+        .expect("the real array-return helper has a body");
+        assert!(source[body].contains(FIXTURE_INITIALIZERS));
+        assert!(
+            function(
+                "fn declaration() -> ([u8; 224], [u8; 632]);",
+                "declaration",
+                None
+            )
+            .is_none()
+        );
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let source = format!("item!{open}fn direct() -> bool {{ true }}{close}");
+            assert!(function(&source, "direct", None).is_none());
+        }
     }
 
     #[test]

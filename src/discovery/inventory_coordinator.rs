@@ -10171,7 +10171,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn witness_batch() -> WitnessBatch {
+    pub(super) fn witness_batch() -> WitnessBatch {
         WitnessBatch {
             domain: crate::attach::capture::NativeDomainId::mint(),
             phase: crate::attach::capture::CapturePhase::Active,
@@ -22189,6 +22189,10 @@ int main(void) {
 #[cfg(test)]
 #[path = "demotion_retirement_tests.rs"]
 mod demotion_retirement_tests;
+
+#[cfg(test)]
+#[path = "cgroup_native_owner_tests.rs"]
+mod cgroup_native_owner_tests;
 
 #[cfg(test)]
 #[path = "inventory_diagnostics_tests.rs"]

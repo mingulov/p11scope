@@ -485,8 +485,16 @@ fn queued_execs(
     bail!("owned EXEC lifecycle drain did not complete in 64 quanta")
 }
 
-fn exec_witnesses(capture: &mut InventoryCapture) -> Result<Vec<WitnessRow>> {
-    let (rows, batch) = read_sweep(&mut |window| capture.read_witnesses(window))?;
+/// Check each quantum before its rows enter the accumulated positive.
+fn validate_exec_quantum(
+    batch: &WitnessBatch,
+    domain: NativeDomainId,
+    phase: CapturePhase,
+) -> Result<()> {
+    ensure!(batch.domain == domain && batch.phase == phase, "{batch:?}");
+    ensure!(batch.integrity.is_empty(), "{batch:?}");
+    ensure!(batch.read_failures.is_empty(), "{batch:?}");
+    ensure!(batch.health.failures.is_empty(), "{batch:?}");
     ensure!(batch.health_regression.is_none(), "{batch:?}");
     ensure!(batch.health_unproven.is_none(), "{batch:?}");
     ensure!(batch.lifecycle_loss.is_none(), "{batch:?}");
@@ -496,17 +504,183 @@ fn exec_witnesses(capture: &mut InventoryCapture) -> Result<Vec<WitnessRow>> {
         .discovery_counters
         .context("EXEC control requires actual lifecycle loss counters")?;
     ensure!(counters[0] == 0, "lifecycle ring loss: {counters:?}");
+    Ok(())
+}
+
+fn exec_witness_sweep(
+    read: &mut dyn FnMut(ReadWindow) -> WitnessBatch,
+    domain: NativeDomainId,
+    phase: CapturePhase,
+) -> Result<(Vec<WitnessRow>, WitnessBatch)> {
+    let mut rows = Vec::new();
+    for _ in 0..64 {
+        let batch = read(read_window());
+        validate_exec_quantum(&batch, domain, phase)?;
+        rows.extend(batch.rows.iter().cloned());
+        if batch.sweep_completed {
+            return Ok((rows, batch));
+        }
+    }
+    bail!("EXEC control CALLER_USE sweep did not complete in 64 quanta")
+}
+
+fn exec_witnesses(capture: &mut InventoryCapture) -> Result<Vec<WitnessRow>> {
+    let domain = capture.domain();
+    let (rows, _) = exec_witness_sweep(
+        &mut |window| capture.read_witnesses(window),
+        domain,
+        CapturePhase::Active,
+    )?;
     ensure!(capture.failure().is_none(), "{:?}", capture.failure());
     Ok(rows)
 }
 
+fn drain_exec_terminal(
+    read: &mut dyn FnMut(ReadWindow) -> DiscoveryBatch,
+    domain: NativeDomainId,
+) -> Result<()> {
+    for _ in 0..64 {
+        let batch = read(read_window());
+        ensure!(batch.domain == domain, "{batch:?}");
+        ensure!(batch.failure.is_none(), "{batch:?}");
+        if batch.drained() {
+            return Ok(());
+        }
+    }
+    bail!("terminal EXEC lifecycle drain did not complete in 64 quanta")
+}
+
 fn finish_exec_capture(capture: InventoryCapture) -> Result<()> {
-    let retired = stop(capture)?;
+    let mut retired = stop(capture)?;
+    let domain = retired.domain();
+    drain_exec_terminal(&mut |window| retired.service_discovery(window), domain)?;
+    let (rows, terminal) = exec_witness_sweep(
+        &mut |window| retired.read_witnesses(window),
+        domain,
+        CapturePhase::Retired,
+    )?;
+    ensure!(
+        terminal.unsettled,
+        "retired read claimed settlement: {terminal:?}"
+    );
+    ensure!(rows.is_empty(), "unread terminal provider rows: {rows:?}");
     ensure!(retired.failure().is_none(), "{:?}", retired.failure());
     ensure!(
         retired.cleanup().failures.is_empty() && retired.cleanup().retained_links == 0,
         "{:?}",
         retired.cleanup()
+    );
+    Ok(())
+}
+
+/// Actual production batch construction without native state, followed by
+/// explicit scripted health for the pure EXEC validation controls below.
+fn scripted_exec_quantum(
+    book: &mut CaptureBook,
+    phase: CapturePhase,
+    complete: bool,
+) -> WitnessBatch {
+    let mut batch = read_witnesses_from(None, book, phase, read_window());
+    batch.health_unproven = None;
+    batch.health.discovery_counters = Some([0; 5]);
+    batch.sweep_completed = complete;
+    batch.unsettled = phase == CapturePhase::Retired;
+    batch
+}
+
+#[test]
+fn exec_control_sweep_rejects_an_earlier_bad_quantum_despite_healthy_final() -> Result<()> {
+    for phase in [CapturePhase::Active, CapturePhase::Retired] {
+        for failure in [
+            "read",
+            "health",
+            "regression",
+            "unproven",
+            "lifecycle",
+            "decode",
+            "ring",
+        ] {
+            let mut book = CaptureBook::new(budget(N), 64, None, 100);
+            let domain = book.domain;
+            let mut first = scripted_exec_quantum(&mut book, phase, false);
+            match failure {
+                "read" => first.read_failures.push("earlier read failure".into()),
+                "health" => first.health.failures.push("earlier health failure".into()),
+                "regression" => first.health_regression = Some("earlier counter rise".into()),
+                "unproven" => first.health_unproven = Some("earlier unproven health".into()),
+                "lifecycle" => {
+                    first.lifecycle_loss = Some(LifecycleLoss {
+                        at_ns: 100,
+                        reason: "earlier lifecycle loss".into(),
+                    })
+                }
+                "decode" => first.health.malformed_discovery = 1,
+                "ring" => first.health.discovery_counters = Some([1, 0, 0, 0, 0]),
+                _ => unreachable!(),
+            }
+            let final_batch = scripted_exec_quantum(&mut book, phase, true);
+            let mut sequence = std::collections::VecDeque::from([first, final_batch]);
+            let mut reads = 0;
+            let result = exec_witness_sweep(
+                &mut |_| {
+                    reads += 1;
+                    sequence
+                        .pop_front()
+                        .expect("only the actual supplied quanta may be read")
+                },
+                domain,
+                phase,
+            );
+            ensure!(
+                result.is_err(),
+                "earlier {failure} was hidden in phase {phase:?}"
+            );
+            ensure!(
+                reads == 1 && sequence.len() == 1,
+                "healthy final masked {failure}"
+            );
+        }
+        let mut book = CaptureBook::new(budget(N), 64, None, 100);
+        let domain = book.domain;
+        let mut healthy = std::collections::VecDeque::from([
+            scripted_exec_quantum(&mut book, phase, false),
+            scripted_exec_quantum(&mut book, phase, true),
+        ]);
+        let (rows, terminal) =
+            exec_witness_sweep(&mut |_| healthy.pop_front().unwrap(), domain, phase)?;
+        ensure!(healthy.is_empty() && rows.is_empty() && terminal.sweep_completed);
+    }
+    Ok(())
+}
+
+#[test]
+fn exec_control_terminal_drain_checks_failure_and_requires_actual_drained() -> Result<()> {
+    let domain = NativeDomainId::try_mint()?;
+    for failure in ["decode", "domain"] {
+        let mut first = DiscoveryBatch::scripted(domain, Vec::new(), 100);
+        if failure == "decode" {
+            first.failure = Some("terminal decode failure".into());
+        } else {
+            first.domain = NativeDomainId::try_mint()?;
+        }
+        let healthy = DiscoveryBatch::scripted(domain, Vec::new(), 101);
+        let mut sequence = std::collections::VecDeque::from([first, healthy]);
+        let result = drain_exec_terminal(&mut |_| sequence.pop_front().unwrap(), domain);
+        ensure!(
+            result.is_err() && sequence.len() == 1,
+            "terminal {failure} was hidden"
+        );
+    }
+    let mut bounded = DiscoveryBatch::scripted(domain, Vec::new(), 100);
+    bounded.record_bound_reached = true;
+    let mut pending = DiscoveryBatch::scripted(domain, Vec::new(), 101);
+    pending.head_pending = true;
+    let drained = DiscoveryBatch::scripted(domain, Vec::new(), 102);
+    let mut sequence = std::collections::VecDeque::from([bounded, pending, drained]);
+    drain_exec_terminal(&mut |_| sequence.pop_front().unwrap(), domain)?;
+    ensure!(
+        sequence.is_empty(),
+        "terminal drain stopped at a bound or pending head"
     );
     Ok(())
 }

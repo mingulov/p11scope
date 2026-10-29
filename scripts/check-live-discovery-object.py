@@ -1915,24 +1915,425 @@ def reservation_loss_contract(disassembly):
     } == reservation_functions
 
 
+_OUTLINED_ENTRY_ROOTS = ("function_list_entry", "interface_list_entry")
+_OUTLINED_TAKE_EXPORT_ROOTS = ("function_list_return", "interface_list_return")
+_OUTLINED_TAKE_SELECTION_ROOTS = ("interface_return",)
+_OUTLINED_RELEVANT_ROOTS = frozenset(
+    _OUTLINED_ENTRY_ROOTS + _OUTLINED_TAKE_EXPORT_ROOTS + _OUTLINED_TAKE_SELECTION_ROOTS
+)
+_OUTLINED_PROGRAM_ROOTS = frozenset(
+    _OUTLINED_RELEVANT_ROOTS | {"interface_entry", "interface_list_worker", "dl_debug_state"}
+)
+_OUTLINED_TAKE_OUTPUT = 56
+
+
+def _register_write(text):
+    match = re.match(r"([rw]\d+) (=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|s>>=) ", text)
+    if not match:
+        return None
+    return "r" + match.group(1)[1:]
+
+
+def _reaching_defs(insns, graph, pc, reg):
+    """PCs with a kill-free path of their reg write to pc (may-analysis).
+
+    Calls kill r0-r5 (callee-clobbered); r6-r9 survive calls. The use at pc
+    reads before pc executes, so pc itself never kills. Extra paths only add
+    definitions, which fails closed against exact-shape requirements.
+    """
+    writes = {q for q, text in insns if _register_write(text) == reg}
+    killers = set(writes)
+    if int(reg[1:]) < 6:
+        killers |= {q for q, text in insns if re.search(r"\bcall ", text)}
+    killers.discard(pc)
+    return sorted(
+        write
+        for write in writes
+        if write != pc and pc in reachable(graph, [write], killers - {write})
+    )
+
+
+def _prove_outlined_insert(disassembly, calls, wrapper):
+    blocks = function_blocks(disassembly)
+    lines = blocks[wrapper]
+    incoming = [(caller, pc) for caller, _, pc, target in calls if target == wrapper]
+    if sorted(caller for caller, _ in incoming) != sorted(_OUTLINED_ENTRY_ROOTS):
+        return None
+    for caller, pc in incoming:
+        facts = call_argument_facts(blocks[caller])
+        if facts.get(pc, {}).get("r2") != ("stack", -32):
+            return None
+    inserts = discovery_call_sites(disassembly, wrapper, "insert")
+    if (len(inserts) != 1 or discovery_call_sites(disassembly, wrapper, "get")
+            or discovery_call_sites(disassembly, wrapper, "remove")):
+        return None
+    insert_pc = inserts[0][1]
+    facts = call_argument_facts(lines)
+    state = facts.get(insert_pc, {})
+    if state.get("r3") != ("constant", 1) or state.get("r1") != ("stack", -40):
+        return None
+    insns, graph = instruction_graph(lines)
+    texts = dict(insns)
+    entry = insns[0][0]
+    retentions = [pc for pc, text in insns if _register_write(text) == "r6"]
+    if len(retentions) != 1 or texts[retentions[0]] != "r6 = r2":
+        return None
+    if insert_pc in reachable(graph, [entry], set(retentions)):
+        return None
+    moves = _reaching_defs(insns, graph, insert_pc, "r2")
+    if len(moves) != 1 or texts[moves[0]] != "r2 = r6":
+        return None
+    if _reaching_defs(insns, graph, moves[0], "r6") != retentions:
+        return None
+    relocs = [index for index, line in enumerate(lines)
+              if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)]
+    if len(relocs) != 1 or finite_counter_key(lines, relocs[0]) != 1:
+        return None
+    sites = [pc for _, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)]
+    if len(sites) != 1 or not counter_writeback_contract(lines, sites[0]):
+        return None
+    callees = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in callees):
+        return None
+    if any(target == wrapper or target in _OUTLINED_PROGRAM_ROOTS for target in callees):
+        return None
+    return frozenset(caller for caller, _ in incoming)
+
+
+def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
+    blocks = function_blocks(disassembly)
+    lines = blocks[wrapper]
+    incoming = [(caller, pc) for caller, _, pc, target in calls if target == wrapper]
+    wanted = sorted(root for root in expected_roots for _ in range(2))
+    if sorted(caller for caller, _ in incoming) != wanted:
+        return None
+    scopes = {}
+    for caller, pc in incoming:
+        state = call_argument_facts(blocks[caller]).get(pc, {})
+        slot, scope = state.get("r1"), state.get("r3")
+        if (not slot or slot[0] != "stack" or slot[1] < -512
+                or slot[1] + _OUTLINED_TAKE_OUTPUT > 0
+                or scope not in (("constant", 0), ("constant", 1))):
+            return None
+        scopes.setdefault(caller, []).append(scope[1])
+    if any(sorted(values) != [0, 1] for values in scopes.values()):
+        return None
+    gets = discovery_call_sites(disassembly, wrapper, "get")
+    removes = discovery_call_sites(disassembly, wrapper, "remove")
+    if (len(gets) != 1 or len(removes) != 1
+            or discovery_call_sites(disassembly, wrapper, "insert")):
+        return None
+    if not discovery_arguments(disassembly, wrapper, "get", 0):
+        return None
+    get_pc, remove_pc = gets[0][1], removes[0][1]
+    facts = call_argument_facts(lines)
+    key = facts.get(get_pc, {}).get("r1")
+    if not key or key[0] != "stack":
+        return None
+    slot = key[1]
+    if facts.get(remove_pc, {}).get("r1") != ("stack", slot):
+        return None
+    insns, graph = instruction_graph(lines)
+    texts = dict(insns)
+    entry = insns[0][0]
+    if remove_pc in reachable(graph, [entry], {get_pc}):
+        return None
+    flag_defs = _reaching_defs(insns, graph, remove_pc, "r2")
+    if len(flag_defs) == 1:
+        move = re.fullmatch(r"r2 = r([6789])", texts[flag_defs[0]])
+        if not move:
+            return None
+        flag_reg = "r" + move.group(1)
+        const_defs = _reaching_defs(insns, graph, flag_defs[0], flag_reg)
+    elif len(flag_defs) == 2:
+        flag_reg = "r2"
+        const_defs = flag_defs
+    else:
+        return None
+    consts = sorted((texts[d], d) for d in const_defs)
+    if [text for text, _ in consts] != [f"{flag_reg} = 0x0", f"{flag_reg} = 0x1"]:
+        return None
+    zero_pc = next(d for text, d in consts if text == f"{flag_reg} = 0x0")
+    one_pc = next(d for text, d in consts if text == f"{flag_reg} = 0x1")
+    null_tests = []
+    for pc, text in insns:
+        match = re.fullmatch(r"if (r\d+) != 0x0 goto [+-]0x[0-9a-f]+", text)
+        if not match:
+            continue
+        taken = relative_target(pc, text)
+        edges = graph[pc]
+        if len(edges) != 2:
+            return None
+        fall = next(edge for edge in edges if edge != taken)
+        if fall == zero_pc:
+            null_tests.append((pc, match.group(1), taken))
+    if len(null_tests) != 1:
+        return None
+    test_pc, cell_reg, taken = null_tests[0]
+    if (remove_pc in reachable(graph, [entry], {test_pc})
+            or test_pc in reachable(graph, [entry], {one_pc})
+            or remove_pc not in reachable(graph, [taken])
+            or zero_pc in reachable(graph, [taken])):
+        return None
+    moves = _reaching_defs(insns, graph, test_pc, cell_reg)
+    if len(moves) != 1 or texts[moves[0]] != f"{cell_reg} = r0":
+        return None
+    if moves[0] not in reachable(graph, [get_pc]):
+        return None
+    if any(re.search(r"\bcall ", texts[pc])
+           for pc in nodes_on_paths(graph, get_pc, moves[0]) - {get_pc, moves[0]}):
+        return None
+    for pc, text in insns:
+        if text.startswith("if r7 ") or text.startswith("if w7 "):
+            defs = _reaching_defs(insns, graph, pc, "r7")
+            if len(defs) != 1 or texts[defs[0]] != "r7 = r3":
+                return None
+    outputs = [pc for pc, text in insns if _register_write(text) == "r6"]
+    if len(outputs) != 1 or texts[outputs[0]] != "r6 = r1":
+        return None
+
+    def output_offset(pc, base, rel):
+        if base == "r6":
+            return rel
+        total, current, at = rel, base, pc
+        for _ in range(4):
+            defs = _reaching_defs(insns, graph, at, current)
+            if len(defs) != 1:
+                return None
+            step = texts[defs[0]]
+            if step == f"{current} = r6":
+                if _reaching_defs(insns, graph, defs[0], "r6") != outputs:
+                    return None
+                return total
+            move = re.fullmatch(rf"{current} \+= (-?0x[0-9a-f]+)", step)
+            if not move:
+                return None
+            total += int(move.group(1), 16)
+            at = defs[0]
+        return None
+
+    store_pattern = re.compile(
+        r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = (.+)"
+    )
+    disc_stores, payload_stores = [], []
+    for pc, text in insns:
+        match = store_pattern.fullmatch(text)
+        if not match:
+            continue
+        width, base, sign, offset, src = match.groups()
+        size = int(width) // 8
+        rel = int(offset, 16) * (1 if sign == "+" else -1)
+        base = "r" + base
+        if base != "r6":
+            proven = facts.get(pc, {}).get(base)
+            if proven and proven[0] == "stack":
+                if proven[1] + rel < -512 or proven[1] + rel + size > 0:
+                    return None
+                continue
+            rel = output_offset(pc, base, rel)
+            if rel is None:
+                return None
+        if rel < 0 or rel + size > _OUTLINED_TAKE_OUTPUT:
+            return None
+        if rel == 0 and size == 8:
+            disc_stores.append((pc, src))
+        else:
+            if pc in reachable(graph, [entry], {remove_pc}):
+                return None
+            payload_stores.append((pc, src))
+    for pc, src in disc_stores:
+        if not re.fullmatch(r"r\d+", src):
+            return None
+        defs = _reaching_defs(insns, graph, pc, src)
+        if not defs or any(texts[d] not in (f"{src} = 0x0", f"{src} = 0x1")
+                           for d in defs):
+            return None
+    between = nodes_on_paths(graph, get_pc, remove_pc)
+    snapshot = []
+    for pc, text in insns:
+        if pc not in between:
+            continue
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if not proven or proven[0] != "stack":
+            return None
+        addr = proven[1] + rel
+        if slot <= addr < slot + 24:
+            return None
+        snapshot.append((addr, pc, match.group(5)))
+    if len(snapshot) != 3:
+        return None
+    addrs = sorted(addr for addr, _, _ in snapshot)
+    if addrs[1] != addrs[0] + 8 or addrs[2] != addrs[0] + 16:
+        return None
+    for _, pc, src in snapshot:
+        if not re.fullmatch(r"r\d+", src):
+            return None
+        defs = _reaching_defs(insns, graph, pc, src)
+        if len(defs) != 1:
+            return None
+        load = re.fullmatch(rf"{src} = \*\(u64 \*\)\(r(\d+) \+ 0x([0-9a-f]+)\)",
+                            texts[defs[0]])
+        if not load or int(load.group(2), 16) not in (0, 8, 16):
+            return None
+        cell = "r" + load.group(1)
+        moves = _reaching_defs(insns, graph, defs[0], cell)
+        if len(moves) != 1 or texts[moves[0]] != f"{cell} = r0":
+            return None
+        if moves[0] not in reachable(graph, [get_pc]):
+            return None
+        if any(re.search(r"\bcall ", texts[pc])
+               for pc in nodes_on_paths(graph, get_pc, moves[0]) - {get_pc, moves[0]}):
+            return None
+    before = nodes_on_paths(graph, entry, get_pc)
+    key_writes = set()
+    for pc, text in insns:
+        if pc not in before:
+            continue
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if proven and proven[0] == "stack" and proven[1] + rel in (slot, slot + 8, slot + 16):
+            key_writes.add(proven[1] + rel)
+    if key_writes != {slot, slot + 8, slot + 16}:
+        return None
+    proven_addrs = {slot, slot + 8, slot + 16, addrs[0], addrs[0] + 8, addrs[0] + 16}
+
+    def loads_from_proven(src_reg, at):
+        defs = _reaching_defs(insns, graph, at, src_reg)
+        if not defs:
+            return False
+        for load_pc in defs:
+            load = re.fullmatch(
+                rf"{src_reg} = \*\(u64 \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\)",
+                texts[load_pc],
+            )
+            if not load:
+                return False
+            base = facts.get(load_pc, {}).get("r" + load.group(1))
+            if not base or base[0] != "stack":
+                return False
+            delta = int(load.group(3), 16) * (1 if load.group(2) == "+" else -1)
+            if base[1] + delta not in proven_addrs:
+                return False
+        return True
+
+    stack_stores = []
+    for pc, text in insns:
+        match = store_pattern.fullmatch(text)
+        if not match or match.group(1) != "64":
+            continue
+        base = "r" + match.group(2)
+        rel = int(match.group(4), 16) * (1 if match.group(3) == "+" else -1)
+        proven = facts.get(pc, {}).get(base)
+        if proven and proven[0] == "stack":
+            stack_stores.append((pc, proven[1] + rel, match.group(5)))
+    changed = True
+    while changed:
+        changed = False
+        for pc, addr, src in stack_stores:
+            if addr in proven_addrs or not re.fullmatch(r"r\d+", src):
+                continue
+            if loads_from_proven(src, pc):
+                proven_addrs.add(addr)
+                changed = True
+    for pc, src in payload_stores:
+        if not re.fullmatch(r"r\d+", src) or not loads_from_proven(src, pc):
+            return None
+    relocs = [index for index, line in enumerate(lines)
+              if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)]
+    if len(relocs) != 1 or finite_counter_key(lines, relocs[0]) != 1:
+        return None
+    sites = [pc for _, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)]
+    if len(sites) != 1 or not counter_writeback_contract(lines, sites[0]):
+        return None
+    if sites[0] in reachable(graph, [entry], {remove_pc}):
+        return None
+    callees = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in callees):
+        return None
+    if any(target == wrapper or target in _OUTLINED_PROGRAM_ROOTS for target in callees):
+        return None
+    return frozenset(caller for caller, _ in incoming)
+
+
+def _outlined_wrapper_proofs(disassembly):
+    """Prove exact outlined export-state wrapper custody, if present.
+
+    Returns {"insert", "take_export", "take_selection"} each holding either
+    (wrapper, proven callers) or None. Never raises on mismatch.
+    """
+    blocks = function_blocks(disassembly)
+    calls = internal_call_targets(disassembly)
+    empty = {"insert": None, "take_export": None, "take_selection": None}
+    if any(target is None for caller, _, _, target in calls
+           if caller in _OUTLINED_RELEVANT_ROOTS):
+        return empty
+
+    def unique(suffix):
+        found = [name for name in blocks if name.endswith(suffix)]
+        return found[0] if len(found) == 1 else None
+
+    insert = unique("insert_export_state")
+    take_export = unique("take_export_state")
+    take_selection = unique("take_selection_state")
+    proofs = dict(empty)
+    if insert is not None:
+        callers = _prove_outlined_insert(disassembly, calls, insert)
+        if callers is not None:
+            proofs["insert"] = (insert, callers)
+    if take_export is not None:
+        callers = _prove_outlined_take(
+            disassembly, calls, take_export, _OUTLINED_TAKE_EXPORT_ROOTS)
+        if callers is not None:
+            proofs["take_export"] = (take_export, callers)
+    if take_selection is not None:
+        callers = _prove_outlined_take(
+            disassembly, calls, take_selection, _OUTLINED_TAKE_SELECTION_ROOTS)
+        if callers is not None:
+            proofs["take_selection"] = (take_selection, callers)
+    return proofs
+
+
 def producer_object_contract(disassembly):
     blocks = function_blocks(disassembly)
+    proofs = _outlined_wrapper_proofs(disassembly)
+    insert_callers = proofs["insert"][1] if proofs["insert"] else frozenset()
+    take_export_callers = proofs["take_export"][1] if proofs["take_export"] else frozenset()
+    take_selection_callers = (
+        proofs["take_selection"][1] if proofs["take_selection"] else frozenset()
+    )
     entry_names = ("function_list_entry", "interface_list_entry", "interface_entry")
     return_names = ("function_list_return", "interface_list_return", "interface_return")
     for name in entry_names:
         lines = blocks.get(name, [])
-        if (not discovery_arguments(disassembly, name, "insert", 1)
-                or not discovery_call_sites(disassembly, name, "remove")
-                or not map_call_sites(lines, "COUNTERS", helper=1)):
+        direct = (discovery_arguments(disassembly, name, "insert", 1)
+                  and discovery_call_sites(disassembly, name, "remove")
+                  and map_call_sites(lines, "COUNTERS", helper=1))
+        if not direct and name not in insert_callers:
             return False
     for name in return_names:
         lines = blocks.get(name, [])
-        if (not discovery_arguments(disassembly, name, "get", 0)
-                # Scope-refused and admitted returns each read their saved state.
-                or len(discovery_call_sites(disassembly, name, "get")) != 2
-                or len(discovery_call_sites(disassembly, name, "remove")) < 2
-                or not map_call_sites(lines, "COUNTERS", helper=1)):
-            return False
+        direct = (discovery_arguments(disassembly, name, "get", 0)
+                  # Scope-refused and admitted returns each read their saved state.
+                  and len(discovery_call_sites(disassembly, name, "get")) == 2
+                  and len(discovery_call_sites(disassembly, name, "remove")) >= 2
+                  and map_call_sites(lines, "COUNTERS", helper=1))
+        if direct:
+            continue
+        if name in ("function_list_return", "interface_list_return") \
+                and name in take_export_callers:
+            continue
+        if name == "interface_return" and name in take_selection_callers:
+            continue
+        return False
 
     export = "\n".join(blocks.get("interface_list_return", []))
     if "call 0x70" not in export or not re.search(
@@ -1968,7 +2369,20 @@ def object_counter_uses(disassembly):
             if key is None:
                 fail(f"{function}: COUNTERS lookup has no finite u32 stack key")
             uses.append((function, key))
-    return uses
+    attribution = {}
+    for proof in _outlined_wrapper_proofs(disassembly).values():
+        if proof is not None:
+            wrapper, callers = proof
+            attribution[wrapper] = callers
+    if not attribution:
+        return uses
+    rewritten = []
+    for function, key in uses:
+        if function in attribution and key == 1:
+            rewritten.extend((caller, key) for caller in sorted(attribution[function]))
+        else:
+            rewritten.append((function, key))
+    return rewritten
 
 
 def counter_ownership_contract(uses):
@@ -2750,11 +3164,12 @@ def _outlined_disassembly():
                          "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
                         + call(GET_AT)
                         + ["r9 = r0",
-                           "if r9 == 0x0 goto @removing",
+                           "if r9 == 0x0 goto @retest",
                            "r1 = r10", "r1 += -0x48",
                            "r2 = *(u64 *)(r9 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
                            "r2 = *(u64 *)(r9 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
                            "r2 = *(u64 *)(r9 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                           "label:retest",
                            "if r9 != 0x0 goto @removing",
                            "r8 = 0x0",
                            "label:removing",
@@ -2773,11 +3188,12 @@ def _outlined_disassembly():
                             "r1 = r10", "r1 += -0x60", "r2 = 0x0"]
                            + call(GET_AT)
                            + ["r8 = r0",
-                              "if r8 == 0x0 goto @removing",
+                              "if r8 == 0x0 goto @retest",
                               "r1 = r10", "r1 += -0x48",
                               "r2 = *(u64 *)(r8 + 0x0)", "*(u64 *)(r1 + 0x0) = r2",
                               "r2 = *(u64 *)(r8 + 0x8)", "*(u64 *)(r1 + 0x8) = r2",
                               "r2 = *(u64 *)(r8 + 0x10)", "*(u64 *)(r1 + 0x10) = r2",
+                              "label:retest",
                               "r2 = 0x1",
                               "if r8 != 0x0 goto @removing",
                               "r2 = 0x0",

@@ -897,6 +897,121 @@ fn object_journal_combined_transactions_publish_valid_wire_records() {
     assert_eq!(abandons, 3, "ABANDON count");
 }
 
+/// P1 executes real inactive native globals. No production define, BPF load
+/// or live authority is enabled by this host fixture.
+#[test]
+fn object_journal_native_producer_preserves_wire_and_custody() {
+    use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    use std::process::Command;
+    let work = tempfile::tempdir().expect("native producer fixture");
+    for (name, defines) in [
+        ("default", vec![]),
+        ("small", vec!["-DP11SCOPE_SMALL_STATE_MAPS"]),
+        ("wide", vec!["-DP11SCOPE_OWNER_SLOT_BOUND=2112U"]),
+    ] {
+        let executable = work.path().join(name);
+        let output = Command::new("clang-18")
+            .args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-DP11SCOPE_OBJECT_JOURNAL",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/object-journal/journal_owner_tests.c",
+                "-o",
+            ])
+            .arg(&executable)
+            .args(defines)
+            .output()
+            .expect("compile producer fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dump = work.path().join(format!("dump-{name}"));
+        std::fs::create_dir(&dump).unwrap();
+        let output = Command::new(executable)
+            .arg("producer")
+            .env("P11_JOURNAL_PRODUCER_DUMP_DIR", &dump)
+            .output()
+            .expect("run producer fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let descriptors = publish_object_descriptors();
+        let mut counts = [0usize; 3];
+        for entry in std::fs::read_dir(&dump).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            let record = decode_journal_record(&bytes, &descriptors).unwrap_or_else(|| {
+                panic!(
+                    "{name}: {} ({} bytes) does not validate",
+                    path.display(),
+                    bytes.len()
+                )
+            });
+            counts[match record {
+                JournalRecord::Begin(_) => 0,
+                JournalRecord::End(_) => 1,
+                JournalRecord::Abandon(_) => 2,
+            }] += 1;
+        }
+        assert_eq!(counts, [29, 1, 18], "exact producer record selection");
+    }
+    assert_eq!(
+        std::mem::size_of::<p11scope_ebpf_common::SlotSemantics>(),
+        18
+    );
+    assert_eq!(
+        std::mem::offset_of!(p11scope_ebpf_common::SlotSemantics, session_arg),
+        6
+    );
+    assert_eq!(
+        std::mem::size_of::<p11scope_ebpf_common::InstanceEntry>(),
+        24
+    );
+    assert_eq!(
+        std::mem::offset_of!(p11scope_ebpf_common::InstanceEntry, entry_stamp),
+        8
+    );
+    use p11scope_ebpf_common::CallStart;
+    assert_eq!(std::mem::size_of::<CallStart>(), 288);
+    assert_eq!(
+        [
+            std::mem::offset_of!(CallStart, ts_ns),
+            std::mem::offset_of!(CallStart, session),
+            std::mem::offset_of!(CallStart, slot_id),
+            std::mem::offset_of!(CallStart, mechanism),
+            std::mem::offset_of!(CallStart, flags),
+            std::mem::offset_of!(CallStart, user_type),
+            std::mem::offset_of!(CallStart, capture),
+            std::mem::offset_of!(CallStart, object_required),
+            std::mem::offset_of!(CallStart, image),
+        ],
+        [0, 8, 16, 24, 40, 56, 256, 264, 272],
+        "actual retained START words copied by the native producer"
+    );
+    let source = include_str!("../crates/ebpf/native/object_journal.c");
+    for forbidden in [
+        "probe_read",
+        "core_read",
+        "preserve_access_index",
+        "get_current_task",
+        "get_current_pid_tgid",
+        "ktime_get_ns",
+    ] {
+        assert!(!source.contains(forbidden), "new target read: {forbidden}");
+    }
+}
+
 /// N4: the journal unit's BPF-subprogram call shape is covered, not
 /// just its host behavior. The real pipeline compiles native units
 /// with `-emit-llvm` (no backend), which cannot see the BPF
@@ -950,11 +1065,10 @@ fn object_journal_bpf_call_shape() {
 }
 
 /// N8/C4/N9: the reserve/fault/cleanup/submit matrix is pinned by
-/// ORDERING, not names. Nothing at or below the combined level
-/// discards (the only discard call in this file is the leaf's own ring
-/// delegation; the root — outside this file — raises the checked fault
-/// before every discard, proven at runtime by the fixture's
-/// checked-generation hooks). Each combined transaction instead reports
+/// ORDERING, not names. Combined transactions and their helpers never
+/// discard. The historical root handles uncommitted reservations; the new
+/// outer P1 BEGIN handles its own reservation after raising gap/loss,
+/// checked by the fixture's discard callback. Each combined transaction reports
 /// its fault cell BEFORE handing its uncommitted reservation back;
 /// terminals submit only after their required cleanup commits; and
 /// each operation accepts only its own publication kind.
@@ -990,9 +1104,8 @@ fn object_journal_transaction_ordering_matrix() {
             .or_default()
             .push((index + 1, line.trim_start()));
     }
-    // N8: no discard call site anywhere below the root. The leaf's own
-    // ring delegation is the single exception; every other function —
-    // combined or helper — must hold zero.
+    // N8: only the ring delegation and the new outer P1 BEGIN may discard.
+    // Combined transactions and their helpers still return reservations.
     for (name, body) in &functions {
         for (number, text) in body {
             if !(text.starts_with("p11_journal_discard(")
@@ -1000,9 +1113,9 @@ fn object_journal_transaction_ordering_matrix() {
             {
                 continue;
             }
-            assert_eq!(
-                name, "p11_journal_discard",
-                "discard site in {name} (line {number}): nothing below the root discards",
+            assert!(
+                name == "p11_journal_discard" || name == "p11_journal_begin",
+                "discard site in {name} (line {number}): combined transactions never discard",
             );
         }
     }

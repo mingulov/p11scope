@@ -24,6 +24,17 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
 #ifndef P11SCOPE_INVENTORY_ONLY
 unsigned char START, OBJECT_START, OBJECT_DESCRIPTORS, OBJECT_ZERO;
 unsigned char JOURNAL_START_MAP, JOURNAL_RING;
+unsigned char INSTANCE_START, DESCRIPTORS, EVENTS, EVIDENCE;
+static u64 producer_evidence[6];
+static unsigned producer_gaps, producer_side_lookups;
+static int producer_mode, producer_insert_fail, producer_phase_fail;
+static int producer_object_delete_fail, producer_start_delete_fail;
+static struct owner_start_key producer_terminal_key;
+u32 p11_instance_scope_gap(void)
+{
+    producer_gaps++;
+    return 1;
+}
 #endif
 unsigned char DISCOVERY_STATE;
 
@@ -125,11 +136,11 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
 static size_t key_size(void *map)
 {
 #ifndef P11SCOPE_INVENTORY_ONLY
-    if (map == &JOURNAL_START_MAP)
+    if (map == &JOURNAL_START_MAP || map == &JOURNAL_START || map == &INSTANCE_START)
         return 16;
     if (map == &START || map == &OBJECT_START)
         return 16;
-    if (map == &OBJECT_DESCRIPTORS || map == &OBJECT_ZERO)
+    if (map == &OBJECT_DESCRIPTORS || map == &OBJECT_ZERO || map == &DESCRIPTORS || map == &EVIDENCE)
         return 4;
 #else
     (void)map;
@@ -154,6 +165,12 @@ static void *lookup(void *map, const void *key)
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &JOURNAL_CTL)
         return &journal_ctl;
+    if (map == &EVIDENCE) {
+        u32 index = *(const u32 *)key;
+        return index < 6 ? &producer_evidence[index] : NULL;
+    }
+    if (producer_mode && map == &JOURNAL_START)
+        producer_side_lookups++;
 #endif
     r = row(map, key);
     return r ? r->value : NULL;
@@ -164,13 +181,18 @@ static long update(void *map, const void *key, const void *data, u64 flags)
     size_t width = 24;
     struct row *r = row(map, key);
     unsigned i;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    if (map == &JOURNAL_START && ((flags == 1 && producer_insert_fail) ||
+                                 (flags == 2 && producer_phase_fail)))
+        return -12;
+#endif
     if (r && flags == 1)
         return -17;
     if (!r && flags == 2)
         return -2;
     if (!r) {
 #ifndef P11SCOPE_INVENTORY_ONLY
-        if (map == &JOURNAL_START_MAP) {
+        if (map == &JOURNAL_START_MAP || map == &JOURNAL_START) {
             /* The side map honors its own limit, like the kernel map. */
             unsigned live = 0;
             for (i = 0; i < 256; i++)
@@ -194,8 +216,10 @@ static long update(void *map, const void *key, const void *data, u64 flags)
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &START)
         width = 288;
-    else if (map == &JOURNAL_START_MAP)
+    else if (map == &JOURNAL_START_MAP || map == &JOURNAL_START || map == &INSTANCE_START)
         width = 24;
+    else if (map == &DESCRIPTORS)
+        width = 18;
     else if (map == &OBJECT_START)
         width = 432;
     else if (map == &OBJECT_DESCRIPTORS)
@@ -211,7 +235,10 @@ static long pair_delete(void *map, const void *key)
 {
     struct row *r = row(map, key);
 #ifndef P11SCOPE_INVENTORY_ONLY
-    if (map == &JOURNAL_START_MAP && fail_journal_delete)
+    if ((map == &JOURNAL_START_MAP || map == &JOURNAL_START) && fail_journal_delete)
+        return -1;
+    if (producer_mode && ((map == &OBJECT_START && producer_object_delete_fail) ||
+                           (map == &START && producer_start_delete_fail)))
         return -1;
 #endif
     if (!r)
@@ -276,7 +303,7 @@ static void *ring_reserve(void *ring, u64 bytes, u64 flags)
 {
     void *slot;
     (void)flags;
-    assert(ring == &JOURNAL_RING);
+    assert(ring == &JOURNAL_RING || ring == &EVENTS);
     if (fail_reserve || !bytes || ring_arena_used + bytes > sizeof(ring_arena))
         return NULL;
     slot = ring_arena + ring_arena_used;
@@ -296,6 +323,11 @@ static void ring_submit(void *record, u64 flags)
     assert(ring_log_len < 64);
     ring_log[ring_log_len++] = record;
     ring_submits++;
+    if (producer_mode && (bytes[4] == JOURNAL_KIND_END || bytes[4] == JOURNAL_KIND_ABANDON)) {
+        EXPECT(lookup(&JOURNAL_START, &producer_terminal_key) == NULL, "producer journal retired before terminal");
+        EXPECT(lookup(&OBJECT_START, &producer_terminal_key) == NULL, "producer object retired before terminal");
+        EXPECT(lookup(&START, &producer_terminal_key) == NULL, "producer START retired before terminal");
+    }
     if (end_order_key && bytes[4] == JOURNAL_KIND_END) {
         /* N9: the END submits only after its custody retired — START
          * and OBJECT_START gone, journal row RETURNING. */
@@ -334,6 +366,9 @@ static void ring_discard(void *record, u64 flags)
     assert(ring_log_len < 64);
     ring_log[ring_log_len++] = record;
     ring_discards++;
+    if (producer_mode)
+        EXPECT(producer_gaps && (producer_evidence[0] || producer_evidence[5]),
+               "producer reports gap/loss before discard");
     if (raise_armed) {
         /* The root's discard: a checked raise covered THIS reservation
          * after its reserve — generation order, not a local shadow. */
@@ -421,6 +456,10 @@ static void reset(void)
     journal_ring_reserve = ring_reserve;
     journal_ring_submit = ring_submit;
     journal_ring_discard = ring_discard;
+    memset(producer_evidence, 0, sizeof(producer_evidence));
+    producer_gaps = producer_side_lookups = 0;
+    producer_mode = producer_insert_fail = producer_phase_fail = 0;
+    producer_object_delete_fail = producer_start_delete_fail = 0;
 #endif
 }
 
@@ -2344,6 +2383,367 @@ static void combined_journal_delete_failure(void)
 
 #endif /* P11SCOPE_INVENTORY_ONLY */
 
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* P1 tests drive the actual proposed producer API, separately from the
+ * historical combined-transaction fixture above. No synthetic transaction
+ * graph supplies the producer's retained fields. */
+static void producer_return_words_absent(void)
+{
+    const struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 5 };
+    struct journal_return_words words;
+    reset();
+    memset(&words, 0xa5, sizeof(words));
+    p11_journal_returning(&key, &words);
+    EXPECT(words.thread == 0 && words.sequence == 0 && words.flags == 4 && words.pad == 0,
+           "an absent journal row fills every return word as UNJOURNALED");
+    {
+        struct journal_settle_words settle;
+        memset(&settle, 0xa5, sizeof(settle));
+        p11_journal_settle_prepare(&key, 0, &settle);
+        EXPECT(!memcmp(&settle, (unsigned char[72]){0}, sizeof(settle)),
+               "absent prepare fills the entire bounded workspace");
+        EXPECT(!producer_side_lookups, "an unminted owner never reads the side map");
+    }
+}
+
+static struct journal_entry_context producer_setup(u32 descriptor, u32 class_bits, int object,
+                                                    unsigned char session_arg)
+{
+    struct journal_entry_context entry = {descriptor, class_bits, JOURNAL_LAYOUT_LP64, 0};
+    struct journal_descriptor_row semantics = {};
+    struct journal_entry_witness witness;
+    struct journal_begin_facts facts;
+    struct object_descriptor_row object_desc = {};
+    static unsigned char zero[432];
+    u32 zero_key = 0;
+    u64 word;
+    reset();
+    producer_mode = 1;
+    producer_terminal_key = (struct owner_start_key){ .pid_tgid = pid_tgid(), .slot = 5 };
+    make_begin_facts(&producer_terminal_key, &facts);
+    facts.entry_ns = 1000;
+    facts.entry_mechanism = ~0ULL; /* Real START's MECH_NONE sentinel. */
+    memset(start_value, 0, sizeof(start_value));
+#define P1_WORD(offset, value) do { word = (value); memcpy(start_value + (offset), &word, 8); } while (0)
+    P1_WORD(0, facts.entry_ns);
+    P1_WORD(8, session_arg == 255 ? ~0ULL : facts.session_word);
+    P1_WORD(16, facts.slot_id);
+    P1_WORD(24, facts.entry_mechanism);
+    P1_WORD(40, facts.call_flags);
+    memcpy(start_value + 56, &facts.user_type, 4);
+    P1_WORD(264, object ? descriptor + 1 : 0);
+    P1_WORD(272, facts.image_cookie);
+    P1_WORD(280, facts.image_exec);
+#undef P1_WORD
+    semantics.session_arg = session_arg;
+    EXPECT(update(&DESCRIPTORS, &descriptor, &semantics, 0) == 0, "frozen descriptor fixture");
+    witness.entry_ip = facts.entry_ip;
+    memcpy(witness.entry_stamp, facts.entry_stamp, 16);
+    EXPECT(update(&INSTANCE_START, &producer_terminal_key, &witness, 0) == 0, "retained instance fixture");
+    if (object) {
+        object_desc.function = descriptor - 1;
+        object_desc.action = 1;
+        object_desc.guard = 1;
+        EXPECT(update(&OBJECT_DESCRIPTORS, &descriptor, &object_desc, 0) == 0, "object descriptor fixture");
+        EXPECT(update(&OBJECT_ZERO, &zero_key, zero, 0) == 0, "zero fixture");
+    }
+    EXPECT(p11_owner_start_insert(&producer_terminal_key, start_value) == 0, "actual START insertion");
+    if (object) {
+        struct object_start *side = lookup(&OBJECT_START, &producer_terminal_key);
+        EXPECT(side != NULL, "actual subordinate allocation");
+        side->layout = JOURNAL_LAYOUT_LP64;
+        side->phase = OBJECT_PHASE_READY;
+#ifdef P11_JOURNAL_FIXTURE_UNINSPECTED
+        if (descriptor == 21)
+            side->requested[0].flags = 0x10;
+#endif
+    }
+    dump_dir = getenv("P11_JOURNAL_PRODUCER_DUMP_DIR");
+    dump_armed = dump_dir != NULL;
+    return entry;
+}
+
+static void producer_begin_return_settle(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct journal_return_words words;
+    struct journal_start_value *side;
+    struct journal_header_spec header;
+    unsigned char payload[JOURNAL_END_PAYLOAD_BYTES];
+    void *record;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(ring_submits == 1 && ring_discards == 0 && producer_gaps == 0, "one native BEGIN");
+    side = lookup(&JOURNAL_START, &producer_terminal_key);
+    EXPECT(side && side->thread == 1 && side->sequence == 1 && side->phase == JOURNAL_PHASE_BEGUN,
+           "native BEGIN owns a BEGUN row");
+    memset(&words, 0xa5, sizeof(words));
+    p11_journal_returning(&producer_terminal_key, &words);
+    EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0 && words.pad == 0,
+           "return fills all words from the original BEGIN");
+    header = (struct journal_header_spec){632, JOURNAL_KIND_END, words.flags, words.thread, words.sequence};
+    build_end_payload(payload);
+    { u64 value = 2000; memcpy(payload, &value, 8); value = 1000; memcpy(payload + 8, &value, 8); }
+    memcpy(payload + 16, &producer_terminal_key.pid_tgid, 8);
+    memcpy(payload + 104, &producer_terminal_key.slot, 4);
+    { u64 value = ~0ULL; memcpy(payload + 48, &value, 8); }
+    record = p11_journal_reserve(&EVENTS, 632);
+    EXPECT(record && !p11_journal_header_init(record, &header) && !txn_fill_end(record, payload, 632, 0),
+           "return root frames the actual words");
+    EXPECT(p11_owner_start_remove(&producer_terminal_key, 1) == 0, "physical return settles");
+    p11_journal_submit(record);
+    EXPECT(ring_submits == 2 && !producer_gaps, "one BEGIN and one END, no ABANDON");
+}
+
+static void producer_classes_and_projection(void)
+{
+    struct journal_entry_context entry;
+    struct journal_return_words words;
+    const unsigned char *bytes;
+    entry = producer_setup(1, JOURNAL_CLASS_COUNT_ONLY, 0, 255);
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(!ring_submits && !producer_gaps && !owners[0].journal_thread && !producer_side_lookups,
+           "count-only remains completely unjournaled");
+    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && !producer_side_lookups,
+           "unminted owner does no journal side-map work");
+    entry = producer_setup(2, JOURNAL_CLASS_NO_END, 0, 255);
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(ring_submits == 1 && ((unsigned char *)ring_log[0])[5] == 1,
+           "NO_END BEGIN publishes the commitment");
+    EXPECT(!lookup(&JOURNAL_START, &producer_terminal_key), "NO_END holds no side row");
+    p11_journal_returning(&producer_terminal_key, &words);
+    EXPECT(words.flags == 4 && !words.thread && !words.sequence && !words.pad, "NO_END returns unjournaled");
+    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && !producer_gaps, "NO_END ordinary result settles");
+    for (unsigned test = 0; test < 5; test++) {
+        u64 session;
+        u32 capture;
+        unsigned char *start;
+        entry = producer_setup(test == 0 ? 13 : 17, JOURNAL_CLASS_TRACKED, 0, test == 0 ? 255 : 0);
+        start = lookup(&START, &producer_terminal_key);
+        session = test == 0 ? ~0ULL : test == 1 ? 0 : test == 2 ? ~0ULL : 42;
+        capture = test >= 3 ? 16 : 0;
+        if (test == 4) session = ~0ULL;
+        memcpy(start + 8, &session, 8);
+        memcpy(start + 256, &capture, 4);
+        p11_journal_begin(&producer_terminal_key, &entry);
+        if (test == 4) {
+            EXPECT(!ring_submits && producer_gaps == 1 && producer_evidence[5] == 1,
+                   "ambiguous unreadable sentinel preserves ordinary data and refuses BEGIN");
+        } else {
+            EXPECT(ring_submits == 1 && !producer_gaps, "real neutral/lifecycle BEGIN");
+            bytes = ring_log[0];
+            EXPECT(bytes[125] == (test == 0 ? 0 : test == 1 ? 3 : 1), "session projection is conservative");
+            EXPECT(!memcmp(bytes + 88, (unsigned char[16]){0}, 16), "no object row means absent inputs");
+            EXPECT(!memcmp(bytes + 128, (unsigned char[72]){0}, 72), "no object row means absent lists");
+        }
+        EXPECT(!p11_owner_start_remove_reason(&producer_terminal_key, 1, 6), "projected START physical cleanup");
+    }
+}
+
+static void producer_failure_matrix(void)
+{
+    for (unsigned test = 0; test < 14; test++) {
+        struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+        struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
+        struct journal_entry_witness *witness = lookup(&INSTANCE_START, &producer_terminal_key);
+        unsigned char *start = lookup(&START, &producer_terminal_key);
+        if (test == 0) entry.descriptor = 0;
+        if (test == 1) entry.descriptor = 105;
+        if (test == 2) entry.class_bits = 3;
+        if (test == 3) entry.reserved = 1;
+        if (test == 4) entry.layout = 2;
+        if (test == 5) pair_delete(&INSTANCE_START, &producer_terminal_key);
+        if (test == 6) witness->entry_stamp[15] = 0;
+        if (test == 7) ((struct journal_descriptor_row *)lookup(&DESCRIPTORS, &entry.descriptor))->session_arg = 6;
+        if (test == 8) object->descriptor_index++;
+        if (test == 9) object->layout = 2;
+        if (test == 10) object->entry_ns++;
+        if (test == 11) object->task_cookie++;
+        if (test == 12) { object->inputs[0] = 99; object->input_statuses[0] = 0; }
+        if (test == 13) { u64 value = 7; memcpy(start + 264, &value, 8); }
+        p11_journal_begin(&producer_terminal_key, &entry);
+        EXPECT(!ring_submits && producer_gaps == 1 && producer_evidence[5] == 1,
+               "invalid retained context fails once: %u", test);
+        EXPECT(lookup(&START, &producer_terminal_key) != NULL, "journal refusal preserves ordinary START");
+    }
+    for (unsigned test = 0; test < 4; test++) {
+        struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+        if (test == 0) journal_ctl.next_thread = JOURNAL_THREAD_LIMIT;
+        if (test == 1) producer_insert_fail = 1;
+        if (test == 2) fail_reserve = 1;
+        if (test == 3) producer_phase_fail = 1;
+        p11_journal_begin(&producer_terminal_key, &entry);
+        EXPECT(producer_gaps == 1 && producer_evidence[test == 2 ? 0 : 5] == 1,
+               "allocation/publication failure counted once: %u", test);
+        EXPECT(lookup(&START, &producer_terminal_key) != NULL, "failed BEGIN retains ordinary result");
+        if (test == 0) EXPECT(journal_ctl.admission_failures == 1, "allocator admission evidence survives");
+        if (test == 3) {
+            const struct journal_start_value *side = lookup(&JOURNAL_START, &producer_terminal_key);
+            EXPECT(ring_submits == 1 && !ring_discards && side && side->phase == JOURNAL_PHASE_PREPARING,
+                   "BEGIN submits before phase commit; failed commit retains PREPARING");
+            producer_phase_fail = 0;
+            EXPECT(!p11_owner_start_remove_reason(&producer_terminal_key, 1, 6), "failed commit retires by named cleanup");
+            EXPECT(ring_submits == 2 && !lookup(&JOURNAL_START, &producer_terminal_key) && !ctl.outstanding,
+                   "published BEGIN gets one ABANDON after cleanup, not a discard");
+        } else {
+            EXPECT(!ring_submits && !lookup(&JOURNAL_START, &producer_terminal_key),
+                   "pre-publication failure leaves no journal row");
+        }
+    }
+}
+
+static void producer_terminal_matrix(void)
+{
+    for (u32 reason = 0; reason <= 9; reason++) {
+        struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+        u32 actual_reason;
+        p11_journal_begin(&producer_terminal_key, &entry);
+        EXPECT(!p11_owner_start_remove_reason(&producer_terminal_key, 1, reason), "named removal %u", reason);
+        EXPECT(ring_submits == 2, "one native BEGIN/ABANDON pair: %u", reason);
+        memcpy(&actual_reason, (unsigned char *)ring_log[1] + 52, 4);
+        EXPECT(actual_reason == (reason ? reason : 9), "normal unsettled removal is reason9");
+        EXPECT(producer_gaps == (reason ? 0U : 1U), "only unsettled normal return adds its own loss");
+    }
+    for (unsigned test = 0; test < 4; test++) {
+        struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+        p11_journal_begin(&producer_terminal_key, &entry);
+        if (test == 0) fail_journal_delete = 1;
+        if (test == 1) producer_object_delete_fail = 1;
+        if (test == 2) producer_start_delete_fail = 1;
+        if (test == 3) fail_reserve = 1;
+        {
+            long result = p11_owner_start_remove_reason(&producer_terminal_key, 1, 6);
+            EXPECT(test == 3 ? result == 0 : result != 0, "original physical failure preserved: %u", test);
+        }
+        EXPECT(ring_submits == 1 && producer_gaps == 1 && producer_evidence[test == 3 ? 0 : 5] == 1,
+               "failed terminal never publishes or hides loss: %u", test);
+        if (test == 0) {
+            EXPECT(lookup(&START, &producer_terminal_key) && lookup(&OBJECT_START, &producer_terminal_key)
+                   && lookup(&JOURNAL_START, &producer_terminal_key) && ctl.outstanding == 1,
+                   "failed journal deletion keeps every retry authority");
+            fail_journal_delete = 0;
+            EXPECT(!p11_owner_start_remove_reason(&producer_terminal_key, 1, 6), "healed terminal retries");
+            EXPECT(ring_submits == 2 && !ctl.outstanding, "retry publishes once after all cleanup");
+            EXPECT(p11_owner_start_remove(&producer_terminal_key, 0) == -2 && ring_submits == 2,
+                   "a repeated optional removal never doubles the terminal");
+        } else {
+            EXPECT(!lookup(&JOURNAL_START, &producer_terminal_key), "no journal orphan after physical/publication failure");
+            if (test == 3) EXPECT(!lookup(&START, &producer_terminal_key) && !ctl.outstanding,
+                                  "late reserve failure cannot suppress physical cleanup");
+        }
+    }
+}
+
+static void producer_return_refusals(void)
+{
+    for (unsigned test = 0; test < 6; test++) {
+        struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+        struct journal_start_value *side;
+        struct journal_return_words words;
+        p11_journal_begin(&producer_terminal_key, &entry);
+        side = lookup(&JOURNAL_START, &producer_terminal_key);
+        if (test == 0) side->phase = JOURNAL_PHASE_PREPARING;
+        if (test == 1) side->phase = JOURNAL_PHASE_RETURNING;
+        if (test == 2) side->phase = 99;
+        if (test == 3) side->thread++;
+        if (test == 4) side->sequence = 0;
+        if (test == 5) producer_phase_fail = 1;
+        memset(&words, 0xa5, sizeof(words));
+        p11_journal_returning(&producer_terminal_key, &words);
+        EXPECT(words.thread == 0 && words.sequence == 0 && words.flags == 4 && words.pad == 0,
+               "return contradiction fills unjournaled words: %u", test);
+        EXPECT(producer_gaps == 1 && producer_evidence[5] == 1 && lookup(&START, &producer_terminal_key),
+               "return contradiction refuses only journal authority: %u", test);
+    }
+}
+
+static void producer_prepare_finish_and_collision(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct journal_settle_words words;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    p11_journal_settle_prepare(&producer_terminal_key, 6, &words);
+    EXPECT(words.state == JOURNAL_SETTLE_ABANDON && words.pad == 0, "bounded terminal snapshot");
+    EXPECT(reserve_len == 1 && ring_submits == 1, "prepare owns no ring reservation");
+    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1), "physical cleanup commits before finish");
+    p11_journal_settle_finish(&words, 1);
+    EXPECT(ring_submits == 2 && words.state == JOURNAL_SETTLE_EMPTY, "finish consumes terminal once");
+    p11_journal_settle_finish(&words, 1);
+    EXPECT(ring_submits == 2 && !producer_gaps, "repeat finish never republishes");
+    entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(p11_owner_start_insert(&producer_terminal_key, start_value) != 0, "real entry collision refuses new call");
+    EXPECT(ring_submits == 2 && !lookup(&START, &producer_terminal_key) && !ctl.outstanding,
+           "collision settles only the original invocation");
+    { u32 reason; memcpy(&reason, (unsigned char *)ring_log[1] + 52, 4);
+      EXPECT(reason == 1, "real collision preserves its named reason"); }
+}
+
+/* Exact pre-BEGIN native row snapshots for the private P0a unit module.
+ * END construction there uses shared production Rust writers, not BEGIN
+ * bytes copied back into an equality-shaped payload. */
+static void producer_snapshot(const char *name, const char *kind, const void *bytes, size_t size)
+{
+    char path[1024];
+    FILE *file;
+    const char *directory = getenv("P11_JOURNAL_PRODUCER_SNAPSHOT_DIR");
+    EXPECT(directory != NULL, "snapshot directory selected explicitly");
+    if (!directory)
+        return;
+    snprintf(path, sizeof(path), "%s/%s.%s", directory, name, kind);
+    file = fopen(path, "wb");
+    EXPECT(file != NULL, "open exact native snapshot");
+    if (!file)
+        return;
+    EXPECT(fwrite(bytes, 1, size, file) == size, "write exact native snapshot");
+    EXPECT(fclose(file) == 0, "close exact native snapshot");
+}
+
+static void producer_agreement_snapshots(void)
+{
+    static const char *names[] = {"object", "neutral", "open-session", "mechanism", "zero-session", "sentinel"};
+    for (unsigned test = 0; test < 6; test++) {
+        u32 descriptor = test == 0 ? 21 : test == 2 ? 13 : test == 3 ? 30 : 17;
+        struct journal_entry_context entry = producer_setup(descriptor, JOURNAL_CLASS_TRACKED,
+                                                             test == 0 || test == 3, test == 2 ? 255 : 0);
+        unsigned char *start = lookup(&START, &producer_terminal_key);
+        struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
+        u64 word;
+        if (test == 2) {
+            u32 capture = 8; /* OUTPUT_NON_NULL: real OpenSession return rewrite. */
+            word = 0x2000; memcpy(start + 48, &word, 8);
+            memcpy(start + 256, &capture, 4);
+        }
+        if (test == 3) {
+            word = ~0ULL; memcpy(start + 24, &word, 8); /* entry MECH_NONE */
+            word = 0x1000; memcpy(start + 32, &word, 8); /* retained mechanism pointer */
+            object->inputs[0] = 7;
+            object->input_statuses[0] = 1;
+            object->action = 8;
+        }
+        if (test == 4 || test == 5) {
+            word = test == 4 ? 0 : ~0ULL;
+            memcpy(start + 8, &word, 8);
+        }
+        producer_snapshot(names[test], "start", start, 288);
+        producer_snapshot(names[test], "key", &producer_terminal_key, 16);
+        producer_snapshot(names[test], "context", &entry, 16);
+        producer_snapshot(names[test], "instance", lookup(&INSTANCE_START, &producer_terminal_key), 24);
+        if (object)
+            producer_snapshot(names[test], "object", object, 432);
+        p11_journal_begin(&producer_terminal_key, &entry);
+        EXPECT(ring_submits == 1 && !producer_gaps, "native agreement BEGIN: %s", names[test]);
+        if (ring_submits == 1) {
+            struct journal_return_words words;
+            producer_snapshot(names[test], "begin", ring_log[0], 224);
+            p11_journal_returning(&producer_terminal_key, &words);
+            EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0 && words.pad == 0,
+                   "actual native return words: %s", names[test]);
+            producer_snapshot(names[test], "return", &words, sizeof(words));
+        }
+    }
+}
+#endif
+
 #ifdef P11SCOPE_INVENTORY_ONLY
 static void inventory_carries_no_journal(void)
 {
@@ -2364,8 +2764,30 @@ static void inventory_carries_no_journal(void)
 }
 #endif
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+    if (argc == 2 && !strcmp(argv[1], "producer-pairs")) {
+        producer_agreement_snapshots();
+        if (!failures)
+            fprintf(stderr, "journal producer snapshots: six real native cases passed\n");
+        return failures != 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "producer")) {
+        producer_return_words_absent();
+        producer_begin_return_settle();
+        producer_classes_and_projection();
+        producer_failure_matrix();
+        producer_terminal_matrix();
+        producer_return_refusals();
+        producer_prepare_finish_and_collision();
+        if (!failures)
+            fprintf(stderr, "journal producer fixture: all checks passed\n");
+        return failures != 0;
+    }
+#endif
 #ifdef P11SCOPE_INVENTORY_ONLY
     inventory_carries_no_journal();
 #else

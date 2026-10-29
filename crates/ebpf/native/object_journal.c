@@ -785,4 +785,295 @@ start_leg:
     return 0;
 }
 
+/* Inactive P1 producer. Every input is retained capture data or frozen
+ * endpoint policy; none of these globals reads a task field or user memory. */
+extern u32 p11_instance_scope_gap(void);
+
+static __always_inline void producer_loss(u32 index)
+{
+    u64 *cell;
+    (void)p11_instance_scope_gap();
+    cell = owner_map_lookup(&EVIDENCE, &index);
+    if (cell && *(volatile u64 *)cell != ~0ULL)
+        __sync_fetch_and_add(cell, 1);
+}
+
+static __always_inline u64 producer_u64(const void *row, u32 offset)
+{
+    u64 word;
+    __builtin_memcpy(&word, (const unsigned char *)row + offset, 8);
+    return word;
+}
+
+static __always_inline u32 producer_u32(const void *row, u32 offset)
+{
+    u32 word;
+    __builtin_memcpy(&word, (const unsigned char *)row + offset, 4);
+    return word;
+}
+
+static __always_inline int producer_facts(const struct owner_start_key *key,
+                                          const struct journal_entry_context *entry,
+                                          struct journal_begin_facts *facts)
+{
+    const void *start = owner_map_lookup(&START, key);
+    const struct journal_entry_witness *witness = owner_map_lookup(&INSTANCE_START, key);
+    const struct journal_descriptor_row *semantics;
+    const struct object_start *object;
+    u32 descriptor = entry->descriptor;
+    unsigned stamp;
+    u64 session, marker;
+    if (!start || !witness)
+        return 0;
+    semantics = owner_map_lookup(&DESCRIPTORS, &descriptor);
+    if (!semantics || (semantics->session_arg != 255 && semantics->session_arg >= 6))
+        return 0;
+    stamp = witness->entry_stamp[14] | ((unsigned)witness->entry_stamp[15] << 8);
+    if (!(stamp & JOURNAL_STAMP_VALID) || (stamp & ~JOURNAL_STAMP_MASK))
+        return 0;
+    facts->pid_tgid = key->pid_tgid;
+    facts->slot = key->slot;
+    facts->descriptor = descriptor;
+    facts->layout = entry->layout;
+    facts->entry_ns = producer_u64(start, 0);
+    facts->image_cookie = producer_u64(start, 272);
+    facts->image_exec = producer_u64(start, 280);
+    facts->entry_ip = witness->entry_ip;
+    txn_copy(facts->entry_stamp, witness->entry_stamp, 16);
+    facts->slot_id = producer_u64(start, 16);
+    facts->entry_mechanism = producer_u64(start, 24);
+    facts->call_flags = producer_u64(start, 40);
+    facts->user_type = producer_u32(start, 56);
+    facts->capture = producer_u32(start, 256);
+    if (facts->capture & ~JOURNAL_CAPTURE_MASK)
+        return 0;
+    session = producer_u64(start, 8);
+    if (semantics->session_arg == 255) {
+        if (session != ~0ULL)
+            return 0;
+        facts->session_word = 0;
+        facts->session_status = 0;
+    } else if (!session) {
+        facts->session_word = 0;
+        facts->session_status = 3; /* INVALID_ZERO, not ABSENT or UNREADABLE. */
+    } else {
+        if (session == ~0ULL && (facts->capture & 16U))
+            return 0;
+        facts->session_word = session;
+        facts->session_status = JOURNAL_HANDLE_VALUE;
+    }
+    marker = producer_u64(start, 264);
+    if (!marker)
+        return 1;
+    if (marker != (u64)descriptor + 1)
+        return 0;
+    object = owner_map_lookup(&OBJECT_START, key);
+    if (!object || object->descriptor_index != descriptor || object->layout != entry->layout ||
+        object->phase != OBJECT_PHASE_READY || object->task_cookie != facts->image_cookie ||
+        object->exec_id != facts->image_exec || object->entry_ns != facts->entry_ns)
+        return 0;
+    for (u32 i = 0; i < 2; i++) {
+        facts->input_words[i] = object->inputs[i];
+        facts->input_status[i] = object->input_statuses[i];
+        if (!txn_word_ok(facts->input_status[i], facts->input_words[i], facts->layout))
+            return 0;
+        txn_copy(facts->requested[i], (const unsigned char *)&object->requested[i], 36);
+    }
+    return 1;
+}
+
+/* BEGIN unwind owns only the new journal insertion. START/OBJECT_START and
+ * their ordinary result survive even when this cleanup cannot delete. */
+static __always_inline void producer_unwind(const struct owner_start_key *key)
+{
+    if (owner_map_delete(&JOURNAL_START, key))
+        producer_loss(5);
+}
+
+__attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *key,
+                                                const struct journal_entry_context *entry)
+{
+    struct journal_begin_facts facts = {};
+    struct journal_header_spec header = {224, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_start_value value;
+    struct thread_owner *owner;
+    struct journal_control *ctl;
+    void *record;
+    u32 zero = 0;
+    if (!side_key_valid(key) || !entry || !entry->descriptor ||
+        entry->descriptor >= JOURNAL_DESCRIPTOR_MAX || entry->reserved ||
+        entry->layout != JOURNAL_LAYOUT_LP64 || entry->class_bits > JOURNAL_CLASS_NO_END) {
+        producer_loss(5);
+        return;
+    }
+    if (entry->class_bits == JOURNAL_CLASS_COUNT_ONLY)
+        return;
+    owner = txn_owner(key);
+    if (!owner || !owner->start_count || !producer_facts(key, entry, &facts)) {
+        producer_loss(5);
+        return;
+    }
+    ctl = owner_map_lookup(&JOURNAL_CTL, &zero);
+    if (!ctl || ctl->poison) {
+        producer_loss(5);
+        return;
+    }
+    value.thread = p11_journal_thread(owner, ctl);
+    value.sequence = value.thread ? p11_journal_next_sequence(owner) : 0;
+    value.phase = JOURNAL_PHASE_PREPARING;
+    if (!value.thread || !value.sequence) {
+        producer_loss(5);
+        return;
+    }
+    header.thread = value.thread;
+    header.sequence = value.sequence;
+    if (entry->class_bits == JOURNAL_CLASS_TRACKED) {
+        if (p11_journal_side_insert(&JOURNAL_START, key, &value)) {
+            producer_loss(5);
+            return;
+        }
+    } else {
+        header.flags = JOURNAL_FLAG_NO_END;
+        if (owner_map_lookup(&JOURNAL_START, key)) {
+            producer_loss(5);
+            return;
+        }
+    }
+    record = p11_journal_reserve(&EVENTS, JOURNAL_BEGIN_BYTES);
+    if (!record) {
+        producer_loss(0);
+        if (entry->class_bits == JOURNAL_CLASS_TRACKED)
+            producer_unwind(key);
+        return;
+    }
+    if (p11_journal_header_init(record, &header) || txn_fill_begin(record, &facts, key)) {
+        producer_loss(5);
+        if (entry->class_bits == JOURNAL_CLASS_TRACKED)
+            producer_unwind(key);
+        p11_journal_discard(record);
+        return;
+    }
+    p11_journal_submit(record);
+    /* As in the combined transaction, publish before committing BEGUN.
+     * A failed commit keeps PREPARING for a later named ABANDON; the
+     * already published BEGIN has no reservation left to discard. */
+    if (entry->class_bits == JOURNAL_CLASS_TRACKED &&
+        p11_journal_mark_begun(&JOURNAL_START, key, value.thread, value.sequence))
+        producer_loss(5);
+}
+
+__attribute__((noinline)) void p11_journal_returning(const struct owner_start_key *key,
+                                                    struct journal_return_words *out)
+{
+    struct thread_owner *owner;
+    struct journal_start_value *row;
+    u64 thread, sequence;
+    if (!out)
+        return;
+    out->thread = out->sequence = 0;
+    out->flags = JOURNAL_FLAG_UNJOURNALED;
+    out->pad = 0;
+    owner = txn_owner(key);
+    if (!owner || !owner->journal_thread)
+        return;
+    row = p11_journal_side_lookup(&JOURNAL_START, key);
+    if (!row)
+        return;
+    thread = row->thread;
+    sequence = row->sequence;
+    if (thread != owner->journal_thread || !sequence || row->phase != JOURNAL_PHASE_BEGUN ||
+        p11_journal_return(owner, &JOURNAL_START, key, thread, sequence)) {
+        producer_loss(5);
+        return;
+    }
+    out->thread = thread;
+    out->sequence = sequence;
+    out->flags = 0;
+}
+
+__attribute__((noinline)) void p11_journal_settle_prepare(const struct owner_start_key *key,
+                                                         u32 reason,
+                                                         struct journal_settle_words *out)
+{
+    struct thread_owner *owner;
+    struct journal_start_value *row;
+    struct journal_header_spec header = {64, JOURNAL_KIND_ABANDON, 0, 0, 0};
+    struct journal_abandon_facts facts;
+    const void *start;
+    if (!out)
+        return;
+    __builtin_memset(out, 0, sizeof(*out));
+    owner = txn_owner(key);
+    if (!owner || !owner->journal_thread)
+        return;
+    row = p11_journal_side_lookup(&JOURNAL_START, key);
+    if (!row)
+        return;
+    if (row->thread != owner->journal_thread || !row->sequence || !journal_phase_valid(row->phase)) {
+        producer_loss(5);
+        row->thread = row->sequence = row->phase = 0;
+    } else if (!reason && row->phase == JOURNAL_PHASE_RETURNING) {
+        out->state = JOURNAL_SETTLE_SILENT;
+    } else {
+        if (!reason) {
+            reason = 9;
+            producer_loss(5);
+        }
+        start = owner_map_lookup(&START, key);
+        if (!start || reason < JOURNAL_REASON_MIN || reason > JOURNAL_REASON_MAX) {
+            producer_loss(5);
+        } else {
+            header.thread = row->thread;
+            header.sequence = row->sequence;
+            facts.pid_tgid = key->pid_tgid;
+            facts.image_cookie = producer_u64(start, 272);
+            facts.image_exec = producer_u64(start, 280);
+            facts.entry_ns = producer_u64(start, 0);
+            facts.slot = key->slot;
+            facts.reason = reason;
+            if (p11_journal_header_init(out->record, &header) ||
+                txn_fill_abandon(out->record, &facts, key))
+                producer_loss(5);
+            else
+                out->state = JOURNAL_SETTLE_ABANDON;
+        }
+    }
+    /* Valid rows remain intact on deletion failure: START and its lease
+     * stay owned, so a healed retry has the original terminal identity. */
+    if (owner_map_delete(&JOURNAL_START, key)) {
+        producer_loss(5);
+        out->state = JOURNAL_SETTLE_BLOCKED;
+    }
+}
+
+__attribute__((noinline)) void p11_journal_settle_finish(struct journal_settle_words *words,
+                                                        u32 cleanup_committed)
+{
+    u32 state;
+    void *record;
+    if (!words)
+        return;
+    state = words->state;
+    words->state = JOURNAL_SETTLE_EMPTY;
+    if (state == JOURNAL_SETTLE_EMPTY || state == JOURNAL_SETTLE_BLOCKED)
+        return;
+    if (cleanup_committed != 1) {
+        producer_loss(5);
+        return;
+    }
+    if (state == JOURNAL_SETTLE_SILENT)
+        return;
+    if (state != JOURNAL_SETTLE_ABANDON || words->pad) {
+        producer_loss(5);
+        return;
+    }
+    record = p11_journal_reserve(&EVENTS, JOURNAL_ABANDON_BYTES);
+    if (!record) {
+        producer_loss(0);
+        return;
+    }
+    txn_copy(record, words->record, JOURNAL_ABANDON_BYTES);
+    p11_journal_submit(record);
+}
+
 #endif /* P11SCOPE_INVENTORY_ONLY */

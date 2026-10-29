@@ -2,6 +2,50 @@
 use std::process::Command;
 
 #[test]
+fn production_task_owner_conditional_journal_settlement() {
+    let work = tempfile::tempdir().expect("conditional journal owner fixture");
+    for (name, flags) in [
+        ("default", vec![]),
+        ("small", vec!["-DP11SCOPE_SMALL_STATE_MAPS"]),
+        ("wide", vec!["-DP11SCOPE_OWNER_SLOT_BOUND=2112U"]),
+    ] {
+        let binary = work.path().join(name);
+        let output = Command::new("clang-18")
+            .args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-DP11SCOPE_OBJECT_JOURNAL",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/task-owner/helper_tests.c",
+                "-o",
+            ])
+            .arg(&binary)
+            .args(flags)
+            .output()
+            .expect("compile journal owner fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(binary)
+            .arg("journal_removal_hook")
+            .output()
+            .expect("run owner fixture");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn production_task_owner_transactions_and_lifecycle() {
     let temporary = tempfile::tempdir().expect("native owner test directory");
     for (small, inventory) in [(false, false), (true, false), (false, true), (true, true)] {

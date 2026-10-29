@@ -73,6 +73,51 @@ _Static_assert(JOURNAL_START_LIMIT == 16384U || JOURNAL_START_LIMIT == 1U, "jour
 #define JOURNAL_COMMON_BYTES 24U
 #define JOURNAL_FLAG_NO_END 1U
 #define JOURNAL_FLAG_ABSENT_TAIL 2U
+#define JOURNAL_FLAG_UNJOURNALED 4U
+
+/* Normalized endpoint class, not the unrelated raw semantic_flags bits. */
+#define JOURNAL_CLASS_COUNT_ONLY 0U
+#define JOURNAL_CLASS_TRACKED 1U
+#define JOURNAL_CLASS_NO_END 2U
+struct journal_entry_context {
+    u32 descriptor;
+    u32 class_bits;
+    u32 layout;
+    u32 reserved;
+};
+struct journal_return_words {
+    u64 thread;
+    u64 sequence;
+    u32 flags;
+    u32 pad;
+};
+_Static_assert(sizeof(struct journal_entry_context) == 16, "journal entry context ABI");
+_Static_assert(sizeof(struct journal_return_words) == 24, "journal return words ABI");
+_Static_assert(__builtin_offsetof(struct journal_return_words, flags) == 16, "return flags");
+_Static_assert(__builtin_offsetof(struct journal_return_words, pad) == 20, "return padding");
+
+/* Existing retained INSTANCE_START and frozen DESCRIPTORS map values. */
+struct journal_entry_witness {
+    u64 entry_ip;
+    unsigned char entry_stamp[16];
+};
+struct journal_descriptor_row {
+    unsigned short operations;
+    unsigned char transition, lifecycle, direct, semantic_flags;
+    unsigned char session_arg;
+    unsigned char slot_arg, mechanism_arg, output_arg, flags_arg, user_type_arg;
+    unsigned char template0_arg, template_count0_arg, template1_arg, template_count1_arg;
+    unsigned char async_name_arg, async_value_arg;
+};
+_Static_assert(sizeof(struct journal_entry_witness) == 24, "retained instance entry ABI");
+_Static_assert(sizeof(struct journal_descriptor_row) == 18, "frozen semantics ABI");
+_Static_assert(__builtin_offsetof(struct journal_descriptor_row, session_arg) == 6, "session arg");
+extern unsigned char INSTANCE_START, DESCRIPTORS, EVENTS, EVIDENCE;
+void p11_journal_begin(const struct owner_start_key *key, const struct journal_entry_context *entry);
+void p11_journal_returning(const struct owner_start_key *key, struct journal_return_words *out);
+void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                                struct journal_settle_words *out);
+void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
 
 /* Whether one header describes an exact version/kind/length/flag
  * combination over a nonzero identity. Mirrors the Rust validators;

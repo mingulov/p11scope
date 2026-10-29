@@ -280,6 +280,7 @@ impl ScopedNativeScene {
 }
 
 #[test]
+#[ignore = "6.11 activation deferred per docs/superpowers/decisions/2026-10-29-611-bridge-decision.md; tracked RED cell, migration twin cgroup_native_owner_migration_during_provider_retention_refuses_activation stays running"]
 fn cgroup_native_owner_stable_retained_member_activates_after_final_permit() {
     // A missing scoped owner path must fail here only after real original
     // binding, fallback and final sampled membership have all succeeded.

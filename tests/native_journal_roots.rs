@@ -27,6 +27,61 @@ fn frozen_class_context_never_promotes_unknown_and_preserves_target_abi() {
 }
 
 #[test]
+fn begin_decision_calls_every_valid_context_and_gaps_the_rest() {
+    use p11scope_ebpf_common::{LinuxLayout, MAX_DESCRIPTORS};
+    use root_writers::BeginDecision;
+    for (layout, code) in [(LinuxLayout::Lp64, 1), (LinuxLayout::Ilp32, 2)] {
+        for (configured, normalized) in [(1, 0), (2, 1), (3, 2)] {
+            let BeginDecision::Call(context) = root_writers::begin_decision(21, configured, layout)
+            else {
+                panic!("configured {configured} must decide Call");
+            };
+            assert_eq!(context.descriptor, 21);
+            assert_eq!(context.class_bits, normalized);
+            assert_eq!(context.layout, code);
+            assert_eq!(context.reserved, 0);
+        }
+        for unknown in [0, 4, u32::MAX] {
+            assert!(matches!(
+                root_writers::begin_decision(21, unknown, layout),
+                BeginDecision::Gap
+            ));
+        }
+        for descriptor in [0, MAX_DESCRIPTORS, u32::MAX] {
+            assert!(matches!(
+                root_writers::begin_decision(descriptor, 2, layout),
+                BeginDecision::Gap
+            ));
+        }
+    }
+}
+
+#[test]
+fn completion_reason_names_result_lost_only_on_unjournaled() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+    };
+    for (flags, expected) in [
+        (0, 0),
+        (u32::from(JOURNAL_END_TAIL_ABSENT), 0),
+        (
+            u32::from(JOURNAL_END_UNJOURNALED),
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        ),
+        (
+            u32::from(JOURNAL_END_TAIL_ABSENT | JOURNAL_END_UNJOURNALED),
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        ),
+    ] {
+        let words = root_writers::ReturnWords {
+            flags,
+            ..root_writers::ReturnWords::default()
+        };
+        assert_eq!(root_writers::completion_reason(&words), expected);
+    }
+}
+
+#[test]
 fn end_header_and_absent_tail_initialize_every_byte_in_poisoned_storage() {
     use p11scope_ebpf_common::object_journal::{
         JOURNAL_END_FULL_BYTES, JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END,

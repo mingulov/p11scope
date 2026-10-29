@@ -3,12 +3,13 @@
 //! The host proof includes its scalar policy and in-place wire writers only.
 
 use p11scope_ebpf_common::object_journal::{
-    JOURNAL_END_FULL_BYTES, JOURNAL_END_TAIL_ABSENT, JOURNAL_KIND_END, JOURNAL_VERSION,
-    JournalEndFull,
+    JOURNAL_END_FULL_BYTES, JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END,
+    JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JOURNAL_VERSION, JournalEndFull,
 };
 use p11scope_ebpf_common::{Event, LinuxLayout, MAX_DESCRIPTORS};
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EntryContext {
     pub descriptor: u32,
     pub class_bits: u32,
@@ -83,6 +84,40 @@ pub(crate) fn entry_context(
     })
 }
 
+/// Pure BEGIN custody decision shared by the BPF root and the host proof.
+/// Every valid context calls the native BEGIN function, including
+/// proved-irrelevant class zero; the native function's own validation
+/// decides. There is no skip arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeginDecision {
+    Call(EntryContext),
+    Gap,
+}
+
+#[inline(always)]
+pub(crate) fn begin_decision(
+    descriptor: u32,
+    configured_class: u32,
+    layout: LinuxLayout,
+) -> BeginDecision {
+    match entry_context(descriptor, configured_class, layout) {
+        Some(context) => BeginDecision::Call(context),
+        None => BeginDecision::Gap,
+    }
+}
+
+/// Pure completion-reason decision shared by the BPF root and the host
+/// proof. A refused phase already reported its actual loss; a named reason
+/// avoids reason-zero's second loss on an unsettled row.
+#[inline(always)]
+pub(crate) fn completion_reason(words: &ReturnWords) -> u32 {
+    if words.flags & u32::from(JOURNAL_END_UNJOURNALED) != 0 {
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+    } else {
+        0
+    }
+}
+
 /// Initialize the exact header in reserved storage. Native returning supplies
 /// both identity words and its finite flags, including zero UNJOURNALED words.
 /// No PID/current-owner value can substitute for them.
@@ -128,11 +163,13 @@ pub(crate) unsafe fn initialize_end(
 
 #[cfg(target_arch = "bpf")]
 pub(super) mod program {
-    use super::{EntryContext, ReturnWords, RoutingWord, entry_context, initialize_end};
+    use super::{
+        BeginDecision, EntryContext, ReturnWords, RoutingWord, begin_decision, completion_reason,
+        initialize_end,
+    };
     use crate::*;
     use p11scope_ebpf_common::object_journal::{
-        JOURNAL_END_UNJOURNALED, JOURNAL_REASON_IDENTITY_REFUSED,
-        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalEndFull,
+        JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalEndFull,
     };
 
     #[map]
@@ -197,14 +234,15 @@ pub(super) mod program {
     #[inline(never)]
     pub(crate) fn begin(key: &StartKey, descriptor: u32, layout: LinuxLayout) {
         let configured = JOURNAL_CLASSES.get(descriptor).copied().unwrap_or(0);
-        let Some(context) = entry_context(descriptor, configured, layout) else {
-            gap();
-            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-            return;
-        };
-        // Irrelevant is configured explicitly. Unknown never takes this arm.
-        if context.class_bits != 0 {
-            unsafe { p11_journal_begin(key, &context) };
+        // Irrelevant is configured explicitly and still takes the native
+        // call; the native function's own validation decides. Unknown never
+        // takes the Call arm.
+        match begin_decision(descriptor, configured, layout) {
+            BeginDecision::Call(context) => unsafe { p11_journal_begin(key, &context) },
+            BeginDecision::Gap => {
+                gap();
+                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            }
         }
     }
 
@@ -240,13 +278,7 @@ pub(super) mod program {
         let mut words = ReturnWords::default();
         unsafe { p11_journal_returning(key, &mut words) };
         unsafe { initialize_end(record, &words, absent) };
-        if words.flags & u32::from(JOURNAL_END_UNJOURNALED) != 0 {
-            // A refused phase already reported its actual loss. A named
-            // reason avoids reason-zero's second loss on an unsettled row.
-            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-        } else {
-            0
-        }
+        completion_reason(&words)
     }
 
     #[inline(never)]

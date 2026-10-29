@@ -10,7 +10,7 @@ use p11scope_ebpf_common::object_flow::{
     encode_return_gate, fill_call_event, preserve_refused_base,
 };
 use p11scope_ebpf_common::object_journal::{
-    JOURNAL_END_FULL_BYTES, JOURNAL_END_UNJOURNALED, JOURNAL_REASON_IDENTITY_REFUSED,
+    JOURNAL_END_FULL_BYTES, JOURNAL_REASON_IDENTITY_REFUSED,
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalEndFull, JournalRecord, decode_journal_record,
 };
 use p11scope_ebpf_common::object_wire::{
@@ -218,12 +218,9 @@ impl Bridge {
     }
 
     fn begin(&self, descriptor: u32, configured: u32, layout: LinuxLayout) {
-        if let Some(context) = root_writers::entry_context(descriptor, configured, layout) {
-            if context.class_bits != 0 {
-                unsafe { (self.begin)(&context) };
-            }
-        } else {
-            unsafe { (self.loss)(5) };
+        match root_writers::begin_decision(descriptor, configured, layout) {
+            root_writers::BeginDecision::Call(context) => unsafe { (self.begin)(&context) },
+            root_writers::BeginDecision::Gap => unsafe { (self.loss)(5) },
         }
     }
 }
@@ -388,9 +385,7 @@ fn completed(
         let mut words = root_writers::ReturnWords::default();
         unsafe { (bridge.returning)(&mut words) };
         unsafe { root_writers::initialize_end(record, &words, !object) };
-        if words.flags & u32::from(JOURNAL_END_UNJOURNALED) == 0 {
-            reason = 0;
-        }
+        reason = root_writers::completion_reason(&words);
     }
     let outcome = emission_finalize(emitted, || unsafe { (bridge.remove)(reason) == 0 });
     if outcome.submitted {

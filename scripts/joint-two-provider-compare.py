@@ -9,6 +9,15 @@ arrival, physical cut, post-cut burst). The first row is ready; further
 ready rows, call rows and cut/handle marker rows follow in arrival order;
 one ack row closes. Call seq is global and contiguous across feeds;
 issued counts call rows only, so markers are transparent to counts.
+A forwarding layer evidences its sums with forward marker rows
+{kind, feed, count, t}: shaped and window-checked like handle rows,
+likewise transparent to issued. Snapshot key_rows carry the echoed
+forwarded sum beside started/completed/failed/unknown; the comparison
+proves the forwarded sum is never merged into any hardware-operation
+tally (per-feed exact match against ledger calls, unchanged) and that
+the echo equals the ledgered sum exactly. Forwarded sums are
+fixture-evidenced, never derived; the oracle proves only non-merger
+and the exact echo.
 Clocks are CLOCK_MONOTONIC ns.
 
 Ready rows may arrive late (feed B loads after feed A runs); every
@@ -29,7 +38,9 @@ path (the double-load gap must name it and no feed may claim a positive);
 otherwise the split path (one caller across feeds, distinct module per
 feed, per-feed counts exact, cut arithmetic with mapping-interruption and
 identity-gap evidence, uncertainty in one feed never weakens another);
-the association bound over observed rows. Refusal exits 1 with a
+forwarded sums echo the ledgered markers exactly on every path and never
+merge into hardware-operation tallies; the association bound over observed
+rows. Refusal exits 1 with a
 numbers-only reason; feed names print verbatim (charset-bound labels,
 never payload). Twins live in
 tests/python/test_joint_two_provider_oracle.py.
@@ -41,15 +52,17 @@ import re
 import sys
 
 MAX_CALLS = 200000
-# ready + calls + ack plus cut/handle marker headroom: the fixtures emit
-# at most two readys, two handles and one cut beside 2*COUNT calls.
-MAX_ROWS = MAX_CALLS + 64
+# ready + calls + ack plus cut/handle/forward marker headroom: the
+# fixtures emit at most two readys, two handles, one cut and a bounded
+# run of forward markers beside 2*COUNT calls.
+MAX_ROWS = MAX_CALLS + 128
 MAX_LINE_BYTES = 4096
 MAX_LEDGER_BYTES = 32 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_WORD = (1 << 64) - 1
 MAX_CUTS = 64
 MAX_HANDLES = 64
+MAX_FORWARDS = 64
 MAX_INSTANCES = 4096
 FN_PATTERN = re.compile(r"[A-Za-z0-9_\[\]]{1,64}\Z")
 FEED_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
@@ -195,10 +208,11 @@ def validate_ledger(rows):
     calls = []
     cuts = []
     handles = []
+    forwards = []
     for row in rows[1:-1]:
         _require(type(row) is dict, "middle row must be an object")
         kind = row.get("kind")
-        _require(kind in ("ready", "call", "cut", "handle"),
+        _require(kind in ("ready", "call", "cut", "handle", "forward"),
                  f"unexpected {_shown(kind)} row between ready and ack")
         if kind == "call":
             _keys(row, {"kind", "seq", "fn", "rv", "pid", "tid", "t0", "t1"},
@@ -224,8 +238,19 @@ def validate_ledger(rows):
             _require(window_start <= row["t"] <= ack["t"],
                      "handle lies outside the ready/ack window")
             handles.append(row)
+        elif kind == "forward":
+            _keys(row, {"kind", "feed", "count", "t"})
+            _require(type(row["feed"]) is str and row["feed"] in feeds,
+                     f"forward names undeclared feed {_shown(row['feed'])}")
+            _require(_integer(row["count"]) and row["count"] >= 1,
+                     "forward count out of range")
+            _require(_integer(row["t"]), "forward t out of range")
+            _require(window_start <= row["t"] <= ack["t"],
+                     "forward lies outside the ready/ack window")
+            forwards.append(row)
     _require(len(cuts) <= MAX_CUTS, "cut row limit")
     _require(len(handles) <= MAX_HANDLES, "handle row limit")
+    _require(len(forwards) <= MAX_FORWARDS, "forward row limit")
     _require(ack["issued"] == len(calls),
              f"issued {ack['issued']} disagrees with {len(calls)} call rows")
     if len(readys) == 1 and "feed" not in readys[0]:
@@ -238,6 +263,9 @@ def validate_ledger(rows):
     for handle in handles:
         _require(handle["t"] >= ready_t[handle["feed"]],
                  f"handle precedes the {handle['feed']} ready row")
+    for forward in forwards:
+        _require(forward["t"] >= ready_t[forward["feed"]],
+                 f"forward precedes the {forward['feed']} ready row")
     feed_rows = {feed: [] for feed in feeds}
     for position, row in enumerate(calls, start=1):
         _require(row["seq"] == position,
@@ -286,14 +314,16 @@ def validate_ledger(rows):
                  f"duplicate cut at_seq {_shown(at_seq)} for feed {feed}")
         seen_cut.setdefault(feed, []).append(at_seq)
     summary = {"issued": ack["issued"], "calls": len(calls), "feeds": {},
-               "cuts": cuts, "handles": handles, "window_start": window_start,
-               "ack_t": ack["t"]}
+               "cuts": cuts, "handles": handles, "forwards": forwards,
+               "window_start": window_start, "ack_t": ack["t"]}
     for feed in feeds:
         rows_for = feed_rows[feed]
         summary["feeds"][feed] = {
             "calls": len(rows_for),
             "ok": sum(1 for row in rows_for if row["rv"] == 0),
             "failed": sum(1 for row in rows_for if row["rv"] != 0),
+            "forwarded": sum(row["count"] for row in forwards
+                             if row["feed"] == feed),
             "ready_t": ready_t[feed],
             "seqs": sorted(row["seq"] for row in rows_for),
             "ok_seqs": sorted(row["seq"] for row in rows_for
@@ -384,6 +414,8 @@ def read_snapshot(stream):
         for key in ("cut_published", "cut_published_failed"):
             value = row.get(key, 0)
             _require(_integer(value), f"key row {key} out of range")
+        forwarded = row.get("forwarded", 0)
+        _require(_integer(forwarded), "key row forwarded out of range")
         _require(row.get("cut_published_failed", 0) <= row.get("cut_published", 0),
                  "key row cut_published_failed exceeds cut_published")
     identifiers = [row["instance"] for row in snapshot["key_rows"]]
@@ -513,6 +545,9 @@ def _compare_merge(summary, snapshot, instances, key_rows, associations):
         _require(key_row["failed"] == 0 and key_row["unknown"] == 0,
                  f"double-loaded calls claim failures or unknowns "
                  f"on {instance_id}")
+        _require(key_row.get("forwarded", 0) == 0,
+                 f"double-loaded calls claim forwarded sums "
+                 f"on {instance_id}")
     return {"path": "merge", "feeds": sorted(summary["feeds"]),
             "issued": summary["issued"],
             "associations": associations["associations"]}
@@ -554,6 +589,9 @@ def _compare_split(summary, snapshot, key_rows, associations):
         key_row = key_rows.get(instance["id"])
         _require(key_row is not None,
                  f"observed instance {instance['id']} without a key row")
+        _require(key_row.get("forwarded", 0) == counts["forwarded"],
+                 f"feed {feed} forwarded {key_row.get('forwarded', 0)} disagrees "
+                 f"with {counts['forwarded']} ledgered forwarded calls")
         if feed in cuts:
             _check_cut_feed(feed, counts, key_row, cuts[feed],
                             feed_modules[feed], edges)
@@ -582,6 +620,8 @@ def _compare_split(summary, snapshot, key_rows, associations):
                  f"feed {row['feed']} over-claims failed while {row['state']}")
         _require(key_row["started"] <= counts["calls"],
                  f"feed {row['feed']} over-claims started while {row['state']}")
+        _require(key_row.get("forwarded", 0) <= counts["forwarded"],
+                 f"feed {row['feed']} over-claims forwarded while {row['state']}")
     return {"path": "split", "feeds": sorted(summary["feeds"]),
             "issued": summary["issued"],
             "associations": associations["associations"]}

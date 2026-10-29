@@ -2493,6 +2493,47 @@ mod tests {
         assert_eq!(key.pad, 0);
     }
 
+    /// Packet 6.14 phase 1 (Option A RED): kind-7 leader-exit-mapping
+    /// summaries reuse `DiscoveryRecord` byte-identical and validate their
+    /// exact payload shape. A3 GREEN lands the named kind/status consts
+    /// and the validator arm; this RED uses literals so it compiles
+    /// before them. Guards first (they hold before and after GREEN);
+    /// the accept assertion last (it fails until GREEN).
+    #[test]
+    fn leader_exit_mappings_abi_offsets_unchanged() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<DiscoveryRecord>(), 920);
+        assert_eq!(offset_of!(DiscoveryRecord, pointers), 32);
+        assert_eq!(offset_of!(DiscoveryRecord, kind), 864);
+        assert_eq!(offset_of!(DiscoveryRecord, status_flags), 868);
+        assert_eq!(offset_of!(DiscoveryRecord, binding_id), 912);
+
+        // Guards: nonzero reserved words, wrong kind and oversized slot
+        // ids stay invalid. Slot cells are slot+1, so 1024
+        // (instance::FILE_SLOTS) is the largest encodable value.
+        let mut reserved = discovery_record(7);
+        reserved.pointers[8] = 1;
+        assert!(!valid_discovery_record(&reserved));
+        let mut wrong_kind = discovery_record(8);
+        wrong_kind.pointers[0] = 3;
+        assert!(!valid_discovery_record(&wrong_kind));
+        let mut oversized = discovery_record(7);
+        oversized.pointers[0] = 1025;
+        assert!(!valid_discovery_record(&oversized));
+        let mut bad_status = discovery_record(7);
+        bad_status.pointers[0] = 3;
+        bad_status.status_flags = 0x80;
+        assert!(!valid_discovery_record(&bad_status));
+
+        // RED: the exact kind-7 payload shape validates.
+        let mut summary = discovery_record(7);
+        summary.pointers[0] = 3;
+        assert!(valid_discovery_record(&summary));
+        let mut empty = discovery_record(7);
+        empty.status_flags = 0x40; // EXIT_MAP_HOOKS_REFUSED (A3)
+        assert!(valid_discovery_record(&empty));
+    }
+
     #[test]
     fn discovery_producer_decisions_cover_the_finite_edges() {
         assert_eq!(

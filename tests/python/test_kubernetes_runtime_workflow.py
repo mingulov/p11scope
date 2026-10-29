@@ -38,7 +38,7 @@ def step_body(identifier):
 class WorkflowShapeTests(unittest.TestCase):
     def test_manual_host_jobs_have_explicit_k1_k2_budgets(self):
         data = workflow()
-        self.assertEqual(set(data["on"]), {"workflow_dispatch"})
+        self.assertEqual(set(data["on"]), {"workflow_dispatch", "workflow_call"})
         inputs = data["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["run_k2"]["default"], "false")
         self.assertEqual(inputs["run_k2"]["type"], "boolean")

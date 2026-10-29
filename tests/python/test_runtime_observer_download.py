@@ -219,7 +219,8 @@ sys.stdout.buffer.write((base / name).read_bytes())
 
     def package_delivery(self, *, conclusion="success", p0="success"):
         # Isolate vectors even when a prior negative unexpectedly staged output.
-        shutil.rmtree(self.output, ignore_errors=True)
+        if self.output.exists():
+            shutil.rmtree(self.output)
         self.package_preview(conclusion=conclusion, p0=p0)
         self.run.update(workflow_id=71, path=".github/workflows/ci.yml")
         for job in self.jobs["jobs"]:
@@ -256,6 +257,30 @@ sys.stdout.buffer.write((base / name).read_bytes())
                         self.jobs["total_count"] += 1
                     self.refused()
                     self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_legacy_route_cannot_hide_attempted_delivery_lookalikes(self):
+        for change in ("prefix", "suffix", "foreign-caller"):
+            with self.subTest(change=change):
+                self.package_delivery(p0=None)
+                for job in self.jobs["jobs"][:2]:
+                    if change == "prefix":
+                        job["name"] = "foreign / " + job["name"]
+                    elif change == "suffix":
+                        job["name"] += " / foreign"
+                    else:
+                        job["name"] = job["name"].replace("package-delivery", "foreign")
+                self.jobs["jobs"][-1].update(conclusion="success", started_at="2026-10-28T10:00:00Z",
+                                               completed_at="2026-10-28T10:02:00Z")
+                self.refused()
+                self.assertNotIn("/zip", (self.base / "calls").read_text())
+
+    def test_nested_route_requires_a_completed_skip_for_inactive_legacy(self):
+        for status in ("queued", "in_progress", None):
+            with self.subTest(status=status):
+                self.package_delivery()
+                self.jobs["jobs"][-1]["status"] = status
+                self.refused()
+                self.assertNotIn("/zip", (self.base / "calls").read_text())
 
     def test_nested_route_requires_exact_jobs_genuine_steps_and_original_attempt(self):
         for index in (0, 1):

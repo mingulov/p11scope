@@ -2,16 +2,40 @@ name: ci
 on:
   push:
   pull_request:
-  # Manual runs from the Actions tab. The two dispatch-only jobs below run
-  # only when their input is selected; every other job runs as on push.
+  # Checks remain the default. Delivery routes call the maintained workflows
+  # at this commit without repeating the ordinary check matrix.
   workflow_dispatch:
     inputs:
+      delivery_task:
+        description: Run ordinary checks or one independent delivery task
+        type: choice
+        options: [checks, packages, docker, kubernetes]
+        default: checks
       release_preview:
         description: Run release-preview (hosted; builds and verifies the release artifacts)
         type: boolean
         default: true
       privileged_e2e:
         description: Run four gated capture cells on a hosted Ubuntu 26.04 runner
+        type: boolean
+        default: false
+      accepted_ci_run_id:
+        description: Completed successful exact-source ordinary CI run for package delivery
+        type: string
+      artifact_run_id:
+        description: Completed exact-source FULL package producer run for runtime delivery
+        type: string
+      capture_mode:
+        description: Package delivery modes
+        type: choice
+        options: [full, p0, both]
+        default: both
+      delivery_jobs:
+        description: Package build jobs (canonical integer 1 through 16)
+        type: string
+        default: '2'
+      run_k2:
+        description: Also run Kubernetes attach-pod controls
         type: boolean
         default: false
 permissions:
@@ -65,8 +89,9 @@ jobs:
   # an earlier run on the commit is unfinished, this job waits for it (75
   # minutes at most), so a cancelled or failed earlier run never leaves the
   # commit without a result: the matrix then runs here. Pull requests (which
-  # test a merge commit) and manual dispatches always run it, and any API
-  # error runs it too. A covering run must itself have run lint,
+  # test a merge commit) and default manual checks always run it; selected
+  # delivery tasks opt out before the API query. Any API error runs checks.
+  # A covering run must itself have run lint,
   # coverage-report and bpf-noninterference successfully.
   dedupe:
     runs-on: ubuntu-26.04
@@ -75,6 +100,7 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      DELIVERY_TASK: ${{ inputs.delivery_task || 'checks' }}
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
@@ -87,6 +113,14 @@ jobs:
             printf '## dedupe\n\n%s\n' "$2" >>"$GITHUB_STEP_SUMMARY"
             exit 0
           }
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "$DELIVERY_TASK" in
+              checks) ;;
+              packages|docker|kubernetes)
+                decide false "delivery task $DELIVERY_TASK selected; ordinary checks were not requested" ;;
+              *) echo "invalid delivery task: $DELIVERY_TASK" >&2; exit 1 ;;
+            esac
+          fi
           if [ "$GITHUB_EVENT_NAME" != push ]; then
             decide true "$GITHUB_EVENT_NAME run: the check matrix runs"
           fi
@@ -121,6 +155,34 @@ jobs:
             echo "dedupe: waiting for earlier run(s) on $GITHUB_SHA:$active"
             sleep 60
           done
+  package-delivery:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'packages' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/package-preview.yml
+    with:
+      accepted_ci_run_id: ${{ inputs.accepted_ci_run_id }}
+      capture_mode: ${{ inputs.capture_mode }}
+      jobs: ${{ inputs.delivery_jobs }}
+  docker-delivery:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'docker' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/docker-runtime.yml
+    with:
+      preview_run_id: ${{ inputs.artifact_run_id }}
+  kubernetes-delivery:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'kubernetes' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/kubernetes-runtime.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+      run_k2: ${{ inputs.run_k2 }}
   # Static gates: formatting, compilation (gnu plus the shipped musl and
   # P0 configurations), both clippy profiles, the diagnostic-object
   # inventory test, feature host-admission regressions and script lints.
@@ -838,7 +900,7 @@ jobs:
   # matrix or failed count/window oracle fails rather than becoming a skip.
   # Endpoint/WIDE/population scale and long soaks are separate qualifications.
   privileged-e2e:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.privileged_e2e }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.privileged_e2e }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -909,6 +971,7 @@ jobs:
               exit 1
             fi
           fi
+          # shellcheck disable=SC2016
           flock -n "$TMPDIR/hosted-system.lock" bash -c '
             set -euo pipefail
             binary="$PWD/target/release/p11scope"
@@ -1021,7 +1084,7 @@ jobs:
   # suffice (passwordless sudo covers the receipt steps); no special labels
   # needed.
   release-preview:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_preview }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_task == 'checks' && inputs.release_preview }}
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -785,6 +785,58 @@ static void check_scope_gap(void)
 }
 #endif
 
+/* Packet 6.14 (Option A): the exit-summary struct and helper come from
+ * instance_epoch.h/.c via the include above. */
+static void check_exit_summary(void)
+{
+    struct instance_exit_summary out;
+    /* No record: a no-create read contributes zero slots and no flags. */
+    reset();
+    memset(&out, 0xa5, sizeof(out));
+    out.flags = 0x40; /* caller pre-seed survives: flags are ORed, never cleared */
+    assert(p11_instance_exit_summary(&out) == 0);
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        assert(out.slot_plus1[i] == 0);
+    assert(out.flags == 0x40);
+    assert(!storage_creates);
+    /* Present record: copies all eight slot+1 cells, ORs the record flags. */
+    reset();
+    record_present[0] = 1;
+    records[0].slot_plus1[0] = 6;
+    records[0].slot_plus1[7] = 1024;
+    records[0].flags = INST_RECORD_OVERFLOW;
+    memset(&out, 0xa5, sizeof(out));
+    out.flags = 0x40;
+    assert(p11_instance_exit_summary(&out) == 1);
+    assert(out.slot_plus1[0] == 6 && out.slot_plus1[7] == 1024);
+    for (int i = 1; i < 7; i++)
+        assert(out.slot_plus1[i] == 0);
+    assert(out.flags == (0x40 | INST_RECORD_OVERFLOW));
+    assert(!storage_creates);
+    /* No current task, or no leader: zero slots, pre-seed kept, returns 0. */
+    reset();
+    record_present[0] = 1;
+    current_task = 0;
+    memset(&out, 0xa5, sizeof(out));
+    out.flags = 0x40;
+    assert(p11_instance_exit_summary(&out) == 0);
+    assert(out.flags == 0x40);
+    reset();
+    record_present[0] = 1;
+    current_task = &leader; /* the exiting thread is the leader */
+    leader.group_leader = 0;
+    memset(&out, 0xa5, sizeof(out));
+    assert(p11_instance_exit_summary(&out) == 0);
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        assert(out.slot_plus1[i] == 0);
+    leader.group_leader = &leader;
+    /* A null out pointer refuses without touching storage. */
+    reset();
+    record_present[0] = 1;
+    assert(p11_instance_exit_summary(0) == 0);
+    assert(!storage_creates);
+}
+
 int main(int argc, char **argv)
 {
     stop_gate_map_lookup = lookup;
@@ -812,6 +864,7 @@ int main(int argc, char **argv)
         return 2;
     }
     denied_scope_shared_mm_birth();
+    check_exit_summary();
 
     /* A disabled/poisoned image may never leave a joinable entry stamp. */
     reset();

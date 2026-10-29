@@ -537,6 +537,38 @@ __attribute__((noinline)) u32 p11_instance_exec(void)
     return 1;
 }
 
+/* Exit summary: a no-create read of the leader record for the kind-7 exit
+ * record, mirroring p11_instance_exec's lookup. Copies the eight slot+1
+ * cells and ORs the record flags into the caller's word; absent record,
+ * missing task/leader, or null out contributes nothing and returns 0.
+ * Reads kernel VMA/file/mm metadata only, like every hook in this unit. */
+__attribute__((noinline)) u32 p11_instance_exit_summary(struct instance_exit_summary *out)
+{
+    struct task_struct___p11inst *current;
+    struct task_struct___p11inst *leader;
+    struct instance_record *rec;
+
+    if (!out)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        out->slot_plus1[i] = 0;
+    current = inst_current_task();
+    if (!current)
+        return 0;
+    leader = current->group_leader;
+    if (!leader)
+        return 0;
+    rec = inst_storage_get(&PROC_EPOCH, leader, 0, 0);
+    if (!rec)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        out->slot_plus1[i] = *(volatile u64 *)&rec->slot_plus1[i];
+    out->flags |= *(volatile u64 *)&rec->flags;
+    return 1;
+}
+
 #ifdef P11SCOPE_JOURNAL_MARKER
 /* Exec-ID read for the birth marker: the established volatile CO-RE
  * deref (image_identity.c). The host harness counts reads through

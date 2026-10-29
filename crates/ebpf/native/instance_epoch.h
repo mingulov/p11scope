@@ -131,6 +131,15 @@ struct instance_counters {
     u64 faults;
     u64 calib_hits;
 };
+/* Exit summary: the eight slot+1 cells plus the record flag word, copied
+ * out of the leader record for the kind-7 exit record. The helper ORs the
+ * record flags into `flags` and never clears caller pre-seed bits (capture
+ * state such as refused hooks). Tracks the kind-7 DiscoveryRecord arm in
+ * p11scope_ebpf_common; change both together. */
+struct instance_exit_summary {
+    u64 slot_plus1[INST_RECORD_SLOTS];
+    u64 flags;
+};
 _Static_assert(sizeof(struct instance_stamp) == 16, "stamp ABI");
 _Static_assert(__builtin_offsetof(struct instance_stamp, file_slot_plus1) == 12, "stamp slot");
 _Static_assert(__builtin_offsetof(struct instance_stamp, flags) == 14, "stamp flags");
@@ -146,5 +155,7 @@ _Static_assert(__builtin_offsetof(struct instance_record, journal_bootstrap) == 
 _Static_assert(sizeof(struct instance_file_key) == 16, "key ABI");
 _Static_assert(sizeof(struct instance_calib) == 40, "calib ABI");
 _Static_assert(sizeof(struct instance_counters) == 80, "counters ABI");
+_Static_assert(sizeof(struct instance_exit_summary) == 72, "exit summary ABI");
+_Static_assert(__builtin_offsetof(struct instance_exit_summary, flags) == 64, "exit summary flags");
 
 #endif

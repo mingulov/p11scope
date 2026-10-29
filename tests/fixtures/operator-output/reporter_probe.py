@@ -4,14 +4,18 @@
 The parent retains the observer pidfd/unreaped child and FilePin throughout.
 Decoder fixtures and symbol controls do not qualify installed cancellation.
 """
+import json
 import os
 from pathlib import Path
 import re
 import runpy
+import select
+import shutil
 import signal
 import struct
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[3]
 MAPPING_FROM_FD = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['mapping_from_fd']
@@ -74,15 +78,102 @@ def read_reporter_symbols(output, role='reporter'):
     return matches
 
 
+class _NmTimeoutExpired(subprocess.TimeoutExpired):
+    def __str__(self):
+        return super().__str__() + '; nm diagnostic: ' + json.dumps(self.diagnostics, sort_keys=True)
+
+
+def _nm_child(process, candidate_fd):
+    root = Path(f'/proc/{process.pid}')
+
+    def link(path):
+        try:
+            return os.readlink(path)
+        except OSError:
+            return None
+
+    def field(path, parse):
+        try:
+            with path.open() as stream:
+                return parse(stream.read(4096))
+        except (OSError, IndexError, UnicodeError):
+            return None
+
+    return dict(pid=process.pid, executable=link(root / 'exe'),
+                state=field(root / 'stat', lambda text: text.rsplit(')', 1)[1].split()[0]),
+                wchan=field(root / 'wchan', str.strip),
+                fds={name: link(root / 'fd' / str(fd)) for name, fd in
+                     (('candidate', candidate_fd), ('stdout', 1), ('stderr', 2))})
+
+
+def _nm_version(command):
+    if command is None:
+        return dict(status='unresolved', output='')
+    output = bytearray()
+    deadline = time.monotonic() + 1
+    status = 'completed'
+    try:
+        with subprocess.Popen([command, '--version'], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT) as process:
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                        status = 'timeout'
+                        break
+                    chunk = os.read(process.stdout.fileno(), min(4097 - len(output), 4096))
+                    if not chunk:
+                        try:
+                            process.wait(timeout=max(0, deadline - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            status = 'timeout'
+                        break
+                    output.extend(chunk)
+                    if len(output) > 4096:
+                        del output[4096:]
+                        status = 'output_limit'
+                        break
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+    except OSError as error:
+        return dict(status='unavailable', errno=error.errno, output='')
+    return dict(status=status, returncode=process.returncode,
+                output=output.decode('utf-8', errors='replace'))
+
+
 def resolve_role(pin, role):
     verify_path(pin)
     # Disk-backed nm output, bounded before reading into memory. Symbol names
     # come from the actual held candidate, never a source-name/offset guess.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        result = subprocess.run(['nm', '--demangle=rust', '--defined-only', '--format=posix',
-                                 f'/proc/self/fd/{pin.fd}'], pass_fds=(pin.fd,),
-                                stdout=output, stderr=errors, timeout=10)
-        if result.returncode:
+        command = ['nm', '--demangle=rust', '--defined-only', '--format=posix',
+                   f'/proc/self/fd/{pin.fd}']
+        resolved_command = shutil.which('nm')
+        with subprocess.Popen(command, pass_fds=(pin.fd,), stdout=output, stderr=errors) as process:
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired as error:
+                # Observe only the owned tool before cleanup; never read its
+                # candidate bytes or inspect the observed target process.
+                try:
+                    diagnostics = dict(resolved_command=resolved_command,
+                                       child=_nm_child(process, pin.fd))
+                finally:
+                    process.kill()
+                    process.wait()
+                diagnostics['version'] = _nm_version(resolved_command)
+                timed_out = _NmTimeoutExpired(error.cmd, error.timeout,
+                                             output=error.output, stderr=error.stderr)
+                timed_out.args = error.args
+                timed_out.diagnostics = diagnostics
+                raise timed_out from error
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+        if process.returncode:
             raise ValueError('actual candidate symbol table is unavailable')
         matches = read_reporter_symbols(output, role)
     offset = symbol_file_offset(pin.fd, matches[0])

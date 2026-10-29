@@ -656,12 +656,14 @@ def analyze(disassembly, variant):
                 found = (section, blocks[name])
         require(found is not None, "missing program " + name)
         section, lines = found
+        # Section headers keep cross-section PCs distinct; unresolved edges stay
+        # absent, as before section-aware resolution.
         calls = {
             pc: target
             for caller, _, pc, target in D.internal_call_targets(
-                split[section] + "\n" + split[".text"]
+                ENTRY.joined(split, section, ".text")
             )
-            if caller == name
+            if caller == name and target is not None
         }
         analyses[name] = GateAnalysis(section, name, lines, calls, role)
     return analyses

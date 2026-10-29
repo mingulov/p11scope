@@ -260,6 +260,22 @@ def sections(disassembly):
     return dict(zip(parts[1::2], parts[2::2]))
 
 
+def joined(split, *names):
+    """Section bodies with their headers, for section-aware call resolution.
+
+    sections() strips the header lines, but internal_call_targets keys PCs by
+    section: concatenated headerless bodies collide (e.g. two pc-0 function
+    starts) and legitimate calls resolve to None. Same bodies, labeled.
+    """
+    chunks = []
+    for name in names:
+        body = split[name]
+        if not body.endswith("\n"):
+            body += "\n"
+        chunks.append("Disassembly of section " + name + ":\n" + body)
+    return "".join(chunks)
+
+
 class Consumer:
     def __init__(self, section, name, lines, calls):
         self.section, self.name = section, name
@@ -2392,7 +2408,7 @@ def scalar_scope_flags_contract(disassembly):
     authority = [candidate for candidate in blocks
                  if re.fullmatch(r"_RNv[0-9A-Za-z]+_13p11scope_ebpf10scope_auth", candidate)]
     calls = [(pc, target) for caller, _, pc, target in D.internal_call_targets(split[".text"])
-             if caller == name]
+             if caller == name and target is not None]
     require(len(authority) == 1 and len(calls) == 1 and calls[0][0] == insns[2][0]
             and calls[0][1] == authority[0],
             "scalar scope flags one actual scope_auth callee")
@@ -2460,12 +2476,14 @@ def seeded_start_contract(disassembly):
     require(".text" in split and "uprobe" in split, "seeded START missing sections")
     blocks = D.function_blocks(split[".text"])
     memset_body_contract(blocks)
-    calls = D.internal_call_targets(split["uprobe"] + "\n" + split[".text"])
+    calls = D.internal_call_targets(joined(split, "uprobe", ".text"))
     report = {}
     for name, lines in D.function_blocks(split["uprobe"]).items():
         if not name.startswith("p11_entry") or name == "p11_entry_template_second":
             continue
-        consumer = _SeedCaller("uprobe", name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
+        # Unresolved edges stay absent, as before section-aware resolution: every
+        # gate below fails closed on a missing callee instead.
+        consumer = _SeedCaller("uprobe", name, lines, {pc: target for caller, _, pc, target in calls if caller == name and target is not None})
         if scalar_scope is not None:
             require(sum(target == scalar_scope for target in consumer.calls.values()) == 1,
                     name + ": seeded START one scalar scope call")
@@ -3266,7 +3284,8 @@ def contract(disassembly, variant):
     internal_blocks = D.function_blocks(split[".text"])
     internal_calls = {}
     for caller, _, pc, target in D.internal_call_targets(split[".text"]):
-        internal_calls.setdefault(caller, {})[pc] = target
+        if target is not None:
+            internal_calls.setdefault(caller, {})[pc] = target
     scalar_body_contract(internal_blocks, internal_calls, variant)
     expected = {"p11_entry", "p11_return"}
     if variant == "unsafe":
@@ -3275,12 +3294,12 @@ def contract(disassembly, variant):
     report = {}
     for section in ("uprobe", "uretprobe"):
         require(section in split, "missing "+section)
-        calls = D.internal_call_targets(split[section]+"\n"+split[".text"])
+        calls = D.internal_call_targets(joined(split, section, ".text"))
         for name, lines in D.function_blocks(split[section]).items():
             if not (name.startswith("p11_entry") or name == "p11_return"):
                 continue
             caller = _ReturnCaller if name == "p11_return" else _SeedCaller
-            consumer = caller(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
+            consumer = caller(section, name, lines, {pc: target for caller, _, pc, target in calls if caller == name and target is not None})
             result = consumer_contract(consumer, variant, internal_blocks)
             result["final_sinks"] = final_sink_contract(consumer, variant, result["accepted_selectors"], internal_blocks, internal_calls)
             report[name] = result

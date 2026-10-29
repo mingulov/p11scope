@@ -51,6 +51,22 @@ def sections(disassembly):
     return dict(zip(parts[1::2], parts[2::2]))
 
 
+def joined(split, *names):
+    '''Section bodies with their headers, for section-aware call resolution.
+
+    sections() strips the header lines, but internal_call_targets keys PCs by
+    section: concatenated headerless bodies collide (e.g. two pc-0 function
+    starts) and legitimate calls resolve to None. Same bodies, labeled.
+    '''
+    chunks = []
+    for name in names:
+        body = split[name]
+        if not body.endswith('\n'):
+            body += '\n'
+        chunks.append('Disassembly of section ' + name + ':\n' + body)
+    return ''.join(chunks)
+
+
 def function(text, suffix, reason):
     matches = [(n, lines) for n, lines in D.function_blocks(text).items() if n.endswith(suffix)]
     require(len(matches) == 1, reason + ': function missing/ambiguous ' + suffix)
@@ -111,8 +127,10 @@ def typed_birth(elf, secs):
     defined(elf, 'task_newtask', section, tag + 'section')
     require('.text' in secs, tag + 'link: .text missing')
     # Only this real program section and .text participate: other sections reuse PCs.
-    text = secs[section] + secs['.text']
-    calls = D.internal_call_targets(text)
+    text = joined(secs, section, '.text')
+    # Unresolved edges stay absent, as before section-aware resolution: every
+    # gate below fails closed on a missing callee instead.
+    calls = [c for c in D.internal_call_targets(text) if c[3] is not None]
     _, hook = function(secs[section], 'task_newtask', tag + 'section')
     hi, hg = D.instruction_graph(hook)
     links = {}
@@ -430,12 +448,14 @@ def interface_name(elf, secs):
     shared_section = narrow_loads(secs['.text'])
     # The reused tail contract needs return + worker + .text. No other sections
     # enter its PC lookup; .text comes last for relocations targeting .text.
-    text = return_section + shared_section
+    narrowed = {'uretprobe': return_section, '.text': shared_section}
+    text = joined(narrowed, 'uretprobe', '.text')
     require(D.interface_tail_contract(text), tag + 'tail: existing interface-tail contract')
     name, lines = function(shared_section, 'classify_direct_interface', tag + 'read')
     defined(elf, name, '.text', tag + 'read')
     insns, graph = D.instruction_graph(lines)
-    calls = [c for c in D.internal_call_targets(shared_section) if c[0] == name]
+    calls = [c for c in D.internal_call_targets(shared_section)
+             if c[0] == name and c[3] is not None]
     emitter_calls = [c for c in calls if c[3].endswith('emit_export')]
     require(len(emitter_calls) == 1, tag + 'metadata: emitter link')
     defined(elf, emitter_calls[0][3], '.text', tag + 'metadata')

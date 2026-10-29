@@ -420,55 +420,175 @@ fn pid_scope_excludes_foreign_and_reused_pid(backend: AttachBackend) -> Result<(
     Ok(())
 }
 
+/// A ticket retained from an actual drained EXEC, never from a later query.
+#[derive(Debug, Clone, Copy)]
+struct QueuedExec {
+    pid: u32,
+    hook_ns: u64,
+    ticket: DomainCookie,
+}
+
+/// Every requested exec already completed its owned READY barrier. Drain in
+/// dequeue order through an empty quantum, so duplicate or foreign records
+/// cannot stand in for the exact per-target positive counts.
+fn queued_execs(
+    capture: &mut InventoryCapture,
+    expected: &[(u32, usize)],
+) -> Result<Vec<QueuedExec>> {
+    for (index, &(pid, count)) in expected.iter().enumerate() {
+        ensure!(pid != 0 && count != 0);
+        ensure!(!expected[..index].iter().any(|&(other, _)| other == pid));
+    }
+    let mut records = Vec::new();
+    for _ in 0..64 {
+        let batch = capture.service_discovery(read_window());
+        ensure!(batch.domain == capture.domain());
+        ensure!(batch.failure.is_none(), "{batch:?}");
+        ensure!(batch.started_ns != u64::MAX && batch.finished_ns >= batch.started_ns);
+        for record in &batch.records {
+            let pid = (record.pid_tgid >> 32) as u32;
+            if record.kind != p11scope_ebpf_common::DISCOVERY_KIND_EXEC
+                || !expected.iter().any(|&(wanted, _)| wanted == pid)
+            {
+                continue;
+            }
+            ensure!(
+                (1..=p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT)
+                    .contains(&record.binding_id),
+                "owned EXEC pid={pid} has unavailable/out-of-range ticket {}",
+                record.binding_id
+            );
+            ensure!(
+                record.hook_ts_ns != 0 && record.hook_ts_ns <= batch.started_ns,
+                "owned EXEC was not queued before this drain: pid={pid} hook={} drain={}",
+                record.hook_ts_ns,
+                batch.started_ns
+            );
+            let actual = QueuedExec {
+                pid,
+                hook_ns: record.hook_ts_ns,
+                ticket: DomainCookie::new(batch.domain, record.binding_id),
+            };
+            eprintln!("C3_EXEC_RECORD backend={:?} {actual:?}", capture.backend());
+            records.push(actual);
+        }
+        if batch.drained() {
+            for &(pid, count) in expected {
+                ensure!(
+                    records.iter().filter(|record| record.pid == pid).count() == count,
+                    "wrong queued EXEC count for pid={pid}, want {count}: {records:?}"
+                );
+            }
+            return Ok(records);
+        }
+    }
+    bail!("owned EXEC lifecycle drain did not complete in 64 quanta")
+}
+
+fn exec_witnesses(capture: &mut InventoryCapture) -> Result<Vec<WitnessRow>> {
+    let (rows, batch) = read_sweep(&mut |window| capture.read_witnesses(window))?;
+    ensure!(batch.health_regression.is_none(), "{batch:?}");
+    ensure!(batch.health_unproven.is_none(), "{batch:?}");
+    ensure!(batch.lifecycle_loss.is_none(), "{batch:?}");
+    ensure!(batch.health.malformed_discovery == 0, "{batch:?}");
+    let counters = batch
+        .health
+        .discovery_counters
+        .context("EXEC control requires actual lifecycle loss counters")?;
+    ensure!(counters[0] == 0, "lifecycle ring loss: {counters:?}");
+    ensure!(capture.failure().is_none(), "{:?}", capture.failure());
+    Ok(rows)
+}
+
+fn finish_exec_capture(capture: InventoryCapture) -> Result<()> {
+    let retired = stop(capture)?;
+    ensure!(retired.failure().is_none(), "{:?}", retired.failure());
+    ensure!(
+        retired.cleanup().failures.is_empty() && retired.cleanup().retained_links == 0,
+        "{:?}",
+        retired.cleanup()
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "root-owned live BPF lane; pidfd TASK_COOKIE answer equals the row and changes on nonleader exec"]
 fn privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64()
 -> Result<()> {
+    cookie_query_matches_actual_nonleader_exec(AttachBackend::Singles)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; Multi EXEC record ticket equals the original pidfd before provider use"]
+fn privileged_inventory_capture_multi_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64()
+-> Result<()> {
+    cookie_query_matches_actual_nonleader_exec(AttachBackend::Multi)
+}
+
+fn cookie_query_matches_actual_nonleader_exec(backend: AttachBackend) -> Result<()> {
     let a = OwnedFixture::build_n(false, 4)?;
     let mut set = InventoryAttachSet::new(budget(N));
     let delta = absorb(&mut set, &[&a]);
-    let mut capture = prepare(CaptureScope::System)?;
+    let mut capture = prepare_on(CaptureScope::System, backend)?;
     let mut target = a.spawn()?;
     let pin_view = PidPin::open(target.child.id()).map_err(anyhow::Error::msg)?;
+    // The spawn happened while Prepared, before any lifecycle or entry hook.
+    ensure!(capture.phase() == CapturePhase::Prepared);
     ensure!(
         capture.query_cookie(&pin_view) == CookieQuery::NoCookie,
-        "a cookie before any instrumented call"
+        "a cookie before activation or any instrumented call"
     );
     let receipt = capture.extend(delta, &set, extend_window());
-    ensure!(receipt.attached.len() == 4, "{receipt:?}");
+    ensure!(
+        capture.backend() == backend
+            && capture.phase() == CapturePhase::Active
+            && receipt.activated_roots
+            && receipt.attached.len() == 4
+            && receipt.failed.is_empty()
+            && receipt.refused.is_none(),
+        "{receipt:?}"
+    );
     target.calls(0, 1)?;
-    let (rows, _) = read_sweep(&mut |window| capture.read_witnesses(window))?;
+    let rows = exec_witnesses(&mut capture)?;
     ensure!(rows.len() == 1, "{rows:?}");
     let first = rows[0].clone();
+    ensure!(first.host_tgid == target.child.id());
     ensure!(
         capture.query_cookie(&pin_view) == CookieQuery::Cookie(first.cookie()),
-        "cookie query differs from the row"
+        "cookie query differs from the original witness row"
     );
-    // A nonleader worker execs: the pidfd now names the successor leader,
-    // which holds no ticket in this domain.
     target.start_held_worker("NONLEADER_EXEC", 1)?;
     target.release_held_worker_exec()?;
     ensure!(
         !pin_view.original_exited().map_err(anyhow::Error::msg)?,
         "the process survives its nonleader exec"
     );
+    // The EXEC hook itself issues the successor's ticket. Its actual queued
+    // record supplies the expectation before any successor provider call.
+    let execs = queued_execs(&mut capture, &[(target.child.id(), 1)])?;
+    let actual = execs[0];
     ensure!(
-        capture.query_cookie(&pin_view) == CookieQuery::NoCookie,
-        "the old leader's cookie survived a nonleader exec"
+        actual.ticket != first.cookie(),
+        "old leader ticket reused: {actual:?}"
+    );
+    ensure!(
+        capture.query_cookie(&pin_view) == CookieQuery::Cookie(actual.ticket),
+        "original retained pidfd differs from the actual nonleader EXEC record: {actual:?}"
     );
     target.calls(0, 1)?;
-    let (rows, _) = read_sweep(&mut |window| capture.read_witnesses(window))?;
+    let rows = exec_witnesses(&mut capture)?;
     ensure!(rows.len() == 1, "{rows:?}");
     let second = rows[0].clone();
     ensure!(
         second.host_tgid == first.host_tgid
+            && second.cookie() == actual.ticket
             && second.cookie() != first.cookie()
             && second.exec_id() != first.exec_id(),
-        "successor image did not get its own cookie: {first:?} {second:?}"
+        "successor physical history differs from its original EXEC: {first:?} {second:?} {actual:?}"
     );
     ensure!(capture.query_cookie(&pin_view) == CookieQuery::Cookie(second.cookie()));
     eprintln!(
-        "C3_COOKIE pid={} first={:?} second={:?} exec {}->{}",
+        "C3_COOKIE backend={backend:?} pid={} first={:?} actual_exec={actual:?} second={:?} exec {}->{}",
         first.host_tgid,
         first.cookie(),
         second.cookie(),
@@ -477,13 +597,157 @@ fn privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleade
     );
     target.finish()?;
     ensure!(capture.query_cookie(&pin_view) == CookieQuery::Exited);
-    let retired = stop(capture)?;
+    finish_exec_capture(capture)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; leader EXEC tickets survive queued delayed drain and match the original pidfd"]
+fn privileged_inventory_capture_leader_exec_ticket_and_delayed_drain_lp64() -> Result<()> {
+    leader_exec_ticket_and_delayed_drain(AttachBackend::Singles)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; Multi leader EXEC tickets survive queued delayed drain and match the original pidfd"]
+fn privileged_inventory_capture_multi_leader_exec_ticket_and_delayed_drain_lp64() -> Result<()> {
+    leader_exec_ticket_and_delayed_drain(AttachBackend::Multi)
+}
+
+fn leader_exec_ticket_and_delayed_drain(backend: AttachBackend) -> Result<()> {
+    let fixture = OwnedFixture::build_n(false, 4)?;
+    let mut set = InventoryAttachSet::new(budget(N));
+    let delta = absorb(&mut set, &[&fixture]);
+    let mut capture = prepare_on(CaptureScope::System, backend)?;
+    let mut target = fixture.spawn()?;
+    let pin = PidPin::open(target.child.id()).map_err(anyhow::Error::msg)?;
+    ensure!(capture.phase() == CapturePhase::Prepared);
+    ensure!(capture.query_cookie(&pin) == CookieQuery::NoCookie);
+    let receipt = capture.extend(delta, &set, extend_window());
     ensure!(
-        retired.cleanup().failures.is_empty(),
-        "{:?}",
-        retired.cleanup()
+        capture.backend() == backend
+            && receipt.activated_roots
+            && receipt.attached.len() == 4
+            && receipt.failed.is_empty()
+            && receipt.refused.is_none(),
+        "{receipt:?}"
     );
-    Ok(())
+    target.calls(0, 1)?;
+    let rows = exec_witnesses(&mut capture)?;
+    ensure!(
+        rows.len() == 1 && rows[0].host_tgid == target.child.id(),
+        "{rows:?}"
+    );
+    let original = rows[0].clone();
+    ensure!(capture.query_cookie(&pin) == CookieQuery::Cookie(original.cookie()));
+    let mut previous_image = original.exec_id();
+    let mut previous_hook = 0;
+    // First one completed leader exec; then two completed execs with no
+    // intervening drain or provider call. Each original record must survive.
+    for queued in [1, 2] {
+        for _ in 0..queued {
+            target.exec_self()?;
+        }
+        ensure!(!pin.original_exited().map_err(anyhow::Error::msg)?);
+        let execs = queued_execs(&mut capture, &[(target.child.id(), queued)])?;
+        for actual in &execs {
+            ensure!(
+                actual.hook_ns > previous_hook,
+                "EXEC dequeue order: {execs:?}"
+            );
+            ensure!(
+                actual.ticket == original.cookie(),
+                "leader ticket changed: {actual:?}"
+            );
+            previous_hook = actual.hook_ns;
+        }
+        ensure!(capture.query_cookie(&pin) == CookieQuery::Cookie(execs[0].ticket));
+        target.calls(0, 1)?;
+        let rows = exec_witnesses(&mut capture)?;
+        ensure!(
+            rows.len() == 1
+                && rows[0].host_tgid == target.child.id()
+                && rows[0].cookie() == execs[0].ticket
+                && rows[0].exec_id() != previous_image,
+            "first post-EXEC call differs from its queued record: {rows:?} {execs:?}"
+        );
+        previous_image = rows[0].exec_id();
+    }
+    eprintln!(
+        "C3_EXEC_LEADER backend={backend:?} pid={} actual_records=3 delayed_records=2 provider_rows=3 ticket={:?}",
+        target.child.id(),
+        original.cookie()
+    );
+    target.finish()?;
+    ensure!(capture.query_cookie(&pin) == CookieQuery::Exited);
+    finish_exec_capture(capture)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; post-activation EXEC allocates distinct owned tickets without any provider call"]
+fn privileged_inventory_capture_active_spawn_exec_ticket_without_provider_call_lp64() -> Result<()>
+{
+    active_spawn_exec_ticket_without_provider_call(AttachBackend::Singles)
+}
+
+#[test]
+#[ignore = "root-owned live BPF lane; Multi post-activation EXEC allocates distinct owned tickets without any provider call"]
+fn privileged_inventory_capture_multi_active_spawn_exec_ticket_without_provider_call_lp64()
+-> Result<()> {
+    active_spawn_exec_ticket_without_provider_call(AttachBackend::Multi)
+}
+
+fn active_spawn_exec_ticket_without_provider_call(backend: AttachBackend) -> Result<()> {
+    let fixture = OwnedFixture::build_n(false, 4)?;
+    let mut set = InventoryAttachSet::new(budget(N));
+    let delta = absorb(&mut set, &[&fixture]);
+    let mut capture = prepare_on(CaptureScope::System, backend)?;
+    let receipt = capture.extend(delta, &set, extend_window());
+    ensure!(
+        capture.backend() == backend
+            && capture.phase() == CapturePhase::Active
+            && receipt.activated_roots
+            && receipt.attached.len() == 4
+            && receipt.failed.is_empty()
+            && receipt.refused.is_none(),
+        "{receipt:?}"
+    );
+    // Neither child calls a provider. Each spawn's real EXEC must provide
+    // its own record; the other child's event cannot satisfy its positive.
+    let mut first = fixture.spawn()?;
+    let first_pin = PidPin::open(first.child.id()).map_err(anyhow::Error::msg)?;
+    let mut second = fixture.spawn()?;
+    let second_pin = PidPin::open(second.child.id()).map_err(anyhow::Error::msg)?;
+    ensure!(first.child.id() != second.child.id());
+    let execs = queued_execs(
+        &mut capture,
+        &[(first.child.id(), 1), (second.child.id(), 1)],
+    )?;
+    let first_exec = execs
+        .iter()
+        .find(|record| record.pid == first.child.id())
+        .context("first owned EXEC")?;
+    let second_exec = execs
+        .iter()
+        .find(|record| record.pid == second.child.id())
+        .context("second owned EXEC")?;
+    ensure!(
+        first_exec.ticket != second_exec.ticket,
+        "distinct tasks shared a ticket: {execs:?}"
+    );
+    ensure!(capture.query_cookie(&first_pin) == CookieQuery::Cookie(first_exec.ticket));
+    ensure!(capture.query_cookie(&second_pin) == CookieQuery::Cookie(second_exec.ticket));
+    let rows = exec_witnesses(&mut capture)?;
+    ensure!(
+        rows.is_empty(),
+        "EXEC-only spawns fabricated provider rows: {rows:?}"
+    );
+    eprintln!(
+        "C3_EXEC_NO_PROVIDER backend={backend:?} actual_records=2 provider_rows=0 first={first_exec:?} second={second_exec:?}"
+    );
+    first.finish()?;
+    second.finish()?;
+    ensure!(capture.query_cookie(&first_pin) == CookieQuery::Exited);
+    ensure!(capture.query_cookie(&second_pin) == CookieQuery::Exited);
+    finish_exec_capture(capture)
 }
 
 #[test]

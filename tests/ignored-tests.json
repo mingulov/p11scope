@@ -494,6 +494,12 @@
     },
     {
       "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_active_spawn_exec_ticket_without_provider_call_lp64",
+      "reason": "root-owned live BPF lane; post-activation EXEC allocates distinct owned tickets without any provider call",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
       "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64",
       "reason": "root-owned live BPF lane; pidfd TASK_COOKIE answer equals the row and changes on nonleader exec",
       "cell": "privileged"
@@ -502,6 +508,30 @@
       "file": "src/attach/inventory/capture/privileged_tests.rs",
       "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64",
       "reason": "root-owned live BPF lane; a provider extended after activation is witnessed only after extend",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_leader_exec_ticket_and_delayed_drain_lp64",
+      "reason": "root-owned live BPF lane; leader EXEC tickets survive queued delayed drain and match the original pidfd",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_active_spawn_exec_ticket_without_provider_call_lp64",
+      "reason": "root-owned live BPF lane; Multi post-activation EXEC allocates distinct owned tickets without any provider call",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64",
+      "reason": "root-owned live BPF lane; Multi EXEC record ticket equals the original pidfd before provider use",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/capture/privileged_tests.rs",
+      "path": "attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_leader_exec_ticket_and_delayed_drain_lp64",
+      "reason": "root-owned live BPF lane; Multi leader EXEC tickets survive queued delayed drain and match the original pidfd",
       "cell": "privileged"
     },
     {

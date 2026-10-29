@@ -176,8 +176,13 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 # pid filter plus the in-BPF guard); where the pid-filter probe fails (5.15)
 # it asserts the PID-scoped Multi refusal instead; the leader-exit probe
 # again under uprobe-multi (or the same refusal).
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_active_spawn_exec_ticket_without_provider_call_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_leader_exec_ticket_and_delayed_drain_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_active_spawn_exec_ticket_without_provider_call_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_leader_exec_ticket_and_delayed_drain_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64

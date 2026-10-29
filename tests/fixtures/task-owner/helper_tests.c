@@ -2,6 +2,35 @@
  * Only kernel helper operations and atomic interference are injected; there is
  * no second owner-accounting algorithm. */
 #include "task_owner.h"
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* This owner-only fixture counts the journal call boundary; the journal
+ * fixture separately executes the actual producer and side-map body. */
+static unsigned journal_settle_calls;
+static struct owner_start_key journal_settle_key;
+static u32 journal_settle_reason;
+static unsigned journal_finish_calls;
+static u32 journal_finish_committed;
+static u32 journal_prepare_state = JOURNAL_SETTLE_SILENT;
+static void record_journal_prepare(const struct owner_start_key *key, u32 reason)
+{
+    journal_settle_calls++;
+    journal_settle_key = *key;
+    journal_settle_reason = reason;
+}
+void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                                struct journal_settle_words *out)
+{
+    record_journal_prepare(key, reason);
+    __builtin_memset(out, 0, sizeof(*out));
+    out->state = journal_prepare_state;
+}
+void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed)
+{
+    (void)words;
+    journal_finish_calls++;
+    journal_finish_committed = cleanup_committed;
+}
+#endif
 #if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
 #define P11SCOPE_HOST_OWNER_LOOP 1
 #endif
@@ -381,6 +410,14 @@ u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
 #endif
 static void reset(void)
 {
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+    journal_settle_calls = 0;
+    memset(&journal_settle_key, 0, sizeof(journal_settle_key));
+    journal_settle_reason = ~0U;
+    journal_finish_calls = 0;
+    journal_finish_committed = ~0U;
+    journal_prepare_state = JOURNAL_SETTLE_SILENT;
+#endif
     memset(&ctl, 0, sizeof(ctl)); ctl.limit = OWNER_LIMIT;
     memset(owners, 0, sizeof(owners)); memset(installed, 0, sizeof(installed));
     memset(rows, 0, sizeof(rows)); memset(value, 0, sizeof(value));
@@ -2792,9 +2829,67 @@ int main(void)
     puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
 }
 #else
+#ifdef P11SCOPE_OBJECT_JOURNAL
+static void journal_removal_hook(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 5 };
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    owners[0].journal_thread = 7;
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(journal_settle_calls == 1 && journal_settle_reason == 0);
+    assert(journal_finish_calls == 1 && journal_finish_committed == 1);
+    assert(journal_settle_key.pid_tgid == key.pid_tgid && journal_settle_key.slot == key.slot);
+    assert(!row(&START, &key) && !ctl.outstanding);
+    for (u32 reason = 1; reason <= 9; reason++) {
+        reset();
+        assert(!p11_owner_start_insert(&key, value));
+        owners[0].journal_thread = 7;
+        assert(!p11_owner_start_remove_reason(&key, 1, reason));
+        assert(journal_settle_calls == 1 && journal_settle_reason == reason);
+        assert(journal_finish_calls == 1 && journal_finish_committed == 1);
+        assert(!row(&START, &key) && !ctl.outstanding);
+    }
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(!journal_settle_calls && !journal_finish_calls);
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    owners[0].journal_thread = 7;
+    assert(p11_owner_start_insert(&key, value));
+    assert(journal_settle_calls == 1 && journal_settle_reason == 1);
+    assert(journal_finish_calls == 1 && journal_finish_committed == 1);
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    owners[0].journal_thread = 7;
+    assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+    assert(journal_settle_calls == 1 && journal_settle_reason == 6);
+    assert(journal_finish_calls == 1 && journal_finish_committed == 1);
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    owners[0].journal_thread = 7;
+    journal_prepare_state = JOURNAL_SETTLE_BLOCKED;
+    assert(p11_owner_start_remove(&key, 1));
+    assert(row(&START, &key) && ctl.outstanding == 1 && !journal_finish_calls);
+    journal_prepare_state = JOURNAL_SETTLE_SILENT;
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(journal_settle_calls == 2 && journal_finish_calls == 1);
+    reset();
+    assert(!p11_owner_start_insert(&key, value));
+    owners[0].journal_thread = 7;
+    fail_start_delete = 1;
+    assert(p11_owner_start_remove(&key, 1));
+    assert(journal_finish_calls == 1 && journal_finish_committed == 0);
+    assert(row(&START, &key) && ctl.outstanding == 1);
+}
+#endif
 int main(int argc, char **argv)
 {
     if (argc == 2) {
+#ifdef P11SCOPE_OBJECT_JOURNAL
+        if (!strcmp(argv[1], "journal_removal_hook")) { journal_removal_hook(); return 0; }
+#endif
         if (!strcmp(argv[1], "classifier")) classifier();
         else if (!strcmp(argv[1], "transactions")) transactions();
         else if (!strcmp(argv[1], "directory")) directory();

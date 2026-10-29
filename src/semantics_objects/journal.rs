@@ -24,6 +24,8 @@
 pub(crate) mod joint_audit;
 #[path = "joint_driver.rs"]
 pub(crate) mod joint_driver;
+#[cfg(test)]
+mod native_producer_tests;
 mod reservations;
 mod seal_replay;
 use seal_replay::ReplayPreparation;

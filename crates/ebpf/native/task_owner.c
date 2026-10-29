@@ -560,10 +560,13 @@ __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key
 }
 
 static __always_inline long remove_start(struct owner_control *ctl, struct thread_owner *owner,
-                                         const struct owner_start_key *key)
+                                         const struct owner_start_key *key, u32 reason)
 {
     void *start_value = owner_map_lookup(&START, key);
     int side;
+#ifdef P11SCOPE_OBJECT_JOURNAL
+    struct journal_settle_words journal;
+#endif
     if (!start_value) {
         bookkeeping(ctl, OWNER_START_ROW_MISSING);
         return -1;
@@ -572,19 +575,40 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
         bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return -1;
     }
+    (void)reason;
+#ifdef P11SCOPE_OBJECT_JOURNAL
+    if (owner->journal_thread) {
+        p11_journal_settle_prepare(key, reason, &journal);
+        if (journal.state == JOURNAL_SETTLE_BLOCKED)
+            return -1;
+    }
+#endif
     /* Subordinate custody retires with its START: scrub the side value,
      * delete it, then delete START and refund below. A contradicted side
      * row still retires its START (no orphaned required rows) but reports
      * failure; only a failed side deletion keeps START for retry. */
     side = object_side_for_remove(ctl, start_value, key);
-    if (side < 0)
+    if (side < 0) {
+#ifdef P11SCOPE_OBJECT_JOURNAL
+        if (owner->journal_thread)
+            p11_journal_settle_finish(&journal, 0);
+#endif
         return -1;
+    }
     long rc = owner_map_delete(&START, key);
     if (rc) {
         poison(ctl, OWNER_STATE_DELETE_FAILED);
+#ifdef P11SCOPE_OBJECT_JOURNAL
+        if (owner->journal_thread)
+            p11_journal_settle_finish(&journal, 0);
+#endif
         return rc;
     }
     owner->start_count--;
+#ifdef P11SCOPE_OBJECT_JOURNAL
+    if (owner->journal_thread)
+        p11_journal_settle_finish(&journal, side == 0);
+#endif
     /* Branchless nonzero-to--1: (s|-s) has bit63 set exactly when s != 0.
      * All-unsigned, so no overflow UB; a comparison would compile to a jump. */
     {
@@ -593,7 +617,8 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
     }
 }
 
-__attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_key *key, u32 required)
+static __always_inline long start_remove_reason(const struct owner_start_key *key, u32 required,
+                                                 u32 reason)
 {
     struct owner_control *ctl = control();
     if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)
@@ -609,7 +634,7 @@ __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_k
         bookkeeping(ctl, OWNER_START_KEY_MISMATCH);
         return -1;
     }
-    long rc = remove_start(ctl, owner, key);
+    long rc = remove_start(ctl, owner, key, reason);
     if (rc) {
         /* A contradicted side row still retired its START above; settle an
          * emptied lease while reporting the failure. A kept row (a failed
@@ -621,6 +646,19 @@ __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_k
         return -1;
     return rc;
 }
+
+__attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_key *key, u32 required)
+{
+    return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);
+}
+
+#ifdef P11SCOPE_OBJECT_JOURNAL
+__attribute__((noinline)) long p11_owner_start_remove_reason(const struct owner_start_key *key,
+                                                            u32 required, u32 reason)
+{
+    return start_remove_reason(key, required, reason);
+}
+#endif
 
 __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_key *key, const void *value)
 {
@@ -637,7 +675,7 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
         /* At the slot bound a nested entry still invalidates its own old
          * invocation. Do not leave it available for an ambiguous return. */
         count(&ctl->admission_failures);
-        remove_start(ctl, owner, key);
+        remove_start(ctl, owner, key, P11_OWNER_START_REASON_COLLISION);
         return -1;
     }
     owner->start_count++;
@@ -649,7 +687,7 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
     /* NOEXIST ambiguity invalidates only a record under this physical owner.
      * A collision with an empty owner is uncertainty, never numeric authority. */
     if (owner_map_lookup(&START, key))
-        remove_start(ctl, owner, key);
+        remove_start(ctl, owner, key, P11_OWNER_START_REASON_COLLISION);
     release_empty(ctl, owner);
     return rc;
 }
@@ -678,7 +716,7 @@ static __always_inline void *begin_owned_start(const struct owner_start_key *key
     }
     if (owner->start_count >= P11SCOPE_OWNER_SLOT_BOUND) {
         count(&ctl->admission_failures);
-        remove_start(ctl, owner, key);
+        remove_start(ctl, owner, key, P11_OWNER_START_REASON_COLLISION);
         return (void *)0;
     }
     zero = owner_map_lookup(&OBJECT_ZERO, &zero_key);
@@ -701,7 +739,7 @@ static __always_inline void *begin_owned_start(const struct owner_start_key *key
         count(&ctl->admission_failures);
         /* Preserve the existing physical-owner NOEXIST ambiguity rule. */
         if (owner_map_lookup(&START, key))
-            remove_start(ctl, owner, key);
+            remove_start(ctl, owner, key, P11_OWNER_START_REASON_COLLISION);
         release_empty(ctl, owner);
         return (void *)0;
     }
@@ -987,7 +1025,8 @@ static long owner_cleanup_start_callback(u32 slot, void *opaque)
     }
     context->key.slot = slot;
     if (owner_map_lookup(&START, &context->key)) {
-        long rc = remove_start(context->ctl, context->owner, &context->key);
+        long rc = remove_start(context->ctl, context->owner, &context->key,
+                               P11_OWNER_START_REASON_EXEC_EXIT);
         /* Preserve the existing remove -> readback -> abandoned count ->
          * error-release order. In particular, cleanup works after poison;
          * the healthy-gated public remove wrapper cannot replace this leg. */
@@ -1101,7 +1140,7 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
     for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         start.slot = i;
         if (owner_map_lookup(&START, &start)) {
-            long rc = remove_start(ctl, owner, &start);
+            long rc = remove_start(ctl, owner, &start, P11_OWNER_START_REASON_EXEC_EXIT);
             /* Retirement is tested directly (no materialized flag): one
              * jump per slot. No carried accumulator: per-iteration
              * scalars multiply verifier states instead. */

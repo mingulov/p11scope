@@ -91,6 +91,30 @@ struct owner_control {
     u64 abandoned_discovery;
 };
 struct owner_start_key { u64 pid_tgid; u32 slot; u32 pad; };
+#define P11_OWNER_START_REASON_RETURN 0U
+#define P11_OWNER_START_REASON_COLLISION 1U
+#define P11_OWNER_START_REASON_EXEC_EXIT 6U
+#ifndef P11SCOPE_INVENTORY_ONLY
+#define JOURNAL_SETTLE_EMPTY 0U
+#define JOURNAL_SETTLE_SILENT 1U
+#define JOURNAL_SETTLE_ABANDON 2U
+#define JOURNAL_SETTLE_BLOCKED 3U
+struct journal_settle_words {
+    unsigned char record[64];
+    u32 state;
+    u32 pad;
+};
+_Static_assert(sizeof(struct journal_settle_words) == 72, "journal settle workspace ABI");
+_Static_assert(__builtin_offsetof(struct journal_settle_words, state) == 64, "settle state");
+#endif
+#if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
+/* Optional journal settlement adds no scalar result or new failure branch
+ * to ordinary physical cleanup. Existing exported signatures stay intact. */
+void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                                struct journal_settle_words *out);
+void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
+long p11_owner_start_remove_reason(const struct owner_start_key *key, u32 required, u32 reason);
+#endif
 struct owner_discovery_key { u64 pid_tgid; u64 cookie; u64 domain; };
 #ifdef P11SCOPE_INVENTORY_ONLY
 _Static_assert(sizeof(struct thread_owner) == 544, "owner ABI");

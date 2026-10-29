@@ -278,8 +278,8 @@ class DiscoveryFlow(unittest.TestCase):
              ('r1 = 0x10', 'r2 = r4', 'r2 &= 0xff'), 6, '@classifier'),
         ]
         for variant, elf, disassembly in self.objects:
-            text = C.sections(disassembly)
-            text = text['uretprobe'] + text['.text']
+            split = C.sections(disassembly)
+            text = split['uretprobe'] + split['.text']
             for label, function, sequence, offset, replacement in cases:
                 with self.subTest(variant=variant, mutation=label):
                     name, lines = C.function(text, function, 'fixture')
@@ -293,8 +293,9 @@ class DiscoveryFlow(unittest.TestCase):
                             'r1 = *(u64 *)(r10 - 0x58)', 'r5 = r8', 'r8 = r9'))[0]
                         replacement = f'goto {target - site[0] - 1:+#x}'
                     elif replacement == '@classifier':
-                        targets = [pc for caller, _, pc, target in C.D.internal_call_targets(text)
-                                   if caller == name and target.endswith('classify_direct_interface')]
+                        links = C.D.internal_call_targets(C.joined(split, 'uretprobe', '.text'))
+                        targets = [pc for caller, _, pc, target in links
+                                   if caller == name and target is not None and target.endswith('classify_direct_interface')]
                         self.assertEqual(len(targets), 1)
                         replacement = site[1].split('goto ')[0] + f'goto {targets[0] - site[0] - 1:+#x}'
                     old, new = instruction_change(lines, site, replacement)
@@ -606,7 +607,7 @@ class DiscoveryFlow(unittest.TestCase):
                 with self.subTest(variant=variant, mutation=label):
                     if old == '@propagation-call':
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_root_propagate_thread']
                         self.assertEqual(len(targets), 1)
                         hook = C.D.function_blocks(secs['tp_btf/task_newtask'])['task_newtask']
@@ -616,7 +617,7 @@ class DiscoveryFlow(unittest.TestCase):
                         # located by the call, not by a code-size-dependent
                         # branch displacement.
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_fork_allowed']
                         self.assertEqual(len(targets), 1)
                         _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')
@@ -630,7 +631,7 @@ class DiscoveryFlow(unittest.TestCase):
                             'if r0 == 0x0 goto', new))
                     elif old == '@flags-restore':
                         secs = C.sections(disassembly)
-                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        links = C.D.internal_call_targets(C.joined(secs, 'tp_btf/task_newtask', '.text'))
                         targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_emit_fork']
                         self.assertEqual(len(targets), 1)
                         _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')

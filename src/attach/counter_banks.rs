@@ -4619,15 +4619,27 @@ impl DetailWindowReservation {
     /// adapter's own binding checks, so a refused bind still parks a
     /// closeable `Unactivated` window instead of dropping the lease.
     pub(crate) fn bind_generation(self, generation: u64) -> CounterDetailWindow {
-        let _ = generation;
-        todo!("6.15b RED: bind_generation")
+        CounterDetailWindow {
+            before: self.before,
+            selected: self.selected,
+            physical: self.physical,
+            detail_generation: generation,
+            child_keys: self.child_keys,
+            child_pins: self.child_pins,
+            broad: self.broad,
+            _charge: self._charge,
+        }
     }
 
     /// Abandon a never-bound reservation (cancel / preparation
     /// failure / refused reselect): return the held selection for the
     /// ledger and release the charge. No lineage: nothing ran.
     pub(crate) fn abandon(self) -> ReservationAbandonment {
-        todo!("6.15b RED: abandon")
+        ReservationAbandonment {
+            before: self.before,
+            selected: self.selected,
+            physical: self.physical,
+        }
     }
 }
 
@@ -4685,7 +4697,42 @@ impl CounterDetailWindow {
     /// — no live directory, no stopped flag) the close discloses as
     /// drift, or the lifecycle's cancel check owns; see the adapter.
     pub(crate) fn validate_live_match(&self) -> Result<(), DetailToggleRefusal> {
-        todo!("6.15b RED: validate_live_match")
+        // Broad side first: the retained share live-checks its shared
+        // file handle, exactly as the reserve-time held target did.
+        if self.broad.check_unchanged() != Ok(true) {
+            return Err(DetailToggleRefusal::Changed);
+        }
+        // Per retained child slot: unchanged, then same retained
+        // object (a changed same-file digest reports Changed;
+        // another file is Foreign) — the reserve checks, re-run.
+        let mut covered = false;
+        for key in &self.child_keys {
+            if self.child_pins.object_unchanged(key.object) != Ok(true) {
+                return Err(DetailToggleRefusal::Changed);
+            }
+            if !self.broad.same_object_as(&self.child_pins, key.object) {
+                if self.broad.same_kernel_file_as(&self.child_pins, key.object) {
+                    return Err(DetailToggleRefusal::Changed);
+                }
+                return Err(DetailToggleRefusal::Foreign);
+            }
+            covered |= key.file_offset == self.physical.file_offset;
+        }
+        if !covered {
+            return Err(DetailToggleRefusal::Foreign);
+        }
+        // FD headroom re-check (admission only; the byte charge is
+        // already held from reserve).
+        let links = self
+            .child_keys
+            .len()
+            .checked_mul(DETAIL_CHILD_LINK_FDS_PER_ENDPOINT)
+            .ok_or(DetailToggleRefusal::Budget)?;
+        let fds = links
+            .checked_add(DETAIL_CHILD_FD_SLACK)
+            .ok_or(DetailToggleRefusal::Budget)?;
+        admit_detail_child_fds(fds, read_fd_snapshot)?;
+        Ok(())
     }
 
     /// Close the window against live broad banks: record the after-mark
@@ -4778,16 +4825,132 @@ impl CounterBanks {
         read_seq_before: u64,
         reserve: &SemanticResourceReserver,
     ) -> Result<DetailWindowReservation, DetailToggleRefusal> {
-        let _ = (
-            broad,
-            plan,
-            objects,
+        let directory = self
+            .directory
+            .lock()
+            .map_err(|_| DetailToggleRefusal::Quarantined)?;
+        if directory.quarantined {
+            return Err(DetailToggleRefusal::Quarantined);
+        }
+        if broad.stopped {
+            return Err(DetailToggleRefusal::BroadStopping);
+        }
+        if child_slots.is_empty() || child_slots.len() > MAX_SLOTS as usize {
+            return Err(DetailToggleRefusal::ChildShape);
+        }
+        let Some(slot) = plan.slots.get(selected as usize) else {
+            return Err(DetailToggleRefusal::NotPublished);
+        };
+        let physical = physical(slot);
+        let Some(position) = directory.positions.get(selected as usize) else {
+            return Err(DetailToggleRefusal::NotPublished);
+        };
+        if !matches!(position.state, PositionState::Published(_)) || position.key != physical {
+            return Err(DetailToggleRefusal::NotPublished);
+        }
+        let custody = self
+            .keepalive
+            .custody
+            .lock()
+            .map_err(|_| DetailToggleRefusal::Quarantined)?;
+        let Some(held) = custody
+            .providers
+            .get(selected as usize)
+            .and_then(Option::as_ref)
+        else {
+            return Err(DetailToggleRefusal::NotPublished);
+        };
+        // The child must cover the selected endpoint: its offset on the
+        // broad retained kernel file.
+        let covered = child_slots.iter().any(|candidate| {
+            candidate.file_offset == physical.file_offset
+                && held.same_kernel_file_as(objects, candidate.object)
+        });
+        if !covered {
+            return Err(DetailToggleRefusal::Foreign);
+        }
+        if held.check_unchanged() != Ok(true) {
+            return Err(DetailToggleRefusal::Changed);
+        }
+        // Identity per child slot: unchanged, then same-object (a changed
+        // same-file digest reports Changed; another file is Foreign).
+        for candidate in child_slots {
+            if objects.object_unchanged(candidate.object) != Ok(true) {
+                return Err(DetailToggleRefusal::Changed);
+            }
+            if !held.same_object_as(objects, candidate.object) {
+                if held.same_kernel_file_as(objects, candidate.object) {
+                    return Err(DetailToggleRefusal::Changed);
+                }
+                return Err(DetailToggleRefusal::Foreign);
+            }
+        }
+        let cpus = aya::util::nr_cpus().map_err(|_| DetailToggleRefusal::Budget)?;
+        let envelope = detail_child_envelope(child_slots, objects, cpus)?;
+        // Retention for the bind-time re-validation: the child slot
+        // keys, one pin-store clone, one broad share, plus slop.
+        // Sized here (from the live inputs), charged with the
+        // envelope in one lease, cloned after the charge lands.
+        let mut distinct = std::collections::BTreeSet::new();
+        for candidate in child_slots {
+            distinct.insert(candidate.object);
+        }
+        let mut retention = child_slots
+            .len()
+            .checked_mul(size_of::<AttachKey>())
+            .ok_or(DetailToggleRefusal::Budget)?;
+        for id in distinct {
+            let copy = objects
+                .retained_target_copy_allocation_charge(id)
+                .ok_or(DetailToggleRefusal::Budget)?;
+            retention = retention
+                .checked_add(copy)
+                .ok_or(DetailToggleRefusal::Budget)?;
+        }
+        retention = retention
+            .checked_add(
+                held.retained_copy_allocation_charge()
+                    .ok_or(DetailToggleRefusal::Budget)?,
+            )
+            .ok_or(DetailToggleRefusal::Budget)?;
+        retention = retention
+            .checked_add(3 * OWNED_ALLOCATION_PADDING)
+            .ok_or(DetailToggleRefusal::Budget)?;
+        let charge = reserve
+            .reserve(
+                envelope
+                    .bytes
+                    .checked_add(retention)
+                    .ok_or(DetailToggleRefusal::Budget)?,
+            )
+            .map_err(|_| DetailToggleRefusal::Budget)?;
+        admit_detail_child_fds(envelope.file_descriptors, read_fd_snapshot)?;
+        let before = BroadReadMark {
+            seq: read_seq_before,
+            generation: broad.generation,
+            indices: directory.published_indices().collect(),
+            bank_ids: custody
+                .banks
+                .iter()
+                .enumerate()
+                .filter_map(|(bank, handle)| handle.as_ref().map(|held| (bank as u32, held.id)))
+                .collect(),
+            transaction: directory.next_transaction,
+        };
+        let mut child_keys = Vec::with_capacity(child_slots.len());
+        child_keys.extend(child_slots.iter().map(|candidate| AttachKey {
+            object: candidate.object,
+            file_offset: candidate.file_offset,
+        }));
+        Ok(DetailWindowReservation {
+            before,
             selected,
-            child_slots,
-            read_seq_before,
-            reserve,
-        );
-        todo!("6.15b RED: reserve_detail_window")
+            physical,
+            child_keys,
+            child_pins: objects.clone(),
+            broad: held.share(),
+            _charge: charge,
+        })
     }
 }
 
@@ -12703,7 +12866,20 @@ pub(crate) mod tests {
             (41, 87)
         );
         // Forged foreign retention: the child clone names another
-        // file than the broad share was proved against.
+        // file than the broad share was proved against. Fresh
+        // fixtures: the scene above rewrote its provider file.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh_path = toggle_provider(&fresh_dir, "provider.so", b"toggle bind fresh bytes");
+        let fresh_objects = crate::discovery::identity::test_fixture::real_scan_pin(
+            &fresh_path,
+            None,
+            1,
+            "toggle-fresh",
+        );
+        let fresh_object = fresh_objects.pinned().next().unwrap().id;
+        let fresh_pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut fresh_history = toggle_object_plan(fresh_object, 513);
+        let fresh_banks = stage_toggle_banks(&fresh_pool, &fresh_objects, &mut fresh_history);
         let foreign_dir = tempfile::tempdir().unwrap();
         let foreign_path = toggle_provider(
             &foreign_dir,
@@ -12716,18 +12892,19 @@ pub(crate) mod tests {
             1,
             "toggle-foreign",
         );
-        let reservation = banks
+        let fresh_slots = fresh_history.slots[9..10].to_vec();
+        let reservation = fresh_banks
             .reserve_detail_window(
                 super::BroadToggleFacts {
                     generation: NonZeroU64::new(7).unwrap(),
                     stopped: false,
                 },
-                &history,
-                &objects,
+                &fresh_history,
+                &fresh_objects,
                 9,
-                history.slots[9..10].to_vec().as_slice(),
+                fresh_slots.as_slice(),
                 41,
-                &pool.reserver(),
+                &fresh_pool.reserver(),
             )
             .unwrap();
         let window = reservation.bind_generation(9);
@@ -12744,11 +12921,11 @@ pub(crate) mod tests {
             detail_generation: window.detail_generation(),
             child_keys: vec![foreign_key],
             child_pins: foreign_objects,
-            broad: banks.keepalive.custody.lock().unwrap().providers[9]
+            broad: fresh_banks.keepalive.custody.lock().unwrap().providers[9]
                 .as_ref()
                 .unwrap()
                 .share(),
-            _charge: pool.reserver().reserve(1).unwrap(),
+            _charge: fresh_pool.reserver().reserve(1).unwrap(),
         };
         drop(window);
         assert_eq!(
@@ -12756,7 +12933,9 @@ pub(crate) mod tests {
             super::DetailToggleRefusal::Foreign,
             "a child naming another file refuses Foreign at bind"
         );
-        let (lineage, _) = forged.close(&banks, NonZeroU64::new(7).unwrap(), 87).unwrap();
+        let (lineage, _) = forged
+            .close(&fresh_banks, NonZeroU64::new(7).unwrap(), 87)
+            .unwrap();
         assert_eq!(
             (lineage.broad_read_seq_before, lineage.broad_read_seq_after),
             (41, 87),

@@ -6762,6 +6762,205 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     assert_eq!(ending.finish.as_ref().unwrap().stops, 1);
 }
 
+/// Keep the original A BEGIN unfinished while the same image's B has a real
+/// END. The next service call is the first visit to this original Audited
+/// frame: its actual target snapshot has not been bound yet.
+fn machine_with_first_future_consumer() -> (MachineScene, [u8; 224], [u8; 632], Vec<u64>) {
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let before = fixture.reduced();
+    let pid = std::process::id();
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.reach_phase("Audited");
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((0, 0, 0)),
+        "the real frame is retained before its first publication poll binds targets"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    (fixture, begin_a, end_a, before)
+}
+
+fn finish_machine_future_consumer(
+    fixture: &mut MachineScene,
+    begin_a: [u8; 224],
+    end_a: [u8; 632],
+    before: &[u64],
+) {
+    let native_a = (u64::from(std::process::id()), 3);
+    let audit = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    fixture.published();
+    assert_eq!(fixture.reduced(), before);
+    {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.reference_h3_audit_state(), audit);
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test(native_a),
+            Some(begin_a)
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            1
+        );
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        assert_eq!((roles[0], roles[1], roles[3]), (0, 2, 1));
+    }
+    fixture.scene.drain.source_mut().push_record(end_a.to_vec());
+    fixture.published();
+    assert_eq!(
+        fixture.reduced(),
+        before.iter().map(|count| count + 1).collect::<Vec<_>>()
+    );
+    {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.reference_h3_audit_state(), (audit.0 + 1, false));
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test()
+                .0,
+            0
+        );
+        assert!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .retained_start_bytes_for_test(native_a)
+                .is_none()
+        );
+        let roles = coordinator.joint_capture().ledger().roles_for_test();
+        assert_eq!((roles[0], roles[1], roles[3]), (0, 0, 0));
+        let ids = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| {
+                assert_eq!(record.api_returns, Some(2));
+                let s1 = record.semantics.as_ref().unwrap();
+                assert_eq!((s1.calls(), s1.started(), s1.completed()), (2, 1, 0));
+                record.id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert_live_sign_associations(coordinator.registry(), &ids);
+    }
+    // Complete both actual operations, so their association leases have an
+    // original terminal rather than being mistaken for leaked H8/H9 custody.
+    fixture.scene.push(std::process::id(), 0, "C_SignFinal", 5);
+    fixture.scene.push(std::process::id(), 1, "C_SignFinal", 6);
+    fixture.published();
+    assert_eq!(
+        fixture.reduced(),
+        before.iter().map(|count| count + 2).collect::<Vec<_>>()
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert_eq!(coordinator.reference_h3_audit_state(), (audit.0 + 2, false));
+    assert_eq!(
+        coordinator.joint_capture().ledger().roles_for_test(),
+        [0; 5]
+    );
+    assert!(coordinator.registry().keyuse_for_test().open().is_empty());
+    for record in coordinator.registry().instance_semantic_edges() {
+        assert_eq!(record.api_returns, Some(3));
+        let s1 = record.semantics.as_ref().unwrap();
+        assert_eq!((s1.calls(), s1.started(), s1.completed()), (3, 1, 1));
+        assert!(s1.active_summary().is_empty());
+    }
+    let terminal = (
+        coordinator.registry().published_revision(),
+        coordinator.reference_h3_audit_state(),
+        coordinator.joint_capture().ledger().roles_for_test(),
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        fixture.reduced(),
+        coordinator.joint_capture().model().project(),
+    );
+    for _ in 0..3 {
+        fixture.service(1).unwrap();
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(coordinator.registry().published_revision(), terminal.0);
+        assert_eq!(coordinator.reference_h3_audit_state(), terminal.1);
+        assert_eq!(
+            coordinator.joint_capture().ledger().roles_for_test(),
+            terminal.2
+        );
+        assert_eq!(
+            coordinator
+                .joint_capture()
+                .adapter()
+                .invocation_claims_for_test(),
+            terminal.3
+        );
+        assert_eq!(fixture.reduced(), terminal.4);
+        assert_eq!(coordinator.joint_capture().model().project(), terminal.5);
+    }
+}
+
+#[test]
+fn joint_machine_real_future_consumer_keeps_original_until_q2_end() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let (mut fixture, begin_a, end_a, before) = machine_with_first_future_consumer();
+    let original = fixture.machine.retained_original_for_test().unwrap();
+    let progress = fixture.service(1);
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((1, 1, 1)),
+        "one original consumer really became Future while the other remains Pending"
+    );
+    assert!(fixture.machine.retained_original_for_test().unwrap() == original);
+    assert_eq!(progress, Ok(JointServiceProgress::Pending));
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    finish_machine_future_consumer(&mut fixture, begin_a, end_a, &before);
+}
+
+#[test]
+fn joint_machine_real_future_consumer_progress_resets_running_stall_bound() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let (mut fixture, begin_a, end_a, before) = machine_with_first_future_consumer();
+    let original = fixture.machine.retained_original_for_test().unwrap();
+    // No sleep and no posed poll: only the existing clock seam is old. The
+    // real next poll must prove consumer advancement before checking the guard.
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        Instant::now() - (Duration::from_secs(6) + Duration::from_millis(100)),
+    ));
+    let progress = fixture.service(1);
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((1, 1, 1)),
+        "the real original advanced Pending -> Future; the second original is still Pending"
+    );
+    assert!(fixture.machine.retained_original_for_test().unwrap() == original);
+    assert_eq!(
+        progress,
+        Ok(JointServiceProgress::Pending),
+        "genuine consumer advancement must reset the running audit's old stall clock"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    finish_machine_future_consumer(&mut fixture, begin_a, end_a, &before);
+}
+
 #[test]
 fn joint_machine_pending_a_allows_q2_real_end() {
     for reverse in [false, true] {

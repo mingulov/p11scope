@@ -767,6 +767,11 @@ impl IngestedJointQuantum {
     }
 
     #[cfg(test)]
+    pub(crate) fn consumer_progress_for_test(&self) -> (usize, usize, usize) {
+        (self.pending, self.future, self.cursor)
+    }
+
+    #[cfg(test)]
     pub(crate) fn active_seal_for_test(&self) -> Option<&SealSuccess> {
         self.active.as_ref()?.outcome.as_ref().ok()
     }

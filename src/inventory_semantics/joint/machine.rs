@@ -2004,6 +2004,17 @@ impl LiveJointMachine {
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_consumer_progress_for_test(&self) -> Option<(usize, usize, usize)> {
+        let Phase::Audited {
+            frame: Some(frame), ..
+        } = self.phase.as_ref()?
+        else {
+            return None;
+        };
+        Some(frame.consumer_progress_for_test())
+    }
+
+    #[cfg(test)]
     pub(crate) fn diagnostic_snapshot_for_test(
         &self,
     ) -> (&'static str, &'static str, Option<(usize, usize)>, u64) {

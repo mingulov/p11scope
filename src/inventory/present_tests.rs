@@ -1687,7 +1687,7 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
 // over it is display-only). Either old sentence returning fails the pin.
 #[test]
 fn event_doc_pins_activity_precedence_and_last_seen_presence() {
-    const DOC: &str = include_str!("../docs/schema/inventory-events-v1.md");
+    const DOC: &str = include_str!("../../docs/schema/inventory-events-v1.md");
     let counted = UseCoverage::Counted {
         since_ns: 7,
         lossy: false,

@@ -9,7 +9,7 @@ as in tests/fixtures/key-operations/object-observations.json; the live
 driver extracts the section from the inventory -o snapshot), and
 optionally the companion event stream (production envelope lines; the
 object_observed and key_operations_observed kinds bind from
-src/inventory_events.rs).
+src/inventory/events.rs).
 
 Checked here (each names its output field below): per-feed operation
 order and phase scripts from ledger rows; key_row started/completed and

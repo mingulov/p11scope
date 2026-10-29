@@ -8049,12 +8049,7 @@ mod tests {
         assert!(reason.contains("FULL"), "{reason}");
         assert!(reason.contains("P0"), "{reason}");
         assert!(!reason.contains("semantic_attachment_refused"), "{reason}");
-        let startup = pin_body(
-            include_str!("inventory.rs"),
-            "fn start_semantic_lane(",
-            "\n}\n",
-        )
-        .unwrap();
+        let startup = pin_body(include_str!("mod.rs"), "fn start_semantic_lane(", "\n}\n").unwrap();
         assert!(
             startup.contains("checked_embedded_flavor"),
             "the flavor check runs up front in start_semantic_lane"
@@ -14907,23 +14902,23 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "inventory_privileged_tests.rs"]
+#[path = "privileged_tests.rs"]
 mod privileged_tests;
 
 #[cfg(test)]
-#[path = "inventory_manifest_e2e_tests.rs"]
+#[path = "manifest_e2e_tests.rs"]
 mod manifest_e2e_tests;
 
 #[cfg(test)]
-#[path = "inventory_edge_stream_tests.rs"]
+#[path = "edge_stream_tests.rs"]
 mod edge_stream_tests;
 
 #[cfg(test)]
-#[path = "inventory_diagnostics_runtime_tests.rs"]
+#[path = "diagnostics_runtime_tests.rs"]
 mod diagnostics_runtime_tests;
 
 #[cfg(test)]
-#[path = "inventory_cgroup_runtime_tests.rs"]
+#[path = "cgroup_runtime_tests.rs"]
 mod cgroup_runtime_tests;
 
 #[cfg(test)]
@@ -21176,7 +21171,7 @@ mod promotion_driver_tests {
     // so the Driver home file joins through `include!` under the
     // contract's `joint_cells` module (§8.7).
     mod joint_cells {
-        include!("inventory_joint_cells_tests.rs");
+        include!("joint_cells_tests.rs");
     }
 }
 

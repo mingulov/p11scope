@@ -215,5 +215,5 @@ impl FinalStdout for WriterStdout<'_> {
 }
 
 #[cfg(test)]
-#[path = "inventory_output_tests.rs"]
+#[path = "output_tests.rs"]
 mod tests;

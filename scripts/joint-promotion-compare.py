@@ -33,7 +33,7 @@ MAX_WORD = (1 << 64) - 1
 FN_PATTERN = re.compile(r"[A-Za-z0-9_\[\]]{1,64}\Z")
 
 # The four refusal cells, with the exact PromotionRefusal::label() strings
-# from src/inventory_promotion/state.rs. The scan cell is the parent scan
+# from src/inventory/promotion/state.rs. The scan cell is the parent scan
 # ending before activation (ScopeEnded); the unsupported cell is a cgroup
 # parent scope, which SelectedSession revalidation leaves unqualified
 # (src/attach/selected_detailed.rs).

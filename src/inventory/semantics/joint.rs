@@ -20,6 +20,7 @@ use crate::semantics_objects::journal::{FaultEpoch, FaultReadError, SessionBirth
 use std::borrow::Borrow;
 use std::cell::RefCell;
 
+#[path = "joint/machine.rs"]
 mod machine;
 #[cfg(test)]
 pub(crate) use machine::JointMachineIo;

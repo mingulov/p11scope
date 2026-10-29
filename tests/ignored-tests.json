@@ -907,145 +907,145 @@
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
       "reason": "root-owned live BPF lane; D3d forced-kernel multi-pass session reuse over a btrfs fixture",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
       "reason": "root-owned live BPF lane; D3d forced-kernel sweep cell over a btrfs fixture",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64",
       "reason": "privileged: live Joint absence and S1Only siblings beside a post-attach exec",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64",
       "reason": "root-owned live BPF lane; live joint machine begin to Published to WoundDown through the finish driver",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64",
       "reason": "privileged: live Joint first birth through a held q1 to q2 and stop",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64",
       "reason": "privileged: live Joint promotion retires A before B is admitted",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_manifest_e2e_tests.rs",
+      "file": "src/inventory/manifest_e2e_tests.rs",
       "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64",
       "reason": "privileged: inventory --system --manifest end to end with a SoftHSM workload exits 0 with populated S1 edges or named route-loss gaps",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_manifest_e2e_tests.rs",
+      "file": "src/inventory/manifest_e2e_tests.rs",
       "path": "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64",
       "reason": "privileged: inventory --system --manifest over 4097+ endpoints stops finitely with S1 edges for a long-running caller and the journal_unavailable disclosure",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_pid_lp64",
       "reason": "root-owned live BPF lane; native lane --pid: stamps, witnessed edge, no foreign caller",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_pid_provider_retirement_diagnostics_lp64",
       "reason": "root-owned live BPF lane; real provider retirement recovers B and exports diagnostics",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64",
       "reason": "root-owned live BPF lane; SIGINT during activation still gets one full pass",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64",
       "reason": "root-owned live BPF lane; native lane stop with a held call reads unsettled",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_system_ab_first_count_lp64",
       "reason": "root-owned live BPF lane; native lane --system counts a late second module's first call exactly",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64",
       "reason": "root-owned live BPF lane; native --system under 100 and 1,000 execs/s exec churn",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64",
       "reason": "root-owned live BPF lane; native lane --system witnesses a late dlopen",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests.rs",
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64",
       "reason": "root-owned live BPF lane; native --system over 400+ endpoints retires closed",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64",
       "reason": "root-owned BPF lane; real3-round accelerated10ms cadence pilot, bounded90s",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64",
       "reason": "root-owned BPF lane; real3-round default-cadence control, bounded90s",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64",
       "reason": "root-owned BPF lane; real3-round gate-cadence probe, bounded90s",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64",
       "reason": "root-owned BPF lane; source-matched prebuilt3-round probe, bounded90s",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64",
       "reason": "root-owned BPF lane; parameterized C=32/S=4 full-transition pilot at default cadence, bounded540s",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64",
       "reason": "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap (~22min)",
       "cell": "privileged"
     },
     {
-      "file": "src/inventory_privileged_tests/operator_diagnostics_wrap.rs",
+      "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64",
       "reason": "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair (~22min+)",
       "cell": "privileged"

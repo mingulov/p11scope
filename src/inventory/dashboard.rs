@@ -3614,5 +3614,5 @@ impl Notices {
 }
 
 #[cfg(test)]
-#[path = "inventory_dashboard_tests.rs"]
+#[path = "dashboard_tests.rs"]
 mod tests;

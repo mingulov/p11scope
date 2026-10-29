@@ -3931,7 +3931,7 @@ pub(crate) fn finish_native<L, T>(
 }
 
 #[cfg(test)]
-#[path = "inventory_capture_tests.rs"]
+#[path = "capture_tests.rs"]
 pub(crate) mod tests;
 
 /// Finding 9: a PID/System stop (no collection control) latches the host

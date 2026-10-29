@@ -15582,7 +15582,7 @@ mod tests {
     /// transport the sink tests pin (shed-a-stalled-sink, closed-sink);
     /// the delivery-independent exit status is covered end to end by
     /// `tests/capture_stderr_delivery.rs`. The collection-spawn fallback
-    /// in `inventory_capture.rs` (whose tests live in another file and
+    /// in `inventory/capture.rs` (whose tests live in another file and
     /// cannot pin it) is pinned here too.
     #[test]
     fn capture_diagnostics_never_use_blocking_stderr_writes() {
@@ -15646,10 +15646,10 @@ mod tests {
                 "{region} lost its bounded diagnostic emission"
             );
         }
-        let inventory = include_str!("inventory_capture.rs");
+        let inventory = include_str!("inventory/capture.rs");
         assert!(
             !inventory.contains("eprintln!"),
-            "inventory_capture.rs still has a blocking stderr write"
+            "inventory/capture.rs still has a blocking stderr write"
         );
     }
 

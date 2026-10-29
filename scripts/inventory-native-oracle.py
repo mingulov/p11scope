@@ -926,7 +926,7 @@ def coverage(edge):
 
 def coverage_ok(edge):
     """The documented seven keys, a known state, and fields valid for the
-    state (O5, grounded in inventory.rs coverage_json: until_ns only on
+    state (O5, grounded in inventory/mod.rs coverage_json: until_ns only on
     a watched interval — never on counted — since_ns on counted and
     watched, first_ns on witnessed, lossy on counted; anything else is
     an invented boundary)."""
@@ -1013,7 +1013,7 @@ def expected_capture(caller, module, edge):
 
 def expected_presence(caller, module, edge):
     """inventory-events-v1 `presence`, re-derived from the snapshot record
-    (inventory_present.rs Presence::for_edge): an exited caller, then an
+    (inventory/present.rs Presence::for_edge): an exited caller, then an
     unloaded module, then a live mapping on two live endpoints; anything
     else (exec_retired, uncertain mapping, unknown lifecycles) is unknown."""
     if caller.get("lifecycle") == "exited":
@@ -2066,7 +2066,7 @@ def check_counted_nonzero(view, res):
 def check_saturated(view, res):
     """O7: the saturation triple is production-shaped on every edge and
     coherent — production always publishes the fixed cap u64::MAX
-    (MAX_EDGE_ENTRY_COUNT, src/inventory.rs edge_json), a u64 count,
+    (MAX_EDGE_ENTRY_COUNT, src/inventory/mod.rs edge_json), a u64 count,
     and a Boolean saturated set exactly when the count reached the cap.
     A forged cap, a non-u64 count, or a non-Boolean flag fails: the
     document can never invent its own saturation exemption."""
@@ -2780,7 +2780,7 @@ def demotion_public_health(inventory):
     demotion_require(type(census["unbound_reasons"]) is dict)
     for value in census["unbound_reasons"].values():
         demotion_uint(value)
-    # inventory.rs exports unbound_total() and these very same reason counts;
+    # inventory/mod.rs exports unbound_total() and these very same reason counts;
     # native_binding.rs accounts each offered row as decided or pending.
     demotion_require(sum(census["unbound_reasons"].values()) == census["unbound"] and
                      all(value > 0 for value in census["unbound_reasons"].values()) and
@@ -6333,7 +6333,7 @@ def self_test():
 
         # --- O7: saturation cap bounds (astra A6) ---------------------------
         # Production's cap is fixed at u64::MAX (MAX_EDGE_ENTRY_COUNT,
-        # src/inventory.rs edge_json): the document can never invent its
+        # src/inventory/mod.rs edge_json): the document can never invent its
         # own saturation exemption. Small-cap arithmetic lives here as
         # unit checks, separate from artifact qualification (which
         # requires the fixed cap).

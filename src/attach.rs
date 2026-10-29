@@ -3298,7 +3298,7 @@ impl<S> FrozenObjectTable<S> {
 }
 
 #[cfg(test)]
-#[path = "inventory_semantics_tests.rs"]
+#[path = "inventory/semantics_tests.rs"]
 mod inventory_semantics_tests;
 
 /// Retains exact reattach facts for every requested slot that gained a

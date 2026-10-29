@@ -1040,5 +1040,5 @@ fn project<'a>(
 }
 
 #[cfg(test)]
-#[path = "inventory_diagnostics_tests.rs"]
+#[path = "diagnostics_tests.rs"]
 mod tests;

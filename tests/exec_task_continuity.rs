@@ -327,6 +327,89 @@ fn exec_task_embedded_lifecycle_preserves_maps_hooks_and_class_boundary() {
 }
 
 #[test]
+fn exec_generation_ticket_helper_respects_flavor_and_reservation_boundary() {
+    let mut variants = vec![
+        ("detailed", p11scope::EBPF_OBJECT, true),
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT, false),
+        ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT, true),
+    ];
+    for (name, bytes) in [
+        ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
+        ("timestamps", p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT),
+        ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
+    ] {
+        if !bytes.is_empty() {
+            variants.push((name, bytes, true));
+        }
+    }
+    let script = r#"
+import re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from _loader import load_path
+m = load_path(Path('scripts/check-live-discovery-object.py'), 'exec_ticket_flow')
+c = load_path(Path('scripts/check-bpf-map-defs.py'), 'exec_ticket_btf')
+elf = c.Elf(Path(sys.argv[1]).read_bytes())
+btf = c.Btf(elf.sections['.BTF'][1])
+nodes = [n for n in btf.types[1:] if n[:2] == (12, 'p11_link_current_cookie')]
+assert len(nodes) == 1 and nodes[0][3] == 1
+proto = btf.types[nodes[0][2]]
+assert proto[0] == 13 and proto[3] == 0, 'cookie helper takes no arguments'
+result = btf.resolve(proto[2])
+assert result[0] == 1 and result[2] == 8, 'cookie helper returns u64'
+dump = subprocess.check_output(['llvm-objdump-18', '-dr', sys.argv[1]], text=True)
+blocks = m.function_blocks(dump)
+owners = [(name, lines) for name, lines in blocks.items()
+          if any(re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line) for line in lines)]
+assert len(owners) == 1 and owners[0][0].endswith('emit_lifecycle'), owners
+lines = owners[0][1]
+ticket_row = next(i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line))
+ticket = next(m.line_pc(line) for line in reversed(lines[:ticket_row]) if m.line_pc(line) is not None)
+reserve_row = next(i for i, line in enumerate(lines) if re.search(r'\bcall 0x83\b', line))
+reserve = m.line_pc(lines[reserve_row])
+insns, graph = m.instruction_graph(lines)
+assert ticket not in m.reachable(graph, [insns[0][0]], {reserve}), 'ticket before ring reserve'
+branch_row = next(i for i in range(reserve_row + 1, min(len(lines), reserve_row + 8))
+                  if re.search(r'\bif r\d+ (?:==|!=) 0x0 goto ', lines[i]))
+branch = lines[branch_row]
+target = m.relative_target(m.line_pc(branch), branch)
+following = next(m.line_pc(line) for line in lines[branch_row + 1:] if m.line_pc(line) is not None)
+null = target if '== 0x0 goto' in branch else following
+assert ticket not in m.reachable(graph, [null]), 'failed reservation acquired a ticket'
+"#;
+    for (name, bytes, identity) in variants {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        let helpers = object
+            .functions
+            .values()
+            .filter(|function| function.name == "p11_link_current_cookie")
+            .count();
+        assert_eq!(
+            helpers,
+            usize::from(identity),
+            "{name}: cookie-only helper selection"
+        );
+        assert_eq!(object.maps.contains_key("TASK_COOKIE"), identity, "{name}");
+        assert_eq!(object.maps.contains_key("COOKIE_CTL"), identity, "{name}");
+        if identity {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("exec-ticket.o");
+            fs::write(&path, bytes).unwrap();
+            let check = Command::new("python3")
+                .args(["-I", "-c", script])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn exec_task_singles_perf_attributes_preserve_healthy_leader_exec() {
     // Characterize the exact patched Aya constructor our Singles path uses.
     // This pins attributes, not live registered-pair activity or a receipt.

@@ -1,8 +1,10 @@
 #include "image_identity.h"
 /* A counter increment must survive another CPU winning a race on its cell. */
 static u64 *lost_race_cell;
+static unsigned int cas_attempts;
 static u64 injected_identity_cas(u64 *cell, u64 old, u64 replacement)
 {
+    cas_attempts++;
     if (cell == lost_race_cell)
         return old + 1;
     return __sync_val_compare_and_swap(cell, old, replacement);
@@ -11,26 +13,89 @@ static u64 injected_identity_cas(u64 *cell, u64 old, u64 replacement)
 #include "image_identity.c"
 #undef __sync_val_compare_and_swap
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 static struct control ctl;
 static u64 stored;
-static int present, fail_create, control_present = 1;
+static int present, fail_create, control_present = 1, current_present = 1;
+static unsigned int storage_calls, create_calls;
 static struct task_struct leader = { .tgid = 42 };
 static struct task_struct worker = { .tgid = 42, .group_leader = &leader };
 static void *lookup(void *map, const void *key) { (void)map; (void)key; return control_present ? &ctl : 0; }
 static u64 *storage(void *map, struct task_struct *task, u64 *value, u64 flags) {
-    (void)map; assert(task == &leader); (void)flags;
+    (void)map; assert(task == worker.group_leader);
+    storage_calls++;
+    if (flags & BPF_LOCAL_STORAGE_GET_F_CREATE) create_calls++;
     if (present) return &stored;
     if (!value || fail_create) return 0;
     stored = *value; present = 1; return &stored;
 }
-static struct task_struct *current(void) { return &worker; }
+static struct task_struct *current(void) { return current_present ? &worker : 0; }
 u32 p11_link_fork_allowed(void) { return 0; }
 u32 p11_root_propagate_thread(struct task_struct *child, u64 flags) {
     (void)child; (void)flags; assert(0); return 0;
 }
 u32 p11_link_emit_fork(u32 pid, u64 flags, const struct image_identity *a, const struct image_identity *b) {
     (void)pid; (void)flags; (void)a; (void)b; assert(0); return 0;
+}
+/* A weak declaration makes the pre-implementation test fail at the actual
+ * missing helper assertion, without a link-error masquerading as runtime RED. */
+extern u64 p11_link_current_cookie(void) __attribute__((weak));
+static void exec_cookie_controls(void) {
+    assert(p11_link_current_cookie && "EXEC needs the actual cookie-only helper");
+    ctl = (struct control){ .limit = IMAGE_IDENTITY_TICKET_LIMIT };
+    control_present = current_present = 1; worker.group_leader = &leader;
+    present = fail_create = 0; lost_race_cell = 0;
+    storage_calls = create_calls = cas_attempts = 0;
+    leader.self_exec_id = ~0ULL;
+    assert(p11_link_current_cookie() == 1);
+    assert(ctl.next_ticket == 1 && create_calls == 1 && cas_attempts == 1);
+    leader.self_exec_id = 0;
+    assert(p11_link_current_cookie() == 1);
+    assert(ctl.next_ticket == 1 && create_calls == 1 && cas_attempts == 1);
+    present = 0; ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT - 1;
+    assert(p11_link_current_cookie() == IMAGE_IDENTITY_TICKET_LIMIT);
+    assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT && create_calls == 2);
+    present = 0;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT && create_calls == 2);
+    ctl.next_ticket = 0; fail_create = 1;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.next_ticket == 1 && ctl.create_failures == 1 && create_calls == 3);
+    fail_create = 0; lost_race_cell = &ctl.next_ticket; cas_attempts = 0;
+    assert(p11_link_current_cookie() == 0);
+    assert(cas_attempts == COOKIE_CAS_TRIES && ctl.next_ticket == 1);
+    assert(ctl.retry_exhausted == 1 && create_calls == 3);
+    lost_race_cell = 0; present = 1; stored = 0;
+    assert(p11_link_current_cookie() == 0);
+    stored = IMAGE_IDENTITY_TICKET_LIMIT + 1;
+    assert(p11_link_current_cookie() == 0);
+    stored = 7; ctl.limit = 0;
+    assert(p11_link_current_cookie() == 0);
+    ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT; control_present = 0;
+    assert(p11_link_current_cookie() == 0);
+    control_present = 1; current_present = 0;
+    unsigned int reads = storage_calls;
+    assert(p11_link_current_cookie() == 0 && storage_calls == reads);
+    current_present = 1; worker.group_leader = 0;
+    assert(p11_link_current_cookie() == 0 && storage_calls == reads);
+    worker.group_leader = &leader;
+    assert(p11_link_current_cookie() == 7 && ctl.next_ticket == 1);
+    /* Put self_exec_id in an inaccessible page: the cookie-only path must
+     * not touch that field, including when the existing ticket is reused. */
+    long page = sysconf(_SC_PAGESIZE);
+    assert(page > (long)sizeof(struct task_struct));
+    char *guard = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(guard != MAP_FAILED);
+    assert(mprotect(guard + page, (size_t)page, PROT_NONE) == 0);
+    worker.group_leader = (void *)(guard + page - offsetof(struct task_struct, self_exec_id));
+    assert(p11_link_current_cookie() == 7 && ctl.next_ticket == 1);
+    worker.group_leader = &leader;
+    assert(munmap(guard, (size_t)page * 2) == 0);
+    puts("EXEC cookie-only control: stable leader ticket, finite allocation/refusal/recovery passed");
 }
 int main(void) {
     bpf_map_lookup_elem = lookup; bpf_task_storage_get = storage; bpf_get_current_task_btf = current;
@@ -73,5 +138,6 @@ int main(void) {
     ctl.next_ticket = 0; ctl.create_failures = 0; fail_create = 1; lost_race_cell = &ctl.create_failures;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_CREATE_FAILED);
     assert(ctl.create_failures == 1 && ctl.unavailable == 2);
+    exec_cookie_controls();
     puts("native control: malformed, near-limit exhaustion, stable cookie/exec, zero cell, creation failure, null refusal passed");
 }

@@ -2834,6 +2834,41 @@ mod tests {
         }
     }
 
+    /// A bounded original task ticket is private EXEC transport, independent
+    /// of its finite same-task class; it never relaxes another payload field.
+    #[test]
+    fn exec_generation_ticket_is_bounded_and_kind_specific() {
+        for class in 0..=2 {
+            for ticket in [0, 1, IMAGE_IDENTITY_TICKET_LIMIT] {
+                let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+                record.case_id = class;
+                record.binding_id = ticket;
+                assert!(
+                    valid_discovery_record(&record),
+                    "class={class} ticket={ticket}"
+                );
+                record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+                record.send_signal_rc = COALESCED_NO_HELPER_RC;
+                assert!(valid_discovery_record(&record));
+                record.send_signal_rc = 0;
+                assert!(!valid_discovery_record(&record));
+            }
+        }
+        for ticket in [IMAGE_IDENTITY_TICKET_LIMIT + 1, 1 << 32, u64::MAX] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.binding_id = ticket;
+            assert!(
+                !valid_discovery_record(&record),
+                "noncanonical ticket={ticket}"
+            );
+        }
+        for kind in [DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER] {
+            let mut record = discovery_record(kind);
+            record.binding_id = 1;
+            assert!(!valid_discovery_record(&record), "wrong kind={kind}");
+        }
+    }
+
     #[test]
     fn exec_task_classification_requires_checked_equal_leader_and_user_dumpability() {
         let leader = (17u64 << 32) | 17;
@@ -2887,7 +2922,7 @@ mod tests {
             |r| r.reserved_tail_zero[3] = 1,
             |r| r.return_rv = 1,
             |r| r.request_flags = 1,
-            |r| r.binding_id = 1,
+            |r| r.binding_id = IMAGE_IDENTITY_TICKET_LIMIT + 1,
             |r| r.send_signal_rc = COALESCED_NO_HELPER_RC,
             |r| r.send_signal_rc = i64::MAX,
         ];

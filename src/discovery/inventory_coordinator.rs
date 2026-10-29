@@ -13113,6 +13113,26 @@ exit 0
             (Self::over(scene, 0), caller)
         }
 
+        /// Collection begins at50; the actual per-incarnation admission
+        /// validation finishes at200, through the production reconcile path.
+        fn with_collection_admission_window() -> (Self, CallerId) {
+            let mut scene = CaptureScene::new(2);
+            scene.coordinator.engine.scope = Scope::System;
+            scene.source.spawn(7, 500);
+            scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let caller = scene.coordinator.adapter.live_id(7).unwrap();
+            let record = scene.coordinator.adapter.record(caller).unwrap();
+            assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+            scene.project(7, 300);
+            scene.coordinator.commit_batch(false).unwrap();
+            (Self::over(scene, 0), caller)
+        }
+
         /// A native lane over `scene` whose exec coverage began at
         /// `coverage_ns`, forwarded the way C5 forwards it: through the
         /// activating extend receipt.
@@ -13447,6 +13467,216 @@ exit 0
             "the unheld predecessor is disclosed: {:?}",
             native.scene.coordinator.registry.gaps()
         );
+    }
+
+    #[test]
+    fn an_exec_during_collection_mints_a_bindable_successor_before_admission() {
+        for hook_ts_ns in [50, 125] {
+            for class in [
+                p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+                p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
+            ] {
+                let (mut native, caller) = NativeScene::with_collection_admission_window();
+                native.answer(7, 500, 41);
+                native.scene.coordinator.exit_clocks_comparable = true;
+                assert!(
+                    !native
+                        .scene
+                        .coordinator
+                        .binder
+                        .holds_image(native.domain, caller)
+                );
+                let at = native.stamps.tick();
+                let mut drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+                drain.records[0].binding_id = 41;
+                drain.records[0].case_id = class;
+                let receipt = native.stage(NativeBatch::Lifecycle(drain));
+                let [CallerEvent::ExecRetired { old, new }] = receipt.events.as_slice() else {
+                    panic!(
+                        "matching collection-window EXEC must mint: hook={hook_ts_ns} class={class}, events={:?}",
+                        receipt.events
+                    );
+                };
+                assert_eq!(*old, caller);
+                let successor = *new;
+                let adapter = &native.scene.coordinator.adapter;
+                assert!(adapter.record(caller).unwrap().retired);
+                assert_eq!(adapter.live_id(7), Some(successor));
+                assert!(adapter.record(successor).unwrap().first_seen_ns > hook_ts_ns);
+                let queries = native.cookies.queries;
+                let at = native.stamps.tick();
+                let mut replay = exec_hook_drain(native.domain, at, hook_ts_ns);
+                replay.records[0].binding_id = 41;
+                replay.records[0].case_id = class;
+                let replay = native.stage(NativeBatch::Lifecycle(replay));
+                assert!(
+                    replay.events.is_empty(),
+                    "one EXEC mints once: {:?}",
+                    replay.events
+                );
+                assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+                assert_eq!(
+                    native.cookies.queries, queries,
+                    "replay queries no current ticket"
+                );
+                let at = native.stamps.tick();
+                native.scene.project(7, at);
+                let entered = native.stamps.tick();
+                let row = native.row(41, 2, 7, entered, 0);
+                let events = native.witness(vec![row]);
+                assert!(events.is_empty(), "{events:?}");
+                assert!(
+                    native
+                        .scene
+                        .coordinator
+                        .binder
+                        .holds_image(native.domain, successor)
+                );
+                assert!(matches!(
+                    native.scene.coverage(successor),
+                    UseCoverage::Counted { lossy: false, .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn an_exec_before_collection_cannot_retire_a_later_admission() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 49);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(caller));
+        assert_eq!(native.cookies.queries, 0, "older hooks query no image");
+    }
+
+    #[test]
+    fn an_unstamped_exec_during_collection_cannot_retire_the_caller() {
+        for hook_ts_ns in [50, 125] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.answer(7, 500, 41);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let drain = exec_hook_drain(native.domain, at, hook_ts_ns);
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(
+                native.cookies.queries, 0,
+                "zero original ticket queries nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collection_exec_requires_the_original_same_domain_live_ticket() {
+        let foreign = NativeDomainId::mint();
+        for answer in [
+            CookieQuery::Cookie(DomainCookie::scripted(foreign, 41)),
+            CookieQuery::NoCookie,
+            CookieQuery::Exited,
+            CookieQuery::Unavailable("scripted lookup refusal".into()),
+        ] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.query_answer(7, 500, answer.clone());
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = 41;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(
+                receipt.events.is_empty(),
+                "{answer:?}: {:?}",
+                receipt.events
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(
+                native.cookies.queries, 1,
+                "the original pin was queried: {answer:?}"
+            );
+        }
+        for ticket in [0, 42] {
+            let (mut native, caller) = NativeScene::with_collection_admission_window();
+            native.answer(7, 500, ticket);
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let at = native.stamps.tick();
+            let mut drain = exec_hook_drain(native.domain, at, 125);
+            drain.records[0].binding_id = 41;
+            let receipt = native.stage(NativeBatch::Lifecycle(drain));
+            assert!(receipt.events.is_empty());
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert!(
+                !native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .unwrap()
+                    .retired
+            );
+            assert_eq!(native.cookies.queries, 1);
+        }
+    }
+
+    #[test]
+    fn a_queued_old_exec_cannot_retire_a_reused_pid_inside_collection() {
+        for ticket in [0, 41] {
+            let (mut native, original) = NativeScene::new();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            let mut queued_old_exec = exec_hook_drain(native.domain, 300, 125);
+            queued_old_exec.records[0].binding_id = ticket;
+            native.scene.source.spawn(7, 700);
+            native.scene.coordinator.adapter.reconcile_detected(
+                &[7].into_iter().collect(),
+                &mut |_| ImageAuthority::ScanPinned,
+                50,
+                &mut || Some(200),
+            );
+            let replacement = native.scene.coordinator.adapter.live_id(7).unwrap();
+            assert_ne!(replacement, original);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(adapter.record(original).unwrap().retired);
+            let record = adapter.record(replacement).unwrap();
+            assert_eq!(record.start_time, Some(700));
+            assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+            native.answer(7, 700, 99);
+            let queries = native.cookies.queries;
+            let receipt = native.stage(NativeBatch::Lifecycle(queued_old_exec));
+            assert!(
+                receipt.events.is_empty(),
+                "old task ticket={ticket}: {:?}",
+                receipt.events
+            );
+            let adapter = &native.scene.coordinator.adapter;
+            assert_eq!(adapter.live_id(7), Some(replacement));
+            assert!(!adapter.record(replacement).unwrap().retired);
+            assert_eq!(native.cookies.queries - queries, usize::from(ticket != 0));
+        }
     }
 
     #[test]

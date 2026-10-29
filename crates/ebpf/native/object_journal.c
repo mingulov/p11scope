@@ -227,29 +227,39 @@ __attribute__((noinline)) int p11_journal_remove(struct thread_owner *owner, voi
     return owner_map_delete(map, key) ? -1 : 0;
 }
 
-/* Write one validated 24 B common header. Native little-endian x86-64;
- * every combination this accepts the Rust validators accept too. */
-__attribute__((noinline)) int p11_journal_header_init(void *record,
-                                                      const struct journal_header_spec *spec)
+/* One validated writer, inlined for callers that already have scalar facts.
+ * No externally callable six-register interface is introduced. */
+static __always_inline int journal_header_write(void *record, u64 bytes, u64 kind,
+                                                u64 flags, u64 thread, u64 sequence)
 {
     unsigned char *out;
-    if (!record || !spec)
+    if (!record)
         return -1;
-    if (!journal_header_valid(spec->bytes, spec->kind, spec->flags, 0, spec->thread,
-                              spec->sequence))
+    if (!journal_header_valid(bytes, kind, flags, 0, thread, sequence))
         return -1;
     out = record;
     out[0] = JOURNAL_VERSION & 0xff;
     out[1] = (JOURNAL_VERSION >> 8) & 0xff;
-    out[2] = spec->bytes & 0xff;
-    out[3] = (spec->bytes >> 8) & 0xff;
-    out[4] = spec->kind & 0xff;
-    out[5] = spec->flags & 0xff;
+    out[2] = bytes & 0xff;
+    out[3] = (bytes >> 8) & 0xff;
+    out[4] = kind & 0xff;
+    out[5] = flags & 0xff;
     out[6] = 0;
     out[7] = 0;
-    __builtin_memcpy(out + 8, &spec->thread, 8);
-    __builtin_memcpy(out + 16, &spec->sequence, 8);
+    __builtin_memcpy(out + 8, &thread, 8);
+    __builtin_memcpy(out + 16, &sequence, 8);
     return 0;
+}
+
+/* Preserve the sized external ABI and no-write-on-refusal contract used by
+ * every historical header/combined caller. */
+__attribute__((noinline)) int p11_journal_header_init(void *record,
+                                                      const struct journal_header_spec *spec)
+{
+    if (!record || !spec)
+        return -1;
+    return journal_header_write(record, spec->bytes, spec->kind, spec->flags,
+                                 spec->thread, spec->sequence);
 }
 
 /* Ring-leaf skeleton: pure pass-through to the ring helpers. Ordering
@@ -998,8 +1008,6 @@ __attribute__((noinline)) void p11_journal_settle_prepare(const struct owner_sta
 {
     struct thread_owner *owner;
     struct journal_start_value *row;
-    struct journal_header_spec header = {64, JOURNAL_KIND_ABANDON, 0, 0, 0};
-    struct journal_abandon_facts facts;
     const void *start;
     if (!out)
         return;
@@ -1024,19 +1032,22 @@ __attribute__((noinline)) void p11_journal_settle_prepare(const struct owner_sta
         if (!start || reason < JOURNAL_REASON_MIN || reason > JOURNAL_REASON_MAX) {
             producer_loss(5);
         } else {
-            header.thread = row->thread;
-            header.sequence = row->sequence;
-            facts.pid_tgid = key->pid_tgid;
-            facts.image_cookie = producer_u64(start, 272);
-            facts.image_exec = producer_u64(start, 280);
-            facts.entry_ns = producer_u64(start, 0);
-            facts.slot = key->slot;
-            facts.reason = reason;
-            if (p11_journal_header_init(out->record, &header) ||
-                txn_fill_abandon(out->record, &facts, key))
+            if (journal_header_write(out->record, JOURNAL_ABANDON_BYTES,
+                                       JOURNAL_KIND_ABANDON, 0, row->thread, row->sequence)) {
                 producer_loss(5);
-            else
+            } else {
+                /* Frame directly after header validation: retaining the
+                 * individual START bytes across the global header call
+                 * spills a second facts body onto the BPF stack. These
+                 * exact spans are the same retained/key facts checked by
+                 * txn_fill_abandon, with no target read or new authority. */
+                txn_copy(out->record + 24, (const unsigned char *)&key->pid_tgid, 8);
+                txn_copy(out->record + 32, (const unsigned char *)start + 272, 16);
+                txn_copy(out->record + 48, (const unsigned char *)&key->slot, 4);
+                txn_copy(out->record + 52, (const unsigned char *)&reason, 4);
+                txn_copy(out->record + 56, (const unsigned char *)start, 8);
                 out->state = JOURNAL_SETTLE_ABANDON;
+            }
         }
     }
     /* Valid rows remain intact on deletion failure: START and its lease

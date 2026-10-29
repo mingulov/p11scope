@@ -174,8 +174,25 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
     let bytes = fs::read(&path).unwrap();
     let object = aya_obj::Object::parse(&bytes).unwrap();
     let ordinary = aya_obj::Object::parse(p11scope::EBPF_OBJECT).unwrap();
+    let mut expected_programs: BTreeSet<_> = ordinary.programs.keys().map(String::as_str).collect();
+    assert!(expected_programs.remove("p11_entry"));
+    assert!(expected_programs.remove("p11_return"));
+    expected_programs.extend(["p11_entry_journal", "p11_return_journal"]);
+    assert_eq!(
+        object
+            .programs
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_programs
+    );
     let mut expected_maps: BTreeSet<_> = ordinary.maps.keys().map(String::as_str).collect();
-    expected_maps.extend(["JOURNAL_START", "JOURNAL_CTL", "JOURNAL_MARKER_CTL"]);
+    expected_maps.extend([
+        "JOURNAL_START",
+        "JOURNAL_CTL",
+        "JOURNAL_MARKER_CTL",
+        "JOURNAL_CLASSES",
+    ]);
     assert_eq!(
         object
             .maps
@@ -183,7 +200,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         expected_maps,
-        "private map inventory must be ordinary Detailed plus the three journal maps"
+        "private map inventory must be ordinary Detailed plus the four journal maps"
     );
     for (name, baseline) in &ordinary.maps {
         let map = &object.maps[name];
@@ -237,6 +254,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         ("JOURNAL_START", (1, 16, 24, 16_384, 0)),
         ("JOURNAL_CTL", (2, 4, 24, 1, 0)),
         ("JOURNAL_MARKER_CTL", (2, 4, 16, 1, 0)),
+        ("JOURNAL_CLASSES", (2, 4, 4, 105, 128)),
         ("THREAD_OWNER", (29, 4, 560, 0, 1)),
         ("START", (1, 16, 288, 16_384, 0)),
         ("OBJECT_START", (1, 16, 432, 16_384, 0)),
@@ -336,7 +354,18 @@ fn journal_proof_never_enters_ordinary_objects_or_loader_sources() {
     }
     for bytes in bodies {
         let object = aya_obj::Object::parse(bytes).unwrap();
-        for name in ["JOURNAL_START", "JOURNAL_CTL", "JOURNAL_MARKER_CTL"] {
+        for name in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                !object.programs.contains_key(name),
+                "ordinary object selected {name}"
+            );
+        }
+        for name in [
+            "JOURNAL_START",
+            "JOURNAL_CTL",
+            "JOURNAL_MARKER_CTL",
+            "JOURNAL_CLASSES",
+        ] {
             assert!(!object.maps.contains_key(name));
         }
         assert!(

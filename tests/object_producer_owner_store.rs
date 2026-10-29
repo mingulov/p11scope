@@ -125,7 +125,7 @@ fn object_producer_missing_side_state_faults_before_return() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     assert!(
@@ -142,12 +142,13 @@ fn object_producer_missing_side_state_faults_before_return() {
         .find("row.layout == 0 || u32::from(row.layout) == layout_code")
         .expect("drain must check retained-ABI agreement");
     assert_eq!(
-        returned.matches("owned_start_remove(&key, true)").count(),
+        returned.matches("owned_start_remove(&key, true)").count()
+            + returned.matches("start_remove_for::<JOURNAL>").count(),
         8,
         "ordinary, ready, agreement, aggregate, image, continuity-gate, reserve-failure and emission arms each retire"
     );
     let drain_retire = returned
-        .rfind("owned_start_remove(&key, true)")
+        .rfind("start_remove_for::<JOURNAL>")
         .expect("emission arm retires");
     assert!(
         query < drain_retire,
@@ -157,7 +158,7 @@ fn object_producer_missing_side_state_faults_before_return() {
         .find("p11_object_fault()")
         .expect("failed settle must fault");
     let reserve = returned
-        .find("reserve::<ObjectEventRecord>")
+        .find("reserve::<Record>")
         .expect("slice D reserves the complete object record");
     let fill = returned
         .find("object_fill_return(")
@@ -308,22 +309,27 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF return source");
     let dispatch = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "struct ReturnAccounting",
     );
+    let whole_dispatch = dispatch;
+    let ordinary_at = dispatch
+        .rfind("    if unsafe { (*start).object_required } == 0 {")
+        .expect("ordinary false-specialized dispatch");
+    let dispatch = &dispatch[ordinary_at..];
     // The outlined halves gap a lost in-scope call at their own arms, in
     // place at depth 3 inside return's 512-byte chain. The dispatcher
     // still owns no lifetime: it only tail-routes to the two halves and
     // consumes no lost code, keeping the 6.1/5.15 verifier shape.
     assert!(
         dispatch.contains(
-            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {\n        object_return(ctx, &key, start, flags, layout)\n    }"
+            "if unsafe { (*start).object_required } == 0 {\n        ordinary_return(ctx, &key, start, flags, layout)\n    } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n    }"
         ),
         "dispatcher must tail-route ordinary and object calls through a plain else"
     );
     for half in [
         "ordinary_return(ctx, &key, start, flags, layout)",
-        "object_return(ctx, &key, start, flags, layout)",
+        "object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)",
     ] {
         assert_eq!(
             dispatch.matches(half).count(),
@@ -339,13 +345,13 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     // matches the old unindented anchor and both exact-once counts, so only
     // the 4-space anchor above catches it.
     let nested = dispatch.replacen(
-        "\n    } else {\n        object_return(ctx, &key, start, flags, layout)\n    }",
-        "\n        } else {\n        object_return(ctx, &key, start, flags, layout)\n        }",
+        "\n    } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n    }",
+        "\n        } else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n        }",
         1,
     );
     assert_ne!(nested, dispatch, "nesting mutant must change the dispatch");
     assert!(
-        nested.contains("} else {\n        object_return(ctx, &key, start, flags, layout)"),
+        nested.contains("} else {\n        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)"),
         "nesting mutant must stay on target for the unindented anchor"
     );
     assert_eq!(
@@ -357,7 +363,7 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     );
     assert_eq!(
         nested
-            .matches("object_return(ctx, &key, start, flags, layout)")
+            .matches("object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)")
             .count(),
         1,
         "nesting mutant must keep the object count"
@@ -371,15 +377,19 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     for forbidden in [
         "EVENTS.reserve",
         "account_return(",
-        "capture_return_facts(",
+        "capture_return_facts::<",
         "let Some(&start)",
     ] {
         assert!(
-            !dispatch.contains(forbidden),
+            !whole_dispatch.contains(forbidden),
             "dispatcher must not {forbidden}"
         );
     }
-    let ordinary = source_between(&source, "fn ordinary_return(", "fn object_return(");
+    let ordinary = source_between(
+        &source,
+        "fn ordinary_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
     let snapshot = ordinary
         .find("let start = unsafe { *start };")
         .expect("ordinary snapshot");
@@ -390,12 +400,12 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
         .find("account_return(")
         .expect("ordinary accounting");
     let reads = ordinary
-        .find("capture_return_facts(")
+        .find("capture_return_facts::<")
         .expect("ordinary private reads");
     assert!(snapshot < retire && retire < account && account < reads);
     let object = source_between(
         &source,
-        "fn object_return(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     assert!(

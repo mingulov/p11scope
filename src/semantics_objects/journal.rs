@@ -26,6 +26,8 @@ pub(crate) mod joint_audit;
 pub(crate) mod joint_driver;
 #[cfg(test)]
 mod native_producer_tests;
+#[cfg(all(test, p11scope_journal_roots))]
+mod root_proof_tests;
 mod reservations;
 mod seal_replay;
 use seal_replay::ReplayPreparation;

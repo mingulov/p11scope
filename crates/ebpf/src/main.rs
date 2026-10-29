@@ -46,6 +46,9 @@ compile_error!("exactly one counter measurement flavor is required");
 ))]
 compile_error!("private counter artifacts require default FULL capacities");
 
+#[cfg(p11scope_journal_roots)]
+mod journal_roots;
+
 #[cfg(feature = "inventory-only")]
 mod inventory;
 #[cfg(feature = "inventory-callers")]
@@ -89,6 +92,11 @@ use p11scope_ebpf_common::object_flow::{
     adapter_emit_find_control, adapter_emit_get_control, adapter_fill_return_control,
     adapter_tail_fill, continuity_joins, decode_return_gate, emission_finalize, encode_return_gate,
     fill_call_event, preserve_refused_base,
+};
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_journal::{
+    JOURNAL_REASON_ABI_REFUSED, JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_INSERT_FAILED,
+    JOURNAL_REASON_SCOPE_LOST, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -199,7 +207,12 @@ static OBJECT_DESCRIPTORS: Array<ObjectDescriptorWire> =
 #[map]
 static OBJECT_ZERO: Array<ObjectStart> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
-#[cfg(not(any(feature = "inventory-only", feature = "counts-bank-proof", feature = "timestamps-bank-proof", feature = "latency-bank-proof")))]
+#[cfg(not(any(
+    feature = "inventory-only",
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+)))]
 #[map]
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
@@ -2778,6 +2791,7 @@ const ENTRY_ABI_LP64: u8 = 1;
 const ENTRY_ABI_ILP32: u8 = 2;
 
 #[cfg(not(feature = "inventory-only"))]
+#[cfg(not(p11scope_journal_roots))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
     keep_endpoint_stack(&ctx);
@@ -2785,9 +2799,9 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         return 0;
     }
     #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
-    let rc = p11_entry_impl::<0, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     #[cfg(feature = "unsafe-unvalidated-metadata")]
-    let rc = p11_entry_impl::<0, ENTRY_ABI_LP64>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_LP64, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2799,7 +2813,7 @@ pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<0, ENTRY_ABI_ILP32>(ctx);
+    let rc = p11_entry_impl::<0, ENTRY_ABI_ILP32, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2811,7 +2825,7 @@ pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<1, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<1, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2823,7 +2837,7 @@ pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<2, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<2, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2837,7 +2851,7 @@ pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_entry_impl::<3, ENTRY_ABI_MIXED>(ctx);
+    let rc = p11_entry_impl::<3, ENTRY_ABI_MIXED, false>(ctx, core::ptr::null_mut());
     stop_gate_leave();
     rc
 }
@@ -2930,7 +2944,7 @@ unsafe extern "C" {
     #[cfg(p11scope_birth_marker)]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_exec_birth() -> u32;
-    #[cfg(p11scope_birth_marker)]
+    #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_scope_gap() -> u32;
     fn p11_owner_healthy() -> u32;
@@ -2996,6 +3010,29 @@ fn owned_start_remove(key: &StartKey, required: bool) -> Result<(), ()> {
 #[inline(always)]
 fn owned_start_remove_rc(key: &StartKey, required: bool) -> i64 {
     unsafe { p11_owner_start_remove(key, u32::from(required)) }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_remove_rc_for<const JOURNAL: bool>(key: &StartKey, required: bool, reason: u32) -> i64 {
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        return journal_roots::program::remove(key, required, reason);
+    }
+    let _ = reason;
+    owned_start_remove_rc(key, required)
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_remove_for<const JOURNAL: bool>(
+    key: &StartKey,
+    required: bool,
+    reason: u32,
+) -> Result<(), ()> {
+    (start_remove_rc_for::<JOURNAL>(key, required, reason) == 0)
+        .then_some(())
+        .ok_or(())
 }
 
 // Required-object marker for this attachment cookie: the frozen descriptor
@@ -3410,7 +3447,13 @@ fn object_emit_get_attributes(
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn owned_start_discard(key: &StartKey) {
-    if !matches!(owned_start_remove_rc(key, false), 0 | -2) {
+    start_discard_for::<false>(key, 0);
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn start_discard_for<const JOURNAL: bool>(key: &StartKey, reason: u32) {
+    if !matches!(start_remove_rc_for::<JOURNAL>(key, false, reason), 0 | -2) {
         unsafe { p11_object_fault() };
     }
 }
@@ -3458,8 +3501,41 @@ fn entry_ip(ctx: &ProbeContext, layout: LinuxLayout) -> u64 {
 }
 
 #[cfg(not(feature = "inventory-only"))]
+#[repr(C)]
+struct CompletedEntry {
+    key: StartKey,
+    descriptor: u32,
+    layout: u8,
+    completed: u8,
+    reserved: u16,
+}
+
+#[cfg(not(feature = "inventory-only"))]
+impl Default for CompletedEntry {
+    fn default() -> Self {
+        Self {
+            key: StartKey {
+                pid_tgid: 0,
+                slot: 0,
+                _pad: 0,
+            },
+            descriptor: 0,
+            layout: 0,
+            completed: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+const _: () = assert!(core::mem::size_of::<CompletedEntry>() == 24);
+
+#[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {
+fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(
+    ctx: ProbeContext,
+    completed: *mut CompletedEntry,
+) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;
@@ -3468,10 +3544,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         // H8-D birth marker: a watched call outside the scope dirties
         // the leader row, so a later exec cannot claim an uncaptured
         // prefix as born.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
         return 0;
     };
@@ -3482,24 +3560,28 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     };
     let Some(actual_layout) = probe_layout(&ctx) else {
         // H8-D birth marker: a refused ABI is an uncaptured call.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
-        let _ = owned_start_remove(&key, false);
+        let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
     let layout = if ENTRY_ABI == ENTRY_ABI_LP64 {
         if !matches!(actual_layout, LinuxLayout::Lp64) {
             // H8-D birth marker: a refused ABI is an uncaptured call.
-            #[cfg(p11scope_birth_marker)]
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
             #[cfg(not(feature = "counter-broad"))]
-            unsafe {
-                p11_instance_scope_gap();
+            if JOURNAL || cfg!(p11scope_birth_marker) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
             }
-            let _ = owned_start_remove(&key, false);
+            let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;
         }
@@ -3507,12 +3589,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     } else if ENTRY_ABI == ENTRY_ABI_ILP32 {
         if !matches!(actual_layout, LinuxLayout::Ilp32) {
             // H8-D birth marker: a refused ABI is an uncaptured call.
-            #[cfg(p11scope_birth_marker)]
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
             #[cfg(not(feature = "counter-broad"))]
-            unsafe {
-                p11_instance_scope_gap();
+            if JOURNAL || cfg!(p11scope_birth_marker) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
             }
-            let _ = owned_start_remove(&key, false);
+            let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_ABI_REFUSED);
             bump_evidence(EVIDENCE_ABI_REFUSALS);
             return 0;
         }
@@ -3539,12 +3623,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if unsafe { p11_link_current_identity(&mut seed.image) } != 1 || seed.image.task_cookie == 0 {
         // H8-D birth marker: a call lost to identity failure is an
         // uncaptured call, so it dirties the leader row.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
-        let _ = owned_start_remove(&key, false);
+        let _ = start_remove_for::<JOURNAL>(&key, false, JOURNAL_REASON_IDENTITY_REFUSED);
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
     }
@@ -3570,10 +3656,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if start_pointer.is_null() {
         // H8-D birth marker: a call lost to START refusal is an
         // uncaptured call, so it dirties the leader row.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
         bump_evidence(EVIDENCE_START_INSERT_FAILURES);
         return 0;
@@ -3744,7 +3832,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         // abandon the invocation loudly instead of running half-bound.
         let recorded = object_record_entry_abi(&key, (object_required - 1) as u32, layout);
         if !recorded {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
@@ -3756,7 +3844,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         let fill_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_fill_entry(&ctx, fill_side, layout, null_cancel) {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
@@ -3764,7 +3852,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         let derive_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_derive(&ctx, derive_side, layout) {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
@@ -3772,7 +3860,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         let results_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_results(&ctx, results_side, layout) {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
@@ -3780,7 +3868,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         let find_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_find(&ctx, find_side, layout) {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
@@ -3788,12 +3876,33 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         let attributes_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_attributes(&ctx, attributes_side, layout) {
-            let _ = owned_start_remove(&key, true);
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
         }
     }
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        // Only the fully successful construction reaches this write. Failed
+        // entry arms leave the root's initialized NONE token untouched.
+        unsafe {
+            // Write directly into the caller's token: an aggregate copy can
+            // materialize a second token in this tightly bounded frame.
+            core::ptr::addr_of_mut!((*completed).key.pid_tgid).write(key.pid_tgid);
+            core::ptr::addr_of_mut!((*completed).key.slot).write(key.slot);
+            core::ptr::addr_of_mut!((*completed).key._pad).write(0);
+            core::ptr::addr_of_mut!((*completed).descriptor)
+                .write(cookie_descriptor(cookie_of(&ctx)));
+            core::ptr::addr_of_mut!((*completed).layout).write(match layout {
+                LinuxLayout::Lp64 => 1,
+                LinuxLayout::Ilp32 => 2,
+            });
+            core::ptr::addr_of_mut!((*completed).reserved).write(0);
+            core::ptr::addr_of_mut!((*completed).completed).write(1);
+        }
+    }
+    let _ = completed;
     #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
@@ -3837,20 +3946,21 @@ fn rv_count_add(key: &RvKey) -> bool {
 }
 
 #[cfg(not(feature = "inventory-only"))]
+#[cfg(not(p11scope_journal_roots))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
     keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_return_impl(ctx);
+    let rc = p11_return_impl::<false>(ctx);
     stop_gate_leave();
     rc
 }
 
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn p11_return_impl(ctx: RetProbeContext) -> u32 {
+fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
         return 0;
@@ -3863,15 +3973,17 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         };
         // H8-D birth marker: a return that lost its scope loses the
         // completion, so it dirties the leader row.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
-        match owned_start_remove_rc(&key, false) {
+        match start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST) {
             0 => bump_evidence(EVIDENCE_UNMATCHED_RETURNS),
             -2 => {}
             _ => {
@@ -3889,12 +4001,14 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let Some(layout) = ret_probe_layout(&ctx) else {
         // H8-D birth marker: a return with a refused ABI loses the
         // completion, so it dirties the leader row.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
-        owned_start_discard(&key);
+        start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
@@ -3905,15 +4019,17 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         // H8-D birth marker: a return without START loses the
         // completion. Absence and owner-custody refusal share this NULL,
         // so both dirty the leader row.
-        #[cfg(p11scope_birth_marker)]
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(feature = "counter-broad"))]
-        unsafe {
-            p11_instance_scope_gap();
+        if JOURNAL || cfg!(p11scope_birth_marker) {
+            unsafe {
+                p11_instance_scope_gap();
+            }
         }
         return 0;
     }
     if cfg!(feature = "counter-broad") && unsafe { (*start).object_required } != 0 {
-        owned_start_discard(&key);
+        start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
@@ -3922,10 +4038,20 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     // in place at their own lost-call arms (a 12-byte global frame at
     // depth 3, inside the 512-byte chain). No lost code crosses to the
     // root: the 6.1/5.15 verifiers explore the pre-marker tail shape.
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL {
+        return if unsafe { (*start).object_required } == 0 {
+            journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)
+        } else {
+            object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(
+                ctx, &key, start, flags, layout,
+            )
+        };
+    }
     if unsafe { (*start).object_required } == 0 {
         ordinary_return(ctx, &key, start, flags, layout)
     } else {
-        object_return(ctx, &key, start, flags, layout)
+        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)
     }
 }
 
@@ -3995,7 +4121,7 @@ fn account_return(
 
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn capture_return_facts(
+fn capture_return_facts<const DEFER_ROUTING: bool>(
     ctx: &RetProbeContext,
     start: &CallStart,
     flags: u64,
@@ -4054,9 +4180,21 @@ fn capture_return_facts(
         session,
         async_value,
         capture_flags,
-        pid_tgid: helpers::bpf_get_current_pid_tgid(),
-        cgroup_id: unsafe { helpers::bpf_get_current_cgroup_id() },
-        root_affiliation: unsafe { p11_root_current_tag() },
+        pid_tgid: if DEFER_ROUTING {
+            0
+        } else {
+            helpers::bpf_get_current_pid_tgid()
+        },
+        cgroup_id: if DEFER_ROUTING {
+            0
+        } else {
+            unsafe { helpers::bpf_get_current_cgroup_id() }
+        },
+        root_affiliation: if DEFER_ROUTING {
+            0
+        } else {
+            unsafe { p11_root_current_tag() }
+        },
     }
 }
 
@@ -4097,7 +4235,7 @@ fn ordinary_return(
         }
         return 0;
     }
-    let facts = capture_return_facts(ctx, &start, flags, layout, accounting);
+    let facts = capture_return_facts::<false>(ctx, &start, flags, layout, accounting);
     match EVENTS.reserve::<EventRecord>(0) {
         Some(mut e) => {
             let raw = e.as_mut_ptr();
@@ -4128,8 +4266,21 @@ fn ordinary_return(
 }
 
 #[cfg(not(feature = "inventory-only"))]
+trait ReturnPayload: Sized + 'static {
+    unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord;
+}
+
+#[cfg(not(feature = "inventory-only"))]
+impl ReturnPayload for ObjectEventRecord {
+    #[inline(always)]
+    unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
+        record
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
-fn object_return(
+fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
     ctx: RetProbeContext,
     key: &StartKey,
     start: *const CallStart,
@@ -4156,7 +4307,7 @@ fn object_return(
         // H7-E2: every refusal retires identifiable owned state
         // through the checked removal before returning; the fault
         // below fires whether or not the retire settles.
-        let _ = owned_start_remove(&key, true);
+        let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
@@ -4168,88 +4319,112 @@ fn object_return(
     });
     if !agreed {
         // H7-E2: retire before returning, as on every refusal arm.
-        let _ = owned_start_remove(&key, true);
+        let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
-    let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
-    if flags & FLAG_POLICY_AGGREGATE != 0 {
-        if owned_start_remove(&key, true).is_err() {
-            unsafe { p11_object_fault() };
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-        }
-        return 0;
-    }
-    let mut image = ImageIdentity::default();
-    if unsafe { p11_link_current_identity(&mut image) } != 1
-        || !image_pair_matches(unsafe { (*start).image }, image)
-    {
-        let _ = owned_start_remove(&key, true);
-        unsafe { p11_object_fault() };
-        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        return 0;
-    }
-    // This short immutable borrow ends before reservation/native continuity
-    // or side-row helpers. All retained START reads finish before removal.
-    let facts = unsafe { capture_return_facts(ctx, &*start, flags, layout, accounting) };
-    // Slice D emission: reserve the complete 608-byte record BEFORE
-    // any result/attribute read. Reservation failure performs no new
-    // reads: disclose loss, clean ownership, keep the aggregate
-    // return/RV accounting recorded above, and return.
-    let descriptor = cookie_descriptor(cookie_of(ctx));
-    let rv = accounting.rv;
-    let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
-        // The fault below already refuses births; gap only when the
-        // START removal settles. The gap runs here in place; the root
-        // stays a plain tail dispatch for the 6.1/5.15 verifiers.
-        let failed = owned_start_remove(&key, true).is_err();
-        if failed {
-            unsafe { p11_object_fault() };
-        }
-        bump_evidence(EVIDENCE_RING_LOSS);
-        // H8-D birth marker: a ring-loss return whose START removal
-        // settled loses the completion, so it gaps here in place.
-        #[cfg(p11scope_birth_marker)]
-        #[cfg(not(feature = "counter-broad"))]
-        if !failed {
-            unsafe {
-                p11_instance_scope_gap();
+    // Finish the accounting/facts storage lifetime before deep object
+    // readers. Only the owned reservation and three return scalars leave
+    // this block; no duplicate aggregate survives into attribute capture.
+    let (mut entry, rv, mechanism, capture_flags) = {
+        let accounting = account_return(ctx, key.slot, unsafe { (*start).ts_ns }, layout);
+        if flags & FLAG_POLICY_AGGREGATE != 0 {
+            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                .is_err()
+            {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
+            return 0;
         }
-        return 0;
+        let mut image = ImageIdentity::default();
+        if unsafe { p11_link_current_identity(&mut image) } != 1
+            || !image_pair_matches(unsafe { (*start).image }, image)
+        {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            return 0;
+        }
+        // This short immutable borrow ends before reservation/native continuity
+        // or side-row helpers. All retained START reads finish before removal.
+        let facts =
+            unsafe { capture_return_facts::<JOURNAL>(ctx, &*start, flags, layout, accounting) };
+        // Slice D emission: reserve the complete 608-byte record BEFORE
+        // any result/attribute read. Reservation failure performs no new
+        // reads: disclose loss, clean ownership, keep the aggregate
+        // return/RV accounting recorded above, and return.
+        let Some(mut entry) = EVENTS.reserve::<Record>(0) else {
+            // The fault below already refuses births; gap only when the
+            // START removal settles. The gap runs here in place; the root
+            // stays a plain tail dispatch for the 6.1/5.15 verifiers.
+            let failed =
+                start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                    .is_err();
+            if failed {
+                unsafe { p11_object_fault() };
+            }
+            bump_evidence(EVIDENCE_RING_LOSS);
+            // H8-D birth marker: a ring-loss return whose START removal
+            // settled loses the completion, so it gaps here in place.
+            #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+            #[cfg(not(feature = "counter-broad"))]
+            if !failed && (JOURNAL || cfg!(p11scope_birth_marker)) {
+                unsafe {
+                    p11_instance_scope_gap();
+                }
+            }
+            return 0;
+        };
+        // H7-E1: populate in place under ownership with the base event
+        // and its continuity landing in the reserved record FIRST, then
+        // the join gate before any object result read, then (with the S1
+        // return-time mechanism evidence the return body just captured)
+        // the result fills and tail sections. A refused join preserves only
+        // the ordinary base. A found continuity entry is not a join: only the full
+        // stamp predicate authorizes result/Find/attribute reads.
+        let reservation = entry.as_mut_ptr();
+        let raw = unsafe { Record::payload(reservation) };
+        unsafe {
+            fill_call_event(
+                core::ptr::addr_of_mut!((*raw).base.event),
+                &*start,
+                key.slot,
+                &facts,
+            );
+            #[cfg(p11scope_journal_roots)]
+            if JOURNAL {
+                journal_roots::program::route(core::ptr::addr_of_mut!((*raw).base.event));
+            }
+            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+        }
+        (entry, accounting.rv, facts.mechanism, facts.capture_flags)
     };
-    // H7-E1: populate in place under ownership with the base event
-    // and its continuity landing in the reserved record FIRST, then
-    // the join gate before any object result read, then (with the S1
-    // return-time mechanism evidence the return body just captured)
-    // the result fills and tail sections. A refused join preserves only
-    // the ordinary base. A found continuity entry is not a join: only the full
-    // stamp predicate authorizes result/Find/attribute reads.
-    let raw = entry.as_mut_ptr();
-    unsafe {
-        fill_call_event(
-            core::ptr::addr_of_mut!((*raw).base.event),
-            &*start,
-            key.slot,
-            &facts,
-        );
-        let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
-    }
+    let reservation = entry.as_mut_ptr();
+    let raw = unsafe { Record::payload(reservation) };
     let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
     if !joined {
         let outcome = preserve_refused_base(
-            || owned_start_remove(&key, true).is_ok(),
+            || start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),
             || unsafe { p11_object_fault() },
             // SAFETY: fill_call_event and p11_instance_return initialized
             // every byte of this 368-byte base while the reservation was
             // owned. Copy it before discard; the unfilled object tail is
             // never read, and the original failing stamps remain unchanged.
-            || EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok(),
+            || {
+                EVENTS
+                    .output::<EventRecord>(unsafe { &(*raw).base }, 0)
+                    .is_ok()
+            },
         );
         entry.discard(0);
         if outcome == RefusedBaseOutcome::OutputFailed {
             bump_evidence(EVIDENCE_RING_LOSS);
+        }
+        #[cfg(p11scope_journal_roots)]
+        if JOURNAL {
+            journal_roots::program::gap();
         }
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         return 0;
@@ -4259,8 +4434,8 @@ fn object_return(
     let filled = object_fill_return(
         ready,
         rv,
-        facts.capture_flags & capture::MECHANISM_MASK,
-        facts.mechanism,
+        capture_flags & capture::MECHANISM_MASK,
+        mechanism,
         encode_return_gate(layout, joined),
     );
     // Each emission level re-queries its side row like the entry
@@ -4290,7 +4465,21 @@ fn object_return(
     // cleanup decision evaluates the retirement independently of
     // emission success, so a failed fill/emission still retires owned
     // state and no read runs after either failure.
-    let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
+    #[cfg(p11scope_journal_roots)]
+    if JOURNAL && !emitted {
+        journal_roots::program::gap();
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+    }
+    let reason = JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    #[cfg(p11scope_journal_roots)]
+    let reason = if JOURNAL && emitted {
+        unsafe { journal_roots::program::complete(reservation.cast(), &key, false) }
+    } else {
+        reason
+    };
+    let outcome = emission_finalize(emitted, || {
+        start_remove_for::<JOURNAL>(&key, true, reason).is_ok()
+    });
     if !outcome.submitted {
         unsafe { p11_object_fault() };
         entry.discard(0);
@@ -4371,9 +4560,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 // Appended so disabled proof preparation does not move ordinary BPF lines.
-#[cfg(any(feature = "counts-bank-proof", feature = "timestamps-bank-proof", feature = "latency-bank-proof"))]
+#[cfg(any(
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+))]
 mod counter_bank_proof;
-#[cfg(any(feature = "counts-bank-proof", feature = "timestamps-bank-proof", feature = "latency-bank-proof"))]
+#[cfg(any(
+    feature = "counts-bank-proof",
+    feature = "timestamps-bank-proof",
+    feature = "latency-bank-proof"
+))]
 use counter_bank_proof::RV_COUNTS;
 // Appended so disabled proof preparation does not move ordinary BPF lines.
 #[cfg(feature = "image-bank-proof")]

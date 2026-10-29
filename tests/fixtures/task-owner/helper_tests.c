@@ -2986,6 +2986,134 @@ static void loader_retirement_no_recycle_before_ack(void)
     assert(gate_ctl.retired == 1 && gate_ctl.admitted == 1);
     puts("SCENARIO loader_retirement_no_recycle_before_ack PASS");
 }
+
+/* T-L2 stale-cookie twin: START retires cleanly but the gate refuses the
+ * cookie, so the contract reports -3 with START gone, the gate row ARMED
+ * and one refusal counted. No retry can re-report the lost disposition. */
+static void loader_retirement_stale_cookie(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 10 };
+    u64 cookie = LOADER_TOKEN(1, 20);
+    u64 stale = LOADER_TOKEN(2, 20);
+    reset();
+    assert(p11_loader_gate_admit(20, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         stale) == -3);
+    assert(!row(&START, &key) && !ctl.outstanding);
+    assert(gate_rows[20].state == LOADER_GATE_ARMED);
+    assert(gate_rows[20].disposition == LOADER_GATE_DISP_NONE);
+    assert(gate_ctl.retired == 0 && gate_ctl.refusals == 1);
+    /* The lost disposition cannot be recovered by retry: START is gone. */
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == -1);
+    assert(gate_rows[20].state == LOADER_GATE_ARMED);
+    assert(gate_ctl.refusals == 1);
+    /* An unknown reason owns no disposition: START still retires, the gate
+     * still refuses, and the contract still reports -3. */
+    reset();
+    assert(p11_loader_gate_admit(20, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, 99, cookie) == -3);
+    assert(!row(&START, &key) && !ctl.outstanding);
+    assert(gate_rows[20].state == LOADER_GATE_ARMED);
+    assert(gate_ctl.retired == 0 && gate_ctl.refusals == 1);
+    /* A NULL key refuses before any map access, like the sibling. */
+    assert(p11_owner_start_remove_loader(NULL, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == -1);
+    assert(gate_ctl.refusals == 1);
+    puts("SCENARIO loader_retirement_stale_cookie PASS");
+}
+
+/* T-L2 side-contradiction twin: a planted OBJECT_START row faults the
+ * removal (-1, START and side gone, mismatch recorded) while the good
+ * cookie still records its END disposition. */
+static void loader_retirement_side_fault(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 11 };
+    u64 cookie = LOADER_TOKEN(1, 21);
+    unsigned char leaked[432];
+    reset();
+    assert(p11_loader_gate_admit(21, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    /* An ordinary START must hold no side row: plant the contradiction. */
+    memset(leaked, 0, sizeof(leaked));
+    assert(!update(&OBJECT_START, &key, leaked, 1));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         cookie) == -1);
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!ctl.outstanding);
+    assert(ctl.poison & OWNER_OBJECT_MISMATCH);
+    /* The fault dominates the return, but the good cookie still recorded
+     * its disposition: reconcile by lookup, not by retry. */
+    assert(gate_rows[21].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[21].disposition == LOADER_GATE_DISP_END);
+    assert(gate_ctl.retired == 1 && gate_ctl.refusals == 0);
+    assert(p11_loader_gate_lookup(cookie) == -1);
+    puts("SCENARIO loader_retirement_side_fault PASS");
+}
+
+/* T-L2 fault-plus-stale twin: the fault dominates the return (-1,
+ * identical to fault-with-report) but the gate refused the cookie, so
+ * the row stays ARMED and the disposition is lost until reconciled. */
+static void loader_retirement_fault_plus_stale(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 12 };
+    u64 stale = LOADER_TOKEN(1, 99);
+    unsigned char leaked[432];
+    reset();
+    assert(p11_loader_gate_admit(22, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    memset(leaked, 0, sizeof(leaked));
+    assert(!update(&OBJECT_START, &key, leaked, 1));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_RETURN,
+                                         stale) == -1);
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!ctl.outstanding);
+    assert(ctl.poison & OWNER_OBJECT_MISMATCH);
+    assert(gate_rows[22].state == LOADER_GATE_ARMED);
+    assert(gate_rows[22].disposition == LOADER_GATE_DISP_NONE);
+    assert(gate_ctl.retired == 0 && gate_ctl.refusals == 1);
+    /* Reconcile through the gate: the ARMED row re-reports directly. */
+    assert(p11_loader_gate_note_producer_end(LOADER_TOKEN(1, 22),
+                                             P11_OWNER_START_REASON_RETURN) == 0);
+    assert(gate_rows[22].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[22].disposition == LOADER_GATE_DISP_END);
+    puts("SCENARIO loader_retirement_fault_plus_stale PASS");
+}
+
+/* T-L2 combined COLLISION and EXEC_EXIT twins: both reasons retire
+ * through the combined removal with their owned dispositions. */
+static void loader_retirement_collision_exec_exit(void)
+{
+    struct owner_start_key key = { .pid_tgid = (42ULL << 32) | 100, .slot = 13 };
+    u64 cookie = LOADER_TOKEN(1, 23);
+    reset();
+    assert(p11_loader_gate_admit(23, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_COLLISION,
+                                         cookie) == 0);
+    assert(!row(&START, &key) && !ctl.outstanding && !ctl.poison);
+    assert(gate_rows[23].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[23].disposition == LOADER_GATE_DISP_NO_END);
+    reset();
+    key.slot = 14;
+    cookie = LOADER_TOKEN(1, 24);
+    assert(p11_loader_gate_admit(24, 1) == 0);
+    assert(p11_loader_gate_cutover() == 0);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(p11_owner_start_remove_loader(&key, 1, P11_OWNER_START_REASON_EXEC_EXIT,
+                                         cookie) == 0);
+    assert(!row(&START, &key) && !ctl.outstanding && !ctl.poison);
+    assert(gate_rows[24].state == LOADER_GATE_RETIRED);
+    assert(gate_rows[24].disposition == LOADER_GATE_DISP_ABANDON);
+    puts("SCENARIO loader_retirement_collision_exec_exit PASS");
+}
 #endif
 #ifdef P11SCOPE_OBJECT_JOURNAL
 static void journal_removal_hook(void)
@@ -3134,6 +3262,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "loader_retirement_exec_exit_abandon")) loader_retirement_exec_exit_abandon();
         else if (!strcmp(argv[1], "loader_retirement_failures")) loader_retirement_failures();
         else if (!strcmp(argv[1], "loader_retirement_no_recycle_before_ack")) loader_retirement_no_recycle_before_ack();
+        else if (!strcmp(argv[1], "loader_retirement_stale_cookie")) loader_retirement_stale_cookie();
+        else if (!strcmp(argv[1], "loader_retirement_side_fault")) loader_retirement_side_fault();
+        else if (!strcmp(argv[1], "loader_retirement_fault_plus_stale")) loader_retirement_fault_plus_stale();
+        else if (!strcmp(argv[1], "loader_retirement_collision_exec_exit")) loader_retirement_collision_exec_exit();
 #endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
         else if (!strcmp(argv[1], "bank_timing_add_saturates")) bank_timing_add_saturates();

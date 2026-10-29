@@ -269,6 +269,10 @@ fn production_loader_retirement_reports_owned_gate_dispositions() {
         "loader_retirement_exec_exit_abandon",
         "loader_retirement_failures",
         "loader_retirement_no_recycle_before_ack",
+        "loader_retirement_stale_cookie",
+        "loader_retirement_side_fault",
+        "loader_retirement_fault_plus_stale",
+        "loader_retirement_collision_exec_exit",
     ] {
         let output = Command::new(&binary).arg(selector).output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

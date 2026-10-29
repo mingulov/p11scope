@@ -177,8 +177,8 @@ pub(super) mod program {
         Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
 
     unsafe extern "C" {
-        fn p11_journal_begin(key: *const StartKey, context: *const EntryContext);
-        fn p11_journal_returning(key: *const StartKey, out: *mut ReturnWords);
+        fn p11_journal_begin(key: *const StartKey, context: *const EntryContext) -> u32;
+        fn p11_journal_returning(key: *const StartKey, out: *mut ReturnWords) -> u32;
         fn p11_owner_start_remove_reason(key: *const StartKey, required: u32, reason: u32) -> i64;
     }
 
@@ -238,7 +238,9 @@ pub(super) mod program {
         // call; the native function's own validation decides. Unknown never
         // takes the Call arm.
         match begin_decision(descriptor, configured, layout) {
-            BeginDecision::Call(context) => unsafe { p11_journal_begin(key, &context) },
+            BeginDecision::Call(context) => {
+                unsafe { p11_journal_begin(key, &context) };
+            }
             BeginDecision::Gap => {
                 gap();
                 bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);

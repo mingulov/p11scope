@@ -293,10 +293,10 @@ reader = load_path(Path('scripts/check-bpf-map-defs.py'), 'journal_link_btf')
 elf = reader.Elf(Path(sys.argv[1]).read_bytes())
 btf = reader.Btf(elf.sections['.BTF'][1])
 expected = {
-    'p11_journal_begin': (0, (('ptr', 16), ('ptr', 16))),
-    'p11_journal_returning': (0, (('ptr', 16), ('ptr', 24))),
-    'p11_journal_settle_prepare': (0, (('ptr', 16), ('int', 4), ('ptr', 72))),
-    'p11_journal_settle_finish': (0, (('ptr', 72), ('int', 4))),
+    'p11_journal_begin': (4, (('ptr', 16), ('ptr', 16))),
+    'p11_journal_returning': (4, (('ptr', 16), ('ptr', 24))),
+    'p11_journal_settle_prepare': (4, (('ptr', 16), ('int', 4), ('ptr', 72))),
+    'p11_journal_settle_finish': (4, (('ptr', 72), ('int', 4))),
     'p11_owner_start_remove_reason': (8, (('ptr', 16), ('int', 4), ('int', 4))),
     'p11_instance_scope_gap': (4, ()),
 }
@@ -305,11 +305,9 @@ for name, (result_size, arguments) in expected.items():
     assert len(functions) == 1 and functions[0][3] == 1, name + ' global BTF function'
     proto = btf.types[functions[0][2]]
     assert proto[0] == 13 and proto[3] == len(arguments), name + ' argument count'
-    if result_size:
-        result = btf.resolve(proto[2])
-        assert result[0] == 1 and result[2] == result_size, name + ' scalar result'
-    else:
-        assert proto[2] == 0, name + ' void result'
+    assert result_size != 0, name + ' must declare a scalar BTF result for the verifier'
+    result = btf.resolve(proto[2])
+    assert result[0] == 1 and result[2] == result_size, name + ' scalar result'
     for ref, (kind, size) in zip(proto[5][1::2], arguments, strict=True):
         node = btf.resolve(ref)
         if kind == 'ptr':

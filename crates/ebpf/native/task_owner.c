@@ -578,7 +578,7 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
     (void)reason;
 #ifdef P11SCOPE_OBJECT_JOURNAL
     if (owner->journal_thread) {
-        p11_journal_settle_prepare(key, reason, &journal);
+        (void)p11_journal_settle_prepare(key, reason, &journal);
         if (journal.state == JOURNAL_SETTLE_BLOCKED)
             return -1;
     }
@@ -591,7 +591,7 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
     if (side < 0) {
 #ifdef P11SCOPE_OBJECT_JOURNAL
         if (owner->journal_thread)
-            p11_journal_settle_finish(&journal, 0);
+            (void)p11_journal_settle_finish(&journal, 0);
 #endif
         return -1;
     }
@@ -600,14 +600,14 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
         poison(ctl, OWNER_STATE_DELETE_FAILED);
 #ifdef P11SCOPE_OBJECT_JOURNAL
         if (owner->journal_thread)
-            p11_journal_settle_finish(&journal, 0);
+            (void)p11_journal_settle_finish(&journal, 0);
 #endif
         return rc;
     }
     owner->start_count--;
 #ifdef P11SCOPE_OBJECT_JOURNAL
     if (owner->journal_thread)
-        p11_journal_settle_finish(&journal, side == 0);
+        (void)p11_journal_settle_finish(&journal, side == 0);
 #endif
     /* Branchless nonzero-to--1: (s|-s) has bit63 set exactly when s != 0.
      * All-unsigned, so no overflow UB; a comparison would compile to a jump. */

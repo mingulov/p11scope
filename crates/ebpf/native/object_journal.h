@@ -113,11 +113,11 @@ _Static_assert(sizeof(struct journal_entry_witness) == 24, "retained instance en
 _Static_assert(sizeof(struct journal_descriptor_row) == 18, "frozen semantics ABI");
 _Static_assert(__builtin_offsetof(struct journal_descriptor_row, session_arg) == 6, "session arg");
 extern unsigned char INSTANCE_START, DESCRIPTORS, EVENTS, EVIDENCE;
-void p11_journal_begin(const struct owner_start_key *key, const struct journal_entry_context *entry);
-void p11_journal_returning(const struct owner_start_key *key, struct journal_return_words *out);
-void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
-                                struct journal_settle_words *out);
-void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
+u32 p11_journal_begin(const struct owner_start_key *key, const struct journal_entry_context *entry);
+u32 p11_journal_returning(const struct owner_start_key *key, struct journal_return_words *out);
+u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                               struct journal_settle_words *out);
+u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
 
 /* Whether one header describes an exact version/kind/length/flag
  * combination over a nonzero identity. Mirrors the Rust validators;

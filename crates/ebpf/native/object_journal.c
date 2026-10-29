@@ -900,8 +900,8 @@ static __always_inline void producer_unwind(const struct owner_start_key *key)
         producer_loss(5);
 }
 
-__attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *key,
-                                                const struct journal_entry_context *entry)
+__attribute__((noinline)) u32 p11_journal_begin(const struct owner_start_key *key,
+                                               const struct journal_entry_context *entry)
 {
     struct journal_begin_facts facts = {};
     struct journal_header_spec header = {224, JOURNAL_KIND_BEGIN, 0, 0, 0};
@@ -915,39 +915,39 @@ __attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *k
         (entry->layout != JOURNAL_LAYOUT_LP64 && entry->layout != JOURNAL_LAYOUT_ILP32) ||
         entry->class_bits > JOURNAL_CLASS_NO_END) {
         producer_loss(5);
-        return;
+        return 0;
     }
     if (entry->class_bits == JOURNAL_CLASS_COUNT_ONLY)
-        return;
+        return 0;
     owner = txn_owner(key);
     if (!owner || !owner->start_count || !producer_facts(key, entry, &facts)) {
         producer_loss(5);
-        return;
+        return 0;
     }
     ctl = owner_map_lookup(&JOURNAL_CTL, &zero);
     if (!ctl || ctl->poison) {
         producer_loss(5);
-        return;
+        return 0;
     }
     value.thread = p11_journal_thread(owner, ctl);
     value.sequence = value.thread ? p11_journal_next_sequence(owner) : 0;
     value.phase = JOURNAL_PHASE_PREPARING;
     if (!value.thread || !value.sequence) {
         producer_loss(5);
-        return;
+        return 0;
     }
     header.thread = value.thread;
     header.sequence = value.sequence;
     if (entry->class_bits == JOURNAL_CLASS_TRACKED) {
         if (p11_journal_side_insert(&JOURNAL_START, key, &value)) {
             producer_loss(5);
-            return;
+            return 0;
         }
     } else {
         header.flags = JOURNAL_FLAG_NO_END;
         if (owner_map_lookup(&JOURNAL_START, key)) {
             producer_loss(5);
-            return;
+            return 0;
         }
     }
     record = p11_journal_reserve(&EVENTS, JOURNAL_BEGIN_BYTES);
@@ -955,14 +955,14 @@ __attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *k
         producer_loss(0);
         if (entry->class_bits == JOURNAL_CLASS_TRACKED)
             producer_unwind(key);
-        return;
+        return 0;
     }
     if (p11_journal_header_init(record, &header) || txn_fill_begin(record, &facts, key)) {
         producer_loss(5);
         if (entry->class_bits == JOURNAL_CLASS_TRACKED)
             producer_unwind(key);
         p11_journal_discard(record);
-        return;
+        return 0;
     }
     p11_journal_submit(record);
     /* As in the combined transaction, publish before committing BEGUN.
@@ -971,53 +971,55 @@ __attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *k
     if (entry->class_bits == JOURNAL_CLASS_TRACKED &&
         p11_journal_mark_begun(&JOURNAL_START, key, value.thread, value.sequence))
         producer_loss(5);
+    return 0;
 }
 
-__attribute__((noinline)) void p11_journal_returning(const struct owner_start_key *key,
-                                                    struct journal_return_words *out)
+__attribute__((noinline)) u32 p11_journal_returning(const struct owner_start_key *key,
+                                                   struct journal_return_words *out)
 {
     struct thread_owner *owner;
     struct journal_start_value *row;
     u64 thread, sequence;
     if (!out)
-        return;
+        return 0;
     out->thread = out->sequence = 0;
     out->flags = JOURNAL_FLAG_UNJOURNALED;
     out->pad = 0;
     owner = txn_owner(key);
     if (!owner || !owner->journal_thread)
-        return;
+        return 0;
     row = p11_journal_side_lookup(&JOURNAL_START, key);
     if (!row)
-        return;
+        return 0;
     thread = row->thread;
     sequence = row->sequence;
     if (thread != owner->journal_thread || !sequence || row->phase != JOURNAL_PHASE_BEGUN ||
         p11_journal_return(owner, &JOURNAL_START, key, thread, sequence)) {
         producer_loss(5);
-        return;
+        return 0;
     }
     out->thread = thread;
     out->sequence = sequence;
     out->flags = 0;
+    return 0;
 }
 
-__attribute__((noinline)) void p11_journal_settle_prepare(const struct owner_start_key *key,
-                                                         u32 reason,
-                                                         struct journal_settle_words *out)
+__attribute__((noinline)) u32 p11_journal_settle_prepare(const struct owner_start_key *key,
+                                                        u32 reason,
+                                                        struct journal_settle_words *out)
 {
     struct thread_owner *owner;
     struct journal_start_value *row;
     const void *start;
     if (!out)
-        return;
+        return 0;
     __builtin_memset(out, 0, sizeof(*out));
     owner = txn_owner(key);
     if (!owner || !owner->journal_thread)
-        return;
+        return 0;
     row = p11_journal_side_lookup(&JOURNAL_START, key);
     if (!row)
-        return;
+        return 0;
     if (row->thread != owner->journal_thread || !row->sequence || !journal_phase_valid(row->phase)) {
         producer_loss(5);
         row->thread = row->sequence = row->phase = 0;
@@ -1056,36 +1058,38 @@ __attribute__((noinline)) void p11_journal_settle_prepare(const struct owner_sta
         producer_loss(5);
         out->state = JOURNAL_SETTLE_BLOCKED;
     }
+    return 0;
 }
 
-__attribute__((noinline)) void p11_journal_settle_finish(struct journal_settle_words *words,
-                                                        u32 cleanup_committed)
+__attribute__((noinline)) u32 p11_journal_settle_finish(struct journal_settle_words *words,
+                                                       u32 cleanup_committed)
 {
     u32 state;
     void *record;
     if (!words)
-        return;
+        return 0;
     state = words->state;
     words->state = JOURNAL_SETTLE_EMPTY;
     if (state == JOURNAL_SETTLE_EMPTY || state == JOURNAL_SETTLE_BLOCKED)
-        return;
+        return 0;
     if (cleanup_committed != 1) {
         producer_loss(5);
-        return;
+        return 0;
     }
     if (state == JOURNAL_SETTLE_SILENT)
-        return;
+        return 0;
     if (state != JOURNAL_SETTLE_ABANDON || words->pad) {
         producer_loss(5);
-        return;
+        return 0;
     }
     record = p11_journal_reserve(&EVENTS, JOURNAL_ABANDON_BYTES);
     if (!record) {
         producer_loss(0);
-        return;
+        return 0;
     }
     txn_copy(record, words->record, JOURNAL_ABANDON_BYTES);
     p11_journal_submit(record);
+    return 0;
 }
 
 #endif /* P11SCOPE_INVENTORY_ONLY */

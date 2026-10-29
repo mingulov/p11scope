@@ -108,11 +108,11 @@ _Static_assert(sizeof(struct journal_settle_words) == 72, "journal settle worksp
 _Static_assert(__builtin_offsetof(struct journal_settle_words, state) == 64, "settle state");
 #endif
 #if defined(P11SCOPE_OBJECT_JOURNAL) && !defined(P11SCOPE_INVENTORY_ONLY)
-/* Optional journal settlement adds no scalar result or new failure branch
- * to ordinary physical cleanup. Existing exported signatures stay intact. */
-void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
-                                struct journal_settle_words *out);
-void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
+/* Optional journal settlement adds no consumed scalar result or new failure
+ * branch to ordinary physical cleanup. Existing exported signatures stay intact. */
+u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                               struct journal_settle_words *out);
+u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
 long p11_owner_start_remove_reason(const struct owner_start_key *key, u32 required, u32 reason);
 #endif
 struct owner_discovery_key { u64 pid_tgid; u64 cookie; u64 domain; };

@@ -316,6 +316,28 @@ fn private_journal_roots_reach_the_real_producer_with_bounded_stack() {
     }
 }
 
+#[test]
+fn private_roots_reach_no_void_global_callee() {
+    if option_env!("P11SCOPE_JOURNAL_PROOF_ENABLED") != Some("1") {
+        assert_eq!(option_env!("P11SCOPE_JOURNAL_PROOF_ENABLED"), Some("0"));
+        return;
+    }
+    let object = Path::new(env!("OUT_DIR")).join("journal-proof-v1/p11scope-ebpf-journal-proof-v1");
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "-c", VOID_CALLEE_CHECKER])
+        .arg(&object)
+        .output()
+        .expect("inspect actual private callees");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
 const ROOT_CHECKER: &str = r#"
 from pathlib import Path
 import struct
@@ -478,4 +500,102 @@ assert sites, 'actual entry stack mutation has no site'
 changed = bytearray(data)
 struct.pack_into('<h', changed, section_offsets[root[0]] + root[1] + sites[0] * 8 + 2, -488)
 (output / 'excess-stack').write_bytes(changed)
+"#;
+
+const VOID_CALLEE_CHECKER: &str = r#"
+from pathlib import Path
+import struct
+import sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+reader = load_path(Path('scripts/check-bpf-map-defs.py'), 'journal_void_guard')
+elf = reader.Elf(Path(sys.argv[1]).read_bytes())
+bodies = {(s[3], s[4]): s for s in elf.symbols if s[1] & 15 == 2 and s[3] and s[5]}
+raws = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+relocations = {}
+for row, raw in elf.sections.values():
+    if row[1] == 9:
+        for at in range(0, len(raw), 16):
+            address, info = struct.unpack_from('<QQ', raw, at)
+            relocations[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+
+# Associate Rust's mangled ELF symbols with their actual BTF FUNC names at
+# the same section/offset. Substring presence is not call reachability.
+btf = reader.Btf(elf.sections['.BTF'][1])
+ext = elf.sections['.BTF.ext'][1]
+magic, version, flags, hlen, off, length = struct.unpack_from('<HBBIII', ext)
+assert (magic, version, flags, hlen) == (0xeb9f, 1, 0, 32)
+raw = ext[hlen + off:hlen + off + length]
+stride, = struct.unpack_from('<I', raw)
+assert stride == 8
+names, pos = {}, 4
+while pos < len(raw):
+    section_name, count = struct.unpack_from('<II', raw, pos)
+    section = elf.indices[reader.string_at(btf.strings, section_name)]
+    pos += 8
+    for _ in range(count):
+        offset, ident = struct.unpack_from('<II', raw, pos)
+        pos += stride
+        assert btf.types[ident][0] == 12 and (section, offset) in bodies
+        names[section, offset] = btf.types[ident][1]
+
+def instructions(key):
+    symbol = bodies[key]
+    raw = raws[key[0]][key[1]:key[1] + symbol[5]]
+    return [struct.unpack_from('<BBhi', raw, at) for at in range(0, len(raw), 8)]
+
+def children(key):
+    found = []
+    for index, (op, reg, _, immediate) in enumerate(instructions(key)):
+        if op != 0x85 or reg >> 4 != 1:
+            continue
+        relocation = relocations.get((key[0], key[1] + index * 8))
+        if relocation:
+            kind, target = relocation
+            assert kind == 10, f'unknown call relocation in {bodies[key][0]}'
+            child = (target[3], target[4] + (immediate + 1) * 8)
+        else:
+            child = (key[0], key[1] + index * 8 + (immediate + 1) * 8)
+        assert child in bodies, f'unresolved call in {bodies[key][0]}'
+        found.append(child)
+    return found
+
+def closure(root):
+    seen, pending = set(), [root]
+    while pending:
+        key = pending.pop()
+        if key not in seen:
+            seen.add(key)
+            pending.extend(children(key))
+    return seen
+
+def reachable(root):
+    return {names.get(key, bodies[key][0]) for key in closure(root)}
+
+# The kernel verifier requires every GLOBAL BPF callee to return a scalar;
+# a void global reachable from a program is refused at BPF_PROG_LOAD. The
+# three compiler builtins are empirically exempt (loaded programs reach
+# memset); every other void global must be unreachable from every program.
+void_globals = set()
+for node in btf.types[1:]:
+    if node[0] == 12 and node[3] == 1:
+        proto = btf.types[node[2]]
+        assert proto[0] == 13, 'global BTF function without a prototype'
+        if proto[2] == 0:
+            void_globals.add(node[1])
+builtins = {'memcpy', 'memmove', 'memset'}
+assert builtins <= void_globals, \
+    f'builtin carve-out is not all void globals: {builtins - void_globals}'
+for name in ('p11_journal_begin', 'p11_journal_returning',
+             'p11_journal_settle_prepare', 'p11_journal_settle_finish'):
+    functions = [node for node in btf.types[1:] if node[0] == 12 and node[1] == name]
+    assert len(functions) == 1 and functions[0][3] == 1, name + ' must stay a global BTF function'
+    proto = btf.types[functions[0][2]]
+    assert proto[0] == 13 and proto[2] != 0, name + ' must return a scalar for the verifier'
+programs = [key for key in bodies if key[0] != elf.indices['.text']]
+assert len(programs) >= 20, 'missing ordinary discovery/lifecycle/identity program inventory'
+for key in programs:
+    bad = sorted((reachable(key) & void_globals) - builtins)
+    assert not bad, f'{bodies[key][0]} reaches void GLOBAL FUNCs the verifier refuses: {bad}'
+print(f'all {len(programs)} programs reach no void GLOBAL callee outside the 3 builtins')
 "#;

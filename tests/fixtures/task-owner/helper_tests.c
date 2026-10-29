@@ -17,18 +17,20 @@ static void record_journal_prepare(const struct owner_start_key *key, u32 reason
     journal_settle_key = *key;
     journal_settle_reason = reason;
 }
-void p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
-                                struct journal_settle_words *out)
+u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
+                               struct journal_settle_words *out)
 {
     record_journal_prepare(key, reason);
     __builtin_memset(out, 0, sizeof(*out));
     out->state = journal_prepare_state;
+    return 0;
 }
-void p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed)
+u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed)
 {
     (void)words;
     journal_finish_calls++;
     journal_finish_committed = cleanup_committed;
+    return 0;
 }
 #endif
 #if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)

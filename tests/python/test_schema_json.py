@@ -463,5 +463,80 @@ class SchemaOracleAgreement(unittest.TestCase):
         )
 
 
+class PrearmOracleAgreement(unittest.TestCase):
+    """Packet 6.13: the oracle admits the prearm source shapes and checks
+    the additive watch keys."""
+
+    def evidence(self, sources):
+        return CHECKER["evidence_fixture"]({}, sources)
+
+    def test_prearm_source_shapes_admitted(self):
+        for sources in (
+            ("prearm",),
+            ("scan", "prearm"),
+            ("manifest", "prearm"),
+            ("scan", "manifest", "prearm"),
+        ):
+            evidence = self.evidence(sources)
+            CHECKER["exact_discovery_semantics"](evidence)
+
+    def test_prearm_only_reads_uncorroborated(self):
+        evidence = self.evidence(("prearm",))
+        module = evidence["discovery"][0]
+        self.assertEqual(module["corroboration"], ["uncorroborated"])
+        self.assertFalse(module["corroborated"])
+        self.assertEqual(evidence["discovery_uncorroborated"], 1)
+
+    def test_prearm_fixture_carries_no_tables(self):
+        evidence = self.evidence(("prearm",))
+        self.assertEqual(evidence["discovery"][0]["tables"], [])
+
+    def test_watch_keys_accepted_and_rejected(self):
+        evidence = self.evidence(("prearm",))
+        module = evidence["discovery"][0]
+        module["watch"] = {"since_ns": None, "state": "pinned_unarmed"}
+        module["attached_at_ns"] = None
+        CHECKER["exact_discovery_semantics"](evidence)
+        module["watch"] = {
+            "since_ns": 100,
+            "state": "ended",
+            "until_ns": 300,
+            "ended_by": "object_changed",
+            "changed": {
+                "last_ok_ns": 200,
+                "detected_ns": 300,
+                "previous_ino": 42,
+            },
+        }
+        module["attached_at_ns"] = 900
+        module["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "pre_attach"}
+        ]
+        CHECKER["exact_discovery_semantics"](evidence)
+        for bad in (
+            {"since_ns": None, "state": "watched"},
+            {"since_ns": None, "state": "armed", "ended_by": "cancel"},
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "changed": {
+                    "last_ok_ns": 300,
+                    "detected_ns": 200,
+                    "previous_ino": 42,
+                },
+            },
+        ):
+            broken = copy.deepcopy(evidence)
+            broken["discovery"][0]["watch"] = bad
+            with self.assertRaises(AssertionError):
+                CHECKER["exact_discovery_semantics"](broken)
+        broken = copy.deepcopy(evidence)
+        broken["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "missed_calls"}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](broken)
+
+
 if __name__ == "__main__":
     unittest.main()

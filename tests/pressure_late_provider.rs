@@ -129,6 +129,7 @@ fn system_args(hints: Vec<PathBuf>) -> CaptureArgs {
         kind: Kind::Profile,
         modules: hints,
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::System,
         metrics: false,

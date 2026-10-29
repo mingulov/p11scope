@@ -95,6 +95,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         kind: Kind::Profile,
         modules: hints,
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::System,
         metrics: false,

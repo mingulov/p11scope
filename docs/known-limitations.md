@@ -165,10 +165,23 @@ coverage as partial. The capture does not hang, and nothing is
 silently dropped. Fixing the underlying stall is planned for a later
 release.
 
+`--prearm-module` pins the named provider before any mapping and watches
+its proved offsets (`watch` on the discovery record, with `attached_at_ns`
+and `unobserved_windows` merged at capture end). A quiet pre-armed interval
+is a stated watch interval, not proven-exact coverage: no R2-D1-6 exactness
+producer ships yet, so attached modules always disclose their window.
+Inventory accepts and retains pre-arm inputs but Detailed-subset offset
+activation follows in a later packet (disclosed as a `pre-arm subset
+pending` scope gap). An in-place rewrite that preserves `(ino, size, ctime)`
+at the filesystem's granularity is undetectable by the retained-fd checks;
+heavier proof is later work.
+
 ## Planned for later versions
 
 - Live key operations (key type and size, sign/verify per key) in 0.6.0.
 - Promoting one endpoint to full detail during a counter capture, in 0.6.0.
+- Pre-arm exactness producers, inventory Detailed-subset activation, and
+  same-granularity rewrite proof (packet 6.13 follow-ups).
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.

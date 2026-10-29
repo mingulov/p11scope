@@ -21,10 +21,11 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
     KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
-    PinnedObjects, PinnedTimingKey, ReconciledModule, RetainedScannedInputs, RetiredFileHandoff,
-    ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe, StaleManifestObject,
-    bind_scanned_modules, canonicalize_scanned_overlays, open_view_executable_cached,
-    open_view_rooted_object_cached, pin_manifest_objects_deferred_in_views_with_budget,
+    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
+    RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
+    open_view_executable_cached, open_view_rooted_object_cached,
+    pin_manifest_objects_deferred_in_views_with_budget, pin_prearm_objects_in_views_with_budget,
     pin_scanned_view_objects, preexec_object_key, retained_object_key_cached,
     self_mapped_fallback_key, target_paths_equal,
 };
@@ -375,6 +376,8 @@ pub struct Engine {
     identity_mismatches: usize,
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
+    prearm_input: Option<PrearmInput>,
+    prearm: crate::prearm_module::PrearmState,
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
     inventory: Option<inventory::InventoryState>,
@@ -1904,6 +1907,7 @@ impl CaptureFacts {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_current(
         &mut self,
         plan: &plan::AttachPlan,
@@ -1912,6 +1916,7 @@ impl CaptureFacts {
         manifests: &[Manifest],
         manifest_ordinals: &[u32],
         counters: &DiscoveryCounters,
+        prearm: &crate::prearm_module::PrearmState,
     ) -> Result<()> {
         // Proves the fallible surface before cloning: same checks, same
         // order, same first failure as the interleaved checks below.
@@ -1919,7 +1924,7 @@ impl CaptureFacts {
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
-        let current = discovery_evidence(plan, pinned, counters);
+        let current = discovery_evidence(plan, pinned, counters, prearm);
 
         // §4.12 by capture end. Each fresh reading replaces the retained one;
         // a publication with nothing to read keeps what the capture already
@@ -2518,14 +2523,15 @@ fn extend_occurrences<T: Clone + PartialEq>(retained: &mut Vec<T>, incoming: Vec
     }
 }
 
-/// The union of two source sets in the one order the schema allows: exactly
-/// `["scan"]`, `["manifest"]`, or `["scan", "manifest"]`
-/// (docs/schema/observed-profile-v2.md, "in that canonical order"). This is the
-/// order `PinnedObjects::sources` already emits; a union that appends in
-/// arrival order does not, and a manifest-first module the scan only reaches
-/// later renders the illegal `["manifest", "scan"]`.
+/// The union of two source sets in the one order the schema allows:
+/// `scan`, `manifest`, `prearm` subsets in that canonical order
+/// (docs/schema/observed-profile-v2.md, "in that canonical order",
+/// extended by packet 6.13). This is the order `PinnedObjects::sources`
+/// already emits; a union that appends in arrival order does not, and a
+/// manifest-first module the scan only reaches later renders the illegal
+/// `["manifest", "scan"]`.
 fn canonical_sources(retained: &[&'static str], incoming: &[&'static str]) -> Vec<&'static str> {
-    ["scan", "manifest"]
+    ["scan", "manifest", "prearm"]
         .into_iter()
         .filter(|source| retained.contains(source) || incoming.contains(source))
         .collect()
@@ -2571,6 +2577,18 @@ fn merge_discovered_module(
         if !retained.corroboration.contains(&outcome) {
             retained.corroboration.push(outcome);
         }
+    }
+    // The incoming snapshot's interval state supersedes: a module that lost
+    // its pre-arm source is genuinely unwatched, and a live watch's current
+    // state is always fresher than the retained one. Attach keys only move
+    // forward into set, never back to unset: assembly runs once at capture
+    // end, and a later snapshot must not clobber assembled keys with `None`.
+    retained.watch = incoming.watch;
+    if incoming.attached_at_ns.is_some() {
+        retained.attached_at_ns = incoming.attached_at_ns;
+    }
+    if incoming.unobserved_windows.is_some() {
+        retained.unobserved_windows = incoming.unobserved_windows;
     }
 }
 
@@ -2632,6 +2650,11 @@ pub(crate) trait EngineSession {
     }
     fn has_slot_link(&self, _: u32) -> bool {
         false
+    }
+    /// The session's retained attach-complete instant for one slot, if it
+    /// ever attached (packet 6.13, R2-D1-5). Scripted sessions override.
+    fn slot_attached_at(&self, _: u32) -> Option<u64> {
+        None
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
         crate::attach::PhysicalGapSummary::default()
@@ -2783,6 +2806,7 @@ pub(crate) trait EngineSession {
         &mut self,
         targets: &[plan::Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult>;
     /// Counter growth staging for this candidate plan. Sessions without
     /// banks refuse; scripted sessions record and replay.
@@ -2880,6 +2904,9 @@ impl EngineSession for Session {
     }
     fn has_slot_link(&self, slot: u32) -> bool {
         Session::has_slot_link(self, slot)
+    }
+    fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+        Session::slot_attached_at(self, slot)
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
         Session::physical_gap_summary(self)
@@ -3062,8 +3089,9 @@ impl EngineSession for Session {
         &mut self,
         targets: &[plan::Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
-        Session::attach_targets(self, targets, objects)
+        Session::attach_targets(self, targets, objects, ended)
     }
 
     fn stage_counter_growth(
@@ -3423,6 +3451,16 @@ struct ManifestInput {
     manifest: Manifest,
     pins: PinnedObjects,
     stale: Vec<StaleManifestObject>,
+}
+
+/// The capture's `--prearm-module` pin call (packet 6.13, R2-D1-1/2/3):
+/// pinned once at startup, all-or-nothing, and retained for the capture's
+/// lifetime. One input (one pin call over every path, so the shared
+/// accounting holds), resolved fresh against the current pin set before
+/// each plan build.
+struct PrearmInput {
+    pins: PinnedObjects,
+    inputs: Vec<PrearmPinnedInput>,
 }
 
 struct LiveCandidate {
@@ -6300,6 +6338,12 @@ fn discover_plan(
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
+    // The capture's scope start, before any observation: the outer bound of
+    // every unobserved window. (The `run` path overrides with its pre-spawn
+    // instant once it knows it.)
+    discovered
+        .prearm
+        .set_scope_start_ns(crate::attach::monotonic_ns());
     discovered.max_scan_pids = a
         .max_scan_pids
         .filter(|cap| *cap > 0)
@@ -6498,7 +6542,56 @@ fn discover_plan(
         });
     }
 
+    // Pre-arm inputs pin once at startup, after the manifests, through the
+    // shared worker and budget (R2-D1-1/2/3). One bad path fails the whole
+    // startup; nothing pins partially, and no pre-arm input populates
+    // `module_hints` or manufactures manifest claims.
+    if !a.prearm_modules.is_empty() {
+        let named_pid = match scope {
+            Scope::Pid(pid) => Some(*pid),
+            Scope::Cgroup { .. } | Scope::System => None,
+        };
+        let prior_objects: usize = discovered
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned().count())
+            .sum();
+        let prior_bytes: u64 = discovered
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned_object_bytes())
+            .fold(0u64, |total, bytes| total.saturating_add(bytes));
+        let pinning = pin_prearm_objects_in_views_with_budget(
+            &a.prearm_modules,
+            &discovered.views,
+            named_pid,
+            prior_objects,
+            prior_bytes,
+            &mut discovered.budget,
+        )
+        .map_err(|error| {
+            for problem in error.problems() {
+                eprintln!("p11scope: {problem}");
+            }
+            anyhow!("--prearm-module inputs are not usable trusted inputs; refusing to attach")
+        })?;
+        eprintln!(
+            "p11scope: pre-armed {} provider file(s) before any mapping",
+            pinning.inputs.len()
+        );
+        discovered.prearm_input = Some(PrearmInput {
+            pins: pinning.pins,
+            inputs: pinning.inputs,
+        });
+    }
+
     rebuild_discovered(&mut discovered)?;
+    // The initial build's module set: assembly reads late discovery off it.
+    // Recorded once here (not in the rebuild: stale-view re-runs must not
+    // re-mark the set).
+    discovered
+        .prearm
+        .record_initial_modules(discovered.plan.modules.iter().map(|module| module.object));
     discovered.counters.report_notes();
     // Task 3.2 (S1): one categorical summary per noise class instead of one
     // line per skipped view. Cleared here so live accumulation starts fresh
@@ -6519,10 +6612,39 @@ fn discover_plan(
     Ok(discovered)
 }
 
+/// Resolves the capture's `--prearm-module` inputs against the current pin
+/// set (packet 6.13): like manifest resolution, a retired object simply
+/// has no piece here, never a stale id.
+fn resolve_prearm_pieces(
+    prearm: Option<&PrearmInput>,
+    pinned: &PinnedObjects,
+) -> Vec<plan::PrearmPlanPiece> {
+    prearm
+        .map(|prearm| {
+            prearm
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    pinned.id_for_prearm(input.key, &input.path).map(|object| {
+                        plan::PrearmPlanPiece {
+                            object,
+                            key: input.key,
+                            path: input.path.clone(),
+                            proved: input.proved.clone(),
+                            non_executable: input.non_executable.clone(),
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_current_plan(
     modules: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[plan::PrearmPlanPiece],
     pinned: &PinnedObjects,
     counters: &mut DiscoveryCounters,
     corroborated: &BTreeSet<PinnedObjectId>,
@@ -6533,8 +6655,14 @@ fn build_current_plan(
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan =
-        plan::build_from_sources_scoped(modules, manifests, pinned, broad_admit, admission_scope);
+    let mut plan = plan::build_from_sources_scoped_with_prearm(
+        modules,
+        manifests,
+        prearm,
+        pinned,
+        broad_admit,
+        admission_scope,
+    );
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
         if let Some(summary) = plan
@@ -6581,7 +6709,9 @@ fn uncorroborated_count(
     let uncorroborated = plan
         .modules
         .iter()
-        .filter(|m| m.source.contains("manifest") && !m.corroborated)
+        .filter(|m| {
+            (m.source.contains("manifest") || m.source.contains("prearm")) && !m.corroborated
+        })
         .count();
     (uncorroborated + identity_mismatches + manifest_fallbacks) as u64
 }
@@ -6648,6 +6778,7 @@ fn discovery_evidence(
     plan: &plan::AttachPlan,
     pinned: &PinnedObjects,
     counters: &DiscoveryCounters,
+    prearm: &crate::prearm_module::PrearmState,
 ) -> render::DiscoveryEvidence {
     let summary_of = |id, path: &str| {
         let pin = pinned
@@ -6702,6 +6833,11 @@ fn discovery_evidence(
                 tables: m.tables.clone(),
                 interfaces: m.interfaces,
                 skipped: m.skipped.iter().map(render::capture_skipped_out).collect(),
+                // Discovery emits only the watch (R2-D1-5 stage rule);
+                // attach keys merge at evidence assembly.
+                watch: prearm.get(m.object).map(|watch| watch.render()),
+                attached_at_ns: None,
+                unobserved_windows: None,
             }
         })
         .collect();
@@ -6737,8 +6873,9 @@ fn discovery_evidence(
 }
 
 /// Every §4.12 outcome recorded against this module's object — one per
-/// `--manifest` that named it. Empty only when no manifest did, which the
-/// record states as `single_source` rather than as silence.
+/// `--manifest` that named it, plus one `agreed` when pre-arm and scan meet
+/// with no manifest naming the object. Empty only when neither did, which
+/// the record states as `single_source` rather than as silence.
 fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Vec<&'static str> {
     let recorded: Vec<&'static str> = counters
         .corroboration
@@ -6749,13 +6886,15 @@ fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Ve
     if !recorded.is_empty() {
         return recorded;
     }
-    vec![if !m.source.contains("manifest") {
-        "single_source"
-    } else if m.corroborated {
-        "agreed"
-    } else {
-        "uncorroborated"
-    }]
+    vec![
+        if !m.source.contains("manifest") && !m.source.contains("prearm") {
+            "single_source"
+        } else if m.corroborated {
+            "agreed"
+        } else {
+            "uncorroborated"
+        },
+    ]
 }
 
 fn skipped_out(s: &Skipped) -> render::SkippedOut {
@@ -7703,6 +7842,15 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
+    // Pre-arm pins join the capture set like manifest pins: one pinned
+    // object however many of pre-arm/manifest/scan name it, sources
+    // gaining the `"prearm"` label on merge.
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        let absorbed = pinned.absorb(prearm.pins.clone());
+        attribution::note_all(&absorbed);
+        counters.object_skips.extend(absorbed);
+    }
+
     // Pre-6.8 overlayfs splits the manifest join: the helper recorded the
     // maps/backing key while each manifest pin files the opened fd's overlay
     // key. Re-file every split alias onto its scan pin — proved by the shared
@@ -7739,8 +7887,33 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);
     let proofs_start = crate::attach::monotonic_ns();
-    let corroborated =
+    let mut corroborated =
         bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
+    // Pre-arm/scan agreement (R2-D1-1): a pre-armed object the scan also
+    // bound is corroborated — two independent sources describing one
+    // object — with no manifest needed. Recorded only when no manifest
+    // named the object, so outcome labels stay one-per-manifest plus at
+    // most one pre-arm agreement (two operator inputs never manufacture
+    // independent scan corroboration on their own).
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        let manifest_objects: BTreeSet<PinnedObjectId> = accepted
+            .iter()
+            .filter_map(|manifest| manifest_module_object(manifest, &pinned))
+            .collect();
+        let scan_objects: BTreeSet<PinnedObjectId> =
+            modules.iter().map(|module| module.object).collect();
+        for input in &prearm.inputs {
+            let Some(id) = pinned.id_for_prearm(input.key, &input.path) else {
+                continue;
+            };
+            if scan_objects.contains(&id) && !manifest_objects.contains(&id) {
+                corroborated.insert(id);
+                counters
+                    .corroboration
+                    .push((BTreeSet::from([id]), "agreed"));
+            }
+        }
+    }
 
     let mut replacements = BTreeSet::new();
     for pending in pending_fallbacks {
@@ -7794,9 +7967,11 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
     let admission_scope = discovered.admission_scope();
+    let prearm_pieces = resolve_prearm_pieces(discovered.prearm_input.as_ref(), &pinned);
     let mut plan = build_current_plan(
         &modules,
         &accepted,
+        &prearm_pieces,
         &pinned,
         &mut counters,
         &corroborated,
@@ -7838,6 +8013,12 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     if pinned.has_overlay_uncertainty() {
         discovered.invalidate_causal_timing();
     }
+    // Freeze each pre-arm watch's declared endpoint set from the
+    // operator-declared keys. Existing watches are never reset.
+    let declared = plan::operator_target_keys(&accepted, &prearm_pieces, &pinned);
+    discovered
+        .prearm
+        .create_watches(&plan.modules, &declared, &pinned);
     discovered.stage_timings.span(
         crate::timing::StageKind::Plan,
         "build_initial_plan",
@@ -7845,7 +8026,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         crate::attach::monotonic_ns(),
     );
     let evidence_start = crate::attach::monotonic_ns();
-    let discovery = discovery_evidence(&plan, &pinned, &counters);
+    let discovery = discovery_evidence(&plan, &pinned, &counters, &discovered.prearm);
     discovered.stage_timings.span(
         crate::timing::StageKind::Projection,
         "build_initial_evidence",
@@ -9459,6 +9640,8 @@ impl Engine {
             identity_mismatches: 0,
             scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
+            prearm_input: None,
+            prearm: crate::prearm_module::PrearmState::empty(),
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
             inventory: None,
@@ -11999,6 +12182,7 @@ impl Engine {
             &self.manifests,
             &self.manifest_ordinals,
             &self.counters,
+            &self.prearm,
         );
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
@@ -12120,7 +12304,8 @@ impl Engine {
         } else if self.capture_facts.history.modules.is_empty()
             && self.capture_facts.history.decoded.is_empty()
         {
-            self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+            self.discovery =
+                discovery_evidence(&self.plan, &self.pinned, &self.counters, &self.prearm);
         } else {
             self.project_capture_facts();
         }
@@ -12238,9 +12423,19 @@ impl Engine {
         );
         let plan_start = crate::attach::monotonic_ns();
         let broad_admit = self.broad_admit;
-        let mut rebuilt =
-            self.plan
-                .rebuild_from_sources_broad(&modules, &self.manifests, &pinned, broad_admit);
+        let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &pinned);
+        let mut rebuilt = self.plan.rebuild_from_sources_broad_with_prearm(
+            &modules,
+            &self.manifests,
+            &prearm_pieces,
+            &pinned,
+            broad_admit,
+        );
+        // Live rebuilds keep pre-armed modules (and only create watches for
+        // newly appeared ones — live interval state is never reset).
+        let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &pinned);
+        self.prearm
+            .create_watches(&rebuilt.modules, &declared, &pinned);
         self.capture_facts.bind_plan_module_ids(
             &mut rebuilt,
             &modules,
@@ -13071,7 +13266,11 @@ impl Engine {
                             reserve,
                         )
                     } else {
-                        session.attach_targets(&candidate.delta.new, &candidate.pinned)
+                        session.attach_targets(
+                            &candidate.delta.new,
+                            &candidate.pinned,
+                            &self.prearm.ended_declared_keys(),
+                        )
                     }
                 },
             );
@@ -27279,6 +27478,260 @@ impl Engine {
         &self.discovery
     }
 
+    /// Cancels every pre-arm watch at scope end (packet 6.13, R2-D1-7):
+    /// each open watch closes with `until_ns` and `ended_by: scope_end`,
+    /// exactly once. A natural close preserves an earned `armed_idle`
+    /// claim with its closed bounds; every other watch reads `ended`.
+    pub fn end_prearm_watches(&mut self) {
+        self.end_prearm_watches_at(
+            crate::render::PrearmWatchEnd::ScopeEnd,
+            crate::attach::monotonic_ns(),
+        );
+    }
+
+    /// Ends every pre-arm watch's tracking for an explicit cause, exactly
+    /// once per watch, and re-renders the discovery records.
+    pub(crate) fn end_prearm_watches_at(
+        &mut self,
+        cause: crate::render::PrearmWatchEnd,
+        now: Option<u64>,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        self.prearm.end_all(cause, now);
+        self.retire_prematurely_ended_watch_slots();
+        self.rerender_prearm_watches();
+    }
+
+    /// Re-runs per-object held-fd checks on pre-arm watched objects and
+    /// publishes fresh `pinned_object_changed` brackets (R2-D1-8). Returns
+    /// the newly changed object ids (sticky: already-reported objects are
+    /// not returned again). An `fstat` failure records nothing here — the
+    /// attach path's global check is the backstop that surfaces it.
+    pub fn refresh_prearm_object_changes(&mut self) -> Vec<PinnedObjectId> {
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        let mut newly = Vec::new();
+        for id in ids {
+            match self.pinned.check_object_unchanged(id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let bracket = self.pinned.change_bracket(id);
+                    if let Some(watch) = self.prearm.get_mut(id) {
+                        let was_ended = watch.is_ended();
+                        match bracket {
+                            Some(bracket) => watch.note_object_changed(bracket),
+                            // Detected but the clock never yielded the
+                            // bounds: the end is still disclosed, only its
+                            // instants are not.
+                            None => watch.end(
+                                crate::render::PrearmWatchEnd::ObjectChanged,
+                                crate::attach::monotonic_ns(),
+                            ),
+                        }
+                        if !was_ended {
+                            newly.push(id);
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if !newly.is_empty() {
+            self.retire_prematurely_ended_watch_slots();
+            self.rerender_prearm_watches();
+        }
+        newly
+    }
+
+    /// Deactivates the plan slots of prematurely ended watches
+    /// (`object_changed`, `health_loss`, `scope_uncertain`, `attached`):
+    /// no probe for them attaches after their `until_ns`, and the ordinary
+    /// `is_active` machinery agrees. Natural closes (`scope_end`, `stop`)
+    /// end the capture itself, so their slots stay untouched.
+    fn retire_prematurely_ended_watch_slots(&mut self) {
+        use crate::render::PrearmWatchEnd::*;
+        let premature: BTreeSet<plan::AttachKey> = self
+            .prearm
+            .watches()
+            .values()
+            .filter(|watch| {
+                matches!(
+                    watch.ended_by(),
+                    Some(ObjectChanged) | Some(HealthLoss) | Some(ScopeUncertain) | Some(Attached)
+                )
+            })
+            .flat_map(|watch| watch.declared().iter().copied())
+            .collect();
+        let indices: Vec<u32> = premature
+            .iter()
+            .filter_map(|key| self.plan.slot_index_for_key(*key))
+            .collect();
+        for index in indices {
+            self.plan.deactivate(index);
+        }
+    }
+
+    /// Re-renders current watch intervals into the discovery records after
+    /// a transition. Records whose modules left the plan keep their last
+    /// rendered state; attach keys are never touched here (assembly owns
+    /// them).
+    fn rerender_prearm_watches(&mut self) {
+        let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
+            .plan
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        for record in &mut self.discovery.modules {
+            if let Some(object) = objects.get(&record.id) {
+                record.watch = self.prearm.get(*object).map(|watch| watch.render());
+            }
+        }
+    }
+
+    /// Records the capture's scope start (the `run` path overrides the
+    /// discover-entry instant with its pre-spawn instant).
+    pub(crate) fn set_scope_start_ns(&mut self, scope_start_ns: Option<u64>) {
+        self.prearm.set_scope_start_ns(scope_start_ns);
+    }
+
+    /// Whether this capture holds any pre-arm watch (packet 6.13): terminal
+    /// paths skip interval work entirely when there is none.
+    pub(crate) fn has_prearm_watches(&self) -> bool {
+        !self.prearm.is_empty()
+    }
+
+    /// Evaluates every pre-arm watch against current link facts: unarmed
+    /// watches arm when their declared set links, armed watches verify
+    /// their links stay up, and watched objects are change-polled. The
+    /// capture-end path drives this; mid-capture tick driving is a
+    /// precision follow-up (end evaluation is conservative-correct:
+    /// stamps are historical facts, and unverified links truncate at the
+    /// arm instant).
+    pub(crate) fn refresh_prearm_liveness(
+        &mut self,
+        session: &impl EngineSession,
+        now: Option<u64>,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        for id in ids {
+            let links = self.declared_links(id, session);
+            if let Some(watch) = self.prearm.get_mut(id) {
+                watch.evaluate_arm(&links);
+                watch.verify_links(&links, now);
+            }
+        }
+        self.refresh_prearm_object_changes();
+        self.rerender_prearm_watches();
+    }
+
+    /// Closes the capture for every pre-arm watch (packet 6.13, R2-D1-4/5/7):
+    /// final link evaluation, idle qualification over the closed interval
+    /// (armed + clean health + no observed use), the end for `cause`, and
+    /// the evidence-assembly merge of attach keys from real session
+    /// stamps. `used` names modules with observed calls; `attach_failures`
+    /// are the session's `(slot, reason)` failures for per-module health.
+    pub(crate) fn finish_prearm_capture(
+        &mut self,
+        session: &impl EngineSession,
+        cause: crate::render::PrearmWatchEnd,
+        used: &BTreeSet<plan::ModuleId>,
+        attach_failures: &[(u32, String)],
+        now: Option<u64>,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        self.refresh_prearm_liveness(session, now);
+        let failed_slots: BTreeSet<u32> = attach_failures.iter().map(|(slot, _)| *slot).collect();
+        let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
+            .plan
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        let mut module_of: BTreeMap<PinnedObjectId, plan::ModuleId> = BTreeMap::new();
+        for (id, object) in &objects {
+            module_of.insert(*object, *id);
+        }
+        for (object, module) in &module_of {
+            let own_failed =
+                self.plan.slots.iter().any(|slot| {
+                    slot.module_ids.contains(module) && failed_slots.contains(&slot.index)
+                });
+            let health_clean = crate::prearm_module::idle_health_clean(
+                self.counter_snapshot.ring_loss,
+                self.counter_snapshot.export_state_failures,
+                self.counter_snapshot.export_bounded_read_failures,
+                self.discovery_truncated,
+                self.malformed_discovery,
+                own_failed,
+            );
+            if let Some(watch) = self.prearm.get_mut(*object) {
+                watch.evaluate_idle(used.contains(module), health_clean);
+            }
+        }
+        self.prearm.end_all(cause, now);
+        self.rerender_prearm_watches();
+        let stamps: BTreeMap<u32, u64> = self
+            .plan
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                session
+                    .slot_attached_at(slot.index)
+                    .map(|stamp| (slot.index, stamp))
+            })
+            .collect();
+        // No R2-D1-6 producer ships in this packet: proofs stay empty until
+        // C6-D wires installed proof, so attached modules always disclose
+        // their window here.
+        let proofs = BTreeMap::new();
+        self.prearm
+            .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
+        // Retire after assembly: deactivation unresolves declared keys, and
+        // the stamps are historical facts the assembly must still read.
+        self.retire_prematurely_ended_watch_slots();
+    }
+
+    /// Current link facts for one watch's declared set: a key counts as
+    /// linked only through an active plan slot with a live session link.
+    fn declared_links(
+        &self,
+        id: PinnedObjectId,
+        session: &impl EngineSession,
+    ) -> Vec<crate::prearm_module::DeclaredLink> {
+        self.prearm
+            .get(id)
+            .map(|watch| {
+                watch
+                    .declared()
+                    .iter()
+                    .map(|key| {
+                        let index = self.plan.slot_index_for_key(*key);
+                        let active = index.is_some_and(|index| self.plan.is_active(index));
+                        let linked =
+                            active && index.is_some_and(|index| session.has_slot_link(index));
+                        let stamped_at = if active {
+                            index.and_then(|index| session.slot_attached_at(index))
+                        } else {
+                            None
+                        };
+                        crate::prearm_module::DeclaredLink {
+                            key: *key,
+                            linked,
+                            stamped_at,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Per-stage wall-time accumulation (Phase 2 measurement API): totals,
     /// invocation counts, and the longest indivisible operation.
     pub fn stage_timings(&self) -> &crate::timing::StageTimings {
@@ -27974,6 +28427,9 @@ pub(crate) mod session_fixture {
         pub(crate) failed_cleanup_slot_indices: Vec<Vec<u32>>,
         /// Exact slot identities of every `replace_targets` call, in order.
         pub(crate) replaced_slot_indices: Vec<Vec<u32>>,
+        /// Slot indices skipped as ended-watch targets by `attach_targets`
+        /// (packet 6.13, R2-D1-7), in call order.
+        pub(crate) skipped_ended: Vec<u32>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
         /// One entry per upcoming `detach_slots` call; `true` fails it
@@ -28530,7 +28986,27 @@ pub(crate) mod session_fixture {
             &mut self,
             slots: &[plan::Slot],
             objects: &PinnedObjects,
+            ended: &BTreeSet<plan::AttachKey>,
         ) -> Result<TargetAttachResult> {
+            // Mirror production (packet 6.13, R2-D1-7): ended-watch targets
+            // skip, and the skip is recorded for the test to assert.
+            let filtered: Vec<plan::Slot>;
+            let slots: &[plan::Slot] = if ended.is_empty() {
+                slots
+            } else {
+                filtered = slots
+                    .iter()
+                    .filter(|slot| {
+                        let skip = ended.contains(&plan::AttachKey::of(slot));
+                        if skip {
+                            self.skipped_ended.push(slot.index);
+                        }
+                        !skip
+                    })
+                    .cloned()
+                    .collect();
+                &filtered
+            };
             if !slots.is_empty()
                 && self
                     .global_retirement

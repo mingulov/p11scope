@@ -638,7 +638,8 @@ pub struct ModuleSummary {
     /// The most interfaces any one source saw, never the sum across sources —
     /// two sources describing one provider both count its interfaces.
     pub interfaces: usize,
-    /// "scan" | "manifest".
+    /// `"scan"`, `"manifest"`, `"prearm"`, or a canonical `+`-joined
+    /// combination (`join_source`).
     pub source: &'static str,
     /// Whether a second discovery source agreed with this one (spec §4.12).
     pub corroborated: bool,
@@ -854,7 +855,7 @@ pub struct AttachKey {
 }
 
 impl AttachKey {
-    fn of(slot: &Slot) -> Self {
+    pub(crate) fn of(slot: &Slot) -> Self {
         Self {
             object: slot.object,
             file_offset: slot.file_offset,
@@ -1301,10 +1302,25 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         broad_admit: bool,
     ) -> AttachPlan {
+        self.rebuild_from_sources_broad_with_prearm(scanned, manifests, &[], pinned, broad_admit)
+    }
+
+    /// [`rebuild_from_sources_broad`] plus resolved `--prearm-module` pieces
+    /// (packet 6.13), so live rebuilds keep pre-armed modules. An empty
+    /// slice rebuilds exactly the old plan.
+    pub fn rebuild_from_sources_broad_with_prearm(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
+        pinned: &PinnedObjects,
+        broad_admit: bool,
+    ) -> AttachPlan {
         let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
         let mut rebuilt = self.rebuild_from_sources_with(
             scanned,
             manifests,
+            prearm,
             pinned_id,
             compatible,
             broad_admit,
@@ -1314,10 +1330,12 @@ impl AttachPlan {
         rebuilt
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_from_sources_with(
         &self,
         scanned: &[ReconciledModule],
         manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
         broad_admit: bool,
@@ -1327,6 +1345,7 @@ impl AttachPlan {
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
+            prearm,
             pinned_id,
             compatible,
             ExistingAllocation {
@@ -1562,6 +1581,15 @@ impl AttachPlan {
     pub fn is_active(&self, slot: u32) -> bool {
         let position = slot as usize;
         position < self.slots.len() && !self.retired_slots.contains(&position)
+    }
+
+    /// The slot index for one exact attach target, if this plan holds it
+    /// (packet 6.13: the pre-arm arm check maps declared keys to session
+    /// links and their stamps).
+    pub(crate) fn slot_index_for_key(&self, key: AttachKey) -> Option<u32> {
+        self.slot_by_key
+            .get(&key)
+            .and_then(|position| u32::try_from(*position).ok())
     }
 
     /// How many allocated slots are still active right now (U-14): the plan's
@@ -2338,6 +2366,25 @@ fn table_key(piece: usize, index: usize, table: &ScannedTable) -> TableKey {
     }
 }
 
+/// One `--prearm-module` input lowered for `merge` (packet 6.13, R2-D1-1/2).
+/// A pre-arm input selects a physical file; it carries no function claims.
+/// Only offsets proved by an accompanying manifest (lowered separately) or
+/// by defined ELF exports proved executable in held bytes (`proved`) lower
+/// pre-mapping. Resolved fresh against the current pin set before each
+/// build, like manifest resolution — never a stale id.
+#[derive(Debug, Clone)]
+pub struct PrearmPlanPiece {
+    pub(crate) object: PinnedObjectId,
+    pub(crate) key: ObjectKey,
+    /// Operator spelling: messages and the module path only, never identity.
+    pub(crate) path: String,
+    /// Standard-name `.dynsym` definitions proved executable in held bytes.
+    pub(crate) proved: Vec<(String, u64)>,
+    /// Standard-name exports not proved executable: disclosed as skipped,
+    /// never attached pre-mapping.
+    pub(crate) non_executable: Vec<(String, u64)>,
+}
+
 /// One module lowered for `merge`.
 struct Discovered<'a> {
     object: PinnedObjectId,
@@ -2443,6 +2490,32 @@ fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
         }
     }
     counter.count()
+}
+
+/// Canonical `+`-join over scan/manifest/prearm piece sources. Order is
+/// fixed (scan, manifest, prearm) so every combination renders exactly one
+/// way on the module record. Piece sources are closed — `lower_scanned`
+/// says `"scan"`, `lower_manifest` says `"manifest"`, `lower_prearm` says
+/// `"prearm"` — so an unrecognized side falls back to the other side rather
+/// than inventing a label.
+fn join_source(left: &'static str, right: &'static str) -> &'static str {
+    if left == right {
+        return left;
+    }
+    let has = |source: &'static str, part: &str| source.split('+').any(|piece| piece == part);
+    let scan = has(left, "scan") || has(right, "scan");
+    let manifest = has(left, "manifest") || has(right, "manifest");
+    let prearm = has(left, "prearm") || has(right, "prearm");
+    match (scan, manifest, prearm) {
+        (true, true, true) => "scan+manifest+prearm",
+        (true, true, false) => "scan+manifest",
+        (true, false, true) => "scan+prearm",
+        (false, true, true) => "manifest+prearm",
+        (true, false, false) => "scan",
+        (false, true, false) => "manifest",
+        (false, false, true) => "prearm",
+        (false, false, false) => left,
+    }
 }
 
 fn merge(
@@ -3051,7 +3124,7 @@ fn merge(
             }
             let summary = &mut modules[id.0 as usize];
             if summary.source != module.source {
-                summary.source = "scan+manifest";
+                summary.source = join_source(summary.source, module.source);
             }
             let mut module_tables = Vec::new();
             for table in module.tables {
@@ -3229,6 +3302,7 @@ pub fn build_from_sources_broad(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         broad_admit,
         AdmissionPolicy::detailed(),
@@ -3246,9 +3320,31 @@ pub fn build_from_sources_scoped(
     broad_admit: bool,
     admission_scope: AdmissionScope,
 ) -> AttachPlan {
+    build_from_sources_scoped_with_prearm(
+        scanned,
+        manifests,
+        &[],
+        pinned,
+        broad_admit,
+        admission_scope,
+    )
+}
+
+/// [`build_from_sources_scoped`] plus resolved `--prearm-module` pieces
+/// (packet 6.13). Pre-arm pieces lower like manifest pieces under the
+/// unchanged admission caps; an empty slice builds exactly the old plan.
+pub fn build_from_sources_scoped_with_prearm(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
+    admission_scope: AdmissionScope,
+) -> AttachPlan {
     build_from_sources_with_policy(
         scanned,
         manifests,
+        prearm,
         pinned,
         broad_admit,
         AdmissionPolicy::detailed(),
@@ -3267,6 +3363,7 @@ pub fn build_from_sources_for_policy(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         false,
         admission_policy,
@@ -3288,6 +3385,7 @@ pub fn build_from_sources_for_policy_scoped(
     build_from_sources_with_policy(
         scanned,
         manifests,
+        &[],
         pinned,
         false,
         admission_policy,
@@ -3446,6 +3544,7 @@ pub(crate) fn semantic_source_claims(
 fn build_from_sources_with_policy(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
     pinned: &PinnedObjects,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
@@ -3455,6 +3554,7 @@ fn build_from_sources_with_policy(
     let mut plan = build_from_sources_with(
         scanned,
         manifests,
+        prearm,
         pinned_id,
         compatible,
         ExistingAllocation {
@@ -3506,6 +3606,7 @@ fn pinned_manifest_lookups(
 fn build_from_sources_with(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
     allocated: ExistingAllocation<'_>,
@@ -3520,6 +3621,10 @@ fn build_from_sources_with(
         discovered.extend(module);
         orphaned.extend(skipped);
     }
+    // Pre-arm pieces arrive resolved against the current pin set (the
+    // engine resolves fresh before each build, so a retired object simply
+    // has no piece here).
+    discovered.extend(prearm.iter().map(lower_prearm));
     // The scan never calls the provider, so it contributes no C_GetInterfaceList
     // enumeration and leaves nothing present-but-undecoded: every interface it
     // records names a table it decoded. Only a manifest can report either.
@@ -3553,6 +3658,7 @@ fn build_from_test_sources_with_policy(
     build_from_sources_with(
         scanned,
         manifests,
+        &[],
         |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
         |_, _| true,
         ExistingAllocation {
@@ -3962,6 +4068,94 @@ fn lower_manifest(
         }),
         selection_gaps,
     )
+}
+
+/// Lowers one resolved `--prearm-module` piece (packet 6.13, R2-D1-1/2).
+/// Operator-authoritative like a manifest piece (`scan_evidence: None`:
+/// admitted whole under the unchanged caps), but with no tables, no
+/// interfaces and no surfaces — a pre-arm input proves offsets, never
+/// tables. Targets carry file-derived names, so they read operator-side
+/// like manifest names; `fork_safe` stays false because no standard
+/// interface exposes them.
+fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, file_offset) in &piece.proved {
+        targets.push(Target {
+            name,
+            object: piece.object,
+            object_path: &piece.path,
+            file_offset: *file_offset,
+            fork_safe: false,
+            semantic_authorized: true,
+            name_authorized: true,
+            table: None,
+            ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
+                table_file_offset: None,
+                ordinal,
+            }),
+            aliases: Vec::new(),
+        });
+    }
+    for (name, file_offset) in &piece.non_executable {
+        skipped.push(Skipped {
+            subject: name.clone(),
+            reason: format!(
+                "{name}+{file_offset:#x} is outside every executable ELF segment; \
+                 pre-arm attaches it only after ordinary scan corroboration"
+            ),
+        });
+    }
+    Discovered {
+        object: piece.object,
+        key: piece.key,
+        path: &piece.path,
+        source: "prearm",
+        tables: Vec::new(),
+        interfaces: 0,
+        surfaces: Vec::new(),
+        entries_seen: targets.len() + skipped.len(),
+        targets,
+        skipped,
+        scan_evidence: None,
+    }
+}
+
+/// Operator-declared attach keys per module object (packet 6.13, R2-D1-2/4):
+/// manifest-claimed targets plus pre-arm export-proved targets, grouped by
+/// the publishing module's object. Scan-decoded targets are never declared:
+/// unproved functions attach only after ordinary scan corroboration. The
+/// engine freezes this map's pre-arm entries as each watch's declared
+/// endpoint set; an empty set means `unavailable`, never armed.
+pub(crate) fn operator_target_keys(
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+) -> BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> {
+    let (mut pinned_id, mut compatible) = pinned_manifest_lookups(pinned);
+    let mut declared: BTreeMap<PinnedObjectId, BTreeSet<AttachKey>> = BTreeMap::new();
+    for manifest in manifests {
+        let (piece, _) = lower_manifest(manifest, &mut pinned_id, &mut compatible);
+        if let Some(piece) = &piece {
+            declared
+                .entry(piece.object)
+                .or_default()
+                .extend(piece.targets.iter().map(|target| AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                }));
+        }
+    }
+    for piece in prearm {
+        declared
+            .entry(piece.object)
+            .or_default()
+            .extend(piece.proved.iter().map(|(_, file_offset)| AttachKey {
+                object: piece.object,
+                file_offset: *file_offset,
+            }));
+    }
+    declared
 }
 
 /// Conservative plan cursor: removal-only rebuild of an [`AttachPlan`] from
@@ -6742,6 +6936,7 @@ mod tests {
         let plan = build_from_sources_with(
             std::slice::from_ref(&scanned),
             std::slice::from_ref(&manifest),
+            &[],
             |_, _| Some(manifest_object),
             |_, _| true,
             ExistingAllocation {
@@ -6784,6 +6979,7 @@ mod tests {
         let plan = build_from_sources_with(
             &[],
             std::slice::from_ref(&manifest),
+            &[],
             |_, _| Some(PinnedObjectId(1)),
             |_, _| false,
             ExistingAllocation {
@@ -9583,6 +9779,7 @@ mod tests {
         let rebuilt = plan.rebuild_from_sources_with(
             &[],
             std::slice::from_ref(&manifest),
+            &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
             false,
@@ -10956,6 +11153,7 @@ mod tests {
         let plan = build_from_sources_with(
             &[scan],
             &[manifest],
+            &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
             ExistingAllocation {

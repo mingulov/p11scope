@@ -359,6 +359,7 @@ use crate::inventory_promotion::lifecycle::{
 use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::Array;
 use p11scope_ebpf_common::ImageIdentity;
+use std::collections::BTreeSet;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1190,7 +1191,9 @@ fn start_selected_attempt(
             .audit_image_continuity()
             .map_err(|error| anyhow::anyhow!("selected image hooks: {error:?}"))?;
         session
-            .attach_plan(plan, objects)
+            // Separate lane, separate watches: the selected session never
+            // ends pre-arm watches, so its ended set is always empty.
+            .attach_plan(plan, objects, &BTreeSet::new())
             .map_err(super::unsupported_environment_context)?;
         session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM, 0)?;
         ensure!(

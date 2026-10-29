@@ -674,6 +674,107 @@ pub struct ObjectSummary {
     pub sources: Vec<&'static str>,
 }
 
+/// Pre-arm watch state for one `--prearm-module` object (packet 6.13, merged
+/// D1 contract R2-D1-4). Finite vocabulary, serialized snake_case; stdout and
+/// docs say "armed (not yet mapped)" once armed, never "watched/observed"
+/// for `pinned_unarmed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrearmWatchState {
+    /// Pinned; required links, scope or feed not yet ready. A pin is custody,
+    /// never coverage: absence of a mapping proves nothing about links.
+    PinnedUnarmed,
+    /// Links installed on the whole declared endpoint set; mapping not
+    /// required. Partial attachment stays unarmed for the declared set.
+    Armed,
+    /// Armed, plus clean observation health and no observed use over the
+    /// stated interval — over the declared proved set only.
+    ArmedIdle,
+    /// No proved offset, or attach/scope failure: arming is impossible.
+    Unavailable,
+    /// The watch ended; `until_ns`/`ended_by` say when and why.
+    Ended,
+}
+
+/// Why a pre-arm watch ended (R2-D1-7). Set only when the end actually
+/// happened — never a static policy datum — and set exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrearmWatchEnd {
+    /// The unarmed wait discharged: the declared set fully attached, but no
+    /// armed interval is claimable (the arm instant is unknown).
+    Attached,
+    /// The capture scope ended; the watch is cancelled with it.
+    ScopeEnd,
+    /// The operator stopped the capture.
+    Stop,
+    /// The retained object changed under its pin (see `changed`).
+    ObjectChanged,
+    /// Observation health regressed; the clean claim truncates at its last
+    /// proven-clean bound.
+    HealthLoss,
+    /// Scope membership went uncertain; same truncation as health loss.
+    ScopeUncertain,
+}
+
+/// The uncertainty bracket of a retained-object change (R2-D1-8,
+/// `pinned_object_changed` in prose): the change landed after `last_ok_ns`
+/// and at or before `detected_ns`. A bracket, never a point instant, from
+/// per-object held-fd `(ino, size, ctime)` checks — never retargeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrearmObjectChange {
+    pub last_ok_ns: u64,
+    pub detected_ns: u64,
+    pub previous_ino: u64,
+}
+
+/// The pre-arm watch interval on one discovery module record (R2-D1-4/5/7/8).
+/// Discovery emits only this; `attached_at_ns`/`unobserved_windows` merge
+/// later from real attach stamps at evidence assembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrearmWatch {
+    /// The arm instant (declared set's links ready), `CLOCK_MONOTONIC`.
+    /// Always emitted: null until armed. Never pin time.
+    pub since_ns: Option<u64>,
+    pub state: PrearmWatchState,
+    /// Coverage-claim end, set exactly once at the first of scope end, stop,
+    /// or truncation. No probe for this module attaches after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<PrearmWatchEnd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<PrearmObjectChange>,
+}
+
+/// Why one interval went unobserved (R2-D1-5). Finite; every window carries
+/// conservative outer bounds, never a missed-call estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnobservedReason {
+    /// Before this module's probes attached: `[scope_start_ns, attached_at_ns]`.
+    PreAttach,
+    /// Generic provider discovered after scope start (outer bound starts at
+    /// scope start: it may have existed and been called before discovery).
+    LateDiscovery,
+    /// Mapped but unattached endpoints outside the declared set.
+    MappedUnattached,
+    /// Observation health regressed over the tail interval.
+    HealthLoss,
+    /// Scope membership was uncertain over the tail interval.
+    ScopeUncertain,
+}
+
+/// One explicitly unobserved interval on a discovery module record. Key
+/// presence never proves exactness; only an explicitly empty list with an
+/// R2-D1-6 proof behind it reads as exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct UnobservedWindow {
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub reason: UnobservedReason,
+}
+
 /// One module discovery found, with everything known about how it was found.
 /// Same path caveat as `ObjectSummary`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -692,7 +793,7 @@ pub struct DiscoveredModule {
     /// entry lands in a dependency, not in the module that published it. An
     /// entry that never became a slot is in `skipped`, not here.
     pub objects: Vec<ObjectSummary>,
-    /// `"scan"`, `"manifest"`, or both.
+    /// `"scan"`, `"manifest"`, `"prearm"`, or a `+`-joined combination.
     pub sources: Vec<&'static str>,
     /// A second source described the same targets (spec §4.12).
     pub corroborated: bool,
@@ -714,6 +815,22 @@ pub struct DiscoveredModule {
     pub interfaces: usize,
     /// This module's own unattachable entries, and why.
     pub skipped: Vec<SkippedOut>,
+    /// Pre-arm watch interval (packet 6.13). `None` — and absent on the wire —
+    /// for every module no `--prearm-module` named. Discovery emits only this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<PrearmWatch>,
+    /// Per-module attach instant, `CLOCK_MONOTONIC`, merged at evidence
+    /// assembly from real attach-complete stamps (never the once-only session
+    /// stamp). Triple-state: absent before assembly, null when assembled
+    /// with nothing attached, otherwise the max over the declared set's
+    /// real stamps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_at_ns: Option<Option<u64>>,
+    /// Explicit unobserved intervals, merged at evidence assembly. Absent
+    /// means undisclosed (never-mapped pre-arm, unattached modules); an
+    /// explicitly empty list reads as exact only with an R2-D1-6 proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unobserved_windows: Option<Vec<UnobservedWindow>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -3725,6 +3842,9 @@ pub(crate) mod tests {
             sources: vec!["scan"],
             corroborated: false,
             corroboration: vec!["single_source"],
+            watch: None,
+            attached_at_ns: None,
+            unobserved_windows: None,
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),
                 entries: 68,

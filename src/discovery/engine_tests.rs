@@ -1646,7 +1646,12 @@ fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
     plan.slots[1].object = PinnedObjectId(u32::MAX);
     plan.deactivate(1);
 
-    let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
 
     assert_eq!(evidence.modules[0].objects.len(), 1);
 }
@@ -2105,6 +2110,7 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
         build_current_plan(
             &modules,
             &[],
+            &[],
             &pins,
             &mut DiscoveryCounters::default(),
             &BTreeSet::new(),
@@ -2160,6 +2166,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     engine.plan = build_current_plan(
         &engine.modules,
         &engine.manifests,
+        &[],
         &engine.pinned,
         &mut counters,
         &BTreeSet::new(),
@@ -6239,6 +6246,7 @@ fn capture_start_members_that_ended_are_not_losses() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6303,6 +6311,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6471,6 +6480,7 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6537,6 +6547,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6639,6 +6650,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6804,6 +6816,7 @@ fn retained_views_survive_ordinary_rotation_passes() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -6929,6 +6942,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -7165,6 +7179,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -7361,6 +7376,7 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -7494,6 +7510,7 @@ fn refresh_requests_survive_allocation_exhaustion() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -7586,6 +7603,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -8045,6 +8063,29 @@ impl DiscoveryLifecycleFixture {
         engine
     }
 
+    /// Packet 6.13: bare `--prearm-module` before dlopen — no manifest, so
+    /// only export-proved offsets plan, and the record reads pre-arm-only.
+    fn discover_prearm_before_load(&self) -> Engine {
+        let pid = self.child.pid();
+        let mut args = system_args(Vec::new(), None);
+        args.scope = crate::cli::ScopeArg::Pid(pid);
+        args.prearm_modules = vec![self.provider.clone()];
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the owned generation");
+        let engine = Engine::discover(&args, &Scope::Pid(pid), Some(view))
+            .expect("pre-arm discovery before dlopen");
+        assert!(
+            engine.modules.is_empty(),
+            "the child has not mapped the provider"
+        );
+        assert_eq!(engine.discovery.modules.len(), 1);
+        assert_eq!(engine.discovery.modules[0].sources, ["prearm"]);
+        assert_eq!(
+            engine.discovery.modules[0].corroboration,
+            ["uncorroborated"]
+        );
+        engine
+    }
+
     pub(super) fn load(&mut self) {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -8176,6 +8217,57 @@ fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
     assert!(module.corroborated);
     assert_eq!(module.corroboration, ["agreed"]);
     assert!(engine.plan.skipped.is_empty(), "{:?}", engine.plan.skipped);
+}
+
+/// Packet 6.13: the terminal path over a bare pre-arm watch. Nothing ever
+/// links (the scripted session holds no links), so liveness leaves the
+/// watch pinned-unarmed, and the scope-end finish cancels it and merges
+/// the assembly keys onto every record.
+#[test]
+fn prearm_finish_closes_watches_and_merges_assembly_keys() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    // The proved export set is nonempty: the watch arms-nothing-yet rather
+    // than reading unavailable.
+    assert!(
+        !engine.plan().slots.is_empty(),
+        "bare pre-arm must plan its proved exports"
+    );
+    let state_of = |engine: &Engine| {
+        engine.discovery.modules[0]
+            .watch
+            .as_ref()
+            .expect("discovery renders the watch")
+            .state
+    };
+    assert_eq!(state_of(&engine), PrearmWatchState::PinnedUnarmed);
+
+    let session = ScriptedSession::default();
+    engine.refresh_prearm_liveness(&session, None);
+    assert_eq!(state_of(&engine), PrearmWatchState::PinnedUnarmed);
+
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        None,
+    );
+    assert_eq!(engine.discovery.modules.len(), 1);
+    let record = &engine.discovery.modules[0];
+    let watch = record.watch.as_ref().expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeEnd));
+    // The clock is unknown in this drive, so no `until_ns` is claimable —
+    // but the end still latches exactly once via `ended_by`.
+    assert_eq!(watch.until_ns, None);
+    // Assembly ran: the key is present and null (nothing attached), and
+    // the never-mapped watch discloses no window of its own.
+    assert_eq!(record.attached_at_ns, Some(None));
+    assert_eq!(record.unobserved_windows, None);
 }
 
 /// U-14: pins "0 after a scan-only `--pid` exit" through the real engine
@@ -9546,7 +9638,12 @@ fn evidence_verdict(
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,
-        discovery: discovery_evidence(plan, pinned, counters),
+        discovery: discovery_evidence(
+            plan,
+            pinned,
+            counters,
+            &crate::prearm_module::PrearmState::empty(),
+        ),
         scheduling: render::SchedulingEvidence::default(),
         stop_quiescence: Default::default(),
         drain_proven: false,
@@ -13983,6 +14080,7 @@ fn optional_export_absence_is_complete_independently_of_table_version() {
                 &[],
                 &[],
                 &engine.counters,
+                &crate::prearm_module::PrearmState::empty(),
             )
             .unwrap();
         let exports = engine.interface_selection().standard_exports;
@@ -14034,7 +14132,15 @@ fn capture_history_preserves_the_effective_short_manifest_walk() {
         .bind_plan_module_ids(&mut plan, &[], &manifests, &pins)
         .unwrap();
     facts
-        .merge_current(&plan, &pins, &[], &manifests, &[0], &counters)
+        .merge_current(
+            &plan,
+            &pins,
+            &[],
+            &manifests,
+            &[0],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+        )
         .unwrap();
     let surfaces = facts.history.surfaces.values().collect::<Vec<_>>();
     assert_eq!(surfaces.len(), 1);
@@ -15870,7 +15976,9 @@ fn failed_detach_blocks_fresh_attachment_in_a_later_loader_batch() {
     );
 
     session.preflight_targets(&[], &engine.pinned).unwrap();
-    session.attach_targets(&[], &engine.pinned).unwrap();
+    session
+        .attach_targets(&[], &engine.pinned, &std::collections::BTreeSet::new())
+        .unwrap();
     assert_eq!(session.attached_slots.last(), Some(&0));
     assert_eq!(
         session
@@ -20670,6 +20778,7 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
         &candidate.plan,
         &candidate.pinned,
         &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
     );
     assert!(
         evidence
@@ -20736,6 +20845,7 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
         &candidate.plan,
         &candidate.pinned,
         &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
     );
     assert_eq!(evidence.modules.len(), 1);
 
@@ -22098,6 +22208,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
         metrics: false,
@@ -25643,6 +25754,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
     let plan = build_current_plan(
         &[first, second],
         &[],
+        &[],
         &PinnedObjects::empty(),
         &mut counters,
         // The exact final object, not its equal-key peer, owns the outcome.
@@ -26130,7 +26242,12 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
     assert_eq!(plan.skipped, vec![gated.clone()]);
     assert_eq!(plan.modules[0].skipped, vec![gated]);
 
-    let discovery = discovery_evidence(&plan, &pinned, &DiscoveryCounters::default());
+    let discovery = discovery_evidence(
+        &plan,
+        &pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
@@ -26328,7 +26445,15 @@ fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan::build_from_reconciled_modules(&[]);
     facts
-        .merge_current(&plan, &PinnedObjects::empty(), &[], &[], &[], &counters)
+        .merge_current(
+            &plan,
+            &PinnedObjects::empty(),
+            &[],
+            &[],
+            &[],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+        )
         .unwrap();
     facts
         .merge_current(
@@ -26338,6 +26463,7 @@ fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
             &[],
             &[],
             &DiscoveryCounters::default(),
+            &crate::prearm_module::PrearmState::empty(),
         )
         .unwrap();
     facts.apply_to_plan(&mut plan);
@@ -26573,7 +26699,12 @@ fn a_partial_capacity_refusal_is_reported_and_only_an_empty_one_is_fatal() {
     // instead of aborting honest: `render::Evidence::verdict` turns a
     // non-empty `modules_skipped` into PARTIAL (see `render`'s own tests).
     let (plan, pins) = plan_with_pins(4, 1);
-    let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
     assert_eq!(evidence.modules_skipped.len(), 1);
     assert_eq!(evidence.modules_skipped[0].name, "/opt/big0.so");
     assert!(
@@ -26623,12 +26754,22 @@ fn the_module_record_says_which_corroboration_outcome_it_got() {
             corroboration: vec![([object].into_iter().collect(), corroboration_label(outcome))],
             ..DiscoveryCounters::default()
         };
-        let evidence = discovery_evidence(&plan, &pins, &counters);
+        let evidence = discovery_evidence(
+            &plan,
+            &pins,
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+        );
         assert_eq!(evidence.modules[0].corroboration, vec![label]);
     }
     // Nothing recorded: one source described it, and the record says so
     // rather than implying a second source failed to.
-    let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
     assert_eq!(evidence.modules[0].corroboration, vec!["single_source"]);
     assert_eq!(evidence.modules[0].sources, vec!["scan"]);
 }
@@ -26649,7 +26790,12 @@ fn late_collision_invalidates_fallback_evidence_without_discovery_evidence_panic
         },
     });
 
-    let evidence = discovery_evidence(&plan, &pins, &counters);
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &counters,
+        &crate::prearm_module::PrearmState::empty(),
+    );
 
     assert!(
         evidence.manifest_object_fallbacks.is_empty(),
@@ -27034,7 +27180,13 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         .corroboration
         .push(([modules[0].object].into_iter().collect(), "conflict"));
     assert_eq!(
-        discovery_evidence(&plan, &scan_pins, &counters).conflicts,
+        discovery_evidence(
+            &plan,
+            &scan_pins,
+            &counters,
+            &crate::prearm_module::PrearmState::empty()
+        )
+        .conflicts,
         1,
         "the conflict is the bounded evidence that forces PARTIAL"
     );
@@ -27341,6 +27493,9 @@ fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
         tables: Vec::new(),
         interfaces: 0,
         skipped: Vec::new(),
+        watch: None,
+        attached_at_ns: None,
+        unobserved_windows: None,
     }
 }
 
@@ -28043,6 +28198,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::System,
         metrics: false,
@@ -30147,6 +30303,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             &mode.manifests,
             &mode.ordinals,
             &counters,
+            &crate::prearm_module::PrearmState::empty(),
         ) {
             Ok(()) => panic!("{}: the merge must fail", mode.name),
             Err(error) => error.to_string(),
@@ -30158,7 +30315,15 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         );
         // The failed merge changed nothing observable: valid inputs still
         // merge cleanly into the same facts.
-        if let Err(error) = attempted.merge_current(&plan, &mode.pins, &[], &[], &[], &counters) {
+        if let Err(error) = attempted.merge_current(
+            &plan,
+            &mode.pins,
+            &[],
+            &[],
+            &[],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+        ) {
             panic!("{}: facts stay usable after failure: {error:#}", mode.name);
         }
     }
@@ -30200,13 +30365,25 @@ fn merge_preflight_success_implies_identical_merge_results() {
     let mut first = engine.capture_facts.clone();
     first
         .merge_current(
-            &inputs.0, &inputs.1, &inputs.2, &inputs.3, &inputs.4, &inputs.5,
+            &inputs.0,
+            &inputs.1,
+            &inputs.2,
+            &inputs.3,
+            &inputs.4,
+            &inputs.5,
+            &crate::prearm_module::PrearmState::empty(),
         )
         .expect("the merge accepts real candidate inputs");
     let mut second = engine.capture_facts.clone();
     second
         .merge_current(
-            &inputs.0, &inputs.1, &inputs.2, &inputs.3, &inputs.4, &inputs.5,
+            &inputs.0,
+            &inputs.1,
+            &inputs.2,
+            &inputs.3,
+            &inputs.4,
+            &inputs.5,
+            &crate::prearm_module::PrearmState::empty(),
         )
         .expect("the merge is repeatable");
     assert_eq!(
@@ -30396,6 +30573,7 @@ fn e06_cgroup_args(
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
+        prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Cgroup(scope_dir.to_path_buf()),
         metrics: false,
@@ -43802,7 +43980,11 @@ fn automatic_exec_pid_continuity_first_attachment_poison_stops_map_and_native_wo
         0
     );
 
-    let attached = session.attach_targets(&engine.plan.slots, &engine.pinned);
+    let attached = session.attach_targets(
+        &engine.plan.slots,
+        &engine.pinned,
+        &std::collections::BTreeSet::new(),
+    );
     let state = session.pid_continuity.as_ref().unwrap().borrow();
     assert_eq!(state.health_reads, 1, "no earlier receipt preparation read");
     assert_eq!(state.health_phases, ["attach"]);
@@ -43833,7 +44015,11 @@ fn automatic_exec_pid_continuity_attachment_boundary_rechecks_stop_and_terminal_
         state.attachment_boundary_change = Some(change);
         session.pid_continuity = Some(std::cell::RefCell::new(state));
         assert!(!session.mutation_stopped());
-        let attached = session.attach_targets(&engine.plan.slots, &engine.pinned);
+        let attached = session.attach_targets(
+            &engine.plan.slots,
+            &engine.pinned,
+            &std::collections::BTreeSet::new(),
+        );
         let state = session.pid_continuity.as_ref().unwrap().borrow();
         assert_eq!(state.health_reads, 1);
         assert!(state.stopped());
@@ -43870,7 +44056,11 @@ fn automatic_exec_pid_continuity_already_stopped_attachment_does_no_work() {
         assert!(session.mutation_stopped());
         assert!(
             session
-                .attach_targets(&engine.plan.slots, &engine.pinned)
+                .attach_targets(
+                    &engine.plan.slots,
+                    &engine.pinned,
+                    &std::collections::BTreeSet::new()
+                )
                 .is_err()
         );
         let state = session.pid_continuity.as_ref().unwrap().borrow();
@@ -43894,7 +44084,11 @@ fn automatic_exec_pid_continuity_unavailable_attachment_baseline_stays_conservat
         }
         session.pid_continuity = Some(std::cell::RefCell::new(state));
         let (failed, completed) = session
-            .attach_targets(&engine.plan.slots, &engine.pinned)
+            .attach_targets(
+                &engine.plan.slots,
+                &engine.pinned,
+                &std::collections::BTreeSet::new(),
+            )
             .unwrap();
         assert!(failed.is_empty());
         assert_eq!(completed.len(), engine.plan.slots.len());

@@ -117,6 +117,7 @@ fn cold_group_discovery_keeps_tgid_scope_and_actual_callback_target() {
             kind: crate::cli::Kind::Profile,
             modules: vec![group.program.clone()],
             manifests: vec![],
+            prearm_modules: vec![],
             hooks: HookRegistry::builtin(),
             scope: crate::cli::ScopeArg::Pid(group.pid()),
             metrics: false,

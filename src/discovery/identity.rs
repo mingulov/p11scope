@@ -32,7 +32,7 @@ use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
     standard_function_names,
 };
-use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
+use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
@@ -69,6 +69,13 @@ struct RawObjectInstance {
     mount_namespace: Option<MountNamespaceId>,
     key: ObjectKey,
     path: String,
+    /// A `--prearm-module` operator alias (packet 6.13). Pre-arm aliases are
+    /// operator inputs like manifest aliases (same lifetime: they survive
+    /// view retirement, they never come from maps), but they file
+    /// separately so `sources` can report the `"prearm"` label. The marker
+    /// never participates in identity merges (`ordinary_identity_equal`
+    /// compares mapping, pin and digest only).
+    prearm: bool,
 }
 
 impl RawObjectInstance {
@@ -77,6 +84,7 @@ impl RawObjectInstance {
             mount_namespace: Some(module.mount_namespace),
             key,
             path: normalize_target_path(path)?,
+            prearm: false,
         })
     }
 
@@ -85,6 +93,16 @@ impl RawObjectInstance {
             mount_namespace: None,
             key,
             path: normalize_target_path(&path)?,
+            prearm: false,
+        })
+    }
+
+    fn prearm(key: ObjectKey, path: String) -> Option<Self> {
+        Some(Self {
+            mount_namespace: None,
+            key,
+            path: normalize_target_path(&path)?,
+            prearm: true,
         })
     }
 }
@@ -123,6 +141,17 @@ struct Entry {
     mapping: MappingFileKey,
     file: Arc<std::fs::File>,
     pin: Pin,
+    /// Last `CLOCK_MONOTONIC` instant a held-fd check proved this object
+    /// unchanged, starting at the pin-time bracket verification. Feeds the
+    /// `pinned_object_changed` bracket's `last_ok_ns` (packet 6.13).
+    last_ok_ns: std::cell::Cell<Option<u64>>,
+    /// Sticky: a per-object check saw this object change. Latches the
+    /// `PinnedObjects` global flag with it, so changed-byte refusal keeps
+    /// precedence whatever checked first.
+    changed: std::cell::Cell<bool>,
+    /// `CLOCK_MONOTONIC` instant of the first detecting check, set once
+    /// with `changed`. Feeds the bracket's `detected_ns`.
+    detected_ns: std::cell::Cell<Option<u64>>,
     /// Calibrated through this opened file, while its pin was unchanged.
     /// Keeping the proof avoids mapping a watched file in the observer again.
     mapped: Option<MappedFile>,
@@ -816,6 +845,7 @@ impl Entry {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         file: std::fs::File,
         pin: Pin,
@@ -824,6 +854,7 @@ impl Entry {
         raw: RawObjectInstance,
         mapping: MappingFileKey,
         mapped: Option<MappedFile>,
+        verified_ns: Option<u64>,
     ) -> Result<Self, String> {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
@@ -834,6 +865,9 @@ impl Entry {
             mapping,
             file: Arc::new(file),
             pin,
+            last_ok_ns: std::cell::Cell::new(verified_ns),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
             mapped,
             path,
             // `inspect_file` always records a whole-file digest.
@@ -1541,25 +1575,32 @@ impl PinnedObjects {
     }
 
     /// Canonical, finite source ownership for one opened capture-local object.
-    /// Raw aliases remain private; output only needs to distinguish scan and
-    /// optional-manifest authority.
+    /// Raw aliases remain private; output only needs to distinguish scan,
+    /// optional-manifest and optional-prearm authority, in that order.
     pub fn sources(&self, id: PinnedObjectId) -> Vec<&'static str> {
         let mut scan = false;
         let mut manifest = false;
+        let mut prearm = false;
         for (raw, observed) in &self.raw_to_id {
             if *observed != id {
                 continue;
             }
             if raw.mount_namespace.is_some() {
                 scan = true;
+            } else if raw.prearm {
+                prearm = true;
             } else {
                 manifest = true;
             }
         }
-        [scan.then_some("scan"), manifest.then_some("manifest")]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            scan.then_some("scan"),
+            manifest.then_some("manifest"),
+            prearm.then_some("prearm"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
@@ -1619,11 +1660,18 @@ impl PinnedObjects {
 
     /// The one pin opened for a manifest object before it is absorbed into the
     /// capture set. Used only to compare that opened object with scan-owned pins.
+    /// Same-id duplicates (a manifest and a pre-arm alias merged onto one
+    /// object) are one answer, not ambiguity.
     pub fn id_for_path(&self, path: &str) -> Option<PinnedObjectId> {
         let path = normalize_target_path(path)?;
-        let mut ids = self.raw_to_id.iter().filter_map(|(raw, id)| {
-            (raw.mount_namespace.is_none() && raw.path == path).then_some(*id)
-        });
+        let mut ids = self
+            .raw_to_id
+            .iter()
+            .filter_map(|(raw, id)| {
+                (raw.mount_namespace.is_none() && raw.path == path).then_some(*id)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter();
         let first = ids.next()?;
         ids.next().is_none().then_some(first)
     }
@@ -1634,6 +1682,32 @@ impl PinnedObjects {
         self.raw_to_id
             .get(&RawObjectInstance::manifest(key, path.to_string())?)
             .copied()
+    }
+
+    /// Resolves a `--prearm-module` record only through the exact pre-arm raw
+    /// instance established when that path was opened (packet 6.13). A bare
+    /// raw key is never enough, and a manifest alias never satisfies a
+    /// pre-arm lookup: sources stay distinct even on one merged object.
+    pub(crate) fn id_for_prearm(&self, key: ObjectKey, path: &str) -> Option<PinnedObjectId> {
+        self.raw_to_id
+            .get(&RawObjectInstance::prearm(key, path.to_string())?)
+            .copied()
+    }
+
+    /// Whether this object carries a pre-arm alias: it was named by
+    /// `--prearm-module`, however many other sources describe it.
+    pub(crate) fn has_prearm(&self, id: PinnedObjectId) -> bool {
+        self.raw_to_id
+            .iter()
+            .any(|(raw, observed)| *observed == id && raw.prearm)
+    }
+
+    /// Total pinned object bytes, saturating: the shared manifest+pre-arm
+    /// byte accounting base (packet 6.13, R2-D1-3).
+    pub(crate) fn pinned_object_bytes(&self) -> u64 {
+        self.by_id
+            .values()
+            .fold(0u64, |total, entry| total.saturating_add(entry.pin.size))
     }
 
     /// Re-files one manifest alias split by pre-6.8 overlayfs onto its scan pin.
@@ -1668,10 +1742,10 @@ impl PinnedObjects {
         };
         // The one manifest pin filed for this path, under its fd key. More
         // than one is a genuine change during discovery, not a split.
-        let mut manifest_aliases = self
-            .raw_to_id
-            .iter()
-            .filter(|(raw, _)| raw.mount_namespace.is_none() && raw.path == normalized);
+        // Pre-arm aliases file separately and never join this count.
+        let mut manifest_aliases = self.raw_to_id.iter().filter(|(raw, _)| {
+            raw.mount_namespace.is_none() && !raw.prearm && raw.path == normalized
+        });
         let Some((manifest_raw, manifest_id)) = manifest_aliases.next() else {
             return;
         };
@@ -1737,6 +1811,7 @@ impl PinnedObjects {
                 mount_namespace: None,
                 key: recorded,
                 path: normalized,
+                prearm: false,
             },
             scan_id,
         );
@@ -1794,6 +1869,7 @@ impl PinnedObjects {
             .filter(|(raw, owner)| {
                 **owner == id
                     && raw.mount_namespace.is_none()
+                    && !raw.prearm
                     && raw.path == maps_raw.path
                     && raw.key != maps_key
             })
@@ -1892,15 +1968,22 @@ impl PinnedObjects {
     /// `Ok(true)` when every pinned object still has the `(ino, size, ctime)` seen
     /// at pinning; `Ok(false)` when any changed (sticky: once seen, every later
     /// call is `Ok(false)` without re-checking); `Err` only when `fstat` itself fails.
+    /// Success advances every checked object's `last_ok_ns`; the first
+    /// detected change records the same per-object evidence a targeted
+    /// check would, so both paths agree on the bracket.
     pub fn check_unchanged(&self) -> Result<bool, String> {
         if self.changed.get() {
             return Ok(false);
         }
         for entry in self.by_id.values() {
+            let before = crate::attach::monotonic_ns();
             if pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? != entry.pin {
+                entry.changed.set(true);
+                entry.detected_ns.set(crate::attach::monotonic_ns());
                 self.changed.set(true);
                 return Ok(false);
             }
+            entry.last_ok_ns.set(before);
         }
         Ok(true)
     }
@@ -1908,6 +1991,51 @@ impl PinnedObjects {
     /// Whether any `check_unchanged` so far saw a pinned object change.
     pub fn provider_changed(&self) -> bool {
         self.changed.get()
+    }
+
+    /// Per-object held-fd `(ino, size, ctime)` check (packet 6.13, R2-D1-8):
+    /// `Ok(true)` when this one object still matches its pin. Unlike the
+    /// all-objects sticky bool, this attributes a change to one module.
+    /// Success advances that object's `last_ok_ns`; detection latches
+    /// sticky per-object evidence (and the global flag, so changed-byte
+    /// refusal keeps precedence whatever checked first).
+    pub fn check_object_unchanged(&self, id: PinnedObjectId) -> Result<bool, String> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("object {id:?} is not pinned"))?;
+        if entry.changed.get() {
+            return Ok(false);
+        }
+        // Clock reads bracket the verification: last-ok can only understate
+        // the proven-ok instant, detection can only overstate the change.
+        let before = crate::attach::monotonic_ns();
+        let unchanged =
+            pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? == entry.pin;
+        if unchanged {
+            entry.last_ok_ns.set(before);
+            return Ok(true);
+        }
+        entry.changed.set(true);
+        entry.detected_ns.set(crate::attach::monotonic_ns());
+        self.changed.set(true);
+        Ok(false)
+    }
+
+    /// The `pinned_object_changed` uncertainty bracket for one object, when a
+    /// per-object (or global) check saw it change (R2-D1-8). `None` when
+    /// unchanged — or when the clock never yielded the bounds, in which case
+    /// the end is still disclosed, only its instants are not.
+    pub fn change_bracket(&self, id: PinnedObjectId) -> Option<crate::render::PrearmObjectChange> {
+        let entry = self.by_id.get(&id)?;
+        if !entry.changed.get() {
+            return None;
+        }
+        Some(crate::render::PrearmObjectChange {
+            last_ok_ns: entry.last_ok_ns.get()?,
+            detected_ns: entry.detected_ns.get()?,
+            previous_ino: entry.pin.ino,
+        })
     }
 
     fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
@@ -2267,6 +2395,7 @@ mod conservative_copy {
                         mount_namespace: next.mount_namespace,
                         key: next.key,
                         path: String::with_capacity(next.path.len()),
+                        prearm: next.prearm,
                     },
                     storage,
                 });
@@ -2314,6 +2443,7 @@ mod conservative_copy {
                         mount_namespace: old.raw.mount_namespace,
                         key: old.raw.key,
                         path: String::with_capacity(old.raw.path.len()),
+                        prearm: old.raw.prearm,
                     },
                     mapping: old.mapping,
                     file: old.file.clone(),
@@ -2328,6 +2458,9 @@ mod conservative_copy {
                     collapsed: old.collapsed,
                     probed_maps_unproven: old.probed_maps_unproven,
                     probed_maps_key: old.probed_maps_key,
+                    last_ok_ns: std::cell::Cell::new(old.last_ok_ns.get()),
+                    changed: std::cell::Cell::new(old.changed.get()),
+                    detected_ns: std::cell::Cell::new(old.detected_ns.get()),
                 },
                 field: 0,
             }
@@ -3803,6 +3936,7 @@ mod conservative_copy {
                 mount_namespace: original.mount_namespace,
                 key: original.key,
                 path: String::with_capacity(original.path.len()),
+                prearm: original.prearm,
             });
             return None;
         }
@@ -4980,6 +5114,7 @@ mod conservative_copy {
                     mount_namespace: Some(namespace),
                     key,
                     path,
+                    prearm: false,
                 };
                 Ok(pins.raw_to_id.get(&raw).copied())
             }
@@ -6650,6 +6785,9 @@ fn pin_manifest_objects_with_read_policy(
         };
         // The pin was taken before the bytes were hashed; a write that lands
         // during the hash must not become the baseline the capture trusts.
+        // The clock read precedes the verification it timestamps, so the
+        // pin-time `last_ok_ns` can only understate the proven-ok instant.
+        let verified_ns = crate::attach::monotonic_ns();
         match pin_of(&file) {
             Ok(after) if after == pin => {}
             Ok(_) => {
@@ -6716,6 +6854,7 @@ fn pin_manifest_objects_with_read_policy(
             raw,
             mapping,
             held,
+            verified_ns,
         ) {
             Ok(entry) => entry,
             Err(error) => {
@@ -6803,6 +6942,293 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             .collect()),
         Err(error) => Err(error.problems().to_vec()),
     }
+}
+
+/// One `--prearm-module` path resolved and pinned (packet 6.13, R2-D1-1/2).
+/// The pin itself lives in [`PrearmPinning::pins`] under a pre-arm raw; this
+/// records the R2-D1-2(b) provenance split the plan lowers.
+#[derive(Debug, Clone)]
+pub(crate) struct PrearmPinnedInput {
+    /// Normalized operator spelling: messages, raws and plan pieces. Never
+    /// attach identity (attach uses the retained fd only).
+    pub(crate) path: String,
+    pub(crate) key: ObjectKey,
+    /// Standard-name `.dynsym` definitions proved executable in held bytes.
+    pub(crate) proved: Vec<(String, u64)>,
+    /// Standard-name exports not proved executable: disclosed as skipped.
+    pub(crate) non_executable: Vec<(String, u64)>,
+}
+
+/// Every `--prearm-module` pin of one capture: the pin union plus the
+/// per-path provenance splits, in flag order.
+#[derive(Debug)]
+pub(crate) struct PrearmPinning {
+    pub(crate) pins: PinnedObjects,
+    pub(crate) inputs: Vec<PrearmPinnedInput>,
+}
+
+/// Pre-arm pinning fails whole: one bad path refuses the capture's startup
+/// (R2-D1-1), never a partial pin set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrearmPinError {
+    Fatal(Vec<String>),
+}
+
+impl PrearmPinError {
+    pub(crate) fn problems(&self) -> &[String] {
+        match self {
+            Self::Fatal(problems) => problems,
+        }
+    }
+}
+
+/// Pins `--prearm-module` paths through the existing worker discipline
+/// (packet 6.13, R2-D1-1/2/3): open-first, `(ino, size, ctime)` bracket,
+/// whole-file hash, attach via `/proc/self/fd/N` only. Value resolution is
+/// manifest-locator resolution through retained views — an explicit
+/// canonical `/proc/<pid>/root/...` locator binds to that retained view;
+/// otherwise `--pid` resolves against the named view's root and every
+/// other scope against the observer root — never bounded-JSON manifest
+/// reads, never a pathname at attach. Paths must be absolute; one bad
+/// path fails all-or-nothing. Object and byte accounting is shared with
+/// the already-pinned manifest inputs (`prior_objects`/`prior_bytes`
+/// against the same 512-object/512-MiB caps); admission caps are unchanged
+/// and no new knobs are added.
+pub(crate) fn pin_prearm_objects_in_views_with_budget(
+    paths: &[PathBuf],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+) -> Result<PrearmPinning, PrearmPinError> {
+    let mut problems = Vec::new();
+    if prior_objects.saturating_add(paths.len()) > MAX_OBJECTS {
+        problems.push(format!(
+            "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
+        ));
+        return Err(PrearmPinError::Fatal(problems));
+    }
+    // Phase 1: resolve and open every path before pinning any, so one bad
+    // path cannot leave a partial pin set behind.
+    let mut opened = Vec::new();
+    let mut total_object_bytes = prior_bytes;
+    for path in paths {
+        let spelling = path.to_string_lossy().into_owned();
+        if normalize_target_path(&spelling).is_none() {
+            problems.push(format!(
+                "{spelling}: --prearm-module paths must be absolute"
+            ));
+            continue;
+        }
+        enum PrearmRoot<'a> {
+            NamedView {
+                view: &'a ProcessView,
+                open: PathBuf,
+            },
+            Observer {
+                open: PathBuf,
+            },
+        }
+        let root = match retained_view_for_manifest_locator(&spelling, views) {
+            Ok(Some(view)) => PrearmRoot::NamedView {
+                view,
+                open: path.clone(),
+            },
+            Ok(None) => match named_pid {
+                Some(pid) => match views.iter().find(|view| view.pid() == pid) {
+                    Some(view) => PrearmRoot::NamedView {
+                        view,
+                        open: PathBuf::from(format!("/proc/{pid}/root"))
+                            .join(spelling.trim_start_matches('/')),
+                    },
+                    None => {
+                        problems.push(format!(
+                            "{spelling}: no exact retained process view exists for pid {pid}"
+                        ));
+                        continue;
+                    }
+                },
+                None => PrearmRoot::Observer { open: path.clone() },
+            },
+            Err(binding_error) => {
+                problems.push(binding_error);
+                continue;
+            }
+        };
+        let (located, mountinfo) = match root {
+            PrearmRoot::NamedView { view, open } => {
+                match view
+                    .open_then_mountinfo(|_| Ok::<_, String>(open_manifest_locator(&open)), budget)
+                {
+                    Ok((located, mountinfo)) => (located, Some(mountinfo)),
+                    Err(error) => {
+                        problems.push(format!("{spelling}: {error}"));
+                        continue;
+                    }
+                }
+            }
+            PrearmRoot::Observer { open } => (open_manifest_locator(&open), None),
+        };
+        let file = match located {
+            ManifestLocatorOpen::Opened(file) => file,
+            ManifestLocatorOpen::Stale => {
+                problems.push(format!(
+                    "{spelling}: the pre-arm file locator no longer resolves"
+                ));
+                continue;
+            }
+            ManifestLocatorOpen::Fatal(error) => {
+                problems.push(error);
+                continue;
+            }
+        };
+        let mountinfo = match mountinfo {
+            Some(mountinfo) => Some(mountinfo),
+            None => {
+                let table = match std::fs::File::open("/proc/self/mountinfo")
+                    .map_err(|error| format!("cannot open observer mount table: {error}"))
+                    .and_then(|table| read_mountinfo(table, budget))
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        problems.push(format!("{spelling}: {error}"));
+                        continue;
+                    }
+                };
+                Some(table)
+            }
+        };
+        let pin = match pin_of(&file) {
+            Ok(pin) => pin,
+            Err(error) => {
+                problems.push(format!("{spelling}: {error}"));
+                continue;
+            }
+        };
+        let Some(total) = total_object_bytes.checked_add(pin.size) else {
+            problems.push("total object size overflowed u64".into());
+            continue;
+        };
+        if total > MAX_TOTAL_OBJECT_BYTES {
+            problems.push(format!(
+                "manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+            ));
+            continue;
+        }
+        total_object_bytes = total;
+        opened.push((spelling, file, pin, mountinfo));
+    }
+    if !problems.is_empty() {
+        return Err(PrearmPinError::Fatal(problems));
+    }
+
+    // Phase 2: identify, hash, bracket and file every opened object.
+    let mut pins = PinnedObjects::empty();
+    let mut inputs = Vec::new();
+    for (spelling, file, pin, mountinfo) in opened {
+        let inspected = match inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        ) {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                problems.push(format!(
+                    "{spelling}: cannot identify the file now ({error})"
+                ));
+                continue;
+            }
+        };
+        // The pin was taken before the bytes were hashed; a write that lands
+        // during the hash must not become the baseline the capture trusts.
+        // The clock read precedes the verification it timestamps.
+        let verified_ns = crate::attach::monotonic_ns();
+        match pin_of(&file) {
+            Ok(after) if after == pin => {}
+            Ok(_) => {
+                problems.push(format!(
+                    "{spelling}: file changed while it was being identified — retry"
+                ));
+                continue;
+            }
+            Err(error) => {
+                problems.push(format!("{spelling}: {error}"));
+                continue;
+            }
+        }
+        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                problems.push(format!("{spelling}: {error}"));
+                continue;
+            }
+        };
+        let key = object_key(mapping);
+        let Some(raw) = RawObjectInstance::prearm(key, spelling.clone()) else {
+            problems.push(format!("{spelling}: object path cannot be normalized"));
+            continue;
+        };
+        let input_path = raw.path.clone();
+        let mut entry = match Entry::new(
+            file,
+            pin,
+            spelling.clone(),
+            &inspected,
+            raw,
+            mapping,
+            None,
+            verified_ns,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                problems.push(format!("{spelling}: {error}"));
+                continue;
+            }
+        };
+        // Same pin-time self-mapping proof as manifest objects: record how
+        // the kernel renders this exact held fd when it differs (pre-6.8
+        // overlay split), or latch the unproven note when inconclusive.
+        match self_mapped_fallback_detailed(&entry.file, key, budget, &KernelSelfMappingProbe) {
+            SelfMappedFallback::Split(probed) => {
+                entry.probed_maps_key = Some(probed);
+            }
+            SelfMappedFallback::Agrees => {}
+            SelfMappedFallback::Inconclusive => {
+                entry.probed_maps_unproven = true;
+            }
+        }
+        let mut skipped = Vec::new();
+        if pins.insert_entry(entry, &mut skipped).is_none() {
+            problems.extend(
+                skipped
+                    .into_iter()
+                    .map(|skip| format!("{spelling}: {}", skip.reason)),
+            );
+            continue;
+        }
+        // R2-D1-2(b): only defined exports proved executable in held bytes
+        // lower pre-mapping; the rest wait for scan corroboration.
+        let mut proved = Vec::new();
+        let mut non_executable = Vec::new();
+        for (name, offset) in &inspected.exports {
+            if inspected.contains_executable_offset(*offset) {
+                proved.push((name.clone(), *offset));
+            } else {
+                non_executable.push((name.clone(), *offset));
+            }
+        }
+        inputs.push(PrearmPinnedInput {
+            path: input_path,
+            key,
+            proved,
+            non_executable,
+        });
+    }
+    if !problems.is_empty() {
+        return Err(PrearmPinError::Fatal(problems));
+    }
+    Ok(PrearmPinning { pins, inputs })
 }
 
 /// Opens, identity-checks, hashes once and pins every object the scan named. Objects
@@ -7156,6 +7582,8 @@ fn pin_scanned_object(
     if let Some(inspected) = budget.inspected_file(&cache_key) {
         // Nothing was read for this hit, but the file may have changed since
         // `before`; only the still-unchanged file may reuse the cached value.
+        // The clock read precedes the verification it timestamps.
+        let verified_ns = crate::attach::monotonic_ns();
         if pin_of(&file)? == before {
             return Entry::new(
                 file,
@@ -7165,6 +7593,7 @@ fn pin_scanned_object(
                 raw,
                 found,
                 mapped,
+                verified_ns,
             );
         }
     }
@@ -7188,6 +7617,8 @@ fn pin_scanned_object(
     )?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
+    // The clock read precedes the verification it timestamps.
+    let verified_ns = crate::attach::monotonic_ns();
     if pin_of(&file)? != before {
         return Err("file changed while it was being identified — retry".into());
     }
@@ -7201,6 +7632,7 @@ fn pin_scanned_object(
         raw,
         found,
         mapped,
+        verified_ns,
     )
 }
 
@@ -7312,6 +7744,9 @@ pub(crate) mod test_fixture {
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7355,6 +7790,9 @@ pub(crate) mod test_fixture {
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7545,6 +7983,9 @@ pub(crate) mod test_fixture {
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -7579,6 +8020,9 @@ pub(crate) mod test_fixture {
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());

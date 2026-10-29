@@ -3362,6 +3362,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let selected = build_current_plan(
         std::slice::from_ref(&module),
         &[],
+        &[],
         &PinnedObjects::empty(),
         &mut selected_counters,
         &BTreeSet::new(),
@@ -3380,6 +3381,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let mut broad_counters = DiscoveryCounters::default();
     let error = build_current_plan(
         std::slice::from_ref(&module),
+        &[],
         &[],
         &PinnedObjects::empty(),
         &mut broad_counters,
@@ -3437,6 +3439,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let mut mixed_counters = DiscoveryCounters::default();
     let mixed = build_current_plan(
         &[module, small],
+        &[],
         &[],
         &PinnedObjects::empty(),
         &mut mixed_counters,

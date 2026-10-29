@@ -1564,6 +1564,12 @@ pub struct Session {
     /// so a session that never reached its loop reports no attach time —
     /// never 0, never an estimate.
     attach_mono_ns: Option<u64>,
+    /// Per-slot attach-complete instants (packet 6.13, R2-D1-5): the first
+    /// real per-slot completion stamp per slot, retained from every
+    /// `attach_targets` call. First wins: re-attachment never rewrites the
+    /// instant coverage began. Detach never removes these: they are
+    /// historical facts, and capture-held ordering evidence reads them.
+    slot_attached_at: BTreeMap<u32, u64>,
     /// Reserved once before BPF preparation, in process-local allocation order.
     /// Collection identity only; this grants no capture or lifetime authority.
     counter_collection_generation: NonZeroU64,
@@ -6393,7 +6399,10 @@ impl Session {
         // bank guard refuses Detailed slot attach once banks exist.
         if policy.counter_mode().is_none() {
             session
-                .attach_plan(plan, objects)
+                // Watches cannot have ended before the initial attach (ends
+                // happen at capture end or on detected change, both after
+                // start), so the start path enforces an empty ended set.
+                .attach_plan(plan, objects, &BTreeSet::new())
                 .map_err(unsupported_environment_context)?;
         }
         // The lifecycle producers ran through the whole static attach: stage
@@ -6895,6 +6904,7 @@ impl Session {
                 producers_detached: false,
                 detach_wall_ms: 0,
                 attach_mono_ns: None,
+                slot_attached_at: BTreeMap::new(),
                 counter_collection_generation,
                 successful_static: BTreeSet::new(),
                 dynamic_attach_evidence: DynamicAttachEvidence::default(),
@@ -7568,7 +7578,12 @@ impl Session {
     /// Attaches every active target that this session has not already linked.
     /// The static `start` wrapper calls this once; live discovery supplies the
     /// same complete plan snapshot later without reloading or republishing maps.
-    pub(crate) fn attach_plan(&mut self, plan: &AttachPlan, objects: &PinnedObjects) -> Result<()> {
+    pub(crate) fn attach_plan(
+        &mut self,
+        plan: &AttachPlan,
+        objects: &PinnedObjects,
+        ended: &BTreeSet<crate::plan::AttachKey>,
+    ) -> Result<()> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
@@ -7580,7 +7595,7 @@ impl Session {
             .filter(|slot| plan.is_active(slot.index) && !self.has_slot_link(slot.index))
             .cloned()
             .collect();
-        let _ = self.attach_targets(&targets, objects)?;
+        let _ = self.attach_targets(&targets, objects, ended)?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed while attaching; refusing to observe changed bytes"
@@ -7595,7 +7610,34 @@ impl Session {
         &mut self,
         targets: &[Slot],
         objects: &PinnedObjects,
+        ended: &BTreeSet<crate::plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
+        // No probe attaches after its watch's `until_ns` (packet 6.13,
+        // R2-D1-7): ended-watch targets skip (with a stderr note each) so
+        // the rest of the batch still attaches. The engine also deactivates
+        // ended slots, so reaching here with one is the re-lowered-same-key
+        // edge the key-based check exists for.
+        let filtered: Vec<Slot>;
+        let targets: &[Slot] = if ended.is_empty() {
+            targets
+        } else {
+            filtered = targets
+                .iter()
+                .filter(|slot| {
+                    if ended.contains(&crate::plan::AttachKey::of(slot)) {
+                        eprintln!(
+                            "p11scope: slot {} not attached: its pre-arm watch ended before this attach",
+                            slot.index
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect();
+            &filtered
+        };
         if !targets.is_empty() {
             self.require_return_probe_admission()?;
         }
@@ -7846,6 +7888,13 @@ impl Session {
         });
         #[cfg(test)]
         crate::first_use_probe::attached(&self.events_domain, targets, objects, &completed);
+        // Retain the first real per-slot completion stamp per slot (packet
+        // 6.13, R2-D1-5): per-provider evidence reads these.
+        for (slot, stamp) in &completed {
+            if let Some(stamp) = stamp {
+                self.slot_attached_at.entry(*slot).or_insert(*stamp);
+            }
+        }
         Ok((failed, completed))
     }
 
@@ -8011,7 +8060,10 @@ impl Session {
                 slot.index
             );
         }
-        let (failed, completed) = match self.attach_targets(replace, objects) {
+        // The rebuild replace path has no engine access for the ended-watch
+        // set; unreachable in-packet (ends happen at capture end, after all
+        // attaches) — mid-capture evaluation threads the real set here.
+        let (failed, completed) = match self.attach_targets(replace, objects, &BTreeSet::new()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 for slot in replace {
@@ -8822,6 +8874,13 @@ impl Session {
 
     pub(crate) fn has_slot_link(&self, slot: u32) -> bool {
         links_cover_slot(&self.links, slot)
+    }
+
+    /// The retained attach-complete instant for one slot, if it ever
+    /// attached in this session (packet 6.13: per-provider evidence reads
+    /// these, never the once-only session stamp).
+    pub(crate) fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+        self.slot_attached_at.get(&slot).copied()
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
@@ -18861,7 +18920,7 @@ mod tests {
             "detach names the deferral: {detach_error:?}"
         );
         let attach_error = session
-            .attach_targets(&[plan.slots[1].clone()], &pins)
+            .attach_targets(&[plan.slots[1].clone()], &pins, &BTreeSet::new())
             .unwrap_err();
         eprintln!("retirement-cell partial: attach refuses while deferred: {attach_error:?}");
         drop(split);

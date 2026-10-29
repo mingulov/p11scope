@@ -244,6 +244,26 @@ though the start/readiness/end samples hold RSS. `tail_publishes`/
 `tail_skips` count executed versus provably redundant batch-tail
 publications.
 
+## Pre-arm watch keys on `evidence.discovery[]`
+
+Modules named by `--prearm-module` (packet 6.13) carry three additive keys;
+every other module omits all three. `sources` gains the one new label
+`"prearm"` (canonical order `scan`, `manifest`, `prearm`); pre-arm-only
+modules read `corroboration: ["uncorroborated"]`, and pre-arm never emits
+decoded tables. `watch` is `{since_ns, state, until_ns?, ended_by?,
+changed?}`: `state` is exactly `pinned_unarmed`, `armed`, `armed_idle`,
+`unavailable`, or `ended`; `since_ns` is always present (null until armed);
+`until_ns`/`ended_by` appear only when the end actually happened
+(`ended_by` is exactly `attached`, `scope_end`, `stop`, `object_changed`,
+`health_loss`, or `scope_uncertain`); `changed` is the
+`{last_ok_ns, detected_ns, previous_ino}` uncertainty bracket.
+`attached_at_ns` is null or a `CLOCK_MONOTONIC` instant, merged at evidence
+assembly from real attach-complete stamps. `unobserved_windows` is a list of
+`{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
+`late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
+absent means undisclosed, and an explicitly empty list reads as exact only
+with an R2-D1-6 proof behind it. Key presence never proves exactness.
+
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 
 These fields are always present in every v3 profile, v3-metrics, and terminal

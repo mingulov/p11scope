@@ -668,6 +668,7 @@ fn run_public_selection(
         selection,
         modules,
         &[],
+        &[],
         &HookRegistry::builtin(),
         true,
         Some(2),

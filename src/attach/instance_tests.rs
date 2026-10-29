@@ -1131,7 +1131,10 @@ fn privileged_semantic_capture_multi_reload_and_rebound_successor() -> Result<()
     );
     harness.session.detach_slots(&plan.slots)?;
     ensure!(harness.session.detach_failures().is_empty() && !harness.session.has_slot_link(0));
-    let (failed, completed) = harness.session.attach_targets(&plan.slots, &pins)?;
+    let (failed, completed) =
+        harness
+            .session
+            .attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new())?;
     ensure!(failed.is_empty() && completed.len() == 1 && completed[0].0 == 0);
     let owned_sides = harness
         .session
@@ -1313,7 +1316,8 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         .map_err(|refusal| anyhow::anyhow!("pre-rebind full-image audit refused: {refusal:?}"))?;
     session.detach_slots(&plan.slots)?;
     ensure!(session.detach_failures().is_empty() && !session.has_slot_link(plan.slots[0].index));
-    let (failed, completed) = session.attach_targets(&plan.slots, &pins)?;
+    let (failed, completed) =
+        session.attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new())?;
     ensure!(failed.is_empty() && session.attach_failures().is_empty());
     ensure!(completed.len() == 1 && completed[0].0 == plan.slots[0].index);
     let owned_sides: Vec<_> = session

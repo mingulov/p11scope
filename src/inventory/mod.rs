@@ -691,6 +691,7 @@ pub fn run(
     scope: impl Into<crate::cli::ScopeArg>,
     modules: &[PathBuf],
     manifests: &[PathBuf],
+    prearm_modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -713,6 +714,9 @@ pub fn run(
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
     }
+    if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
+        anyhow::bail!("--prearm-module requires --capture auto or native");
+    }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
         anyhow::bail!(
@@ -731,6 +735,7 @@ pub fn run(
         scope,
         modules,
         manifests,
+        prearm_modules,
         hooks,
         json,
         max_scan_pids,
@@ -941,6 +946,7 @@ fn run_with_terminal_diagnostics(
         scope,
         modules,
         &[],
+        &[],
         hooks,
         json,
         max_scan_pids,
@@ -1106,6 +1112,7 @@ fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
     modules: &[PathBuf],
     manifests: &[PathBuf],
+    prearm_modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -1158,6 +1165,9 @@ fn run_with_terminal_budget(
     }
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
+    }
+    if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
+        anyhow::bail!("--prearm-module requires --capture auto or native");
     }
     validate_primary_destinations(out, event_log)?;
     if capture != CaptureMode::Scan {
@@ -1249,6 +1259,18 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
+    // Packet 6.13: inventory accepts and retains `--prearm-module` inputs,
+    // but Detailed-subset offset activation follows in a later packet — the
+    // pending activation is disclosed, never silently dropped.
+    if !prearm_modules.is_empty() {
+        coordinator.note_scope_gap(
+            "pre-arm subset pending".into(),
+            format!(
+                "{} --prearm-module input(s) retained; Detailed-subset offset activation follows in a later packet",
+                prearm_modules.len()
+            ),
+        );
+    }
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, &numbering);
@@ -7887,6 +7909,7 @@ mod tests {
                         InspectScope::System,
                         &[],
                         &[],
+                        &[],
                         &HookRegistry::builtin(),
                         true,
                         Some(1),
@@ -7934,11 +7957,46 @@ mod tests {
     }
 
     #[test]
+    fn inventory_run_refuses_prearm_under_scan_by_name() {
+        use crate::attach::BackendSelection;
+        let error = super::run(
+            crate::cli::ScopeArg::Pid(std::process::id()),
+            &[],
+            &[],
+            &[PathBuf::from("a.so")],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            BackendSelection::Auto,
+            None,
+            None,
+            crate::cli::IdentityBackendSelection::Auto,
+            false,
+            crate::cli::CallerMetadataMode::None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--prearm-module requires --capture auto or native"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
     fn genuine_inventory_scan_never_requests_live_host_admission() {
         let mut stdout = Vec::new();
         let code = run_with_terminal_budget(
             InspectScope::Pid(std::process::id()),
             &[PathBuf::from("/missing/p11scope-provider")],
+            &[],
             &[],
             &HookRegistry::builtin(),
             true,
@@ -8206,6 +8264,7 @@ mod tests {
             for dashboard in [false, true] {
                 let error = run(
                     InspectScope::System,
+                    &[],
                     &[],
                     &[],
                     &HookRegistry::builtin(),

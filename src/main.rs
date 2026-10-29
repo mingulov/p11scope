@@ -91,6 +91,7 @@ fn run() -> Result<i32> {
                 a.scope,
                 &a.modules,
                 &a.manifests,
+                &a.prearm_modules,
                 &a.hooks,
                 a.json,
                 a.max_scan_pids,

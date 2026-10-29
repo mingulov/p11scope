@@ -21,6 +21,7 @@ use crate::process::{PidPin, ProcessView, ProcessViewId};
 use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard};
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -1908,6 +1909,104 @@ impl CaptureEnd {
             Self::Error => render::LOOP_END_ERROR,
         }
     }
+
+    /// Maps the capture end onto the pre-arm watch end cause (packet 6.13,
+    /// R2-D1-7): the scope's lifetime ending normally closes watches with
+    /// `scope_end`; an operator signal or capture error stops them.
+    fn prearm_end_cause(self) -> crate::render::PrearmWatchEnd {
+        match self {
+            Self::DurationExpired | Self::TargetExit | Self::LimitReached => {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            }
+            Self::Signal | Self::Error => crate::render::PrearmWatchEnd::Stop,
+        }
+    }
+}
+
+/// Modules with observed use at capture end (packet 6.13, R2-D1-4): any
+/// report with completed, error or in-flight calls counts for its
+/// attributed module. Ambiguous use (a shared target with no sole owner)
+/// counts for every owner the target resolves to; truly unresolvable use
+/// counts for every module — a quiet claim needs proven no-use, and
+/// unknown association never proves it (physical counts are still
+/// preserved in the reports themselves).
+fn prearm_used_modules(
+    reports: &[crate::metrics::SlotReport],
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let mut used = BTreeSet::new();
+    let mut unattributable = false;
+    for report in reports {
+        if report.calls == 0 && report.errors == 0 && report.in_flight == 0 {
+            continue;
+        }
+        match report.module {
+            Some(module) => {
+                used.insert(module);
+            }
+            None => {
+                let owners = prearm_report_owners(report, plan, pinned);
+                if owners.is_empty() {
+                    unattributable = true;
+                } else {
+                    used.extend(owners);
+                }
+            }
+        }
+    }
+    if unattributable {
+        used.extend(plan.modules.iter().map(|module| module.id));
+    }
+    used
+}
+
+/// Owner modules of one ownerless report, resolved through its recorded
+/// target identity and offset back into the plan's slots.
+fn prearm_report_owners(
+    report: &crate::metrics::SlotReport,
+    plan: &crate::plan::AttachPlan,
+    pinned: &crate::discovery::identity::PinnedObjects,
+) -> BTreeSet<crate::plan::ModuleId> {
+    let Some(target) = report.target_object.as_ref() else {
+        return BTreeSet::new();
+    };
+    let mut owners = BTreeSet::new();
+    for slot in &plan.slots {
+        let Some(pin) = pinned.summary(slot.object) else {
+            continue;
+        };
+        if (pin.key.device.major, pin.key.device.minor) == (target.dev.0, target.dev.1)
+            && pin.key.inode == target.ino
+            && slot.file_offset == report.file_offset
+        {
+            owners.extend(slot.module_ids.iter().copied());
+        }
+    }
+    owners
+}
+
+/// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
+/// idle qualification over observed use, cancel for the capture end, and
+/// the attach-key assembly merge onto the discovery records — all before
+/// the evidence seals. A no-op without pre-arm watches.
+fn finish_prearm_terminal(
+    engine: &mut Engine,
+    session: &Session,
+    end: CaptureEnd,
+    reports: &[metrics::SlotReport],
+) {
+    if !engine.has_prearm_watches() {
+        return;
+    }
+    let used = prearm_used_modules(reports, engine.plan(), engine.pinned());
+    engine.finish_prearm_capture(
+        session,
+        end.prearm_end_cause(),
+        &used,
+        session.attach_failures(),
+        crate::attach::monotonic_ns(),
+    );
 }
 
 /// All three operator stop signals end a capture the same clean way. SIGTERM
@@ -3201,6 +3300,9 @@ fn run_owned_inner_with_host(
                 reason: reason.to_owned(),
             });
 
+    // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
+    // unobserved outer bound cannot understate the spawn-to-attach gap.
+    let scope_start_ns = crate::attach::monotonic_ns();
     let mut child = OwnedChild::spawn(program, command.collect())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
@@ -3212,6 +3314,7 @@ fn run_owned_inner_with_host(
         kind: args.kind,
         modules: args.modules.clone(),
         manifests: args.manifests.clone(),
+        prearm_modules: args.prearm_modules.clone(),
         hooks: args.hooks.clone(),
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,
@@ -3231,6 +3334,7 @@ fn run_owned_inner_with_host(
     let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    engine.set_scope_start_ns(scope_start_ns);
     engine.retain_return_probe_admission(return_admission);
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
     // signalled `always` failure can be named an interruption, not a refusal.
@@ -5363,6 +5467,9 @@ fn capture_profile(
                         &uretprobe_override,
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
+                        // Sealing during a quiesce failure: the watches end
+                        // stopped, never as a clean scope end.
+                        CaptureEnd::Error,
                     )
                     .map(|_| ())
                 },
@@ -5407,7 +5514,7 @@ fn capture_profile(
             poll_terminal_cancellation();
             result
         },
-        |context, _end, _detached| {
+        |context, end, _detached| {
             let mut terminal_context = (
                 &mut *context.0,
                 &mut *context.1,
@@ -5525,6 +5632,7 @@ fn capture_profile(
                         &uretprobe_override,
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
+                        end,
                     )
                 },
             )
@@ -5553,6 +5661,7 @@ fn capture_profile(
         uretprobe_override: &Option<render::UretprobeOverride>,
         capture_tracking_degraded: bool,
         poll_terminal_cancellation: &impl Fn(),
+        end: CaptureEnd,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -5572,6 +5681,7 @@ fn capture_profile(
             .pinned()
             .check_unchanged()
             .map_err(anyhow::Error::msg)?;
+        finish_prearm_terminal(context.0, context.1, end, reports);
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
         consumers.scheduling.span_stage(
@@ -6406,6 +6516,7 @@ fn capture_trace(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
+                    finish_prearm_terminal(context.0, context.1, end, &reports);
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
                     consumers.scheduling.span_stage(
@@ -12071,11 +12182,131 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn prearm_end_cause_maps_ends() {
+        use render::PrearmWatchEnd;
+        assert_eq!(
+            CaptureEnd::DurationExpired.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::TargetExit.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(
+            CaptureEnd::LimitReached.prearm_end_cause(),
+            PrearmWatchEnd::ScopeEnd
+        );
+        assert_eq!(CaptureEnd::Signal.prearm_end_cause(), PrearmWatchEnd::Stop);
+        assert_eq!(CaptureEnd::Error.prearm_end_cause(), PrearmWatchEnd::Stop);
+    }
+
+    fn prearm_test_report(
+        module: Option<crate::plan::ModuleId>,
+        calls: u64,
+        errors: u64,
+        in_flight: u64,
+    ) -> metrics::SlotReport {
+        metrics::SlotReport {
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantic_authorized: true,
+            module,
+            module_ambiguous: false,
+            module_unresolved: module.is_none(),
+            mode: p11scope_ebpf_common::CounterMode::Latency,
+            calls,
+            errors,
+            in_flight,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+            rv_counts: std::collections::BTreeMap::new(),
+            file_offset: 0x1000,
+            target_object: None,
+            ordinals: Vec::new(),
+        }
+    }
+
+    fn prearm_test_plan(modules: &[u32]) -> crate::plan::AttachPlan {
+        let mut plan = crate::plan::AttachPlan::from_slots(Vec::new());
+        plan.modules = modules
+            .iter()
+            .map(|id| crate::plan::ModuleSummary {
+                id: crate::plan::ModuleId(*id),
+                object: crate::discovery::identity::PinnedObjectId(*id),
+                key: crate::plan::TEST_OBJECT,
+                path: format!("/prearm/{id}.so"),
+                tables: Vec::new(),
+                interfaces: 0,
+                source: "prearm",
+                corroborated: false,
+                skipped: Vec::new(),
+            })
+            .collect();
+        plan
+    }
+
+    #[test]
+    fn prearm_used_modules_counts_attributed_and_inflight() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        let reports = vec![
+            prearm_test_report(Some(ModuleId(3)), 5, 0, 0),
+            // All-zero rows are silence, not use.
+            prearm_test_report(Some(ModuleId(7)), 0, 0, 0),
+        ];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(3)]),
+        );
+        // Entered-but-unreturned calls still count as observed use.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 0, 2)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+        // Error rows count too: the endpoint was reached.
+        let reports = vec![prearm_test_report(Some(ModuleId(7)), 0, 1, 0)];
+        assert_eq!(
+            prearm_used_modules(&reports, &plan, &pins),
+            BTreeSet::from([ModuleId(7)]),
+        );
+    }
+
+    #[test]
+    fn prearm_used_modules_fails_closed_on_unattributable() {
+        use crate::plan::ModuleId;
+        let plan = prearm_test_plan(&[3, 7]);
+        let pins = crate::discovery::identity::PinnedObjects::empty();
+        // An ownerless report no pin resolves marks every module used: a
+        // quiet claim needs proven no-use, and unknown association never
+        // proves it.
+        let mut report = prearm_test_report(None, 4, 0, 0);
+        report.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 42,
+            sha256: None,
+        });
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        let report = prearm_test_report(None, 4, 0, 0);
+        assert_eq!(
+            prearm_used_modules(&[report], &plan, &pins),
+            BTreeSet::from([ModuleId(3), ModuleId(7)]),
+        );
+        assert!(prearm_report_owners(&prearm_test_report(None, 4, 0, 0), &plan, &pins).is_empty());
+    }
+
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
             counter_mode: None,
@@ -12124,6 +12355,7 @@ mod tests {
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
+            prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             scope,
             metrics: false,

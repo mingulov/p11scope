@@ -11871,6 +11871,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             linkage: "heuristic",
             exports_agreeing: Some(0),
         }],
+        watch: None,
+        attached_at_ns: None,
+        unobserved_windows: None,
         interfaces: 0,
         skipped: vec![],
     };

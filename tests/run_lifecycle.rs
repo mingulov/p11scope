@@ -30,6 +30,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         kind: Kind::Profile,
         modules: Vec::new(),
         manifests: Vec::new(),
+        prearm_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         metrics: false,
         counter_mode: None,

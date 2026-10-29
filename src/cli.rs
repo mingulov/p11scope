@@ -31,6 +31,11 @@ pub struct CaptureArgs {
     pub modules: Vec<PathBuf>,
     /// `--manifest` inputs; empty ⇒ scan only. Repeatable (spec §4.6).
     pub manifests: Vec<PathBuf>,
+    /// `--prearm-module` inputs (packet 6.13): provider files to pin and
+    /// pre-arm before any mapping. Repeatable; empty ⇒ no pre-arming.
+    /// Never a scan filter (that is `--module`) and never function claims
+    /// (that is `--manifest`).
+    pub prearm_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub scope: ScopeArg,
     /// `--mode metrics` (profile only).
@@ -73,6 +78,8 @@ pub struct RunArgs {
     pub kind: Kind,
     pub modules: Vec<PathBuf>,
     pub manifests: Vec<PathBuf>,
+    /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`.
+    pub prearm_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     /// `--mode metrics` (rejected beside `--trace`).
     pub metrics: bool,
@@ -150,6 +157,9 @@ pub struct InventoryArgs {
     pub modules: Vec<PathBuf>,
     /// Explicit operator inputs for the optional Detailed subset; repeatable.
     pub manifests: Vec<PathBuf>,
+    /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`. Refused
+    /// under `--capture scan`, like `--manifest`.
+    pub prearm_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
@@ -378,7 +388,7 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 
 usage:
   p11scope --version
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
                    [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -395,15 +405,16 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
@@ -440,7 +451,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 ";
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
                    [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -456,6 +467,7 @@ examples (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
@@ -475,6 +487,7 @@ example (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
@@ -496,6 +509,7 @@ example (replace the example program path with your command):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
@@ -533,9 +547,9 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -549,6 +563,7 @@ Quiet cgroup usage remains unknown: endpoint samples do not prove continuous mem
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets; requires auto or native.
 In this version it adds per-edge mechanisms and API results; key operations are planned for 0.6.0.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
@@ -688,6 +703,7 @@ fn run_unknown_arg(arg: &str) -> CliError {
 struct Common {
     modules: Vec<PathBuf>,
     manifests: Vec<PathBuf>,
+    prearm_modules: Vec<PathBuf>,
     hooks: HookRegistry,
     metrics: Option<bool>,
     counter_mode: Option<CounterMode>,
@@ -740,6 +756,9 @@ fn capture_option(
     match arg {
         "--module" => common.modules.push(require_path(args, "--module")?),
         "--manifest" => common.manifests.push(require_path(args, "--manifest")?),
+        "--prearm-module" => common
+            .prearm_modules
+            .push(require_path(args, "--prearm-module")?),
         "--hook-symbol" => add_hook(&mut common.hooks, args)?,
         "--mode" => {
             if common.metrics.is_some() {
@@ -1047,6 +1066,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut system = false;
     let mut modules = Vec::new();
     let mut manifests = Vec::new();
+    let mut prearm_modules = Vec::new();
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
@@ -1128,6 +1148,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--system" => system = true,
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--manifest" => manifests.push(require_path(&mut args, "--manifest")?),
+            "--prearm-module" => prearm_modules.push(require_path(&mut args, "--prearm-module")?),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--dashboard" => dashboard = true,
@@ -1285,6 +1306,11 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     if !manifests.is_empty() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--manifest requires --capture auto or native"));
     }
+    if !prearm_modules.is_empty() && capture == Some(CaptureMode::Scan) {
+        return Err(usage_err(
+            "--prearm-module requires --capture auto or native",
+        ));
+    }
     if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--diagnostics requires --capture auto or native"));
     }
@@ -1306,6 +1332,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         scope,
         modules,
         manifests,
+        prearm_modules,
         hooks,
         json,
         max_scan_pids,
@@ -1434,6 +1461,7 @@ pub fn parse_capture(
         kind,
         modules: common.modules,
         manifests: common.manifests,
+        prearm_modules: common.prearm_modules,
         hooks: common.hooks,
         scope,
         metrics,
@@ -1519,6 +1547,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         kind,
         modules: common.modules,
         manifests: common.manifests,
+        prearm_modules: common.prearm_modules,
         hooks: common.hooks,
         metrics,
         counter_mode: common.counter_mode,
@@ -2684,6 +2713,57 @@ mod tests {
                 matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
                     if message.contains(expected)),
                 "{argv:?} should report {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_prearm_module_parses_and_refuses_scan() {
+        // Repeatable input surface on inventory.
+        let Command::Inventory(parsed) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "--prearm-module",
+            "a.so",
+            "--prearm-module",
+            "b.so",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(
+            parsed.prearm_modules,
+            vec![
+                std::path::PathBuf::from("a.so"),
+                std::path::PathBuf::from("b.so")
+            ]
+        );
+        // Refused by name under `--capture scan`, like `--manifest`.
+        for argv in [
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--capture",
+                "scan",
+                "--prearm-module",
+                "a.so",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--prearm-module",
+                "a.so",
+                "--capture",
+                "scan",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--prearm-module requires --capture auto or native")),
+                "{argv:?} should refuse --prearm-module under scan"
             );
         }
     }

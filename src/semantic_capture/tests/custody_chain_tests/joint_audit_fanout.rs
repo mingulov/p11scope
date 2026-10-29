@@ -13820,30 +13820,33 @@ fn joint_s1only_exact_refusal_preserves_pending_continuation() {
         .invocation_claims_for_test();
     let roles = coordinator.joint_capture().ledger().roles_for_test();
     let h0 = fixture.scene.real.h0.clone();
-    let mut ports = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_frame_ports(&fixture.scene.producers)
-        .unwrap();
-    frame.bind_targets(&ports).unwrap();
-    let originals = h0.0.borrow_mut().stash.take_outcomes();
-    assert_eq!(
-        frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
-        Ok(QuantumSealProgress::LocalPending)
-    );
-    assert_eq!(h0.0.borrow_mut().stash.push_all(Vec::new(), originals), 0);
-    for _ in 0..2 {
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        let originals = h0.0.borrow_mut().stash.take_outcomes();
         assert_eq!(
             frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
-            Ok(QuantumSealProgress::AwaitFutureInput)
+            Ok(QuantumSealProgress::LocalPending)
         );
+        assert_eq!(h0.0.borrow_mut().stash.push_all(Vec::new(), originals), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+                Ok(QuantumSealProgress::AwaitFutureInput)
+            );
+        }
+        frame
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("exact original pending continuation: {reason:?}")
+            });
     }
-    frame
-        .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
-        .unwrap_or_else(|(_, reason)| panic!("exact original pending continuation: {reason:?}"));
-    drop(ports);
     let coordinator = &fixture.scene.real.scene.coordinator;
     assert_eq!(
         coordinator
@@ -14768,9 +14771,6 @@ fn joint_pending_h3_keeps_unmatched_complete_original_local() {
         mut fixture,
         frame: mut q1,
         child_c: _child_c,
-        c_caller: _,
-        c_image: _,
-        end_b: _,
         ..
     } = pending_h3_from_stash(true, &BirthFault);
     assert_eq!(
@@ -14863,9 +14863,6 @@ fn joint_pending_h3_continuation_cannot_forgive_native_fault() {
         mut fixture,
         frame: mut q1,
         child_c: _child_c,
-        c_caller: _,
-        c_image: _,
-        end_b: _,
         ..
     } = pending_h3_from_stash(false, &ChangedFault);
     let original = q1.failure_for_test().unwrap();

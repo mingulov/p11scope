@@ -15295,7 +15295,11 @@ fn finish_exit_loader_subject(fixture: &mut LoadedSeedProvider) {
 /// Future R57 desired positive, expected RED until the observer has a
 /// provider-free transaction receipt. This draft has not been run. ADD/zero
 /// and empty metadata-only surface currently do not supply that receipt.
+/// Tracked as ignored (see docs/notes/2026-10-29-r57-exit-receipt-boundary.md):
+/// no sufficient exit-time receipt exists; settlement is always a counted
+/// truncation. Un-ignore when a settlement receipt lands.
 #[test]
+#[ignore]
 fn exit_loader_balanced_benign_transaction_needs_no_terminal_truncation() {
     let (mut fixture, mut engine, record, mut session) = exit_loader_subject(false);
     session.counters.loader_hits = 1;

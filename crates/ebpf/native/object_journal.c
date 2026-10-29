@@ -902,7 +902,8 @@ __attribute__((noinline)) void p11_journal_begin(const struct owner_start_key *k
     u32 zero = 0;
     if (!side_key_valid(key) || !entry || !entry->descriptor ||
         entry->descriptor >= JOURNAL_DESCRIPTOR_MAX || entry->reserved ||
-        entry->layout != JOURNAL_LAYOUT_LP64 || entry->class_bits > JOURNAL_CLASS_NO_END) {
+        (entry->layout != JOURNAL_LAYOUT_LP64 && entry->layout != JOURNAL_LAYOUT_ILP32) ||
+        entry->class_bits > JOURNAL_CLASS_NO_END) {
         producer_loss(5);
         return;
     }

@@ -71,14 +71,22 @@ fn native_producer_begin_agrees_with_actual_return_constructor() {
         String::from_utf8_lossy(&output.stderr)
     );
     let descriptors = publish_object_descriptors();
-    for (name, function_name) in [
-        ("object", "C_CreateObject"),
-        ("neutral", "C_GetOperationState"),
-        ("open-session", "C_OpenSession"),
-        ("mechanism", "C_EncryptInit"),
-        ("zero-session", "C_GetOperationState"),
-        ("sentinel", "C_GetOperationState"),
-    ] {
+    let mut checked = 0;
+    for (layout, case_name, function_name) in [1, 2].into_iter().flat_map(|layout| {
+        [
+            ("object", "C_CreateObject"),
+            ("neutral", "C_GetOperationState"),
+            ("open-session", "C_OpenSession"),
+            ("mechanism", "C_EncryptInit"),
+            ("zero-session", "C_GetOperationState"),
+            ("sentinel", "C_GetOperationState"),
+            ("high-session", "C_GetOperationState"),
+            ("max-input", "C_EncryptInit"),
+        ]
+        .into_iter()
+        .map(move |(name, function)| (layout, name, function))
+    }) {
+        let name = format!("{}{case_name}", if layout == 2 { "ilp32-" } else { "" });
         let path = |extension: &str| dump.join(format!("{name}.{extension}"));
         // These are the actual rows captured BEFORE the C BEGIN function ran,
         // independent of the emitted BEGIN bytes whose agreement is tested.
@@ -95,7 +103,7 @@ fn native_producer_begin_agrees_with_actual_return_constructor() {
         let function = crate::kinds::function_id(function_name).unwrap();
         assert_eq!(
             context,
-            [function + 1, 1, 1, 0],
+            [function + 1, 1, layout, 0],
             "frozen native context {name}"
         );
         let mut facts = ReturnEventFacts {
@@ -110,11 +118,11 @@ fn native_producer_begin_agrees_with_actual_return_constructor() {
             cgroup_id: 1,
             root_affiliation: 1,
         };
-        if name == "open-session" {
+        if case_name == "open-session" {
             assert_ne!(start.out_ptr, 0);
             facts.session = 0x9090;
         }
-        if name == "mechanism" {
+        if case_name == "mechanism" || case_name == "max-input" {
             assert_ne!(start.mechanism_ptr, 0);
             facts.mechanism = 0x250;
             facts.capture_flags =
@@ -188,5 +196,30 @@ fn native_producer_begin_agrees_with_actual_return_constructor() {
             !end_agrees_with_begin(&begin, &poison),
             "wrong carrier refuses: {name}"
         );
+        if case_name == "high-session" {
+            assert_eq!(
+                start.session,
+                if layout == 2 {
+                    0x8000_0001
+                } else {
+                    0x1_8000_0001
+                }
+            );
+        }
+        if case_name == "sentinel" {
+            assert_eq!(
+                start.session,
+                if layout == 2 {
+                    u64::from(u32::MAX)
+                } else {
+                    u64::MAX
+                }
+            );
+        }
+        checked += 1;
     }
+    assert_eq!(
+        checked, 16,
+        "both layouts exercised all native retained-row cases"
+    );
 }

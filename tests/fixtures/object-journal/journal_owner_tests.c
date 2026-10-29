@@ -2494,6 +2494,103 @@ static void producer_begin_return_settle(void)
     EXPECT(ring_submits == 2 && !producer_gaps, "one BEGIN and one END, no ABANDON");
 }
 
+static void producer_layout_matrix(void)
+{
+    for (u32 layout = JOURNAL_LAYOUT_LP64; layout <= JOURNAL_LAYOUT_ILP32; layout++) {
+        for (unsigned object_case = 0; object_case < 2; object_case++) {
+            for (unsigned word_case = 0; word_case < 3; word_case++) {
+                struct journal_entry_context entry = producer_setup(
+                    object_case ? 30 : 17, JOURNAL_CLASS_TRACKED, object_case, 0);
+                unsigned char *start = lookup(&START, &producer_terminal_key);
+                struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
+                struct journal_return_words words;
+                unsigned char original[288], instance[24], side[432];
+                u64 word = word_case == 0 ? 0x80000001ULL : word_case == 1 ? 0xffffffffULL : 0;
+                entry.layout = layout;
+                memcpy(start + 8, &word, 8);
+                if (object) {
+                    object->layout = layout;
+                    object->action = 8;
+                    object->inputs[0] = word;
+                    object->input_statuses[0] = word ? JOURNAL_HANDLE_VALUE : 3;
+                    memcpy(side, object, sizeof(side));
+                }
+                memcpy(original, start, sizeof(original));
+                memcpy(instance, lookup(&INSTANCE_START, &producer_terminal_key), sizeof(instance));
+                p11_journal_begin(&producer_terminal_key, &entry);
+                EXPECT(ring_submits == 1 && !ring_discards && !producer_gaps,
+                       "retained layout BEGIN: layout=%u object=%u word=%u", layout, object_case, word_case);
+                EXPECT(!memcmp(original, start, sizeof(original)) &&
+                       !memcmp(instance, lookup(&INSTANCE_START, &producer_terminal_key), sizeof(instance)) &&
+                       (!object || !memcmp(side, object, sizeof(side))),
+                       "BEGIN preserves independent original rows");
+                if (ring_submits == 1) {
+                    const unsigned char *bytes = ring_log[0];
+                    u64 actual;
+                    memcpy(&actual, bytes + 80, 8);
+                    EXPECT(bytes[124] == layout && bytes[125] == (word ? 1 : 3) && actual == word,
+                           "layout and normalized session retained without truncation");
+                    if (object) {
+                        memcpy(&actual, bytes + 88, 8);
+                        EXPECT(bytes[126] == (word ? 1 : 3) && actual == word,
+                               "normalized input retained without truncation");
+                    }
+                    p11_journal_returning(&producer_terminal_key, &words);
+                    EXPECT(words.thread == 1 && words.sequence == 1 && !words.flags && !words.pad,
+                           "both layouts return the original invocation");
+                    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && !ctl.outstanding &&
+                           !lookup(&START, &producer_terminal_key) && !lookup(&OBJECT_START, &producer_terminal_key) &&
+                           !lookup(&JOURNAL_START, &producer_terminal_key) && ring_submits == 1 && !producer_gaps,
+                           "returning cleanup preserves one BEGIN and releases all rows");
+                }
+            }
+        }
+        for (unsigned negative = 0; negative < 7; negative++) {
+            struct journal_entry_context entry = producer_setup(30, JOURNAL_CLASS_TRACKED, 1, 0);
+            struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
+            unsigned char *start = lookup(&START, &producer_terminal_key);
+            u64 session = 0x80000001ULL;
+            entry.layout = object->layout = layout;
+            memcpy(start + 8, &session, 8);
+            if (negative == 0) entry.layout = 3;
+            if (negative == 1) object->layout = layout == JOURNAL_LAYOUT_LP64 ? JOURNAL_LAYOUT_ILP32 : JOURNAL_LAYOUT_LP64;
+            if (negative == 2) object->descriptor_index++;
+            if (negative == 3) {
+                session = ~0ULL;
+                u32 capture = 16;
+                memcpy(start + 8, &session, 8);
+                memcpy(start + 256, &capture, 4);
+            }
+            if (negative == 4) pair_delete(&INSTANCE_START, &producer_terminal_key);
+            if (negative == 5) {
+                session = 0x100000001ULL;
+                memcpy(start + 8, &session, 8);
+            }
+            if (negative == 6) {
+                object->inputs[0] = 0x1ffffffffULL;
+                object->input_statuses[0] = JOURNAL_HANDLE_VALUE;
+            }
+            p11_journal_begin(&producer_terminal_key, &entry);
+            if (negative >= 5 && layout == JOURNAL_LAYOUT_LP64) {
+                EXPECT(ring_submits == 1 && !producer_gaps, "wide LP64 healthy twin: %u", negative);
+            } else {
+                EXPECT(!ring_submits && producer_gaps == 1 && producer_evidence[5] == 1 &&
+                       !lookup(&JOURNAL_START, &producer_terminal_key) && lookup(&START, &producer_terminal_key),
+                       "retained layout refusal conserves ordinary START: layout=%u case=%u", layout, negative);
+            }
+        }
+        for (u32 class_bits = JOURNAL_CLASS_COUNT_ONLY; class_bits <= JOURNAL_CLASS_NO_END; class_bits += 2) {
+            struct journal_entry_context entry = producer_setup(2, class_bits, 0, 255);
+            entry.layout = layout;
+            p11_journal_begin(&producer_terminal_key, &entry);
+            EXPECT(ring_submits == (class_bits == JOURNAL_CLASS_NO_END) && !producer_gaps &&
+                   !lookup(&JOURNAL_START, &producer_terminal_key), "finite layout preserves endpoint class");
+            EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && !ctl.outstanding,
+                   "finite class releases ordinary custody");
+        }
+    }
+}
+
 static void producer_classes_and_projection(void)
 {
     struct journal_entry_context entry;
@@ -2550,7 +2647,7 @@ static void producer_failure_matrix(void)
         if (test == 1) entry.descriptor = 105;
         if (test == 2) entry.class_bits = 3;
         if (test == 3) entry.reserved = 1;
-        if (test == 4) entry.layout = 2;
+        if (test == 4) entry.layout = 3;
         if (test == 5) pair_delete(&INSTANCE_START, &producer_terminal_key);
         if (test == 6) witness->entry_stamp[15] = 0;
         if (test == 7) ((struct journal_descriptor_row *)lookup(&DESCRIPTORS, &entry.descriptor))->session_arg = 6;
@@ -2700,45 +2797,60 @@ static void producer_snapshot(const char *name, const char *kind, const void *by
 
 static void producer_agreement_snapshots(void)
 {
-    static const char *names[] = {"object", "neutral", "open-session", "mechanism", "zero-session", "sentinel"};
-    for (unsigned test = 0; test < 6; test++) {
-        u32 descriptor = test == 0 ? 21 : test == 2 ? 13 : test == 3 ? 30 : 17;
-        struct journal_entry_context entry = producer_setup(descriptor, JOURNAL_CLASS_TRACKED,
-                                                             test == 0 || test == 3, test == 2 ? 255 : 0);
-        unsigned char *start = lookup(&START, &producer_terminal_key);
-        struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
-        u64 word;
-        if (test == 2) {
-            u32 capture = 8; /* OUTPUT_NON_NULL: real OpenSession return rewrite. */
-            word = 0x2000; memcpy(start + 48, &word, 8);
-            memcpy(start + 256, &capture, 4);
-        }
-        if (test == 3) {
-            word = ~0ULL; memcpy(start + 24, &word, 8); /* entry MECH_NONE */
-            word = 0x1000; memcpy(start + 32, &word, 8); /* retained mechanism pointer */
-            object->inputs[0] = 7;
-            object->input_statuses[0] = 1;
-            object->action = 8;
-        }
-        if (test == 4 || test == 5) {
-            word = test == 4 ? 0 : ~0ULL;
-            memcpy(start + 8, &word, 8);
-        }
-        producer_snapshot(names[test], "start", start, 288);
-        producer_snapshot(names[test], "key", &producer_terminal_key, 16);
-        producer_snapshot(names[test], "context", &entry, 16);
-        producer_snapshot(names[test], "instance", lookup(&INSTANCE_START, &producer_terminal_key), 24);
-        if (object)
-            producer_snapshot(names[test], "object", object, 432);
-        p11_journal_begin(&producer_terminal_key, &entry);
-        EXPECT(ring_submits == 1 && !producer_gaps, "native agreement BEGIN: %s", names[test]);
-        if (ring_submits == 1) {
-            struct journal_return_words words;
-            producer_snapshot(names[test], "begin", ring_log[0], 224);
-            p11_journal_returning(&producer_terminal_key, &words);
-            EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0 && words.pad == 0,
-                   "actual native return words: %s", names[test]);
-            producer_snapshot(names[test], "return", &words, sizeof(words));
+    static const char *names[] = {"object", "neutral", "open-session", "mechanism", "zero-session", "sentinel", "high-session", "max-input"};
+    /* The agreement test also executes the real retained-row refusal twins. */
+    producer_layout_matrix();
+    for (u32 layout = JOURNAL_LAYOUT_LP64; layout <= JOURNAL_LAYOUT_ILP32; layout++) {
+        for (unsigned test = 0; test < 8; test++) {
+            char name[64];
+            u32 descriptor = test == 0 ? 21 : test == 2 ? 13 : test == 3 || test == 7 ? 30 : 17;
+            struct journal_entry_context entry = producer_setup(descriptor, JOURNAL_CLASS_TRACKED,
+                                                                 test == 0 || test == 3 || test == 7, test == 2 ? 255 : 0);
+            unsigned char *start = lookup(&START, &producer_terminal_key);
+            struct object_start *object = lookup(&OBJECT_START, &producer_terminal_key);
+            u64 word;
+            snprintf(name, sizeof(name), "%s%s", layout == JOURNAL_LAYOUT_ILP32 ? "ilp32-" : "", names[test]);
+            entry.layout = layout;
+            if (object) object->layout = layout;
+            if (layout == JOURNAL_LAYOUT_ILP32 && test != 2) {
+                word = 0x80000001ULL; memcpy(start + 8, &word, 8);
+            }
+            if (test == 2) {
+                u32 capture = 8; /* OUTPUT_NON_NULL: real OpenSession return rewrite. */
+                word = 0x2000; memcpy(start + 48, &word, 8);
+                memcpy(start + 256, &capture, 4);
+            }
+            if (test == 3 || test == 7) {
+                word = ~0ULL; memcpy(start + 24, &word, 8); /* entry MECH_NONE */
+                word = 0x1000; memcpy(start + 32, &word, 8); /* retained mechanism pointer */
+                object->inputs[0] = test == 7 ? (layout == JOURNAL_LAYOUT_ILP32 ? 0xffffffffULL : 0x1ffffffffULL) : 7;
+                object->input_statuses[0] = 1;
+                object->action = 8;
+            }
+            if (test == 4 || test == 5) {
+                word = test == 4 ? 0 : layout == JOURNAL_LAYOUT_ILP32 ? 0xffffffffULL : ~0ULL;
+                memcpy(start + 8, &word, 8);
+            }
+            if (test == 6) {
+                word = layout == JOURNAL_LAYOUT_ILP32 ? 0x80000001ULL : 0x180000001ULL;
+                memcpy(start + 8, &word, 8);
+            }
+            producer_snapshot(name, "start", start, 288);
+            producer_snapshot(name, "key", &producer_terminal_key, 16);
+            producer_snapshot(name, "context", &entry, 16);
+            producer_snapshot(name, "instance", lookup(&INSTANCE_START, &producer_terminal_key), 24);
+            if (object)
+                producer_snapshot(name, "object", object, 432);
+            p11_journal_begin(&producer_terminal_key, &entry);
+            EXPECT(ring_submits == 1 && !producer_gaps, "native agreement BEGIN: %s", name);
+            if (ring_submits == 1) {
+                struct journal_return_words words;
+                producer_snapshot(name, "begin", ring_log[0], 224);
+                p11_journal_returning(&producer_terminal_key, &words);
+                EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0 && words.pad == 0,
+                       "actual native return words: %s", name);
+                producer_snapshot(name, "return", &words, sizeof(words));
+            }
         }
     }
 }
@@ -2772,7 +2884,13 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "producer-pairs")) {
         producer_agreement_snapshots();
         if (!failures)
-            fprintf(stderr, "journal producer snapshots: six real native cases passed\n");
+            fprintf(stderr, "journal producer snapshots: sixteen real native cases passed\n");
+        return failures != 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "producer-layouts")) {
+        producer_layout_matrix();
+        if (!failures)
+            fprintf(stderr, "journal producer layouts: 12 word positives, 14 refusal/twin cases and 4 endpoint classes passed\n");
         return failures != 0;
     }
     if (argc == 2 && !strcmp(argv[1], "producer")) {

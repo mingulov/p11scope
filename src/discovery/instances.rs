@@ -624,6 +624,12 @@ struct Observed {
     /// observation was recorded (`None` when the backend cannot read the
     /// counter). A global-only advance after this value moved mints.
     storage_seen: Option<u64>,
+    /// B17 W1: this entry continued across a global-only move, so a
+    /// same-address unload+reload by a multi-threaded holder between the
+    /// scans is not excluded. Sticky: same-triple refresh preserves it in
+    /// place, later global-only entries inherit it, and only a genuine
+    /// mint or eviction/retirement clears it (by replacing the entry).
+    continued_across_global: bool,
 }
 
 /// A private load-base address.
@@ -646,6 +652,12 @@ pub(crate) struct RouterCounters {
     pub(crate) joined: u64,
     pub(crate) observations: u64,
     pub(crate) continued: u64,
+    /// B17 W1: observations that took the global-only continuation arm (a
+    /// subset of `continued`, which keeps its existing both-arms total).
+    pub(crate) continued_across_global: u64,
+    /// B17 W1: calls that joined through a tainted entry (direct routes
+    /// and pending resolutions alike; a subset of `joined`).
+    pub(crate) joined_across_global: u64,
     pub(crate) coverage_faults: u64,
     pub(crate) eras: u64,
     /// Era advances latched by a hook-program miss the capture loop had not
@@ -740,9 +752,31 @@ pub(crate) struct InstanceRouter {
     /// the capture loop once per pass. `None` until the first snapshot
     /// (legacy backends never set it) keeps the legacy continuity rule.
     storage_snapshot: Option<u64>,
+    /// B17 W1: identities newly qualified by a global-only continuation,
+    /// drained by the owning adapter for the
+    /// [`RELOAD_NOT_EXCLUDED_LABEL`] disclosure. Each entry is pushed once
+    /// per identity, so the queue shares the retained-history bound.
+    reload_not_excluded: Vec<ReloadNotExcluded>,
 }
 
 pub(crate) struct ObservationLoss {
+    pub(crate) image: ImageIdentity,
+    pub(crate) file_slot: u32,
+    pub(crate) ids: Vec<InstanceId>,
+}
+
+/// B17 W1 disclosure label (frozen by the D4 decision): a continued
+/// instance whose global-only continuation cannot exclude a same-address
+/// reload between the scans. Finite label only; never epochs, ranges or
+/// addresses.
+pub(crate) const RELOAD_NOT_EXCLUDED_LABEL: &str = "instance_reload_not_excluded";
+
+/// One identity newly qualified by a global-only continuation, drained by
+/// the owning adapter like [`ObservationLoss`]. Pushed once per identity —
+/// on its first tainted continuation — so the queue is bounded by the
+/// retained-history caps (each push names minted IDs, never re-pushed for
+/// the same IDs), never a side table.
+pub(crate) struct ReloadNotExcluded {
     pub(crate) image: ImageIdentity,
     pub(crate) file_slot: u32,
     pub(crate) ids: Vec<InstanceId>,
@@ -798,6 +832,7 @@ impl InstanceRouter {
             counters: RouterCounters::default(),
             observation_losses: Vec::new(),
             storage_snapshot: None,
+            reload_not_excluded: Vec::new(),
         }
     }
 
@@ -893,6 +928,12 @@ impl InstanceRouter {
 
     pub(crate) fn take_observation_losses(&mut self) -> Vec<ObservationLoss> {
         std::mem::take(&mut self.observation_losses)
+    }
+
+    /// Drains the identities newly qualified since the last drain. Draining
+    /// reports the qualification; it never clears the sticky entry taint.
+    pub(crate) fn take_reload_not_excluded(&mut self) -> Vec<ReloadNotExcluded> {
+        std::mem::take(&mut self.reload_not_excluded)
     }
 
     pub(crate) fn refuse_image_pending(
@@ -1382,6 +1423,7 @@ impl InstanceRouter {
                         ranges: observation.ranges,
                         partitions,
                         storage_seen: storage_snapshot,
+                        continued_across_global: false,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1430,6 +1472,7 @@ impl InstanceRouter {
                         ranges: observation.ranges,
                         partitions,
                         storage_seen: storage_snapshot,
+                        continued_across_global: false,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1740,3 +1783,7 @@ fn route_ip(observed: &Observed, facts: &CallFacts) -> Route {
 #[cfg(test)]
 #[path = "instances_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reload_witness_tests.rs"]
+mod reload_witness_tests;

@@ -4616,6 +4616,31 @@ mod tests {
         assert!(decode_discovery(&discovery_bytes(&record)).is_none());
     }
 
+    #[test]
+    fn exec_generation_decode_retains_only_the_bounded_private_ticket() {
+        let mut record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        for ticket in [0, 1, p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT] {
+            record.binding_id = ticket;
+            let bytes = discovery_bytes(&record);
+            assert_eq!(bytes.len(), 920);
+            assert_eq!(&bytes[912..920], &ticket.to_ne_bytes());
+            assert_eq!(decode_discovery(&bytes).unwrap().binding_id, ticket);
+            let mut reserved = record;
+            reserved.reserved_zero[0] = 1;
+            assert!(decode_discovery(&discovery_bytes(&reserved)).is_none());
+        }
+        for ticket in [
+            p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT + 1,
+            u64::MAX,
+        ] {
+            record.binding_id = ticket;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.binding_id = 1;
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+    }
+
     /// Regression: one retained reader advances through backlog once, rejects
     /// malformed bytes once, and stays empty after the queue is consumed.
     #[test]

@@ -327,6 +327,134 @@ fn exec_task_embedded_lifecycle_preserves_maps_hooks_and_class_boundary() {
 }
 
 #[test]
+fn exec_generation_ticket_helper_respects_flavor_and_reservation_boundary() {
+    let mut variants = vec![
+        ("detailed", p11scope::EBPF_OBJECT, true),
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT, false),
+        ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT, true),
+    ];
+    for (name, bytes) in [
+        ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
+        ("timestamps", p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT),
+        ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
+    ] {
+        if !bytes.is_empty() {
+            variants.push((name, bytes, true));
+        }
+    }
+    let script = r#"
+import re, struct, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from _loader import load_path
+m = load_path(Path('scripts/check-live-discovery-object.py'), 'exec_ticket_flow')
+c = load_path(Path('scripts/check-bpf-map-defs.py'), 'exec_ticket_btf')
+elf = c.Elf(Path(sys.argv[1]).read_bytes())
+btf = c.Btf(elf.sections['.BTF'][1])
+nodes = [n for n in btf.types[1:] if n[:2] == (12, 'p11_link_current_cookie')]
+assert len(nodes) == 1 and nodes[0][3] == 1
+proto = btf.types[nodes[0][2]]
+assert proto[0] == 13 and proto[3] == 0, 'cookie helper takes no arguments'
+result = btf.resolve(proto[2])
+assert result[0] == 1 and result[2] == 8, 'cookie helper returns u64'
+dump = subprocess.check_output(['llvm-objdump-18', '-dr', sys.argv[1]], text=True)
+blocks = m.function_blocks(dump)
+owners = [(name, lines) for name, lines in blocks.items()
+          if any(re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line) for line in lines)]
+assert len(owners) == 1 and owners[0][0].endswith('emit_lifecycle'), owners
+lines = owners[0][1]
+ticket_row = next(i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line))
+ticket = next(m.line_pc(line) for line in reversed(lines[:ticket_row]) if m.line_pc(line) is not None)
+reserve_row = next(i for i, line in enumerate(lines) if re.search(r'\bcall 0x83\b', line))
+reserve = m.line_pc(lines[reserve_row])
+insns, graph = m.instruction_graph(lines)
+assert ticket not in m.reachable(graph, [insns[0][0]], {reserve}), 'ticket before ring reserve'
+branch_row = next(i for i in range(reserve_row + 1, min(len(lines), reserve_row + 8))
+                  if re.search(r'\bif r\d+ (?:==|!=) 0x0 goto ', lines[i]))
+branch = lines[branch_row]
+target = m.relative_target(m.line_pc(branch), branch)
+following = next(m.line_pc(line) for line in lines[branch_row + 1:] if m.line_pc(line) is not None)
+null = target if '== 0x0 goto' in branch else following
+assert ticket not in m.reachable(graph, [null]), 'failed reservation acquired a ticket'
+kind_checks = [(pc, text) for pc, text in insns if re.search(r'\bif r\d+ (?:==|!=) 0x5 goto ', text)]
+assert len(kind_checks) == 1, 'only EXEC kind5 may acquire a lifecycle ticket'
+kind_pc, kind_text = kind_checks[0]
+kind_target = m.relative_target(kind_pc, kind_text)
+kind_next = next(pc for pc, _ in insns if pc > kind_pc)
+not_exec = kind_next if '== 0x5 goto' in kind_text else kind_target
+assert ticket not in m.reachable(graph, [not_exec]), 'another lifecycle kind acquired a ticket'
+
+# Resolve the actual linked root's local calls, including .text relocations.
+# The checked scope-auth return discriminator must dominate emission; its
+# refusal arm cannot reach the emitter that owns the only ticket call.
+symbols = [s for s in elf.symbols if s[1] & 15 == 2 and s[5]]
+root = next(s for s in symbols if s[0] == 'sched_process_exec')
+sections = {elf.indices[name]: raw for name, (_, raw) in elf.sections.items()}
+calls = []
+for header, relocs in elf.sections.values():
+    if header[1] != 9 or header[7] != root[3]:
+        continue
+    for offset in range(0, len(relocs), 16):
+        address, info = struct.unpack_from('<QQ', relocs, offset)
+        if info & 0xffffffff != 10 or not root[4] <= address < root[4] + root[5]:
+            continue
+        op, regs, _, immediate = struct.unpack_from('<BBhi', sections[root[3]], address)
+        if op != 0x85 or regs >> 4 != 1:
+            continue
+        named = elf.symbols[info >> 32]
+        target = (named[3], named[4] + (immediate + 1) * 8)
+        resolved = [s for s in symbols if s[3:5] == target]
+        assert len(resolved) == 1, 'unresolved EXEC root call'
+        calls.append((address // 8, resolved[0][0]))
+auth = [pc for pc, name in calls if name.endswith('10scope_auth')]
+emit = [pc for pc, name in calls if name.endswith('14emit_lifecycle')]
+assert len(auth) == len(emit) == 1, 'EXEC root uses actual scope/emitter bodies'
+root_lines = blocks['sched_process_exec']
+root_insns, root_graph = m.instruction_graph(root_lines)
+assert emit[0] not in m.reachable(root_graph, [root_insns[0][0]], {auth[0]}), 'scope bypassed'
+after = [(pc, text) for pc, text in root_insns if auth[0] < pc <= auth[0] + 3]
+assert len(after) >= 2 and re.fullmatch(r'r\d+ = \*\(u64 \*\)\(r10 - 0x[0-9a-f]+\)', after[0][1])
+scope_register = after[0][1].split(' = ', 1)[0]
+guard_pc, guard_text = after[1]
+assert re.search(r'\bif ' + scope_register + r' (?:==|!=) 0x1 goto ', guard_text), 'scope discriminator unchecked'
+scope_target = m.relative_target(guard_pc, guard_text)
+scope_next = next(pc for pc, _ in root_insns if pc > guard_pc)
+refused = scope_next if '== 0x1 goto' in guard_text else scope_target
+assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted an EXEC ticket'
+"#;
+    for (name, bytes, identity) in variants {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        let helpers = object
+            .functions
+            .values()
+            .filter(|function| function.name == "p11_link_current_cookie")
+            .count();
+        assert_eq!(
+            helpers,
+            usize::from(identity),
+            "{name}: cookie-only helper selection"
+        );
+        assert_eq!(object.maps.contains_key("TASK_COOKIE"), identity, "{name}");
+        assert_eq!(object.maps.contains_key("COOKIE_CTL"), identity, "{name}");
+        if identity {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("exec-ticket.o");
+            fs::write(&path, bytes).unwrap();
+            let check = Command::new("python3")
+                .args(["-I", "-c", script])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn exec_task_singles_perf_attributes_preserve_healthy_leader_exec() {
     // Characterize the exact patched Aya constructor our Singles path uses.
     // This pins attributes, not live registered-pair activity or a receipt.

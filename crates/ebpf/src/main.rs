@@ -1928,6 +1928,16 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).case_id), case_id);
     }
+    // ScopeAuth was admitted by the lifecycle root and this reservation
+    // succeeded. Only EXEC owns this private word; all other kinds retain
+    // the initializer's zero. InventoryGlobal carries no identity allocator.
+    #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    if kind == DISCOVERY_KIND_EXEC {
+        let ticket = unsafe { p11_link_current_cookie() };
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);
+        }
+    }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
 }
@@ -2901,6 +2911,8 @@ unsafe extern "C" {
     fn p11_root_current_exit();
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
+    #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    fn p11_link_current_cookie() -> u64;
     /// Task 3 Stage A continuity halves (native instance_epoch.c): the entry
     /// half records the private probed address and entry stamp under the
     /// call's START key; the return half fills an `EventRecord`'s private

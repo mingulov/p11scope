@@ -782,6 +782,8 @@ fn build_variant_with_proof(
     if !matches!(flavor, BpfFlavor::InventoryGlobal) {
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
+        append_flag("-C");
+        append_flag("link-arg=--export=p11_link_current_cookie");
     }
     if counter_bank_proof || image_bank_proof {
         let bank_exports: &[&str] = match flavor {

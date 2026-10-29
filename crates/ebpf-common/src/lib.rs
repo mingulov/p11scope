@@ -701,8 +701,26 @@ pub struct DiscoveryRecord {
     pub return_rv: u64,
     /// Full request CK_FLAGS for kind 4.
     pub request_flags: u64,
-    /// Full-width private selection binding id for kind 4.
+    /// Full-width private selection binding id for kind4. For kind5 only,
+    /// the original producer's group-leader TASK_COOKIE ticket (zero means
+    /// unavailable). Every other kind keeps this word zero. Neither value
+    /// is a public identity or proof of an exact executable image.
     pub binding_id: u64,
+}
+
+impl DiscoveryRecord {
+    /// The bounded original task ticket carried by an EXEC, if available.
+    /// Record decoding separately validates every other kind-owned field.
+    pub const fn exec_task_ticket(&self) -> Option<u64> {
+        if self.kind == DISCOVERY_KIND_EXEC
+            && self.binding_id != 0
+            && self.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
+        {
+            Some(self.binding_id)
+        } else {
+            None
+        }
+    }
 }
 
 #[repr(C)]
@@ -730,6 +748,10 @@ pub struct PauseKey {
 }
 
 fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
+    record.binding_id == 0 && zero_discovery_payload_except_binding(record)
+}
+
+fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
     record.table_ptr == 0
         && record.interface_flags == 0
         && record.pointers.iter().all(|pointer| *pointer == 0)
@@ -744,7 +766,6 @@ fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
         && record.symbol_id == 0
         && record.return_rv == 0
         && record.request_flags == 0
-        && record.binding_id == 0
 }
 
 fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
@@ -930,7 +951,8 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                     | DISCOVERY_EXEC_TASK_REPLACED
             ) && valid_exec_leader(record.pid_tgid)
                 && record.announced_count == 0
-                && zero_discovery_payload(record)
+                && record.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
+                && zero_discovery_payload_except_binding(record)
         }
         DISCOVERY_KIND_LEADER_EXIT => {
             record.status_flags == 0
@@ -2834,6 +2856,51 @@ mod tests {
         }
     }
 
+    /// A bounded original task ticket is private EXEC transport, independent
+    /// of its finite same-task class; it never relaxes another payload field.
+    #[test]
+    fn exec_generation_ticket_is_bounded_and_kind_specific() {
+        for class in 0..=2 {
+            for ticket in [0, 1, IMAGE_IDENTITY_TICKET_LIMIT] {
+                let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+                record.case_id = class;
+                record.binding_id = ticket;
+                assert!(
+                    valid_discovery_record(&record),
+                    "class={class} ticket={ticket}"
+                );
+                assert_eq!(record.exec_task_ticket(), (ticket != 0).then_some(ticket));
+                record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+                record.send_signal_rc = COALESCED_NO_HELPER_RC;
+                assert!(valid_discovery_record(&record));
+                record.send_signal_rc = 0;
+                assert!(!valid_discovery_record(&record));
+            }
+        }
+        for ticket in [IMAGE_IDENTITY_TICKET_LIMIT + 1, 1 << 32, u64::MAX] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.binding_id = ticket;
+            assert!(
+                !valid_discovery_record(&record),
+                "noncanonical ticket={ticket}"
+            );
+            assert_eq!(record.exec_task_ticket(), None);
+        }
+        for kind in [DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER] {
+            let mut record = discovery_record(kind);
+            record.binding_id = 1;
+            assert!(!valid_discovery_record(&record), "wrong kind={kind}");
+            assert_eq!(record.exec_task_ticket(), None);
+        }
+        let mut selection = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        selection.binding_id = IMAGE_IDENTITY_TICKET_LIMIT + 1;
+        assert_eq!(
+            selection.exec_task_ticket(),
+            None,
+            "kind4 is not an EXEC ticket"
+        );
+    }
+
     #[test]
     fn exec_task_classification_requires_checked_equal_leader_and_user_dumpability() {
         let leader = (17u64 << 32) | 17;
@@ -2887,7 +2954,7 @@ mod tests {
             |r| r.reserved_tail_zero[3] = 1,
             |r| r.return_rv = 1,
             |r| r.request_flags = 1,
-            |r| r.binding_id = 1,
+            |r| r.binding_id = IMAGE_IDENTITY_TICKET_LIMIT + 1,
             |r| r.send_signal_rc = COALESCED_NO_HELPER_RC,
             |r| r.send_signal_rc = i64::MAX,
         ];

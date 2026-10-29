@@ -282,6 +282,46 @@ def relative_target(pc, text):
     return pc + 1 + (distance if branch.group("sign") == "+" else -distance)
 
 
+def reservation_branches(lines, reserve, end=None):
+    """Identify the same reserved pointer on both finite null-guard polarities."""
+    insns, graph = instruction_graph(lines)
+    if len(insns) != len(dict(insns)):
+        fail("reservation function has duplicate instruction addresses")
+    facts = call_argument_facts(lines)
+    reserve_pc = line_pc(lines[reserve])
+    texts = dict(insns)
+    internal = {pc for index, pc, text in instruction_entries(lines)
+                if text.startswith("85 10 ") or any(
+                    relocation == index + 1 and kind == "32"
+                    for relocation, kind, _ in relocation_targets(lines))}
+    if (texts.get(reserve_pc) != "call 0x83" or reserve_pc in internal
+            or facts.get(reserve_pc, {}).get("r2") != ("constant", 920)):
+        fail("reservation is not the 920-byte ring-reserve helper")
+    branches = []
+    limit = end if end is not None else min(len(lines), reserve + 8)
+    for index, pc, _ in instruction_entries(lines):
+        if not reserve < index < limit:
+            continue
+        branch = re.fullmatch(r"if (r\d+) (==|!=) 0x0 goto [+-]0x[0-9a-f]+", texts[pc])
+        if branch and facts.get(pc, {}).get(branch.group(1)) == ("result", reserve_pc):
+            target = relative_target(pc, texts[pc])
+            edges = graph[pc]
+            if len(edges) != 2 or edges[0] == edges[1]:
+                fail("reservation guard does not have two distinct finite arms")
+            fallthrough = next(edge for edge in edges if edge != target)
+            success, failure = ((target, fallthrough) if branch.group(2) == "!="
+                                else (fallthrough, target))
+            branches.append((index, success, failure))
+    if len(branches) != 1:
+        fail("reservation must have one finite null guard of its result")
+    # Encoded internal calls with the same immediate are not target-read helpers.
+    reads = {pc for pc, text in insns if pc not in internal
+             and re.fullmatch(r"call 0x(?:70|72)", text)}
+    if reads & reachable(graph, [insns[0][0]], {reserve_pc}):
+        fail("target read can precede ring reservation")
+    return branches[0], facts, insns, graph, reads
+
+
 def initializer_regions(disassembly):
     regions = []
     for function, lines in function_blocks(disassembly).items():
@@ -328,31 +368,31 @@ def initializer_regions(disassembly):
             if candidate is None:
                 fail(f"{function}: missing exact 115-store initializer")
             start, end, base, zero, stores = candidate
-            prefix = "\n".join(lines[:start])
-            if not re.search(rf"r{zero} = 0x0\b", prefix):
-                fail(f"{function}: initializer source register is not proven zero")
-            success_branches = []
-            for line in lines[reserve + 1 : start]:
-                pc = line_pc(line)
-                if pc is None or not re.search(rf"\bif r{base} != 0x0 goto ", line):
-                    continue
-                success_branches.append(relative_target(pc, line))
-            if len(success_branches) != 1 or success_branches[0] is None:
-                fail(
-                    f"{function}: reservation must have one finite success branch"
-                )
-            target = success_branches[0]
+            (branch, target, failure), facts, insns, graph, reads = reservation_branches(lines, reserve, start)
+            result = ("result", line_pc(lines[reserve]))
+            state = facts.get(line_pc(lines[start]), {})
+            if (state.get("r" + base) != result or state.get("r" + zero) != ("constant", 0)
+                    or not state.get(("nonzero", result)) or state.get(("zero", result))):
+                fail(f"{function}: initializer lacks a non-null reserved pointer and known zero")
             target_index = next(
-                (index for index, line in enumerate(lines) if line_pc(line) == target),
+                (index for index, pc, _ in instruction_entries(lines) if pc == target),
                 None,
             )
-            if target_index is None or not (reserve < target_index <= start):
+            if target_index is None or not (branch < target_index <= start):
                 fail(f"{function}: successful reservation does not enter the initializer")
             for line in lines[target_index:start]:
                 if line_pc(line) is not None and not re.search(
                     r"\*\(u(?:8|16|32|64) \*\)\(r10 - 0x[0-9a-f]+\) =", line
                 ):
                     fail(f"{function}: non-stack operation precedes initialization: {line!r}")
+            store_pcs = [line_pc(line) for line in lines[start:end]]
+            for previous, pc in zip(store_pcs, store_pcs[1:]):
+                if {source for source, edges in graph.items() if pc in edges} != {previous}:
+                    fail(f"{function}: a path bypasses part of the initializer")
+            null_paths = reachable(graph, [failure])
+            submits = {pc for pc, text in insns if text == "call 0x84"}
+            if null_paths & (set(store_pcs) | reads | submits):
+                fail(f"{function}: null reservation arm reaches record work")
             before_init = "\n".join(lines[reserve + 1 : start])
             if re.search(rf"= \*\([^)]*\)\(r{base} \+", before_init):
                 fail(f"{function}: record field read precedes initialization")
@@ -1802,40 +1842,18 @@ def reservation_loss_contract(disassembly):
             )
             if reserve is None:
                 return False
-            branch = next(
-                (
-                    index
-                    for index in range(reserve + 1, min(len(lines), reserve + 8))
-                    if re.search(r"\bif r(?P<base>\d+) != 0x0 goto ", lines[index])
-                ),
-                None,
-            )
-            if branch is None:
+            try:
+                (_, target, failure), _, _, graph, _ = reservation_branches(lines, reserve)
+            except RuntimeError:
                 return False
-            target = relative_target(line_pc(lines[branch]), lines[branch])
-            target_index = next(
-                (index for index, line in enumerate(lines) if line_pc(line) == target),
-                None,
-            )
-            if target_index is None or target_index <= branch:
+            failure_paths = reachable(graph, [failure])
+            lookups = [pc for index, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)
+                       if pc in failure_paths and finite_counter_key(lines, index) == 0]
+            if len(lookups) != 1 or not counter_writeback_contract(lines, lookups[0]):
                 return False
-            failure = lines[branch + 1 : target_index]
-            counters = [
-                index
-                for index, line in enumerate(failure)
-                if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
-            ]
-            if len(counters) != 1 or finite_counter_key(lines, branch + 1 + counters[0]) != 0:
-                return False
-            lookups = map_call_sites(lines, "COUNTERS", helper=1)
-            lookup = next((pc for index, pc, _ in lookups
-                           if branch < index < target_index), None)
-            if lookup is None or not counter_writeback_contract(lines, lookup):
-                return False
-            _, graph = instruction_graph(lines)
+            lookup = lookups[0]
             # The null reservation arm cannot bypass its COUNTERS lookup.
-            failure_start = line_pc(next(line for line in lines[branch + 1:] if line_pc(line) is not None))
-            unaccounted = reachable(graph, [failure_start], {lookup})
+            unaccounted = reachable(graph, [failure], {lookup})
             if target in unaccounted or any(not graph[pc] for pc in unaccounted):
                 return False
     return len(reservation_functions) == 3 and {
@@ -2035,7 +2053,7 @@ def _source(stores=range(115)):
     )
 
 
-def _initializer_block(function, tail=""):
+def _initializer_block(function, tail="", null_to_failure=False):
     lines = [
         f"0000000000000000 <{function}>:",
         "       0:\tr7 = 0x0",
@@ -2045,32 +2063,47 @@ def _initializer_block(function, tail=""):
         "       4:\tr3 = 0x0",
         "       5:\tcall 0x83",
         "       6:\tr6 = r0",
+    ]
+    if null_to_failure:
+        lines += ["       7:\tif r6 == 0x0 goto +0x77",
+                  "       8:\t*(u64 *)(r10 - 0x18) = r8"]
+        first = 9
+    else:
+        lines += [
         "       7:\tif r6 != 0x0 goto +0x7",
         "       8:\t*(u32 *)(r10 - 0x4) = r7",
         "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
         "       9:\tcall 0x1",
-        "      10:\tif r0 == 0x0 goto +0x74",
+        "      10:\tif r0 == 0x0 goto +0x78",
         "      11:\tr1 = 0x1",
         "      12:\tlock *(u64 *)(r0 + 0x0) += r1",
         "      13:\tr1 = 0x0",
-        "      14:\tgoto +0x70",
-    ]
+        "      14:\tgoto +0x74",
+        ]
+        first = 15
     lines.extend(
-        f"{15 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
+        f"{first + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
         for index in range(115)
     )
-    lines.append("     127:\tcall 0x84")
+    end = first + 115
+    lines += [f"{end:8}:\tcall 0x84", f"{end + 1:8}:\tr0 = 0x0", f"{end + 2:8}:\texit"]
+    if null_to_failure:
+        lines += ["     127:\t*(u32 *)(r10 - 0x4) = r7",
+                  "\t\t00000000000003f8:  R_BPF_64_64\tCOUNTERS",
+                  "     128:\tcall 0x1", "     129:\tif r0 == 0x0 goto +0x3",
+                  "     130:\tr1 = 0x1", "     131:\tlock *(u64 *)(r0 + 0x0) += r1",
+                  "     132:\tr0 = 0x0", "     133:\texit"]
     if tail:
         lines.extend(tail.splitlines())
     return "\n".join(lines)
 
 
-def _initializer_disassembly(loader_tail=""):
+def _initializer_disassembly(loader_tail="", null_to_failure=False):
     return "\n".join(
         [
-            _initializer_block("fixture_emit_export"),
-            _initializer_block("fixture_emit_lifecycle"),
-            _initializer_block("dl_debug_state", loader_tail),
+            _initializer_block("fixture_emit_export", null_to_failure=null_to_failure),
+            _initializer_block("fixture_emit_lifecycle", null_to_failure=null_to_failure),
+            _initializer_block("dl_debug_state", loader_tail, null_to_failure),
         ]
     )
 
@@ -2213,16 +2246,22 @@ def _owned_disassembly(indexed_gap=None, metadata_spill=()):
             tail = ["call 0xae", "r7 = r0", "r1 = r7", "r1 &= 0x100", "r2 = r7", "r2 &= -0x200",
                     "r7 s>>= 0x9", "r1 = 0x4", "r7 = -0x8000000000000000 ll",
                     "if r0 == 0x2 goto +0x0", "if r0 == 0x2 goto +0x0", "r1 = 0x0 ll", "rel64:PAUSE_PIDS"]
-        # Reuse the initializer fixture, fixing its historical duplicate PC at submit.
-        block = _initializer_block(name).replace("     127:\tcall 0x84", "     130:\tcall 0x84")
+        # Keep the bounds fixture's existing submit clobber before its tail,
+        # while making every null-reservation path go to the final exit.
+        block = _initializer_block(name)
         body = []
         for line in block.splitlines()[1:]:
             if "R_BPF" in line:
                 kind, target = re.search(r"R_BPF_64_(32|64)\s+(\S+)", line).groups()
                 body.append(f"rel{kind}:{target}")
             elif (match := re.match(r"\s*\d+:\s+(.*)", line)):
-                body.append(match.group(1))
-        parts.append(assemble(name, body + tail + ["exit"], 7000 + index * 200))
+                text = match.group(1)
+                if text == "if r0 == 0x0 goto +0x78":
+                    text = "if r0 == 0x0 goto @exit"
+                elif text == "goto +0x74":
+                    text = "goto @exit"
+                body.append(text)
+        parts.append(assemble(name, body[:-2] + tail + ["label:exit", "r0 = 0x0", "exit"], 7000 + index * 200))
     return "\n".join(parts)
 
 
@@ -2536,6 +2575,27 @@ def _reject(action, label):
     raise AssertionError(f"mutation accepted: {label}")
 
 
+def _initializer_polarity_self_test():
+    for null_to_failure in (False, True):
+        good = _initializer_disassembly(null_to_failure=null_to_failure)
+        if len(initializer_regions(good)) != 3 or not reservation_loss_contract(good):
+            raise AssertionError(f"valid initializer polarity rejected: {null_to_failure}")
+        branch = "if r6 == 0x0 goto +0x77" if null_to_failure else "if r6 != 0x0 goto +0x7"
+        wrong = "if r6 == 0x0 goto +0x1" if null_to_failure else "if r6 != 0x0 goto +0x8"
+        escape_before = "     132:\tr0 = 0x0" if null_to_failure else "      14:\tgoto +0x74"
+        escape_after = "     132:\tgoto -0x7b" if null_to_failure else "      14:\tgoto +0x1"
+        cases = [
+            ("partial initialization", good.replace("*(u64 *)(r6 + 0x378) = r7", "r1 = r1", 1)),
+            ("wrong null/success target", good.replace(branch, wrong, 1)),
+            ("failure escape into partial initialization", good.replace(escape_before, escape_after, 1)),
+            ("wrong reservation size", good.replace("r2 = 0x398", "r2 = 0x390", 1)),
+            ("wrong reservation result", good.replace("r6 = r0", "r6 = r1", 1)),
+            ("target read before reservation", good.replace("       4:\tr3 = 0x0", "       4:\tcall 0x70", 1)),
+        ]
+        for label, bad in cases:
+            _reject(lambda bad=bad: initializer_regions(bad), f"{label}, polarity={null_to_failure}")
+
+
 def self_test():
     good = _source()
     source_contract(good)
@@ -2656,6 +2716,7 @@ interface_continuation_pack(count, 0, symbol_id)
         raise AssertionError("valid initializer disassembly fixture was rejected")
     if not reservation_loss_contract(initializer):
         raise AssertionError("valid reservation-loss disassembly fixture was rejected")
+    _initializer_polarity_self_test()
     initializer_mutations = [
         (
             "initializer success branch retarget",
@@ -2668,8 +2729,8 @@ interface_continuation_pack(count, 0, symbol_id)
         (
             "116 object stores",
             initializer.replace(
-                "     127:\tcall 0x84",
-                "     127:\t*(u64 *)(r6 + 0x398) = r7\n     128:\tcall 0x84",
+                "     130:\tcall 0x84",
+                "     130:\t*(u64 *)(r6 + 0x398) = r7\n     131:\tcall 0x84",
                 1,
             ),
         ),

@@ -54,6 +54,7 @@ mod counter_generation;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
+pub(crate) mod journal;
 mod multi_host;
 #[allow(dead_code)] // Collected carrier is staged before its coordinator activation.
 mod native_retirement;
@@ -5726,6 +5727,7 @@ enum SessionPreparation {
     PublishShapes,
     PublishAttributes,
     PublishObjects,
+    PublishJournalClasses,
     FreezePublished,
     SelectScope,
     LoadProgram(&'static str),
@@ -5741,6 +5743,7 @@ enum SessionPreparation {
 fn prepare_session_with(
     object_has_unsafe: bool,
     roots: StaticRoots,
+    journal: bool,
     mut operation: impl FnMut(SessionPreparation) -> Result<()>,
 ) -> Result<()> {
     use SessionPreparation::*;
@@ -5756,12 +5759,23 @@ fn prepare_session_with(
         PublishShapes,
         PublishAttributes,
         PublishObjects,
-        FreezePublished,
-        SelectScope,
     ] {
         operation(step)?;
     }
-    for name in expected_programs(object_has_unsafe) {
+    // The journal class array is RDONLY_PROG like DESCRIPTORS: userspace
+    // fill runs before the published freeze, and only for journal roots.
+    if journal {
+        operation(PublishJournalClasses)?;
+    }
+    for step in [FreezePublished, SelectScope] {
+        operation(step)?;
+    }
+    let loads = if journal {
+        journal::journal_expected_programs()
+    } else {
+        expected_programs(object_has_unsafe)
+    };
+    for name in loads {
         operation(LoadProgram(name))?;
     }
     operation(LoadImagePrograms)?;
@@ -5772,6 +5786,9 @@ fn prepare_session_with(
         if defers_freeze_until_loaded(name, &meta) && name != TAIL_POLICY_MAP {
             operation(FreezeDeferred(name))?;
         }
+    }
+    if journal {
+        operation(FreezeDeferred("JOURNAL_CLASSES"))?;
     }
     operation(PublishTailCalls)?;
     operation(PrepareEventsDomain)?;
@@ -6085,6 +6102,7 @@ impl Session {
             selection,
             None,
             None,
+            None,
             require_multi_capable_host(),
             || crate::uretprobe_hazard::admit(None, false),
         )
@@ -6116,6 +6134,7 @@ impl Session {
             selection,
             None,
             Some(counter),
+            None,
             require_multi_capable_host(),
             || crate::uretprobe_hazard::admit(None, false),
         )
@@ -6147,6 +6166,7 @@ impl Session {
             selection,
             None,
             counter,
+            None,
             require_multi_capable_host(),
             || match admission {
                 Some(admission) => Ok(admission),
@@ -6167,6 +6187,7 @@ impl Session {
         selection: BackendSelection,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
         host: MultiHostVerdict,
         admission: impl FnOnce() -> std::result::Result<
             crate::uretprobe_hazard::ReturnProbeAdmission,
@@ -6197,6 +6218,7 @@ impl Session {
             backend,
             selected,
             counter,
+            journal,
             &admission,
         ) {
             Ok(session) => Ok((session, fallback)),
@@ -6227,6 +6249,7 @@ impl Session {
                     AttachBackend::Singles,
                     selected,
                     counter,
+                    journal,
                     &admission,
                 )
                 .map(|session| (session, Some(reason)))
@@ -6334,6 +6357,7 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
         admission: &crate::uretprobe_hazard::ReturnProbeAdmission,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
@@ -6350,6 +6374,7 @@ impl Session {
             backend,
             selected,
             counter,
+            journal,
         )
         .map_err(|error| {
             if counter.is_some() {
@@ -6403,6 +6428,7 @@ impl Session {
             AttachBackend::Singles,
             None,
             None,
+            None,
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -6420,6 +6446,7 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
     ) -> Result<Self> {
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
             scope,
@@ -6430,6 +6457,7 @@ impl Session {
             backend,
             selected,
             counter,
+            journal,
         )?;
         session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
@@ -6482,9 +6510,10 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
         counter: Option<&counter_banks::CounterSpec>,
+        journal: Option<&journal::JournalSpec>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
-        match counter {
-            None => Self::prepare_inner_unlinked_with_object(
+        match (counter, journal) {
+            (None, None) => Self::prepare_inner_unlinked_with_object(
                 scope,
                 policy,
                 pause_key,
@@ -6493,8 +6522,9 @@ impl Session {
                 backend,
                 selected,
                 None,
+                None,
             ),
-            Some(spec) => {
+            (Some(spec), None) => {
                 let prepared = spec.prepare(backend)?;
                 Self::prepare_inner_unlinked_with_object(
                     scope,
@@ -6505,7 +6535,25 @@ impl Session {
                     backend,
                     selected,
                     Some(prepared),
+                    None,
                 )
+            }
+            (None, Some(spec)) => {
+                let prepared = spec.prepare()?;
+                Self::prepare_inner_unlinked_with_object(
+                    scope,
+                    policy,
+                    pause_key,
+                    ring_bytes,
+                    owned_child,
+                    backend,
+                    selected,
+                    None,
+                    Some(prepared),
+                )
+            }
+            (Some(_), Some(_)) => {
+                bail!("journal preparation refuses alongside counter preparation: select one")
             }
         }
     }
@@ -6523,19 +6571,24 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
         counter: Option<counter_banks::CounterPreparation<'_>>,
+        journal: Option<journal::JournalPreparation<'_>>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         // The bytes rule before anything loads or attaches: a stale or
         // mismatched embedded object refuses here with both values named.
         // Counter sessions check their own object's flavor, never the
-        // Detailed bytes.
-        let flavor = match policy.counter_mode() {
-            Some(mode) => {
+        // Detailed bytes, and journal sessions check the journal pair.
+        let flavor = match (policy.counter_mode(), journal.as_ref()) {
+            (Some(mode), None) => {
                 let prepared = counter
                     .as_ref()
                     .context("counter policy requires its preparation")?;
                 checked_counter_flavor(mode, prepared.object)?
             }
-            None => checked_embedded_flavor()?,
+            (None, None) => checked_embedded_flavor()?,
+            (None, Some(prepared)) => journal::checked_journal_flavor(prepared.object)?,
+            (Some(_), Some(_)) => {
+                bail!("journal preparation refuses alongside counter preparation: select one")
+            }
         };
         if policy.uses_unsafe_decoders() && !flavor.unsafe_present {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
@@ -6559,14 +6612,22 @@ impl Session {
         } else {
             StaticRoots::Detailed
         };
+        // Journal sessions reuse Detailed roots: the journal object retains
+        // every ordinary program and map, with the entry/return pair
+        // swapped. The flavor check above already refused a counter/journal
+        // combination, so at most one preparation selects here.
+        let object = match journal.as_ref() {
+            Some(prepared) => prepared.object,
+            None => counter
+                .as_ref()
+                .map_or(crate::EBPF_OBJECT, |prepared| prepared.object),
+        };
         let mut ebpf = load_capture_object_bytes_with_images(
             host.btf(),
             crate::run::resolve_ring_bytes(ring_bytes),
             discovery_ring_bytes(scope),
             policy.wants_instance_hooks(),
-            counter
-                .as_ref()
-                .map_or(crate::EBPF_OBJECT, |prepared| prepared.object),
+            object,
         )
         .context("loading BPF object with required task storage")?;
         let native_selection =
@@ -6582,17 +6643,27 @@ impl Session {
         let mut image_query = None;
         let mut prepared_instance = None;
         let mut prepared_owner_limit = None;
-        let preparation = prepare_session_with(object_has_unsafe, roots, |step| {
+        // The option served selection above; only the flag reaches preparation.
+        let journal = journal.is_some();
+        let preparation = prepare_session_with(object_has_unsafe, roots, journal, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
                         .context("validating exact policy-map metadata")?;
+                    if journal {
+                        journal::validate_journal_maps(&ebpf)
+                            .context("validating exact journal map metadata")?;
+                    }
                 }
                 SessionPreparation::ValidateRuntime => {
                     validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
                     image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
-                    instance::prepare_marker_control(&ebpf, roots)?;
+                    // The journal object always carries its marker control
+                    // map; the birth-marker feature verdict stays Detailed.
+                    if !journal {
+                        instance::prepare_marker_control(&ebpf, roots)?;
+                    }
                     selected_detailed::validate_maps(&ebpf)?;
                 }
                 SessionPreparation::ValidateStopGate => {
@@ -6604,7 +6675,9 @@ impl Session {
                     );
                 }
                 SessionPreparation::ValidatePrograms => {
-                    (if roots == StaticRoots::Detailed {
+                    (if journal {
+                        journal::validate_journal_inventory(&ebpf)
+                    } else if roots == StaticRoots::Detailed {
                         validate_program_inventory(&ebpf, object_has_unsafe)
                     } else {
                         validate_program_inventory_with_roots(&ebpf, object_has_unsafe, roots)
@@ -6660,6 +6733,25 @@ impl Session {
                 SessionPreparation::PublishObjects => {
                     publish_object_custody_maps(&mut ebpf)
                         .context("publishing OBJECT_DESCRIPTORS")?;
+                }
+                SessionPreparation::PublishJournalClasses => {
+                    let mut classes: Array<_, u32> = Array::try_from(
+                        ebpf.map_mut("JOURNAL_CLASSES")
+                            .context("JOURNAL_CLASSES map")?,
+                    )?;
+                    journal::publish_journal_classes(
+                        &mut classes,
+                        |classes, index, value| {
+                            classes.set(index, value, 0).map_err(anyhow::Error::from)
+                        },
+                        |classes| {
+                            classes
+                                .iter()
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(anyhow::Error::from)
+                        },
+                    )
+                    .context("publishing JOURNAL_CLASSES")?;
                 }
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
@@ -8864,6 +8956,7 @@ impl Session {
             AttachBackend::Singles,
             None,
             None,
+            None,
         )
     }
 
@@ -9996,6 +10089,7 @@ mod tests {
                     backend,
                     None,
                     None,
+                    None,
                     Ok(super::multi_host::MultiCapableHost::for_test()),
                     || Err(refusal),
                 )
@@ -10030,6 +10124,7 @@ mod tests {
                     None,
                     None,
                     selection,
+                    None,
                     None,
                     None,
                     Err(refusal),
@@ -12686,20 +12781,21 @@ mod tests {
             let image_loaded = std::cell::Cell::new(false);
             let deferred_frozen = std::cell::Cell::new(0);
             let activation_called = std::cell::Cell::new(false);
-            let preparation = prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
-                if step == SessionPreparation::LoadImagePrograms {
-                    assert_eq!(deferred_frozen.get(), 0);
-                    image_loaded.set(true);
-                }
-                if let SessionPreparation::FreezeDeferred(_) = step {
-                    anyhow::ensure!(
-                        image_loaded.get(),
-                        "native query/hooks must load before deferred policy freeze"
-                    );
-                    deferred_frozen.set(deferred_frozen.get() + 1);
-                }
-                Ok(())
-            });
+            let preparation =
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                    if step == SessionPreparation::LoadImagePrograms {
+                        assert_eq!(deferred_frozen.get(), 0);
+                        image_loaded.set(true);
+                    }
+                    if let SessionPreparation::FreezeDeferred(_) = step {
+                        anyhow::ensure!(
+                            image_loaded.get(),
+                            "native query/hooks must load before deferred policy freeze"
+                        );
+                        deferred_frozen.set(deferred_frozen.get() + 1);
+                    }
+                    Ok(())
+                });
             activate_after_preparation_with(preparation, || {
                 assert!(image_loaded.get());
                 assert_eq!(deferred_frozen.get(), 3);
@@ -12717,7 +12813,7 @@ mod tests {
             for fail_counter in [false, true] {
                 let mut seen = Vec::new();
                 let mut activated = false;
-                let preparation = prepare_session_with(false, roots, |step| {
+                let preparation = prepare_session_with(false, roots, false, |step| {
                     if step == SessionPreparation::LoadCounterPrograms {
                         anyhow::ensure!(
                             !seen.iter().any(|step| matches!(
@@ -12771,11 +12867,296 @@ mod tests {
         }
     }
 
+    fn expected_preparation_journal() -> Vec<SessionPreparation> {
+        use SessionPreparation::*;
+        let mut steps = vec![
+            ValidatePolicy,
+            ValidateRuntime,
+            ValidateStopGate,
+            ValidatePrograms,
+            PublishScope,
+            PrepareIdentity,
+            PublishDescriptors,
+            PublishAsync,
+            PublishShapes,
+            PublishAttributes,
+            PublishObjects,
+            PublishJournalClasses,
+            FreezePublished,
+            SelectScope,
+        ];
+        steps.extend(
+            super::journal::journal_expected_programs()
+                .into_iter()
+                .map(LoadProgram),
+        );
+        steps.extend([
+            LoadImagePrograms,
+            FreezeDeferred("CONFIG"),
+            FreezeDeferred("DESCRIPTORS"),
+            FreezeDeferred("OBJECT_DESCRIPTORS"),
+            FreezeDeferred("JOURNAL_CLASSES"),
+            PublishTailCalls,
+            PrepareEventsDomain,
+        ]);
+        steps
+    }
+
+    /// Journal roots add class publication immediately before the published
+    /// freeze, load the swapped pair, and freeze the class array after the
+    /// loads. The ordinary order is unchanged, and a class-fill failure
+    /// stops preparation with no activation.
+    #[test]
+    fn journal_preparation_orders_classes_before_freeze_and_pair_at_load() {
+        let mut ordinary = Vec::new();
+        prepare_session_with(false, StaticRoots::Detailed, false, |step| {
+            ordinary.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ordinary, expected_preparation(false));
+        let expected = expected_preparation_journal();
+        for unsafe_object in [false, true] {
+            let mut seen = Vec::new();
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, true, |step| {
+                seen.push(step);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, expected);
+        }
+        let classes = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::PublishJournalClasses)
+            .unwrap();
+        let freeze = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::FreezePublished)
+            .unwrap();
+        assert_eq!(classes + 1, freeze);
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|step| **step == SessionPreparation::PublishJournalClasses)
+                .count(),
+            1
+        );
+        let loads: Vec<_> = expected
+            .iter()
+            .filter_map(|step| match step {
+                SessionPreparation::LoadProgram(name) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        assert!(loads.contains(&"p11_entry_journal"));
+        assert!(loads.contains(&"p11_return_journal"));
+        assert!(!loads.contains(&"p11_entry"));
+        assert!(!loads.contains(&"p11_return"));
+        assert_eq!(
+            loads,
+            super::journal::journal_expected_programs()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        let last_load = expected
+            .iter()
+            .rposition(|step| matches!(step, SessionPreparation::LoadProgram(_)))
+            .unwrap();
+        let classes_freeze = expected
+            .iter()
+            .position(|step| *step == SessionPreparation::FreezeDeferred("JOURNAL_CLASSES"))
+            .unwrap();
+        assert!(last_load < classes_freeze);
+        assert!(
+            !expected
+                .iter()
+                .any(|step| *step == SessionPreparation::LoadCounterPrograms)
+        );
+        for fail_classes in [false, true] {
+            let mut seen = Vec::new();
+            let mut activated = false;
+            let preparation = prepare_session_with(false, StaticRoots::Detailed, true, |step| {
+                seen.push(step);
+                if fail_classes && step == SessionPreparation::PublishJournalClasses {
+                    anyhow::bail!("injected journal class fill failure");
+                }
+                Ok(())
+            });
+            let result = activate_after_preparation_with(preparation, || {
+                activated = true;
+                Ok(())
+            });
+            if fail_classes {
+                assert!(result.is_err());
+                assert!(!activated);
+                assert_eq!(
+                    seen.last(),
+                    Some(&SessionPreparation::PublishJournalClasses)
+                );
+            } else {
+                result.unwrap();
+                assert!(activated);
+                assert_eq!(seen, expected);
+            }
+        }
+    }
+
+    /// R-a: without a built production object the Session preparation
+    /// reports the finite unbuilt reason before any load or attach. The
+    /// journal-selected configuration instead resolves through the
+    /// flavor-acceptance twin; ordinary preparation is unchanged above.
+    #[test]
+    fn journal_unbuilt_reports_unlinked_through_session_preparation() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "journal-v1");
+            return;
+        }
+        let scope = Scope::System;
+        let error = Session::prepare_inner_unlinked(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(&journal::JournalSpec),
+        )
+        .err()
+        .expect("unbuilt journal preparation refuses");
+        assert!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "{error:#}"
+        );
+    }
+
+    /// R-b: corrupt journal object bytes refuse the Session before any
+    /// load, naming the journal flavor.
+    #[test]
+    fn journal_pair_load_error_refuses_session_before_any_load() {
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: b"not an ELF object",
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+        )
+        .err()
+        .expect("corrupt journal bytes refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot determine journal BPF object flavor"),
+            "{text}"
+        );
+    }
+
+    /// R-c: journal bytes without the pair refuse with both roots named.
+    /// Ordinary bytes are the durable partial-attach fixture: they parse
+    /// but carry neither journal root.
+    #[test]
+    fn journal_pair_missing_from_inventory_refuses_with_named_roots() {
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: crate::EBPF_OBJECT,
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+        )
+        .err()
+        .expect("pair-less journal bytes refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("missing journal roots"), "{text}");
+        assert!(text.contains("p11_entry_journal"), "{text}");
+        assert!(text.contains("p11_return_journal"), "{text}");
+    }
+
+    /// Counter and journal preparations are mutually exclusive: the
+    /// combination refuses before either preparation acquires resources.
+    #[test]
+    fn journal_and_counter_preparations_refuse_together() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use p11scope_ebpf_common::CounterMode;
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let zero = counter_banks::BankReservation {
+            retained_bytes: 0,
+            transient_bytes: 0,
+            metadata_bytes: 0,
+            file_descriptors: 0,
+        };
+        let counter = counter_banks::CounterSpec::new(CounterMode::Counts, zero, pool.reserver());
+        let scope = Scope::System;
+        let error = Session::prepare_inner_unlinked(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            Some(&counter),
+            Some(&journal::JournalSpec),
+        )
+        .err()
+        .expect("counter/journal combination refuses");
+        assert!(
+            format!("{error:#}")
+                .contains("journal preparation refuses alongside counter preparation"),
+            "{error:#}"
+        );
+    }
+
+    /// The counter/journal combination refuses inside the Session start
+    /// before any flavor parse: even corrupt journal bytes report the
+    /// combination, never a parse error.
+    #[test]
+    fn journal_and_counter_policy_refuse_before_any_flavor_parse() {
+        use p11scope_ebpf_common::CounterMode;
+        let scope = Scope::System;
+        let prepared = journal::JournalPreparation {
+            object: b"not an ELF object",
+        };
+        let error = Session::prepare_inner_unlinked_with_object(
+            &scope,
+            CapturePolicy::Counter(CounterMode::Counts),
+            None,
+            None,
+            None,
+            AttachBackend::Singles,
+            None,
+            None,
+            Some(prepared),
+        )
+        .err()
+        .expect("counter policy with journal bytes refuses");
+        assert!(
+            format!("{error:#}")
+                .contains("journal preparation refuses alongside counter preparation"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn preparation_contract_runs_every_phase_successfully() {
         for unsafe_object in [false, true] {
             let mut seen = Vec::new();
-            prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
                 seen.push(step);
                 Ok(())
             })
@@ -12792,7 +13173,7 @@ mod tests {
             let mut activation_calls = 0;
             let mut attach_calls = Vec::new();
             let preparation_result =
-                prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
                     preparation.push(step);
                     Ok(())
                 });
@@ -12842,7 +13223,7 @@ mod tests {
                 let mut activation_calls = 0;
                 let mut attach_calls = 0;
                 let preparation_result =
-                    prepare_session_with(unsafe_object, StaticRoots::Detailed, |step| {
+                    prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
                         seen.push(step);
                         if seen.len() == fail + 1 {
                             return Err(Injected(fail).into());
@@ -12884,7 +13265,7 @@ mod tests {
         for unsafe_object in [false, true] {
             let mut activation_calls = 0;
             let preparation =
-                prepare_session_with(unsafe_object, StaticRoots::Detailed, |_| Ok(()));
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |_| Ok(()));
             let result: Result<()> = activate_after_preparation_with(preparation, || {
                 activation_calls += 1;
                 Err(ActivationFailure.into())

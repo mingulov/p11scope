@@ -666,3 +666,18 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
     assert!(!flags.contains("--cfg=p11scope_birth_marker"));
     assert!(!flags.contains("image-bank-proof"));
 }
+
+#[test]
+fn journal_production_embedded_bytes_match_selection() {
+    if !journal_selected() {
+        assert_eq!(option_env!("P11SCOPE_JOURNAL_OUTPUTS"), Some(""));
+        assert!(
+            p11scope::EBPF_JOURNAL_OBJECT.is_empty(),
+            "unselected production journal embeds bytes"
+        );
+        return;
+    }
+    let file = fs::read(Path::new(env!("OUT_DIR")).join(JOURNAL_OUTPUT)).unwrap();
+    assert!(!p11scope::EBPF_JOURNAL_OBJECT.is_empty());
+    assert_eq!(p11scope::EBPF_JOURNAL_OBJECT, file.as_slice());
+}

@@ -2702,6 +2702,8 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// refused object join: 123958 B, measured with the unchanged lexer.
 /// Re-baselined for the shared birth-marker compile selector and forbidden
 /// counter/inventory combination: 124730 B, measured with that same lexer.
+/// Re-baselined for the appended private image-bank-proof module cfg;
+/// the lexer and existing ordinary-source line positions are unchanged.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -2711,8 +2713,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            124730,
-            "014e51a833f5d651a836a252c9bda9a940f14ebede3f01335aa944630a8e74c3"
+            124773,
+            "21d75a1af0b9542a3537a2fb1764d068b33c8d0a742ff74220da3754f72296cd"
         ),
         "stripped BPF dump must stay byte-identical"
     );

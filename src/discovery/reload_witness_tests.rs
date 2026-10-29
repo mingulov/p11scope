@@ -329,7 +329,8 @@ fn b17_foreign_churn_stays_joined_without_mint() {
     for global in 1u32..5 {
         let token = u64::from(global) + 1;
         assert_eq!(
-            r.observe_legacy(observation(2, u64::from(global), 0, load(BASE_A))).0,
+            r.observe_legacy(observation(2, u64::from(global), 0, load(BASE_A)))
+                .0,
             ObserveOutcome::Continued
         );
         assert_eq!(
@@ -383,7 +384,10 @@ fn b17_pending_call_resolving_through_tainted_counts() {
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    assert_eq!(r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))), Route::Pending);
+    assert_eq!(
+        r.route(call(2, stamp(2, 1, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
     let (outcome, resolved) = r.observe_legacy(observation(2, 1, 0, load(BASE_A)));
     assert_eq!(outcome, ObserveOutcome::Continued);
     assert_eq!(resolved, vec![(2, Route::Joined(old))]);

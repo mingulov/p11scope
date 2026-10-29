@@ -14,13 +14,20 @@
 //! only fresh entries charge, only true exits dispose. Re-park and
 //! put-back sites are marked so activation never double-charges them.
 //! - `Collected`: `Engine::pending_discovery_records` (`engine.rs:391`);
-//!   charge at fresh entry (Finish pull `:26466`, diverted-fresh rejoins
-//!   `:20153`, `:20229`), dispose at per-record dispatch drain (Finish
-//!   `:26668-26673`). Internal moves, never a new charge: re-parks
+//!   charge once per fresh record at its ingress boundary, before
+//!   retention/dispatch: Finish pull (`:26466`), diverted-fresh rejoins
+//!   (`:20153`, `:20229`), backlog fresh pull (`:26878-26893`), ordinary
+//!   fresh suffix (`:27099-27103`). Dispose at per-record dispatch drain
+//!   (Finish `:26668-26673`). Shared first parks hold mixed provenance:
+//!   counter-failure put-back (`:26916`), ordinary counter/barrier parks
+//!   (`:27108`, `:27121`) and later carries (`:27168`) may hold fresh
+//!   records (charge stays from ingress) or replays (never recharged).
+//!   The no-recharge rule below is conditioned on that ingress charge
+//!   having occurred. Internal moves, never a new charge: re-parks
 //!   (`:20002`, parked extends `:20152`, `:20162`, `:20172`, `:20187`),
-//!   take/put-backs (`:26683`, `:26899` with `:26916`/`:26965`/`:26971`/
-//!   `:26989`, `:27098` with `:27168`) and the deferred re-queue
-//!   (`:22404`).
+//!   take/put-backs (`:26683`, pending-prefix take `:26894-26899` with
+//!   `:26916`/`:26965`/`:26971`/`:26989`, pending take `:27098` with
+//!   `:27168`) and the deferred re-queue (`:22404`).
 //! - `Pending`: `Engine::pending_loader_arm_scans` (`engine.rs:620`, a
 //!   `BTreeSet`); charge only on new-key insert (`:17228-17231`),
 //!   dispose at serve (`:14905`, `:14920`, `:14923`, `:15522`),
@@ -137,8 +144,13 @@ impl LoaderAckDriver {
     }
 
     /// Collected: one loader record entered `pending_discovery_records`
-    /// fresh. Re-parks and take/put-backs keep the existing charge and
-    /// never call this again.
+    /// fresh (Finish pull, diverted-fresh rejoin, backlog fresh pull,
+    /// ordinary fresh suffix). Call once per fresh record at its ingress
+    /// boundary, before retention/dispatch. Re-parks and take/put-backs
+    /// keep the existing charge and never call this again; shared first
+    /// parks (`:26916`, `:27108`, `:27121`, `:27168`) hold mixed
+    /// provenance, so the no-recharge rule holds only where the ingress
+    /// charge above occurred.
     pub(crate) fn note_collected_record(
         &mut self,
         token: LoaderToken,

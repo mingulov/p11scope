@@ -51,6 +51,16 @@
 //! attributes (a local move), or that a scan observes as unmapped, never
 //! revives the old IDs.
 //!
+//! B17 named marker: a global-only continuation (only the per-file global
+//! epoch moved) taints the continued entry, counts the observation and
+//! every call joining through it (`continued_across_global`,
+//! `joined_across_global`), and yields the identity once through
+//! [`InstanceRouter::take_reload_not_excluded`] for the
+//! `instance_reload_not_excluded` disclosure. The keep is named, never
+//! silent. The marker discloses undecidability — a threaded self-reload
+//! *advances* `global` exactly like foreign churn — and proves neither a
+//! reload nor its absence.
+//!
 //! Privacy (proposed allowlist-v3): entry IPs and map ranges are private,
 //! generation-local routing inputs. Their `Debug` output is redacted, they
 //! have no `Serialize`/`Display`, and only [`InstanceId`]s and finite
@@ -490,7 +500,9 @@ pub(crate) enum ObserveOutcome {
     /// over the same merged mapping with the local epoch unchanged, no
     /// proven absence since, no latched absence overflow, and the
     /// storage_null counter unmoved since the key's last observation.
-    /// The same instances continue.
+    /// The same instances continue. The global-only case additionally
+    /// taints the continued entry (see the module marker docs); the
+    /// outcome itself is unchanged.
     Continued,
     /// A range appeared at unchanged epochs: sticky coverage fault.
     CoverageFault,
@@ -769,6 +781,8 @@ pub(crate) struct ObservationLoss {
 /// instance whose global-only continuation cannot exclude a same-address
 /// reload between the scans. Finite label only; never epochs, ranges or
 /// addresses.
+#[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
+// semantic-capture drain call + report publication; remove the allow with it.
 pub(crate) const RELOAD_NOT_EXCLUDED_LABEL: &str = "instance_reload_not_excluded";
 
 /// One identity newly qualified by a global-only continuation, drained by
@@ -776,6 +790,8 @@ pub(crate) const RELOAD_NOT_EXCLUDED_LABEL: &str = "instance_reload_not_excluded
 /// on its first tainted continuation — so the queue is bounded by the
 /// retained-history caps (each push names minted IDs, never re-pushed for
 /// the same IDs), never a side table.
+#[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
+// semantic-capture drain call + report publication; remove the allow with it.
 pub(crate) struct ReloadNotExcluded {
     pub(crate) image: ImageIdentity,
     pub(crate) file_slot: u32,
@@ -932,6 +948,8 @@ impl InstanceRouter {
 
     /// Drains the identities newly qualified since the last drain. Draining
     /// reports the qualification; it never clears the sticky entry taint.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
+    // semantic-capture drain call + report publication; remove the allow with it.
     pub(crate) fn take_reload_not_excluded(&mut self) -> Vec<ReloadNotExcluded> {
         std::mem::take(&mut self.reload_not_excluded)
     }
@@ -1399,12 +1417,17 @@ impl InstanceRouter {
                     .get(&key)
                     .and_then(|list| list.back())
                     .filter(|current| {
+                        // The triple is new against every retained entry
+                        // while local matches the back and fault matches
+                        // the era, so the back's global necessarily moved:
+                        // the comparison below names the arm global-only.
                         !broken
                             && !storage_moved_since(storage_snapshot, current.storage_seen)
                             && current.epochs.local == epochs.local
+                            && current.epochs.global != epochs.global
                             && same_mapping(&current.ranges, &observation.ranges)
                     })
-                    .map(|current| current.partitions.clone());
+                    .map(|current| (current.partitions.clone(), current.continued_across_global));
                 if continued.is_some() && self.absence_overflowed {
                     // The flag table dropped a proven absence earlier, so
                     // some key's break is missing: split (mint) instead of
@@ -1414,8 +1437,27 @@ impl InstanceRouter {
                     self.absence_overflowed = false;
                     continued = None;
                 }
-                if let Some(partitions) = continued {
+                if let Some((partitions, back_tainted)) = continued {
                     self.counters.continued += 1;
+                    self.counters.continued_across_global =
+                        self.counters.continued_across_global.saturating_add(1);
+                    if !back_tainted {
+                        // First tainted continuation of this identity: queue
+                        // it once for the disclosure drain. Later
+                        // continuations inherit the taint without re-queueing.
+                        let ids: Vec<InstanceId> =
+                            partitions.iter().filter_map(|(_, id)| *id).collect();
+                        if !ids.is_empty() {
+                            self.reload_not_excluded.push(ReloadNotExcluded {
+                                image: ImageIdentity {
+                                    task_cookie: image.cookie,
+                                    exec_id: image.exec,
+                                },
+                                file_slot: file,
+                                ids,
+                            });
+                        }
+                    }
                     self.ranges += observation.ranges.len();
                     let list = self.observed.entry(key).or_default();
                     list.push_back(Observed {
@@ -1423,7 +1465,7 @@ impl InstanceRouter {
                         ranges: observation.ranges,
                         partitions,
                         storage_seen: storage_snapshot,
-                        continued_across_global: false,
+                        continued_across_global: true,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1490,7 +1532,7 @@ impl InstanceRouter {
     /// Routes one completed call: joined, pending (a scan is needed), or a
     /// finite unknown reason.
     pub(crate) fn route(&mut self, facts: CallFacts) -> Route {
-        let route = self.decide(&facts, true);
+        let (route, tainted) = self.decide(&facts, true);
         match route {
             Route::Pending => {
                 if self.pending.len() >= self.limits.pending {
@@ -1501,6 +1543,10 @@ impl InstanceRouter {
             }
             Route::Joined(_) => {
                 self.counters.joined += 1;
+                if tainted {
+                    self.counters.joined_across_global =
+                        self.counters.joined_across_global.saturating_add(1);
+                }
                 route
             }
             Route::Unknown(reason) => self.unknown(reason),
@@ -1510,74 +1556,80 @@ impl InstanceRouter {
     /// Domain/identity and permanent authority failure precede call flags;
     /// clean equal stamps then require the current fault, a live full image,
     /// retained matching epochs and an executable range at the exact offset.
-    fn decide(&self, facts: &CallFacts, may_wait: bool) -> Route {
+    /// The flag reports whether the route joined through a B17-tainted
+    /// entry: true only for a `Joined` route whose stamp matched a
+    /// continued-across-global entry (a tainted match that fails the range
+    /// checks is an ordinary unknown, not a tainted join).
+    fn decide(&self, facts: &CallFacts, may_wait: bool) -> (Route, bool) {
         use UnknownReason as U;
         let entry = facts.entry;
         if facts.domain != self.domain {
-            return Route::Unknown(U::ForeignDomain);
+            return (Route::Unknown(U::ForeignDomain), false);
         }
         if RetirementLedger::index(facts.image.task_cookie).is_none() {
-            return Route::Unknown(U::InvalidImage);
+            return (Route::Unknown(U::InvalidImage), false);
         }
         if self.authority_failed {
-            return Route::Unknown(U::AuthorityExhausted);
+            return (Route::Unknown(U::AuthorityExhausted), false);
         }
         if self.image_failed {
-            return Route::Unknown(U::CoverageFault);
+            return (Route::Unknown(U::CoverageFault), false);
         }
         if self.sticky != 0 {
-            return Route::Unknown(U::Sticky);
+            return (Route::Unknown(U::Sticky), false);
         }
         if entry.flags & instance::STAMP_VALID == 0 || entry.flags & instance::STAMP_NO_TASK != 0 {
-            return Route::Unknown(U::Unstamped);
+            return (Route::Unknown(U::Unstamped), false);
         }
         if entry.flags & instance::STAMP_NO_FILE != 0
             || entry.file_slot_plus1 == 0
             || u32::from(entry.file_slot_plus1) > instance::FILE_SLOTS
         {
-            return Route::Unknown(U::NoFile);
+            return (Route::Unknown(U::NoFile), false);
         }
         if entry.flags & instance::STAMP_SHARED_MM != 0 {
-            return Route::Unknown(U::SharedMm);
+            return (Route::Unknown(U::SharedMm), false);
         }
         if entry.flags & instance::STAMP_OVERFLOW != 0 {
-            return Route::Unknown(U::Overflow);
+            return (Route::Unknown(U::Overflow), false);
         }
         if entry.flags & instance::STAMP_LOCAL_FAULT != 0 {
-            return Route::Unknown(U::LocalFault);
+            return (Route::Unknown(U::LocalFault), false);
         }
         if !instance::stamp_joinable(entry, facts.ret) {
-            return Route::Unknown(U::Straddle);
+            return (Route::Unknown(U::Straddle), false);
         }
         // The miss latch is consulted here, not plumbed per call: stamps
         // carry no miss count, so a miss increase between the call's entry
         // and its routing can only surface as a latched era at audit time.
         if entry.fault != self.fault as u32 || self.miss_latched {
-            return Route::Unknown(U::FaultEra);
+            return (Route::Unknown(U::FaultEra), false);
         }
         let image = ImageKey::from(facts.image);
         if self.image_retired(image) {
-            return Route::Unknown(U::Retired);
+            return (Route::Unknown(U::Retired), false);
         }
         let file = u32::from(entry.file_slot_plus1) - 1;
         let key = (image, file);
         if self.faulted.contains(&key) {
-            return Route::Unknown(U::CoverageFault);
+            return (Route::Unknown(U::CoverageFault), false);
         }
         if self.faulted_overflowed && !self.observed.contains_key(&key) {
             // P2-1: the overflow latch refuses unknown keys at route time
             // too, so an evicted tombstone can never re-join.
-            return Route::Unknown(U::CoverageFault);
+            return (Route::Unknown(U::CoverageFault), false);
         }
         let Some(list) = self.observed.get(&key) else {
             return if may_wait {
-                Route::Pending
+                (Route::Pending, false)
             } else {
-                Route::Unknown(U::Unobserved)
+                (Route::Unknown(U::Unobserved), false)
             };
         };
         if let Some(observed) = list.iter().find(|o| o.epochs.matches(&entry)) {
-            return route_ip(observed, facts);
+            let route = route_ip(observed, facts);
+            let tainted = observed.continued_across_global && matches!(route, Route::Joined(_));
+            return (route, tainted);
         }
         let newest = list.back().expect("retained lists are never empty");
         let oldest = list.front().expect("retained lists are never empty");
@@ -1585,14 +1637,14 @@ impl InstanceRouter {
             // Older than the newest observation and not retained: either it
             // was evicted, or it was never stable while current.
             if oldest.epochs.supersedes(&entry) && list.len() == KEYS_PER_PROCESS_FILE {
-                return Route::Unknown(U::Evicted);
+                return (Route::Unknown(U::Evicted), false);
             }
-            return Route::Unknown(U::Unobserved);
+            return (Route::Unknown(U::Unobserved), false);
         }
         if may_wait {
-            Route::Pending
+            (Route::Pending, false)
         } else {
-            Route::Unknown(U::Unobserved)
+            (Route::Unknown(U::Unobserved), false)
         }
     }
 
@@ -1606,12 +1658,16 @@ impl InstanceRouter {
                 continue;
             }
             match self.decide(&call.facts, true) {
-                Route::Pending => kept.push_back(call),
-                Route::Joined(id) => {
+                (Route::Pending, _) => kept.push_back(call),
+                (Route::Joined(id), tainted) => {
                     self.counters.joined += 1;
+                    if tainted {
+                        self.counters.joined_across_global =
+                            self.counters.joined_across_global.saturating_add(1);
+                    }
                     resolved.push((call.facts.token, Route::Joined(id)));
                 }
-                Route::Unknown(reason) => {
+                (Route::Unknown(reason), _) => {
                     self.note_unknown_n(reason, 1);
                     resolved.push((call.facts.token, Route::Unknown(reason)));
                 }

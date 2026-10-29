@@ -118,7 +118,9 @@ long p11_owner_start_remove_reason(const struct owner_start_key *key, u32 requir
 #if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
 /* T-L2 loader retirement: START removal plus the owned gate disposition
  * report (see task_owner.c). Host harnesses define P11SCOPE_LOADER_GATE;
- * no production build does, so production objects are unchanged. */
+ * no production build does, so production builds carry no code, map or
+ * symbol changes from this extend -- only DWARF line info shifts where
+ * the guarded source lines sit. */
 long p11_owner_start_remove_loader(const struct owner_start_key *key, u32 required, u32 reason,
                                    u64 loader_cookie);
 #endif

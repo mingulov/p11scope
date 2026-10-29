@@ -113,8 +113,9 @@ static __always_inline u32 p11_loader_gate_disposition_for_reason(u32 reason)
 }
 
 /* Arm one slot for a nonzero 32-bit generation. 0 armed, -1 strict
- * refusal (counted), -2 pre-cutover refusal (untracked). A row that is
- * not EMPTY never re-admits. */
+ * refusal (counted), -2 pre-cutover refusal (untracked). Sequentially, a
+ * row that is not EMPTY never re-admits; concurrent same-slot admits are
+ * a caller protocol fault (single-owner proof obligation, loader_gate.c). */
 long p11_loader_gate_admit(u32 slot, u64 generation);
 /* Resolve a token cookie to its slot. Negative on every refusal. */
 long p11_loader_gate_lookup(u64 cookie);

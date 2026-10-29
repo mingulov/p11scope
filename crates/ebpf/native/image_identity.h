@@ -58,8 +58,9 @@ u32 p11_link_task_identity(struct task_struct *task, struct image_identity *out)
 u64 p11_link_current_cookie(void);
 #ifdef P11SCOPE_LOADER_GATE
 /* T-L2 ticket-query extends (see image_identity.c). Host harnesses define
- * P11SCOPE_LOADER_GATE; no production build does, so production objects
- * are unchanged. */
+ * P11SCOPE_LOADER_GATE; no production build does, so production builds
+ * carry no code, map or symbol changes from this extend -- only DWARF
+ * line info shifts where the guarded source lines sit. */
 u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out);
 u32 p11_image_identity_issued(u64 *watermark_out);
 #endif

@@ -1,10 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* T-L2c token-keyed loader gate (see loader_gate.h). Single-writer
- * discipline per row: only the attach path admits a slot, only the owning
+/* T-L2c token-keyed loader gate (see loader_gate.h). Single-owner by
+ * construction: only the attach path admits a slot, only the owning
  * producer reports its end, and only the T-L3 acknowledgement (not this
- * packet) empties a retired row. Concurrent admissions of distinct slots
- * touch disjoint rows; a double admission of one slot is a protocol fault
- * the second caller observes as a refusal. */
+ * packet) empties a retired row. Same-slot admit/retire transitions are
+ * NOT atomic -- they are check-then-write sequences, so two concurrent
+ * same-slot admits (or two concurrent retires) can both succeed. A
+ * sequential double admission refuses, but that refusal is not a
+ * concurrency primitive and must never be read as one. Concurrent
+ * admissions of distinct slots touch disjoint rows and are safe.
+ * Activation proof obligation (no production callers exist yet): the
+ * activation call sites must prove at most one in-flight admit per slot
+ * and at most one end-report per admitted row -- slot allocation
+ * serialized through the registries, exactly one owning producer per
+ * admitted row. Until that proof lands, concurrent same-slot use is a
+ * caller protocol fault with an undefined gate outcome. */
 #include "loader_gate.h"
 
 /* Exact under contention: a non-fetch atomic add never loses an increment.
@@ -74,8 +83,10 @@ __attribute__((noinline)) long p11_loader_gate_admit(u32 slot, u64 generation)
         return gate_refuse(ctl);
     key = slot;
     row = loader_gate_map_lookup(&LOADER_GATE, &key);
-    /* Only EMPTY admits: ARMED double-admits and RETIRED re-admits both
-     * refuse, so no identity recycles before acknowledgement. */
+    /* Only EMPTY admits: sequential ARMED double-admits and RETIRED
+     * re-admits refuse, so no identity recycles before acknowledgement.
+     * Callers must still serialize same-slot admits (see above): this
+     * check-then-write is not atomic under concurrency. */
     if (!row || row->state != LOADER_GATE_EMPTY)
         return gate_refuse(ctl);
     row->generation = generation;

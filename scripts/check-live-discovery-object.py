@@ -1359,7 +1359,7 @@ def _tail_trusted_facts(lines, calls, blocks):
                     if isinstance(key, int) and key < address + size and address < key + 8:
                         state.pop(key)
             else:
-                preserves_stack = (target is None
+                preserves_stack = (pc not in targets
                                    and text in ("call 0x1", "call 0x3", "call 0xe", "call 0xae"))
                 if not preserves_stack:
                     for key in list(state):
@@ -1750,7 +1750,37 @@ def cookie_object_contract(disassembly):
             checked = cookie if domain == 2 else ("cookie_mask", cookie[1], 0xffffff)
             if not state.get(("nonzero", checked)):
                 return False
+    proofs = _outlined_wrapper_proofs(disassembly)
+    routes = (("insert_export_state", "insert", "insert", 1),
+              ("take_export_state", "get", "take_export", 1),
+              ("take_export_state", "remove", "take_export", 1),
+              ("take_selection_state", "get", "take_selection", 2),
+              ("take_selection_state", "remove", "take_selection", 2))
+    for suffix, operation, kind, domain in routes:
+        matches = [name for name in blocks if name.endswith(suffix)]
+        if not matches:
+            continue
+        if len(matches) != 1 or proofs[kind] is None:
+            return False
+        facts = call_argument_facts(blocks[matches[0]])
+        for _, pc in discovery_call_sites(disassembly, matches[0], operation):
+            if not _wrapper_key_site_contract(facts, pc, domain):
+                return False
     return True
+
+
+def _wrapper_key_site_contract(facts, pc, expected_domain):
+    state = facts.get(pc, {})
+    key = state.get("r1")
+    if not key or key[0] != "stack":
+        return False
+    if state.get(key[1] + 16) != ("constant", expected_domain):
+        return False
+    cookie = state.get(key[1] + 8)
+    if not cookie or cookie[0] != "cookie":
+        return False
+    checked = cookie if expected_domain == 2 else ("cookie_mask", cookie[1], 0xffffff)
+    return bool(state.get(("nonzero", checked)))
 
 
 def finite_counter_key(lines, relocation):
@@ -1953,6 +1983,23 @@ def _reaching_defs(insns, graph, pc, reg):
     )
 
 
+def _resolved_callee_closure(calls, root):
+    """All functions reachable from root, or None if any edge is unresolved."""
+    edges = {}
+    for caller, _, _, target in calls:
+        edges.setdefault(caller, []).append(target)
+    seen = set()
+    stack = [root]
+    while stack:
+        for target in edges.get(stack.pop(), []):
+            if target is None:
+                return None
+            if target not in seen:
+                seen.add(target)
+                stack.append(target)
+    return seen
+
+
 def _prove_outlined_insert(disassembly, calls, wrapper):
     blocks = function_blocks(disassembly)
     lines = blocks[wrapper]
@@ -1992,10 +2039,22 @@ def _prove_outlined_insert(disassembly, calls, wrapper):
     sites = [pc for _, pc, _ in map_call_sites(lines, "COUNTERS", helper=1)]
     if len(sites) != 1 or not counter_writeback_contract(lines, sites[0]):
         return None
-    callees = [target for caller, _, _, target in calls if caller == wrapper]
-    if any(target is None for target in callees):
+    atomics = [pc for pc, text in insns
+               if "lock " in text or "atomic" in text
+               or "cmpxchg" in text or "xchg" in text]
+    if len(atomics) != 1:
         return None
-    if any(target == wrapper or target in _OUTLINED_PROGRAM_ROOTS for target in callees):
+    direct = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in direct):
+        return None
+    allowed = {"p11_owner_discovery_insert"}
+    scope_auths = [name for name in blocks if name.endswith("scope_auth")]
+    if len(scope_auths) == 1:
+        allowed.add(scope_auths[0])
+    if any(target not in allowed for target in direct):
+        return None
+    closure = _resolved_callee_closure(calls, wrapper)
+    if closure is None or (closure & (_OUTLINED_PROGRAM_ROOTS | {wrapper})):
         return None
     return frozenset(caller for caller, _ in incoming)
 
@@ -2130,17 +2189,19 @@ def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
                 if proven[1] + rel < -512 or proven[1] + rel + size > 0:
                     return None
                 continue
-            rel = output_offset(pc, base, rel)
-            if rel is None:
+            off = output_offset(pc, base, rel)
+            if off is None:
                 return None
-        if rel < 0 or rel + size > _OUTLINED_TAKE_OUTPUT:
+        else:
+            off = rel
+        if off < 0 or off + size > _OUTLINED_TAKE_OUTPUT:
             return None
-        if rel == 0 and size == 8:
+        if off == 0 and size == 8:
             disc_stores.append((pc, src))
         else:
             if pc in reachable(graph, [entry], {remove_pc}):
                 return None
-            payload_stores.append((pc, src))
+            payload_stores.append((pc, src, off))
     for pc, src in disc_stores:
         if not re.fullmatch(r"r\d+", src):
             return None
@@ -2148,6 +2209,10 @@ def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
         if not defs or any(texts[d] not in (f"{src} = 0x0", f"{src} = 0x1")
                            for d in defs):
             return None
+    if not disc_stores:
+        return None
+    if sorted(off for _, _, off in payload_stores) != [8, 16, 24, 32, 40, 48]:
+        return None
     between = nodes_on_paths(graph, get_pc, remove_pc)
     snapshot = []
     for pc, text in insns:
@@ -2244,7 +2309,7 @@ def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
             if loads_from_proven(src, pc):
                 proven_addrs.add(addr)
                 changed = True
-    for pc, src in payload_stores:
+    for pc, src, _ in payload_stores:
         if not re.fullmatch(r"r\d+", src) or not loads_from_proven(src, pc):
             return None
     relocs = [index for index, line in enumerate(lines)
@@ -2256,10 +2321,19 @@ def _prove_outlined_take(disassembly, calls, wrapper, expected_roots):
         return None
     if sites[0] in reachable(graph, [entry], {remove_pc}):
         return None
-    callees = [target for caller, _, _, target in calls if caller == wrapper]
-    if any(target is None for target in callees):
+    atomics = [pc for pc, text in insns
+               if "lock " in text or "atomic" in text
+               or "cmpxchg" in text or "xchg" in text]
+    if len(atomics) != 1:
         return None
-    if any(target == wrapper or target in _OUTLINED_PROGRAM_ROOTS for target in callees):
+    direct = [target for caller, _, _, target in calls if caller == wrapper]
+    if any(target is None for target in direct):
+        return None
+    allowed = {"p11_owner_discovery_get", "p11_owner_discovery_remove"}
+    if any(target not in allowed for target in direct):
+        return None
+    closure = _resolved_callee_closure(calls, wrapper)
+    if closure is None or (closure & (_OUTLINED_PROGRAM_ROOTS | {wrapper})):
         return None
     return frozenset(caller for caller, _ in incoming)
 
@@ -2317,7 +2391,9 @@ def producer_object_contract(disassembly):
         direct = (discovery_arguments(disassembly, name, "insert", 1)
                   and discovery_call_sites(disassembly, name, "remove")
                   and map_call_sites(lines, "COUNTERS", helper=1))
-        if not direct and name not in insert_callers:
+        outlined = (name in insert_callers
+                    and discovery_call_sites(disassembly, name, "remove"))
+        if not direct and not outlined:
             return False
     for name in return_names:
         lines = blocks.get(name, [])
@@ -2328,10 +2404,11 @@ def producer_object_contract(disassembly):
                   and map_call_sites(lines, "COUNTERS", helper=1))
         if direct:
             continue
+        outlined = discovery_call_sites(disassembly, name, "remove")
         if name in ("function_list_return", "interface_list_return") \
-                and name in take_export_callers:
+                and name in take_export_callers and outlined:
             continue
-        if name == "interface_return" and name in take_selection_callers:
+        if name == "interface_return" and name in take_selection_callers and outlined:
             continue
         return False
 
@@ -3164,9 +3241,12 @@ def _outlined_disassembly():
                    "*(u64 *)(r6 + 0x0) = r1",
                    "exit"])
 
-    insert_body = (["r6 = r2", "r7 = 0x1", "r1 = r10", "r1 += -0x28",
-                    "*(u64 *)(r1 + 0x0) = r7",
+    insert_body = (["r6 = r2", "call 0xae", "r7 = r0", "r1 = r7",
+                    "r1 &= 0xffffff", "if r1 == 0x0 goto @exit", "call 0xe",
+                    "r1 = r10", "r1 += -0x28",
+                    "*(u64 *)(r1 + 0x0) = r0",
                     "*(u64 *)(r1 + 0x8) = r7",
+                    "r7 = 0x1",
                     "*(u64 *)(r1 + 0x10) = r7",
                     "r2 = r6", "r3 = 0x1"]
                    + call(INSERT_NATIVE_AT)
@@ -3353,7 +3433,7 @@ def _outlined_wrapper_self_test():
                 "*(u64 *)(r1 + 0x0) = r3", "lock *(u64 *)(r1 + 0x0) += r9")),
         ("lock key-slot store",
          mutate("fixture_insert_export_state",
-                "*(u64 *)(r1 + 0x0) = r7", "lock *(u64 *)(r1 + 0x0) += r7")),
+                "*(u64 *)(r1 + 0x0) = r0", "lock *(u64 *)(r1 + 0x0) += r0")),
         ("deleted payload word",
          mutate("fixture_take_export_state",
                 "*(u64 *)(r1 + 0x28) = r3", "r3 = r3")),

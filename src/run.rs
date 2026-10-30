@@ -12478,6 +12478,7 @@ mod tests {
                 scope: ScopeArg::Pid(pid),
                 metrics: false,
                 counter_mode: None,
+                track_short_lived: false,
                 duration: None,
                 out: None,
                 max_events: None,

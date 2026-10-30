@@ -3876,10 +3876,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // TEMPORARY (I-12 port re-application): help pin recomputed at the
-        // end of the stack for prearm + extensive insertions combined.
-        assert_eq!(USAGE.len(), 7804);
-        assert_eq!(hash, 0x48e22805a6f37227);
+        // 8267 / 0x8b8a01b0f89d22de (I-12 614b port re-application over
+        // I-10/I-11): USAGE diff vs the 7804/0x48e2 pin is exactly the
+        // `--track-short-lived` synopsis insertions (2 sites) + the
+        // 5-line extensive-mode flag paragraph; no other drift. Pair
+        // measured by this test (old pair reproduced as `right` by the
+        // same extractor before the update).
+        assert_eq!(USAGE.len(), 8267);
+        assert_eq!(hash, 0x8b8a01b0f89d22de);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

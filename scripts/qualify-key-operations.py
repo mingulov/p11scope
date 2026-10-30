@@ -55,6 +55,7 @@ MAX_OBSERVER_BYTES = 8 * 1024 * 1024
 MAX_WORD = (1 << 64) - 1
 INVENTORY_SCHEMA = "p11scope/inventory/v1"
 OBSERVATIONS_VERSION = 1
+OBSERVATIONS_VERSION_V2 = 2
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -69,6 +70,9 @@ SESSION_ORIGINS = ("opened", "first_observed")
 SESSION_STATUSES = ("live", "closed", "lost")
 OBJECT_ORIGINS = ("created", "first_observed")
 CREATIONS = ("create", "copy", "generate", "generate_pair", "derive", "unwrap")
+# H9 section v2 additions (packet 6.07c): v1 tables stay frozen; v2
+# sections dispatch to the extended tables below.
+CREATIONS_V2 = CREATIONS + ("encapsulate", "decapsulate")
 LIFETIMES = ("live", "destroyed", "access_ended", "retired")
 ATTRIBUTIONS = ("valid", "downgraded")
 METADATA_KEYS = ("class", "key_type", "token", "value_len", "modulus_bits", "ec_params")
@@ -91,6 +95,7 @@ CATEGORIES = ("digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "derive", "encapsulate", "decapsulate", "wrap_authenticated",
               "unwrap_authenticated", "operation", "direct", "unknown")
 ROLES = ("key", "wrapping_key", "wrapped_object", "unwrapping_key", "base_key", "other")
+ROLES_V2 = ROLES[:5] + ("encapsulation_key", "decapsulation_key", "other")
 UNITS = ("operations", "message_contexts")
 UNKNOWN_REASONS = ("unbound", "key_join_lost", "metadata_unknown", "metadata_conflicting",
                    "role_unavailable", "not_applicable")
@@ -298,7 +303,7 @@ def _check_sessions(rows):
     return ids
 
 
-def _check_objects(rows, sessions):
+def _check_objects(rows, sessions, creations):
     _require(type(rows) is list, "unexpected fields")
     ids = set()
     for row in rows:
@@ -306,7 +311,7 @@ def _check_objects(rows, sessions):
         _require(_u64(row["object"]) and _u64(row["session"]), "invalid object row")
         _label(row["origin"], OBJECT_ORIGINS, "object origin")
         if row["creation"] is not None:
-            _label(row["creation"], CREATIONS, "object creation")
+            _label(row["creation"], creations, "object creation")
         birth = row["birth"]
         if birth is not None:
             _keys(birth, {"start_ns", "end_ns"})
@@ -336,14 +341,14 @@ def _check_objects(rows, sessions):
     return ids
 
 
-def _check_key_row(row, objects):
+def _check_key_row(row, objects, roles):
     _keys(row, KEY_ROW_KEYS)
     _require(type(row["instance"]) is str and INSTANCE_RE.fullmatch(row["instance"]) is not None,
              "unexpected instance label")
     _require(_u64(row["object"]), "invalid key row")
     _require(row["object"] in objects, f"key row references unknown object {row['object']}")
     category = _label(row["category"], CATEGORIES, "operation category")
-    role = _label(row["role"], ROLES, "operation role")
+    role = _label(row["role"], roles, "operation role")
     metadata = _label(row["metadata_at_use"], METADATA_LABELS, "operation metadata")
     unit = _label(row["unit"], UNITS, "operation unit")
     counters = {name: row[name] for name in
@@ -419,20 +424,23 @@ def _check_budgets(budgets, key_len, object_len, unknown_len):
 def check_section(section):
     """Validate the section shape and return the checked facts."""
     _keys(section, SECTION_KEYS)
-    _require(section["version"] == OBSERVATIONS_VERSION
-             and type(section["version"]) is int,
+    version = section["version"]
+    _require(type(version) is int
+             and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2),
              "unsupported observations version")
+    roles = ROLES_V2 if version == OBSERVATIONS_VERSION_V2 else ROLES
+    creations = CREATIONS_V2 if version == OBSERVATIONS_VERSION_V2 else CREATIONS
     _require(_u64(section["revision"]), "invalid observations revision")
     status = _label(section["status"], STATUSES, "status")
     reason = _label(section["reason"], REASONS, "reason")
     _require((reason == "none") == (status == "populated"), "status and reason disagree")
     sessions = _check_sessions(section["sessions"])
-    objects = _check_objects(section["objects"], sessions)
+    objects = _check_objects(section["objects"], sessions, creations)
     tallies = {}
     order = []
     _require(type(section["key_operations"]) is list, "unexpected fields")
     for row in section["key_operations"]:
-        category, counters = _check_key_row(row, objects)
+        category, counters = _check_key_row(row, objects, roles)
         key = (row["instance"], row["object"], category, row["role"], row["metadata_at_use"])
         _require(key not in tallies, "duplicate key row")
         tallies[key] = (category, counters)

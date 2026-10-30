@@ -67,6 +67,12 @@ CATEGORIES = {"digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "operation", "direct", "unknown"}
 ROLES = {"key", "wrapping_key", "wrapped_object", "unwrapping_key", "base_key",
          "other"}
+# H9 section v2 additions (packet 6.07c): v1 tables stay frozen;
+# versioned snapshots dispatch to the extended set below. Ledger
+# feeds (unversioned claims) accept the union; the snapshot's own
+# version still governs its rows.
+ROLES_V2 = ROLES | {"encapsulation_key", "decapsulation_key"}
+SNAPSHOT_VERSIONS = (1, 2)
 LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
           "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521"}
 UNITS = {"operations", "message_contexts"}
@@ -225,7 +231,7 @@ def validate_ledger(rows, tag):
              f"{tag}: feed instance invalid")
     _require(_integer(feed["object"]), f"{tag}: feed object out of range")
     _require(feed["category"] in CATEGORIES, f"{tag}: feed category invalid")
-    _require(feed["role"] in ROLES, f"{tag}: feed role invalid")
+    _require(feed["role"] in ROLES_V2, f"{tag}: feed role invalid")
     _require(feed["metadata"] is None or feed["metadata"] in LABELS,
              f"{tag}: feed metadata invalid")
     _require(type(feed["scope"]) is str and SCOPE_PATTERN.match(feed["scope"]),
@@ -312,7 +318,7 @@ def _check_counters(row, names, where):
         _require(_integer(row[name]), f"{where}: {name} out of range")
 
 
-def _check_key_row(row, where):
+def _check_key_row(row, where, roles=ROLES):
     _require(type(row) is dict, f"{where}: key row must be an object")
     _keys(row, {"instance", "object", "category", "role", "metadata_at_use",
                 "unit"} | set(KEY_COUNTERS))
@@ -321,7 +327,7 @@ def _check_key_row(row, where):
              f"{where}: key row instance invalid")
     _require(_integer(row["object"]), f"{where}: key row object out of range")
     _require(row["category"] in CATEGORIES, f"{where}: key row category invalid")
-    _require(row["role"] in ROLES, f"{where}: key row role invalid")
+    _require(row["role"] in roles, f"{where}: key row role invalid")
     _require(row["metadata_at_use"] in LABELS,
              f"{where}: key row metadata_at_use invalid")
     _require(row["unit"] in UNITS, f"{where}: key row unit invalid")
@@ -382,12 +388,20 @@ def _check_row_budget(node, where):
     _require(_integer(node["refused"]), f"{where}: budget refused out of range")
 
 
+def _snapshot_roles(document):
+    """Role vocabulary governed by the snapshot's section version."""
+    version = document["version"]
+    _require(type(version) is int and version in SNAPSHOT_VERSIONS,
+             "snapshot version mismatch")
+    return ROLES_V2 if version == 2 else ROLES
+
+
 def validate_snapshot(document):
     """Validate the frozen H9 subset; refuse anything but populated output."""
     _keys(document, {"version", "revision", "status", "reason", "sessions",
                      "objects", "key_operations", "unknown_key_operations",
                      "gaps", "budgets"})
-    _require(document["version"] == 1, "snapshot version mismatch")
+    roles = _snapshot_roles(document)
     _require(_integer(document["revision"]), "snapshot revision out of range")
     _require(document["status"] in STATUSES, "snapshot status invalid")
     _require(document["reason"] in STATUS_REASONS, "snapshot reason invalid")
@@ -416,7 +430,7 @@ def validate_snapshot(document):
     _check_sorted_unique(object_ids, "snapshot objects")
     _require(type(document["key_operations"]) is list,
              "snapshot key_operations must be a list")
-    known_keys = [_check_key_row(row, f"snapshot key row {position}")
+    known_keys = [_check_key_row(row, f"snapshot key row {position}", roles)
                   for position, row in enumerate(document["key_operations"])]
     _check_sorted_unique(known_keys, "snapshot key rows")
     _require(type(document["unknown_key_operations"]) is list,
@@ -492,8 +506,9 @@ def compare_pair(first, second, snapshot):
                  f" use objects {first['object']},{second['object']}"
                  f" in scope {first['scope']}")
     known = {}
+    roles = _snapshot_roles(snapshot)
     for row in snapshot["key_operations"]:
-        known[(_check_key_row(row, "snapshot key row"))] = row
+        known[(_check_key_row(row, "snapshot key row", roles))] = row
     unknown = {}
     for row in snapshot["unknown_key_operations"]:
         unknown[(_check_unknown_row(row, "snapshot unknown row"))] = row
@@ -594,6 +609,7 @@ def compare_stream(events, feeds, snapshot):
     last_seq = None
     last_revision = None
     series = {}
+    roles = _snapshot_roles(snapshot)
     for position, line in enumerate(events):
         where = f"stream line {position}"
         _require(type(line) is dict, f"{where} must be an object")
@@ -619,7 +635,7 @@ def compare_stream(events, feeds, snapshot):
             _require(event["bucket"] in ("known", "unknown"),
                      f"{where}: bucket invalid")
             if event["bucket"] == "known":
-                key = ("known", _check_key_row(event["row"], where))
+                key = ("known", _check_key_row(event["row"], where, roles))
             else:
                 key = ("unknown", _check_unknown_row(event["row"], where))
             series.setdefault(key, []).append(

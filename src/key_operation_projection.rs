@@ -27,6 +27,10 @@ pub(crate) const KEY_OP_ROW_CAPACITY: usize = 65_536;
 
 /// Frozen section version. Consumers reject unknown versions.
 pub(crate) const OBSERVATIONS_VERSION: u8 = 1;
+/// H9 section version 2: v1 plus the KEM role/creation labels. The
+/// renderer emits v2 only when KEM content is present; v1 output is
+/// byte-stable.
+pub(crate) const OBSERVATIONS_VERSION_V2: u8 = 2;
 
 /// Frozen machine reasons. `none` only when populated.
 /// `journal_unavailable` (OD33/R-50) names the v0.5.0 world: no journal
@@ -98,6 +102,18 @@ pub(crate) mod contract {
         "generate_pair",
         "derive",
         "unwrap",
+    ];
+    /// H9 section v2 creation vocabulary: v1 plus the two KEM
+    /// families. v1 stays frozen; v2 sections carry these.
+    pub(crate) const CREATION_LABELS_V2: [&str; 8] = [
+        "create",
+        "copy",
+        "generate",
+        "generate_pair",
+        "derive",
+        "unwrap",
+        "encapsulate",
+        "decapsulate",
     ];
     pub(crate) const BIRTH_KEYS: [&str; 2] = ["start_ns", "end_ns"];
     pub(crate) const LIFETIME_LABELS: [&str; 4] = ["live", "destroyed", "access_ended", "retired"];
@@ -177,6 +193,18 @@ pub(crate) mod contract {
         "wrapped_object",
         "unwrapping_key",
         "base_key",
+        "other",
+    ];
+    /// H9 section v2 role vocabulary: v1 plus the two KEM roles. v1
+    /// stays frozen; v2 sections carry these.
+    pub(crate) const ROLE_LABELS_V2: [&str; 8] = [
+        "key",
+        "wrapping_key",
+        "wrapped_object",
+        "unwrapping_key",
+        "base_key",
+        "encapsulation_key",
+        "decapsulation_key",
         "other",
     ];
 
@@ -671,10 +699,22 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
 
 /// Render the whole section: the exact frozen keys. The single
 /// renderer behind JSON, JSONL row payloads and byte measurement —
-/// every consumer reads these shapes.
+/// every consumer reads these shapes. The version follows the
+/// content: v2 iff a KEM creation or role label is present,
+/// otherwise byte-stable v1.
 pub(crate) fn object_observations_json(observations: &ObjectObservations) -> serde_json::Value {
+    let kem = observations.objects.iter().any(|row| {
+        matches!(row.creation, Some("encapsulate" | "decapsulate"))
+    }) || observations.key_operations.iter().any(|row| {
+        matches!(row.role, "encapsulation_key" | "decapsulation_key")
+    });
+    let version = if kem {
+        OBSERVATIONS_VERSION_V2
+    } else {
+        OBSERVATIONS_VERSION
+    };
     serde_json::json!({
-        "version": OBSERVATIONS_VERSION,
+        "version": version,
         "revision": observations.revision,
         "status": observations.status.label(),
         "reason": observations.reason,

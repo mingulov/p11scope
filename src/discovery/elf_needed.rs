@@ -319,7 +319,7 @@ impl ExtensiveState {
                 Some(file) => {
                     let identity = identity_of(file).unwrap_or((0, 0));
                     let mut charge = 0u64;
-                    let soname = read_elf_needed(file, &mut charge)
+                    let soname = read_elf_needed(file, &mut charge, self.capture_bytes_charged)
                         .map(|parsed| parsed.soname.unwrap_or_default())
                         .unwrap_or_default();
                     self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
@@ -428,9 +428,9 @@ impl ExtensiveState {
         if identity != (dev, ino) {
             return StaticHint::Unknown;
         }
-        // P2-1 RED: test hooks force changed/unavailable snapshots
-        // between the brackets. Publication gating lands with the fix;
-        // this revision still gates only caching (the defect).
+        // Row A: the opened FD's stability bracket gates the
+        // publication, not just caching. Changed or unavailable
+        // identity voids to Unknown and inserts nothing.
         #[cfg(test)]
         let pre = if self.test_fail_exe_pre_snapshot {
             None
@@ -439,6 +439,9 @@ impl ExtensiveState {
         };
         #[cfg(not(test))]
         let pre = snapshot_of(&exe).ok();
+        let Some(pre) = pre else {
+            return StaticHint::Unknown;
+        };
         let hint = self.walk_dependencies(&exe, dev, ino);
         #[cfg(test)]
         if let Some(mutate) = self.test_exe_mutator {
@@ -452,14 +455,15 @@ impl ExtensiveState {
         };
         #[cfg(not(test))]
         let post = snapshot_of(&exe);
-        // Cache only completed non-unknown verdicts, only when the file
-        // did not change mid-analysis, and only while the cache has room
-        // (a full cache serves hits but retains nothing new).
-        if hint != StaticHint::Unknown
-            && let (Some(pre), Ok(post)) = (pre, post)
-            && pre == post
-            && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES
-        {
+        let Ok(post) = post else {
+            return StaticHint::Unknown;
+        };
+        if pre != post {
+            return StaticHint::Unknown;
+        }
+        // Cache only completed non-unknown verdicts, and only while the
+        // cache has room (a full cache serves hits but retains nothing new).
+        if hint != StaticHint::Unknown && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES {
             self.verdicts.insert(
                 (dev, ino),
                 VerdictEntry {
@@ -522,14 +526,17 @@ impl ExtensiveState {
     /// over the scan-learned path cache plus the pinned watched paths —
     /// no RUNPATH, no loader search, no directory walks. Each candidate
     /// is opened, `fstat`-verified against its learned/pinned identity,
-    /// parsed within budget, and SONAME-checked (a present SONAME must
-    /// equal the needed name); the first candidate to survive all four
-    /// wins, the rest are tried in deterministic order.
+    /// stability-bracketed around its bounded parse, and SONAME-checked
+    /// (a present SONAME must equal the needed name); the first candidate
+    /// to survive all five wins, the rest are tried in deterministic order.
+    /// A changed or unavailable intermediate voids that candidate, so its
+    /// required chain resolves nowhere and the walk voids per Row C.
     fn resolve_needed(
         &self,
         name: &[u8],
         charge: &mut u64,
         visited: &mut BTreeSet<(u64, u64)>,
+        capture_base: u64,
     ) -> Option<Option<ElfNeeded>> {
         let mut candidates: Vec<(PathBuf, (u64, u64))> = Vec::new();
         for (key, path) in &self.path_cache {
@@ -559,17 +566,22 @@ impl ExtensiveState {
                 // Path replaced since learning: not the file we knew.
                 continue;
             }
-            // P2-1 RED: test hook forces an intermediate change between
-            // open and parse. The stability bracket lands with the fix;
-            // this revision still reads without one (the defect).
+            // Row A: bracket the bounded parse. A change or an
+            // unavailable snapshot voids this candidate like any other
+            // failed read; span charges already taken are never refunded.
+            let pre = snapshot_of(&file).ok();
             #[cfg(test)]
             if let Some(mutate) = self.test_intermediate_mutator {
                 mutate(&path);
             }
-            let parsed = match read_elf_needed(&file, charge) {
+            let parsed = match read_elf_needed(&file, charge, capture_base) {
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+            let post = snapshot_of(&file);
+            if !matches!((&pre, &post), (Some(pre), Ok(post)) if pre == post) {
+                continue;
+            }
             if let Some(soname) = parsed.soname.as_deref()
                 && soname != name
             {
@@ -594,11 +606,15 @@ impl ExtensiveState {
     /// negative. Charges (objects, edges, bytes) include duplicates and
     /// failed parses and are never refunded.
     fn walk_dependencies(&mut self, exe: &File, dev: u64, ino: u64) -> StaticHint {
+        // Row D: every span read checks the remaining per-capture
+        // allowance before touching the file, so the direct-provider
+        // early return and the empty closure cannot over-read either.
+        let capture_base = self.capture_bytes_charged;
         let mut charge = 0u64;
         let mut objects = 1usize;
         let mut edges = 0usize;
         let mut visited = BTreeSet::from([(dev, ino)]);
-        let exe_parsed = match read_elf_needed(exe, &mut charge) {
+        let exe_parsed = match read_elf_needed(exe, &mut charge, capture_base) {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
@@ -632,7 +648,8 @@ impl ExtensiveState {
             // needed order); the first failure voids.
             for parsed in &level {
                 for name in &parsed.needed {
-                    let Some(resolved) = self.resolve_needed(name, &mut charge, &mut visited)
+                    let Some(resolved) =
+                        self.resolve_needed(name, &mut charge, &mut visited, capture_base)
                     else {
                         self.capture_bytes_charged =
                             self.capture_bytes_charged.saturating_add(charge);
@@ -721,16 +738,22 @@ pub(crate) enum ElfReadFailure {
 
 /// One bounded span read: bytes are charged before the read, so failed
 /// parses still account for the spans they attempted, and no span can
-/// over-allocate past the per-analysis budget.
+/// over-allocate past the per-analysis budget. The remaining per-capture
+/// allowance is checked before touching the file, so a starved analysis
+/// refuses the span instead of over-reading past the capture cap.
 struct BoundedReader<'a> {
     file: &'a File,
     charge: &'a mut u64,
+    capture_base: u64,
 }
 
 impl BoundedReader<'_> {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, ElfReadFailure> {
         *self.charge = self.charge.saturating_add(len as u64);
         if *self.charge > HINT_MAX_BYTES_PER_ANALYSIS {
+            return Err(ElfReadFailure::OverBudget);
+        }
+        if self.capture_base.saturating_add(*self.charge) > HINT_MAX_BYTES_PER_CAPTURE {
             return Err(ElfReadFailure::OverBudget);
         }
         let mut buf = vec![0u8; len];
@@ -758,14 +781,24 @@ fn le_u64(bytes: &[u8]) -> u64 {
 /// Row B: read one object's `DT_NEEDED` names and optional `DT_SONAME`
 /// through bounded spans (header, program headers, dynamic array,
 /// string table). Every span is charged to the per-analysis budget,
-/// including spans of failed parses. Both 32- and 64-bit little-endian
-/// objects parse; anything else — bad magic, big-endian, truncated
-/// spans, an untranslatable string-table address, an unterminated name —
-/// is `Malformed`. A name longer than 255 bytes is `NameTooLong`. An
-/// object with no program headers or no `PT_DYNAMIC` is honestly empty
-/// (statically linked as far as `DT_NEEDED` shows), not malformed.
-pub(crate) fn read_elf_needed(file: &File, charge: &mut u64) -> Result<ElfNeeded, ElfReadFailure> {
-    let mut reader = BoundedReader { file, charge };
+/// including spans of failed parses, and refused before reading when it
+/// would exceed the remaining per-capture allowance. Both 32- and 64-bit
+/// little-endian objects parse; anything else — bad magic, big-endian,
+/// truncated spans, an untranslatable string-table address, an
+/// unterminated name — is `Malformed`. A name longer than 255 bytes is
+/// `NameTooLong`. An object with no program headers or no `PT_DYNAMIC`
+/// is honestly empty (statically linked as far as `DT_NEEDED` shows),
+/// not malformed.
+pub(crate) fn read_elf_needed(
+    file: &File,
+    charge: &mut u64,
+    capture_base: u64,
+) -> Result<ElfNeeded, ElfReadFailure> {
+    let mut reader = BoundedReader {
+        file,
+        charge,
+        capture_base,
+    };
     let ehdr = reader.read_at(0, 64)?;
     if ehdr[0..4] != [0x7f, b'E', b'L', b'F'] {
         return Err(ElfReadFailure::Malformed);

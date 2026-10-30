@@ -3467,6 +3467,105 @@ pub(crate) mod tests {
         assert!(metrics["evidence"].get("gap_exe_hints").is_none());
     }
 
+    // 614b P2#5: the shares-unchanged twin over a nonzero observed
+    // call/attribution surface. Both sides observe the same calls
+    // through the semantic state machine and render the same slot
+    // aggregates; only the hint evidence differs, so every rendered
+    // call, mechanism, cgroup-attribution, verdict and completeness
+    // surface must be identical.
+    #[test]
+    fn profile_v3_gap_exe_hints_do_not_move_call_or_attribution_surfaces() {
+        use p11scope_ebpf_common::shape;
+
+        let observed_state = || {
+            let mut state =
+                crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+            let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+            event.cgroup_id = 111;
+            state.observe(&event);
+            state.observe(&event);
+            state.observe(&event);
+            state
+        };
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            let mut encrypt = report("C_Encrypt", 7, 0, false);
+            encrypt.module = Some(crate::plan::ModuleId(0));
+            encrypt.rv_counts.insert(0, 7);
+            vec![sign, encrypt]
+        };
+        let mut plain_ev = evidence();
+        plain_ev.pid_descendant_gaps = 2;
+        let mut armed_ev = evidence();
+        armed_ev.pid_descendant_gaps = 2;
+        armed_ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 0,
+            no_static_link_within_scope: 0,
+            unknown: 1,
+        });
+
+        let plain = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&plain_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        let mut armed = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&armed_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+
+        // Both controls really carry calls and attribution, and only
+        // the armed side carries a nonzero hint split.
+        let total_calls: u64 = plain["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["calls"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total_calls, 32, "twin must observe nonzero calls");
+        assert_eq!(plain["mechanisms"][0]["calls"], 3);
+        assert_eq!(plain["cgroups"][0]["calls"], 3);
+        assert_eq!(plain["cgroups"][0]["mechanisms"][0]["calls"], 3);
+        assert!(plain["evidence"].get("gap_exe_hints").is_none());
+        assert_eq!(armed["evidence"]["gap_exe_hints"]["links_provider"], 1);
+        assert_eq!(armed["evidence"]["gap_exe_hints"]["unknown"], 1);
+
+        // Call/attribution surfaces match exactly, field by field.
+        for surface in ["functions", "mechanisms", "sessions", "logins", "cgroups"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["verdict_detail"], plain["evidence"]["verdict_detail"],
+            "verdict must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["pid_descendant_gaps"],
+            plain["evidence"]["pid_descendant_gaps"]
+        );
+
+        // With the hint split removed, the whole documents are equal:
+        // the hint evidence is the only difference anywhere.
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exe_hints");
+        assert_eq!(armed, plain);
+    }
+
     #[test]
     fn metrics_serializes_actual_attach_backend_metadata() {
         let pid_fallback = crate::attach::select_session_backend(

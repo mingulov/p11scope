@@ -2217,4 +2217,239 @@ mod tests {
             StaticHint::LinksProvider
         );
     }
+
+    // 614b P2#3: the 32-object budget reserves each new candidate
+    // before it is opened, so object 33 is never examined. The padded
+    // 33rd object makes any actual span read visible in the capture
+    // byte charge: the learned twin must charge exactly what the
+    // unlearned twin charges.
+    #[test]
+    fn elf_needed_object_attempts_stop_before_33() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut libs: Vec<PathBuf> = Vec::new();
+        for index in 0..32 {
+            let name = format!("libo{index:02}.so").into_bytes();
+            let mut spec = ElfSpec::lib(&name, &[]);
+            if index == 31 {
+                spec.strtab_pad = 64 * 1024;
+            }
+            let lib = write_elf(dir.path(), &format!("libo{index:02}.so"), &build_elf(&spec));
+            names.push(name);
+            libs.push(lib);
+        }
+        // At-cap positive control: executable + 31 dependencies is
+        // exactly 32 objects and completes.
+        let refs31: Vec<&[u8]> = names[..31].iter().map(Vec::as_slice).collect();
+        let exe31 = write_elf(dir.path(), "atcap", &build_elf(&ElfSpec::exe(&refs31)));
+        let lib_refs31: Vec<&Path> = libs[..31].iter().map(PathBuf::as_path).collect();
+        let (hint, _) = analyzed(dir.path(), vec![], &exe31, &lib_refs31);
+        assert_eq!(hint, StaticHint::NoStaticLinkWithinScope);
+
+        let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let exe = write_elf(dir.path(), "overcap", &build_elf(&ElfSpec::exe(&refs)));
+        let lib_refs: Vec<&Path> = libs.iter().map(PathBuf::as_path).collect();
+        let (hint_learned, learned) = analyzed(dir.path(), vec![], &exe, &lib_refs);
+        let (hint_unlearned, unlearned) = analyzed(dir.path(), vec![], &exe, &lib_refs31);
+        assert_eq!(hint_learned, StaticHint::Unknown);
+        assert_eq!(hint_unlearned, StaticHint::Unknown);
+        assert_eq!(
+            learned.capture_bytes_charged_for_test(),
+            unlearned.capture_bytes_charged_for_test(),
+            "object 33 must be refused before any of its spans are read"
+        );
+    }
+
+    // 614b P2#3: failed candidates (SONAME-mismatched or malformed)
+    // consume the same pre-open object budget, so a matching
+    // candidate ordered after the budget is never opened. Candidate
+    // order is path-cache key order; the matching body is written
+    // into whichever file sorts last.
+    #[test]
+    fn elf_needed_failed_candidates_consume_object_budget() {
+        fn scenario(
+            dir: &Path,
+            base: &str,
+            count: usize,
+            malformed: bool,
+        ) -> (PathBuf, Vec<PathBuf>) {
+            let mut paths = Vec::new();
+            for index in 0..count {
+                let sub = dir.join(format!("{base}-{index}"));
+                std::fs::create_dir(&sub).unwrap();
+                paths.push(write_elf(&sub, base, &[0u8; 8]));
+            }
+            let mut ordered: Vec<(ObjectKey, PathBuf)> = paths
+                .iter()
+                .map(|path| (cache_key_of(path), path.clone()))
+                .collect();
+            ordered.sort();
+            let bad_body = if malformed {
+                vec![0u8; 128]
+            } else {
+                build_elf(&ElfSpec::lib(b"libother.so", &[]))
+            };
+            let good_body = build_elf(&ElfSpec::lib(base.as_bytes(), &[]));
+            for (pos, (_, path)) in ordered.iter().enumerate() {
+                let body = if pos + 1 == count {
+                    &good_body
+                } else {
+                    &bad_body
+                };
+                std::fs::write(path, body).unwrap();
+            }
+            let exe = write_elf(
+                dir,
+                &format!("exe-{base}"),
+                &build_elf(&ElfSpec::exe(&[base.as_bytes()])),
+            );
+            (exe, paths)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for malformed in [false, true] {
+            let base = if malformed { "liby.so" } else { "libx.so" };
+            let (exe, libs) = scenario(dir.path(), base, 40, malformed);
+            let refs: Vec<&Path> = libs.iter().map(PathBuf::as_path).collect();
+            let (hint, state) = analyzed(dir.path(), vec![], &exe, &refs);
+            assert_eq!(
+                hint,
+                StaticHint::Unknown,
+                "malformed={malformed}: failed candidates must exhaust the \
+                 object budget before the matching candidate is opened"
+            );
+            assert_eq!(state.analyses_run_for_test(), 1);
+        }
+        // Below-cap twin: a handful of failed candidates still
+        // reaches the matching one and completes the negative.
+        let (exe, libs) = scenario(dir.path(), "libz.so", 6, false);
+        let refs: Vec<&Path> = libs.iter().map(PathBuf::as_path).collect();
+        let (hint, _) = analyzed(dir.path(), vec![], &exe, &refs);
+        assert_eq!(hint, StaticHint::NoStaticLinkWithinScope);
+    }
+
+    fn transitive_state(provider: &Path, exe: &Path, helper: &Path) -> ExtensiveState {
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(provider, b"libprov.so.1")]);
+        for candidate in [exe, helper, provider] {
+            state.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        state
+    }
+
+    // 614b P2#4: a transitive cache hit must revalidate the
+    // intermediate dependency evidence, not just the executable. An
+    // unchanged helper still serves the hit; an overwritten helper
+    // (same inode, now needing the provider) refuses it.
+    #[test]
+    fn elf_needed_transitive_cache_revalidates_changed_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir.path(),
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[])),
+        );
+        let exe = write_elf(
+            dir.path(),
+            "exe",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+        let mut state = transitive_state(&provider, &exe, &helper);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        // Stable helper: the hit serves without re-analysis.
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        assert_eq!(state.analyses_run_for_test(), 1);
+        // Same helper inode, SONAME preserved, now needing the
+        // provider: the cached negative must not survive.
+        std::fs::write(
+            &helper,
+            build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        )
+        .unwrap();
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider,
+            "changed helper must refuse the cached transitive negative"
+        );
+        assert_eq!(state.analyses_run_for_test(), 2);
+        let mut fresh = transitive_state(&provider, &exe, &helper);
+        assert_eq!(
+            fresh.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+    }
+
+    // 614b P2#4: a removed helper voids a cached completed hint to
+    // unknown, and a helper replaced from provider-needing to empty
+    // turns a cached positive into a fresh negative.
+    #[test]
+    fn elf_needed_transitive_cache_refuses_removed_or_replaced_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir.path(),
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[])),
+        );
+        let exe = write_elf(
+            dir.path(),
+            "exe",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+        let mut removed = transitive_state(&provider, &exe, &helper);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(
+            removed.analyze_executable(dev, ino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        std::fs::remove_file(&helper).unwrap();
+        assert_eq!(
+            removed.analyze_executable(dev, ino),
+            StaticHint::Unknown,
+            "removed helper must refuse the cached transitive negative"
+        );
+        assert_eq!(removed.analyses_run_for_test(), 2);
+
+        // Positive-to-negative: the helper first needs the provider,
+        // then is overwritten empty at the same inode.
+        std::fs::write(
+            &helper,
+            build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        )
+        .unwrap();
+        let mut replaced = transitive_state(&provider, &exe, &helper);
+        assert_eq!(
+            replaced.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(
+            replaced.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(replaced.analyses_run_for_test(), 1);
+        std::fs::write(&helper, build_elf(&ElfSpec::lib(b"libhelper.so.1", &[]))).unwrap();
+        assert_eq!(
+            replaced.analyze_executable(dev, ino),
+            StaticHint::NoStaticLinkWithinScope,
+            "replaced helper must refuse the cached transitive positive"
+        );
+        assert_eq!(replaced.analyses_run_for_test(), 2);
+    }
 }

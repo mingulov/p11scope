@@ -2002,6 +2002,15 @@ fn prearm_stop_ns(first_stop: crate::attach::FirstStop, loop_end_ns: Option<u64>
     }
 }
 
+/// Terminal kernel health for pre-arm watch close (packet 6.13): sampled
+/// beside the reports, before the watches close on it. This feeds watch
+/// health only — the trace publication sample stays after
+/// `settle_terminal_drain` (trace terminal-order contract, round-4
+/// re-audit finding 2).
+fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> {
+    metrics::kernel_evidence(session)
+}
+
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
 /// idle qualification over observed use and terminal health, the end for
 /// the capture end, and the attach-key assembly merge onto the discovery
@@ -6562,16 +6571,17 @@ fn capture_trace(
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
                     // Terminal observation health is sampled beside the
-                    // reports, before the watches close on it.
-                    let kernel_start = Instant::now();
-                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
+                    // reports, before the watches close on it. This feeds
+                    // watch health only; the publication sample stays after
+                    // `settle_terminal_drain` (trace terminal-order contract).
+                    let watch_kernel = prearm_terminal_kernel(context.1)?;
                     finish_prearm_terminal(
                         context.0,
                         &*context.1,
                         context.1.attach_failures(),
                         end,
                         &reports,
-                        &terminal_kernel,
+                        &watch_kernel,
                         *consumers.malformed_records,
                         watch_stop_ns,
                     );
@@ -6584,9 +6594,11 @@ fn capture_trace(
                         crate::attach::monotonic_ns(),
                     );
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
+                    let maps_start = Instant::now();
+                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
                     consumers
                         .scheduling
-                        .add_phase(SchedulingPhase::Maps, kernel_start.elapsed());
+                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
                     consumers.scheduling.note_terminal(
                         terminal_kernel.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],

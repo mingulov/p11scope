@@ -253,6 +253,18 @@ pub(crate) struct ExtensiveState {
     hints: GapExeHints,
     capture_bytes_charged: u64,
     analyses_run: u64,
+    /// Test-only mid-analysis mutation hooks (P2-1 stability RED).
+    /// Production leaves these `None`/false; tests set them to force a
+    /// pre/post snapshot mismatch or an unavailable snapshot between the
+    /// brackets, deterministically exercising the Row A stability gate.
+    #[cfg(test)]
+    pub(crate) test_exe_mutator: Option<fn(&Path)>,
+    #[cfg(test)]
+    pub(crate) test_intermediate_mutator: Option<fn(&Path)>,
+    #[cfg(test)]
+    pub(crate) test_fail_exe_pre_snapshot: bool,
+    #[cfg(test)]
+    pub(crate) test_fail_exe_post_snapshot: bool,
 }
 
 impl ExtensiveState {
@@ -416,13 +428,35 @@ impl ExtensiveState {
         if identity != (dev, ino) {
             return StaticHint::Unknown;
         }
+        // P2-1 RED: test hooks force changed/unavailable snapshots
+        // between the brackets. Publication gating lands with the fix;
+        // this revision still gates only caching (the defect).
+        #[cfg(test)]
+        let pre = if self.test_fail_exe_pre_snapshot {
+            None
+        } else {
+            snapshot_of(&exe).ok()
+        };
+        #[cfg(not(test))]
         let pre = snapshot_of(&exe).ok();
         let hint = self.walk_dependencies(&exe, dev, ino);
+        #[cfg(test)]
+        if let Some(mutate) = self.test_exe_mutator {
+            mutate(&path);
+        }
+        #[cfg(test)]
+        let post = if self.test_fail_exe_post_snapshot {
+            Err(std::io::Error::other("injected post-snapshot failure"))
+        } else {
+            snapshot_of(&exe)
+        };
+        #[cfg(not(test))]
+        let post = snapshot_of(&exe);
         // Cache only completed non-unknown verdicts, only when the file
         // did not change mid-analysis, and only while the cache has room
         // (a full cache serves hits but retains nothing new).
         if hint != StaticHint::Unknown
-            && let (Some(pre), Ok(post)) = (pre, snapshot_of(&exe))
+            && let (Some(pre), Ok(post)) = (pre, post)
             && pre == post
             && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES
         {
@@ -524,6 +558,13 @@ impl ExtensiveState {
             if found != identity {
                 // Path replaced since learning: not the file we knew.
                 continue;
+            }
+            // P2-1 RED: test hook forces an intermediate change between
+            // open and parse. The stability bracket lands with the fix;
+            // this revision still reads without one (the defect).
+            #[cfg(test)]
+            if let Some(mutate) = self.test_intermediate_mutator {
+                mutate(&path);
             }
             let parsed = match read_elf_needed(&file, charge) {
                 Ok(parsed) => parsed,
@@ -1645,5 +1686,502 @@ mod tests {
         assert_ne!((dev, ino), (new_dev, new_ino), "replacement kept identity");
         assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
         assert_eq!(state.analyses_run_for_test(), 1);
+    }
+
+    // P2-1 RED 1: changed-or-unavailable exe pre/post snapshot voids the
+    // publication (Row A), inserting nothing. Stable twins keep proper
+    // hints, including under a full verdict cache.
+    #[test]
+    fn elf_needed_changed_exe_snapshot_voids_publication() {
+        fn append_byte(path: &Path) {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(&[0]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let exe_stable = write_elf(
+            dir.path(),
+            "stable",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        let exe_changed = write_elf(
+            dir.path(),
+            "changed",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        let exe_unavail = write_elf(
+            dir.path(),
+            "unavail",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe_stable, &exe_changed, &exe_unavail, &provider] {
+            state.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+
+        // Stable twin: proper hint, cached.
+        let (sdev, sino) = record_identity_of(&exe_stable);
+        assert_eq!(
+            state.analyze_executable(sdev, sino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(state.verdicts_len_for_test(), 1);
+
+        // Changed mid-analysis (append between brackets): Unknown, no insert.
+        state.test_exe_mutator = Some(append_byte);
+        let (cdev, cino) = record_identity_of(&exe_changed);
+        assert_eq!(state.analyze_executable(cdev, cino), StaticHint::Unknown);
+        assert_eq!(
+            state.verdicts_len_for_test(),
+            1,
+            "changed exe must not insert"
+        );
+
+        // Unavailable post snapshot: Unknown, no insert.
+        state.test_exe_mutator = None;
+        state.test_fail_exe_post_snapshot = true;
+        let (udev, uino) = record_identity_of(&exe_unavail);
+        assert_eq!(state.analyze_executable(udev, uino), StaticHint::Unknown);
+        assert_eq!(state.verdicts_len_for_test(), 1);
+        state.test_fail_exe_post_snapshot = false;
+
+        // Unavailable pre snapshot: Unknown, no insert.
+        state.test_fail_exe_pre_snapshot = true;
+        let exe_pre = write_elf(
+            dir.path(),
+            "pre",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        state.learn_scan_path(cache_key_of(&exe_pre), &exe_pre);
+        let (pdev, pino) = record_identity_of(&exe_pre);
+        assert_eq!(state.analyze_executable(pdev, pino), StaticHint::Unknown);
+        assert_eq!(state.verdicts_len_for_test(), 1);
+        state.test_fail_exe_pre_snapshot = false;
+
+        // Stable twin still hints after the failures (cache hit).
+        assert_eq!(
+            state.analyze_executable(sdev, sino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(state.analyses_run_for_test(), 4);
+
+        // Full verdict cache neighbor: hits serve, new verdicts retain nothing.
+        let mut full = ExtensiveState::new();
+        full.set_enabled(true);
+        full.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        full.learn_scan_path(cache_key_of(&exe_stable), &exe_stable);
+        full.learn_scan_path(cache_key_of(&provider), &provider);
+        let (fdev, fino) = record_identity_of(&exe_stable);
+        assert_eq!(
+            full.analyze_executable(fdev, fino),
+            StaticHint::LinksProvider
+        );
+        for index in 0..HINT_MAX_VERDICT_CACHE_ENTRIES - 1 {
+            let key = (
+                0xffff_ffff_0000_0000u64 + index as u64,
+                0xffff_ffff_0000_0000u64 + index as u64,
+            );
+            full.verdicts.insert(
+                key,
+                VerdictEntry {
+                    hint: StaticHint::NoStaticLinkWithinScope,
+                    size: 0,
+                    mtime_sec: 0,
+                    mtime_nsec: 0,
+                    ctime_sec: 0,
+                    ctime_nsec: 0,
+                },
+            );
+        }
+        assert_eq!(full.verdicts_len_for_test(), HINT_MAX_VERDICT_CACHE_ENTRIES);
+        assert_eq!(
+            full.analyze_executable(fdev, fino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(full.analyses_run_for_test(), 1);
+        let exe_new = write_elf(
+            dir.path(),
+            "newstable",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        full.learn_scan_path(cache_key_of(&exe_new), &exe_new);
+        let (ndev, nino) = record_identity_of(&exe_new);
+        assert_eq!(
+            full.analyze_executable(ndev, nino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(full.verdicts_len_for_test(), HINT_MAX_VERDICT_CACHE_ENTRIES);
+        assert_eq!(full.analyses_run_for_test(), 2);
+    }
+
+    // P2-1 RED 2: a changed intermediate dependency voids its required
+    // chain to Unknown. A direct-provider chain that avoids the changed
+    // object still links.
+    #[test]
+    fn elf_needed_changed_intermediate_voids_required_chain() {
+        fn append_if_helper(path: &Path) {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "libhelper.so.1")
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(&[0]).unwrap();
+                file.sync_all().unwrap();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir.path(),
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let exe = write_elf(
+            dir.path(),
+            "exe",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+        let exe_direct = write_elf(
+            dir.path(),
+            "direct",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+
+        let mut stable = ExtensiveState::new();
+        stable.set_enabled(true);
+        stable.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider, &exe_direct] {
+            stable.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        let (edev, eino) = record_identity_of(&exe);
+        assert_eq!(
+            stable.analyze_executable(edev, eino),
+            StaticHint::LinksProvider
+        );
+
+        let mut changed = ExtensiveState::new();
+        changed.set_enabled(true);
+        changed.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider, &exe_direct] {
+            changed.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        changed.test_intermediate_mutator = Some(append_if_helper);
+        assert_eq!(changed.analyze_executable(edev, eino), StaticHint::Unknown);
+        assert_eq!(changed.verdicts_len_for_test(), 0);
+
+        // Neighbor: the direct chain avoids the changed helper.
+        let (ddev, dino) = record_identity_of(&exe_direct);
+        assert_eq!(
+            changed.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(changed.verdicts_len_for_test(), 1);
+    }
+
+    // P2-1 RED 3: remaining capture allowance below the first required
+    // span refuses before the excess read. Exact-bound twins succeed;
+    // failed and duplicate work still charges; earlier verdicts survive.
+    #[test]
+    fn elf_needed_capture_budget_checked_before_span_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir.path(),
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let exe = write_elf(
+            dir.path(),
+            "exe",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+
+        let mut measure = ExtensiveState::new();
+        measure.set_enabled(true);
+        measure.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider] {
+            measure.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        let (edev, eino) = record_identity_of(&exe);
+        assert_eq!(
+            measure.analyze_executable(edev, eino),
+            StaticHint::LinksProvider
+        );
+        let total = measure.capture_bytes_charged_for_test();
+        assert!(total > 64, "fixture too small to test span gating");
+
+        // Just below the 64-byte header span: Unknown, refused span
+        // charged once, nothing cached.
+        let mut starved = ExtensiveState::new();
+        starved.set_enabled(true);
+        starved.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider] {
+            starved.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        starved.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - 63;
+        let before = starved.capture_bytes_charged_for_test();
+        assert_eq!(starved.analyze_executable(edev, eino), StaticHint::Unknown);
+        assert_eq!(
+            starved.capture_bytes_charged_for_test(),
+            before + 64,
+            "refused span charged once, no excess read"
+        );
+        assert_eq!(starved.verdicts_len_for_test(), 0);
+        assert_eq!(starved.analyses_run_for_test(), 1);
+
+        // Exact-bound twin: remaining equals the measured total.
+        let mut exact = ExtensiveState::new();
+        exact.set_enabled(true);
+        exact.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider] {
+            exact.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        exact.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - total;
+        assert_eq!(
+            exact.analyze_executable(edev, eino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(
+            exact.capture_bytes_charged_for_test(),
+            HINT_MAX_BYTES_PER_CAPTURE
+        );
+        assert_eq!(exact.verdicts_len_for_test(), 1);
+
+        // Failed work charges; duplicate re-attempts charge again.
+        let mut truncated = build_elf(&ElfSpec::exe(&[b"libprov.so.1"]));
+        truncated.truncate(truncated.len() / 2);
+        let exe_trunc = write_elf(dir.path(), "trunc", &truncated);
+        let mut failed = ExtensiveState::new();
+        failed.set_enabled(true);
+        failed.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        failed.learn_scan_path(cache_key_of(&exe_trunc), &exe_trunc);
+        failed.learn_scan_path(cache_key_of(&provider), &provider);
+        let (tdev, tino) = record_identity_of(&exe_trunc);
+        let before_fail = failed.capture_bytes_charged_for_test();
+        assert_eq!(failed.analyze_executable(tdev, tino), StaticHint::Unknown);
+        let after_first = failed.capture_bytes_charged_for_test();
+        assert!(after_first > before_fail, "failed parse must charge");
+        assert_eq!(failed.verdicts_len_for_test(), 0);
+        assert_eq!(failed.analyze_executable(tdev, tino), StaticHint::Unknown);
+        assert!(
+            failed.capture_bytes_charged_for_test() > after_first,
+            "duplicate failed work must charge again"
+        );
+        assert_eq!(failed.analyses_run_for_test(), 2);
+
+        // Earlier complete verdicts survive a later starved refusal.
+        let exe_direct = write_elf(
+            dir.path(),
+            "direct",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        let mut preserve = ExtensiveState::new();
+        preserve.set_enabled(true);
+        preserve.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        for candidate in [&exe, &helper, &provider, &exe_direct] {
+            preserve.learn_scan_path(cache_key_of(candidate), candidate);
+        }
+        let (ddev, dino) = record_identity_of(&exe_direct);
+        assert_eq!(
+            preserve.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(preserve.verdicts_len_for_test(), 1);
+        preserve.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - 63;
+        assert_eq!(preserve.analyze_executable(edev, eino), StaticHint::Unknown);
+        assert!(
+            preserve.verdicts.contains_key(&(ddev, dino)),
+            "earlier verdict preserved"
+        );
+    }
+
+    // P2-1 RED 4: the direct-provider early return and the empty or
+    // no-provider closure obey the same per-span capture cap. Cache
+    // hits need no reads; revalidation and late-unrelated-failure
+    // witnesses keep their standing.
+    #[test]
+    fn elf_needed_capture_budget_gates_provider_and_empty_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let exe_direct = write_elf(
+            dir.path(),
+            "direct",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])),
+        );
+        let exe_empty = write_elf(dir.path(), "empty", &build_elf(&ElfSpec::exe(&[])));
+
+        let mut measure_direct = ExtensiveState::new();
+        measure_direct.set_enabled(true);
+        measure_direct.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        measure_direct.learn_scan_path(cache_key_of(&exe_direct), &exe_direct);
+        measure_direct.learn_scan_path(cache_key_of(&provider), &provider);
+        let (ddev, dino) = record_identity_of(&exe_direct);
+        assert_eq!(
+            measure_direct.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider
+        );
+        let total_direct = measure_direct.capture_bytes_charged_for_test();
+
+        let mut measure_empty = ExtensiveState::new();
+        measure_empty.set_enabled(true);
+        measure_empty.learn_scan_path(cache_key_of(&exe_empty), &exe_empty);
+        let (edev, eino) = record_identity_of(&exe_empty);
+        assert_eq!(
+            measure_empty.analyze_executable(edev, eino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        let total_empty = measure_empty.capture_bytes_charged_for_test();
+
+        // Starved direct-provider early return: Unknown, no excess read.
+        let mut starved_direct = ExtensiveState::new();
+        starved_direct.set_enabled(true);
+        starved_direct.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        starved_direct.learn_scan_path(cache_key_of(&exe_direct), &exe_direct);
+        starved_direct.learn_scan_path(cache_key_of(&provider), &provider);
+        starved_direct.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - 63;
+        let before_direct = starved_direct.capture_bytes_charged_for_test();
+        assert_eq!(
+            starved_direct.analyze_executable(ddev, dino),
+            StaticHint::Unknown
+        );
+        assert_eq!(
+            starved_direct.capture_bytes_charged_for_test(),
+            before_direct + 64,
+            "direct early return must not over-read"
+        );
+
+        // Starved empty closure: Unknown, no excess read.
+        let mut starved_empty = ExtensiveState::new();
+        starved_empty.set_enabled(true);
+        starved_empty.learn_scan_path(cache_key_of(&exe_empty), &exe_empty);
+        starved_empty.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - 63;
+        let before_empty = starved_empty.capture_bytes_charged_for_test();
+        assert_eq!(
+            starved_empty.analyze_executable(edev, eino),
+            StaticHint::Unknown
+        );
+        assert_eq!(
+            starved_empty.capture_bytes_charged_for_test(),
+            before_empty + 64,
+            "empty closure must not over-read"
+        );
+
+        // Exact-bound twins hit the limit precisely and keep their hints.
+        let mut exact_direct = ExtensiveState::new();
+        exact_direct.set_enabled(true);
+        exact_direct.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        exact_direct.learn_scan_path(cache_key_of(&exe_direct), &exe_direct);
+        exact_direct.learn_scan_path(cache_key_of(&provider), &provider);
+        exact_direct.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - total_direct;
+        assert_eq!(
+            exact_direct.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(
+            exact_direct.capture_bytes_charged_for_test(),
+            HINT_MAX_BYTES_PER_CAPTURE
+        );
+
+        let mut exact_empty = ExtensiveState::new();
+        exact_empty.set_enabled(true);
+        exact_empty.learn_scan_path(cache_key_of(&exe_empty), &exe_empty);
+        exact_empty.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - total_empty;
+        assert_eq!(
+            exact_empty.analyze_executable(edev, eino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        assert_eq!(
+            exact_empty.capture_bytes_charged_for_test(),
+            HINT_MAX_BYTES_PER_CAPTURE
+        );
+
+        // Cache hit with low remaining needs no reads and still serves.
+        let mut cached = ExtensiveState::new();
+        cached.set_enabled(true);
+        cached.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        cached.learn_scan_path(cache_key_of(&exe_direct), &exe_direct);
+        cached.learn_scan_path(cache_key_of(&provider), &provider);
+        assert_eq!(
+            cached.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider
+        );
+        cached.capture_bytes_charged = HINT_MAX_BYTES_PER_CAPTURE - 63;
+        assert_eq!(
+            cached.analyze_executable(ddev, dino),
+            StaticHint::LinksProvider,
+            "cache hit needs no reads"
+        );
+        assert_eq!(cached.analyses_run_for_test(), 1);
+        assert_eq!(
+            cached.capture_bytes_charged_for_test(),
+            HINT_MAX_BYTES_PER_CAPTURE - 63
+        );
+
+        // Revalidation neighbor: same inode, new bytes refuse the stale hit.
+        let mut reval = ExtensiveState::new();
+        reval.set_enabled(true);
+        reval.learn_scan_path(cache_key_of(&exe_empty), &exe_empty);
+        assert_eq!(
+            reval.analyze_executable(edev, eino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        std::fs::write(&exe_empty, build_elf(&ElfSpec::exe(&[]))).unwrap();
+        assert_eq!(
+            reval.analyze_executable(edev, eino),
+            StaticHint::NoStaticLinkWithinScope
+        );
+        assert_eq!(reval.analyses_run_for_test(), 2);
+
+        // Late-unrelated-failure neighbors keep their witnesses.
+        let exe_loader_mixed = write_elf(
+            dir.path(),
+            "loadermix",
+            &build_elf(&ElfSpec::exe(&[b"libp11-kit.so.0", b"libmissing.so.9"])),
+        );
+        let exe_provider_mixed = write_elf(
+            dir.path(),
+            "provmix",
+            &build_elf(&ElfSpec::exe(&[b"libprov.so.1", b"libmissing.so.9"])),
+        );
+        let mut late = ExtensiveState::new();
+        late.set_enabled(true);
+        late.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        late.learn_scan_path(cache_key_of(&exe_loader_mixed), &exe_loader_mixed);
+        late.learn_scan_path(cache_key_of(&exe_provider_mixed), &exe_provider_mixed);
+        late.learn_scan_path(cache_key_of(&provider), &provider);
+        let (ldev, lino) = record_identity_of(&exe_loader_mixed);
+        assert_eq!(
+            late.analyze_executable(ldev, lino),
+            StaticHint::LinksPkcs11Loader
+        );
+        let (pdev, pino) = record_identity_of(&exe_provider_mixed);
+        assert_eq!(
+            late.analyze_executable(pdev, pino),
+            StaticHint::LinksProvider
+        );
     }
 }

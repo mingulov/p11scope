@@ -10751,9 +10751,14 @@ impl Engine {
     /// before the session starts (run flow only; inventory never calls
     /// this, so its surface is unchanged). Arming snapshots the pinned
     /// watched providers; the kernel bit publishes with the session.
+    /// 614b P1: the engine itself refuses to arm on a scope that never
+    /// classifies descendant gaps, so no caller can arm the
+    /// exe-identity read (or retain its stash/caches) for an exact-PID
+    /// capture however it computed its request.
     pub(crate) fn arm_extensive(&mut self, track_short_lived: bool) {
-        self.extensive.set_enabled(track_short_lived);
-        if track_short_lived {
+        let armed = track_short_lived && self.admits_generations();
+        self.extensive.set_enabled(armed);
+        if armed {
             self.extensive.snapshot_watched(&self.pinned);
         }
     }

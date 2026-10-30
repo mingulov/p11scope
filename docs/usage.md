@@ -785,10 +785,11 @@ Limits that matter in pods:
   name a pinned watched provider, or the PKCS#11 loader, within two
   `DT_NEEDED` steps. A hint is labelled `STATIC HINT`, never a call
   or verdict, and never moves call/attribution shares. Beside
-  `--trace` the exe words ride the raw EXEC records with no hint
-  analysis; beside `--mode metrics` or exact `--pid` scope the
-  flag is accepted but adds nothing observable (nothing there
-  classifies gaps). Beside `--counter-mode` the flag is refused:
+  `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
+  `run` the flag is accepted but arms nothing: no exe identity is
+  recorded there, because nothing there classifies gaps (614b P1
+  narrow authorization — the read arms only where hints publish).
+  Beside `--counter-mode` the flag is refused:
   extensive mode arms Detailed captures only, never a counter
   object. Privacy row: `docs/privacy/allowlist-v3.md`
   (extensive-mode executable dependency hints).

@@ -202,6 +202,9 @@ Replays and further unremembered keys do not increment again.
 
 `gap_exe_hints` is present if and only if the capture armed extensive
 mode (`--track-short-lived`); otherwise the key is absent, never null.
+Arming is confined to profile (non-metrics) `--cgroup`/`--system`
+captures: on trace, metrics, exact-`--pid` and `run` captures the flag
+records nothing and the key stays absent.
 It classifies the novel unmatched-exit subpopulation of
 `pid_descendant_gaps` (admissions and overflow sentinels carry no hint)
 into finite static-linkage classes: `links_provider` (the dead

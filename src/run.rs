@@ -2492,8 +2492,11 @@ pub(crate) fn extensive_effective(
     scope: &Scope,
     policy: CapturePolicy,
 ) -> bool {
-    let _ = (kind, metrics, scope);
-    track_short_lived && policy.allows_track_short_lived()
+    track_short_lived
+        && policy.allows_track_short_lived()
+        && kind == Kind::Profile
+        && !metrics
+        && matches!(scope, Scope::Cgroup { .. } | Scope::System)
 }
 
 pub(crate) fn capture_policy(

@@ -1114,7 +1114,10 @@ original custody and reservations until it actually returns and joins.
 
 **Status: APPROVED (owner ratification 2026-10-29, batch item 5,
 merged P5 text, branch D-transitive; the D-direct branch was
-considered and not ratified).** The rows below are additive in v3
+considered and not ratified). The kernel exe-identity read in
+Row A is granted by the 614b P1 narrow authorization recorded in
+the standing v0.6.0 requirements; merged P5 alone covered the
+cache-only D-transitive analysis, not the new capture.** The rows below are additive in v3
 and precede any B1 capture code. Default capture is OFF
 (`--track-short-lived`, extensive mode); allowlist-v1 is unchanged.
 Option A (kernel exit summaries) needs no decision here and is
@@ -1213,6 +1216,10 @@ changing content; the stability recheck defeats racing
 modification, not earlier replacement. The scan-learned path
 cache keeps at most 4,096 entries (no-retain-when-full); the
 verdict cache stores size/mtime/ctime beside each verdict and a
-hit requires all-fields equality. This packet arms Detailed
-captures only (profile/trace/run); inventory arming is a
-follow-up, and inventory captures keep no exe identity.
+hit requires all-fields equality. This packet arms only where
+hints publish: Detailed profile (non-metrics) captures over
+cgroup/system scope (614b P1 narrow authorization). Beside
+trace, metrics, exact-PID scope or an owned `run` the flag is
+accepted but arms nothing and records no exe identity; beside
+counter modes it is refused. Inventory captures never arm and
+keep no exe identity.

@@ -432,6 +432,7 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 exec-time executable identity and unmatched exits classify into STATIC HINT linkage
 classes beside pid_descendant_gaps, never moving call or attribution shares.
 Refused beside --counter-mode: extensive mode arms Detailed captures only.
+Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
 working backports qualify by probe), including with --attach-backend singles.
 Offline inspect/diff and inventory --capture scan do not require live capability.
@@ -488,6 +489,7 @@ Exactly one of --pid, --cgroup, or --system is required; --cgroup includes desce
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
 Refused beside --counter-mode: extensive mode arms Detailed captures only.
+Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 ";
 
@@ -535,6 +537,7 @@ Profile and metrics counts are aggregate, not per application; --trace selects c
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
 Refused beside --counter-mode: extensive mode arms Detailed captures only.
+Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.

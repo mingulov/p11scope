@@ -187,7 +187,9 @@ does anything past the published budgets (depth 2, 32 objects, 128
 edges, 1 MiB per executable, 64 MiB per capture, 255-byte names).
 `dlopen`-only provider use is invisible by design and reads
 `no_static_link_within_scope`, never a use claim. Inventory captures
-do not arm extensive mode yet, so they publish no split. Hints never
+do not arm extensive mode yet, so they publish no split; trace,
+metrics, exact-`--pid` and owned-`run` captures likewise never arm
+it (the flag records no exe identity there). Hints never
 move call or attribution shares; exit records still settle no birth,
 admission, absence, or call (R57).
 

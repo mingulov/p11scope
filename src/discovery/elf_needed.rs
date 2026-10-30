@@ -1084,15 +1084,35 @@ pub(crate) fn read_elf_needed(
     let (Some(strtab_vaddr), Some(strsz)) = (strtab_vaddr, strsz) else {
         return Err(ElfReadFailure::Malformed);
     };
-    let strtab_off = loads
-        .iter()
-        .find(|(_, vaddr, filesz)| {
-            strtab_vaddr >= *vaddr && strtab_vaddr.wrapping_sub(*vaddr) < *filesz
-        })
-        .map(|(offset, vaddr, _)| strtab_vaddr - vaddr + offset);
-    let Some(strtab_off) = strtab_off else {
+    let containing = loads.iter().find(|(_, vaddr, filesz)| {
+        strtab_vaddr
+            .checked_sub(*vaddr)
+            .is_some_and(|delta| delta < *filesz)
+    });
+    let Some((offset, vaddr, filesz)) = containing else {
         return Err(ElfReadFailure::Malformed);
     };
+    // Checked translation: the file offset and the full DT_STRSZ span
+    // must fit the containing load's file-backed range. Unchecked
+    // arithmetic wrapped in release (misreading a translated span) and
+    // panicked in debug; an overlong span over-read past the segment.
+    // Refused before any strtab read or charge, like an untranslatable
+    // address.
+    let Some(delta) = strtab_vaddr.checked_sub(*vaddr) else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    let Some(strtab_off) = offset.checked_add(delta) else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    let (Some(strtab_end), Some(load_end)) = (
+        strtab_off.checked_add(strsz),
+        offset.checked_add(*filesz),
+    ) else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    if strtab_end > load_end {
+        return Err(ElfReadFailure::Malformed);
+    }
     let strtab = reader.read_at(strtab_off, strsz as usize)?;
     let mut needed = Vec::with_capacity(needed_offs.len());
     for off in needed_offs {

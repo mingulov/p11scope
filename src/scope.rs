@@ -244,6 +244,17 @@ fn publish_detailed_with(
     if generation_token.is_some() && !matches!(scope, Scope::Pid(_)) {
         bail!("pause generation requires PID scope");
     }
+    // 6.14 Option B: the extensive CONFIG bit publishes for Detailed
+    // policies only; a counter policy refuses before any map writes.
+    if track_short_lived && !policy.allows_track_short_lived() {
+        bail!(
+            "--track-short-lived arms Detailed captures only; refusing it for counter mode {}",
+            policy
+                .counter_mode()
+                .expect("non-Detailed policy here is a counter policy")
+                .name()
+        );
+    }
     let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
     // 6.14 Option B: extensive mode arms the kernel exe-identity read
     // on EXEC. Default off; inventory never sets this bit.

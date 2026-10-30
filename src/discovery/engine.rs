@@ -28411,9 +28411,11 @@ impl Engine {
         let scope = &retained_scope;
         let admission = self.return_probe_admission.clone();
         // 6.14 Option B: the kernel exe-identity read arms exactly when
-        // the engine armed extensive mode. Hoisted: the closure below
-        // cannot borrow `self` while `start_retained_with` holds it.
-        let track_short_lived = self.extensive.enabled();
+        // the engine armed extensive mode under a Detailed policy;
+        // a counter policy never forwards the bit even if the engine
+        // was armed. Hoisted: the closure below cannot borrow `self`
+        // while `start_retained_with` holds it.
+        let track_short_lived = self.extensive.enabled() && policy.allows_track_short_lived();
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
                 Session::start_for_capture(

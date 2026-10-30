@@ -788,7 +788,9 @@ Limits that matter in pods:
   `--trace` the exe words ride the raw EXEC records with no hint
   analysis; beside `--mode metrics` or exact `--pid` scope the
   flag is accepted but adds nothing observable (nothing there
-  classifies gaps). Privacy row: `docs/privacy/allowlist-v3.md`
+  classifies gaps). Beside `--counter-mode` the flag is refused:
+  extensive mode arms Detailed captures only, never a counter
+  object. Privacy row: `docs/privacy/allowlist-v3.md`
   (extensive-mode executable dependency hints).
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.

@@ -2393,8 +2393,9 @@ fn capture_with_host(
     let mut engine = discovered?;
     engine.retain_return_probe_admission(return_admission);
     // 6.14 Option B: arm extensive mode before the session publishes
-    // its CONFIG bit; inventory never reaches this flow.
-    engine.arm_extensive(a.track_short_lived);
+    // its CONFIG bit; inventory never reaches this flow. Counter
+    // policies never arm (the CLI combination already refused).
+    engine.arm_extensive(a.track_short_lived && policy.allows_track_short_lived());
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
@@ -2475,7 +2476,6 @@ pub(crate) fn capture_policy(
     counter_mode: Option<p11scope_ebpf_common::CounterMode>,
     track_short_lived: bool,
 ) -> Result<CapturePolicy> {
-    let _ = track_short_lived;
     if let Some(mode) = counter_mode {
         if kind != Kind::Profile || !metrics {
             anyhow::bail!(
@@ -2485,6 +2485,16 @@ pub(crate) fn capture_policy(
         }
         if unsafe_requested {
             anyhow::bail!("--counter-mode cannot be combined with --unsafe-unvalidated-metadata");
+        }
+        // 6.14 Option B: extensive mode arms Detailed captures only.
+        // Refused by name before build/flavor checks so no counter
+        // session can ever arm the exe-identity read.
+        if track_short_lived {
+            anyhow::bail!(
+                "--track-short-lived cannot be combined with --counter-mode {}: \
+                 extensive mode arms Detailed captures only",
+                mode.name()
+            );
         }
         // Builds without counter objects (WIDE, SMALL) refuse here by
         // name: the statics are empty there, and preparation never runs
@@ -3393,8 +3403,9 @@ fn run_owned_inner_with_host(
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     // 6.14 Option B: arm extensive mode before the session publishes
-    // its CONFIG bit.
-    engine.arm_extensive(args.track_short_lived);
+    // its CONFIG bit. Counter policies never arm (the CLI
+    // combination already refused).
+    engine.arm_extensive(args.track_short_lived && policy.allows_track_short_lived());
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.

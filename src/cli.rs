@@ -431,6 +431,7 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --track-short-lived (profile/run, default off) is extensive mode: the kernel records
 exec-time executable identity and unmatched exits classify into STATIC HINT linkage
 classes beside pid_descendant_gaps, never moving call or attribution shares.
+Refused beside --counter-mode: extensive mode arms Detailed captures only.
 Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
 working backports qualify by probe), including with --attach-backend singles.
 Offline inspect/diff and inventory --capture scan do not require live capability.
@@ -486,6 +487,7 @@ Aggregate across the selected scope; counts are not per application.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
+Refused beside --counter-mode: extensive mode arms Detailed captures only.
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 ";
 
@@ -532,6 +534,7 @@ Profile and metrics counts are aggregate, not per application; --trace selects c
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
+Refused beside --counter-mode: extensive mode arms Detailed captures only.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.

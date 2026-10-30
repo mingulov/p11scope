@@ -935,6 +935,18 @@ impl CapturePolicy {
         }
     }
 
+    /// Whether this policy may arm extensive mode (`--track-short-lived`,
+    /// 6.14 Option B): the exe-identity read arms Detailed-object
+    /// captures only, never a counter object. Explicit match, not
+    /// `counter_mode().is_none()`: a future variant must decide here
+    /// at compile time.
+    pub const fn allows_track_short_lived(self) -> bool {
+        match self {
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata | Self::AggregateOnly => true,
+            Self::Counter(_) => false,
+        }
+    }
+
     /// Whether the policy can consume load-instance continuity (Task 3 Stage
     /// A): profile/trace join per-call records to load instances, so their
     /// sessions attach the three mapping hooks; metrics (aggregate-only)
@@ -6205,6 +6217,17 @@ impl Session {
             crate::uretprobe_hazard::Action,
         >,
     ) -> Result<Self> {
+        // 6.14 Option B: no factory path starts a counter session
+        // with the exe-identity read armed (Detailed objects only).
+        if track_short_lived && !policy.allows_track_short_lived() {
+            bail!(
+                "--track-short-lived arms Detailed captures only; refusing it for counter mode {}",
+                policy
+                    .counter_mode()
+                    .expect("non-Detailed policy here is a counter policy")
+                    .name()
+            );
+        }
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let _host = host?;
         let admission = admission().map_err(crate::uretprobe_hazard::refusal_error)?;

@@ -12971,9 +12971,7 @@ mod tests {
             .unwrap();
         assert!(last_load < classes_freeze);
         assert!(
-            !expected
-                .iter()
-                .any(|step| *step == SessionPreparation::LoadCounterPrograms)
+            !expected.contains(&SessionPreparation::LoadCounterPrograms)
         );
         for fail_classes in [false, true] {
             let mut seen = Vec::new();

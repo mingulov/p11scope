@@ -9,11 +9,12 @@ use super::super::inventory::{
     ScanReceipt, UnavailableImageGuard,
 };
 use super::*;
+use crate::attach::capture::NativeDomainId;
 use crate::capacity::InventoryBudget;
+use crate::discovery::native_binding::BoundImage;
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
-use p11scope_ebpf_common::ImageIdentity;
 
 fn inventory_engine(scan_capacity: usize) -> Engine {
     inventory_engine_with_claim_capacity(scan_capacity, 32768)
@@ -39,15 +40,19 @@ fn inventory_engine_with_claim_capacity(scan_capacity: usize, claim_capacity: us
 // This is explicitly a scripted native-query dependency, not live image proof.
 struct FixtureImages;
 
-fn fixture_image(pid: u32) -> ImageIdentity {
-    ImageIdentity {
-        task_cookie: u64::from(pid) + 1,
-        exec_id: 7,
-    }
+/// One stable scripted domain for this module's fixture images; a fresh
+/// domain per call would break equality for the wrong reason.
+fn fixture_domain() -> NativeDomainId {
+    static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(NativeDomainId::mint)
+}
+
+fn fixture_image(pid: u32) -> BoundImage {
+    BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 7).unwrap()
 }
 
 impl ImageGuard for FixtureImages {
-    fn check(&mut self, view: &ProcessView, expected: ImageIdentity) -> ImageCheck {
+    fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
         assert_eq!(expected, fixture_image(view.pid()));
         ImageCheck::Exact
     }
@@ -469,7 +474,7 @@ fn inventory_unavailable_image_cannot_retire_committed_claims() {
 fn inventory_changed_image_after_candidate_build_cannot_publish_absence() {
     struct ChangesAfterFirstCheck(bool);
     impl ImageGuard for ChangesAfterFirstCheck {
-        fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+        fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
             if std::mem::replace(&mut self.0, true) {
                 ImageCheck::Changed
             } else {

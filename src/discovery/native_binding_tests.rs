@@ -5,7 +5,7 @@
 use super::*;
 use crate::attach::capture::{CaptureHealth, CapturePhase, ScopeCustody};
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
-use p11scope_ebpf_common::DiscoveryRecord;
+use p11scope_ebpf_common::{DiscoveryRecord, ImageIdentity};
 use std::collections::HashMap;
 
 /// A scripted pin: (pid, generation). Two generations of one pid are two
@@ -241,7 +241,7 @@ struct AnswerTable<'a> {
 }
 
 impl NativeIdentity<Pin> for AnswerTable<'_> {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -406,7 +406,7 @@ fn metadata_proof_binds_actual_adapter_original_and_keeps_paired_custody_charge(
 
     struct Identity(NativeDomainId);
     impl NativeIdentity<PidPin> for Identity {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
         fn query_cookie(&mut self, domain: NativeDomainId, _: &PidPin) -> CookieQuery {
@@ -1366,4 +1366,45 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
             );
         }
     }
+}
+
+#[test]
+fn bound_image_equality_keeps_domain_and_full_exec() {
+    let domain = NativeDomainId::mint();
+    let other = NativeDomainId::mint();
+    let image = BoundImage::scripted(domain, 41, 7).unwrap();
+    assert_eq!(image, BoundImage::scripted(domain, 41, 7).unwrap());
+    // Identical numbers in another domain are another image.
+    assert_ne!(image, BoundImage::scripted(other, 41, 7).unwrap());
+    // Exec zero is a valid image; all 64 exec bits matter.
+    let zero = BoundImage::scripted(domain, 41, 0).unwrap();
+    assert_ne!(image, zero);
+    assert_eq!(zero, BoundImage::scripted(domain, 41, 0).unwrap());
+    assert_ne!(
+        image,
+        BoundImage::scripted(domain, 41, 7 ^ (1 << 63)).unwrap()
+    );
+    assert_ne!(image, BoundImage::scripted(domain, 42, 7).unwrap());
+    // Zero is unavailable, never an expected image.
+    assert!(BoundImage::scripted(domain, 0, 7).is_none());
+    assert!(BoundImage::scripted(domain, 0, 0).is_none());
+    // Domain membership is an equality coordinate, not a number.
+    assert!(image.belongs_to(domain));
+    assert!(!image.belongs_to(other));
+}
+
+#[test]
+fn bound_image_debug_redacts_private_numbers() {
+    use super::super::caller_registry::ImageAuthority;
+    let domain = NativeDomainId::mint();
+    let image = BoundImage::scripted(domain, 41, 7).unwrap();
+    assert_eq!(format!("{image:?}"), "BoundImage(<expected>)");
+    // Authority snapshots redact through the same form: the label stays,
+    // the numbers never appear.
+    let authority = ImageAuthority::NativeExact { image };
+    assert_eq!(authority.label(), "native_exact");
+    let rendered = format!("{authority:?}");
+    assert!(rendered.contains("NativeExact"));
+    assert!(rendered.contains("<expected>"));
+    assert!(!rendered.contains("41"));
 }

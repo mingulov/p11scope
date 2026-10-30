@@ -16,6 +16,7 @@ use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::native_binding::UnboundReason;
+use p11scope_ebpf_common::ImageIdentity;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -319,7 +320,7 @@ fn cgroup_runtime_lane_with_exec(
 ) {
     struct OsLane(ScriptedLane, Option<u32>, u64);
     impl NativeIdentity<crate::process::PidPin> for OsLane {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
         fn query_cookie(
@@ -550,7 +551,7 @@ impl ScriptedLane {
 }
 
 impl NativeIdentity<Pin> for ScriptedLane {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 

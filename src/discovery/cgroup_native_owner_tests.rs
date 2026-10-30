@@ -7,6 +7,7 @@
 use super::*;
 use crate::attach::capture::{AttachedEndpoint, ExecCoverage};
 use crate::discovery::caller_registry::OsProcessSource;
+use crate::discovery::native_binding::BoundImage;
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::inspect_system::inventory_cgroup::ScopedCollectionGap;
 use crate::process::PidPin;
@@ -23,7 +24,7 @@ struct OriginalNativeIdentity {
 }
 
 impl NativeIdentity<PidPin> for OriginalNativeIdentity {
-    fn owner_image(&mut self, _: u32) -> Option<p11scope_ebpf_common::ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 

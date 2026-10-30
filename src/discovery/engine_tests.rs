@@ -48588,13 +48588,15 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
     epoch += 1;
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     let mut guard = super::inventory::UnavailableImageGuard;
+    let refused = crate::discovery::native_binding::BoundImage::scripted(
+        crate::attach::capture::NativeDomainId::mint(),
+        42,
+        0,
+    )
+    .unwrap();
     assert!(
         engine
-            .open_inventory_owner(
-                std::process::id(),
-                p11scope_ebpf_common::ImageIdentity::default(),
-                &mut guard
-            )
+            .open_inventory_owner(std::process::id(), refused, &mut guard)
             .is_err()
     );
     epoch += 1;

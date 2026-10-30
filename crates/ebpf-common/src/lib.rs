@@ -263,6 +263,10 @@ pub mod lifecycle {
     pub const ASYNC_JOIN: u8 = 13;
     /// C_FindObjects while a search is active; success keeps it active.
     pub const FIND_OPERATION: u8 = 14;
+    /// C_Initialize: initialization-era boundary (P4, owner 2026-10-29).
+    /// Appended; no existing value renumbered. Distinct from
+    /// `transition::INITIALIZE` (operation initialization).
+    pub const CRYPTOKI_INITIALIZE: u8 = 15;
 }
 
 pub mod direct {

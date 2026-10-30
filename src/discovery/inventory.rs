@@ -8,9 +8,15 @@
 
 use super::*;
 use crate::capacity::InventoryBudget;
+use crate::discovery::native_binding::BoundImage;
 use crate::discovery::scan::{DiscoveryPolicy, InventoryDiscoveryLimits};
-use p11scope_ebpf_common::{ImageIdentity, image_pair_matches};
 use std::sync::Arc;
+
+#[path = "inventory/image_guard.rs"]
+pub(crate) mod image_guard;
+// Packet 2 preparation consumes this; packet-1 production only stores the types.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use image_guard::FreshImageGuard;
 
 /// Counted retained resources, separate from the renewable scan work budget.
 /// Each owner can retain at most one ProcessView/pidfd. Claim references count
@@ -69,16 +75,19 @@ pub(crate) enum ImageCheck {
 /// The adapter must query the same capture's native identity domain and verify
 /// both lifetime ticket and exec ID for this exact retained process. A pidfd,
 /// start time, maps equality, or missing query row cannot implement `Exact`.
-/// Implementations may consume a batched native result; missing/stale results
-/// must be Unavailable. This trait supplies no successful production adapter.
+/// Only a fresh current-image observation of the retained pin answers
+/// `Exact`; missing, stale, failed, or foreign-provenance results are
+/// `Unavailable`, and only a well-formed observation of the correct
+/// original in the correct domain may report `Changed`. Cached binder
+/// state is never currency evidence.
 pub(crate) trait ImageGuard {
-    fn check(&mut self, view: &ProcessView, expected: ImageIdentity) -> ImageCheck;
+    fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck;
 }
 
 pub(crate) struct UnavailableImageGuard;
 
 impl ImageGuard for UnavailableImageGuard {
-    fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+    fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
         ImageCheck::Unavailable
     }
 }
@@ -128,7 +137,7 @@ const EXEC_INVALIDATED_DIRTY: u8 = 16;
 
 #[derive(Debug)]
 struct Owner {
-    image: ImageIdentity,
+    image: BoundImage,
     revision: u64,
     requested_epoch: u64,
     serviced_epoch: u64,
@@ -206,7 +215,7 @@ pub(crate) struct ScanLease {
 struct ReceiptIdentity {
     domain: Arc<()>,
     owner: ProcessViewId,
-    image: ImageIdentity,
+    image: BoundImage,
     revision: u64,
     requested_epoch: u64,
 }
@@ -299,12 +308,15 @@ impl Engine {
     pub(crate) fn open_inventory_owner(
         &mut self,
         pid: u32,
-        image: ImageIdentity,
+        image: BoundImage,
         guard: &mut dyn ImageGuard,
     ) -> Result<ProcessViewId> {
         self.note_graph_inputs_mutated();
         self.inventory_state()?;
-        if image.task_cookie == 0 || !self.inventory_scope_contains(pid) {
+        // An invalid expected image cannot be manufactured: the only
+        // production factory builds from a settled binder association, and
+        // the scripted constructor refuses zero. Only scope still refuses.
+        if !self.inventory_scope_contains(pid) {
             bail!("inventory owner lacks image identity or current scope membership");
         }
         let id = self.allocate_view_id()?;
@@ -477,7 +489,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("inventory receipt owner is no longer retained"))?;
         if !Arc::ptr_eq(&state.domain, &identity.domain)
             || owner.revision != identity.revision
-            || !image_pair_matches(owner.image, identity.image)
+            || owner.image != identity.image
         {
             bail!("inventory receipt belongs to another owner, image, or claim revision");
         }

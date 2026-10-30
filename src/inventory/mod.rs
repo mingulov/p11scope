@@ -7183,15 +7183,13 @@ fn caller_json(
     metadata: &crate::caller_metadata::runtime::MetadataFrame,
 ) -> serde_json::Value {
     let record = caller;
+    // Private native image values never render: the schema requires a new
+    // allowlist row for non-null values, so both authority variants emit
+    // null snapshot keys.
     let (task_cookie, exec_id) = match record.authority {
-        ImageAuthority::NativeExact {
-            task_cookie,
-            exec_id,
-        } => (
-            serde_json::Value::from(task_cookie),
-            serde_json::Value::from(exec_id),
-        ),
-        ImageAuthority::ScanPinned => (serde_json::Value::Null, serde_json::Value::Null),
+        ImageAuthority::NativeExact { .. } | ImageAuthority::ScanPinned => {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        }
     };
     let exe = record.exe.as_ref().map(|exe| {
         serde_json::json!({
@@ -10264,8 +10262,12 @@ mod tests {
     fn stream_inline_identity_exact_privacy_keys() {
         let (mut view, events) = stream_identity_fixture(1);
         view.callers[0].authority = ImageAuthority::NativeExact {
-            task_cookie: 0xfedc_ba98_7654_3210,
-            exec_id: 0xabcd_ef01_2345_6789,
+            image: crate::discovery::native_binding::BoundImage::scripted(
+                crate::attach::capture::NativeDomainId::mint(),
+                0xfedc_ba98_7654_3210,
+                0xabcd_ef01_2345_6789,
+            )
+            .unwrap(),
         };
         view.callers[0].lifecycle_reason = Some("FORBIDDEN_ARGV_ENV_COMM".into());
         view.modules[0].admission_reasons = vec!["FORBIDDEN_MODULE_REASON".into()];
@@ -15621,7 +15623,10 @@ mod promotion_driver_tests {
     }
 
     impl<L: NativeIdentity<PidPin>> NativeIdentity<PidPin> for BaselineStub<L> {
-        fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+        fn owner_image(
+            &mut self,
+            pid: u32,
+        ) -> Option<crate::discovery::native_binding::BoundImage> {
             self.inner.owner_image(pid)
         }
 

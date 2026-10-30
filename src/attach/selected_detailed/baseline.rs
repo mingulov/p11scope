@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 #[path = "caller_image.rs"]
 mod caller_image;
-pub(crate) use caller_image::{CallerImageObservation, observe_caller_image};
+#[cfg(test)]
+pub(crate) use caller_image::scripted_observation;
+pub(crate) use caller_image::{BindingObservation, CallerImageObservation, observe_caller_image};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

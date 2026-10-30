@@ -521,7 +521,7 @@ pub struct ProcessView {
     admission: ViewAdmission,
     id: ProcessViewId,
     mount_namespace: MountNamespaceId,
-    pin: PidPin,
+    pin: Arc<PidPin>,
     admitted_ns: u64,
     cold_filesystem_observed: std::sync::atomic::AtomicBool,
 }
@@ -600,13 +600,25 @@ impl ProcessView {
             admission: ViewAdmission(std::sync::Arc::new(())),
             id,
             mount_namespace,
-            pin,
+            // The already opened pin moves into its shared allocation
+            // exactly once: no PID reopen, no duplicate pidfd.
+            pin: Arc::new(pin),
             admitted_ns,
             cold_filesystem_observed: std::sync::atomic::AtomicBool::new(cold_filesystem),
         })
     }
 
     pub(crate) fn retained_pin(&self) -> &PidPin {
+        &self.pin
+    }
+
+    /// The view's original pin allocation, shared without another open or
+    /// FD: repeated identity queries borrow this same allocation. It rides
+    /// the view's own bounded custody (one view per retained owner, paid
+    /// by the view's opening budget); there is no fresh budget and no
+    /// long-lived observation cache.
+    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+    pub(crate) fn retained_pin_arc(&self) -> &Arc<PidPin> {
         &self.pin
     }
     pub(crate) fn view_admission(&self) -> ViewAdmission {
@@ -772,12 +784,12 @@ pub(crate) fn reused_process_view_for_test(
     let retained = process_start_time(pid)
         .map_err(|error| format!("cannot build reused-pid test view: {error}"))?
         .wrapping_add(1);
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
         shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
-    };
+    });
     Ok(view)
 }
 
@@ -787,12 +799,12 @@ pub(crate) fn unprovable_process_view_for_test(
     pid: u32,
 ) -> Result<ProcessView, String> {
     let mut view = ProcessView::open(id, pid)?;
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
         shared_charge: None,
         pid,
         pidfd: None,
         start_time: None,
-    };
+    });
     Ok(view)
 }
 
@@ -807,12 +819,12 @@ pub(crate) fn start_time_pinned_process_view_for_test(
     let mut view = ProcessView::open(id, pid)?;
     let retained = process_start_time(pid)
         .map_err(|error| format!("cannot build start-time-pinned test view: {error}"))?;
-    view.pin = PidPin {
+    view.pin = Arc::new(PidPin {
         shared_charge: None,
         pid,
         pidfd: None,
         start_time: Some(retained),
-    };
+    });
     Ok(view)
 }
 

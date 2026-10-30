@@ -2123,13 +2123,191 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         let native: u32 = literal.parse().expect("native reason parses");
         assert_eq!(native, expected, "native and wire reason numbers agree");
     }
-    /// Executable reason-bearing call sites: source lines that carry
-    /// both the reason token and a removal/settlement call shape.
-    /// Import lines and prose never match: they carry no call.
-    fn executable_sites<'a>(text: &'a str, token: &str, calls: &[&str]) -> Vec<&'a str> {
-        text.lines()
+    /// Executable reason-bearing call sites: comment-stripped
+    /// source lines that carry both the reason token and a
+    /// removal/settlement call shape. Import lines, prose, and
+    /// commented-out calls never match: they carry no live call.
+    fn executable_sites(text: &str, token: &str, calls: &[&str]) -> Vec<String> {
+        strip_comments(text)
+            .lines()
             .filter(|line| line.contains(token) && calls.iter().any(|call| line.contains(call)))
+            .map(str::to_string)
             .collect()
+    }
+    /// Strip C/Rust line (`//`) and block (`/* */`) comments,
+    /// honoring quoted strings and char literals. Commented-out
+    /// emitters and calls never classify as executable. Newlines
+    /// survive, so reported line numbers stay stable.
+    fn strip_comments(text: &str) -> String {
+        enum State {
+            Code,
+            Line,
+            Block,
+            Str,
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut state = State::Code;
+        let mut escape = false;
+        let chars: Vec<char> = text.chars().collect();
+        let mut index = 0;
+        // A quote opens a char literal only with its closer in
+        // reach (`'x'`, `'\n'`): Rust lifetimes (`&'a`) stay code.
+        let char_len = |chars: &[char]| {
+            if chars.len() > 2 && chars[1] != '\\' && chars[2] == '\'' {
+                Some(3)
+            } else if chars.len() > 3 && chars[1] == '\\' && chars[3] == '\'' {
+                Some(4)
+            } else {
+                None
+            }
+        };
+        while index < chars.len() {
+            let c = chars[index];
+            match state {
+                State::Code => {
+                    if c == '/' && chars.get(index + 1) == Some(&'/') {
+                        index += 2;
+                        state = State::Line;
+                        continue;
+                    }
+                    if c == '/' && chars.get(index + 1) == Some(&'*') {
+                        index += 2;
+                        state = State::Block;
+                        continue;
+                    }
+                    if c == '"' {
+                        out.push(c);
+                        index += 1;
+                        state = State::Str;
+                        continue;
+                    }
+                    if c == '\''
+                        && let Some(len) = char_len(&chars[index..])
+                    {
+                        out.push_str(&chars[index..index + len].iter().collect::<String>());
+                        index += len;
+                        continue;
+                    }
+                    out.push(c);
+                    index += 1;
+                }
+                State::Line => {
+                    if c == '\n' {
+                        out.push(c);
+                        state = State::Code;
+                    }
+                    index += 1;
+                }
+                State::Block => {
+                    if c == '*' && chars.get(index + 1) == Some(&'/') {
+                        index += 2;
+                        state = State::Code;
+                    } else {
+                        if c == '\n' {
+                            out.push(c);
+                        }
+                        index += 1;
+                    }
+                }
+                State::Str => {
+                    out.push(c);
+                    if escape {
+                        escape = false;
+                    } else if c == '\\' {
+                        escape = true;
+                    } else if c == '"' {
+                        state = State::Code;
+                    }
+                    index += 1;
+                }
+            }
+        }
+        out
+    }
+    /// A bare reserved numeric (7/8): decimal or hex, one outer cast
+    /// and integer suffixes tolerated, nothing else.
+    fn is_reserved_numeric(argument: &str) -> bool {
+        let mut argument = argument.trim();
+        // One outer cast prefix (`(u32)7`) tolerated.
+        if argument.contains(')') {
+            argument = argument.rsplit(')').next().unwrap_or(argument).trim();
+        }
+        let digits = argument.trim_end_matches(['U', 'u', 'L', 'l']);
+        let value = if let Some(hex) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            digits.parse::<u32>().ok()
+        };
+        matches!(value, Some(7 | 8))
+    }
+    /// Reserved numerics (7/8) in native reason positions: every
+    /// offending assignment spelling and every whole (possibly
+    /// wrapped) reason-taking call whose reason argument is a bare
+    /// 7/8, for production (must be none) and mutants (must be
+    /// some). Comment-stripped throughout.
+    fn reserved_numeric_sites(text: &str) -> Vec<String> {
+        let code = strip_comments(text);
+        let mut sites = Vec::new();
+        for (index, line) in code.lines().enumerate() {
+            for spelling in ["= 7", "=7", "= 8", "=8"] {
+                if line.contains("reason") && line.contains(spelling) {
+                    sites.push(format!("{}: {line}", index + 1));
+                }
+            }
+        }
+        for shape in ["remove_start(", "start_remove_reason("] {
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find(shape) {
+                let lineno = code.len() - rest.len() + at;
+                let lineno = code[..lineno].matches('\n').count() + 1;
+                rest = &rest[at + shape.len()..];
+                // Balance to the call's own closing paren, across
+                // wrapped lines; the reason is the last argument.
+                let mut depth = 1u32;
+                let mut end = None;
+                for (offset, c) in rest.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else {
+                    sites.push(format!("{lineno}: unbalanced {shape} call"));
+                    break;
+                };
+                let args = &rest[..end];
+                let mut depth = 0u32;
+                let mut last_comma = None;
+                for (offset, c) in args.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => last_comma = Some(offset),
+                        _ => {}
+                    }
+                }
+                let reason = match last_comma {
+                    Some(offset) => &args[offset + 1..],
+                    None => args,
+                };
+                if is_reserved_numeric(reason) {
+                    let call: String = args.chars().filter(|c| !c.is_whitespace()).collect();
+                    sites.push(format!("{lineno}: {shape}{call})"));
+                }
+                rest = &rest[end + 1..];
+            }
+        }
+        sites
     }
     // The main import block names every Rust-side token, so whole-file
     // presence cannot tell an emitter from an import. Pin that trap:
@@ -2286,6 +2464,47 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         .is_empty(),
         "scope-loss mutant rejected"
     );
+    // Negative controls: the scope-loss emitter lost, its former call
+    // surviving only in a comment — line, block, and multi-line block
+    // spellings. Line matching counts each comment as an emitter;
+    // comment-stripped classification must reject all three.
+    assert_eq!(
+        main_rs[import_end..].matches(scope_site).count(),
+        1,
+        "scope-loss call anchor"
+    );
+    for (label, commented_site) in [
+        (
+            "line",
+            "//start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST)",
+        ),
+        (
+            "block",
+            "/*start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST)*/",
+        ),
+        (
+            "multi-line block",
+            "/* open\n        match start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST);\n        close */",
+        ),
+    ] {
+        let commented = format!(
+            "{import_block}{}",
+            main_rs[import_end..].replacen(scope_site, commented_site, 1)
+        );
+        assert!(
+            commented.contains("JOURNAL_REASON_SCOPE_LOST"),
+            "{label} comment preserves the token"
+        );
+        assert!(
+            executable_sites(
+                &commented,
+                "JOURNAL_REASON_SCOPE_LOST",
+                &["start_remove_rc_for::<JOURNAL>("]
+            )
+            .is_empty(),
+            "{label} commented-out emitter rejected"
+        );
+    }
     for reserved in [
         "JOURNAL_REASON_STOP_CLEANUP",
         "JOURNAL_REASON_PARTIAL_TRANSACTION",
@@ -2305,20 +2524,48 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
             "{reserved} carries its reservation in the shared contract"
         );
     }
-    // Numeric C spellings: production C emits no reserved numeric
-    // reason. The settle coercion above is the only numeric reason
-    // assignment, and it names 9.
+    // Numeric C positions: production C emits no reserved numeric
+    // reason, neither as an assignment spelling nor as a reason
+    // argument to a whole (possibly wrapped) native call. The settle
+    // coercion above is the only numeric reason assignment, and it
+    // names 9.
     for (name, text) in [("task_owner.c", &owner_c), ("object_journal.c", &journal_c)] {
-        for (index, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            for spelling in ["= 7", "=7", "= 8", "=8"] {
-                assert!(
-                    !(code.contains("reason") && code.contains(spelling)),
-                    "{name}:{}: numeric reserved reason in production C: {line}",
-                    index + 1
-                );
-            }
-        }
+        assert!(
+            reserved_numeric_sites(text).is_empty(),
+            "{name}: numeric reserved reason in production C: {:?}",
+            reserved_numeric_sites(text)
+        );
+    }
+    // Negative controls: a reserved numeric smuggled into one real
+    // reason argument — `7U` at a single-line slot-bound call, `8U`
+    // at the wrapped exec-exit call — with the other named emitters
+    // intact. The assignment-spelling scan passes both mutants; the
+    // reason-argument check must reject them.
+    let slot_bound = "remove_start(ctl, owner, key, P11_OWNER_START_REASON_COLLISION);";
+    assert_eq!(
+        owner_c.matches(slot_bound).count(),
+        4,
+        "slot-bound call sites"
+    );
+    for (label, mutant) in [
+        (
+            "7U",
+            owner_c.replacen(slot_bound, "remove_start(ctl, owner, key, 7U);", 1),
+        ),
+        (
+            "8U-wrapped",
+            owner_c.replacen("P11_OWNER_START_REASON_EXEC_EXIT", "8U", 1),
+        ),
+    ] {
+        assert!(
+            mutant.contains("P11_OWNER_START_REASON_COLLISION")
+                && mutant.contains("P11_OWNER_START_REASON_EXEC_EXIT"),
+            "{label} keeps named emitters: token presence stays green"
+        );
+        assert!(
+            !reserved_numeric_sites(&mutant).is_empty(),
+            "{label} numeric reason argument rejected"
+        );
     }
     // Native reason numbers stay out of the reserved codes.
     for line in owner_h.lines() {

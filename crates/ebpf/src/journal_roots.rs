@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-2.0-only
-//! Private proof roots. This module is absent from every ordinary BPF object.
+//! Distinct journal roots. This module is absent from every non-journal BPF
+//! object; proof and production journal selections link the same roots.
 //! The host proof includes its scalar policy and in-place wire writers only.
 
 use p11scope_ebpf_common::object_journal::{

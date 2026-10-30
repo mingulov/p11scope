@@ -248,7 +248,7 @@ fn object_producer_scalar_scope_flags_preserve_authority_discriminant() {
     use p11scope_ebpf_common::{
         FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
         FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FLAG_SYSTEM_FILTER,
-        valid_config,
+        FLAG_TRACK_SHORT_LIVED, valid_config,
     };
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF scope source");
     let word = source_between(&source, "fn scope_flags_word() -> u64 {", "\n}\n");
@@ -277,8 +277,10 @@ fn object_producer_scalar_scope_flags_preserve_authority_discriminant() {
             FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
         ] {
             valid.push(scope | policy);
+            valid.push(scope | policy | FLAG_TRACK_SHORT_LIVED);
             if scope == FLAG_PID_FILTER {
                 valid.push(scope | policy | FLAG_PAUSE_ENABLED);
+                valid.push(scope | policy | FLAG_PAUSE_ENABLED | FLAG_TRACK_SHORT_LIVED);
             }
         }
     }

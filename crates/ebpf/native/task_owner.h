@@ -65,12 +65,12 @@ struct thread_owner {
     u32 start_count;
     u32 flags;
 #ifndef P11SCOPE_INVENTORY_ONLY
-    /* H8 slice-A inactive custody: physical-task lifetime identity for the
+    /* H8 journal custody: physical-task lifetime identity for the
      * object journal. Minted once per retained task-storage row (zero
      * means unminted), never recycled, preserved across idle and
-     * exec/exit cleanup while lease state clears. Inactive: no live
-     * root reads or writes these yet. Inventory-only objects carry no
-     * journal words. */
+     * exec/exit cleanup while lease state clears. Only the
+     * journal-selected producer reads or writes these; ordinary roots
+     * never touch them. Inventory-only objects carry no journal words. */
     u64 journal_thread;
     u64 journal_sequence;
 #endif

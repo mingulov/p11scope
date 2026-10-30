@@ -2,10 +2,14 @@
 #ifndef P11SCOPE_OBJECT_JOURNAL_H
 #define P11SCOPE_OBJECT_JOURNAL_H
 
-/* H8 inactive custody: the object journal's native side-map,
- * lifetime mint, ring leaves and entry/return/exit transactions.
- * Inactive: no live root calls anything below yet; the host fixture
- * in tests/fixtures/object-journal/ executes this exact code.
+/* H8 journal custody: the object journal's native side-map,
+ * lifetime mint, ring leaves and entry/return/exit transactions. The
+ * producer leaves (`p11_journal_begin`, `p11_journal_returning`,
+ * `p11_journal_settle_*`) are live only in journal-selected objects,
+ * reached from the distinct journal entry/return roots; ordinary and
+ * inventory objects link none of them. The combined transactions
+ * remain host-fixture evidence only. The fixture in
+ * tests/fixtures/object-journal/ executes this exact code.
  * Inventory-only objects carry no journal maps, hooks or reads. */
 #include "task_owner.h"
 

@@ -2,7 +2,7 @@
 //! H8 journal wire contracts: exact BEGIN/END/ABANDON layouts, finite
 //! validators, compact/full equivalence and rejection of every malformed
 //! combination. Drives only the public shared wire API; the producer that
-//! mints these bytes stays inactive.
+//! mints these bytes is live only in journal-selected objects.
 
 use p11scope::kinds;
 use p11scope_ebpf_common::instance;
@@ -747,11 +747,11 @@ fn object_journal_ilp32_abi_layout() {
     assert!(validate_end(&end, Some(&descriptor)).is_none());
 }
 
-/// Slice-A inactive custody: the native lifetime words, JOURNAL_START
+/// Journal custody: the native lifetime words, JOURNAL_START
 /// side-map and ring-leaf skeleton compile for every object flavor and
 /// the actual native-owner fixture passes unprivileged. The producer
-/// that would call this stays inactive: no live root wires these
-/// leaves.
+/// that calls this is live only in journal-selected objects; this host
+/// fixture enables no production define or BPF load.
 #[test]
 fn object_journal_physical_thread_identity() {
     use std::process::Command;
@@ -897,8 +897,8 @@ fn object_journal_combined_transactions_publish_valid_wire_records() {
     assert_eq!(abandons, 3, "ABANDON count");
 }
 
-/// P1 executes real inactive native globals. No production define, BPF load
-/// or live authority is enabled by this host fixture.
+/// P1 executes the real journal-selected native globals. No production
+/// define, BPF load or live authority is enabled by this host fixture.
 #[test]
 fn object_journal_native_producer_preserves_wire_and_custody() {
     use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
@@ -964,7 +964,10 @@ fn object_journal_native_producer_preserves_wire_and_custody() {
                 JournalRecord::Abandon(_) => 2,
             }] += 1;
         }
-        assert_eq!(counts, [29, 1, 18], "exact producer record selection");
+        // The small flavor's one-entry side map admits one fewer live
+        // BEGIN (and its cleanup ABANDON) in the multi-slot cleanup case.
+        let expected = if name == "small" { [33, 1, 20] } else { [34, 1, 21] };
+        assert_eq!(counts, expected, "exact producer record selection");
     }
     assert_eq!(
         std::mem::size_of::<p11scope_ebpf_common::SlotSemantics>(),
@@ -1206,13 +1209,15 @@ fn object_journal_transaction_ordering_matrix() {
     }
 }
 
-/// Slice-A custody stays inactive: no live BPF root wires the journal
-/// transaction leaves until slice B authorizes the transactions. The
-/// slice-D birth marker globals are live (wired from the exec, entry
-/// and return roots through `p11_instance_*` names that carry none of
-/// these literals); only the transaction set below stays unwired. The
-/// ban covers the whole file text, including comments and extern names,
-/// so marker call sites must keep those words out of their spellings.
+/// Ordinary roots stay journal-free: no ordinary BPF root wires the
+/// journal transaction leaves; only the cfg-gated journal roots module
+/// reaches the producer. The slice-D birth marker globals are live
+/// (wired from the exec, entry and return roots through
+/// `p11_instance_*` names that carry none of these literals). The ban
+/// covers the whole file text, including comments and extern names, so
+/// marker call sites must keep those words out of their spellings. The
+/// positive control below pins the one gated module that does wire the
+/// producer, so this contract cannot pass by deleting the producer.
 #[test]
 fn object_journal_leaves_are_inactive() {
     for program in ["main.rs", "inventory.rs", "inventory_callers.rs"] {
@@ -1242,16 +1247,29 @@ fn object_journal_leaves_are_inactive() {
         ] {
             assert!(
                 !source.contains(symbol),
-                "{program} must not wire inactive journal custody ({symbol})"
+                "{program} must not wire journal custody ({symbol})"
             );
         }
+    }
+    let roots = std::fs::read_to_string("crates/ebpf/src/journal_roots.rs")
+        .expect("read journal roots module");
+    for symbol in [
+        "p11_journal_begin",
+        "p11_journal_returning",
+        "p11_owner_start_remove_reason",
+        "p11_entry_journal",
+        "p11_return_journal",
+    ] {
+        assert!(
+            roots.contains(symbol),
+            "journal roots must wire the real producer ({symbol})"
+        );
     }
 }
 
 /// H8-D atomic birth marker: the native publication/dirty/readback/
 /// admission implementation compiles and its actual fixture passes
-/// unprivileged. The producer that would call this stays inactive: no
-/// live root wires these leaves.
+/// unprivileged. This host fixture enables no production define or load.
 #[test]
 fn object_journal_birth_marker() {
     use std::process::Command;
@@ -2114,9 +2132,9 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
                 && !journal_c.contains(reserved),
             "{reserved} stays unemitted while it is reserved"
         );
-        let documented = common
-            .lines()
-            .any(|line| line.contains(reserved) && line.contains("reserved"));
+        let documented = common.lines().any(|line| {
+            line.contains(reserved) && line.to_lowercase().contains("reserved")
+        });
         assert!(documented, "{reserved} carries its reservation in the shared contract");
     }
 }

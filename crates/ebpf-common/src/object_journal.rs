@@ -132,13 +132,23 @@ const _: () = {
 /// Finite ABANDON reasons. Wire carries the code only, never a string; the
 /// reason-to-disposition matrix lives with the journal consumer, and a wire
 /// reason alone never certifies a bounded terminal witness.
+///
+/// Emitters: entry collision (native owner insert), insert-failed,
+/// scope-lost, abi-refused and identity-refused (entry/return roots),
+/// exec-exit (native owner cleanup) and sync-return-result-lost (return
+/// roots, plus the native settle coercion of an unsettled normal removal).
+/// The consumer still accepts every finite code, emitted or reserved.
 pub const JOURNAL_REASON_ENTRY_COLLISION: u32 = 1;
 pub const JOURNAL_REASON_INSERT_FAILED: u32 = 2;
 pub const JOURNAL_REASON_SCOPE_LOST: u32 = 3;
 pub const JOURNAL_REASON_ABI_REFUSED: u32 = 4;
 pub const JOURNAL_REASON_IDENTITY_REFUSED: u32 = 5;
 pub const JOURNAL_REASON_EXEC_EXIT: u32 = 6;
+/// Reserved: `JOURNAL_REASON_STOP_CLEANUP` names a future stop sweep; no
+/// producer emits it, and pending-stop custody settles by exec-exit instead.
 pub const JOURNAL_REASON_STOP_CLEANUP: u32 = 7;
+/// Reserved: `JOURNAL_REASON_PARTIAL_TRANSACTION` names a torn combined
+/// transaction; the live producer never emits it and refuses forward instead.
 pub const JOURNAL_REASON_PARTIAL_TRANSACTION: u32 = 8;
 pub const JOURNAL_REASON_SYNC_RETURN_RESULT_LOST: u32 = 9;
 

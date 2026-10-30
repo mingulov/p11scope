@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* H8 slice-A inactive custody fixture: executes the actual production
+/* H8 journal custody fixture: executes the actual production
  * lifetime-mint, side-map and ring-leaf implementation from
  * crates/ebpf/native/object_journal.{c,h} plus the owner lease/cleanup
  * paths that must preserve the lifetime words. Only kernel helper
  * operations and atomic interference are injected; there is no second
- * custody algorithm. Inactive: no live root calls these leaves. */
+ * custody algorithm. Journal-selected roots call these leaves live;
+ * ordinary objects link none of them. */
 #include "task_owner.h"
 static u64 *cas_interference_cell;
 static unsigned cas_failures_remaining, cas_attempts;
@@ -2777,6 +2778,7 @@ static void producer_prepare_finish_and_collision(void)
 
 /* A second tracked slot on the same physical owner, built from the first
  * slot's retained fixture rows without a reset. */
+#if JOURNAL_START_LIMIT > 1
 static void producer_second_begin(struct journal_entry_context *entry, struct owner_start_key *key)
 {
     struct journal_entry_witness witness;
@@ -2792,6 +2794,7 @@ static void producer_second_begin(struct journal_entry_context *entry, struct ow
     side->phase = OBJECT_PHASE_READY;
     p11_journal_begin(key, entry);
 }
+#endif
 
 /* Pending stop then exec/exit: returns never run, custody stays intact,
  * and cleanup abandons every live tracked BEGIN exactly once with the
@@ -2806,42 +2809,57 @@ static void producer_cleanup_exec_exit(void)
     u64 thread;
     second.slot = 6;
     p11_journal_begin(&producer_terminal_key, &entry);
+#if JOURNAL_START_LIMIT > 1
+    /* The small flavor's one-entry side map admits a single live BEGIN;
+     * its cleanup half below still runs with one slot. */
     producer_second_begin(&entry, &second);
-    EXPECT(ring_submits == 2 && !producer_gaps, "two tracked BEGINs on one owner");
-    EXPECT(lookup(&START, &producer_terminal_key) && lookup(&START, &second) &&
-               lookup(&JOURNAL_START, &producer_terminal_key) && lookup(&JOURNAL_START, &second),
+#endif
+    EXPECT(ring_submits == 1U + (JOURNAL_START_LIMIT > 1) && !producer_gaps,
+           "tracked BEGINs admitted up to the flavor side-map limit");
+    EXPECT(lookup(&START, &producer_terminal_key) &&
+               lookup(&JOURNAL_START, &producer_terminal_key) &&
+               (JOURNAL_START_LIMIT == 1 || (lookup(&START, &second) && lookup(&JOURNAL_START, &second))),
            "pending stop leaves ordinary and journal custody untouched");
     EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
            "cleanup reports abandoned live STARTs");
-    EXPECT(ring_submits == 4 && !producer_gaps, "one ABANDON per live BEGIN, no second loss");
-    EXPECT(((unsigned char *)ring_log[2])[4] == JOURNAL_KIND_ABANDON &&
-               record_u32(ring_log[2], 48) == 5 && record_u32(ring_log[2], 52) == 6 &&
-               record_u64(ring_log[2], 16) == 1,
+    EXPECT(ring_submits == 2U + 2U * (JOURNAL_START_LIMIT > 1) && !producer_gaps,
+           "one ABANDON per live BEGIN, no second loss");
+    EXPECT(((unsigned char *)ring_log[1U + (JOURNAL_START_LIMIT > 1)])[4] == JOURNAL_KIND_ABANDON &&
+               record_u32(ring_log[1U + (JOURNAL_START_LIMIT > 1)], 48) == 5 &&
+               record_u32(ring_log[1U + (JOURNAL_START_LIMIT > 1)], 52) == 6 &&
+               record_u64(ring_log[1U + (JOURNAL_START_LIMIT > 1)], 16) == 1,
            "first cleanup ABANDON names slot, exec/exit reason and original sequence");
+#if JOURNAL_START_LIMIT > 1
     EXPECT(((unsigned char *)ring_log[3])[4] == JOURNAL_KIND_ABANDON &&
                record_u32(ring_log[3], 48) == 6 && record_u32(ring_log[3], 52) == 6 &&
                record_u64(ring_log[3], 16) == 2,
            "second cleanup ABANDON names slot, exec/exit reason and original sequence");
+#endif
     EXPECT(!lookup(&START, &producer_terminal_key) && !lookup(&START, &second) &&
                !lookup(&OBJECT_START, &producer_terminal_key) && !lookup(&OBJECT_START, &second) &&
                !lookup(&JOURNAL_START, &producer_terminal_key) && !lookup(&JOURNAL_START, &second) &&
                !ctl.outstanding,
            "cleanup retires every custody row");
     thread = owners[0].journal_thread;
-    EXPECT(thread == 1 && owners[0].journal_sequence == 2, "exec preserves lifetime words");
+    EXPECT(thread == 1 && owners[0].journal_sequence == 1U + (JOURNAL_START_LIMIT > 1),
+           "exec preserves lifetime words");
     EXPECT(p11_owner_start_insert(&producer_terminal_key, start_value) == 0, "exec successor START");
     side = lookup(&OBJECT_START, &producer_terminal_key);
     EXPECT(side != NULL, "exec successor subordinate");
     side->layout = JOURNAL_LAYOUT_LP64;
     side->phase = OBJECT_PHASE_READY;
     p11_journal_begin(&producer_terminal_key, &entry);
-    EXPECT(ring_submits == 5 && record_u64(ring_log[4], 8) == thread &&
-               record_u64(ring_log[4], 16) == 3,
+    EXPECT(ring_submits == 3U + 2U * (JOURNAL_START_LIMIT > 1) &&
+               record_u64(ring_log[2U + 2U * (JOURNAL_START_LIMIT > 1)], 8) == thread &&
+               record_u64(ring_log[2U + 2U * (JOURNAL_START_LIMIT > 1)], 16) ==
+                   2U + (JOURNAL_START_LIMIT > 1),
            "successor BEGIN continues thread and sequence, never reuses a terminal identity");
     p11_journal_returning(&producer_terminal_key, &words);
-    EXPECT(words.thread == thread && words.sequence == 3 && words.flags == 0,
+    EXPECT(words.thread == thread && words.sequence == 2U + (JOURNAL_START_LIMIT > 1) &&
+               words.flags == 0,
            "successor return joins its own BEGIN");
-    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && ring_submits == 5 &&
+    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) &&
+               ring_submits == 3U + 2U * (JOURNAL_START_LIMIT > 1) &&
                !producer_gaps && !ctl.outstanding,
            "successor settles silently beside its END");
 }

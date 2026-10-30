@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* H8 slice-A inactive custody implementation. See object_journal.h. */
+/* H8 journal custody implementation. See object_journal.h. */
 #include "object_journal.h"
 
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -795,7 +795,7 @@ start_leg:
     return 0;
 }
 
-/* Inactive P1 producer. Every input is retained capture data or frozen
+/* Journal-selected producer leaves. Every input is retained capture data or frozen
  * endpoint policy; none of these globals reads a task field or user memory. */
 extern u32 p11_instance_scope_gap(void);
 

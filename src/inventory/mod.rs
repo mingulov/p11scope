@@ -717,15 +717,6 @@ pub fn run(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
-    // Packet 6.13 residual: the selected-file startup pin/custody path is
-    // not implemented, so the combination is refused before side effects
-    // instead of running a PARTIAL capture that never activates the input.
-    if !prearm_modules.is_empty() {
-        anyhow::bail!(
-            "--prearm-module inventory activation is not implemented under \
-             --capture auto/native; refusing before side effects"
-        );
-    }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
         anyhow::bail!(
@@ -1116,6 +1107,37 @@ fn primary_alias_conflict(report: &Path, kind: &str, other: &Path) -> anyhow::Er
     )
 }
 
+/// Pins `--prearm-module` inputs for supported auto/native Inventory capture
+/// (packet 6.13 round-2, F5): open-first, `(ino, size, ctime)` bracket,
+/// whole-file hash, all-or-nothing `Fatal` on one bad path. `--pid` resolves
+/// against a temporary retained view of the named pid; system/cgroup resolve
+/// against the observer root. The pins live in the coordinator for the run.
+fn pin_inventory_prearm(
+    prearm_modules: &[PathBuf],
+    scope: InventoryRunScope,
+) -> Result<crate::discovery::identity::PrearmPinning> {
+    use crate::discovery::identity::pin_prearm_objects_in_views_with_budget;
+    use crate::process::{ProcessView, ProcessViewId};
+    let (views, named_pid) = match scope {
+        InventoryRunScope::Pid(pid) => {
+            let view = ProcessView::open(ProcessViewId(u32::MAX), pid)
+                .map_err(|error| anyhow::anyhow!("--prearm-module: {error}"))?;
+            (vec![view], Some(pid))
+        }
+        InventoryRunScope::System | InventoryRunScope::Cgroup => (Vec::new(), None),
+    };
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    pin_prearm_objects_in_views_with_budget(prearm_modules, &views, named_pid, 0, 0, &mut budget)
+        .map_err(|error| {
+            for problem in error.problems() {
+                eprintln!("p11scope: {problem}");
+            }
+            anyhow::anyhow!(
+                "--prearm-module inputs are not usable trusted inputs; refusing to attach"
+            )
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
@@ -1178,15 +1200,13 @@ fn run_with_terminal_budget(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
-    // Packet 6.13 residual: the selected-file startup pin/custody path is
-    // not implemented, so the combination is refused before side effects
-    // instead of running a PARTIAL capture that never activates the input.
-    if !prearm_modules.is_empty() {
-        anyhow::bail!(
-            "--prearm-module inventory activation is not implemented under \
-             --capture auto/native; refusing before side effects"
-        );
-    }
+    // F5: pin `--prearm-module` inputs before any sink, probe or scan, so
+    // one bad path refuses all-or-nothing before side effects.
+    let prearm_pinning = if prearm_modules.is_empty() {
+        None
+    } else {
+        Some(pin_inventory_prearm(prearm_modules, scope)?)
+    };
     validate_primary_destinations(out, event_log)?;
     if capture != CaptureMode::Scan {
         let _host = host()?;
@@ -1277,13 +1297,20 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
-    // `--prearm-module` inputs were refused above: reaching here with a
-    // nonempty list is impossible, and a pending-activation gap is not an
-    // implementation of the selected-file contract.
-    debug_assert!(
-        prearm_modules.is_empty(),
-        "pre-arm inventory inputs refuse before coordinator setup"
-    );
+    // Packet 6.13 round-2 (F5): the startup pinning above is retained for
+    // the run. Detailed-subset offset activation follows in a later packet
+    // — disclosed, never silently dropped — but the validation, pin and
+    // held-FD custody here are real.
+    if let Some(pinning) = prearm_pinning {
+        let retained = pinning.inputs.len();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.note_scope_gap(
+            "pre-arm subset pending".into(),
+            format!(
+                "{retained} --prearm-module input(s) retained; Detailed-subset offset activation follows in a later packet"
+            ),
+        );
+    }
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, &numbering);
@@ -8004,9 +8031,10 @@ mod tests {
     }
 
     #[test]
-    fn inventory_run_refuses_prearm_under_auto_and_native_before_side_effects() {
-        // The selected-file startup pin/custody path is not implemented:
-        // inventory refuses the combination before probing, sinks or scans.
+    fn inventory_run_refuses_bad_prearm_path_before_side_effects() {
+        // One bad `--prearm-module` path refuses all-or-nothing before
+        // probing, sinks or scans; a valid provider is retained instead
+        // (see the positive twin below).
         for mode in [CaptureMode::Auto, CaptureMode::Native] {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("out.json");
@@ -8042,7 +8070,7 @@ mod tests {
                 None,
                 None,
             )
-            .expect_err("inventory with --prearm-module under auto/native must refuse");
+            .expect_err("inventory with a bad --prearm-module path must refuse");
             assert!(
                 format!("{error:#}").contains("--prearm-module"),
                 "unexpected refusal: {error:#}"
@@ -8050,6 +8078,121 @@ mod tests {
             assert!(!out.exists(), "refusal must precede sink creation");
             assert!(stdout.is_empty());
         }
+    }
+
+    /// Packet 6.13 round-2 (F5): startup pinning is all-or-nothing — one
+    /// bad path refuses the whole batch and retains no partial pins.
+    #[test]
+    fn inventory_prearm_pinning_refuses_mixed_batch_without_partial_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("prearm-mixed.c");
+        std::fs::write(&src, "int prearm_mixed_marker;\n").unwrap();
+        let provider = dir.path().join("prearm-mixed.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let scope = InventoryRunScope::Pid(std::process::id());
+        let valid = super::pin_inventory_prearm(std::slice::from_ref(&provider), scope)
+            .expect("a valid provider pins");
+        assert_eq!(valid.inputs.len(), 1);
+        assert!(
+            valid.pins.pinned().count() >= 1,
+            "pinning retains the held file"
+        );
+        drop(valid);
+        let error = super::pin_inventory_prearm(
+            &[provider, PathBuf::from("/nonexistent-prearm-provider.so")],
+            scope,
+        )
+        .expect_err("a mixed batch must refuse all-or-nothing");
+        assert!(
+            format!("{error:#}").contains("--prearm-module"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    /// Packet 6.13 round-2 (F5): a valid `--prearm-module` under auto/native
+    /// pins and retains the provider instead of refusing every mode. The
+    /// Detailed-subset offset activation stays pending (disclosed gap), but
+    /// startup validation, pin and held-FD custody are real.
+    #[test]
+    fn inventory_run_accepts_valid_prearm_under_auto_with_retained_gap() {
+        // A trivial provider with no standard exports: pinning succeeds,
+        // retention is real, activation stays pending.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("prearm-valid.c");
+        std::fs::write(&src, "int prearm_valid_marker;\n").unwrap();
+        let provider = dir.path().join("prearm-valid.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Auto falls back to scan when native is unavailable in tests; the
+        // pre-arm pin must not block that fallback, and the pending gap
+        // must disclose the retained input. The stubbed preparation fails
+        // generic (not a typed host refusal), so auto continues on scan.
+        let out = dir.path().join("out.json");
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(std::process::id()),
+                    &[],
+                    &[],
+                    &[provider],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    Some(&out),
+                    false,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    crate::attach::BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                    None,
+                    None,
+                )
+            },
+        )
+        .expect("inventory with a valid --prearm-module under auto must not refuse");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter().any(|gap| {
+                gap["subject"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("pre-arm")
+            }),
+            "a retained pre-arm input discloses its pending activation: {gaps:?}"
+        );
     }
 
     #[test]

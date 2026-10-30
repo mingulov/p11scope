@@ -252,6 +252,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     semantic_inputs: semantics::SemanticInputs,
     /// Explicit count inputs enter the catalog's one plan before admission.
     count_manifests: Vec<PathBuf>,
+    /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
+    /// validation, pin and held-FD custody for supported auto/native
+    /// Inventory capture. Detailed-subset offset activation stays pending
+    /// (disclosed gap); the pins themselves are real and live for the run.
+    prearm: Option<crate::discovery::identity::PrearmPinning>,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -470,6 +475,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine_collected_finish_calls: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             count_manifests: Vec::new(),
+            prearm: None,
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -532,6 +538,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
         self.count_manifests = manifests.clone();
         self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+    }
+
+    /// Retains an already-validated `--prearm-module` pinning for the run's
+    /// lifetime (F5). The pins hold their FDs until the coordinator drops.
+    pub(crate) fn set_prearm_pinning(
+        &mut self,
+        pinning: crate::discovery::identity::PrearmPinning,
+    ) {
+        self.prearm = Some(pinning);
     }
 
     #[cfg(test)]

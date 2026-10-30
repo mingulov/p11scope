@@ -110,10 +110,10 @@
 //! O4 allowlist row: the needed amendment is noted in the packet report;
 //! this patch never writes `docs/privacy/allowlist-v1.md`. Fresh-file
 //! attribution stays 6.12's. Installed exactness positives stay C6-D. The
-//! inventory Detailed-subset work follows the input surface in a later
-//! packet: until its startup pin/custody path exists, inventory refuses
-//! `--prearm-module` inputs by name before side effects under every
-//! capture mode — a pending-activation gap is not an implementation.
+//! inventory Detailed-subset offset activation follows the input surface in
+//! a later packet: inventory pins and retains `--prearm-module` inputs at
+//! startup, refuses them by name under `--capture scan`, and discloses the
+//! pending activation as a scope gap.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -301,6 +301,30 @@ impl PrearmWatch {
         self.state = PrearmWatchState::Ended;
     }
 
+    /// Clamps the published bound to the first stop (packet 6.13 round-2,
+    /// F3): a change detected after observation stopped must not extend
+    /// `until_ns` past it. The bracket's detection instant clamps with the
+    /// bound so the two stay coherent; `last_ok_ns` clamps too, so the
+    /// bracket still orders.
+    pub(crate) fn clamp_to_stop(&mut self, stop_ns: Option<u64>) {
+        let Some(cap) = stop_ns else {
+            return;
+        };
+        if let Some(until) = self.until_ns
+            && until > cap
+        {
+            self.until_ns = Some(cap);
+        }
+        if let Some(changed) = self.changed.as_mut() {
+            if changed.detected_ns > cap {
+                changed.detected_ns = cap;
+            }
+            if changed.last_ok_ns > cap {
+                changed.last_ok_ns = cap;
+            }
+        }
+    }
+
     /// Renders the serializable interval. Discovery calls this; attach keys
     /// merge separately at evidence assembly (stage rule, R2-D1-5).
     pub(crate) fn render(&self) -> RenderWatch {
@@ -485,6 +509,14 @@ impl PrearmState {
     pub(crate) fn end_all(&mut self, cause: PrearmWatchEnd, now: Option<u64>) {
         for watch in self.watches.values_mut() {
             watch.end(cause, now);
+        }
+    }
+
+    /// Clamps every watch's published bound to the first stop (F3), after
+    /// all ends have latched.
+    pub(crate) fn clamp_all_to_stop(&mut self, stop_ns: Option<u64>) {
+        for watch in self.watches.values_mut() {
+            watch.clamp_to_stop(stop_ns);
         }
     }
 

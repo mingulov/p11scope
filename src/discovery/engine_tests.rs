@@ -8340,6 +8340,10 @@ fn prearm_call_ring_loss_refuses_idle() {
     let watch = finish_prearm_terminal_health(kernel, 0, 0);
     assert_eq!(watch.state, PrearmWatchState::Ended);
     assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+    // The truncation closes at the last proven-clean bound (the arm 1000),
+    // never at the link-only advanced stop 5000.
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(1000));
 }
 
 /// Scope and identity refusals with zero use end scope-uncertain: cgroup
@@ -8367,6 +8371,8 @@ fn prearm_scope_identity_refusal_ends_scope_uncertain() {
         let watch = finish_prearm_terminal_health(kernel, 0, 0);
         assert_eq!(watch.state, PrearmWatchState::Ended);
         assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeUncertain));
+        assert_eq!(watch.since_ns, Some(1000));
+        assert_eq!(watch.until_ns, Some(1000));
     }
     // Discovery-side ABI refusal refuses through the engine's own snapshot.
     let fixture = DiscoveryLifecycleFixture::start();
@@ -8392,6 +8398,8 @@ fn prearm_scope_identity_refusal_ends_scope_uncertain() {
         .expect("finish renders every watch");
     assert_eq!(watch.state, PrearmWatchState::Ended);
     assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeUncertain));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(1000));
 }
 
 /// A malformed call feed with zero use refuses the quiet claim as loss.
@@ -8402,6 +8410,8 @@ fn prearm_malformed_feed_refuses_idle() {
     let watch = finish_prearm_terminal_health(crate::metrics::KernelEvidence::default(), 1, 0);
     assert_eq!(watch.state, PrearmWatchState::Ended);
     assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(1000));
 }
 
 /// Link gaps refuse the quiet claim: a finally lost link truncates at the
@@ -8445,6 +8455,62 @@ fn prearm_link_gaps_refuse_idle() {
     let watch = finish_prearm_terminal_health(crate::metrics::KernelEvidence::default(), 0, 1);
     assert_eq!(watch.state, PrearmWatchState::Ended);
     assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(1000));
+}
+
+/// Packet 6.13 round-2 (F3): an object change detected after the first
+/// stop must not extend the published bound past it. The watch arms at
+/// 1000, the first stop freezes at 1000, and the change is detected later
+/// at real-clock time: the published `until_ns` never exceeds the stop.
+#[test]
+fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+    use std::io::Write as _;
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    // Dirty the pinned provider after arming so the terminal refresh
+    // detects the change at real-clock time (far past the frozen stop).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    {
+        let provider = fixture.provider_path();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(provider)
+            .expect("dirty the pinned provider");
+        file.write_all(b"x").expect("extend the pinned provider");
+        file.sync_all().expect("persist the change");
+    }
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(1000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ObjectChanged));
+    assert_eq!(watch.since_ns, Some(1000));
+    let until = watch
+        .until_ns
+        .expect("an object-changed end carries its bound");
+    assert!(
+        until <= 1000,
+        "published bound {until} exceeds the first stop 1000"
+    );
 }
 
 /// Packet 6.13 residual: generic captures assemble their late-discovery

@@ -35,6 +35,11 @@ pub(crate) fn validate_stop_gate(ebpf: &Ebpf) -> Result<()> {
 pub(crate) struct StopGate {
     cell: NonNull<AtomicU64>,
     len: usize,
+    /// First `CLOCK_MONOTONIC` stop-request instant (packet 6.13 round-2,
+    /// F3): latched once at the first effective STOP, never overwritten,
+    /// so terminal watch bounds use the earliest stop instead of a later
+    /// publication read. Zero means no stop was requested yet.
+    first_stop_ns: AtomicU64,
 }
 
 // SAFETY: the mapping is owned exclusively and every access is atomic.
@@ -68,14 +73,33 @@ impl StopGate {
             unsafe { libc::munmap(base, len) };
             bail!("STOP_GATE cell is nonzero before first use");
         }
-        Ok(StopGate { cell, len })
+        Ok(StopGate {
+            cell,
+            len,
+            first_stop_ns: AtomicU64::new(0),
+        })
     }
 
-    /// Publish the stop request: set the stop bit, keep the count.
-    // A later stop-gate task drives userspace stop.
-    #[allow(dead_code)]
+    /// Publish the stop request: set the stop bit, keep the count. The
+    /// first call also latches its `CLOCK_MONOTONIC` instant (read before
+    /// the bit is set, so the stamp is at or before the effective stop);
+    /// later calls never move it.
     pub(crate) fn request_stop(&self) {
+        if let Some(now) = super::monotonic_ns() {
+            let now = now.max(1);
+            let _ = self
+                .first_stop_ns
+                .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
+        }
         self.word().fetch_or(STOP_GATE_STOP, Ordering::SeqCst);
+    }
+
+    /// The first stop-request instant, when any stop was requested.
+    pub(crate) fn first_stop_ns(&self) -> Option<u64> {
+        match self.first_stop_ns.load(Ordering::SeqCst) {
+            0 => None,
+            ns => Some(ns),
+        }
     }
 
     pub(crate) fn stop_requested(&self) -> bool {
@@ -135,9 +159,11 @@ mod tests {
         let gate = StopGate {
             cell: NonNull::new(base.cast()).unwrap(),
             len,
+            first_stop_ns: AtomicU64::new(0),
         };
         gate.word().store(3, Ordering::SeqCst);
         assert!(!gate.stop_requested());
+        assert_eq!(gate.first_stop_ns(), None);
         gate.request_stop();
         assert_eq!(gate.in_flight(), 3);
         assert!(!gate.quiescent());
@@ -145,5 +171,11 @@ mod tests {
             gate.stop_requested(),
             "STOP must refuse before admitted bodies become quiescent"
         );
+        // The first stop latches its instant; a later request never moves it.
+        let first = gate.first_stop_ns().expect("the stop latches its instant");
+        assert!(first > 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        gate.request_stop();
+        assert_eq!(gate.first_stop_ns(), Some(first));
     }
 }

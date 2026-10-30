@@ -1986,14 +1986,25 @@ fn prearm_report_owners(
     owners
 }
 
+/// The terminal watch-close boundary (packet 6.13 round-2, F3): the first
+/// effective STOP when the gate recorded one, else the loop-end stamp. The
+/// minimum wins, so a later publication sample never extends the published
+/// interval past the earliest stop.
+fn prearm_stop_ns(first_stop_ns: Option<u64>, loop_end_ns: Option<u64>) -> Option<u64> {
+    match (first_stop_ns, loop_end_ns) {
+        (Some(first), Some(loop_end)) => Some(first.min(loop_end)),
+        (Some(first), None) => Some(first),
+        (None, loop_end) => loop_end,
+    }
+}
+
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
 /// idle qualification over observed use and terminal health, the end for
 /// the capture end, and the attach-key assembly merge onto the discovery
 /// records — all before the evidence seals. Watches close at the frozen
-/// stop/scope-ending boundary `stop_ns` (the loop-end stamp beside the
-/// loss sampling), never at a later publication read, so the published
-/// interval excludes the blind tail. Generic captures without watches
-/// still assemble their attach/window keys.
+/// first-stop boundary `stop_ns`, never at a later publication read, so the
+/// published interval excludes the blind tail. Generic captures without
+/// watches still assemble their attach/window keys.
 #[allow(clippy::too_many_arguments)]
 fn finish_prearm_terminal(
     engine: &mut Engine,
@@ -5306,6 +5317,9 @@ fn capture_profile(
     // loss sampling, with the loop's real ending (an Err result is an
     // error ending — the loop still ended).
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample.
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop_ns(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -5482,7 +5496,7 @@ fn capture_profile(
                         // Sealing during a quiesce failure: the watches end
                         // stopped, never as a clean scope end.
                         CaptureEnd::Error,
-                        loop_end_ns,
+                        watch_stop_ns,
                     )
                     .map(|_| ())
                 },
@@ -5646,7 +5660,7 @@ fn capture_profile(
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
                         end,
-                        loop_end_ns,
+                        watch_stop_ns,
                     )
                 },
             )
@@ -6225,6 +6239,9 @@ fn capture_trace(
     // Authoritative loop-end stamp (T2, G-14): one clock read beside the
     // loss sampling, with the loop's real ending.
     let loop_end_ns = crate::attach::monotonic_ns();
+    // F3: watches close at the first effective STOP, not at this later
+    // loop-end sample (which follows the identity stop).
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop_ns(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -6552,7 +6569,7 @@ fn capture_trace(
                         &reports,
                         &terminal_kernel,
                         *consumers.malformed_records,
-                        loop_end_ns,
+                        watch_stop_ns,
                     );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
@@ -12410,6 +12427,16 @@ mod tests {
             assert_eq!(watch.until_ns, Some(1000));
             assert_eq!(watch.ended_by, Some(cause));
         }
+    }
+
+    #[test]
+    fn prearm_stop_uses_first_stop_not_later_loop_end() {
+        // The earliest stop wins; a later loop-end sample never extends it.
+        assert_eq!(prearm_stop_ns(Some(1000), Some(5000)), Some(1000));
+        assert_eq!(prearm_stop_ns(Some(5000), Some(1000)), Some(1000));
+        assert_eq!(prearm_stop_ns(Some(1000), None), Some(1000));
+        assert_eq!(prearm_stop_ns(None, Some(5000)), Some(5000));
+        assert_eq!(prearm_stop_ns(None, None), None);
     }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {

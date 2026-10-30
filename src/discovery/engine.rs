@@ -27610,6 +27610,7 @@ impl Engine {
     /// precision follow-up (end evaluation is conservative-correct:
     /// stamps are historical facts, and unverified links truncate at the
     /// arm instant).
+    #[cfg(test)]
     pub(crate) fn refresh_prearm_liveness(
         &mut self,
         session: &impl EngineSession,
@@ -27624,6 +27625,37 @@ impl Engine {
             if let Some(watch) = self.prearm.get_mut(id) {
                 watch.evaluate_arm(&links);
                 watch.verify_links(&links, now);
+            }
+        }
+        self.refresh_prearm_object_changes();
+        self.rerender_prearm_watches();
+    }
+
+    /// Health-gated liveness refresh for terminal close (packet 6.13
+    /// round-2, F2): watches whose terminal health is already dirty verify
+    /// link presence without advancing `last_verified_ns`, so a later
+    /// health truncation closes at the last proven-clean bound instead of
+    /// riding a link-only snapshot to the stop.
+    fn refresh_prearm_liveness_gated(
+        &mut self,
+        session: &impl EngineSession,
+        now: Option<u64>,
+        health_clean_by_object: &BTreeMap<PinnedObjectId, bool>,
+        global_clean: bool,
+    ) {
+        if self.prearm.is_empty() {
+            return;
+        }
+        let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
+        for id in ids {
+            let links = self.declared_links(id, session);
+            if let Some(watch) = self.prearm.get_mut(id) {
+                watch.evaluate_arm(&links);
+                let clean = health_clean_by_object
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(global_clean);
+                watch.verify_links(&links, if clean { now } else { None });
             }
         }
         self.refresh_prearm_object_changes();
@@ -27653,7 +27685,9 @@ impl Engine {
         // pre-arm watch transitions below: a capture without pre-arm
         // watches still gets its late-discovery windows assembled.
         if !self.prearm.is_empty() {
-            self.refresh_prearm_liveness(session, now);
+            // F2: terminal health is computed before any link verification,
+            // so a final link-only snapshot cannot advance the proven-clean
+            // bound when the counters already show loss.
             let failed_slots: BTreeSet<u32> =
                 attach_failures.iter().map(|(slot, _)| *slot).collect();
             let link_gap = self.physical_gap.open
@@ -27671,6 +27705,10 @@ impl Engine {
             for (id, object) in &objects {
                 module_of.insert(*object, *id);
             }
+            let mut health_by_object: BTreeMap<
+                PinnedObjectId,
+                (crate::prearm_module::PrearmHealth, bool),
+            > = BTreeMap::new();
             for (object, module) in &module_of {
                 let own_failed = self.plan.slots.iter().any(|slot| {
                     slot.module_ids.contains(module) && failed_slots.contains(&slot.index)
@@ -27688,18 +27726,43 @@ impl Engine {
                     own_attach_failures: own_failed,
                 };
                 let health_clean = crate::prearm_module::idle_health_clean(&health);
+                health_by_object.insert(*object, (health, health_clean));
+            }
+            let global_health = crate::prearm_module::PrearmHealth {
+                discovery_ring_loss: self.counter_snapshot.ring_loss,
+                discovery_state_failures: self.counter_snapshot.export_state_failures,
+                discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+                discovery_truncated: self.discovery_truncated,
+                malformed_discovery: self.malformed_discovery,
+                discovery_abi_refusals: self.counter_snapshot.abi_refusals,
+                kernel: *kernel,
+                malformed_records,
+                link_gap,
+                own_attach_failures: false,
+            };
+            let global_clean = crate::prearm_module::idle_health_clean(&global_health);
+            let gate: BTreeMap<PinnedObjectId, bool> = health_by_object
+                .iter()
+                .map(|(object, (_, clean))| (*object, *clean))
+                .collect();
+            self.refresh_prearm_liveness_gated(session, now, &gate, global_clean);
+            for (object, module) in &module_of {
+                let (health, health_clean) = &health_by_object[object];
                 if let Some(watch) = self.prearm.get_mut(*object) {
-                    watch.evaluate_idle(used.contains(module), health_clean);
+                    watch.evaluate_idle(used.contains(module), *health_clean);
                     // A health-dirty armed watch truncates at its last
                     // proven-clean bound instead of riding to the natural end.
                     if !health_clean
                         && watch.render().state == crate::render::PrearmWatchState::Armed
                     {
-                        watch.end(crate::prearm_module::prearm_loss_cause(&health), now);
+                        watch.end(crate::prearm_module::prearm_loss_cause(health), now);
                     }
                 }
             }
             self.prearm.end_all(cause, now);
+            // F3: a change detected after the stop must not extend the
+            // published bound past it.
+            self.prearm.clamp_all_to_stop(now);
             self.rerender_prearm_watches();
         }
         let stamps: BTreeMap<u32, u64> = self

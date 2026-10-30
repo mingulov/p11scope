@@ -10636,6 +10636,7 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
         &mut sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
+    let s1_before = (joint.started(), joint.completed());
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -10646,7 +10647,11 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
     );
     assert_eq!(referenced_effects(&success).len(), 1);
     assert_eq!(scene.model.project().objects.len(), 2);
-    assert_eq!((joint.started(), joint.completed()), (2, 2));
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (s1_before.0 + 1, s1_before.1 + 1),
+        "S1 completes the healthy call"
+    );
 }
 
 /// Item 11 (model leg): hostile input scalars never establish use.

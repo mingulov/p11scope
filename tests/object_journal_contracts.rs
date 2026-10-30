@@ -2738,6 +2738,26 @@ fn object_journal_stop_gate_closed_preserves_custody() {
             "no handwritten gate remains: {shadow}"
         );
     }
+    // Denial-control words are always initialized: the open section
+    // must seed a deterministic sentinel before the wrapped return,
+    // as the closed section does, so the always-deny hostile control
+    // never reads indeterminate C data. The denied branch asserts the
+    // sentinel survives; the admitted branch keeps its join check.
+    let open_fn = "static void producer_stop_gate_open_settles";
+    let open_at = fixture.find(open_fn).expect("open section present");
+    let open_end = fixture[open_at..]
+        .find("int p11scope_stop_gate_closed")
+        .expect("open section end")
+        + open_at;
+    let open_body = &fixture[open_at..open_end];
+    assert!(
+        open_body.contains("denied return leaves words untouched"),
+        "open section asserts the sentinel survives the denied call"
+    );
+    assert!(
+        open_body.contains("memset(&sentinel, 0xa5") && open_body.contains("words = sentinel"),
+        "open section initializes denial-control words with a sentinel"
+    );
     // The bridge: production admission + production constants over one
     // shared word, exposed to the fixture through the ops table.
     static WORD: AtomicU64 = AtomicU64::new(0);

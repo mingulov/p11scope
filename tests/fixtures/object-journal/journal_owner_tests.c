@@ -2877,17 +2877,27 @@ static void producer_stop_gate_closed_preserves_custody(const struct stop_gate_o
 
 /* Open-gate control for the bridge: the same wrapped entries settle
  * while admission stays open — one ABANDON with the exec/exit reason,
- * every custody row retired. */
+ * every custody row retired. Denial-control words start as a
+ * deterministic sentinel (as in the closed section), so the hostile
+ * always-deny run never reads indeterminate data: the admitted branch
+ * joins its BEGIN, the denied branch proves the sentinel survives. */
 static void producer_stop_gate_open_settles(const struct stop_gate_ops *ops)
 {
     struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
-    struct journal_return_words words;
+    struct journal_return_words words, sentinel;
+    int admitted;
     ops->reset();
+    memset(&sentinel, 0xa5, sizeof(sentinel));
+    words = sentinel;
     p11_journal_begin(&producer_terminal_key, &entry);
-    EXPECT(stop_gated_returning(ops, &producer_terminal_key, &words) == 1,
-           "open gate admits the return entry");
-    EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0,
-           "admitted return joins its BEGIN");
+    admitted = stop_gated_returning(ops, &producer_terminal_key, &words);
+    EXPECT(admitted == 1, "open gate admits the return entry");
+    if (admitted)
+        EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0,
+               "admitted return joins its BEGIN");
+    else
+        EXPECT(!memcmp(&words, &sentinel, sizeof(words)),
+               "denied return leaves words untouched");
     EXPECT(stop_gated_cleanup(ops) == P11_OWNER_CLEANUP_ABANDONED_START,
            "open gate admits the lifecycle cleanup");
     EXPECT(ring_submits == 2 && ((unsigned char *)ring_log[1])[4] == JOURNAL_KIND_ABANDON &&

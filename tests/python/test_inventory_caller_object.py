@@ -43,7 +43,7 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "interface_return", "sched_process_exec", "sched_process_exit",
             "p11_inventory_image_baseline"}
 SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg", "p11_exec_dumpability",
-           "p11_link_current_identity", "p11_link_current_cookie"}
+           "p11_exe_identity", "p11_link_current_identity", "p11_link_current_cookie"}
 MASK = (1 << 64) - 1
 VALUE = 40  # CALLER_USE layout version 2: the 32-byte witness plus entry_count
 COUNT = 32  # entry_count offset: the only CALLER_USE bytes BPF may change

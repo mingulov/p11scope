@@ -437,7 +437,8 @@ pub const fn valid_config(flags: u64) -> bool {
         | FLAG_POLICY_ALLOWLISTED
         | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
         | FLAG_POLICY_AGGREGATE
-        | FLAG_PAUSE_ENABLED;
+        | FLAG_PAUSE_ENABLED
+        | FLAG_TRACK_SHORT_LIVED;
     matches!(
         scope,
         FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER
@@ -797,6 +798,15 @@ fn zero_discovery_payload_except_binding(record: &DiscoveryRecord) -> bool {
     zero_discovery_scalar_payload(record) && record.pointers.iter().all(|pointer| *pointer == 0)
 }
 
+/// 6.14 Option B: EXEC payload shape. `pointers[0..2]` carry the raw
+/// exe `(s_dev, i_ino)` data pair when extensive mode is armed and
+/// stay zero otherwise; the pair is data, so any value validates.
+/// The tail always stays zero. `(0, 0)` means absent.
+fn zero_discovery_exec_tail(record: &DiscoveryRecord) -> bool {
+    zero_discovery_scalar_payload(record)
+        && record.pointers[2..].iter().all(|pointer| *pointer == 0)
+}
+
 fn zero_selection_payload(record: &DiscoveryRecord) -> bool {
     record.return_rv == 0
         && record.request_flags == 0
@@ -981,7 +991,7 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
             ) && valid_exec_leader(record.pid_tgid)
                 && record.announced_count == 0
                 && record.binding_id <= IMAGE_IDENTITY_TICKET_LIMIT
-                && zero_discovery_payload_except_binding(record)
+                && zero_discovery_exec_tail(record)
         }
         DISCOVERY_KIND_LEADER_EXIT => {
             record.status_flags == 0
@@ -3075,7 +3085,10 @@ mod tests {
         let mutations: &[fn(&mut DiscoveryRecord)] = &[
             |r| r.table_ptr = 1,
             |r| r.interface_flags = 1,
-            |r| r.pointers[0] = 1,
+            // 6.14 Option B (ratified Row A, owner 2026-10-29 item 5):
+            // pointers[0..2] are the exe (s_dev, i_ino) data pair, not
+            // reserved; the reserved tail starts at pointers[2].
+            |r| r.pointers[2] = 1,
             |r| r.pointers[DISCOVERY_POINTERS - 1] = 1,
             |r| r.interface_index = 1,
             |r| r.name_class = 1,

@@ -96,15 +96,11 @@ static void reset_exe(void)
     fake_inode.i_sb = &fake_sb;
     fake_sb.s_dev = 0x801;
 }
-/* Packet 6.14 phase 2 (Option B RED): the B1 helper is absent, so the
- * weak reference is null and the harness fails at runtime on the
- * absence probe below (never a link error). GREEN deletes this
- * declaration and the probe, and exercises the real helper. */
-__attribute__((weak)) unsigned int p11_exe_identity(unsigned long *dev, unsigned long *ino);
+/* Packet 6.14 phase 2 (Option B GREEN): the real helper rides the
+ * exec_task.c include above; these cases exercise it. */
 static void check_exe_identity(void)
 {
     unsigned long dev, ino;
-    assert(p11_exe_identity != 0 && "exe identity helper absent");
     reset_exe();
     dev = ino = 0xa5a5a5a5;
     assert(p11_exe_identity(&dev, &ino) == 1);

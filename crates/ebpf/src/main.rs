@@ -122,7 +122,8 @@ use p11scope_ebpf_common::{
     EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
     Event, EventRecord, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
-    FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
+    FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FLAG_TRACK_SHORT_LIVED,
+    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
     FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
@@ -1951,6 +1952,23 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);
         }
     }
+    // 6.14 Option B: the exe (s_dev, i_ino) pair rides pointers[0..2]
+    // only when extensive mode is armed for this capture. In every
+    // flavor (the ticket above stays flavor-gated): the kernel read
+    // never happens otherwise — not captured but unclassified is
+    // forbidden — and inventory-only never arms the bit. A failed
+    // kernel read keeps the initializer's zeroed pair, which
+    // userspace treats as absent.
+    if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_TRACK_SHORT_LIVED != 0 {
+        let mut dev = 0u64;
+        let mut ino = 0u64;
+        if unsafe { p11_exe_identity(&mut dev, &mut ino) } != 0 {
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).pointers[0]), dev);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).pointers[1]), ino);
+            }
+        }
+    }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
 }
@@ -2919,6 +2937,9 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
 
 unsafe extern "C" {
     fn p11_exec_dumpability() -> u32;
+    // 6.14 Option B: exec-time exe-file identity. Out-words are stack
+    // slots; nonzero return means both words were written.
+    fn p11_exe_identity(dev: *mut u64, ino: *mut u64) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_tag() -> u64;
     #[cfg(not(feature = "inventory-only"))]

@@ -913,6 +913,10 @@ fn build_variant_with_proof(
     }
     append_flag("-C");
     append_flag("link-arg=--export=p11_exec_dumpability");
+    // 6.14 Option B: exec-time exe identity, exported in every flavor
+    // like the predicate it sits beside (behavior is runtime-gated).
+    append_flag("-C");
+    append_flag("link-arg=--export=p11_exe_identity");
     if !inventory {
         for flag in [
             "-C",
